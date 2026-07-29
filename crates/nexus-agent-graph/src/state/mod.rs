@@ -808,6 +808,25 @@ pub struct AgentState {
 }
 
 impl AgentState {
+    /// Forma OSSERVATA dell'ultimo turno, per chi deve stimare quanto costerebbe
+    /// la prossima chiamata (l'escalation, che sceglie fra modelli).
+    ///
+    /// Punto unico della conversione (regola L): i quattro call site
+    /// dell'escalation la chiedono qui invece di ricostruirla ognuno dai campi,
+    /// dove sbagliare `Option` o scambiare prompt e completion non sarebbe un
+    /// errore visibile — solo un confronto di costi che si inverte in silenzio.
+    ///
+    /// `prompt_tokens` e' il LORDO, cache compresa: e' la stessa convenzione di
+    /// [`nexus_pricing::TokenUsage`], che scorpora la cache al proprio interno.
+    /// Un turno non ancora misurato (`None`) da' una forma ignota, che riporta
+    /// l'escalation all'ordine di listino.
+    pub fn turn_shape(&self) -> crate::runtime::ports::TurnShape {
+        crate::runtime::ports::TurnShape {
+            prompt_tokens: self.prompt_tokens.unwrap_or(0),
+            completion_tokens: self.completion_tokens.unwrap_or(0),
+        }
+    }
+
     /// `true` se lo stato richiede una conferma umana prima di proseguire.
     pub fn is_awaiting_confirmation(&self) -> bool {
         self.awaiting_confirmation.unwrap_or(false)

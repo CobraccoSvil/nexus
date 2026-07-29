@@ -15,6 +15,9 @@ uuid.workspace = true
 # Il LISTINO (quanto costa una chiamata) resta il suo punto unico: qui si scrive
 # cio' che quello calcola, non si ricalcola nulla.
 nexus-pricing = { path = "../nexus-pricing" }
+# I settings hanno il loro punto unico di lettura: la finestra su cui si osserva
+# l'hit-rate di cache si legge da li', non da un numero scritto qui (regola G).
+nexus-auth = { path = "../nexus-auth" }
 
 [dev-dependencies]
 # Schema META (`db/migrations`) per i `#[sqlx::test]`: la riga si rilegge dal

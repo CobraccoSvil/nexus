@@ -57,9 +57,13 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod cache_hitrate;
 mod quote;
 mod scrittura;
 
+pub use cache_hitrate::{
+    observed_cache_hit_rates, HitRateWindow, MIN_SAMPLES_SETTING, WINDOW_SETTING,
+};
 pub use quote::{
     active_quotas, check_quota, usage_for_quotas, usage_for_scope, Consumption, QuotaLock,
     QuotaPolicy,

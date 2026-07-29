@@ -36,7 +36,7 @@ use nexus_agent_graph::decisions::escalation::{
 };
 use nexus_agent_graph::decisions::governance::ModelTelemetry;
 use nexus_agent_graph::runtime::ports::{
-    EscalationInputs, EscalationPort, PortError, ProviderFailureCause,
+    EscalationInputs, EscalationPort, PortError, ProviderFailureCause, TurnShape,
 };
 
 use crate::governance_telemetry::{load_governance_policy, load_model_telemetry};
@@ -184,7 +184,35 @@ impl PgEscalationPort {
     /// SELEZIONE resta nel modulo puro `pick_escalation_model` (confine regola L).
     /// Se il modello corrente non e' nel catalog (`window=0`) il filtro e' inattivo
     /// (nessun riferimento), coerente col fail-open.
-    async fn chain_for(&self, provider: &str, base_model: &str) -> Vec<ChainEntry> {
+    ///
+    /// ORDINE, e perche' non e' piu' quello della vista. `escalation_rank` mette
+    /// insieme due assi (`tier_ord * 1_000_000 + blended_cost * 1000`), e il
+    /// secondo — `input*0.75 + output*0.25` — e' il prezzo PIENO dell'input. In un
+    /// loop agentico il prefisso (system prompt, tool schemas, primi messaggi) e'
+    /// identico a ogni iterazione, quindi una quota grande e sistematica del
+    /// prompt viene servita da cache a una frazione (deepseek ~1/10, openai ~1/2)
+    /// e il listino non ha modo di vederla. Misurato il 29/07/2026: deepseek
+    /// 67,0% di hit contro mistral 5,2%; sullo stesso task deepseek e' costato
+    /// $0,14-$0,19 e mistral $3,08-$0,77.
+    ///
+    /// Quindi il TIER resta il criterio primario — l'escalation serve a salire di
+    /// capacita', e un riordino che la ignorasse promuoverebbe il modello sbagliato
+    /// per risparmiare — e il COSTO ATTESO sostituisce il blended_cost come
+    /// tie-break DENTRO lo stesso tier. Il calcolo non e' qui: e'
+    /// [`nexus_pricing::expected_call_cost`], punto unico del prezzo (regola L),
+    /// che a sua volta eredita il ripiego dichiarato — senza tariffa di cache a
+    /// listino i token tornano a prezzo pieno, quindi nessuno sconto fantasma (il
+    /// caso reale di openrouter: 43% di hit misurato, zero tariffe a catalogo).
+    ///
+    /// Il riordino NON avviene, e l'ordine resta quello della vista, quando la
+    /// forma del turno e' ignota o la lettura dei prezzi/hit-rate fallisce: chi
+    /// non sa non riceve una scelta peggiore di quella di prima.
+    async fn chain_for(
+        &self,
+        provider: &str,
+        base_model: &str,
+        shape: TurnShape,
+    ) -> Vec<ChainEntry> {
         if provider.trim().is_empty() || base_model.trim().is_empty() {
             return Vec::new();
         }
@@ -244,13 +272,16 @@ impl PgEscalationPort {
             .fetch_all(&self.db)
             .await
         {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|(escalation_model, tier)| ChainEntry {
-                    escalation_model,
-                    tier: tier.filter(|t| !t.trim().is_empty()),
-                })
-                .collect(),
+            Ok(rows) => {
+                let catena: Vec<ChainEntry> = rows
+                    .into_iter()
+                    .map(|(escalation_model, tier)| ChainEntry {
+                        escalation_model,
+                        tier: tier.filter(|t| !t.trim().is_empty()),
+                    })
+                    .collect();
+                self.riordina_per_costo_atteso(provider, catena, shape).await
+            }
             Err(e) => {
                 tracing::warn!(
                     provider = %provider,
@@ -260,6 +291,101 @@ impl PgEscalationPort {
                 Vec::new()
             }
         }
+    }
+
+    /// Riordina la catena a TIER COSTANTE mettendo davanti, fra i pari, il
+    /// modello il cui costo ATTESO e' minore (vedi la doc di [`Self::chain_for`]).
+    ///
+    /// La catena arriva gia' ordinata per `escalation_rank ASC`, che e'
+    /// `tier_ord` prima e costo di listino poi: un ordinamento STABILE per solo
+    /// tier conserva quel raggruppamento e riscrive unicamente l'ordine interno.
+    /// Cosi' l'asse "capacita' crescente" resta esattamente quello di prima.
+    ///
+    /// FAIL-OPEN in ogni ramo: forma ignota, listino illeggibile o hit-rate
+    /// illeggibile lasciano la catena com'era. Un errore qui non deve cambiare
+    /// quale modello viene promosso — al massimo non migliorarlo.
+    async fn riordina_per_costo_atteso(
+        &self,
+        provider: &str,
+        catena: Vec<ChainEntry>,
+        shape: TurnShape,
+    ) -> Vec<ChainEntry> {
+        if shape.e_ignota() || catena.len() < 2 {
+            return catena;
+        }
+        let currency = match nexus_pricing::platform_currency(&self.db).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "escalation_port: currency illeggibile, ordine di listino");
+                return catena;
+            }
+        };
+        let prezzi = match nexus_pricing::resolve_active_prices_in(&self.db, provider, &currency)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "escalation_port: listino illeggibile, ordine invariato");
+                return catena;
+            }
+        };
+        // L'hit-rate e' un DI PIU': senza, i candidati si confrontano comunque sul
+        // costo atteso a cache fredda, che e' il listino. Per questo un guasto qui
+        // degrada a mappa vuota invece di annullare il riordino.
+        let hit_rates = match nexus_ledger::HitRateWindow::load(&self.db).await {
+            Ok(w) => nexus_ledger::observed_cache_hit_rates(&self.db, provider, w)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "escalation_port: hit-rate illeggibile, cache fredda per tutti");
+                    Default::default()
+                }),
+            Err(e) => {
+                tracing::warn!(error = %e, "escalation_port: finestra hit-rate non configurata, cache fredda per tutti");
+                Default::default()
+            }
+        };
+
+        let call = nexus_pricing::CallShape {
+            prompt_tokens: shape.prompt_tokens,
+            completion_tokens: shape.completion_tokens,
+        };
+        // `None` = costo non calcolabile (modello fuori catalog, o listino
+        // 'unknown'): resta in coda fra i suoi pari invece di fingere costo zero,
+        // che lo farebbe vincere sempre.
+        let costo = |m: &str| -> Option<f64> {
+            match prezzi.get(m) {
+                Some(nexus_pricing::PriceLookup::Priced(p)) => {
+                    let hit = hit_rates
+                        .get(m)
+                        .copied()
+                        .unwrap_or(nexus_pricing::CacheHitRate::Unknown);
+                    Some(nexus_pricing::expected_call_cost(p, &call, hit).total_cost)
+                }
+                _ => None,
+            }
+        };
+
+        let mut ordinata = catena;
+        ordinata.sort_by(|a, b| {
+            match (
+                costo(&a.escalation_model),
+                costo(&b.escalation_model),
+            ) {
+                (Some(x), Some(y)) => x.total_cmp(&y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        });
+        // Il tier torna a comandare: `sort_by_key` e' STABILE, quindi dentro ogni
+        // tier sopravvive l'ordine per costo atteso appena calcolato. I due sort
+        // in sequenza esprimono la precedenza senza ricostruire un rank numerico —
+        // che sarebbe la terza copia della formula della vista.
+        // `tier_rank` e' il punto unico del vocabolario dei 5 livelli
+        // (`nexus-types::tiers`): un tier assente o sconosciuto vale `medium`
+        // neutro, esattamente come lo tratta il resto del sistema.
+        ordinata.sort_by_key(|e| nexus_types::tiers::tier_rank(e.tier.as_deref().unwrap_or("")));
+        ordinata
     }
 
     /// Performance tier di `(provider, model)` dal catalog (vista
@@ -425,6 +551,7 @@ impl EscalationPort for PgEscalationPort {
         _intent: Option<&str>,
         provider: Option<&str>,
         model: Option<&str>,
+        turn_shape: TurnShape,
     ) -> Result<EscalationInputs, PortError> {
         // Candidato cross-provider (loop_fallback_default), sempre risolto.
         let cross = self.cross_provider(provider, model).await;
@@ -435,7 +562,7 @@ impl EscalationPort for PgEscalationPort {
         let intra: Vec<ChainEntry> = match (provider, model) {
             (Some(p), Some(m)) if !p.trim().is_empty() && !m.trim().is_empty() => {
                 if self.provider_available(p).await {
-                    self.chain_for(p, m).await
+                    self.chain_for(p, m, turn_shape).await
                 } else {
                     tracing::info!(
                         provider = %p,
@@ -748,6 +875,7 @@ mod tests {
                 None,
                 Some("anthropic"),
                 Some("claude-haiku-4-5"),
+                TurnShape::default(),
             )
             .await
             .expect("fail-open: mai PortError");
@@ -781,6 +909,7 @@ mod tests {
                 None,
                 Some("anthropic"),
                 Some("claude-haiku-4-5"),
+                TurnShape::default(),
             )
             .await
             .expect("fail-open");
@@ -868,6 +997,7 @@ mod tests {
                 None,
                 Some("deepseek"),
                 Some("deepseek-v4-flash"),
+                TurnShape::default(),
             )
             .await
             .expect("fail-open");
@@ -923,6 +1053,7 @@ mod tests {
                 None,
                 Some("anthropic"),
                 Some("claude-haiku-4-5"),
+                TurnShape::default(),
             )
             .await
             .expect("fail-open");
@@ -945,6 +1076,7 @@ mod tests {
                 None,
                 Some("anthropic"),
                 Some("claude-haiku-4-5"),
+                TurnShape::default(),
             )
             .await
             .expect("fail-open");
@@ -960,7 +1092,7 @@ mod tests {
         create_schema(&pool).await;
         let port = PgEscalationPort::new(pool.clone());
         let inputs = port
-            .escalation_inputs(None, None, None)
+            .escalation_inputs(None, None, None, TurnShape::default())
             .await
             .expect("fail-open");
         assert!(inputs.candidates.is_empty());
@@ -973,7 +1105,7 @@ mod tests {
         set_api_key(&pool, "openai", "sk-live").await;
         let port = PgEscalationPort::new(pool.clone());
         let inputs = port
-            .escalation_inputs(None, Some("openai"), Some("gpt-4o-mini"))
+            .escalation_inputs(None, Some("openai"), Some("gpt-4o-mini"), TurnShape::default())
             .await
             .expect("fail-open");
         assert!(inputs.candidates.is_empty());
@@ -1311,7 +1443,7 @@ mod tests {
 
         let port = PgEscalationPort::new(pool.clone());
         let catena: Vec<String> = port
-            .chain_for("p", "base")
+            .chain_for("p", "base", TurnShape::default())
             .await
             .into_iter()
             .map(|e: ChainEntry| e.escalation_model)
@@ -1393,7 +1525,7 @@ mod tests {
         scena_intra_e_cross(&pool).await;
         let port = PgEscalationPort::new(pool.clone());
         let inputs = port
-            .escalation_inputs(None, Some("anthropic"), Some("claude-medium"))
+            .escalation_inputs(None, Some("anthropic"), Some("claude-medium"), TurnShape::default())
             .await
             .expect("fail-open");
         let fornitori: Vec<&str> = inputs
@@ -1421,7 +1553,7 @@ mod tests {
         let port = PgEscalationPort::new(pool.clone())
             .con_vincolo(vincolo_utente("anthropic"));
         let inputs = port
-            .escalation_inputs(None, Some("anthropic"), Some("claude-medium"))
+            .escalation_inputs(None, Some("anthropic"), Some("claude-medium"), TurnShape::default())
             .await
             .expect("fail-open");
         let fornitori: Vec<&str> = inputs
@@ -1659,6 +1791,240 @@ mod tests {
             port.pinned_provider(),
             None,
             "una preferenza non e' un vincolo e non deve essere raccontata come tale"
+        );
+    }
+
+    // ── Inversione per costo atteso, sulla vista VERA ──────────────────────
+    //
+    // Questi test girano su `META_MIGRATOR`, cioe' sulla
+    // `v_model_escalation_chain` applicata dalla migrazione 0471, NON sullo
+    // specchio a mano di `create_schema` qui sopra: se l'ordine dipende dalla
+    // vista, misurarlo su una copia significherebbe misurare la copia (regola O).
+
+    /// Seed di un modello a catalogo col suo listino completo.
+    ///
+    /// `qualification_state = 'qualified'` non e' un dettaglio: su `META_MIGRATOR`
+    /// i `settings` sono quelli VERI, e fra questi
+    /// `agent.model_qualification.enforce_routing_gate` e' acceso — quindi
+    /// `chain_for` filtra i modelli non qualificati e la catena uscirebbe vuota.
+    /// I test che girano sullo specchio a mano di `create_schema` non lo vedono
+    /// perche' li' `settings` e' una tabella vuota: e' esattamente il genere di
+    /// filtro di produzione che una fixture ricopiata nasconde (regola O).
+    async fn seed_modello(
+        pool: &PgPool,
+        provider: &str,
+        model: &str,
+        tier: &str,
+        input: f64,
+        output: f64,
+        cache_read: Option<f64>,
+    ) {
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+               (provider, model, performance_tier, input_cost_per_million_tokens, \
+                output_cost_per_million_tokens, cache_read_cost_per_million_tokens, \
+                currency, is_enabled, supports_tool_use, context_window, pricing_state, \
+                qualification_state) \
+             VALUES ($1,$2,$3,$4,$5,$6,'USD',TRUE,TRUE,256000,'priced','qualified')",
+        )
+        .bind(provider)
+        .bind(model)
+        .bind(tier)
+        .bind(input)
+        .bind(output)
+        .bind(cache_read)
+        .execute(pool)
+        .await
+        .expect("seed catalog");
+    }
+
+    /// Righe di ledger con un hit-rate dato, scritte dal produttore reale
+    /// (`record_tokens`) con le FK soddisfatte davvero.
+    async fn seed_hit(pool: &PgPool, provider: &str, model: &str, prompt: i64, cache: i64) {
+        let team = uuid::Uuid::new_v4();
+        let user = uuid::Uuid::new_v4();
+        let project = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO teams (id, name, slug) VALUES ($1,'T',$2)")
+            .bind(team)
+            .bind(team.to_string())
+            .execute(pool)
+            .await
+            .expect("team");
+        sqlx::query("INSERT INTO users (id, email, display_name) VALUES ($1,$2,'U')")
+            .bind(user)
+            .bind(format!("{user}@t.local"))
+            .execute(pool)
+            .await
+            .expect("user");
+        sqlx::query(
+            "INSERT INTO projects (id, team_id, name, slug, owner_user_id) \
+             VALUES ($1,$2,'P',$3,$4)",
+        )
+        .bind(project)
+        .bind(team)
+        .bind(project.to_string())
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect("project");
+
+        let id = nexus_ledger::Identity {
+            user_id: user,
+            project_id: project,
+        };
+        for _ in 0..25 {
+            let usage = nexus_pricing::TokenUsage {
+                prompt_tokens: prompt,
+                completion_tokens: 0,
+                cache_read_tokens: cache,
+                cache_creation_tokens: 0,
+            };
+            nexus_ledger::record_tokens(pool, id, provider, model, &usage, "", "test")
+                .await
+                .expect("record_tokens");
+        }
+    }
+
+    /// Il caso che questo lavoro esiste per cambiare: a parita' di tier la catena
+    /// mette davanti il modello con cache efficace, anche se il suo listino e'
+    /// piu' ALTO.
+    ///
+    /// Listini reali (catalog del 29/07/2026, mistral tier `heavy`):
+    ///   `devstral-medium-latest`  in 0.40  out 2.00  cache 0.040
+    ///   `mistral-large-latest`    in 0.50  out 1.50  cache 0.050
+    /// Il `blended_cost` della vista li ordina 0.80 contro 0.75, quindi oggi
+    /// vince `mistral-large-latest`. Con un turno agentico reale (150k di prompt)
+    /// e l'hit-rate misurato sul ledger, l'ordine si ribalta.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn a_parita_di_tier_la_catena_preferisce_la_cache_efficace(pool: PgPool) {
+        // Modello di partenza piu' economico di entrambi: cosi' entrambi hanno
+        // `escalation_rank` superiore ed entrano in catena.
+        seed_modello(&pool, "mistral", "base", "medium", 0.10, 0.30, Some(0.01)).await;
+        seed_modello(
+            &pool,
+            "mistral",
+            "devstral-medium-latest",
+            "heavy",
+            0.40,
+            2.00,
+            Some(0.040),
+        )
+        .await;
+        seed_modello(
+            &pool,
+            "mistral",
+            "mistral-large-latest",
+            "heavy",
+            0.50,
+            1.50,
+            Some(0.050),
+        )
+        .await;
+        // Solo devstral ha cache efficace (60% misurato); large e' freddo.
+        seed_hit(&pool, "mistral", "devstral-medium-latest", 1_000, 600).await;
+        seed_hit(&pool, "mistral", "mistral-large-latest", 1_000, 0).await;
+
+        let port = PgEscalationPort::new(pool.clone());
+        let shape = TurnShape {
+            prompt_tokens: 150_000,
+            completion_tokens: 2_000,
+        };
+        let catena = port.chain_for("mistral", "base", shape).await;
+
+        let modelli: Vec<&str> = catena
+            .iter()
+            .map(|e| e.escalation_model.as_str())
+            .collect();
+        let i_dev = modelli.iter().position(|m| *m == "devstral-medium-latest");
+        let i_large = modelli.iter().position(|m| *m == "mistral-large-latest");
+        assert!(
+            i_dev.is_some() && i_large.is_some(),
+            "entrambi devono essere in catena: {modelli:?}"
+        );
+        assert!(
+            i_dev < i_large,
+            "il modello con cache efficace deve precedere quello col listino piu' \
+             basso e cache fredda: {modelli:?}"
+        );
+    }
+
+    /// Controllo dell'inversione: con la forma del turno IGNOTA il criterio non
+    /// ha nulla da applicare e l'ordine resta quello della vista (listino). E'
+    /// anche la prova che il fallback non peggiora nulla — chi non sa dichiarare
+    /// la forma riceve il comportamento di prima, non uno peggiore.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn senza_forma_del_turno_l_ordine_resta_quello_di_listino(pool: PgPool) {
+        seed_modello(&pool, "mistral", "base", "medium", 0.10, 0.30, Some(0.01)).await;
+        seed_modello(
+            &pool,
+            "mistral",
+            "devstral-medium-latest",
+            "heavy",
+            0.40,
+            2.00,
+            Some(0.040),
+        )
+        .await;
+        seed_modello(
+            &pool,
+            "mistral",
+            "mistral-large-latest",
+            "heavy",
+            0.50,
+            1.50,
+            Some(0.050),
+        )
+        .await;
+        seed_hit(&pool, "mistral", "devstral-medium-latest", 1_000, 600).await;
+
+        let port = PgEscalationPort::new(pool.clone());
+        let catena = port
+            .chain_for("mistral", "base", TurnShape::default())
+            .await;
+
+        let modelli: Vec<&str> = catena
+            .iter()
+            .map(|e| e.escalation_model.as_str())
+            .collect();
+        let i_dev = modelli.iter().position(|m| *m == "devstral-medium-latest");
+        let i_large = modelli.iter().position(|m| *m == "mistral-large-latest");
+        assert!(
+            i_large < i_dev,
+            "forma ignota: deve valere l'ordine di listino (blended 0.75 < 0.80), \
+             non il costo atteso: {modelli:?}"
+        );
+    }
+
+    /// Il TIER resta il criterio primario: un `medium` con costo atteso
+    /// bassissimo non deve scavalcare un `heavy`. L'escalation serve a salire di
+    /// capacita', e un riordino che guardasse solo il prezzo promuoverebbe il
+    /// modello sbagliato, risparmiando su un turno che va comunque rifatto.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_costo_non_scavalca_il_tier(pool: PgPool) {
+        seed_modello(&pool, "mistral", "base", "light", 0.05, 0.10, Some(0.005)).await;
+        // `medium` costosissimo di listino ma con cache quasi gratuita.
+        seed_modello(&pool, "mistral", "medium-cached", "medium", 9.00, 9.00, Some(0.001)).await;
+        // `heavy` economico e senza cache.
+        seed_modello(&pool, "mistral", "heavy-freddo", "heavy", 0.20, 0.20, None).await;
+        seed_hit(&pool, "mistral", "medium-cached", 1_000, 950).await;
+
+        let port = PgEscalationPort::new(pool.clone());
+        let shape = TurnShape {
+            prompt_tokens: 150_000,
+            completion_tokens: 2_000,
+        };
+        let catena = port.chain_for("mistral", "base", shape).await;
+
+        let modelli: Vec<&str> = catena
+            .iter()
+            .map(|e| e.escalation_model.as_str())
+            .collect();
+        let i_med = modelli.iter().position(|m| *m == "medium-cached");
+        let i_heavy = modelli.iter().position(|m| *m == "heavy-freddo");
+        assert!(
+            i_med < i_heavy,
+            "il tier comanda: `medium` prima di `heavy` a prescindere dal costo \
+             atteso: {modelli:?}"
         );
     }
 }

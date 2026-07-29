@@ -785,6 +785,7 @@ pub mod test_doubles {
             intent: Option<&str>,
             provider: Option<&str>,
             model: Option<&str>,
+            _turn_shape: crate::runtime::ports::TurnShape,
         ) -> Result<EscalationInputs, PortError> {
             self.seen.lock().expect("lock seen").push((
                 intent.map(str::to_string),

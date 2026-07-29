@@ -2445,6 +2445,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "nexus-auth",
  "nexus-migrations-embedded",
  "nexus-pricing",
  "serde",

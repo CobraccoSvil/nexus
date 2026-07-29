@@ -95,13 +95,19 @@ pub enum PriceLookup {
 /// e' un posto in cui puo' divergere in silenzio da chi la legge.
 const STATO_PRICED: &str = "priced";
 
+/// Etichetta "non lo so", condivisa da chi dichiara un'ignoranza: il listino a
+/// token, quello a unita' e l'hit-rate di cache. Stessa ragione di
+/// [`STATO_PRICED`] — e' un identificatore macchina (regola N), e tre copie sono
+/// tre posti in cui puo' divergere da chi la confronta.
+const STATO_UNKNOWN: &str = "unknown";
+
 impl PriceLookup {
     /// Etichetta stabile per la telemetria (`details.price_state` del ledger) e i
     /// log. Identificatore macchina, non testo umano (regola M).
     pub fn state_label(&self) -> &'static str {
         match self {
             PriceLookup::Priced(_) => STATO_PRICED,
-            PriceLookup::Unknown => "unknown",
+            PriceLookup::Unknown => STATO_UNKNOWN,
             PriceLookup::NotInCatalog => "not_in_catalog",
         }
     }
@@ -188,6 +194,89 @@ pub async fn resolve_active_price_in(
     Ok(interpret_row(row))
 }
 
+/// Listino attivo di TUTTI i modelli di un provider, in una sola query.
+///
+/// Stessa domanda di [`resolve_active_price_in`] e stessa risposta — passa dallo
+/// stesso [`interpret_row`], quindi `pricing_state = 'unknown'` resta
+/// [`PriceLookup::Unknown`] e non diventa un prezzo zero. Esiste perche' il
+/// chiamante (la catena di escalation) valuta l'intera lista dei modelli di un
+/// provider in un colpo: una query per modello sarebbe fino a 66 round-trip
+/// (openai) su un percorso che deve essere veloce, e la tentazione successiva
+/// sarebbe leggere i prezzi da un JOIN scritto a mano altrove — cioe' una
+/// seconda interpretazione del listino (regola L).
+///
+/// I modelli senza riga attiva semplicemente non compaiono: l'assenza vale
+/// [`PriceLookup::NotInCatalog`], e averla anche come valore darebbe due modi di
+/// dire la stessa cosa.
+pub async fn resolve_active_prices_in(
+    db: &PgPool,
+    provider: &str,
+    currency: &str,
+) -> Result<std::collections::HashMap<String, PriceLookup>> {
+    // `DISTINCT ON (model)` + lo stesso ORDER BY della lettura singola: di ogni
+    // modello si tiene la riga di listino piu' recente ancora in vigore.
+    let rows = sqlx::query_as::<_, CatalogPriceRowNamed>(
+        "SELECT DISTINCT ON (model) model, \
+                input_cost_per_million_tokens::float8 AS input_cost_per_million_tokens, \
+                output_cost_per_million_tokens::float8 AS output_cost_per_million_tokens, \
+                cache_read_cost_per_million_tokens::float8 AS cache_read_cost_per_million_tokens, \
+                cache_creation_cost_per_million_tokens::float8 \
+                    AS cache_creation_cost_per_million_tokens, \
+                currency, \
+                pricing_state \
+           FROM ai_price_catalog \
+          WHERE provider = $1 \
+            AND currency = $2 \
+            AND effective_from <= NOW() \
+            AND (effective_to IS NULL OR effective_to > NOW()) \
+          ORDER BY model, effective_from DESC",
+    )
+    .bind(provider)
+    .bind(currency)
+    .fetch_all(db)
+    .await
+    .with_context(|| format!("lettura listino dei modelli di {provider} fallita"))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let model = r.model.clone();
+            (model, interpret_row(Some(r.into())))
+        })
+        .collect())
+}
+
+/// La stessa riga di listino con in piu' il `model`, per la lettura batch.
+///
+/// Struct separata e non una tupla `(String, CatalogPriceRow)`: `FromRow` non si
+/// annida, e riscrivere i sei campi in una tupla posizionale reintrodurrebbe
+/// esattamente lo scambio di posizione che [`CatalogPriceRow`] esiste per
+/// impedire. La conversione verso quella e' l'unico punto di passaggio, cosi'
+/// l'interpretazione resta una sola ([`interpret_row`]).
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct CatalogPriceRowNamed {
+    model: String,
+    input_cost_per_million_tokens: f64,
+    output_cost_per_million_tokens: f64,
+    cache_read_cost_per_million_tokens: Option<f64>,
+    cache_creation_cost_per_million_tokens: Option<f64>,
+    currency: String,
+    pricing_state: String,
+}
+
+impl From<CatalogPriceRowNamed> for CatalogPriceRow {
+    fn from(r: CatalogPriceRowNamed) -> Self {
+        Self {
+            input_cost_per_million_tokens: r.input_cost_per_million_tokens,
+            output_cost_per_million_tokens: r.output_cost_per_million_tokens,
+            cache_read_cost_per_million_tokens: r.cache_read_cost_per_million_tokens,
+            cache_creation_cost_per_million_tokens: r.cache_creation_cost_per_million_tokens,
+            currency: r.currency,
+            pricing_state: r.pricing_state,
+        }
+    }
+}
+
 /// Riga di listino letta dal catalog.
 ///
 /// E' una struct con NOMI e non una tupla posizionale: con quattro `f64`
@@ -209,7 +298,7 @@ struct CatalogPriceRow {
 fn interpret_row(row: Option<CatalogPriceRow>) -> PriceLookup {
     match row {
         None => PriceLookup::NotInCatalog,
-        Some(r) if r.pricing_state == "unknown" => PriceLookup::Unknown,
+        Some(r) if r.pricing_state == STATO_UNKNOWN => PriceLookup::Unknown,
         Some(r) => PriceLookup::Priced(PriceSnapshot {
             input_cost_per_million_tokens: r.input_cost_per_million_tokens,
             output_cost_per_million_tokens: r.output_cost_per_million_tokens,
@@ -392,6 +481,117 @@ pub fn calculate_cost(
         &TokenUsage::senza_cache(prompt_tokens, completion_tokens),
     );
     (b.input_cost, b.output_cost, b.total_cost)
+}
+
+// ── Costo ATTESO di una chiamata futura ─────────────────────────────────────
+
+/// Forma attesa di una chiamata: quanto prompt si spedisce e quanto output si
+/// attende. E' un tipo e non due `i64` sciolti perche' i due numeri si scambiano
+/// senza che il compilatore se ne accorga, e scambiati invertono il confronto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallShape {
+    /// Prompt LORDO che si spedirebbe: stessa convenzione di [`TokenUsage`].
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+}
+
+/// Quota del prompt che ci si attende servita da prompt-cache.
+///
+/// Due stati DISTINTI, per la stessa ragione per cui [`PriceLookup`] ne ha tre:
+/// "hit-rate zero" e "hit-rate ignoto" portano allo stesso costo ma NON sono lo
+/// stesso fatto, e collassarli renderebbe impossibile dire perche' un modello non
+/// e' stato scontato.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CacheHitRate {
+    /// Frazione MISURATA sul ledger (regola M: dalle colonne strutturate, mai
+    /// stimata dal nome del provider). Invariante `0.0..=1.0`, garantita dal
+    /// costruttore [`CacheHitRate::observed`].
+    Observed(f64),
+    /// Nessuna misura utilizzabile: modello nuovo, finestra vuota, campioni sotto
+    /// la soglia. NON e' un hit-rate di zero travestito: e' l'assenza del dato, e
+    /// porta al costo di LISTINO — cioe' esattamente quello che il sistema
+    /// calcolava prima di questo lavoro. Se non si sa, si dichiara che non si sa.
+    Unknown,
+}
+
+impl CacheHitRate {
+    /// Unico costruttore di [`CacheHitRate::Observed`]: clampa a `0.0..=1.0` e
+    /// degrada a [`CacheHitRate::Unknown`] su NaN.
+    ///
+    /// La validazione vive QUI e non nei chiamanti perche' un rapporto fuori scala
+    /// (una divisione per un monte prompt sbagliato, un NaN da `0/0`) non produce
+    /// un errore visibile piu' a valle: produce un costo atteso assurdo, che il
+    /// confronto usa come se fosse buono. Il tipo non puo' portare un valore che
+    /// non sia una frazione.
+    pub fn observed(frazione: f64) -> Self {
+        if frazione.is_nan() {
+            return CacheHitRate::Unknown;
+        }
+        CacheHitRate::Observed(frazione.clamp(0.0, 1.0))
+    }
+
+    /// Etichetta stabile per la telemetria e i log (regola M, identificatore
+    /// macchina).
+    pub fn state_label(&self) -> &'static str {
+        match self {
+            CacheHitRate::Observed(_) => "observed",
+            CacheHitRate::Unknown => STATO_UNKNOWN,
+        }
+    }
+
+    /// La frazione, o `0.0` se ignota. Privato: fuori di qui il collasso dei due
+    /// stati in un numero e' proprio cio' che l'enum impedisce.
+    fn frazione(&self) -> f64 {
+        match self {
+            CacheHitRate::Observed(f) => *f,
+            CacheHitRate::Unknown => 0.0,
+        }
+    }
+}
+
+/// Costo ATTESO di una chiamata non ancora avvenuta, dato il listino, la forma
+/// della chiamata e l'hit-rate di cache che ci si attende.
+///
+/// Risponde alla domanda "quanto costerebbe QUESTA chiamata su QUESTO modello",
+/// che e' l'unico criterio con cui due modelli si confrontano. Vive qui e non
+/// nella vista SQL ne' nell'adapter perche' la nozione di prezzo ha un punto unico
+/// (regola L): una copia della formula in SQL divergerebbe al primo listino nuovo.
+///
+/// DELEGA a [`calculate_cost_breakdown`] costruendo l'usage atteso, invece di
+/// rifare la moltiplicazione. Ne eredita — ed e' il punto — il ripiego dichiarato:
+/// se il listino non porta la tariffa di cache, i token attesi da cache tornano a
+/// tariffa PIENA e il fatto resta leggibile in `cache_tokens_billed_as_input`.
+/// Quindi un hit-rate alto su un modello SENZA tariffa di cache non produce alcuno
+/// sconto fantasma: e' il caso reale di openrouter, che nel ledger mostra 43% di
+/// hit su `z-ai/glm-4.7-flash` e non ha una sola tariffa di cache a catalogo.
+///
+/// ## Cosa NON modella
+///
+/// I token di SCRITTURA in cache (`cache_creation`) sono attesi a zero. Prevederli
+/// richiederebbe un'ipotesi sul numero di iterazioni del loop su cui la scrittura
+/// si ammortizza — un numero inventato (regola G), che e' proprio cio' che questo
+/// lavoro toglie di mezzo. La conseguenza va detta: per i provider che fanno pagare
+/// la scrittura (Anthropic, `1.25x`) il costo atteso e' una LIEVE sottostima. Non
+/// distorce il confronto fra modelli dello stesso provider, che e' l'uso di questa
+/// funzione nella catena di escalation (intra-provider).
+pub fn expected_call_cost(
+    price: &PriceSnapshot,
+    shape: &CallShape,
+    hit: CacheHitRate,
+) -> CostBreakdown {
+    let prompt = shape.prompt_tokens.max(0);
+    // `as i64` dopo il clamp del costruttore e il `max(0)`: il prodotto sta in
+    // `0..=prompt`, quindi il troncamento non puo' produrre un valore fuori scala.
+    let cache_read = (prompt as f64 * hit.frazione()) as i64;
+    calculate_cost_breakdown(
+        price,
+        &TokenUsage {
+            prompt_tokens: prompt,
+            completion_tokens: shape.completion_tokens.max(0),
+            cache_read_tokens: cache_read.min(prompt),
+            cache_creation_tokens: 0,
+        },
+    )
 }
 
 // ── Listino per unita' non-token (immagini, secondi, caratteri) ─────────────
@@ -840,6 +1040,168 @@ mod tests {
             calculate_cost_breakdown(&con_tariffa, &senza_cache).cache_price_state(),
             "no_cache_tokens"
         );
+    }
+
+    // ── Costo atteso ───────────────────────────────────────────────────────
+    //
+    // I listini di questi test sono COPIATI dal catalog vivo (misurati il
+    // 29/07/2026), non scelti per far tornare il conto: se il criterio funziona
+    // solo su numeri inventati non serve a niente. La coppia mistral `heavy`
+    // qui sotto e' una delle 8 inversioni reali presenti oggi a catalogo.
+
+    /// L'INVERSIONE, che e' il punto di tutto il lavoro: a parita' di tier, il
+    /// modello con listino piu' ALTO ma cache efficace costa MENO di quello con
+    /// listino piu' basso e cache fredda — e il criterio deve preferirlo.
+    ///
+    /// Caso reale (catalog 29/07/2026, mistral tier `heavy`):
+    ///   devstral-medium-latest  in 0.40  out 2.00  cache 0.040  hit osservato alto
+    ///   mistral-large-latest    in 0.50  out 1.50  cache 0.050  cache fredda
+    /// Il `blended_cost` di listino (mig 0471) li ordina 0.80 vs 0.75: oggi vince
+    /// `mistral-large-latest`. Sul costo ATTESO di una chiamata agentica reale
+    /// (150k di prompt, 2k di output, rapporto coerente col 188:1-495:1 misurato
+    /// sui run lunghi) l'ordine si ribalta, e di 2,5 volte.
+    ///
+    /// MUTAZIONE: rimettere il solo listino — cioe' passare `CacheHitRate::Unknown`
+    /// al posto dell'hit osservato — fa fallire l'ultima asserzione. E' il test
+    /// che cattura la regressione, non il calcolo in se'.
+    #[test]
+    fn a_parita_di_tier_vince_la_cache_efficace_non_il_listino_piu_basso() {
+        let devstral = prezzo(0.40, 2.00, Some(0.040), None);
+        let large = prezzo(0.50, 1.50, Some(0.050), None);
+        // Forma di una chiamata agentica a contesto grande: il regime in cui
+        // l'escalation tipicamente scatta.
+        let shape = CallShape {
+            prompt_tokens: 150_000,
+            completion_tokens: 2_000,
+        };
+
+        // Il listino, da solo, preferisce `large` (blended 0.75 < 0.80).
+        let blended = |p: &PriceSnapshot| {
+            p.input_cost_per_million_tokens * 0.75 + p.output_cost_per_million_tokens * 0.25
+        };
+        assert!(
+            blended(&large) < blended(&devstral),
+            "premessa del caso: di listino `large` sembra il piu' economico"
+        );
+
+        // Col costo atteso, `devstral` (hit 60%) batte `large` (cache fredda).
+        let atteso_devstral =
+            expected_call_cost(&devstral, &shape, CacheHitRate::observed(0.60)).total_cost;
+        let atteso_large =
+            expected_call_cost(&large, &shape, CacheHitRate::observed(0.0)).total_cost;
+        assert!(
+            atteso_devstral < atteso_large,
+            "l'inversione non avviene: devstral {atteso_devstral} vs large {atteso_large}"
+        );
+
+        // ...e non di un soffio: il caso non e' fragile a un arrotondamento.
+        assert!(
+            atteso_large / atteso_devstral > 2.0,
+            "inversione marginale ({atteso_large} / {atteso_devstral}): il caso non \
+             proverebbe granche'"
+        );
+    }
+
+    /// Il contesto PICCOLO e' il controllo dell'inversione: li' la cache conta
+    /// poco e l'ordine di listino resta quello giusto. Il criterio dipende dalla
+    /// forma della chiamata SENZA che nessuno scriva un `if contesto_grande`: e'
+    /// la stessa formula, con altri numeri in ingresso.
+    #[test]
+    fn a_contesto_piccolo_il_listino_torna_a_decidere() {
+        let devstral = prezzo(0.40, 2.00, Some(0.040), None);
+        let large = prezzo(0.50, 1.50, Some(0.050), None);
+        // Prompt corto, output lungo: il regime opposto, dove domina l'output e
+        // `devstral` (out 2.00) e' davvero il piu' caro.
+        let shape = CallShape {
+            prompt_tokens: 1_000,
+            completion_tokens: 4_000,
+        };
+        let atteso_devstral =
+            expected_call_cost(&devstral, &shape, CacheHitRate::observed(0.60)).total_cost;
+        let atteso_large =
+            expected_call_cost(&large, &shape, CacheHitRate::observed(0.0)).total_cost;
+        assert!(
+            atteso_devstral > atteso_large,
+            "a contesto piccolo la cache non deve ribaltare nulla: \
+             devstral {atteso_devstral} vs large {atteso_large}"
+        );
+    }
+
+    /// Finestra vuota (modello nuovo, nessuna riga nel ledger): nessuna ipotesi,
+    /// costo di LISTINO. `Unknown` deve dare esattamente il costo che il sistema
+    /// calcolava prima di questo lavoro — non uno sconto prudenziale inventato.
+    #[test]
+    fn finestra_vuota_resta_sul_listino() {
+        let p = prezzo(0.40, 2.00, Some(0.040), None);
+        let shape = CallShape {
+            prompt_tokens: 150_000,
+            completion_tokens: 2_000,
+        };
+        let ignoto = expected_call_cost(&p, &shape, CacheHitRate::Unknown);
+        let a_listino = calculate_cost_breakdown(
+            &p,
+            &TokenUsage::senza_cache(shape.prompt_tokens, shape.completion_tokens),
+        );
+        assert_eq!(ignoto.total_cost, a_listino.total_cost);
+        // E il fatto resta LEGGIBILE: nessun token e' stato trattato come cache.
+        assert_eq!(ignoto.cache_price_state(), "no_cache_tokens");
+    }
+
+    /// Hit-rate alto su un modello SENZA tariffa di cache a listino: nessuno
+    /// sconto fantasma. E' il caso reale di openrouter — 43,1% di hit misurato su
+    /// `z-ai/glm-4.7-flash`, zero tariffe di cache su tutti e 17 i suoi modelli
+    /// abilitati — e sarebbe il modo piu' facile di sbagliare questo lavoro:
+    /// scontare un costo che il provider non sconta.
+    #[test]
+    fn hit_alto_senza_tariffa_non_produce_sconto() {
+        let glm = prezzo(0.070, 0.400, None, None);
+        let shape = CallShape {
+            prompt_tokens: 150_000,
+            completion_tokens: 2_000,
+        };
+        let con_hit = expected_call_cost(&glm, &shape, CacheHitRate::observed(0.431));
+        let a_listino = calculate_cost_breakdown(
+            &glm,
+            &TokenUsage::senza_cache(shape.prompt_tokens, shape.completion_tokens),
+        );
+        assert_eq!(
+            con_hit.total_cost, a_listino.total_cost,
+            "senza tariffa di cache il costo atteso deve restare quello pieno"
+        );
+        // E lo DICHIARA: i token attesi da cache sono stati tariffati a prezzo
+        // pieno, non silenziosamente scontati.
+        assert_eq!(con_hit.cache_price_state(), "cache_price_missing");
+        assert!(con_hit.cache_tokens_billed_as_input > 0);
+    }
+
+    /// Il costruttore e' l'unico modo di ottenere un `Observed`, e non lascia
+    /// passare un valore che non sia una frazione: un NaN da `0/0` o un rapporto
+    /// fuori scala produrrebbe un costo atteso assurdo usato come se fosse buono.
+    #[test]
+    fn l_hit_rate_non_puo_essere_fuori_scala() {
+        assert_eq!(CacheHitRate::observed(1.7), CacheHitRate::Observed(1.0));
+        assert_eq!(CacheHitRate::observed(-0.2), CacheHitRate::Observed(0.0));
+        assert_eq!(CacheHitRate::observed(f64::NAN), CacheHitRate::Unknown);
+        // Gli stati restano distinguibili nella telemetria.
+        assert_eq!(CacheHitRate::observed(0.5).state_label(), "observed");
+        assert_eq!(CacheHitRate::Unknown.state_label(), "unknown");
+    }
+
+    /// Hit al 100%: tutto il prompt da cache, nessun token a tariffa piena.
+    /// Confine opposto a `finestra_vuota_resta_sul_listino`.
+    #[test]
+    fn hit_totale_non_lascia_prompt_a_tariffa_piena() {
+        let p = prezzo(0.40, 2.00, Some(0.040), None);
+        let b = expected_call_cost(
+            &p,
+            &CallShape {
+                prompt_tokens: 100_000,
+                completion_tokens: 0,
+            },
+            CacheHitRate::observed(1.0),
+        );
+        assert_eq!(b.input_cost, 0.0, "nessun token deve restare a tariffa piena");
+        assert!((b.cache_read_cost - 0.004).abs() < 1e-9, "{}", b.cache_read_cost);
     }
 
     /// `total_tokens` e' prompt LORDO + completion. I token di cache sono gia'

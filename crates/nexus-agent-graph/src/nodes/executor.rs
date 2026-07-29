@@ -192,7 +192,7 @@ use crate::runtime::ports::{
     AgentStepStore, BillingCooldownPort, ContextOffload, EmbeddingStore, EscalationPort,
     LlmMessage, LlmRequest, LlmResponse, MetaStepStore, ModelUpscalePort, NextActionsDeriver,
     OffloadKind, PortError, RunControlStore, ScaleMove, ScaleTier, SizingOverrides, SseEvent,
-    StallBudgetPort, SummaryStore, TokenCounter,
+    StallBudgetPort, SummaryStore, TokenCounter, TurnShape,
 };
 use crate::runtime::AgentNodeCtx;
 use crate::state::{
@@ -4356,6 +4356,7 @@ oppure riprova piu' tardi."
                     state.user_intent.as_deref(),
                     provider.as_deref(),
                     model.as_deref(),
+                    state.turn_shape(),
                 )
                 .await
                 .unwrap_or_default();
@@ -5379,6 +5380,9 @@ Riformula la richiesta in modo piu' specifico oppure indica un punto di partenza
                 richiesta.intent.as_deref(),
                 Some(&esito.provider),
                 Some(&esito.model),
+                // Il turno appena concluso: la misura piu' diretta della forma
+                // con cui si ripresenterebbe la prossima chiamata.
+                TurnShape::from(&esito.resp.usage),
             )
             .await
             .unwrap_or_default();
@@ -7188,6 +7192,7 @@ una tool call, non descrivere.",
                 state.user_intent.as_deref(),
                 cur_provider.as_deref(),
                 cur_model.as_deref(),
+                state.turn_shape(),
             )
             .await
             .unwrap_or_default();
@@ -7420,6 +7425,7 @@ azioni concrete e mirate verso il completamento.",
                             state.user_intent.as_deref(),
                             cur_provider.as_deref(),
                             cur_model.as_deref(),
+                            state.turn_shape(),
                         )
                         .await
                         .unwrap_or_default();

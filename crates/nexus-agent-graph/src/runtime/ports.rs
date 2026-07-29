@@ -1006,6 +1006,51 @@ pub trait EmbeddingStore: Send + Sync {
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, PortError>;
 }
 
+/// Forma del turno OSSERVATA: quanti token di prompt e di completamento ha
+/// mosso l'ultima chiamata del run.
+///
+/// Serve all'impl per stimare quanto costerebbe la PROSSIMA chiamata su ciascun
+/// candidato. Senza, il costo di un modello puo' essere solo quello di listino —
+/// e il listino e' cieco alla prompt-cache, che in un loop agentico e' il fattore
+/// dominante: il prefisso (system prompt, tool schemas, primi messaggi) e'
+/// identico a ogni iterazione, quindi una quota grande e sistematica del prompt
+/// costa una frazione. Misurato il 29/07/2026: deepseek 67,0% di hit contro
+/// mistral 5,2%, e sullo stesso task mistral e' costato 18 volte tanto.
+///
+/// E' la forma OSSERVATA e non una stima: `AgentState` la porta gia' dal turno
+/// appena concluso (regola M, dai segnali strutturati). Un tipo e non due `i64`
+/// sciolti perche' i due numeri si scambiano senza che il compilatore se ne
+/// accorga, e scambiati invertono il confronto.
+///
+/// `Default` = zeri, che l'impl tratta come "forma ignota" e che riporta
+/// all'ordine di listino: chi non sa dichiararla non riceve una scelta peggiore
+/// di quella di prima.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnShape {
+    /// Prompt LORDO dell'ultimo turno: comprende i token serviti da cache.
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+}
+
+impl TurnShape {
+    /// `true` se la forma non dice nulla di utile (nessun prompt osservato).
+    pub fn e_ignota(&self) -> bool {
+        self.prompt_tokens <= 0
+    }
+}
+
+/// Dalla misura del turno appena concluso. E' la fonte piu' diretta — l'usage
+/// che il gateway ha riportato per QUELLA chiamata — e la si preferisce allo
+/// stato quando si e' dentro il turno che ha appena fallito.
+impl From<&LlmUsage> for TurnShape {
+    fn from(u: &LlmUsage) -> Self {
+        Self {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+        }
+    }
+}
+
 /// Dati di INPUT dell'auto-escalation gia' risolti dall'impl (catena DB + gate
 /// cooldown + router cross-provider): tutto cio' che serve a
 /// [`crate::decisions::escalation::pick_escalation_model`] per DECIDERE in modo
@@ -1183,11 +1228,18 @@ pub trait EscalationPort: Send + Sync {
     /// `provider_in_cooldown=false`, `cross_provider=None`), che fa risolvere la
     /// selezione a `None` (chiusura secca come oggi), MAI un `PortError`. Il
     /// `PortError` resta per un contratto rotto (mai nel flusso normale).
+    ///
+    /// `turn_shape` = forma OSSERVATA dell'ultimo turno, con cui l'impl stima il
+    /// costo della prossima chiamata su ciascun candidato (la prompt-cache rende
+    /// il listino un cattivo criterio proprio a contesto grande, che e' il regime
+    /// in cui l'escalation scatta). [`TurnShape::default`] = ignota -> ordine di
+    /// listino, cioe' il comportamento precedente.
     async fn escalation_inputs(
         &self,
         intent: Option<&str>,
         provider: Option<&str>,
         model: Option<&str>,
+        turn_shape: TurnShape,
     ) -> Result<EscalationInputs, PortError>;
 
     /// FAILOVER cross-provider su provider CADUTO (gateway 500 `PROVIDER_ERROR` /
