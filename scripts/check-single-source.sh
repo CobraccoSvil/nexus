@@ -1244,6 +1244,109 @@ else
   echo "OK contatore-memorie-per-punto: il recupero si contabilizza per qdrant_point_id"
 fi
 
+# ── appartenenza-processo + iniezione-porta-libera (2026-07-29) ────────────
+# «Di CHI e' questo processo?» ha UN solo punto in cui si risponde. Il criterio
+# precedente rispondeva a «e' del progetto?» (bucket + is_tracked_pid), che e'
+# una domanda piu' LARGA: allocando per `frontend` l'adozione prendeva il primo
+# server del bucket — il BACKEND — e ne legava la porta al frontend.
+assert_single "appartenenza-processo" 'fn classify_ownership' \
+  'crates/mcp-core/src/project_workspace/service_ownership.rs' crates
+
+# Il consumatore, non solo la definizione: i TRE rami di find_or_allocate che
+# possono legare una porta gia' in uso a un servizio devono passare dal verdetto.
+# Un grep sul file resterebbe verde se la funzione esistesse ma nessuno la
+# chiamasse (regola O: il codice morto ha test verdi). Il conteggio e' stampato:
+# zero consumatori trovati e' un FALLIMENTO, non un silenzio.
+# Conta le CHIAMATE, non le menzioni: senza la parentesi e senza escludere i
+# commenti, il guard resterebbe verde con la chiamata rimossa e il commento che
+# la descrive ancora al suo posto (misurato: contava 3 rami su 2 reali).
+rami_verdetto="$(awk '
+  /^pub async fn find_or_allocate/ { dentro = 1 }
+  dentro && !/^[[:space:]]*\/\// && /resolve_stale_adoption\(|owned_listener\(/ { n++ }
+  dentro && /^}/ { exit }
+  END { print n + 0 }
+' crates/mcp-core/src/project_workspace/allocate_port.rs 2>/dev/null)"
+# Atteso: l'adozione dell'allocazione stantia + il riuso quando non esiste riga
+# per la label. Il terzo ramo (occupante della porta gia' allocata) passa da
+# active_port_action, verificato dai suoi test.
+if [[ "$rami_verdetto" -lt 2 ]]; then
+  echo "!! appartenenza-processo: find_or_allocate consulta il verdetto in $rami_verdetto rami su 2." >&2
+  echo "   Ogni ramo che lega una porta gia' in uso deve passare da service_ownership:" >&2
+  echo "   'primo processo del bucket che somigli a un server' e 'stessa classe di" >&2
+  echo "   label' sono le domande larghe che legano a un servizio la porta di un altro." >&2
+  fail=1
+else
+  echo "OK appartenenza-processo: $rami_verdetto rami di find_or_allocate passano dal verdetto"
+fi
+
+# Il ramo "nessuna riga per questa label" non deve tornare a scegliere il
+# candidato col matching per CLASSE: quello accetta una qualsiasi risorsa
+# "di frontend", e per un processo non registrato la label la inventa
+# derive_orphan_label dal nome del programma (regola M).
+if awk '
+  /^pub async fn find_or_allocate/ { dentro = 1 }
+  dentro && /resource_resolver::resolve_for_label\(/ { trovato = 1 }
+  dentro && /^}/ { exit }
+  END { exit !trovato }
+' crates/mcp-core/src/project_workspace/allocate_port.rs 2>/dev/null; then
+  echo "!! appartenenza-processo: find_or_allocate sceglie di nuovo con resolve_for_label." >&2
+  echo "   Quel matching e' per CLASSE di servizio (frontend include web/ui/client/" >&2
+  echo "   vue/next/react) e su un processo non registrato lavora su una label" >&2
+  echo "   DEDOTTA DAL NOME DEL PROGRAMMA. Usare owned_listener." >&2
+  fail=1
+else
+  echo "OK appartenenza-processo: il riuso non passa piu' dal matching per classe"
+fi
+
+# La FONTE delle risorse non deve tornare a indovinare uno scopo dal nome del
+# programma. Un processo senza riga di allocazione compare come `service-<porta>`;
+# se ricevesse "frontend" perche' il suo comando contiene "vite", quella label
+# entrerebbe nella lista mescolata alle label vere lette dal DB, e nessuno dei
+# consumatori potrebbe distinguerle: da li' si eredita una porta, si nega a un
+# agente il proprio avvio, e si UCCIDE l'albero di un processo
+# (`free_listening_scope_port` -> `try_free_port`).
+if awk '
+  /fn orphan_placeholder_label/ { dentro = 1 }
+  dentro && /vite|next|nuxt|astro|react|svelte|frontend|backend/ { trovato = 1 }
+  dentro && /^}/ { exit }
+  END { exit !trovato }
+' crates/mcp-core/src/project_workspace/resource_resolver.rs 2>/dev/null; then
+  echo "!! identita-non-indovinata: la fonte delle risorse deduce di nuovo uno scopo dal programma." >&2
+  echo "   orphan_placeholder_label deve dare un identificatore POSIZIONALE" >&2
+  echo "   (service-<porta>): il nome di un programma non e' un'identita' (regola M)," >&2
+  echo "   e una label inventata e' indistinguibile da una letta dal DB." >&2
+  fail=1
+else
+  echo "OK identita-non-indovinata: un processo non registrato non riceve uno scopo"
+fi
+
+# I percorsi di AVVIO di un servizio delegano l'alloca+inietta al punto unico:
+# ognuno ricopiava la sequenza, e due su tre in caso di errore proseguivano
+# "senza PORT iniettato" — cioe' lasciando scegliere la porta al framework,
+# fuori dal bucket del progetto.
+avvii=0
+avvii_bad=0
+for f in crates/mcp-core/src/project_workspace/services.rs \
+         crates/mcp-core/src/project_workspace/service_manager.rs \
+         crates/mcp-core/src/agent_tools/service.rs; do
+  [[ -f "$f" ]] || continue
+  avvii=$((avvii + 1))
+  if grep -q 'find_or_allocate_port' "$f"; then
+    echo "!! iniezione-porta-libera: $f alloca la porta di avvio da se'." >&2
+    echo "   Delegare ad allocate_port::web_service_port_env: iniettare PORT e' una" >&2
+    echo "   promessa, e va mantenuta solo su una porta davvero bindabile." >&2
+    avvii_bad=$((avvii_bad + 1))
+    fail=1
+  fi
+done
+if [[ "$avvii" -eq 0 ]]; then
+  echo "!! iniezione-porta-libera: nessun percorso di avvio esaminato." >&2
+  echo "   Il check non ha raggiunto il suo oggetto: verificare i percorsi." >&2
+  fail=1
+elif [[ "$avvii_bad" -eq 0 ]]; then
+  echo "OK iniezione-porta-libera: $avvii percorsi di avvio delegano al punto unico"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

@@ -792,58 +792,29 @@ async fn stop_windows_service_label(proj_pool: &sqlx::PgPool, project_id: Uuid, 
 }
 
 /// Alloca (o riusa) la porta stabile del bucket per un web service Windows e la
-/// ritorna come env `PORT`/`HOST` da iniettare nello spawn. Collega l'allocazione
-/// al service_unit (preservazione dal GC, fix f0057b0). Ritorna None per i worker
-/// non-web o se l'allocazione fallisce (avvio senza PORT iniettato). Estratto da
-/// `control_project_service_windows` per tenerla sotto soglia (comportamento invariato).
+/// ritorna come env `PORT`/`HOST` da iniettare nello spawn. Delega al PUNTO UNICO
+/// `allocate_port::web_service_port_env` (alloca + lega all'unit + pretende una
+/// porta bindabile): qui resta solo il gate sull'euristica web-service.
+///
+/// `Ok(None)` per i worker non-web (nessun PORT iniettato, comportamento
+/// invariato). `Err` quando la porta non e' utilizzabile: prima si proseguiva
+/// "senza PORT iniettato", e senza PORT il framework sceglie una porta propria
+/// fuori dal bucket — l'esito che questo percorso deve impedire.
 #[cfg(windows)]
 async fn allocate_web_service_port_env(
     state: &AppState,
     project_id: Uuid,
-    slug: &str,
     short: &str,
     command: &str,
-) -> Option<std::collections::HashMap<String, String>> {
+) -> Result<Option<std::collections::HashMap<String, String>>, String> {
     // Gate sull'euristica web-service (stessa di run_service, regola L): un
     // worker non-web resta invariato, senza PORT iniettato.
     if !crate::agent_tools::service::looks_like_web_service(command) {
-        return None;
+        return Ok(None);
     }
-    // Instrada il servizio managed sul percorso ALLOCA+INIETTA (regola L, riuso
-    // di find_or_allocate) invece del detect-path: Nexus assegna la porta stabile
-    // del bucket PRIMA dello spawn e la inietta come env PORT/HOST, cosi' il
-    // servizio non sceglie piu' una porta propria che poi verrebbe soltanto
-    // "rilevata" (allocation_mode='auto' con service_unit NULL -> rilasciata dal
-    // GC -> drift 31792->31798, incidente Beaty-Book).
-    match super::find_or_allocate_port(&state.db, &state.port_registry, project_id, short).await {
-        Ok(alloc) => {
-            // Unit dal punto unico (regola L): ricopiare qui il `format!` faceva
-            // vivere la formula in due posti, e il commento di `service_unit_name`
-            // chiede proprio che questo valore combaci con quello del pannello.
-            let unit_name = service_unit_name(slug, short);
-            super::allocate_port::link_allocation_to_service_unit(
-                &state.db, project_id, short, &unit_name,
-            )
-            .await;
-            tracing::info!(
-                port = alloc.port,
-                label = %short,
-                mode = alloc.mode,
-                "control_service_windows: PORT alloc+iniettato e service_unit collegato"
-            );
-            let mut env = std::collections::HashMap::new();
-            env.insert("PORT".to_string(), alloc.port.to_string());
-            env.insert("HOST".to_string(), "0.0.0.0".to_string());
-            Some(env)
-        }
-        Err(e) => {
-            tracing::warn!(
-                label = %short,
-                "control_service_windows: find_or_allocate fallita ({e}); avvio senza PORT iniettato"
-            );
-            None
-        }
-    }
+    super::allocate_port::web_service_port_env(&state.db, &state.port_registry, project_id, short)
+        .await
+        .map(Some)
 }
 
 /// Windows: start/stop/restart di un servizio di progetto (processo in agent_processes).
@@ -901,7 +872,7 @@ async fn control_project_service_windows(
 
     // START (anche seconda parte di RESTART): ri-spawn dalla definizione piu' recente.
     if action == "start" || action == "restart" {
-        start_windows_service(&state, &context, &proj_pool, project_id, &slug, &short).await?;
+        start_windows_service(&state, &context, &proj_pool, project_id, &short).await?;
     }
 
     Ok(Json(json!({
@@ -922,7 +893,6 @@ async fn start_windows_service(
     context: &crate::projects::ProjectContext,
     proj_pool: &sqlx::PgPool,
     project_id: Uuid,
-    slug: &str,
     short: &str,
 ) -> Result<(), ApiError> {
     // PUNTO UNICO anti-duplicato (regola L): ferma la label esatta E le
@@ -952,7 +922,9 @@ async fn start_windows_service(
         .filter(|w| !w.trim().is_empty())
         .unwrap_or_else(|| context.root_path.to_string_lossy().to_string());
 
-    let port_env = allocate_web_service_port_env(state, project_id, slug, short, &command).await;
+    let port_env = allocate_web_service_port_env(state, project_id, short, &command)
+        .await
+        .map_err(|e| api_error(StatusCode::CONFLICT, &e))?;
 
     crate::agent_processes::spawn_agent_process(
         &state.db,
