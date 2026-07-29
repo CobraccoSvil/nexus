@@ -23,8 +23,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::provider::ChunkStream;
 use crate::types::{
     GeneratedImage, ImageGenResponse, LlmRequest, LlmResponse, LlmStreamChunk, LlmToolCall,
-    LlmUsage, PromptCacheReporting, ToolCallDelta, ToolCallDeltaFunction, ToolFunctionCall,
-    TranscribeResponse,
+    LlmUsage, PromptCacheKeying, PromptCacheReporting, ToolCallDelta, ToolCallDeltaFunction,
+    ToolFunctionCall, TranscribeResponse,
 };
 
 /// Dialetto di reasoning di un endpoint OpenAI-compatibile. Centralizza (regola
@@ -81,6 +81,7 @@ pub struct OpenAiCompatClient {
     base_url: String,
     api_key: String,
     provider_name: String,
+    cache_keying: PromptCacheKeying,
 }
 
 impl OpenAiCompatClient {
@@ -100,7 +101,26 @@ impl OpenAiCompatClient {
             base_url,
             api_key: api_key.into(),
             provider_name: provider_name.into(),
+            // Il default e' il provider che si arrangia: dichiarare una chiave a
+            // un endpoint che non la conosce e' il solo verso che puo' fare
+            // danno (campo sconosciuto -> HTTP 400), mentre ometterla costa al
+            // massimo un riuso mancato.
+            cache_keying: PromptCacheKeying::ProviderManaged,
         }
+    }
+
+    /// Dichiara che questo endpoint riusa il prefisso solo con
+    /// `prompt_cache_key` in richiesta (vedi [`PromptCacheKeying`]).
+    pub fn with_prompt_cache_keying(mut self, keying: PromptCacheKeying) -> Self {
+        self.cache_keying = keying;
+        self
+    }
+
+    /// Come questo client dichiara il riuso del prefisso. Esposto perche' il
+    /// provider che lo compone possa provare di averlo configurato: il difetto
+    /// da cui nasce era proprio una richiesta che partiva senza chiave.
+    pub fn cache_keying(&self) -> PromptCacheKeying {
+        self.cache_keying
     }
 
     fn endpoint(&self) -> String {
@@ -122,7 +142,7 @@ impl OpenAiCompatClient {
         req: &LlmRequest,
         reasoning: &ResolvedReasoning,
     ) -> anyhow::Result<LlmResponse> {
-        let mut body = build_request_body(req, false, reasoning);
+        let mut body = build_request_body(req, false, reasoning, self.cache_keying);
         if provider_requires_user_or_tool_last(&self.provider_name) {
             strip_trailing_assistant(&mut body.messages);
         }
@@ -177,7 +197,7 @@ impl OpenAiCompatClient {
         req: &LlmRequest,
         reasoning: &ResolvedReasoning,
     ) -> anyhow::Result<ChunkStream> {
-        let mut body = build_request_body(req, true, reasoning);
+        let mut body = build_request_body(req, true, reasoning, self.cache_keying);
         if provider_requires_user_or_tool_last(&self.provider_name) {
             strip_trailing_assistant(&mut body.messages);
         }
@@ -625,10 +645,69 @@ impl SseParser {
 ///     diventa `max_completion_tokens`, temperatura omessa (non accettata) e si
 ///     invia `reasoning_effort` se presente;
 ///   - [`ReasoningDialect::DeepSeek`]: `extra_body.thinking.type` enabled/disabled.
+/// Identificatore stabile del gruppo di chiamate che condividono il prefisso,
+/// per i soli endpoint [`PromptCacheKeying::RequiresKey`].
+///
+/// ## Cosa entra, e perche' quello
+///
+/// Solo la parte di prompt che NON cresce da un turno all'altro: system prompt e
+/// nomi dei tool. La conversazione e' esclusa per costruzione — e' cio' che
+/// cambia a ogni chiamata, e una chiave che cambia a ogni chiamata non raggruppa
+/// niente: varrebbe quanto non mandarla, che e' il difetto che questa funzione
+/// chiude. Sul run misurato il prompt cresceva 14.198 -> 17.586 token con la
+/// testa ferma: e' esattamente la forma su cui il riuso del prefisso rende.
+///
+/// `tenant_id` e `user_id` entrano perche' sono stabili quanto il system prompt
+/// e tengono separati gli spazi di chi chiama, senza costare un riuso: dentro un
+/// run non cambiano mai.
+///
+/// ## Perche' derivarla qui e non farsela passare
+///
+/// L'alternativa era propagare un id di sessione dai chiamanti. Sarebbe stata la
+/// stessa informazione presa per la strada lunga: ogni percorso che apre una
+/// conversazione (chat, run agentico, sub-agente, worker) avrebbe dovuto
+/// ricordarsi di popolarla, e quello che se ne fosse dimenticato avrebbe smesso
+/// di cacheare in silenzio — un difetto invisibile, uguale a quello di partenza.
+/// Derivandola dal prefisso la chiave e' corretta per costruzione: identifica
+/// cio' che deve identificare perche' E' quello.
+///
+/// L'hash e' opaco anche per contratto del provider, che vieta di mettere dati
+/// sensibili nella chiave.
+fn prompt_cache_key(req: &LlmRequest) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(req.metadata.tenant_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(req.metadata.user_id.as_bytes());
+    hasher.update([0]);
+    for msg in req.messages.iter().filter(|m| m.role == "system") {
+        // Impronta del contenuto serializzato invece del solo testo: copre allo
+        // stesso modo il system a blocchi e quello a stringa, e resta valida se
+        // la forma dei blocchi cambia. Un contenuto non serializzabile non
+        // esiste per questi tipi; se mai lo diventasse, saltarlo degrada il
+        // raggruppamento, non la correttezza (la chiave e' un hint).
+        if let Ok(bytes) = serde_json::to_vec(&msg.content) {
+            hasher.update(&bytes);
+        }
+        hasher.update([0]);
+    }
+    if let Some(tools) = req.tools.as_ref() {
+        for t in tools {
+            hasher.update(t.function.name.as_bytes());
+            hasher.update([0]);
+        }
+    }
+    // 128 bit in esadecimale: la chiave e' un'etichetta di raggruppamento, non
+    // un segreto, e il provider la vuole corta.
+    format!("{:x}", hasher.finalize())[..32].to_string()
+}
+
 fn build_request_body(
     req: &LlmRequest,
     stream: bool,
     reasoning: &ResolvedReasoning,
+    cache_keying: PromptCacheKeying,
 ) -> ChatCompletionRequest {
     let mut messages: Vec<WireMessage> = req.messages.iter().map(to_wire_message).collect();
 
@@ -706,6 +785,12 @@ fn build_request_body(
     ChatCompletionRequest {
         model: req.model.clone(),
         messages,
+        // Solo verso gli endpoint che la richiedono: altrove sarebbe un campo
+        // sconosciuto in un dialetto che non lo documenta.
+        prompt_cache_key: match cache_keying {
+            PromptCacheKeying::ProviderManaged => None,
+            PromptCacheKeying::RequiresKey => Some(prompt_cache_key(req)),
+        },
         temperature,
         max_tokens,
         max_completion_tokens,
@@ -1336,6 +1421,13 @@ pub fn classify_provider_error(err: &anyhow::Error) -> ProviderErrorKind {
 struct ChatCompletionRequest {
     model: String,
     messages: Vec<WireMessage>,
+    /// Identificatore stabile del gruppo di chiamate che condividono il
+    /// prefisso. Senza, gli endpoint [`PromptCacheKeying::RequiresKey`] non
+    /// riusano nulla: misurato su Mistral, `cached_tokens` resta 0 anche
+    /// ripetendo lo stesso prefisso di 11.918 token a pochi secondi di
+    /// distanza. Omesso per gli altri dialetti.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1659,6 +1751,100 @@ mod tests {
         }
     }
 
+    fn msg(role: &str, testo: &str) -> LlmMessage {
+        LlmMessage {
+            role: role.to_string(),
+            content: MessageContent::Text(testo.to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+            thinking_signature: None,
+            reasoning: None,
+        }
+    }
+
+    /// IL test del difetto: la chiave deve restare FERMA mentre la conversazione
+    /// cresce, perche' quella e' l'unica forma in cui serve a qualcosa.
+    ///
+    /// Sul run misurato il prompt passava da 14.198 a 17.586 token con la testa
+    /// immutata. Una chiave che si muovesse con la coda darebbe a ogni chiamata
+    /// un gruppo tutto suo: varrebbe esattamente quanto non mandarla, che e' il
+    /// difetto da cui si e' partiti.
+    #[test]
+    fn la_chiave_resta_ferma_mentre_la_conversazione_cresce() {
+        let mut req = sample_request();
+        req.messages.insert(0, msg("system", "istruzioni di progetto"));
+        let prima = prompt_cache_key(&req);
+
+        // Turni successivi: la coda cresce, la testa no.
+        req.messages.push(msg("assistant", "ho letto il file"));
+        req.messages.push(msg("user", "ora modificalo"));
+        let dopo = prompt_cache_key(&req);
+
+        assert_eq!(
+            prima, dopo,
+            "la chiave deve dipendere dalla sola parte stabile del prompt: \
+             se si muove con la conversazione non raggruppa niente"
+        );
+    }
+
+    /// Il verso opposto: due prefissi diversi non devono finire nello stesso
+    /// gruppo. Serve a tenere onesto il test qui sopra, che da solo passerebbe
+    /// anche con una chiave costante.
+    #[test]
+    fn la_chiave_cambia_quando_cambia_la_parte_stabile() {
+        let mut a = sample_request();
+        a.messages.insert(0, msg("system", "istruzioni di progetto"));
+        let mut b = sample_request();
+        b.messages.insert(0, msg("system", "istruzioni DIVERSE"));
+        assert_ne!(prompt_cache_key(&a), prompt_cache_key(&b));
+
+        // Stesso prefisso, utenti diversi: gruppi separati.
+        let mut c = a.clone();
+        c.metadata.user_id = "altro-utente".to_string();
+        assert_ne!(
+            prompt_cache_key(&a),
+            prompt_cache_key(&c),
+            "utenti diversi non condividono il gruppo"
+        );
+    }
+
+    /// La conseguenza sul wire, non il flag: verso un dialetto che la richiede
+    /// la chiave deve comparire nel body serializzato.
+    #[test]
+    fn il_body_porta_la_chiave_solo_dove_serve() {
+        let mut req = sample_request();
+        req.messages.insert(0, msg("system", "istruzioni di progetto"));
+
+        let con = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            &ResolvedReasoning::none(),
+            PromptCacheKeying::RequiresKey,
+        ))
+        .expect("serializza");
+        let chiave = con
+            .get("prompt_cache_key")
+            .and_then(|v| v.as_str())
+            .expect("il dialetto che la richiede deve riceverla");
+        assert_eq!(chiave.len(), 32, "etichetta corta e opaca");
+        assert!(
+            !chiave.contains("istruzioni"),
+            "la chiave non deve trasportare il contenuto del prompt"
+        );
+
+        // Il default resta l'omissione: un campo sconosciuto verso un endpoint
+        // che non lo documenta e' il solo verso che puo' fare danno.
+        let senza = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            &ResolvedReasoning::none(),
+            PromptCacheKeying::ProviderManaged,
+        ))
+        .expect("serializza");
+        assert!(senza.get("prompt_cache_key").is_none());
+    }
+
     #[test]
     fn parse_models_estrae_id_ordina_e_deduplica() {
         // Forma canonica della risposta `GET /models` (OpenAI/Mistral/DeepSeek/vLLM).
@@ -1769,7 +1955,12 @@ mod tests {
     #[test]
     fn request_body_serializza_campi_base() {
         let req = sample_request();
-        let body = build_request_body(&req, false, &ResolvedReasoning::none());
+        let body = build_request_body(
+            &req,
+            false,
+            &ResolvedReasoning::none(),
+            PromptCacheKeying::ProviderManaged,
+        );
         let json = serde_json::to_value(&body).unwrap();
 
         assert_eq!(json["model"], "test-model");
@@ -1823,7 +2014,7 @@ mod tests {
             enabled: true,
             effort: None,
         };
-        let body = build_request_body(&req, false, &deepseek);
+        let body = build_request_body(&req, false, &deepseek, PromptCacheKeying::ProviderManaged);
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(
             json["messages"][0]["reasoning_content"], "ho ragionato cosi'",
@@ -1836,7 +2027,12 @@ mod tests {
         );
 
         // Dialetto non-DeepSeek (base): il campo non viaggia mai.
-        let body_base = build_request_body(&req, false, &ResolvedReasoning::none());
+        let body_base = build_request_body(
+            &req,
+            false,
+            &ResolvedReasoning::none(),
+            PromptCacheKeying::ProviderManaged,
+        );
         let json_base = serde_json::to_value(&body_base).unwrap();
         assert!(
             json_base["messages"][0].get("reasoning_content").is_none(),
@@ -1864,12 +2060,22 @@ mod tests {
         let mut req = sample_request();
         req.tools = Some(vec![edit_tool()]);
         req.tool_choice = Some(serde_json::json!("required"));
-        let json = serde_json::to_value(build_request_body(&req, false, &ResolvedReasoning::none()))
+        let json = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            &ResolvedReasoning::none(),
+            PromptCacheKeying::ProviderManaged,
+        ))
             .unwrap();
         assert_eq!(json["tool_choice"], "required");
         // Oggetto funzione: passthrough nella forma OpenAI canonica.
         req.tool_choice = Some(serde_json::json!({"type": "function", "function": {"name": "edit_file"}}));
-        let json = serde_json::to_value(build_request_body(&req, false, &ResolvedReasoning::none()))
+        let json = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            &ResolvedReasoning::none(),
+            PromptCacheKeying::ProviderManaged,
+        ))
             .unwrap();
         assert_eq!(json["tool_choice"]["type"], "function");
         assert_eq!(json["tool_choice"]["function"]["name"], "edit_file");
@@ -1881,13 +2087,23 @@ mod tests {
         let mut req = sample_request();
         req.tools = None;
         req.tool_choice = Some(serde_json::json!("required"));
-        let json = serde_json::to_value(build_request_body(&req, false, &ResolvedReasoning::none()))
+        let json = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            &ResolvedReasoning::none(),
+            PromptCacheKeying::ProviderManaged,
+        ))
             .unwrap();
         assert!(json.get("tool_choice").is_none());
         // Senza tool_choice (caso storico): campo assente.
         let mut req2 = sample_request();
         req2.tools = Some(vec![edit_tool()]);
-        let json2 = serde_json::to_value(build_request_body(&req2, false, &ResolvedReasoning::none()))
+        let json2 = serde_json::to_value(build_request_body(
+            &req2,
+            false,
+            &ResolvedReasoning::none(),
+            PromptCacheKeying::ProviderManaged,
+        ))
             .unwrap();
         assert!(json2.get("tool_choice").is_none());
     }
@@ -1895,7 +2111,12 @@ mod tests {
     #[test]
     fn request_body_streaming_aggiunge_include_usage() {
         let req = sample_request();
-        let body = build_request_body(&req, true, &ResolvedReasoning::none());
+        let body = build_request_body(
+            &req,
+            true,
+            &ResolvedReasoning::none(),
+            PromptCacheKeying::ProviderManaged,
+        );
         let json = serde_json::to_value(&body).unwrap();
 
         assert_eq!(json["stream"], true);
@@ -1913,7 +2134,7 @@ mod tests {
             effort: Some("high".to_string()),
         };
         let json =
-            serde_json::to_value(build_request_body(&req, false, &reasoning)).unwrap();
+            serde_json::to_value(build_request_body(&req, false, &reasoning, PromptCacheKeying::ProviderManaged)).unwrap();
 
         // max_tokens -> max_completion_tokens; temperatura omessa; effort inviato.
         assert!(json.get("max_tokens").is_none());
@@ -1931,7 +2152,7 @@ mod tests {
             effort: None,
         };
         let json =
-            serde_json::to_value(build_request_body(&req, false, &reasoning)).unwrap();
+            serde_json::to_value(build_request_body(&req, false, &reasoning, PromptCacheKeying::ProviderManaged)).unwrap();
         assert_eq!(json["max_completion_tokens"], 256);
         // Nessun effort configurato: il campo non c'e' (default del modello).
         assert!(json.get("reasoning_effort").is_none());
@@ -1946,7 +2167,7 @@ mod tests {
             effort: None,
         };
         let json =
-            serde_json::to_value(build_request_body(&req, false, &reasoning)).unwrap();
+            serde_json::to_value(build_request_body(&req, false, &reasoning, PromptCacheKeying::ProviderManaged)).unwrap();
 
         // extra_body appiattito nel body radice: thinking.type=enabled.
         assert_eq!(json["thinking"]["type"], "enabled");
@@ -1964,7 +2185,7 @@ mod tests {
             effort: None,
         };
         let json =
-            serde_json::to_value(build_request_body(&req, false, &reasoning)).unwrap();
+            serde_json::to_value(build_request_body(&req, false, &reasoning, PromptCacheKeying::ProviderManaged)).unwrap();
         assert_eq!(json["thinking"]["type"], "disabled");
     }
 
@@ -2326,7 +2547,12 @@ mod tests {
             text_block("descrivi"),
             image_block("data:image/png;base64,AAAA"),
         ]);
-        let json = serde_json::to_value(build_request_body(&req, false, &ResolvedReasoning::none()))
+        let json = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            &ResolvedReasoning::none(),
+            PromptCacheKeying::ProviderManaged,
+        ))
             .unwrap();
 
         let content = &json["messages"][0]["content"];
@@ -2344,7 +2570,12 @@ mod tests {
         let mut req = sample_request();
         req.messages[0].content =
             MessageContent::Blocks(vec![image_block("https://example.com/x.png")]);
-        let json = serde_json::to_value(build_request_body(&req, false, &ResolvedReasoning::none()))
+        let json = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            &ResolvedReasoning::none(),
+            PromptCacheKeying::ProviderManaged,
+        ))
             .unwrap();
         let arr = json["messages"][0]["content"].as_array().unwrap();
         assert_eq!(arr[0]["type"], "image_url");
@@ -2356,7 +2587,12 @@ mod tests {
         // Nessuna immagine -> parita' col TS (content serializzato a stringa).
         let mut req = sample_request();
         req.messages[0].content = MessageContent::Blocks(vec![text_block("solo testo")]);
-        let json = serde_json::to_value(build_request_body(&req, false, &ResolvedReasoning::none()))
+        let json = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            &ResolvedReasoning::none(),
+            PromptCacheKeying::ProviderManaged,
+        ))
             .unwrap();
         assert!(json["messages"][0]["content"].is_string());
     }

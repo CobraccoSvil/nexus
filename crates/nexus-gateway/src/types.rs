@@ -305,6 +305,37 @@ pub enum PromptCacheReporting {
     CachedReportedSeparately,
 }
 
+/// Cosa deve fare la RICHIESTA perche' il provider riusi il prefisso gia'
+/// calcolato. Duale di [`PromptCacheReporting`], che riguarda la risposta:
+/// quello dice come si LEGGE la cache ottenuta, questo cosa si deve CHIEDERE
+/// per ottenerla.
+///
+/// Come il duale, e' un fatto del dialetto e non una preferenza, quindi lo
+/// dichiara l'adapter che quel dialetto lo conosce: il punto unico che compone
+/// il body non contiene un `match provider` (regola L).
+///
+/// Misurato sul provider reale il 29/07/2026, stesso prefisso di 11.918 token
+/// ripetuto tre volte su `mistral-medium-latest`: senza `prompt_cache_key`
+/// `cached_tokens` resta 0 a ogni chiamata, con la chiave passa a 11.904 dalla
+/// seconda in poi. Sul ledger il difetto valeva 93 chiamate con 2,9 milioni di
+/// token di prompt e 80 token di cache totali.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptCacheKeying {
+    /// Il provider riconosce il prefisso da solo: la richiesta non dichiara
+    /// nulla. DeepSeek (misurato 66-68% di token serviti da cache senza alcun
+    /// campo in richiesta), Anthropic (che usa invece `cache_control` sui
+    /// blocchi, dialetto proprio e non OpenAI).
+    ProviderManaged,
+    /// Il provider riusa il prefisso solo se la richiesta porta un
+    /// identificatore stabile del gruppo di chiamate che lo condividono
+    /// (`prompt_cache_key`). Mistral, OpenAI.
+    ///
+    /// E' un hint di ROUTING, non una chiave di lookup: il provider confronta
+    /// comunque il contenuto reale del prefisso, quindi una chiave troppo larga
+    /// puo' solo far perdere un riuso, mai servire il prefisso di un altro.
+    RequiresKey,
+}
+
 /// Conteggio token consumati.
 ///
 /// ## Convenzione: `input_tokens` e' il LORDO (punto unico, regola L)

@@ -34,6 +34,9 @@ dashmap.workspace = true
 futures.workspace = true
 tokio-stream.workspace = true
 uuid.workspace = true
+# Impronta stabile del prefisso di prompt, da cui nasce il `prompt_cache_key`
+# degli endpoint che senza quella chiave non riusano nulla (openai_compat).
+sha2.workspace = true
 jsonwebtoken.workspace = true
 regex.workspace = true
 dotenvy.workspace = true
