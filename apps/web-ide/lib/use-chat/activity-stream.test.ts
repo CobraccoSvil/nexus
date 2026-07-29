@@ -16,6 +16,7 @@ import {
   figureVerdictDisplay,
   foldConsecutiveOkTools,
   aggregateTokensByProvider,
+  etichetteVociCosto,
   providerCostBreakdown,
   tracesForRun,
   capStreamToRecent,
@@ -731,6 +732,48 @@ test("aggregateTokensByProvider somma i token per coppia provider/model", () => 
   assert.equal(google?.outputTokens, 50);
   const anthropic = buckets.find((b) => b.provider === "anthropic");
   assert.equal(anthropic?.inputTokens, 200);
+});
+
+test("due modelli dello stesso provider non danno due etichette identiche", () => {
+  beforeEach();
+  // Il difetto, osservato il 29/07/2026: la barra costi mostrava "openrouter"
+  // due volte con importi diversi ($2,9436 e $0,0011) e si leggeva come un
+  // doppio conteggio. Il conto era giusto -- erano `x-ai/grok-4.5` e
+  // `z-ai/glm-4.7-flash` -- ma l'etichetta mostrava meta' della chiave con cui
+  // le voci sono aggregate, quindi cio' che le distingue restava invisibile.
+  //
+  // Le voci arrivano dal produttore vero (`aggregateTokensByProvider`, la stessa
+  // funzione da cui passa `providerCostBreakdown`): costruire i bucket a mano
+  // fisserebbe qui l'assunto che il test deve verificare.
+  const runId = "run-1";
+  const voci = aggregateTokensByProvider([
+    trace(runId, 1, "openrouter", "x-ai/grok-4.5", { inputTokens: 900, outputTokens: 300 }),
+    trace(runId, 2, "openrouter", "z-ai/glm-4.7-flash", { inputTokens: 40, outputTokens: 10 }),
+    trace(runId, 3, "google", "gemini-3.1-flash-lite", { inputTokens: 60, outputTokens: 20 }),
+  ]);
+  const etichette = etichetteVociCosto(voci);
+  assert.equal(new Set(etichette).size, etichette.length, "due voci non possono avere la stessa etichetta");
+  // Il modello compare col solo nome: il prefisso dice chi lo ha fatto, che nel
+  // provider e' gia' implicito.
+  assert.ok(etichette.includes("openrouter grok-4.5"));
+  assert.ok(etichette.includes("openrouter glm-4.7-flash"));
+  // Il provider che compare una volta sola resta corto: la barra ha poco spazio
+  // e li' il modello non distingue nulla.
+  assert.ok(etichette.includes("google"));
+});
+
+test("senza modello l'etichetta non si allunga", () => {
+  beforeEach();
+  // Un modello assente non ha nulla da distinguere: allungare l'etichetta con
+  // un vuoto darebbe due righe ancora identiche, piu' una spaziatura sospetta.
+  const runId = "run-1";
+  const voci = aggregateTokensByProvider([
+    trace(runId, 1, "openrouter", undefined, { inputTokens: 10, outputTokens: 5 }),
+    trace(runId, 2, "openrouter", "x-ai/grok-4.5", { inputTokens: 20, outputTokens: 5 }),
+  ]);
+  const etichette = etichetteVociCosto(voci);
+  assert.ok(etichette.includes("openrouter"));
+  assert.ok(etichette.includes("openrouter grok-4.5"));
 });
 
 test("i token di cache entrano nel bucket e nel costo della ripartizione", () => {

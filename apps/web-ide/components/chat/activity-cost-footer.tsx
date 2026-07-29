@@ -24,7 +24,7 @@
 
 import { useThemeColors } from "../../lib/theme";
 import { providerBaseColor, usePricingCatalog } from "./provider-badge";
-import { providerCostBreakdown } from "../../lib/use-chat/activity-stream";
+import { etichetteVociCosto, providerCostBreakdown } from "../../lib/use-chat/activity-stream";
 import type { AITraceEvent } from "../../lib/api/agent";
 import { bucketCost } from "../../lib/model-catalog";
 
@@ -46,6 +46,9 @@ export function ActivityCostFooter({
   );
   if (voci.length === 0) return null;
 
+  // Il provider da solo non distingue due voci dello stesso provider su modelli
+  // diversi: il criterio sta col punto unico, qui resta la resa.
+  const etichette = etichetteVociCosto(voci);
   const totalForBar = Math.max(totalTokens, 1);
 
   return (
@@ -93,6 +96,7 @@ export function ActivityCostFooter({
       </span>
       {voci.map((b, i) => {
         const color = providerBaseColor(b.provider);
+        const etichetta = etichette[i] ?? b.provider;
         return (
           <span
             key={`cost-${i}`}
@@ -108,7 +112,7 @@ export function ActivityCostFooter({
               className="nx-as-cost-provider-name"
               style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
             >
-              {b.provider}
+              {etichetta}
             </span>
             <b style={{ color }}>${b.costUsd.toFixed(4)}</b>
           </span>

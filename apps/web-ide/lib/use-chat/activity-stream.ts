@@ -1479,3 +1479,32 @@ export function aggregateTokensByProvider(traces: AITraceEvent[]): ProviderToken
   }
   return Array.from(map.values());
 }
+
+/** Ultimo segmento di un id modello (`x-ai/grok-4.5` -> `grok-4.5`): il prefisso
+ *  nomina l'autore del modello, che nella voce e' gia' implicito nel provider. */
+function nomeBreveModello(model: string): string {
+  const i = model.lastIndexOf("/");
+  return i >= 0 ? model.slice(i + 1) : model;
+}
+
+/** Etichette delle voci di costo, una per voce e nello stesso ordine.
+ *
+ *  Le voci sono aggregate per (provider, modello) perche' le tariffe cambiano
+ *  col modello, ma l'etichetta mostrava il solo provider: quando lo stesso
+ *  provider ha servito piu' modelli -- un failover, o un sub-run instradato su
+ *  un modello leggero -- ne uscivano due righe identiche con importi diversi,
+ *  che si leggono come un doppio conteggio (osservato il 29/07/2026: openrouter
+ *  due volte, `x-ai/grok-4.5` e `z-ai/glm-4.7-flash`).
+ *
+ *  Il criterio e' che l'etichetta DISTINGUA la voce: il modello si aggiunge solo
+ *  dove il provider da solo non basta, cosi' il caso comune resta corto in una
+ *  barra che ha poco spazio. Un modello assente non produce etichetta piu'
+ *  lunga di quella del provider: non avrebbe nulla da distinguere. */
+export function etichetteVociCosto(voci: readonly ProviderTokenBucket[]): string[] {
+  const vociPerProvider = new Map<string, number>();
+  for (const v of voci) vociPerProvider.set(v.provider, (vociPerProvider.get(v.provider) ?? 0) + 1);
+  return voci.map((v) => {
+    const ambiguo = (vociPerProvider.get(v.provider) ?? 0) > 1;
+    return ambiguo && v.model ? `${v.provider} ${nomeBreveModello(v.model)}` : v.provider;
+  });
+}
