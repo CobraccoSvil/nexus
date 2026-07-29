@@ -40,6 +40,43 @@
 //! prima riportavano zero per costruzione, e uno zero li' non significa "nessun
 //! hit" ma "nessuno guardava" — motivo per cui la finestra di default (7 giorni)
 //! non ha ragione di allargarsi oltre quella data.
+//!
+//! ## Quante chiamate servono per MISURARE un hit-rate
+//!
+//! Dipende dal provider, e ignorarlo produce zeri che sembrano fatti. Due
+//! famiglie:
+//!
+//! - **cache dichiarata**: Anthropic (`cache_control` esplicito) e i provider con
+//!   caching automatico deterministico sul prefisso (OpenAI, DeepSeek, Mistral).
+//!   La seconda chiamata con lo stesso prefisso riporta l'hit. Due chiamate
+//!   bastano, e infatti danno 98-99%.
+//! - **cache implicita best-effort**: Google (Gemini 2.5+ su Vertex). Il provider
+//!   decide se materializzare la voce, e l'hit arriva dopo un numero VARIABILE di
+//!   chiamate. Due non bastano: lo zero che producono non distingue "non serve
+//!   cache" da "questa volta non e' toccato".
+//!
+//! Misurato il 29/07/2026 interrogando Vertex direttamente e leggendo
+//! `usageMetadata` grezzo (`gemini-2.5-flash`, prefisso di ~9.900 token, prova
+//! ripetuta con prefissi mai visti per partire da cache vuota):
+//!
+//! | strada | region | primo hit | valore |
+//! |---|---|---|---|
+//! | diretta a Vertex | `europe-west4` | giro 2 su 4 | `cachedContentTokenCount` 9.190 |
+//! | diretta a Vertex | `global` | giro 3 su 4 | `cachedContentTokenCount` 9.189 |
+//! | attraverso il gateway | (routing) | giro 5 su 6 | `cache_read_tokens` 9.189 |
+//!
+//! Quindi: Vertex serve hit impliciti su ENTRAMBE le regioni, il gateway li
+//! riceve, li mappa e li scrive nel ledger. Una prova precedente a due sole
+//! chiamate aveva dato zero su quattro modelli Google e fatto sospettare un
+//! difetto di parsing, di composizione della richiesta o dell'endpoint regionale:
+//! non c'era nessuno dei tre. Era lo strumento a non raggiungere l'oggetto come
+//! lo raggiunge la produzione (regola O), dove un loop agentico ripete lo stesso
+//! prefisso decine di volte.
+//!
+//! Conseguenza pratica: l'hit-rate di un provider a cache implicita si misura
+//! sulla FINESTRA del ledger, dove le chiamate sono migliaia, mai con una prova
+//! a due colpi. E' l'ordine di grandezza che questo modulo gia' usa
+//! (`min_samples`), e vale la pena ricordarne il motivo.
 
 use anyhow::{Context, Result};
 use nexus_pricing::CacheHitRate;
