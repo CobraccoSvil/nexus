@@ -53,7 +53,7 @@ impl PortBind {
             PortBind::Libera => "libera".to_string(),
             PortBind::Occupata => "occupata da un altro processo".to_string(),
             PortBind::NonInterrogabile { codice, errore } => format!(
-                "non verificabile: il sistema ha rifiutato il bind ({errore}{})",
+                "il sistema ha rifiutato il bind ({errore}{})",
                 codice.map(|c| format!(", codice {c}")).unwrap_or_default()
             ),
         }

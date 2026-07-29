@@ -606,9 +606,9 @@ pub async fn web_service_port_env(
                 "web_service_port_env: bind rifiutato dal sistema, avvio non instradato"
             );
             return Err(format!(
-                "la porta {} del servizio '{}' non e' verificabile ({}): non e' un occupante da \
-                 fermare, e' il sistema che ha rifiutato il bind. Avviare senza verifica farebbe \
-                 ripiegare il servizio su una porta fuori dal bucket del progetto.",
+                "la porta {} del servizio '{}' non e' verificabile: {}. Non c'e' un occupante da \
+                 fermare — e' lo stato della macchina a impedire la verifica. Avviare senza \
+                 verifica farebbe ripiegare il servizio su una porta fuori dal bucket del progetto.",
                 alloc.port,
                 label,
                 esito.descrizione()
