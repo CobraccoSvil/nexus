@@ -10,7 +10,12 @@
 //
 // Stile: inline + useThemeColors, niente Tailwind, niente emoji nei sorgenti.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ModalPortal } from "../modal-portal";
+import {
+  posizionePopoverAncorato,
+  type PosizionePopover,
+} from "../anchored-popover-logic";
 import { useDismissOnOutside } from "../../hooks/use-dismiss-on-outside";
 import { useScrollToAnchor } from "../../hooks/use-scroll-to-anchor";
 import { useThemeColors } from "../../lib/theme";
@@ -31,6 +36,12 @@ import type { ActivityStream, FigureAdvisoryReport } from "../../lib/use-chat/ac
 import type { AgentPendingAction } from "../../lib/api/agent";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
+
+/** Ingombro del pannello notifiche. Serve al calcolo della posizione PRIMA che
+ *  il pannello esista nel DOM, quindi non puo' essere misurato: e' dichiarato
+ *  qui e applicato come `width`/`maxHeight`, cosi' misura e resa non divergono. */
+const PANNELLO_LARGHEZZA = 300;
+const PANNELLO_ALTEZZA_MAX = 380;
 
 // Il modello dati (tipi + deriveRunNotifications + hasBlocking + BLOCKING_STATUSES)
 // vive nel modulo PURO ./run-notifications-model (regola L: modello vs vista,
@@ -119,6 +130,34 @@ export function RunNotifications({
   // accetta piu' ref. Delegando, il pannello guadagna anche la chiusura con Escape.
   const chiudiPannello = useCallback(() => setOpen(false), []);
   useDismissOnOutside(open, [panelRef, bellRef], chiudiPannello);
+
+  // Il pannello vive in un portal (vedi anchored-popover-logic): fuori dal
+  // ritaglio della barra di stato, ma anche fuori dal suo riferimento
+  // posizionale. Le coordinate si rileggono dalla campanella a ogni apertura e a
+  // ogni scroll/resize, perche' la barra si muove col nastro sottostante.
+  const [posizione, setPosizione] = useState<PosizionePopover | null>(null);
+  const aggiornaPosizione = useCallback(() => {
+    const bell = bellRef.current;
+    if (!bell) return;
+    setPosizione(
+      posizionePopoverAncorato(bell.getBoundingClientRect(), {
+        width: window.innerWidth,
+        height: window.innerHeight,
+      }, { width: PANNELLO_LARGHEZZA, maxHeight: PANNELLO_ALTEZZA_MAX }),
+    );
+  }, []);
+  // useLayoutEffect: la posizione va nota PRIMA della pittura, altrimenti il
+  // pannello compare per un fotogramma nell'angolo in alto a sinistra.
+  useLayoutEffect(() => {
+    if (!open) return;
+    aggiornaPosizione();
+    window.addEventListener("resize", aggiornaPosizione);
+    window.addEventListener("scroll", aggiornaPosizione, true);
+    return () => {
+      window.removeEventListener("resize", aggiornaPosizione);
+      window.removeEventListener("scroll", aggiornaPosizione, true);
+    };
+  }, [open, aggiornaPosizione]);
 
   // Deep-link: click su una voce -> scroll + flash sulla riga esatta del nastro
   // del run corrente (punto unico use-scroll-to-anchor, regola L). Solo le voci
@@ -255,22 +294,27 @@ export function RunNotifications({
         </span>
       </button>
 
-      {open && (
+      {open && posizione && (
+        <ModalPortal>
         <div
           ref={panelRef}
           role="dialog"
           aria-label="Notifiche del run"
           style={{
-            position: "absolute",
-            bottom: "calc(100% + 6px)",
-            right: 0,
+            // `fixed` DENTRO il portal: la barra di stato che ospita la
+            // campanella e' alta 48px con overflow:hidden, e ritagliava il
+            // pannello a quell'altezza. Fuori dall'albero non lo ritaglia piu'
+            // nessuno; le coordinate arrivano dal punto unico di posizionamento.
+            position: "fixed",
+            left: posizione.left,
+            top: posizione.top,
             zIndex: 50,
-            width: 300,
+            width: PANNELLO_LARGHEZZA,
             maxWidth: "85vw",
-            // Drop-up (bottom): la lista cresce nello spazio libero SOPRA la
-            // campanella. maxHeight relativo al viewport + overflowY:auto evita
-            // che le voci extra sforino sotto il bordo (scroll interno).
-            maxHeight: "min(60vh, 380px)",
+            // Altezza CONCESSA dallo spazio nel verso scelto, non un valore
+            // fisso: un massimo piu' grande dello spazio libero rifarebbe lo
+            // stesso difetto. Le voci in eccesso scorrono dentro il pannello.
+            maxHeight: posizione.maxHeight,
             overflowY: "auto",
             overflowX: "hidden",
             borderRadius: 10,
@@ -593,6 +637,7 @@ export function RunNotifications({
             </div>
           )}
         </div>
+        </ModalPortal>
       )}
     </div>
   );
