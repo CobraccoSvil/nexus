@@ -997,47 +997,18 @@ async fn allocate_web_port_env(
     if !looks_like_web_service(command) {
         return Ok(None);
     }
-    let alloc = crate::project_workspace::find_or_allocate_port(
+    // PUNTO UNICO (regola L) dell'alloca+inietta: alloca la porta del bucket, la
+    // lega all'unit del servizio (senza `service_unit` il GC la rilascerebbe a
+    // servizio fermo — drift 31792->31798, incidente Beaty-Book) e pretende che
+    // sia bindabile prima di prometterla al processo in avvio.
+    let env = crate::project_workspace::allocate_port::web_service_port_env(
         &ctx.db,
         &ctx.port_registry,
         ctx.project_id,
         label,
     )
     .await
-    .map_err(|e| format!("[Errore allocazione porta per servizio '{}': {}]", label, e))?;
-
-    // L'allocazione va LEGATA all'unit del servizio, altrimenti nasce con
-    // `service_unit` NULL e il GC (`cleanup_orphaned_ports`) la rilascia appena il
-    // servizio e' fermo: al riavvio la porta cambia e il pannello non ha piu' un
-    // indirizzo attendibile da mostrare (drift 31792->31798, incidente
-    // Beaty-Book). Il percorso del pannello lo faceva gia'; quello dell'agente no.
-    // Funziona perche' `label` e' ora un'identita' vera: da una generica
-    // ("Service") nascerebbe un unit che nessuna riga di servizio ricostruisce.
-    if let Some(unit) = crate::project_workspace::services::project_service_unit(
-        &ctx.db,
-        ctx.project_id,
-        label,
-    )
-    .await
-    {
-        crate::project_workspace::allocate_port::link_allocation_to_service_unit(
-            &ctx.db,
-            ctx.project_id,
-            label,
-            &unit,
-        )
-        .await;
-    }
-
-    let mut env = HashMap::new();
-    env.insert("PORT".to_string(), alloc.port.to_string());
-    env.insert("HOST".to_string(), "0.0.0.0".to_string());
-    tracing::info!(
-        port = alloc.port,
-        label = %label,
-        mode = alloc.mode,
-        "run_service: PORT auto-allocato per servizio web"
-    );
+    .map_err(|e| format!("[Errore porta per servizio '{}': {}]", label, e))?;
     Ok(Some(env))
 }
 

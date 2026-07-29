@@ -143,19 +143,31 @@ fn normalize_label(label: &str) -> String {
         .join(" ")
 }
 
-/// True se `req` (label richiesta) e `res` (label risorsa) si riferiscono allo
-/// stesso servizio. Ordine (fermarsi al primo):
+/// True se `req` (label richiesta) e `res` (label risorsa) hanno lo stesso SCOPO.
+/// Due criteri, fermandosi al primo:
 ///   a. uguaglianza case-insensitive normalizzata;
-///   b. contenimento bidirezionale su token normalizzati MA solo se le due
-///      label appartengono alla STESSA classe di servizio (frontend/backend):
-///      cosi' "backend" ~ "backend-dev" ma "backend" non matcha mai "frontend".
+///   b. stessa CLASSE di servizio (frontend/backend), classi disgiunte: cosi'
+///      "backend" ~ "backend-dev" e "backend" non matcha mai "frontend".
+///
+/// La (b) e' larga per costruzione: la classe frontend include web, ui, client,
+/// vue, next, react, quindi "frontend" matcha QUALUNQUE risorsa di quella classe,
+/// non solo le varianti del proprio nome. E' voluto qui — la domanda dei chiamanti
+/// e' «esiste gia' un servizio dello stesso scopo?», che serve a non far nascere
+/// due dev-server sulla stessa codebase — e NON va confusa con «questo processo e'
+/// il servizio per cui sto allocando?», che ha un punto unico apposta
+/// (`service_ownership`, regola L) e criteri piu' stretti.
+///
+/// Il commento storico prometteva anche un "contenimento bidirezionale su token
+/// normalizzati" che il codice non ha mai fatto: chi leggeva credeva la funzione
+/// piu' stretta di quanto sia, ed e' cosi' che ha finito per governare decisioni
+/// che esigevano identita' e non scopo.
 fn labels_match(req: &str, res: &str) -> bool {
     let rn = normalize_label(req);
     let sn = normalize_label(res);
     if rn == sn {
         return true;
     }
-    // Contenimento bidirezionale solo entro la stessa classe disgiunta.
+    // Stessa classe disgiunta.
     matches!(
         (service_class(req), service_class(res)),
         (Some(a), Some(b)) if a == b
@@ -241,11 +253,11 @@ fn reconcile(
                 && looks_like_server_process(prog)
         })
         .collect();
-    // Porta crescente: la piu' bassa del bucket e' tipicamente il frontend.
+    // Porta crescente: ordine stabile della lista, non un criterio di identita'.
     orphan_servers.sort_by_key(|(p, _, _)| *p);
 
-    for (idx, (port, pid, program)) in orphan_servers.iter().enumerate() {
-        let label = derive_orphan_label(program, idx, *port);
+    for (port, pid, program) in orphan_servers.iter() {
+        let label = orphan_placeholder_label(*port);
         services.push(ServiceResource {
             label,
             port: Some(*port),
@@ -262,15 +274,34 @@ fn reconcile(
     services
 }
 
-/// Deriva una label per un orfano in LISTEN dal nome del programma. Euristica:
-/// un dev-server frontend noto (vite/next/...) sulla porta piu' bassa diventa
-/// "frontend"; altrimenti "service-<port>".
-fn derive_orphan_label(program: &str, idx: usize, port: u16) -> String {
-    let p = program.to_lowercase();
-    const FRONTEND_HINTS: &[&str] = &["vite", "next", "nuxt", "astro", "react", "svelte", "ng "];
-    if idx == 0 && FRONTEND_HINTS.iter().any(|k| p.contains(k)) {
-        return "frontend".to_string();
-    }
+/// Nome con cui compare un processo in LISTEN che NON ha una riga di allocazione:
+/// `service-<port>`, cioe' un identificatore posizionale, non uno scopo.
+///
+/// Prima l'euristica pretendeva di indovinare: un programma il cui nome conteneva
+/// vite/next/nuxt/astro/react/svelte, se primo per numero di porta, diventava
+/// "frontend" — un'IDENTITA' DEDOTTA DAL NOME DEL PROGRAMMA (regola M), che
+/// nessun consumatore poteva distinguere da una label vera letta dal DB, perche'
+/// la lista delle risorse le mescola. Su quella label decidono tre percorsi:
+/// `find_or_allocate` ne eredita la porta, `refuse_if_same_scope_active` nega
+/// all'agente il proprio avvio indirizzandolo altrove, e
+/// `free_listening_scope_port` ne UCCIDE l'albero di processi.
+///
+/// MISURATO il 29/07/2026 prima di rimuoverla: quel ramo era INERTE, non raro.
+/// Il terzo campo di `listening_ports` e' il nome dell'ESEGUIBILE, mai la riga di
+/// comando, su entrambe le piattaforme (Windows: `exe_name_senza_estensione(
+/// szExeFile)`; Linux: `users:(("node",pid=...))` -> `split('"').nth(1)`), e ogni
+/// dev-server JS gira come processo `node`. La funzione ha quindi sempre
+/// restituito `service-<port>`: nessuno di quei tre percorsi ha mai potuto
+/// scattare per questa via. Il fix non disinnesca una trappola che scattava, ne
+/// toglie una ARMATA — pronta al primo che facesse passare la command line in
+/// quel campo credendo di migliorare la diagnostica.
+///
+/// `service-<port>` non appartiene a nessuna classe di servizio, quindi
+/// `labels_match` lo accetta solo per uguaglianza esatta: un processo non
+/// identificato non viene scambiato per il servizio di nessuno. Il nome del
+/// programma resta VISIBILE nel blocco prompt (campo `program`), dove informa
+/// senza decidere.
+fn orphan_placeholder_label(port: u16) -> String {
     format!("service-{port}")
 }
 
@@ -421,19 +452,23 @@ mod tests {
         assert!(!labels_match("worker", "queue-consumer"));
     }
 
+    /// Un processo senza riga di allocazione non riceve uno SCOPO indovinato dal
+    /// nome del suo programma. L'euristica rimossa lo prometteva ("node" con
+    /// "vite" nel nome, primo per porta, -> "frontend") ma era INERTE: quel campo
+    /// porta il nome dell'eseguibile, e ogni dev-server JS e' `node` (misurato,
+    /// vedi `orphan_placeholder_label`). Il test fissa l'invariante che rendeva
+    /// innocua quella via e che va mantenuta: la label di un processo non
+    /// identificato non appartiene a nessuna classe, quindi non matcha nulla.
     #[test]
-    fn derive_orphan_label_frontend_su_porta_bassa() {
-        assert_eq!(
-            derive_orphan_label("node /proj/node_modules/.bin/vite", 0, 21000),
-            "frontend"
+    fn un_orfano_non_riceve_uno_scopo_indovinato() {
+        assert_eq!(orphan_placeholder_label(21000), "service-21000");
+        // Il placeholder non appartiene a nessuna classe: nessun match spurio.
+        assert_eq!(service_class(&orphan_placeholder_label(21000)), None);
+        assert!(
+            !labels_match("frontend", &orphan_placeholder_label(21000)),
+            "un processo non identificato non e' il frontend di nessuno"
         );
-        // Non sulla porta piu' bassa -> service-<port> anche se vite.
-        assert_eq!(derive_orphan_label("node vite", 1, 21001), "service-21001");
-        // Programma non-frontend -> service-<port>.
-        assert_eq!(
-            derive_orphan_label("python3 -m uvicorn", 0, 21002),
-            "service-21002"
-        );
+        assert!(!labels_match("backend", &orphan_placeholder_label(21001)));
     }
 
     // ── Test della riconciliazione delle fonti (funzione pura `reconcile`) ──
@@ -501,8 +536,13 @@ mod tests {
         let s = &res[0];
         assert_eq!(s.source, ResourceSource::ListeningOrphan);
         assert_eq!(
-            s.label, "frontend",
-            "vite sulla porta piu' bassa -> frontend"
+            s.label, "service-21000",
+            "un processo senza riga DB compare per posizione, non per uno scopo dedotto dal comando"
+        );
+        assert_eq!(
+            s.program.as_deref(),
+            Some("node /p/node_modules/.bin/vite"),
+            "il nome del programma resta VISIBILE: informa il lettore senza decidere per lui"
         );
         assert!(s.listening);
         assert_eq!(s.suggested_action, SuggestedAction::Reuse);
@@ -537,11 +577,14 @@ mod tests {
         let backend = res.iter().find(|s| s.label == "backend").expect("backend");
         assert!(backend.listening);
         assert_eq!(backend.source, ResourceSource::PortAllocation);
-        let frontend = res
+        let orfano = res
             .iter()
             .find(|s| s.source == ResourceSource::ListeningOrphan)
-            .expect("orfano frontend");
-        assert_eq!(frontend.label, "frontend");
-        assert!(frontend.listening);
+            .expect("orfano in ascolto");
+        assert_eq!(orfano.label, "service-21000");
+        assert!(orfano.listening);
+        // La riga REGISTRATA conserva la sua label vera: stringere la fonte
+        // toglie le identita' inventate, non quelle lette dal DB.
+        assert_eq!(backend.label, "backend");
     }
 }

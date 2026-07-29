@@ -20,6 +20,7 @@ pub mod service_log_diagnose;
 pub mod service_manager;
 pub mod service_observer;
 pub mod service_observer_remediation;
+pub(crate) mod service_ownership;
 pub mod services;
 pub mod terminal_ws;
 // Apparato interamente systemd --user (ADR 0028): non ha senso su Windows, dove

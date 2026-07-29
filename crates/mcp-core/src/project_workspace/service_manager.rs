@@ -421,30 +421,26 @@ async fn control_windows(
         .unwrap_or_else(|| ctx.project_root.to_string_lossy().to_string());
 
     // Web service: alloca+inietta la porta stabile del bucket PRIMA dello spawn
-    // (riuso di find_or_allocate + link_allocation_to_service_unit). Solo se il
-    // chiamante ha un registry (il contesto tool agente ne e' privo -> niente
-    // iniezione, il servizio parte comunque).
+    // (PUNTO UNICO `web_service_port_env`). Solo se il chiamante ha un registry
+    // (il contesto tool agente ne e' privo -> niente iniezione, il servizio parte
+    // comunque).
     let port_env = match (
         crate::agent_tools::service::looks_like_web_service(&command),
         ctx.port_registry,
     ) {
         (true, Some(registry)) => {
-            match super::find_or_allocate_port(ctx.db, registry, ctx.project_id, short).await {
-                Ok(alloc) => {
-                    let unit_name = super::services::service_unit_name(ctx.slug, short);
-                    super::allocate_port::link_allocation_to_service_unit(
-                        ctx.db,
-                        ctx.project_id,
-                        short,
-                        &unit_name,
-                    )
-                    .await;
-                    let mut env = std::collections::HashMap::new();
-                    env.insert("PORT".to_string(), alloc.port.to_string());
-                    env.insert("HOST".to_string(), "0.0.0.0".to_string());
-                    Some(env)
-                }
-                Err(_) => None,
+            match super::allocate_port::web_service_port_env(
+                ctx.db,
+                registry,
+                ctx.project_id,
+                short,
+            )
+            .await
+            {
+                Ok(env) => Some(env),
+                // Porta non utilizzabile: NON si avvia. Proseguire senza PORT
+                // lascerebbe scegliere la porta al framework, fuori dal bucket.
+                Err(e) => return ServiceActionOutcome::noop(e),
             }
         }
         _ => None,

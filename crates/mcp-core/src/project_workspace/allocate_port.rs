@@ -14,6 +14,7 @@
 //! 4. Scrive `nexus_resource_audit` (allowed/blocked).
 //! 5. Ritorna `{port, label, allocation_mode}` per uso dell'agente.
 
+use super::service_ownership::{self, ServiceOwnership};
 use super::services::deterministic_project_port_for_key;
 use super::*;
 use crate::port_registry::PortRegistryCache;
@@ -33,28 +34,45 @@ pub struct AllocatedPort {
 
 /// Decisione PURA (testabile, regola L) su cosa fare quando la porta di una
 /// allocazione esistente risponde al probe TCP: la porta e' DAVVERO occupata,
-/// e la scelta dipende solo da chi la occupa e dalla liberabilita'.
+/// e la scelta dipende da CHI la occupa e dalla liberabilita'.
 #[derive(Debug, PartialEq, Eq)]
 enum ActivePortAction {
-    /// Occupante tracciato in `agent_processes` (running/starting): e' il
-    /// servizio legittimo del progetto, la porta si riusa (existing).
-    ReuseTracked,
-    /// Occupante NON tracciato ma la porta e' stata liberata (try_free_port):
-    /// si riusa la stessa porta, ora libera.
+    /// L'occupante E' il servizio richiesto (appartenenza provata da un dato
+    /// strutturato): la porta e' sua, si riusa (existing).
+    ReuseOwn,
+    /// Occupante non attribuibile e non governato, ma la porta e' stata liberata
+    /// (try_free_port): si riusa la stessa porta, ora libera.
     ReuseFreed,
-    /// Occupante NON tracciato e porta NON liberabile: mai ritornare una porta
-    /// occupata (EADDRINUSE garantito al bind del nuovo processo) — si alloca
-    /// una porta nuova segnalando l'occupante.
+    /// Porta occupata da un servizio ALTRUI, oppure da un occupante non
+    /// attribuibile e non liberabile: mai ritornare una porta occupata
+    /// (EADDRINUSE garantito al bind del nuovo processo) — si alloca una porta
+    /// nuova segnalando l'occupante.
     ReallocateNew,
 }
 
-fn active_port_action(occupant_tracked: bool, freed: bool) -> ActivePortAction {
-    if occupant_tracked {
-        ActivePortAction::ReuseTracked
-    } else if freed {
-        ActivePortAction::ReuseFreed
-    } else {
-        ActivePortAction::ReallocateNew
+/// La decisione dipende dall'APPARTENENZA, non dal solo "e' tracciato dal
+/// progetto": quel criterio rispondeva a una domanda piu' larga di quella
+/// necessaria e faceva passare per legittimo l'occupante di un ALTRO servizio.
+///
+/// `freed` e' l'esito di `try_free_port`, che il chiamante invoca soltanto per
+/// occupanti non attribuibili e non governati: un servizio altrui non si uccide
+/// per prendergli la porta (lo spegnerebbe), e un processo governato dal progetto
+/// nemmeno.
+fn active_port_action(ownership: &ServiceOwnership, freed: bool) -> ActivePortAction {
+    match ownership {
+        ServiceOwnership::Own { .. } => ActivePortAction::ReuseOwn,
+        // Appartenenza a un altro servizio PROVATA: la sua porta non e' la nostra.
+        ServiceOwnership::Other { .. } => ActivePortAction::ReallocateNew,
+        // Appartenenza IGNOTA: se la porta e' tornata libera si riusa, altrimenti
+        // si alloca altrove. Non si eredita la porta di un processo di cui non si
+        // sa nulla solo perche' vive nel progetto.
+        ServiceOwnership::Unknown => {
+            if freed {
+                ActivePortAction::ReuseFreed
+            } else {
+                ActivePortAction::ReallocateNew
+            }
+        }
     }
 }
 
@@ -95,17 +113,27 @@ pub async fn find_or_allocate(
             // un processo non tracciato (orfano di uno stop non verificato,
             // avvio manuale con .env stantio), run_service iniettava una porta
             // occupata al nuovo processo -> EADDRINUSE garantito (incidente
-            // Beaty-Book 2026-07-02). Ora la decisione passa dal punto unico
-            // `active_port_action`.
+            // Beaty-Book 2026-07-02). Poi la domanda e' diventata "e' governato
+            // dal progetto?", che rende legittimo anche l'occupante di un ALTRO
+            // servizio. Ora la si pone stretta: "e' IL servizio richiesto?"
+            // (punto unico `service_ownership`).
             let occupant = super::port_recovery::port_occupant(p).await;
+            let ownership = match &occupant {
+                Some((pid, _)) => {
+                    service_ownership::ownership_of_occupant(db, project_id, *pid, label).await
+                }
+                None => ServiceOwnership::Unknown,
+            };
             let tracked = match &occupant {
                 Some((pid, _)) => super::port_recovery::is_tracked_pid(db, project_id, *pid).await,
                 None => false,
             };
             // try_free_port ha side effect (kill dell'albero occupante): si
-            // invoca SOLO per occupanti non tracciati. Rifiuta da se' PID 0 e
-            // mcp-core stesso, e ritorna false se la porta resta occupata.
-            let freed = if tracked {
+            // invoca SOLO per occupanti non governati dal progetto E non
+            // attribuibili a un servizio. Uccidere un servizio altrui per
+            // liberargli la porta e' il danno, non il rimedio. Rifiuta da se'
+            // PID 0 e mcp-core stesso, e ritorna false se la porta resta occupata.
+            let freed = if tracked || !matches!(ownership, ServiceOwnership::Unknown) {
                 false
             } else {
                 super::port_recovery::try_free_port(p).await
@@ -115,8 +143,8 @@ pub async fn find_or_allocate(
                 .as_ref()
                 .map(|(_, prog)| prog.clone())
                 .unwrap_or_default();
-            match active_port_action(tracked, freed) {
-                ActivePortAction::ReuseTracked => {
+            match active_port_action(&ownership, freed) {
+                ActivePortAction::ReuseOwn => {
                     return Ok(AllocatedPort {
                         port: p,
                         mode: "existing",
@@ -143,16 +171,18 @@ pub async fn find_or_allocate(
                     });
                 }
                 ActivePortAction::ReallocateNew => {
-                    // Porta non liberabile: si rialloca nel bucket (la funzione
-                    // deterministica salta le porte gia' allocate in DB e quelle
-                    // che non superano il bind di prova) e si aggiorna la riga
-                    // della label. L'occupante viene SEGNALATO, mai ignorato.
+                    // Porta occupata da un servizio altrui, o da un occupante non
+                    // attribuibile e non liberabile: si rialloca nel bucket (la
+                    // funzione deterministica salta le porte gia' allocate in DB e
+                    // quelle che non superano il bind di prova) e si aggiorna la
+                    // riga della label. L'occupante viene SEGNALATO, mai ignorato.
                     let new_port =
                         deterministic_project_port_for_key(&project_id, label, registry).await;
                     tracing::warn!(
                         label = %label, busy_port = p, new_port,
                         occupant_pid = ?occupant_pid, occupant_program = %occupant_program,
-                        "find_or_allocate: porta occupata da processo NON tracciato e non liberabile, rialloco su porta nuova"
+                        ownership = %ownership.reason(),
+                        "find_or_allocate: la porta allocata e' occupata da un processo che non e' questo servizio, rialloco su porta nuova"
                     );
                     if let Err(e) = sqlx::query(
                         "UPDATE nexus_port_allocations \
@@ -180,7 +210,8 @@ pub async fn find_or_allocate(
                                 "busy_port": p,
                                 "occupant_pid": occupant_pid,
                                 "occupant_program": occupant_program,
-                                "reason": "occupied_by_untracked_unkillable",
+                                "ownership": ownership.reason(),
+                                "reason": "occupied_by_other_service",
                             })),
                     );
                     return Ok(AllocatedPort {
@@ -190,47 +221,94 @@ pub async fn find_or_allocate(
                 }
             }
         }
-        // Allocazione "stale": nessuno in ascolto. Cerca processi orfani del
-        // bucket (utente li ha lanciati manualmente con .env hardcoded, oppure
-        // un avvio precedente di Nexus non e' stato tracciato).
+        // Allocazione "stale": nessuno in ascolto. Cerca processi del bucket che
+        // siano DI QUESTO servizio (utente li ha lanciati manualmente con .env
+        // hardcoded, oppure un avvio precedente di Nexus non e' stato tracciato).
+        //
+        // CAUSA RADICE chiusa qui (incidente gestione-spese 2026-07-28): il
+        // criterio era "primo processo del bucket che somigli a un server", cioe'
+        // rispondeva a "e' del progetto?" invece che a "e' IL servizio per cui sto
+        // allocando?". Allocando per `frontend` adottava il BACKEND, e la porta di
+        // quest'ultimo (occupata) finiva iniettata come PORT al frontend, che
+        // ripiegava fuori bucket. L'appartenenza ora viene da dati strutturati
+        // (`service_ownership`), mai dal nome del programma.
         let orphans = super::port_recovery::scan_bucket_orphans(db, project_id).await;
-        if let Some((found_port, pid, program)) = orphans
-            .iter()
-            .find(|(_, _, prog)| super::port_recovery::looks_like_server_process(prog))
-        {
-            tracing::info!(
-                label = %label, stale_port = p, adopted_port = *found_port,
-                pid = *pid, program = %program,
-                "find_or_allocate: allocazione stale, adotto processo orfano del bucket"
-            );
-            let _ = sqlx::query(
-                "UPDATE nexus_port_allocations \
-                 SET port = $1, allocation_mode = 'adopted', updated_at = NOW() \
-                 WHERE project_id = $2 AND label = $3",
+        let mut candidates = Vec::with_capacity(orphans.len());
+        for (found_port, pid, program) in orphans {
+            let ownership = service_ownership::ownership_of_bucket_listener(
+                db, project_id, pid, found_port, label,
             )
-            .bind(*found_port as i32)
-            .bind(project_id)
-            .bind(label)
-            .execute(db)
             .await;
-            record_audit(
-                AuditEntry::allowed(project_id, "port_adopt", "port")
-                    .with_resource(found_port.to_string())
-                    .with_details(serde_json::json!({
-                        "label": label, "stale_port": p, "pid": pid, "program": program
-                    })),
-            );
-            return Ok(AllocatedPort {
-                port: *found_port,
-                mode: "adopted",
+            candidates.push(service_ownership::ListenerFacts {
+                port: found_port,
+                pid,
+                program,
+                ownership,
             });
         }
-        // Nessun orfano adottabile. La porta stale risulta libera (il probe TCP
-        // poco sopra e' negativo): ADOTTALA riusando la STESSA porta — per
-        // stabilita' tra restart — invece di eliminarla e riallocarne una nuova.
-        // La riga resta (UNIQUE project_id,label) con mode='adopted'. Questo
-        // chiude il deadlock allocazione stantia: run_service prosegue e riusa la
-        // stessa porta per la label, senza dipendere da `service_restart`.
+        match service_ownership::resolve_stale_adoption(p, &candidates) {
+            service_ownership::StaleAdoption::AdoptOrphan {
+                port: found_port,
+                pid,
+            } => {
+                tracing::info!(
+                    label = %label, stale_port = p, adopted_port = found_port, pid,
+                    "find_or_allocate: allocazione stale, adotto il processo DI QUESTO servizio"
+                );
+                let _ = sqlx::query(
+                    "UPDATE nexus_port_allocations \
+                     SET port = $1, allocation_mode = 'adopted', updated_at = NOW() \
+                     WHERE project_id = $2 AND label = $3",
+                )
+                .bind(found_port as i32)
+                .bind(project_id)
+                .bind(label)
+                .execute(db)
+                .await;
+                record_audit(
+                    AuditEntry::allowed(project_id, "port_adopt", "port")
+                        .with_resource(found_port.to_string())
+                        .with_details(serde_json::json!({
+                            "label": label, "stale_port": p, "pid": pid,
+                            "reason": "listener_owned_by_service",
+                        })),
+                );
+                return Ok(AllocatedPort {
+                    port: found_port,
+                    mode: "adopted",
+                });
+            }
+            service_ownership::StaleAdoption::ReuseStale { .. } => {}
+        }
+        // Nessun processo del bucket e' dimostrabilmente di questo servizio. La
+        // porta stale risulta libera (il probe TCP poco sopra e' negativo):
+        // ADOTTALA riusando la STESSA porta — per stabilita' tra restart — invece
+        // di eliminarla e riallocarne una nuova. La riga resta (UNIQUE
+        // project_id,label) con mode='adopted'. Questo chiude il deadlock
+        // allocazione stantia: run_service prosegue e riusa la stessa porta per la
+        // label, senza dipendere da `service_restart`.
+        //
+        // I candidati SCARTATI si dichiarano (regola O: il verdetto senza la sua
+        // premessa non e' diagnosticabile), cosi' dal log si vede quale processo e'
+        // stato visto e perche' non e' stato adottato.
+        if !candidates.is_empty() {
+            let scartati: Vec<String> = candidates
+                .iter()
+                .map(|c| {
+                    format!(
+                        "porta {} pid {} ({}) -> {}",
+                        c.port,
+                        c.pid,
+                        c.program,
+                        c.ownership.reason()
+                    )
+                })
+                .collect();
+            tracing::info!(
+                label = %label, stale_port = p, scartati = %scartati.join("; "),
+                "find_or_allocate: nessun processo del bucket appartiene a questo servizio, riuso la sua porta"
+            );
+        }
         let _ = sqlx::query(
             "UPDATE nexus_port_allocations \
              SET allocation_mode = 'adopted', updated_at = NOW() \
@@ -258,67 +336,95 @@ pub async fn find_or_allocate(
         });
     }
 
-    // 1-bis. Consapevolezza risorse (punto unico, regola L): nessuna riga DB con
-    //    QUESTA label esatta. Prima di allocare una porta nuova, chiedi al
-    //    resolver se un servizio dello STESSO scopo (label/classe) e' gia' ATTIVO
-    //    nel progetto. In tal caso riusa la sua porta come 'existing' e persisti
-    //    la riga per questa label (idempotenza reale via UNIQUE(project_id,label)).
-    //    Cosi' variare il contorno della label ("backend" -> "Backend Nodemon")
-    //    non genera una nuova allocazione 'dynamic' (causa radice del loop
-    //    request_port). Il matching e' a 2 classi disgiunte: una richiesta
-    //    "backend" non riusa mai la porta di un "frontend" attivo.
-    if let Some(res) =
-        super::resource_resolver::resolve_for_label(registry, project_id, label).await
-    {
-        if res.listening {
-            if let Some(existing_port) = res.port {
-                tracing::info!(
-                    label = %label,
-                    matched_label = %res.label,
-                    port = existing_port,
-                    program = res.program.as_deref().unwrap_or("?"),
-                    "find_or_allocate: servizio gia' ATTIVO dello stesso scopo, riuso la porta esistente (existing)"
-                );
-                // Persisti/aggiorna la riga per questa label: ON CONFLICT su
-                // (project_id,label) garantisce idempotenza reale (indice mig 0434).
-                let upsert = sqlx::query(
-                    r#"
-                    INSERT INTO nexus_port_allocations (project_id, port, label, allocation_mode)
-                    VALUES ($1, $2, $3, 'existing')
-                    ON CONFLICT (project_id, label)
-                    DO UPDATE SET port = EXCLUDED.port,
-                                  allocation_mode = EXCLUDED.allocation_mode,
-                                  updated_at = NOW()
-                    "#,
-                )
-                .bind(project_id)
-                .bind(existing_port as i32)
-                .bind(label)
-                .execute(db)
-                .await;
-                if let Err(e) = upsert {
-                    tracing::warn!(
-                        "find_or_allocate: upsert existing fallito (porta {} label {}): {}",
-                        existing_port,
-                        label,
-                        e
-                    );
-                }
-                record_audit(
-                    AuditEntry::allowed(project_id, "port_reuse", "port")
-                        .with_resource(existing_port.to_string())
-                        .with_details(serde_json::json!({
-                            "label": label,
-                            "matched_label": res.label,
-                            "mode": "existing",
-                        })),
-                );
-                return Ok(AllocatedPort {
-                    port: existing_port,
-                    mode: "existing",
-                });
-            }
+    // 1-bis. Consapevolezza risorse: nessuna riga DB con QUESTA label esatta.
+    //    Prima di allocare una porta nuova si guarda se il servizio e' gia' ATTIVO
+    //    sotto un'altra label ("backend" -> "Backend Nodemon"): in tal caso se ne
+    //    riusa la porta come 'existing' e si persiste la riga per questa label
+    //    (idempotenza reale via UNIQUE(project_id,label)). E' il ramo che impedisce
+    //    all'agente di accumulare allocazioni variando il contorno della label
+    //    (causa radice del loop request_port).
+    //
+    //    Il candidato lo sceglie il verdetto di appartenenza, non il matching per
+    //    CLASSE di `resolve_for_label`: a quel criterio basta che due label siano
+    //    entrambe "di frontend" (la classe include web, ui, client, vue, next,
+    //    react), quindi risponde a «stesso SCOPO?» dove qui serve «stesso
+    //    SERVIZIO?». Con `owned_listener` si riusa solo la porta di un processo che
+    //    un dato strutturato lega a QUESTO servizio; altrimenti si alloca dal
+    //    bucket. Per i processi NON registrati la questione e' chiusa a monte:
+    //    `orphan_placeholder_label` da' loro un identificatore posizionale, non uno
+    //    scopo indovinato dal nome del programma (regola M).
+    //
+    //    Misurato prima di stringere (28-29/07/2026, DB dev): zero eventi
+    //    `port_reuse` e zero righe `allocation_mode='existing'` su 114 eventi porta
+    //    e 3 allocazioni, contro 59 `port_adopt` — nessun riuso legittimo dipendeva
+    //    da questo ramo, il loop era retto dall'adozione. PREMESSA:
+    //    `nexus_resource_audit` copriva solo quei due giorni, mentre il ramo esiste
+    //    dal 15/06 (22618285).
+    let attive = super::resource_resolver::resolve_project_resources(registry, project_id).await;
+    let mut in_ascolto = Vec::new();
+    for res in attive.services.iter().filter(|s| s.listening) {
+        let (Some(res_port), Some(res_pid)) = (res.port, res.pid) else {
+            continue;
+        };
+        let ownership = service_ownership::ownership_of_bucket_listener(
+            db, project_id, res_pid, res_port, label,
+        )
+        .await;
+        in_ascolto.push(service_ownership::ListenerFacts {
+            port: res_port,
+            pid: res_pid,
+            program: res.program.clone().unwrap_or_default(),
+            ownership,
+        });
+    }
+    if let Some(mio) = service_ownership::owned_listener(&in_ascolto) {
+        let existing_port = mio.port;
+        tracing::info!(
+            label = %label,
+            port = existing_port,
+            pid = mio.pid,
+            program = %mio.program,
+            ownership = %mio.ownership.reason(),
+            "find_or_allocate: questo servizio e' gia' ATTIVO su un'altra porta, la riuso (existing)"
+        );
+        // Persisti/aggiorna la riga per questa label: ON CONFLICT su
+        // (project_id,label) garantisce idempotenza reale (indice mig 0434).
+        let upsert = sqlx::query(
+            r#"
+            INSERT INTO nexus_port_allocations (project_id, port, label, allocation_mode)
+            VALUES ($1, $2, $3, 'existing')
+            ON CONFLICT (project_id, label)
+            DO UPDATE SET port = EXCLUDED.port,
+                          allocation_mode = EXCLUDED.allocation_mode,
+                          updated_at = NOW()
+            "#,
+        )
+        .bind(project_id)
+        .bind(existing_port as i32)
+        .bind(label)
+        .execute(db)
+        .await;
+        if let Err(e) = upsert {
+            tracing::warn!(
+                "find_or_allocate: upsert existing fallito (porta {} label {}): {}",
+                existing_port,
+                label,
+                e
+            );
         }
+        record_audit(
+            AuditEntry::allowed(project_id, "port_reuse", "port")
+                .with_resource(existing_port.to_string())
+                .with_details(serde_json::json!({
+                    "label": label,
+                    "ownership": mio.ownership.reason(),
+                    "mode": "existing",
+                })),
+        );
+        return Ok(AllocatedPort {
+            port: existing_port,
+            mode: "existing",
+        });
     }
 
     // 2. Quota check: non superare max_ports allocate per il progetto.
@@ -424,6 +530,78 @@ pub async fn link_allocation_to_service_unit(
             e
         );
     }
+}
+
+/// Quanto si attende che la porta del servizio torni bindabile dopo lo stop che
+/// precede ogni avvio: il SO impiega qualche centinaio di ms a rilasciare il
+/// listener del processo terminato. Stessa grazia di `ensure_process_stopped`
+/// (10 x 300ms), che misura lo stesso fenomeno dall'altro lato — non una soglia
+/// scelta a parte, che divergerebbe al primo ritocco.
+const PORT_BINDABLE_ATTEMPTS: u32 = 10;
+const PORT_BINDABLE_STEP_MS: u64 = 300;
+
+/// PUNTO UNICO (regola L) dell'ALLOCA+INIETTA di un web service: alloca la porta
+/// stabile del bucket, la lega all'unit del servizio e ne ricava l'env
+/// `PORT`/`HOST` per lo spawn. I tre percorsi di avvio (pannello Servizi,
+/// `service_manager`, tool agente `run_service`) delegano qui invece di ricopiare
+/// la stessa sequenza.
+///
+/// PRETENDE una porta effettivamente bindabile, e questa e' la parte che mancava
+/// (incidente gestione-spese 2026-07-28): iniettare `PORT` e' una PROMESSA al
+/// processo che sta per nascere, e un framework che non e' in strictPort — Vite —
+/// non fallisce se la trova occupata: ripiega su `port+1`, FUORI dal bucket del
+/// progetto, in silenzio. Il servizio risulta avviato, il pannello mostra la
+/// porta promessa, e l'indirizzo vero non lo conosce nessuno. Se la porta non si
+/// libera entro la grazia si ritorna ERRORE: un avvio mancato e' visibile e
+/// diagnosticabile, un servizio fuori bucket no.
+pub async fn web_service_port_env(
+    db: &PgPool,
+    registry: &PortRegistryCache,
+    project_id: Uuid,
+    label: &str,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let alloc = find_or_allocate(db, registry, project_id, label)
+        .await
+        .map_err(|e| format!("allocazione porta per '{label}' fallita: {e}"))?;
+
+    // L'allocazione va LEGATA all'unit del servizio, altrimenti nasce con
+    // `service_unit` NULL e il GC (`cleanup_orphaned_ports`) la rilascia appena il
+    // servizio e' fermo: al riavvio la porta cambia e il pannello non ha piu' un
+    // indirizzo attendibile (drift 31792->31798, incidente Beaty-Book).
+    if let Some(unit) = super::services::project_service_unit(db, project_id, label).await {
+        link_allocation_to_service_unit(db, project_id, label, &unit).await;
+    }
+
+    if !super::port_recovery::wait_port_bindable(
+        alloc.port,
+        PORT_BINDABLE_ATTEMPTS,
+        PORT_BINDABLE_STEP_MS,
+    )
+    .await
+    {
+        let occupante = super::port_recovery::port_occupant(alloc.port)
+            .await
+            .map(|(pid, prog)| format!("pid {pid} ({prog})"))
+            .unwrap_or_else(|| "occupante non risolvibile".to_string());
+        tracing::warn!(
+            label = %label, port = alloc.port, mode = alloc.mode, occupante = %occupante,
+            "web_service_port_env: la porta del servizio non e' bindabile, avvio non instradato"
+        );
+        return Err(format!(
+            "la porta {} del servizio '{}' e' ancora occupata ({}): fermalo prima di riavviarlo. \
+             Avviarlo ora lo farebbe ripiegare su una porta fuori dal bucket del progetto.",
+            alloc.port, label, occupante
+        ));
+    }
+
+    tracing::info!(
+        port = alloc.port, label = %label, mode = alloc.mode,
+        "web_service_port_env: PORT allocato, libero e iniettato"
+    );
+    let mut env = std::collections::HashMap::new();
+    env.insert("PORT".to_string(), alloc.port.to_string());
+    env.insert("HOST".to_string(), "0.0.0.0".to_string());
+    Ok(env)
 }
 
 pub async fn allocate_port(
@@ -538,32 +716,52 @@ mod tests {
     use sqlx::Row;
     use uuid::Uuid;
 
+    use super::service_ownership::{classify_ownership, OwnershipFacts};
     use super::{active_port_action, ActivePortAction};
 
-    /// Regressione EADDRINUSE (incidente Beaty-Book 2026-07-02): con la porta
-    /// dell'allocazione in LISTEN la decisione dipende dall'occupante. Il
-    /// vecchio comportamento (sempre 'existing') iniettava porte occupate da
-    /// orfani non tracciati nel nuovo processo.
+    /// I verdetti nascono da `classify_ownership` sulle label grezze (regola O:
+    /// il test attraversa il produttore, non fabbrica il valore che verifica).
+    fn occupante(process_label: Option<&str>, richiesta: &str) -> super::ServiceOwnership {
+        let facts = OwnershipFacts::own_port_occupant(process_label.map(str::to_string));
+        classify_ownership(richiesta, &facts)
+    }
+
+    /// Regressione EADDRINUSE (incidente Beaty-Book 2026-07-02) + appartenenza
+    /// (incidente gestione-spese 2026-07-28): con la porta dell'allocazione in
+    /// LISTEN la decisione dipende da CHI la occupa. Il primo comportamento
+    /// (sempre 'existing') iniettava porte occupate nel nuovo processo; il
+    /// secondo ("e' tracciato dal progetto?") faceva passare per legittimo
+    /// l'occupante di un altro servizio.
     #[test]
-    fn porta_attiva_decisione_per_occupante() {
-        // Occupante tracciato (servizio legittimo): riusa, mai killare.
+    fn porta_attiva_decisione_per_appartenenza() {
+        // L'occupante E' questo servizio: riusa, mai killare.
         assert_eq!(
-            active_port_action(true, false),
-            ActivePortAction::ReuseTracked
+            active_port_action(&occupante(Some("frontend"), "frontend"), false),
+            ActivePortAction::ReuseOwn
         );
-        // `freed` e' irrilevante se tracciato (try_free_port non viene invocato).
+        // Variante del contorno della label: sempre lo stesso servizio.
         assert_eq!(
-            active_port_action(true, true),
-            ActivePortAction::ReuseTracked
+            active_port_action(&occupante(Some("frontend-dev"), "frontend"), false),
+            ActivePortAction::ReuseOwn
         );
-        // Orfano non tracciato liberato: riusa la stessa porta.
+        // L'occupante e' un ALTRO servizio: mai ereditarne la porta, nemmeno se
+        // risultasse liberata (non si uccide un servizio sano per la sua porta).
         assert_eq!(
-            active_port_action(false, true),
+            active_port_action(&occupante(Some("backend"), "frontend"), false),
+            ActivePortAction::ReallocateNew
+        );
+        assert_eq!(
+            active_port_action(&occupante(Some("backend"), "frontend"), true),
+            ActivePortAction::ReallocateNew
+        );
+        // Occupante non attribuibile, porta liberata: riusa la stessa porta.
+        assert_eq!(
+            active_port_action(&occupante(None, "frontend"), true),
             ActivePortAction::ReuseFreed
         );
-        // Orfano non liberabile: MAI ritornare la porta occupata, rialloca.
+        // Non attribuibile e non liberabile: MAI ritornare la porta occupata.
         assert_eq!(
-            active_port_action(false, false),
+            active_port_action(&occupante(None, "frontend"), false),
             ActivePortAction::ReallocateNew
         );
     }

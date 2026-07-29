@@ -20,6 +20,34 @@ use super::services::project_bucket_range;
 #[cfg(not(windows))]
 use super::services::{read_listening_ports_proc, read_listening_ports_ss};
 
+/// PUNTO UNICO (regola L) della domanda «questa porta e' USABILE ora?»: il bind
+/// e' la domanda che il processo in avvio porra' al SO, e non coincide con
+/// `tcp_probe` (che chiede solo "qualcuno risponde?"). Una porta in TIME_WAIT o
+/// tenuta da un listener che non accetta connessioni non risponde al probe ma
+/// rifiuta il bind: iniettarla come `PORT` fa ripiegare il framework altrove.
+pub async fn port_bindable(port: u16) -> bool {
+    tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .is_ok()
+}
+
+/// Attende che `port` diventi bindabile, fino a `attempts` tentativi distanziati
+/// di `step_ms`. Serve dopo uno stop: il SO puo' impiegare qualche centinaio di
+/// millisecondi a rilasciare il listener del processo appena terminato. Ritorna
+/// false se allo scadere la porta e' ancora occupata — un fatto da dichiarare,
+/// non da aggirare.
+pub async fn wait_port_bindable(port: u16, attempts: u32, step_ms: u64) -> bool {
+    for attempt in 0..attempts.max(1) {
+        if port_bindable(port).await {
+            return true;
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(Duration::from_millis(step_ms)).await;
+        }
+    }
+    false
+}
+
 /// True se la porta accetta una connessione TCP entro `timeout_ms`.
 pub async fn tcp_probe(port: u16, timeout_ms: u64) -> bool {
     let addr = format!("127.0.0.1:{port}");
@@ -432,9 +460,7 @@ pub async fn try_free_port(port: u16) -> bool {
         kill_process_tree(pid).await;
     }
 
-    tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .is_ok()
+    port_bindable(port).await
 }
 
 /// Lista (port, pid, program) in ascolto nel bucket del progetto, escludendo
@@ -563,6 +589,33 @@ mod stop_verification_tests {
         assert!(!process_fully_stopped(true, None));
         assert!(!process_fully_stopped(true, Some(false)));
         assert!(!process_fully_stopped(true, Some(true)));
+    }
+
+    /// La domanda che l'iniezione di `PORT` deve porre e' il BIND, non il probe:
+    /// promettere a un servizio una porta occupata lo fa ripiegare altrove (Vite
+    /// senza strictPort -> porta+1, fuori dal bucket del progetto). Il test usa un
+    /// listener reale — la stessa porta che il SO concede o rifiuta in produzione —
+    /// ed e' idempotente: la porta la sceglie il SO (bind su 0).
+    #[tokio::test]
+    async fn una_porta_occupata_non_e_bindabile() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind di prova");
+        let port = listener.local_addr().expect("local_addr").port();
+
+        assert!(
+            !super::port_bindable(port).await,
+            "porta con un listener attivo: il bind deve fallire"
+        );
+        // Attesa breve: la porta resta occupata, la funzione lo dichiara invece di
+        // far passare l'avvio con una promessa falsa.
+        assert!(!super::wait_port_bindable(port, 2, 50).await);
+
+        drop(listener);
+        assert!(
+            super::wait_port_bindable(port, 6, 50).await,
+            "rilasciato il listener la porta torna bindabile"
+        );
     }
 
     #[tokio::test]
