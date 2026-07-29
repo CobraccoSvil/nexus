@@ -82,6 +82,15 @@ impl GenericOpenAiProvider {
         }
     }
 
+    /// Aggancia il DB da cui gli INSTRADATORI leggono quale fornitore a valle
+    /// preferire (`nexus_router_upstream_affinity`, mig 0657). Gli altri
+    /// endpoint non lo interrogano: la domanda vale solo dove c'e' davvero
+    /// qualcosa da scegliere.
+    pub fn with_db(mut self, db: Option<sqlx::PgPool>) -> Self {
+        self.client = self.client.with_db(db);
+        self
+    }
+
     /// Garanzia difensiva (regola H): se il provider dichiara `supports_tools=false`
     /// (es. Perplexity sonar, che rifiuta le tool definitions con HTTP 400), rimuove
     /// `tools`/`tool_choice` dalla richiesta PRIMA dell'invio. La garanzia PRIMARIA

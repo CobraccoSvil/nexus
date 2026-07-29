@@ -347,7 +347,40 @@ pub enum PromptCacheKeying {
     /// entrambi, 8704/8797 stabile dal secondo colpo. E' la stessa domanda di
     /// [`Self::RequiresKey`] — «quali chiamate condividono il prefisso?» —
     /// posta due volte, una per livello.
+    ///
+    /// I livelli sono in realta' TRE, e il primo `session_id` non lo copre: vedi
+    /// [`Self::requires_upstream_pinning`].
     RequiresSessionId,
+}
+
+impl PromptCacheKeying {
+    /// Su questo endpoint la richiesta deve dichiarare anche QUALE fornitore a
+    /// valle preferisce?
+    ///
+    /// E' il terzo livello di affinita' di un instradatore, e non e' un doppione
+    /// di `session_id`: quel campo il fornitore doveva fissarlo e NON lo fissa.
+    /// MISURATO il 29/07/2026 chiamando direttamente l'API OpenRouter — l'unico
+    /// modo per leggere il campo `provider` della risposta e vedere chi ha
+    /// servito — 8 chiamate consecutive a prefisso identico, con `session_id` e
+    /// `prompt_cache_key` regolarmente inviati: su `qwen/qwen3-235b-a22b-2507`
+    /// la stessa sequenza girava fra DeepInfra, Alibaba e Novita, 0/8 di cache;
+    /// su `z-ai/glm-4.7-flash` alternava Cloudflare e DeepInfra, 6/8.
+    ///
+    /// Il livello conta perche' i fornitori dello stesso modello NON si
+    /// equivalgono: su qwen3-235b, Google serve il 99% del prefisso e
+    /// DeepInfra/Alibaba/Novita non ne servono niente. Restare sul fornitore
+    /// giusto vale piu' del fissare "un" fornitore qualunque.
+    ///
+    /// `x-ai/grok-4.5` non aveva questo difetto — e' il modello su cui il fix
+    /// precedente sembrava sufficiente — perche' OpenRouter lo serve da un solo
+    /// fornitore: li' non c'era niente da scegliere.
+    ///
+    /// Il criterio sta qui, il VALORE (quale fornitore per quale modello) sta nel
+    /// DB, tabella `nexus_router_upstream_affinity` (mig 0657, regola G). Chi
+    /// aggiunge un nuovo instradatore tocca solo `cache_keying_per_endpoint`.
+    pub fn requires_upstream_pinning(self) -> bool {
+        matches!(self, Self::RequiresSessionId)
+    }
 }
 
 /// Conteggio token consumati.
