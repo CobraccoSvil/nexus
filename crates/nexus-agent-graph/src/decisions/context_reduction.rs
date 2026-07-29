@@ -1187,6 +1187,13 @@ fn truncate_message_content(
 ///
 /// Regola G: `enabled`/`reminder_text` arrivano come parametri (nel Python da
 /// `_load_language_reminder`, DB cache 60s); la funzione e' pura.
+///
+/// Resta in TESTA, a differenza del focus del turno, perche' il suo testo e' una
+/// costante del run (impostazione DB letta all'avvio): identico a ogni turno, non
+/// sposta il prefisso. Se un giorno diventasse dipendente dal turno — per esempio
+/// una lingua dedotta dal messaggio — andrebbe appeso come blocco di turno
+/// (`nexus_types::system_prompt`), altrimenti riapre il difetto di prefisso che
+/// quel modulo documenta.
 pub fn inject_language_reminder(system_text: &str, enabled: bool, reminder_text: &str) -> String {
     if !enabled || reminder_text.is_empty() {
         return system_text.to_string();
@@ -1202,12 +1209,20 @@ pub fn inject_language_reminder(system_text: &str, enabled: bool, reminder_text:
 //  7) _inject_turn_focus (PURA, riusa marker + primitiva, regola L)
 // ──────────────────────────────────────────────────────────────────────────
 
-/// `_inject_turn_focus` (helpers.py:930): antepone la directive di focus al
+/// `_inject_turn_focus` (helpers.py:930): aggiunge la directive di focus al
 /// system (idempotente via [`TURN_FOCUS_MARKER`], RIUSATO da [`super::turn_focus`]).
 /// No-op se `directive` vuota o marker gia' presente. Ritorna il nuovo `system_text`.
 ///
-/// Regola L: il marker e la costruzione della directive ([`build_turn_focus_directive`])
-/// sono i punti unici gia' portati; qui si fa SOLO l'iniezione idempotente.
+/// La directive va DOPO la parte stabile, non in testa: e' ricalcolata a ogni
+/// turno dall'ultimo messaggio umano, e in un loop agentico quel messaggio e' via
+/// via un risultato di tool o un nudge. Anteposta, cambiava i primi caratteri del
+/// system a ogni turno e il fornitore non trovava nulla da riusare — MISURATO
+/// zero caratteri in comune in testa fra primo e secondo turno. La posizione la
+/// decide il punto unico [`nexus_types::system_prompt`] (regola L); qui restano
+/// l'idempotenza e la costruzione della directive.
+///
+/// In coda al system la direttiva NON perde forza: e' il testo adiacente alla
+/// conversazione, la posizione di massima salienza per il modello.
 pub fn inject_turn_focus(system_text: &str, directive: &str) -> String {
     if directive.is_empty() {
         return system_text.to_string();
@@ -1215,7 +1230,10 @@ pub fn inject_turn_focus(system_text: &str, directive: &str) -> String {
     if system_text.contains(TURN_FOCUS_MARKER) {
         return system_text.to_string();
     }
-    format!("{TURN_FOCUS_MARKER}\n{directive}\n\n{system_text}")
+    nexus_types::system_prompt::appendi_blocco_di_turno(
+        system_text,
+        &format!("{TURN_FOCUS_MARKER}\n{directive}"),
+    )
 }
 
 // ──────────────────────────────────────────────────────────────────────────

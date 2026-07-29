@@ -1086,6 +1086,178 @@ mod tests {
         );
     }
 
+    // ── Testa del prompt: stabilita' fra turni consecutivi ────────────────────
+
+    /// Gateway che REGISTRA la richiesta di ogni turno, oltre a scriptare le
+    /// risposte come [`ScriptedLlmGateway`].
+    ///
+    /// Perche' esiste: la testa del prompt (system + catalogo tool) e' il prefisso
+    /// su cui il fornitore fa cache, e la sua stabilita' fra turni consecutivi non
+    /// e' osservabile da nessun'altra parte — l'executor ricompone il system a
+    /// ogni turno in una variabile LOCALE che non torna nello stato, quindi
+    /// leggere `state.system_text` misurerebbe cio' che il motore ha RICEVUTO, non
+    /// cio' che MANDA (regola O). Qui la richiesta arriva dal produttore reale.
+    struct GatewayCheRegistra {
+        turns: Vec<LlmResponse>,
+        richieste: Mutex<Vec<LlmRequest>>,
+    }
+
+    impl GatewayCheRegistra {
+        fn new(turns: Vec<LlmResponse>) -> Self {
+            Self {
+                turns,
+                richieste: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Testa di ogni turno dell'EXECUTOR: `(system, nomi dei tool NELL'ORDINE
+        /// dichiarato)`. L'ordine conta: il riuso e' per prefisso, non per insieme.
+        ///
+        /// Il filtro su `purpose` dichiara da dove guarda la misura: nel grafo
+        /// chiamano l'LLM anche altri nodi (understanding, clarify), con un
+        /// system diverso PER COSTRUZIONE. Confrontare le loro teste con quelle
+        /// dell'executor misurerebbe una differenza legittima e direbbe "instabile"
+        /// di un prefisso sano.
+        fn teste(&self) -> Vec<(String, Vec<String>)> {
+            self.richieste
+                .lock()
+                .expect("lock richieste")
+                .iter()
+                .filter(|r| r.purpose.as_deref() == Some("executor"))
+                .map(|r| {
+                    let sys = r.system_text.clone().unwrap_or_default();
+                    let tools = r
+                        .tools
+                        .as_ref()
+                        .map(|ts| {
+                            ts.iter()
+                                .map(|t| {
+                                    t.get("name")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("?")
+                                        .to_string()
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (sys, tools)
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl LlmGateway for GatewayCheRegistra {
+        async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, PortError> {
+            let idx = {
+                let mut g = self.richieste.lock().expect("lock richieste");
+                g.push(req);
+                g.len() - 1
+            };
+            Ok(self.turns[idx.min(self.turns.len() - 1)].clone())
+        }
+    }
+
+    /// Turno che chiama `write_file` su un path dato (path diversi fra turni: due
+    /// chiamate identiche farebbero scattare la loop-detection e chiuderebbero il
+    /// run prima di poter misurare i turni successivi).
+    fn turn_tool_use_su(path: &str) -> LlmResponse {
+        LlmResponse {
+            content: String::new(),
+            tool_calls: vec![ToolUse {
+                id: format!("tc-{path}"),
+                name: "write_file".to_string(),
+                input: json!({"path": path, "content": "fn main() {}"}),
+                thought_signature: None,
+            }],
+            usage: LlmUsage::default(),
+            stop_reason: Some("tool_use".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Numero di caratteri iniziali in comune fra due teste: dice DOVE divergono,
+    /// non solo che divergono. Un numero senza la sua premessa e' un'opinione.
+    fn prefisso_comune(a: &str, b: &str) -> usize {
+        a.chars()
+            .zip(b.chars())
+            .take_while(|(x, y)| x == y)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn la_testa_del_prompt_resta_identica_fra_i_turni() {
+        // CONTRATTO: in un run agentico il prefisso (system + catalogo tool) e' la
+        // parte che NON deve cambiare da un turno all'altro — cresce solo la coda
+        // della conversazione. E' la condizione perche' il fornitore riusi il
+        // prefisso; se la testa cambia, ogni turno paga il prompt intero.
+        let gateway = Arc::new(GatewayCheRegistra::new(vec![
+            turn_tool_use_su("src/a.rs"),
+            turn_tool_use_su("src/b.rs"),
+            turn_tool_use_su("src/c.rs"),
+            turn_end(),
+        ]));
+        let llm: Arc<dyn LlmGateway> = gateway.clone();
+        let tools = stub_tools();
+        let run_id = Uuid::new_v4();
+
+        let nodes = build_stub_nodes(tools.clone());
+        let engine = build_agent_graph(
+            nodes,
+            RoutingConfig::default(),
+            PlannerConfig::default(),
+            SupervisorConfig::default(),
+            Arc::new(MemoryCheckpointer::default()),
+        );
+
+        // System e catalogo tool come li passa mcp-core: sono la testa del prompt.
+        const SYSTEM: &str =
+            "Sei l'agente di sviluppo del progetto Nexus. Lavora sul repository indicato.";
+        let mut stato = initial_state(run_id);
+        stato.system_text = Some(SYSTEM.to_string());
+        stato.tools_json = Some(vec![
+            json!({"name": "write_file"}),
+            json!({"name": "read_file"}),
+            json!({"name": "run_command"}),
+        ]);
+
+        let ctx = ctx_with(llm, tools, run_id);
+        engine
+            .run_until_interrupt(run_id, Some(stato), &ctx)
+            .await
+            .expect("il run deve completare senza errore");
+
+        let teste = gateway.teste();
+        assert!(
+            teste.len() >= 3,
+            "servono almeno 3 turni per misurare la stabilita', ottenuti {}",
+            teste.len()
+        );
+
+        // Il criterio e' la CONSEGUENZA, non l'uguaglianza: le direttive di turno
+        // possono cambiare (e devono, e' il loro mestiere), ma il tratto iniziale
+        // che i turni condividono deve coprire almeno il system che il chiamante
+        // ha fornito. Misurato in caratteri effettivamente comuni, non chiedendo
+        // al codice sotto misura dove passa il proprio confine.
+        let attesi = SYSTEM.chars().count();
+        let (sys0, tool0) = teste[0].clone();
+        for (i, (sys, tools)) in teste.iter().enumerate().skip(1) {
+            assert_eq!(
+                tools, &tool0,
+                "turno {i}: il catalogo tool e' cambiato rispetto al primo turno \
+                 ({tool0:?} -> {tools:?}): il prefisso non e' piu' riusabile"
+            );
+            let comune = prefisso_comune(&sys0, sys);
+            assert!(
+                comune >= attesi,
+                "turno {i}: la testa condivisa col primo turno e' di {comune} caratteri, \
+                 ne servono almeno {attesi} (il system del run). Un blocco variabile e' \
+                 finito PRIMA della parte stabile: da li' in poi il fornitore non ha \
+                 nulla da riusare.\nprimo turno: {sys0:?}\nturno {i}: {sys:?}"
+            );
+        }
+    }
+
     // ── HITL: sospensione, resume, esecuzione pending, chiusura ───────────────
 
     #[tokio::test]
