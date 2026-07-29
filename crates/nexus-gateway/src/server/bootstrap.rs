@@ -309,15 +309,20 @@ fn construct_provider(
             let url = base_url.or_else(|| d.base_url_default.clone())?;
             let tiers: Vec<SensitivityTier> =
                 d.tiers.iter().map(|t| *t as SensitivityTier).collect();
-            Some(Arc::new(GenericOpenAiProvider::new(
-                http.clone(),
-                url,
-                k,
-                d.name.clone(),
-                tiers,
-                d.max_context_tokens as u32,
-                d.supports_tools,
-            )))
+            Some(Arc::new(
+                GenericOpenAiProvider::new(
+                    http.clone(),
+                    url,
+                    k,
+                    d.name.clone(),
+                    tiers,
+                    d.max_context_tokens as u32,
+                    d.supports_tools,
+                )
+                // Serve agli instradatori per leggere il fornitore a valle
+                // preferito; gli altri endpoint non lo interrogano mai.
+                .with_db(Some(db.clone())),
+            ))
         }
     }
 }

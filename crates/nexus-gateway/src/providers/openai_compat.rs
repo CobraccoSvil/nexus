@@ -15,9 +15,13 @@
 
 use std::time::Instant;
 
+use std::time::Duration;
+
 use futures::StreamExt;
+use nexus_cache::TtlCache;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::provider::ChunkStream;
@@ -82,6 +86,37 @@ pub struct OpenAiCompatClient {
     api_key: String,
     provider_name: String,
     cache_keying: PromptCacheKeying,
+    /// Serve solo agli endpoint [`PromptCacheKeying::requires_upstream_pinning`],
+    /// per leggere quale fornitore a valle preferire. Opzionale: i test che
+    /// esercitano la sola mappatura request/response non hanno DB, e senza si
+    /// perde un riuso di prefisso, non la correttezza.
+    db: Option<PgPool>,
+    /// Preferenza per modello, con la TTL delle altre cache del gateway (60s,
+    /// punto unico `TtlCache`). `None` in valore = misurato assente, e va
+    /// ricordato: senza, ogni chiamata su un modello senza riga interrogherebbe
+    /// il DB da capo.
+    upstream_order: TtlCache<String, Option<Vec<String>>>,
+}
+
+/// TTL della cache delle preferenze di fornitore (come `policy_engine`/`cooldown`).
+const UPSTREAM_AFFINITY_TTL: Duration = Duration::from_secs(60);
+
+/// Legge il CSV di `nexus_router_upstream_affinity.upstream_order`.
+///
+/// Funzione PURA, separata dalla lettura DB: il CSV lo scrive un umano in una
+/// migrazione, quindi lo spazio dopo la virgola e' la norma e non deve entrare
+/// nel nome del fornitore — un ordine con `" DeepInfra"` non lo soddisfa
+/// nessuno, e l'instradatore lo tratterebbe come una preferenza impossibile.
+/// Un CSV vuoto o di soli separatori vale "nessuna preferenza": e' diverso da
+/// una preferenza vuota, che sul wire sarebbe un vincolo insoddisfacibile.
+fn parse_upstream_order(csv: &str) -> Option<Vec<String>> {
+    let v: Vec<String> = csv
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!v.is_empty()).then_some(v)
 }
 
 impl OpenAiCompatClient {
@@ -106,6 +141,8 @@ impl OpenAiCompatClient {
             // danno (campo sconosciuto -> HTTP 400), mentre ometterla costa al
             // massimo un riuso mancato.
             cache_keying: PromptCacheKeying::ProviderManaged,
+            db: None,
+            upstream_order: TtlCache::new(UPSTREAM_AFFINITY_TTL),
         }
     }
 
@@ -114,6 +151,42 @@ impl OpenAiCompatClient {
     pub fn with_prompt_cache_keying(mut self, keying: PromptCacheKeying) -> Self {
         self.cache_keying = keying;
         self
+    }
+
+    /// Aggancia il DB da cui leggere la preferenza di fornitore a valle
+    /// (`nexus_router_upstream_affinity`, mig 0657). Serve ai soli instradatori:
+    /// altrove la preferenza non viene nemmeno interrogata.
+    pub fn with_db(mut self, db: Option<PgPool>) -> Self {
+        self.db = db;
+        self
+    }
+
+    /// Fornitori a valle preferiti per questo modello, in ordine.
+    ///
+    /// Interroga solo se l'endpoint e' un instradatore: su un provider diretto la
+    /// domanda non ha senso e la riga non esisterebbe. Un DB assente o una query
+    /// fallita valgono "nessuna preferenza": si perde il riuso del prefisso, non
+    /// la chiamata — l'opposto di quello che farebbe rifiutare la richiesta.
+    async fn upstream_order_for(&self, model: &str) -> Option<Vec<String>> {
+        if !self.cache_keying.requires_upstream_pinning() {
+            return None;
+        }
+        if let Some(v) = self.upstream_order.get(model) {
+            return v;
+        }
+        let db = self.db.as_ref()?;
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT upstream_order FROM nexus_router_upstream_affinity \
+             WHERE provider = $1 AND model_id = $2 AND is_active",
+        )
+        .bind(&self.provider_name)
+        .bind(model)
+        .fetch_optional(db)
+        .await
+        .unwrap_or(None);
+        let ordine = row.and_then(|(csv,)| parse_upstream_order(&csv));
+        self.upstream_order.insert(model.to_string(), ordine.clone());
+        ordine
     }
 
     /// Come questo client dichiara il riuso del prefisso. Esposto perche' il
@@ -142,7 +215,9 @@ impl OpenAiCompatClient {
         req: &LlmRequest,
         reasoning: &ResolvedReasoning,
     ) -> anyhow::Result<LlmResponse> {
-        let mut body = build_request_body(req, false, reasoning, self.cache_keying);
+        let ordine = self.upstream_order_for(&req.model).await;
+        let mut body =
+            build_request_body(req, false, reasoning, self.cache_keying, ordine.as_deref());
         if provider_requires_user_or_tool_last(&self.provider_name) {
             strip_trailing_assistant(&mut body.messages);
         }
@@ -197,7 +272,9 @@ impl OpenAiCompatClient {
         req: &LlmRequest,
         reasoning: &ResolvedReasoning,
     ) -> anyhow::Result<ChunkStream> {
-        let mut body = build_request_body(req, true, reasoning, self.cache_keying);
+        let ordine = self.upstream_order_for(&req.model).await;
+        let mut body =
+            build_request_body(req, true, reasoning, self.cache_keying, ordine.as_deref());
         if provider_requires_user_or_tool_last(&self.provider_name) {
             strip_trailing_assistant(&mut body.messages);
         }
@@ -708,6 +785,7 @@ fn build_request_body(
     stream: bool,
     reasoning: &ResolvedReasoning,
     cache_keying: PromptCacheKeying,
+    upstream_order: Option<&[String]>,
 ) -> ChatCompletionRequest {
     let mut messages: Vec<WireMessage> = req.messages.iter().map(to_wire_message).collect();
 
@@ -809,6 +887,18 @@ fn build_request_body(
             PromptCacheKeying::RequiresSessionId => Some(prompt_cache_key(req)),
             PromptCacheKeying::ProviderManaged | PromptCacheKeying::RequiresKey => None,
         },
+        // Terzo livello di affinita': QUALE fornitore a valle. `session_id`
+        // doveva fissarlo e non lo fissa (misurato: 8 chiamate consecutive
+        // ripartite su tre fornitori), e i fornitori dello stesso modello non si
+        // equivalgono — su qwen3-235b solo Google serve il prefisso. Il criterio
+        // e' nell'enum, il valore nel DB (mig 0657): qui si applica soltanto.
+        provider: upstream_order
+            .filter(|_| cache_keying.requires_upstream_pinning())
+            .filter(|o| !o.is_empty())
+            .map(|o| WireProviderRouting {
+                order: o.to_vec(),
+                allow_fallbacks: true,
+            }),
         temperature,
         max_tokens,
         max_completion_tokens,
@@ -1452,6 +1542,12 @@ struct ChatCompletionRequest {
     /// si paga il prompt intero.
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<String>,
+    /// Fornitore a valle preferito, per gli instradatori. Necessario perche'
+    /// `session_id` da solo NON lo tiene fermo: misurato il 29/07/2026 su
+    /// OpenRouter, la stessa sequenza di 8 chiamate girava fra tre fornitori.
+    /// Omesso ovunque non serva.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<WireProviderRouting>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1484,6 +1580,21 @@ struct ChatCompletionRequest {
 #[derive(Debug, Serialize)]
 struct StreamOptions {
     include_usage: bool,
+}
+
+/// Preferenza di fornitore a valle, dialetto degli instradatori (OpenRouter
+/// `provider`).
+///
+/// `allow_fallbacks` resta TRUE per scelta misurata: il 29/07/2026, con i
+/// ripieghi attivi, l'ordine da solo ha tenuto fermo il fornitore per 8 chiamate
+/// su 8 sia su `z-ai/glm-4.7-flash` (DeepInfra) sia su
+/// `qwen/qwen3-235b-a22b-2507` (Google). Non c'e' quindi ragione di pagare la
+/// perdita del ripiego: con `false`, un fornitore giu' farebbe fallire la
+/// richiesta invece di costare il solo riuso del prefisso.
+#[derive(Debug, Serialize)]
+struct WireProviderRouting {
+    order: Vec<String>,
+    allow_fallbacks: bool,
 }
 
 /// Corpo della richiesta `POST /images/generations` (dialetto OpenAI Images).
@@ -1845,6 +1956,7 @@ mod tests {
             false,
             &ResolvedReasoning::none(),
             PromptCacheKeying::RequiresKey,
+            None,
         ))
         .expect("serializza");
         let chiave = con
@@ -1864,6 +1976,7 @@ mod tests {
             false,
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
+            None,
         ))
         .expect("serializza");
         assert!(senza.get("prompt_cache_key").is_none());
@@ -1881,6 +1994,7 @@ mod tests {
             false,
             &ResolvedReasoning::none(),
             PromptCacheKeying::RequiresSessionId,
+            None,
         ))
         .expect("serializza");
         assert_eq!(sticky.get("session_id").and_then(|v| v.as_str()), Some(chiave));
@@ -1889,6 +2003,201 @@ mod tests {
             Some(chiave),
             "senza prompt_cache_key il fornitore a valle non riconosce la conversazione"
         );
+        // Senza preferenza risolta il campo non compare: chi non ha una riga in
+        // `nexus_router_upstream_affinity` deve partire come prima.
+        assert!(
+            sticky.get("provider").is_none(),
+            "nessuna preferenza risolta: il campo va omesso, non inviato vuoto"
+        );
+    }
+
+    /// Campo wire con cui un instradatore riceve la preferenza di fornitore.
+    const CAMPO_PROVIDER: &str = "provider";
+    /// L'instradatore su cui la preferenza e' stata misurata.
+    const INSTRADATORE: &str = "openrouter";
+    /// Il modello su cui l'intermittenza e' stata misurata (mig 0657).
+    const MODELLO_MISURATO: &str = "qwen/qwen3-235b-a22b-2507";
+    /// Il fornitore a valle che su quel modello serve il prefisso.
+    const PREFERITO: &str = "Google";
+
+    /// Terzo livello di affinita': la richiesta dichiara QUALE fornitore a valle.
+    ///
+    /// Il difetto che copre e' esattamente cio' che i due campi sopra NON
+    /// bastavano a chiudere. MISURATO il 29/07/2026 contro l'API OpenRouter, 8
+    /// chiamate consecutive a prefisso identico CON `session_id` e
+    /// `prompt_cache_key` regolarmente inviati: `qwen/qwen3-235b-a22b-2507`
+    /// rimbalzava fra DeepInfra, Alibaba e Novita con 0/8 di cache; fissata la
+    /// preferenza su Google, 6/6 al 99%. `session_id` il fornitore non lo fissa.
+    #[test]
+    fn il_fornitore_a_valle_si_dichiara_solo_sugli_instradatori() {
+        let req = sample_request();
+        let ordine = vec![PREFERITO.to_string(), "DeepInfra".to_string()];
+
+        let instradatore = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            &ResolvedReasoning::none(),
+            PromptCacheKeying::RequiresSessionId,
+            Some(&ordine),
+        ))
+        .expect("serializza");
+        let p = instradatore
+            .get(CAMPO_PROVIDER)
+            .expect("l'instradatore deve ricevere la preferenza di fornitore");
+        assert_eq!(
+            p.get("order").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(2),
+            "l'ordine va inoltrato intero: il secondo nome e' il ripiego preferito"
+        );
+        assert_eq!(p["order"][0].as_str(), Some(PREFERITO));
+        // PREFERENZA, non vincolo. Misurato che l'ordine tiene fermo il fornitore
+        // anche coi ripieghi attivi (8/8 su entrambi i modelli provati), quindi
+        // spegnerli costerebbe la resilienza senza comprare nulla: con `false`,
+        // un fornitore giu' fa fallire la richiesta invece di costare il solo
+        // riuso del prefisso.
+        assert_eq!(
+            p.get("allow_fallbacks").and_then(|v| v.as_bool()),
+            Some(true),
+            "il ripiego resta attivo: perdere il prefisso costa meno che perdere la chiamata"
+        );
+
+        // Su un provider diretto la domanda non esiste: non c'e' nessun fornitore
+        // a valle da scegliere, e il campo sarebbe sconosciuto al dialetto.
+        for keying in [
+            PromptCacheKeying::ProviderManaged,
+            PromptCacheKeying::RequiresKey,
+        ] {
+            let diretto = serde_json::to_value(build_request_body(
+                &req,
+                false,
+                &ResolvedReasoning::none(),
+                keying,
+                Some(&ordine),
+            ))
+            .expect("serializza");
+            assert!(
+                diretto.get(CAMPO_PROVIDER).is_none(),
+                "{keying:?} non instrada verso terzi: il campo non deve partire"
+            );
+        }
+
+        // Un ordine vuoto e' "nessuna preferenza", non "preferisci niente": un
+        // `order: []` inviato a OpenRouter e' un vincolo che nessun fornitore
+        // soddisfa.
+        let vuoto = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            &ResolvedReasoning::none(),
+            PromptCacheKeying::RequiresSessionId,
+            Some(&[]),
+        ))
+        .expect("serializza");
+        assert!(
+            vuoto.get(CAMPO_PROVIDER).is_none(),
+            "ordine vuoto = campo omesso"
+        );
+    }
+
+    /// Il criterio sta nell'enum, non sparso nei call site (regola L): questo
+    /// test guarda il punto unico, cosi' un nuovo instradatore aggiunto a
+    /// `cache_keying_per_endpoint` eredita il livello senza altre modifiche.
+    #[test]
+    fn solo_gli_instradatori_dichiarano_il_fornitore_a_valle() {
+        assert!(PromptCacheKeying::RequiresSessionId.requires_upstream_pinning());
+        assert!(!PromptCacheKeying::RequiresKey.requires_upstream_pinning());
+        assert!(!PromptCacheKeying::ProviderManaged.requires_upstream_pinning());
+    }
+
+    /// La preferenza arriva dal DB REALE, sulla migrazione reale (regola O).
+    ///
+    /// I test qui sopra passano l'ordine a mano: provano che il body lo porta,
+    /// non che qualcuno lo sappia leggere. Il difetto da cui nasce questo modulo
+    /// era esattamente una richiesta che partiva senza il campo che credevamo di
+    /// mandare, quindi la catena va attraversata dove sta davvero il valore —
+    /// la riga di `nexus_router_upstream_affinity` (mig 0657).
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_preferenza_arriva_dal_db(pool: sqlx::PgPool) {
+        // Costruito qui e non a mano ogni volta: e' lo stesso endpoint, e tre
+        // copie della stessa configurazione si sarebbero potute scostare senza
+        // che il test se ne accorgesse.
+        let apri = |nome: &str, keying| {
+            OpenAiCompatClient::new(Client::new(), "https://esempio.invalid/v1", "chiave", nome)
+                .with_prompt_cache_keying(keying)
+                .with_db(Some(pool.clone()))
+        };
+        let client = apri(INSTRADATORE, PromptCacheKeying::RequiresSessionId);
+
+        // Un modello senza riga non ha preferenza: deve partire come prima, non
+        // con un ordine inventato. `x-ai/grok-4.5` e' il caso reale — un solo
+        // fornitore a valle, niente da scegliere — e infatti la 0657 non lo
+        // elenca.
+        assert_eq!(client.upstream_order_for("x-ai/grok-4.5").await, None);
+
+        // La preferenza MISURATA arriva dalla migrazione, non da un inserimento
+        // di comodo: se qualcuno cambia la 0657, questo test se ne accorge.
+        let ordine = client
+            .upstream_order_for(MODELLO_MISURATO)
+            .await
+            .expect("la 0657 elenca questo modello: la preferenza va letta");
+        assert_eq!(
+            ordine,
+            vec![PREFERITO.to_string()],
+            "misurato: solo Google serve il prefisso su questo modello"
+        );
+
+        // CSV multi-valore, con lo spazio che un umano scrive dopo la virgola:
+        // non deve entrare nel nome del fornitore, o l'ordine non lo soddisfa
+        // nessuno.
+        sqlx::query(
+            "INSERT INTO nexus_router_upstream_affinity \
+             (provider, model_id, upstream_order, nota) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(INSTRADATORE)
+        .bind("prova/modello-a-due-fornitori")
+        .bind("Google, DeepInfra")
+        .bind("riga di prova")
+        .execute(&pool)
+        .await
+        .expect("inserisce la preferenza");
+        assert_eq!(
+            client
+                .upstream_order_for("prova/modello-a-due-fornitori")
+                .await,
+            Some(vec![PREFERITO.to_string(), "DeepInfra".to_string()])
+        );
+
+        // E arriva fino al body, che e' cio' che il fornitore legge davvero.
+        let mut req = sample_request();
+        req.model = MODELLO_MISURATO.to_string();
+        let body = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            &ResolvedReasoning::none(),
+            client.cache_keying(),
+            Some(&ordine),
+        ))
+        .expect("serializza");
+        assert_eq!(body[CAMPO_PROVIDER]["order"][0].as_str(), Some(PREFERITO));
+
+        // Una riga disattivata non e' una preferenza: serve a togliere un
+        // fornitore diventato cattivo senza cancellare la misura che lo diceva.
+        sqlx::query("UPDATE nexus_router_upstream_affinity SET is_active = false")
+            .execute(&pool)
+            .await
+            .expect("disattiva");
+        // La cache TTL tiene ancora il valore vecchio: e' un client nuovo a dover
+        // vedere lo stato nuovo, non questo (60s, come le altre cache).
+        let fresco = apri(INSTRADATORE, PromptCacheKeying::RequiresSessionId);
+        assert_eq!(
+            fresco.upstream_order_for(MODELLO_MISURATO).await,
+            None,
+            "riga disattivata: nessuna preferenza"
+        );
+
+        // Su un provider diretto la domanda non si pone nemmeno: stessa riga,
+        // ma il livello non esiste.
+        let diretto = apri("mistral", PromptCacheKeying::RequiresKey);
+        assert_eq!(diretto.upstream_order_for(MODELLO_MISURATO).await, None);
     }
 
     #[test]
@@ -2006,6 +2315,7 @@ mod tests {
             false,
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
+            None,
         );
         let json = serde_json::to_value(&body).unwrap();
 
@@ -2060,7 +2370,7 @@ mod tests {
             enabled: true,
             effort: None,
         };
-        let body = build_request_body(&req, false, &deepseek, PromptCacheKeying::ProviderManaged);
+        let body = build_request_body(&req, false, &deepseek, PromptCacheKeying::ProviderManaged, None);
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(
             json["messages"][0]["reasoning_content"], "ho ragionato cosi'",
@@ -2078,6 +2388,7 @@ mod tests {
             false,
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
+            None,
         );
         let json_base = serde_json::to_value(&body_base).unwrap();
         assert!(
@@ -2111,6 +2422,7 @@ mod tests {
             false,
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
+            None,
         ))
             .unwrap();
         assert_eq!(json["tool_choice"], "required");
@@ -2121,6 +2433,7 @@ mod tests {
             false,
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
+            None,
         ))
             .unwrap();
         assert_eq!(json["tool_choice"]["type"], "function");
@@ -2138,6 +2451,7 @@ mod tests {
             false,
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
+            None,
         ))
             .unwrap();
         assert!(json.get("tool_choice").is_none());
@@ -2149,6 +2463,7 @@ mod tests {
             false,
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
+            None,
         ))
             .unwrap();
         assert!(json2.get("tool_choice").is_none());
@@ -2162,6 +2477,7 @@ mod tests {
             true,
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
+            None,
         );
         let json = serde_json::to_value(&body).unwrap();
 
@@ -2180,7 +2496,7 @@ mod tests {
             effort: Some("high".to_string()),
         };
         let json =
-            serde_json::to_value(build_request_body(&req, false, &reasoning, PromptCacheKeying::ProviderManaged)).unwrap();
+            serde_json::to_value(build_request_body(&req, false, &reasoning, PromptCacheKeying::ProviderManaged, None)).unwrap();
 
         // max_tokens -> max_completion_tokens; temperatura omessa; effort inviato.
         assert!(json.get("max_tokens").is_none());
@@ -2198,7 +2514,7 @@ mod tests {
             effort: None,
         };
         let json =
-            serde_json::to_value(build_request_body(&req, false, &reasoning, PromptCacheKeying::ProviderManaged)).unwrap();
+            serde_json::to_value(build_request_body(&req, false, &reasoning, PromptCacheKeying::ProviderManaged, None)).unwrap();
         assert_eq!(json["max_completion_tokens"], 256);
         // Nessun effort configurato: il campo non c'e' (default del modello).
         assert!(json.get("reasoning_effort").is_none());
@@ -2213,7 +2529,7 @@ mod tests {
             effort: None,
         };
         let json =
-            serde_json::to_value(build_request_body(&req, false, &reasoning, PromptCacheKeying::ProviderManaged)).unwrap();
+            serde_json::to_value(build_request_body(&req, false, &reasoning, PromptCacheKeying::ProviderManaged, None)).unwrap();
 
         // extra_body appiattito nel body radice: thinking.type=enabled.
         assert_eq!(json["thinking"]["type"], "enabled");
@@ -2231,7 +2547,7 @@ mod tests {
             effort: None,
         };
         let json =
-            serde_json::to_value(build_request_body(&req, false, &reasoning, PromptCacheKeying::ProviderManaged)).unwrap();
+            serde_json::to_value(build_request_body(&req, false, &reasoning, PromptCacheKeying::ProviderManaged, None)).unwrap();
         assert_eq!(json["thinking"]["type"], "disabled");
     }
 
@@ -2598,6 +2914,7 @@ mod tests {
             false,
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
+            None,
         ))
             .unwrap();
 
@@ -2621,6 +2938,7 @@ mod tests {
             false,
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
+            None,
         ))
             .unwrap();
         let arr = json["messages"][0]["content"].as_array().unwrap();
@@ -2638,6 +2956,7 @@ mod tests {
             false,
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
+            None,
         ))
             .unwrap();
         assert!(json["messages"][0]["content"].is_string());
