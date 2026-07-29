@@ -542,7 +542,7 @@ async fn unit_active_enter(unit: &str) -> Option<String> {
 /// creati fuori dal flusso port_registry); su Windows quella seconda fonte non
 /// esiste (i servizi sono agent_processes, senza Environment= systemd) e ci si
 /// affida alle sole allocazioni registrate.
-async fn ports_for_unit(db: &PgPool, project_id: Uuid, unit: &str) -> Vec<u16> {
+pub(super) async fn ports_for_unit(db: &PgPool, project_id: Uuid, unit: &str) -> Vec<u16> {
     let mut ports: HashSet<u16> = HashSet::new();
     if let Ok(rows) = sqlx::query_scalar::<_, i32>(
         "SELECT port FROM nexus_port_allocations WHERE project_id = $1 AND service_unit = $2",
@@ -598,15 +598,26 @@ async fn unit_env_ports(unit: &str) -> Vec<u16> {
     ports
 }
 
-/// Chiude (resolved) le diagnosi 'crash' aperte di un'unita' tornata sana. Punto
+/// Chiude (resolved) le diagnosi 'crash' APERTE di un'unita' tornata sana. Punto
 /// unico del ciclo di vita dei crash strutturali: quando il servizio e' di nuovo
 /// healthy (porta in ascolto / non failed) il problema sparisce dal pannello,
 /// simmetrico a `resolve_stale_anomalies` per le anomalie.
+///
+/// SOLO `open`, mai `diagnosing`. Una diagnosi in `diagnosing` ha un rimedio in
+/// corso, e la sua chiusura appartiene al contratto di quel rimedio
+/// (`service_recovery`). Prima il predicato includeva `diagnosing`, e questa
+/// funzione veniva invocata da `apply_run_reset` al CAMBIO DEL MARCATORE
+/// D'AVVIO: bastava che il processo rinascesse — cioe' il riavvio che la
+/// remediation stessa aveva appena ordinato — perche' la diagnosi diventasse
+/// `resolved`. Il caso reale (gestione-spese, 28/07): il frontend riparte alle
+/// 21:29, la diagnosi si chiude, il processo muore subito dopo e il guasto
+/// prosegue senza piu' nessuna riga aperta a testimoniarlo. La nascita di un
+/// processo non e' una guarigione.
 async fn resolve_open_crashes(db: &PgPool, project_id: Uuid, unit: &str) -> Vec<Uuid> {
     sqlx::query_scalar(
         "UPDATE service_diagnoses SET status = 'resolved', resolved_at = NOW() \
          WHERE project_id = $1 AND unit = $2 AND signal_kind = 'crash' \
-           AND status IN ('open', 'diagnosing') \
+           AND status = 'open' \
          RETURNING id",
     )
     .bind(project_id)

@@ -192,14 +192,24 @@ async fn collect_failed_job_problems(
         .collect())
 }
 
-/// Aggrega le diagnosi del service_observer (anomaly/crash su servizi systemd
-/// del progetto). E' il secondo store di "problemi" del progetto: prima visibile
+/// Aggrega le diagnosi del service_observer (anomaly/crash su servizi del
+/// progetto). E' il secondo store di "problemi" del progetto: prima visibile
 /// solo via UI separata, ora compare nel pannello "Problemi" come deve essere
-/// (regola L: un solo posto dove l'utente cerca i problemi). Le violazioni di
-/// governance (signal_kind='policy_violation') restano visibili anche durante la
-/// riparazione automatica ('diagnosing') e dopo un fallimento definitivo
-/// ('failed_remediation'): un problema di sicurezza non deve sparire dal pannello
-/// finche' non e' RISOLTO.
+/// (regola L: un solo posto dove l'utente cerca i problemi).
+///
+/// Il criterio di visibilita' e' UNO e vale per ogni `signal_kind`: si mostra
+/// tutto cio' che non e' `resolved`. `resolved` e' l'unico stato che significa
+/// "non e' piu' un problema"; `diagnosing` vuol dire che qualcuno ci sta
+/// lavorando e `failed_remediation` che ci ha provato e non ce l'ha fatta — in
+/// nessuno dei due casi il problema e' finito.
+///
+/// Prima il predicato faceva un'eccezione per le sole `policy_violation`, e i
+/// crash di servizio erano visibili unicamente da `open`. Con la chiusura della
+/// remediation portata sul contratto di `service_recovery`, un crash che il
+/// rimedio non risana finisce in `failed_remediation`: con l'eccezione ristretta
+/// alle violazioni sarebbe sparito dal pannello esattamente come spariva prima
+/// da `resolved`. Sarebbe stato lo stesso difetto, con un nome piu' onesto sulla
+/// riga e nessuno a leggerlo.
 async fn collect_service_diagnosis_problems(
     db: &sqlx::PgPool,
     project_id: Uuid,
@@ -210,9 +220,7 @@ async fn collect_service_diagnosis_problems(
                file_path, created_at
           FROM service_diagnoses
          WHERE project_id = $1
-           AND (status = 'open'
-                OR (signal_kind = 'policy_violation'
-                    AND status IN ('diagnosing', 'failed_remediation')))
+           AND status <> 'resolved'
          ORDER BY created_at DESC
          LIMIT 100
         "#,
@@ -263,8 +271,25 @@ fn diagnosis_row_to_problem(row: sqlx::postgres::PgRow) -> Value {
     })
 }
 
+/// PUNTO UNICO (regola L) del prefisso di stato di una diagnosi: dice a colpo
+/// d'occhio se qualcuno ci sta lavorando o se ci ha provato senza riuscirci.
+///
+/// Vale per OGNI `signal_kind`, non per le sole violazioni risorse: da quando la
+/// chiusura di una remediation di servizio passa dal contratto di
+/// `service_recovery`, un crash puo' stare in `diagnosing` per l'intera verifica
+/// e finire in `failed_remediation` — e senza prefisso la riga direbbe soltanto
+/// "Servizio X: crash", tacendo che una riparazione e' gia' stata tentata e non
+/// ha funzionato.
+fn diagnosis_status_prefix(status: &str) -> &'static str {
+    match status {
+        "failed_remediation" => "Riparazione automatica FALLITA — ",
+        "diagnosing" => "Riparazione automatica in corso — ",
+        _ => "",
+    }
+}
+
 /// Costruisce (source, message) per una diagnosi service_observer. Le violazioni
-/// di policy hanno prefisso di stato riparazione e vengono troncate a 600 char.
+/// di policy vengono troncate a 600 char.
 #[allow(clippy::too_many_arguments)]
 fn diagnosis_source_message(
     signal_kind: &str,
@@ -275,15 +300,11 @@ fn diagnosis_source_message(
     threshold: Option<f64>,
     detail: &Option<String>,
 ) -> (String, String) {
+    let prefix = diagnosis_status_prefix(status);
     if signal_kind == "policy_violation" {
         // metric = 'kind/rule' (es. 'port/enforce_hardcode').
         let rule = metric.clone().unwrap_or_else(|| "resource".to_string());
         let kind_label = rule.split('/').next().unwrap_or("resource").to_string();
-        let prefix = match status {
-            "failed_remediation" => "Riparazione automatica FALLITA — ",
-            "diagnosing" => "Riparazione automatica in corso — ",
-            _ => "",
-        };
         let base = detail
             .clone()
             .filter(|d| !d.is_empty())
@@ -300,7 +321,7 @@ fn diagnosis_source_message(
             (Some(m), None, _) => format!(" — {m}"),
             _ => String::new(),
         };
-        let mut msg = format!("Servizio {unit}: {signal_kind}{metric_part}");
+        let mut msg = format!("{prefix}Servizio {unit}: {signal_kind}{metric_part}");
         if let Some(d) = detail.as_deref().filter(|s| !s.is_empty()) {
             msg.push('\n');
             msg.push_str(d);

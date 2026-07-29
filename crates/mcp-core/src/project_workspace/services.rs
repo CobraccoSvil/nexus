@@ -1145,16 +1145,21 @@ async fn control_project_service_systemd(
 /// Riavvia un'unita' systemd di progetto per NOME COMPLETO (es.
 /// "beauty-book-backend.service"), best-effort, senza passare per l'handler HTTP.
 /// Usato dall'auto-remediation (dopo che il debugger ha applicato un fix) per
-/// chiudere il loop rileva->ripara->RIAVVIA->verifica: l'observer al ciclo
-/// successivo vede il nuovo stato. Condivide gli helper di
+/// chiudere il loop rileva->ripara->RIAVVIA->verifica. Condivide gli helper di
 /// `control_project_service` (free_ports_for_unit, fallback detached WSL) — punto
 /// unico a livello di helper (regola L).
-pub async fn restart_project_unit(state: &AppState, project_id: Uuid, unit: &str) {
+///
+/// Ritorna `acted` (regola M): `true` solo se il backend ha davvero riavviato
+/// qualcosa. Il chiamante NON puo' dedurre da qui che il servizio funzioni — un
+/// riavvio eseguito e' la NASCITA di un processo, non un servizio che serve: il
+/// contratto di successo vive in `service_recovery::restart_and_verify`, che usa
+/// questo valore solo come precondizione ("c'e' qualcosa da verificare?").
+pub async fn restart_project_unit(state: &AppState, project_id: Uuid, unit: &str) -> bool {
     use super::service_manager::{self, ServiceBackend};
 
     if unit.contains('/') || unit.contains("..") || !unit.ends_with(".service") {
         tracing::warn!(unit = %unit, "restart_project_unit: nome unit non valido, skip");
-        return;
+        return false;
     }
 
     // Carica nome + root del progetto per costruire il contesto del ServiceManager
@@ -1170,7 +1175,7 @@ pub async fn restart_project_unit(state: &AppState, project_id: Uuid, unit: &str
         Some(p) => p,
         None => {
             tracing::warn!(unit = %unit, %project_id, "restart_project_unit: progetto non trovato, skip");
-            return;
+            return false;
         }
     };
     let slug = project_service_slug(&name);
@@ -1207,6 +1212,7 @@ pub async fn restart_project_unit(state: &AppState, project_id: Uuid, unit: &str
     } else {
         tracing::warn!(unit = %unit, msg = %outcome.message, "restart_project_unit: riavvio NON effettuato, nessun evento emesso");
     }
+    outcome.acted
 }
 
 // ── POST /api/projects/:id/services/restart-all ─────────────────────────────

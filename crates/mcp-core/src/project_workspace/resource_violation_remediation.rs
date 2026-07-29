@@ -511,6 +511,12 @@ pub(crate) fn spawn_stale_diagnosing_reaper(state: AppState) {
         // Breve attesa: lascia stabilizzare pool e registry dopo il boot.
         tokio::time::sleep(std::time::Duration::from_secs(45)).await;
         reap_stale_diagnosing(&state).await;
+        // Gemello per i crash di servizio: da quando la loro chiusura appartiene
+        // al contratto di `service_recovery` (e non piu' alla rinascita del
+        // processo), un rimedio interrotto da un riavvio di mcp-core lascerebbe
+        // la diagnosi appesa in `diagnosing` per sempre — invisibile esattamente
+        // come il guasto che questo lavoro rende visibile.
+        super::service_recovery::reap_interrupted_service_remediations(&state).await;
     });
 }
 
@@ -536,7 +542,17 @@ async fn reap_stale_diagnosing(state: &AppState) {
 /// True se il run di rimedio e' ancora ATTIVO sul pool del progetto (segnale
 /// strutturato `is_active_run_status`, regola M). DB progetto non disponibile
 /// -> true prudente (non chiudere: al prossimo boot si rivaluta).
-async fn remediation_run_is_active(state: &AppState, project_id: Uuid, run_id: Uuid) -> bool {
+///
+/// PUNTO UNICO (regola L) della domanda "il rimedio e' ancora vivo?": la usa
+/// questo reaper per le violazioni risorse e il gemello di `service_recovery`
+/// per i crash di servizio. Due implementazioni divergerebbero sul significato
+/// di "attivo" — e una diagnosi appesa a un run morto e' invisibile in entrambi
+/// i casi.
+pub(super) async fn remediation_run_is_active(
+    state: &AppState,
+    project_id: Uuid,
+    run_id: Uuid,
+) -> bool {
     let runs_pool =
         match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
             Ok(p) => p,
