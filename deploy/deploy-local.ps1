@@ -165,9 +165,21 @@ if (-not $NoRestart) {
 if ($doWeb -and -not $NoRestart) {
   Write-Host '== build web-ide (next, a servizio fermo) ==' -ForegroundColor Cyan
   Set-Location "$ROOT\apps\web-ide"
+  # NODE_ENV vale per QUESTA build e viene ripristinato subito: piu' avanti la
+  # stessa shell avvia lo stack via dev-start.ps1, e quei processi ereditano il
+  # suo ambiente. Lasciandolo impostato, mcp-core ereditava NODE_ENV=production e
+  # lo passava ai comandi degli agenti: `npm install` nei progetti saltava le
+  # devDependencies (niente Vite, niente Tailwind) senza che nulla fallisse.
+  # Misurato il 29/07/2026: 33 pacchetti installati invece di 112.
+  $nodeEnvPrec = [Environment]::GetEnvironmentVariable('NODE_ENV', 'Process')
   $env:NODE_ENV = 'production'
-  pnpm exec next build
-  if ($LASTEXITCODE -ne 0) { throw 'next build fallito' }
+  try {
+    pnpm exec next build
+    if ($LASTEXITCODE -ne 0) { throw 'next build fallito' }
+  } finally {
+    if ($null -eq $nodeEnvPrec) { Remove-Item -Path env:NODE_ENV -ErrorAction SilentlyContinue }
+    else { $env:NODE_ENV = $nodeEnvPrec }
+  }
   Set-Location $ROOT
 } elseif ($doWeb) {
   # Con -NoRestart non si e' fermato nulla: ricostruire .next sotto il node vivo

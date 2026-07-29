@@ -107,7 +107,27 @@ const DEFAULT_CPUS: f64 = 2.0;
 
 /// Variabili d'ambiente del processo Nexus che NON devono mai
 /// essere propagate ai container dei progetti.
+///
+/// Due famiglie, per due danni diversi.
+///
+/// La prima e' quella storica: credenziali e indirizzi del meta-DB. Il danno e'
+/// una fuga di segreti verso un processo che non deve vederli.
+///
+/// La seconda governa come si COMPORTANO gli strumenti di build del progetto, e
+/// il danno e' piu' silenzioso: nessun errore, un risultato diverso. Misurato il
+/// 29/07/2026 su un run reale — `deploy-local.ps1` imposta `NODE_ENV=production`
+/// per il build del web-ide e non lo ripristina; `dev-start.ps1` avvia lo stack
+/// dalla stessa shell e i processi ereditano (lo dichiara il suo commento); da
+/// li' l'ambiente arriva ai comandi dell'agente. Con `NODE_ENV=production` npm
+/// SALTA le devDependencies: nel progetto restavano 33 pacchetti invece di 112,
+/// senza Vite ne' Tailwind, e nessun comando falliva. L'agente vedeva i pacchetti
+/// mancanti, cancellava `node_modules` e reinstallava, all'infinito.
+///
+/// Il criterio non e' l'elenco: e' che l'ambiente di NEXUS non deve decidere come
+/// si costruisce il progetto dell'utente. Chi aggiunge una variabile che cambia
+/// il comportamento di un build tool la aggiunge qui.
 const BLOCKED_ENV: &[&str] = &[
+    // Credenziali e indirizzi del meta: fuga di segreti.
     "DATABASE_URL",
     "REDIS_URL",
     "NEURAL_CORE_URL",
@@ -128,6 +148,14 @@ const BLOCKED_ENV: &[&str] = &[
     "POSTGRES_PASSWORD",
     "POSTGRES_USER",
     "PGPASSWORD",
+    // Comportamento degli strumenti di build: il progetto li decide da se'.
+    // `NODE_ENV` governa se npm installa le devDependencies; `NODE_OPTIONS` e
+    // `NPM_CONFIG_PRODUCTION`/`NPM_CONFIG_OMIT` fanno lo stesso per altre vie, e
+    // sarebbero la stessa trappola con un nome diverso.
+    "NODE_ENV",
+    "NODE_OPTIONS",
+    "NPM_CONFIG_PRODUCTION",
+    "NPM_CONFIG_OMIT",
 ];
 
 // ─── SandboxConfig ────────────────────────────────────────────────────────────
@@ -859,6 +887,11 @@ mod tests_isolated_env {
             ("SYSTEMROOT", r"C:\Windows"),
             ("TEMP", r"C:\Temp"),
             ("npm_config_registry", "https://registry.npmjs.org"),
+            // C'e' DAVVERO nell'ambiente di mcp-core: `deploy-local.ps1` lo
+            // imposta per il build del web-ide e lo stack parte dalla stessa
+            // shell. Sta qui perche' l'env di prova sia quello vero, non quello
+            // che farebbe comodo.
+            ("NODE_ENV", "production"),
         ]
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -877,6 +910,31 @@ mod tests_isolated_env {
         for kept in ["PATH", "HOME", "SYSTEMROOT", "TEMP", "npm_config_registry"] {
             assert!(env.contains_key(kept), "'{kept}' filtrata per errore");
         }
+    }
+
+    #[test]
+    fn l_ambiente_di_build_di_nexus_non_raggiunge_il_progetto() {
+        // Il difetto misurato il 29/07/2026: mcp-core aveva NODE_ENV=production
+        // (ereditato dalla shell del deploy) e lo passava ai comandi dell'agente.
+        // `npm install` saltava le devDependencies: 33 pacchetti invece di 112,
+        // senza Vite ne' Tailwind, e NESSUN comando falliva — il frontend non
+        // partiva e l'agente reinstallava all'infinito.
+        //
+        // Passa da `filtered_safe_env`, la funzione che i call site usano davvero.
+        let env = filtered_safe_env(host_env_meta());
+        assert!(
+            !env.contains_key("NODE_ENV"),
+            "NODE_ENV di Nexus raggiunge il progetto: npm saltera' le devDependencies"
+        );
+        // Le altre vie per lo stesso effetto: bloccarne una sola sposterebbe il
+        // difetto invece di chiuderlo.
+        for k in ["NODE_OPTIONS", "NPM_CONFIG_PRODUCTION", "NPM_CONFIG_OMIT"] {
+            assert!(is_blocked_env(k), "'{k}' altera il build del progetto ma passa");
+            assert!(is_blocked_env(&k.to_lowercase()), "'{k}' passa in minuscolo");
+        }
+        // La configurazione che NON decide come si costruisce (da dove si scarica)
+        // resta: e' una blacklist, non una whitelist.
+        assert!(env.contains_key("npm_config_registry"));
     }
 
     #[test]
