@@ -22,7 +22,31 @@ use reqwest::Client;
 
 use crate::provider::{ChunkStream, LlmProvider};
 use crate::providers::openai_compat::OpenAiCompatClient;
-use crate::types::{LlmRequest, LlmResponse, SensitivityTier};
+use crate::types::{LlmRequest, LlmResponse, PromptCacheKeying, SensitivityTier};
+
+/// Come questo endpoint del registry vuole che si dichiari il riuso del
+/// prefisso (vedi [`PromptCacheKeying`]).
+///
+/// Qui il provider non e' noto a compile time — e' un descrittore di riga — e la
+/// sola cosa che lo identifica e' il nome, quindi e' da li' che il dialetto va
+/// letto. Resta un punto solo: chi aggiunge un instradatore lo aggiunge qui e
+/// nessun altro file cambia.
+///
+/// Nota: `nexus_provider_capabilities` ha due colonne che sembrerebbero il posto
+/// giusto (`supports_prompt_cache`, `prompt_cache_dialect`), ma sono FOSSILI —
+/// non compaiono in nessun file di codice, solo nelle migrazioni che le hanno
+/// create, e i valori sono ormai falsi (deepseek vi risulta senza cache mentre
+/// ne serve il 63% misurato). Leggerle oggi significherebbe spegnere la cache
+/// dove funziona.
+fn cache_keying_per_endpoint(name: &str) -> PromptCacheKeying {
+    match name {
+        // Smista verso fornitori terzi: senza `session_id` i turni successivi
+        // possono atterrare su un endpoint che il prefisso non ce l'ha.
+        "openrouter" => PromptCacheKeying::RequiresSessionId,
+        // groq, perplexity e gli altri: nessun campo documentato, si arrangiano.
+        _ => PromptCacheKeying::ProviderManaged,
+    }
+}
 
 /// Provider OpenAI-compatibile con capacita' dichiarate dal registry.
 pub struct GenericOpenAiProvider {
@@ -47,7 +71,8 @@ impl GenericOpenAiProvider {
         supports_tools: bool,
     ) -> Self {
         let name = name.into();
-        let client = OpenAiCompatClient::new(http, base_url, api_key, name.as_str());
+        let client = OpenAiCompatClient::new(http, base_url, api_key, name.as_str())
+            .with_prompt_cache_keying(cache_keying_per_endpoint(&name));
         Self {
             client,
             name,
