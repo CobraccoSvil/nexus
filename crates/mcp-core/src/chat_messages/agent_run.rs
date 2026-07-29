@@ -1573,6 +1573,29 @@ pub(crate) async fn native_outcome_to_run_result(
         (other, _, _) => other,
     };
 
+    // Riscontro dei requisiti emessi dal Consiglio delle Competenze (regola M:
+    // il contenuto dei file, mai la dichiarazione dell'agente). Il Consiglio e'
+    // ADVISORY per decisione di prodotto del 13/07/2026: la nota INFORMA di uno
+    // scostamento, non degrada l'esito e non riscrive lo status del run. Per
+    // questo la forma e' quella della nota in coda (come la verifica tecnica non
+    // eseguita) e non `compose_unconfirmed_report`, che presenta il resoconto
+    // come auto-valutazione non confermata.
+    //
+    // La nota si scrive anche quando tutto risulta applicato: il silenzio non
+    // distingue "verificato, conforme" da "nessuno ha guardato", ed era proprio
+    // il secondo il caso — i requisiti arrivavano al coordinatore e nessuno li
+    // riscontrava piu'.
+    let final_answer = match (
+        final_answer,
+        outcome
+            .council_conformance
+            .as_ref()
+            .and_then(nexus_agent_graph::decisions::ConformanceReport::nota),
+    ) {
+        (Some(ans), Some(nota)) => Some(format!("{ans}\n\n---\n\n{nota}")),
+        (other, _) => other,
+    };
+
     // Segnale STRUTTURATO del lavoro svolto per DELEGA (regola M). Sotto
     // todo-isolation (`supervisor_mode=continuous`) i todo del piano sono
     // eseguiti come SUB-RUN isolati: il run PRINCIPALE e' solo un dispatcher e
@@ -7986,6 +8009,8 @@ mod tests_native_mapping {
             review_panel_no_correction: false,
             review_panel_last: None,
             pending_actions: Vec::new(),
+            council_requirements: Vec::new(),
+            council_conformance: None,
         }
     }
 
@@ -8173,6 +8198,175 @@ mod tests_native_mapping {
         // consumatore risomma la cache (sarebbe un doppio conteggio).
         assert_eq!(r.completion_tokens, 1_200);
         assert_eq!(r.total_tokens, 42_200);
+    }
+
+    /// Stato del grafo come lo lascia un run a cui il Consiglio ha posto dei
+    /// vincoli: la sintesi e' quella VERA (composta dal produttore
+    /// `compose_advisory_synthesis` sul parere di una figura), non un JSON
+    /// scritto a mano — se un giorno il campo `requirements` cambiasse nome, il
+    /// test deve accorgersene invece di continuare a leggere il proprio mock
+    /// (regola O).
+    fn stato_con_requisiti_del_consiglio(
+        requirements: &[&str],
+        recommendations: &[&str],
+    ) -> nexus_agent_graph::state::AgentState {
+        use nexus_agent_graph::decisions::{
+            compose_advisory_synthesis, AdvisoryPolicy, AdvisoryRoster,
+        };
+        let parere = serde_json::json!({
+            "success": true,
+            "advisory": {
+                "verdict": "block",
+                "risks": [],
+                "requirements": requirements,
+                "recommendations": recommendations,
+            }
+        });
+        let synth = compose_advisory_synthesis(
+            &[parere],
+            &AdvisoryPolicy::default(),
+            AdvisoryRoster::Convened(1),
+        )
+        .expect("il consiglio ha deliberato");
+
+        let mut state = nexus_agent_graph::state::AgentState {
+            result: Some("Task completato: porta resa dinamica.".to_string()),
+            ..Default::default()
+        };
+        // La stessa chiave con cui il coordinatore ha ricevuto il parere nel
+        // prompt: e' il segnale che il riscontro deve ritrovare a fine run.
+        state.extra.insert(
+            nexus_agent_graph::nodes::PRE_RUN_ADVISORY_SYNTHESIS_KEY.to_string(),
+            synth.to_value(),
+        );
+        state
+    }
+
+    /// LA CONSEGUENZA (regola O): un requisito del Consiglio NON applicato deve
+    /// risultare non soddisfatto NEL RESOCONTO che l'utente legge.
+    ///
+    /// Il test attraversa la catena di produzione per intero: parere della figura
+    /// -> `compose_advisory_synthesis` -> stato del grafo -> `map_outcome`
+    /// (estrazione dei requisiti) -> `riscontra_requisiti_su_root` (lettura del
+    /// file VERO su disco) -> `native_outcome_to_run_result` (il resoconto).
+    /// Fermarsi al criterio proverebbe solo che la misura sa misurare, non che
+    /// qualcuno la guarda — ed e' precisamente il difetto che questo lavoro
+    /// chiude: il segnale c'era, nessuno lo riscontrava.
+    ///
+    /// MUTAZIONE: rendere la verifica sempre-vera (in
+    /// `requirement_conformance::judge`, ritornare `Soddisfatto` su ogni ramo)
+    /// rende rosso questo test — il resoconto perde la riga "NON APPLICATO".
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn requisito_ignorato_compare_nel_resoconto(pool: sqlx::PgPool) {
+        use nexus_graph::outcome::StepOutcome;
+
+        let run = setup_mapping_run(&pool).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("frontend")).expect("cartella frontend");
+        // Il file NON e' stato corretto: la porta fissa e' ancora li'.
+        std::fs::write(
+            dir.path().join("frontend/vite.config.js"),
+            "export default {\n  server: {\n    port: 33649,\n  },\n}\n",
+        )
+        .expect("scrittura vite.config.js");
+
+        let state = stato_con_requisiti_del_consiglio(
+            &["Rimuovere `port: 33649` da `frontend/vite.config.js` e sostituirla con un valore dinamico"],
+            &["Aggiungere un health probe prima dell'avvio"],
+        );
+
+        let mut outcome = crate::native_engine::map_outcome(StepOutcome::Completed(state));
+        assert_eq!(
+            outcome.council_requirements.len(),
+            1,
+            "map_outcome estrae i REQUISITI dalla sintesi; la raccomandazione non entra"
+        );
+        outcome.council_conformance = Some(crate::native_engine::riscontra_requisiti_su_root(
+            dir.path(),
+            &outcome.council_requirements,
+        ));
+
+        let r = native_outcome_to_run_result(&pool, run, outcome).await;
+        let resoconto = r.final_answer.expect("un resoconto c'e'");
+        assert!(
+            resoconto.contains("NON APPLICATO"),
+            "lo scostamento deve essere visibile nel resoconto: {resoconto}"
+        );
+        assert!(
+            resoconto.contains("NON applicati: 1 su 1"),
+            "il conteggio dichiara la portata dello scostamento: {resoconto}"
+        );
+        assert!(
+            resoconto.contains("riga 3"),
+            "l'evidenza cita il fatto osservato sul file: {resoconto}"
+        );
+        assert!(
+            resoconto.starts_with("Task completato"),
+            "il Consiglio e' advisory: la nota si aggiunge al resoconto, non lo sostituisce"
+        );
+        assert_eq!(
+            r.status,
+            crate::agent_types::AgentRunStatus::Completed,
+            "informazione, non gate: lo scostamento NON declassa lo status del run"
+        );
+    }
+
+    /// Il rovescio, e la ragione per cui la nota si scrive sempre: un requisito
+    /// APPLICATO risulta applicato, e uno non controllabile risulta NON
+    /// VERIFICABILE — mai silenziosamente a posto (punto 3 del difetto).
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn requisito_applicato_e_requisito_non_verificabile_nel_resoconto(pool: sqlx::PgPool) {
+        use nexus_graph::outcome::StepOutcome;
+
+        let run = setup_mapping_run(&pool).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("frontend")).expect("cartella frontend");
+        // Questa volta il fix c'e' davvero.
+        std::fs::write(
+            dir.path().join("frontend/vite.config.js"),
+            "export default {\n  server: {\n    port: process.env.PORT,\n    strictPort: false,\n  },\n}\n",
+        )
+        .expect("scrittura vite.config.js");
+
+        let state = stato_con_requisiti_del_consiglio(
+            &[
+                "Rimuovere `port: 33649` da `frontend/vite.config.js` e sostituirla con un valore dinamico",
+                "Aggiungere un health probe che verifichi la disponibilita' della porta prima dell'avvio",
+            ],
+            &[],
+        );
+
+        let mut outcome = crate::native_engine::map_outcome(StepOutcome::Completed(state));
+        outcome.council_conformance = Some(crate::native_engine::riscontra_requisiti_su_root(
+            dir.path(),
+            &outcome.council_requirements,
+        ));
+
+        let r = native_outcome_to_run_result(&pool, run, outcome).await;
+        let resoconto = r.final_answer.expect("un resoconto c'e'");
+        assert!(
+            resoconto.contains("applicati: 1 su 2"),
+            "il conteggio non gonfia: uno applicato su due requisiti: {resoconto}"
+        );
+        assert!(
+            resoconto.contains("NON VERIFICABILE:"),
+            "il requisito descrittivo e' dichiarato tale, non contato come rispettato: {resoconto}"
+        );
+        assert!(
+            !resoconto.contains("NON APPLICATO"),
+            "nessuno scostamento osservato: {resoconto}"
+        );
+    }
+
+    /// Un run senza requisiti non aggiunge una riga di rumore al resoconto: la
+    /// nota esiste per dire qualcosa, non per esserci.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn senza_consiglio_nessuna_nota_nel_resoconto(pool: sqlx::PgPool) {
+        let run = setup_mapping_run(&pool).await;
+        let mut o = outcome_base();
+        o.final_answer = Some("Fatto.".to_string());
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.final_answer.as_deref(), Some("Fatto."));
     }
 
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]

@@ -77,6 +77,13 @@
 //!     chiamate ai tool di scrittura ne' la prosa dell'agente (regola M); l'I/O
 //!     e' la porta [`crate::runtime::ports::MutationProgressPort`], che porta i
 //!     fatti e non li giudica.
+//!   - [`requirement_conformance`]: PUNTO UNICO di "i requisiti emessi dal
+//!     Consiglio sono stati applicati?". Il criterio e' il CONTENUTO del file
+//!     (regola M), mai la dichiarazione dell'agente; l'incertezza degrada sempre
+//!     a "non verificabile", mai a "soddisfatto". Solo `requirements` entra nella
+//!     misura: `recommendations` e' l'altra lista e non genera rilievi. L'I/O
+//!     (leggere il file dal workspace) e' il parametro `leggi` di
+//!     `compose_conformance`.
 //!
 //! Le `route_after_*` NON sono qui: stanno nel PR 2b.
 
@@ -103,6 +110,7 @@ pub mod panel_quorum;
 pub mod severity;
 pub mod predictive_cap;
 pub mod progress_controller;
+pub mod requirement_conformance;
 pub mod reward;
 pub mod scale_reason;
 pub mod supervisor;
@@ -130,6 +138,10 @@ pub use context_reduction::{
 };
 pub use correction_progress::{
     classify_correction_progress, CorrectionProgress, WriteFact,
+};
+pub use requirement_conformance::{
+    compose_conformance, conformance_senza_progetto, requirements_from_synthesis,
+    ConformanceReport, FileEvidence, RequirementCriterion, RequirementOutcome, RequirementVerdict,
 };
 pub use dag_scheduler::{
     compute_ready_layer, descendants, pick_next_todo, should_parallelize, DagConfig, Todo,

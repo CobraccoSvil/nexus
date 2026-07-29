@@ -1186,6 +1186,50 @@ else
   echo "OK correction-progress: il criterio vive nel punto unico e la porta e' innestata"
 fi
 
+# ── conformita' ai requisiti del Consiglio ───────────────────────────────────
+# Due presidi per lo stesso punto unico (regola L), e il secondo e' il piu'
+# importante: e' la forma del difetto che il modulo chiude.
+#
+# 1. I REQUISITI si leggono dalla sintesi con `requirements_from_synthesis`.
+#    Chi si prendesse il campo per conto proprio prima o poi ci aggiungerebbe
+#    `recommendations` "gia' che c'e'", e una raccomandazione non applicata
+#    diventerebbe uno scostamento: il rilievo si trasforma in rumore da ignorare,
+#    che e' il modo in cui un rilievo smette di essere letto.
+# 2. Il riscontro dev'essere INNESTATO in TUTTE le chiusure di un run nativo.
+#    `Ok(map_outcome(...))` diretto in un ingresso significa che quel percorso
+#    chiude senza guardare i requisiti — cioe' il comportamento di prima del fix,
+#    su una strada sola e in silenzio. E' esattamente cosi' che il segnale del
+#    Consiglio e' rimasto non riscontrato: nessuno lo collegava, tutto verde.
+#    Un `assert` sul campo NON e' una lettura decisionale: verifica la forma del
+#    payload prodotto, che e' proprio cio' che si vuole restare libero di
+#    controllare. Escluso di proposito, non per far tacere il check.
+conf_hits="$(grep -rEn '\["requirements"\]|get\("requirements"\)' \
+  --include='*.rs' crates/ 2>/dev/null \
+  | grep -vE '^[^:]+:[0-9]+:\s*(//|#|--|\*)' \
+  | grep -v 'assert' \
+  | grep -v '^crates/nexus-agent-graph/src/decisions/requirement_conformance.rs:' \
+  | grep -v '^crates/nexus-agent-graph/src/decisions/advisory_panel.rs:' \
+  || true)"
+if grep -qE '^\s*Ok\(map_outcome\(' crates/mcp-core/src/native_engine.rs 2>/dev/null; then
+  conf_hits="${conf_hits}
+crates/mcp-core/src/native_engine.rs: un ingresso chiude con map_outcome() senza riscontro"
+fi
+if ! grep -q 'ConformanceReport::nota' crates/mcp-core/src/chat_messages/agent_run.rs 2>/dev/null; then
+  conf_hits="${conf_hits}
+crates/mcp-core/src/chat_messages/agent_run.rs: il resoconto non consuma piu' la nota di conformita'"
+fi
+if [[ -n "${conf_hits// /}" ]]; then
+  echo "!! requisiti-consiglio: la conformita' e' decisa o consumata fuori dal punto unico:" >&2
+  printf '%s\n' "$conf_hits" | sed 's/^/     /' >&2
+  echo "   I requisiti si leggono con requirements_from_synthesis (SOLO quelli:" >&2
+  echo "   recommendations e' l'altra lista); il verdetto e' di judge() sul" >&2
+  echo "   CONTENUTO del file; le chiusure di un run passano da" >&2
+  echo "   map_outcome_con_riscontro. Vedi decisions/requirement_conformance.rs." >&2
+  fail=1
+else
+  echo "OK requisiti-consiglio: il riscontro e' innestato e la nota arriva al resoconto"
+fi
+
 # ── forma-punto-memoria + contatore-memorie-per-punto (2026-07-28) ──────────
 # I punti della collection memorie/correzioni hanno TRE produttori (compattazione
 # di sessione, correzioni admin, correzioni di chat) e devono avere UNA forma.
