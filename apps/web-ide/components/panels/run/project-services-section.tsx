@@ -307,17 +307,27 @@ export function ProjectServicesSection({
                 </div>
               )}
               {!effectiveUrl && svc.state === "active" && (
-                // Un servizio ATTIVO senza indirizzo non e' un dettaglio mancante:
-                // sta ascoltando da qualche parte e Nexus non sa dove, perche'
-                // nessuna allocazione porta la sua identita'. Va detto, altrimenti
-                // lo spazio vuoto si legge come "questo servizio non espone nulla".
-                // Sui servizi fermi si tace: li' l'assenza di indirizzo e' ovvia.
+                // Un servizio ATTIVO senza indirizzo non e' un dettaglio mancante,
+                // ma le condizioni che lo producono sono DUE e portano ad azioni
+                // opposte: o non esiste un'allocazione con la sua identita' (e la
+                // porta su cui ascolta, se ascolta, non e' garantita), oppure
+                // l'allocazione c'e' e non risponde nessuno — cioe' il servizio e'
+                // dichiarato vivo ma non e' in ascolto.
+                //
+                // Dire "porta non allocata" nel secondo caso e' falso: la porta e'
+                // allocata, e il numero e' li' accanto. Misurato il 29/07/2026 su
+                // bacheca-attivita: 24804 allocata al frontend, `live: false`,
+                // nessun processo in ascolto, e il pannello annunciava un'assenza
+                // di allocazione che non c'era. Mandava a cercare la causa dalla
+                // parte sbagliata.
                 <div style={{ paddingLeft:21, marginTop:1 }}>
                   <span
-                    title="Nessuna porta allocata a questo servizio. Succede quando il processo e' stato avviato fuori dal pannello (es. da un comando dell'agente): la porta viene rilevata ma non assegnata, quindi non e' garantita. Riavvialo dal pannello per fargli assegnare una porta stabile."
+                    title={svcPort
+                      ? `La porta ${svcPort.port} e' allocata a questo servizio, ma non risponde nessuno: il servizio risulta attivo e non e' in ascolto. Di solito e' morto dopo l'avvio, o ascolta su un'altra porta perche' il framework ha ripiegato. Riavvialo dal pannello e guarda i log.`
+                      : "Nessuna porta allocata a questo servizio. Succede quando il processo e' stato avviato fuori dal pannello (es. da un comando dell'agente): la porta viene rilevata ma non assegnata, quindi non e' garantita. Riavvialo dal pannello per fargli assegnare una porta stabile."}
                     style={{ fontSize:10,color:tc.textSecondary,fontFamily:'var(--font-mono)' }}
                   >
-                    porta non allocata
+                    {svcPort ? `porta ${svcPort.port} allocata, nessuno in ascolto` : "porta non allocata"}
                   </span>
                 </div>
               )}
