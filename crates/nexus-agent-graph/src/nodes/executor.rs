@@ -1475,6 +1475,7 @@ struct SegnaliRepeatedAction {
     read_only: bool,
     service_failed: bool,
     failed: bool,
+    is_build_or_test: bool,
 }
 
 /// Ingredienti della mossa decisa sull'asse repeated_action: tenerli insieme
@@ -3887,6 +3888,7 @@ oppure riprova piu' tardi."
             repeated_action_read_only: ra.read_only,
             repeated_action_service_failed: ra.service_failed,
             repeated_action_failed: ra.failed,
+            repeated_action_is_build_or_test: ra.is_build_or_test,
             // Biforca il nudge read-only: su un task di fix orienta all'EDIT
             // (no rinuncia), su una domanda concludi con testo (punto unico).
             action_oriented: turn_action_oriented(state.action_oriented),
@@ -4290,6 +4292,10 @@ oppure riprova piu' tardi."
         // invece che a escalation/ABORT "il modello non riesce". I casi
         // specifici (edit/service falliti) mantengono i loro nudge dedicati.
         let failed = ra_hit.as_ref().map(|h| h.failed).unwrap_or(false);
+        // Segnale STRUTTURATO (tool_name + primo token del comando, regola M):
+        // mai un `contains()` sulla label, che include il bersaglio per intero
+        // e farebbe scattare il ramo build/test su un path che CONTIENE "test".
+        let is_build_or_test = ra_hit.as_ref().map(|h| h.is_build_or_test).unwrap_or(false);
         // Soglia dedicata per le LETTURE idempotenti (piu' alta): una
         // rilettura accidentale non deve innescare subito GUIDE->ABORT su un
         // modello capace. Le azioni produttive (build/test/edit) mantengono la
@@ -4311,6 +4317,7 @@ oppure riprova piu' tardi."
             read_only,
             service_failed,
             failed,
+            is_build_or_test,
         }
     }
 

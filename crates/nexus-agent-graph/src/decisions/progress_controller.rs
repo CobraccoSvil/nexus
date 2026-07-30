@@ -164,6 +164,16 @@ pub struct ProgressSignals {
     /// all'ABORT "il modello non riesce". Se `edit_failed`/`service_failed` sono
     /// gia' true, i loro nudge SPECIFICI hanno precedenza; questo copre il resto.
     pub repeated_action_failed: bool,
+    /// `true` se l'azione ripetuta e' l'esecuzione di un comando di build/test
+    /// riconosciuto (`RepeatedActionHit::is_build_or_test`, segnale
+    /// STRUTTURATO tool_name + primo token del comando). Biforca il nudge fra
+    /// "correggi il codice" (build/test) e "identifica la causa esterna"
+    /// (generico). NON deriva piu' da un `contains()` sulla label leggibile:
+    /// quella include il bersaglio per intero e un path che CONTIENE "test"
+    /// (es. `pnpm install packages/frontend-test-utils`) la faceva scattare
+    /// per errore, impedendo a un `pnpm install` davvero fallito di chiudersi
+    /// con `blocked` (bug reale chiuso il 30/07/2026).
+    pub repeated_action_is_build_or_test: bool,
     /// `true` se il turno corrente e' ACTION-ORIENTED (task di modifica/fix), come
     /// derivato da `turn_action_oriented(state.action_oriented)`. Biforca il nudge
     /// del ramo read-only: su un task di fix una lettura ripetuta NON va chiusa con
@@ -213,6 +223,7 @@ impl Default for ProgressSignals {
             repeated_action_read_only: false,
             repeated_action_service_failed: false,
             repeated_action_failed: false,
+            repeated_action_is_build_or_test: false,
             // Conservativo: identico a `turn_action_oriented(None) == true`.
             action_oriented: true,
             reallocation_count: 0,
@@ -318,37 +329,6 @@ dato indispensabile e diverso, dichiara il blocco con task_complete."
         .to_string()
 }
 
-/// Vocabolario build/test per il nudge build-aware. Vedi `_BUILD_TEST_LABEL_KEYWORDS`.
-const BUILD_TEST_LABEL_KEYWORDS: &[&str] = &[
-    "build",
-    "tsc",
-    "compile",
-    "cargo check",
-    "cargo build",
-    "cargo test",
-    "npm run",
-    "npm test",
-    "pnpm",
-    "yarn",
-    "lint",
-    "eslint",
-    "make",
-    "pytest",
-    "run_tests",
-    "test",
-    "gradle",
-    "mvn",
-    "go build",
-    "go test",
-];
-
-/// True se il label del comando ripetuto e' un build/compilazione/test. Vedi
-/// `_is_build_or_test_label` Python.
-fn is_build_or_test_label(label: &str) -> bool {
-    let l = label.to_lowercase();
-    BUILD_TEST_LABEL_KEYWORDS.iter().any(|k| l.contains(k))
-}
-
 /// Nudge per la ripetizione identica di una azione produttiva (build/test-aware).
 /// Nudge del CAMBIO DI STRATEGIA (livello 1.9, solo repeated_action): impone
 /// al modello CORRENTE di abbandonare l'approccio che si ripete e provarne uno
@@ -368,9 +348,12 @@ dichiara l'esito con task_complete (outcome=blocked + blocker)."
     )
 }
 
-/// Vedi `_repeated_action_nudge` Python.
-fn repeated_action_nudge(label: &str, count: i64) -> String {
-    if is_build_or_test_label(label) {
+/// Vedi `_repeated_action_nudge` Python. `is_build_or_test` e' il segnale
+/// STRUTTURATO `RepeatedActionHit::is_build_or_test` (tool_name + primo
+/// token del comando): mai un `contains()` sulla label, che include il
+/// bersaglio per intero.
+fn repeated_action_nudge(label: &str, count: i64, is_build_or_test: bool) -> String {
+    if is_build_or_test {
         format!(
             "STOP: hai gia' eseguito '{label}' {count} volte. Ri-eseguire un \
 build/test NON riduce gli errori: li riduce solo correggere i file \
@@ -467,9 +450,10 @@ installabile), dichiaralo esplicitamente: non e' un loop, e' un blocco da segnal
 }
 
 /// Nudge di DIAGNOSI FORZATA (stadio tra GUIDE e ABORT). Vedi
-/// `_force_diagnose_nudge` Python (build/test-aware).
-fn force_diagnose_nudge(label: &str, count: i64) -> String {
-    if is_build_or_test_label(label) {
+/// `_force_diagnose_nudge` Python (build/test-aware). `is_build_or_test`:
+/// vedi [`repeated_action_nudge`].
+fn force_diagnose_nudge(label: &str, count: i64, is_build_or_test: bool) -> String {
+    if is_build_or_test {
         format!(
             "STOP: hai ripetuto '{label}' {count} volte e il sollecito precedente \
 non ha cambiato nulla. Ri-eseguire il build NON e' un'azione diversa: e' la \
@@ -560,7 +544,7 @@ fn repeated_action_guide_nudge(signals: &ProgressSignals) -> String {
             repeated_read_only_nudge(&label, count)
         }
     } else {
-        repeated_action_nudge(&label, count)
+        repeated_action_nudge(&label, count, signals.repeated_action_is_build_or_test)
     }
 }
 
@@ -654,7 +638,7 @@ fn force_diagnose_decision(signals: &ProgressSignals, axis: Axis) -> ProgressDec
     } else if signals.repeated_action_service_failed {
         repeated_action_service_failed_nudge(&label, count)
     } else {
-        force_diagnose_nudge(&label, count)
+        force_diagnose_nudge(&label, count, signals.repeated_action_is_build_or_test)
     };
     let reason = if signals.repeated_action_edit_failed {
         "stallo repeated_action (edit fallito): correzione old_string forzata, \
