@@ -119,17 +119,57 @@ pub fn has_productive_action_in_history(messages: &[Message]) -> bool {
         .any(|name| !EXPLORATION_ONLY_TOOLS.contains(&name))
 }
 
+/// Conta, negli ultimi `lookback` messaggi, i turni AI (`Message::Ai`) totali e
+/// quanti di essi hanno emesso almeno un tool_use PRODUTTIVO (nome fuori da
+/// [`EXPLORATION_ONLY_TOOLS`]). Ritorna `(ai_turns_in_lookback,
+/// productive_turns_in_lookback)`.
+///
+/// Punto unico (regola L) del fatto strutturale "la history recente mostra
+/// azione produttiva?": [`has_recent_productive_action`] e' un thin wrapper su
+/// questo conteggio (`productive_turns_in_lookback > 0`), e il gate G1
+/// loop-conclamato (`nodes::executor::ExecutorNode::g1_cap_effettivo`) legge
+/// entrambe le componenti dallo STESSO conteggio invece di ri-scandire la
+/// history due volte con due implementazioni distinte. Riusa
+/// `message_tool_uses`/`tail_messages`, non re-implementa l'estrazione
+/// tool_use.
+pub fn recent_ai_turn_counts(messages: &[Message], lookback: usize) -> (usize, usize) {
+    let window = tail_messages(messages, lookback);
+    let mut ai_turns = 0usize;
+    let mut productive_turns = 0usize;
+    for m in window {
+        if !matches!(m, Message::Ai { .. }) {
+            continue;
+        }
+        ai_turns += 1;
+        // NOTA: "produttivo" e' giudicato dal NOME del tool richiesto, non
+        // dall'ESITO (tool_result): un tool fuori da EXPLORATION_ONLY_TOOLS che
+        // fallisce sempre (is_error=true a ogni tentativo) resta contato come
+        // produttivo qui. Un loop di tentativi falliti su un tool "giusto" non
+        // e' intercettato da questo conteggio (limite noto, non una regressione:
+        // il comportamento pre-esistente non lo copriva nemmeno lui).
+        let is_productive = message_tool_uses(m)
+            .into_iter()
+            .any(|(name, _)| !EXPLORATION_ONLY_TOOLS.contains(&name));
+        if is_productive {
+            productive_turns += 1;
+        }
+    }
+    (ai_turns, productive_turns)
+}
+
 /// Come [`has_productive_action_in_history`] ma limitata agli ULTIMI `lookback`
-/// messaggi: distingue "il run sta producendo lavoro ADESSO" da "ha agito all'inizio
-/// e ora gira a vuoto". Usata dal gate G1 loop-conclamato per NON abortire un run che
-/// ha appena eseguito azioni concrete (anti falso-negativo, regola H): un run reale
-/// aveva installato i browser Playwright + system-deps e fatto passare il test E2E,
-/// ma il vecchio gate lessicale "non compiuto" (blacklist NARRAZIONE, rimossa con
-/// ADR 0018 fase 3) lo abortiva ignorando i 16 tool riusciti, sostituendo il
-/// successo con un messaggio di resa. Il segnale STRUTTURALE prevale sempre.
+/// messaggi: distingue "il run sta producendo lavoro ADESSO" da "ha agito
+/// all'inizio e ora gira a vuoto". Usata dal gate G1 loop-conclamato per NON
+/// abortire un run che ha appena eseguito azioni concrete (anti falso-negativo,
+/// regola H): un run reale aveva installato i browser Playwright + system-deps e
+/// fatto passare il test E2E, ma il vecchio gate lessicale "non compiuto"
+/// (blacklist NARRAZIONE, rimossa con ADR 0018 fase 3) lo abortiva ignorando i
+/// 16 tool riusciti, sostituendo il successo con un messaggio di resa. Il
+/// segnale STRUTTURALE prevale sempre. Thin wrapper su
+/// [`recent_ai_turn_counts`] (regola L): stessa finestra, stessa nozione di
+/// "produttivo", un solo posto che la definisce.
 pub fn has_recent_productive_action(messages: &[Message], lookback: usize) -> bool {
-    let start = messages.len().saturating_sub(lookback);
-    has_productive_action_in_history(&messages[start..])
+    recent_ai_turn_counts(messages, lookback).1 > 0
 }
 
 /// Elenca i file modificati con SUCCESSO (edit_file/write_file con tool_result NON

@@ -929,6 +929,143 @@ async fn forced_text_risposta_testuale_chiude_senza_forced_close() {
     assert!(out.extra.get("force_outcome_declaration").is_none());
 }
 
+/// History di loop CONCLAMATO genuino: 8 turni AI consecutivi, SOLO tool di
+/// sola esplorazione (mai un end_turn, quindi `g1_accounting` non conta MAI
+/// una re-entry: `prev_stop_reason` resta sempre "tool_use"), nessuna prosa
+/// (nessun blocco Text -> `g1.unfulfilled` resta `false`, il report testuale
+/// "prossimi passi" non c'entra qui). E' il pattern che il vecchio
+/// `g1_cap_effettivo` non intercettava mai (regressione del bug diagnosticato).
+fn history_loop_esplorativo_senza_convergenza() -> Vec<Message> {
+    let mut msgs = vec![human(
+        "Verifica perche' i pagamenti in valuta estera falliscono e correggi il bug",
+    )];
+    let rounds: &[(&str, Value, &str)] = &[
+        ("read_file", json!({"path": "src/payments/mod.rs"}), "contenuto mod.rs"),
+        ("grep", json!({"pattern": "currency"}), "3 corrispondenze"),
+        ("read_file", json!({"path": "src/payments/currency.rs"}), "contenuto currency.rs"),
+        ("list_files", json!({"path": "src/payments/tests"}), "mod.rs"),
+        ("grep", json!({"pattern": "unwrap"}), "1 corrispondenza"),
+        ("read_file", json!({"path": "src/payments/gateway.rs"}), "contenuto gateway.rs"),
+        ("list_files", json!({"path": "src/payments/adapters"}), "stripe.rs, paypal.rs"),
+        (
+            "read_file",
+            json!({"path": "src/payments/adapters/stripe.rs"}),
+            "contenuto stripe.rs",
+        ),
+    ];
+    for (name, input, result) in rounds {
+        msgs.push(ai_tool(name, input.clone()));
+        msgs.push(Message::Human {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "c1".into(),
+                content: Value::String((*result).into()),
+                is_error: false,
+                exit_code: None,
+            }]),
+        });
+    }
+    msgs
+}
+
+#[tokio::test]
+async fn loop_conclamato_di_sola_esplorazione_scatta_cap_g1() {
+    // REGRESSIONE: prima del fix, con g1.unfulfilled sempre false su questo
+    // pattern (nessun elenco "prossimi passi" ne' testo affatto) e
+    // g1.cap_reached sempre false (prev_stop_reason mai end_turn), il gate G1
+    // non scattava MAI: il run avrebbe bruciato iterazioni fino a
+    // iteration_cap=60. Nessun task_complete nel catalogo e nessuna escalation
+    // configurata (node() di default) -> cap secco.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone());
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: history_loop_esplorativo_senza_convergenza(),
+        iterations: Some(12), // == soglia loop-conclamato di default (3*4*1)
+        stop_reason: Some(StopReason::ToolUse),
+        tools_json: Some(vec![json!({"name": "edit_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::G1CapReached));
+    assert_eq!(out.forced_close_unverified, Some(true));
+    assert!(
+        llm.seen.lock().unwrap().is_empty(),
+        "il gate G1 chiude PRIMA della chiamata LLM"
+    );
+}
+
+/// Contro-prova: stessa forma (8 turni AI, mai un end_turn) ma con azioni
+/// PRODUTTIVE (edit_file/write_file, fuori da EXPLORATION_ONLY_TOOLS). Anche a
+/// iterazioni alte (50, ben oltre la soglia 12) il ramo loop-conclamato NON
+/// deve scattare: il run sta lavorando, non e' fermo.
+fn history_produttiva_alte_iterazioni() -> Vec<Message> {
+    let mut msgs = vec![human("Migra il modulo pagamenti al supporto multi-valuta")];
+    let rounds: &[(&str, Value, &str)] = &[
+        ("edit_file", json!({"path": "src/payments/mod.rs"}), "applicato"),
+        ("write_file", json!({"path": "src/payments/currency.rs"}), "scritto"),
+        ("edit_file", json!({"path": "src/payments/tests/mod.rs"}), "applicato"),
+        (
+            "write_file",
+            json!({"path": "src/payments/adapters/stripe.rs"}),
+            "scritto",
+        ),
+        ("edit_file", json!({"path": "src/payments/mod.rs"}), "applicato"),
+        (
+            "write_file",
+            json!({"path": "src/payments/adapters/paypal.rs"}),
+            "scritto",
+        ),
+        ("edit_file", json!({"path": "src/payments/currency.rs"}), "applicato"),
+        (
+            "write_file",
+            json!({"path": "src/payments/tests/currency_test.rs"}),
+            "scritto",
+        ),
+    ];
+    for (name, input, result) in rounds {
+        msgs.push(ai_tool(name, input.clone()));
+        msgs.push(Message::Human {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "c1".into(),
+                content: Value::String((*result).into()),
+                is_error: false,
+                exit_code: None,
+            }]),
+        });
+    }
+    msgs
+}
+
+#[tokio::test]
+async fn run_produttivo_alte_iterazioni_non_scatena_g1() {
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = llm_tool_call("edit_file", json!({"path": "src/payments/mod.rs"}));
+    let ctx = ctx_with(llm.clone());
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: history_produttiva_alte_iterazioni(),
+        iterations: Some(50),
+        stop_reason: Some(StopReason::ToolUse),
+        tools_json: Some(vec![
+            json!({"name": "edit_file"}),
+            json!({"name": "write_file"}),
+        ]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_ne!(out.stop_reason, Some(StopReason::G1CapReached));
+    assert_ne!(out.stop_reason, Some(StopReason::G1Escalated));
+    assert!(
+        !llm.seen.lock().unwrap().is_empty(),
+        "il turno prosegue: l'LLM viene chiamato"
+    );
+}
+
 #[tokio::test]
 async fn dichiarazione_avvenuta_chiude_con_summary() {
     // ADR 0034: dopo il turno dichiarativo forzato (flag consumato) con

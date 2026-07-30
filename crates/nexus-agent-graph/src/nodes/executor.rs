@@ -156,8 +156,8 @@ use crate::decisions::escalation::{
 use crate::decisions::switch_reason::SwitchReason;
 use crate::decisions::g1_accounting::{g1_accounting, G1Signals};
 use crate::decisions::helpers::{
-    provider_style_supports_forcing, should_force_tool_choice, structural_unfulfilled_signal,
-    turn_action_oriented,
+    provider_style_supports_forcing, should_force_tool_choice, structural_loop_stall_signal,
+    structural_unfulfilled_signal, turn_action_oriented,
 };
 use crate::decisions::loop_signatures::{
     build_signature, detect_signature_loop_progress_aware_with, exploration_counter_update,
@@ -185,8 +185,8 @@ use crate::nodes::stall_recovery::{stall_move_key, STALL_CONTEXT_KEY};
 use crate::routing::signals::{
     count_recent_request_port, detect_recent_tool_error, detect_repeated_action_detailed,
     detect_repeated_failed_command, has_active_resources_in_history, has_recent_productive_action,
-    has_tool_calls_in_history, modified_files_from_messages, tool_error_stats,
-    unfulfilled_signal_with, EXPLORATION_ONLY_TOOLS,
+    has_tool_calls_in_history, modified_files_from_messages, recent_ai_turn_counts,
+    tool_error_stats, unfulfilled_signal_with, EXPLORATION_ONLY_TOOLS,
 };
 use crate::runtime::ports::RecoveryMove;
 use crate::runtime::ports::{
@@ -2668,6 +2668,11 @@ struct ConteggioG1 {
     /// Esito del turno precedente NON compiuto (finestra stretta, vedi doc
     /// dello struct). Alimenta sia [`g1_accounting`] sia
     /// [`ExecutorNode::g1_cap_effettivo`].
+    ///
+    /// NOTA: `g1_cap_effettivo` allarga questo segnale in OR con
+    /// [`structural_loop_stall_signal`] (turni AI ripetuti senza azione
+    /// produttiva): leggere questo campo da solo non basta a sapere se il ramo
+    /// "loop conclamato" scattera'.
     unfulfilled: bool,
     /// Escalation gia' fatte nel run: la soglia del loop conclamato ci cresce
     /// sopra, cosi' ogni promosso riceve un budget di iterazioni suo.
@@ -4501,12 +4506,26 @@ oppure riprova piu' tardi."
     }
 
     /// Oltre al cap re-entry "pulito" (`g1.cap_reached`), il cap scatta anche su
-    /// loop G1 CONCLAMATO: molte iterazioni e output ancora non compiuto. Cattura
-    /// il loop DESCRITTIVO con tool-call inutili intervallate (modello debole che
-    /// descrive o chiama tool a vuoto), dove il pattern end_turn/tool_use alternato
-    /// NON viene contato come re-entry da g1_accounting (e nudge_count non cresce
-    /// perche' pending_tool_uses non e' vuoto). Cosi' scatta l'escalation a un
-    /// modello piu' capace invece di bruciare iterazioni fino a iteration_cap.
+    /// loop G1 CONCLAMATO: molte iterazioni e output ancora non compiuto. "Non
+    /// compiuto" e' l'OR di due segnali STRUTTURALI indipendenti (mai un terzo
+    /// pattern testuale libero, regola M):
+    ///   - `g1.unfulfilled`: report ESPLICITO di passi pendenti (etichetta tipo
+    ///     "prossimi passi" seguita da un elenco, invariato);
+    ///   - [`structural_loop_stall_signal`]: almeno `G1_LOOP_STALL_MIN_AI_TURNS`
+    ///     turni AI nella finestra recente, NESSUNO produttivo. Copre il caso
+    ///     GENERICO che il solo report testuale non intercettava mai: un modello
+    ///     debole che descrive in prosa QUALSIASI (mai un elenco formattato) o
+    ///     chiama SOLO tool di sola esplorazione, senza mai convergere.
+    ///
+    /// Il pattern piu' insidioso e' quello in cui il modello non emette MAI un
+    /// `end_turn` (solo tool_use di sola esplorazione ripetuti a oltranza): li'
+    /// `g1_accounting` non conta MAI una re-entry, perche' `prev_stop_counts`
+    /// accetta solo `end_turn`/`stop` come stop_reason del turno PRECEDENTE — un
+    /// turno il cui turno precedente e' finito in `tool_use` non e' MAI una
+    /// re-entry, qualunque sia `pending_tool_uses` (gia' svuotato dal dispatch
+    /// quando l'executor rientra). Senza questo ramo, `g1.cap_reached` resta
+    /// fermo a 0 e il run brucia iterazioni fino a `iteration_cap` invece di
+    /// fermarsi/escalare qui.
     ///
     /// Soglia DB-driven (g1_max_nudges, regola G); 4x = ben oltre il budget nudge,
     /// quindi un run legittimo che progredisce non viene escalato per errore. La
@@ -4519,11 +4538,15 @@ oppure riprova piu' tardi."
     /// STICKY (mig 0524, decisione #5) rende la soglia ADATTIVA: senza override il
     /// moltiplicatore e' 1.0 -> base invariata.
     ///
-    /// Anti falso-negativo (regola H): un run che ha PRODOTTO lavoro (es. installato
-    /// system-deps + browser e fatto passare i test E2E) non va abortito a
-    /// `iters>=soglia` solo per la forma dell'ultimo testo. Lookback in messaggi
-    /// (~5-6 iterazioni: AI tool_use + tool_result), ampio da non scattare su un run
-    /// che ha appena agito, stretto da non mascherare un loop davvero a vuoto.
+    /// Anti falso-negativo (regola H): un run che ha PRODOTTO lavoro di recente
+    /// (`productive_turns_in_lookback > 0`, derivato dallo STESSO conteggio di
+    /// `recent_ai_turn_counts`: nessuna seconda scansione della history) non va
+    /// abortito. Lookback in messaggi (~5-6 iterazioni: AI tool_use + tool_result),
+    /// ampio da non scattare su un run che ha appena agito, stretto da non
+    /// mascherare un loop davvero a vuoto. `G1_LOOP_STALL_MIN_AI_TURNS` protegge
+    /// dal falso positivo simmetrico: un SOLO turno AI nella finestra (nessuna
+    /// ripetizione osservabile, es. il turno che precede la finestra forced-text)
+    /// non e' evidenza di loop.
     ///
     /// `!declaration_pending` (ADR 0034): con un turno dichiarativo PENDENTE i gate
     /// di chiusura pre-LLM lasciano passare — al rientro dal delta dichiarativo la
@@ -4539,6 +4562,13 @@ oppure riprova piu' tardi."
         declaration_pending: bool,
     ) -> bool {
         const G1_LOOP_PRODUCTIVE_LOOKBACK: usize = 16;
+        // Turni AI minimi nella finestra per parlare di "ripetizione": un solo
+        // turno AI (es. il turno che precede la finestra forced-text) e' rumore,
+        // non un loop. Tuning locale a questo solo gate, come
+        // G1_LOOP_PRODUCTIVE_LOOKBACK sopra: nessuna nuova tabella DB per una
+        // soglia di conteggio interna (la parte incrementale della soglia resta
+        // derivata da g1_max_nudges, regola G).
+        const G1_LOOP_STALL_MIN_AI_TURNS: usize = 3;
         let g1_loop_threshold = effective_g1_threshold(
             self.cfg
                 .g1_max_nudges
@@ -4546,10 +4576,20 @@ oppure riprova piu' tardi."
                 .saturating_mul(g1.escalations + 1),
             sizing_ov,
         );
-        let g1_recent_productive =
-            has_recent_productive_action(messages, G1_LOOP_PRODUCTIVE_LOOKBACK);
+        let (g1_loop_ai_turns, g1_loop_productive_turns) =
+            recent_ai_turn_counts(messages, G1_LOOP_PRODUCTIVE_LOOKBACK);
+        // Stessa domanda di has_recent_productive_action ("esiste un turno
+        // produttivo nella finestra?"), derivata dal conteggio sopra invece di
+        // ri-scandire la history una seconda volta (regola L).
+        let g1_recent_productive = g1_loop_productive_turns > 0;
+        let g1_unfulfilled_or_stalled = g1.unfulfilled
+            || structural_loop_stall_signal(
+                g1_loop_ai_turns,
+                g1_loop_productive_turns,
+                G1_LOOP_STALL_MIN_AI_TURNS,
+            );
         (g1.cap_reached
-            || (g1.unfulfilled && iters_in >= g1_loop_threshold && !g1_recent_productive))
+            || (g1_unfulfilled_or_stalled && iters_in >= g1_loop_threshold && !g1_recent_productive))
             && !declaration_pending
     }
 

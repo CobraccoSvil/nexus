@@ -70,6 +70,22 @@ pub fn structural_unfulfilled_signal(
     true
 }
 
+/// Funzione PURA: loop G1 CONCLAMATO per CONTEGGIO strutturale di turni AI
+/// nella finestra recente. Stesso schema di [`structural_unfulfilled_signal`]
+/// (segnali gia' risolti dal chiamante, nessun IO, nessun pattern testuale —
+/// regola M): vero SOLO con evidenza di ripetizione, cioe' almeno
+/// `min_ai_turns` turni AI DISTINTI osservati nella finestra e NESSUNO di essi
+/// produttivo. Con un solo turno AI nella finestra (nessuna ripetizione
+/// osservabile) e' strutturalmente `false`, qualunque sia l'iterazione
+/// corrente: la soglia sulle iterazioni resta responsabilita' del chiamante.
+pub fn structural_loop_stall_signal(
+    ai_turns_in_lookback: usize,
+    productive_turns_in_lookback: usize,
+    min_ai_turns: usize,
+) -> bool {
+    ai_turns_in_lookback >= min_ai_turns && productive_turns_in_lookback == 0
+}
+
 /// Punto unico (regola L): il TURNO CORRENTE richiede azione con tool?
 ///
 /// Fonte autoritativa: il campo `action_oriented` calcolato da router_node.
