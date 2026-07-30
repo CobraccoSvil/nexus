@@ -433,7 +433,7 @@ pub async fn handle_doc_generate(
         project_name,
     } = match resolve_generate_context(db, pid, args).await {
         Ok(ctx) => ctx,
-        Err(msg) => return msg,
+        Err(msg) => return tool_failure(msg),
     };
 
     // Se content_json manca o è vuoto, auto-genera il contenuto analizzando il progetto
@@ -441,12 +441,12 @@ pub async fn handle_doc_generate(
         Some(v) if !v.is_null() && v.as_object().is_none_or(|o| !o.is_empty()) => v.clone(),
         _ => match autogenerate_content_json(db, pid, &project_name, &root_path, &doc_type).await {
             Ok(v) => v,
-            Err(msg) => return msg,
+            Err(msg) => return tool_failure(msg),
         },
     };
 
     if let Err(msg) = reject_empty_document(&content, &doc_type) {
-        return msg;
+        return tool_failure(msg);
     }
 
     let ctx = GenerateContext {
@@ -476,7 +476,11 @@ async fn finalize_document(
     let abs_output = format!("{}/{}", ctx.root_path, relative_path);
     let content_str = match serde_json::to_string(&content) {
         Ok(s) => s,
-        Err(e) => return format!("[Errore] Serializzazione contenuto documento fallita: {e}"),
+        Err(e) => {
+            return tool_failure(format!(
+                "[Errore] Serializzazione contenuto documento fallita: {e}"
+            ))
+        }
     };
 
     let final_title = if ctx.title.is_empty() {
@@ -496,7 +500,7 @@ async fn finalize_document(
     .await
     {
         Ok(r) => r,
-        Err(msg) => return msg,
+        Err(msg) => return tool_failure(msg),
     };
     persist_generated_document(
         db,
@@ -607,7 +611,7 @@ async fn persist_generated_document(
     )
     .await
     {
-        return msg;
+        return tool_failure(msg);
     }
 
     spawn_document_side_effects(
@@ -816,12 +820,12 @@ async fn load_document_for_update(
 pub(super) async fn handle_doc_update(db: &PgPool, _project_id: Uuid, args: &Value) -> String {
     let doc_id = match parse_uuid(args, "document_id") {
         Ok(u) => u,
-        Err(e) => return e,
+        Err(e) => return tool_failure(e),
     };
 
     let sections = match args.get("sections").and_then(Value::as_array) {
         Some(s) => s.clone(),
-        None => return "[Errore] Parametro 'sections' obbligatorio (array)".to_string(),
+        None => return tool_failure("[Errore] Parametro 'sections' obbligatorio (array)"),
     };
 
     let bump = args.get("bump").and_then(Value::as_str).unwrap_or("patch");
@@ -830,7 +834,7 @@ pub(super) async fn handle_doc_update(db: &PgPool, _project_id: Uuid, args: &Val
     let (old_version, old_file_path, mut structure) =
         match load_document_for_update(db, doc_id).await {
             Ok(t) => t,
-            Err(msg) => return msg,
+            Err(msg) => return tool_failure(msg),
         };
 
     let new_version = bump_version(&old_version, bump);
@@ -862,7 +866,7 @@ pub(super) async fn handle_doc_update(db: &PgPool, _project_id: Uuid, args: &Val
 pub(super) async fn handle_doc_list(db: &PgPool, args: &Value) -> String {
     let pid = match parse_uuid(args, "project_id") {
         Ok(u) => u,
-        Err(e) => return e,
+        Err(e) => return tool_failure(e),
     };
 
     let doc_type_filter = args.get("doc_type").and_then(Value::as_str).unwrap_or("");
@@ -898,7 +902,7 @@ pub(super) async fn handle_doc_list(db: &PgPool, args: &Value) -> String {
                 .collect();
             format_json(&json!({ "documents": docs, "count": docs.len() }))
         }
-        Err(e) => format!("[Errore DB] {e}"),
+        Err(e) => tool_failure(format!("[Errore DB] {e}")),
     }
 }
 
@@ -912,7 +916,7 @@ pub(super) async fn handle_doc_search(db: &PgPool, project_id: Uuid, args: &Valu
     };
     let query = match args.get("query").and_then(Value::as_str) {
         Some(q) if !q.trim().is_empty() => q.trim().to_string(),
-        _ => return "[Errore] Parametro 'query' obbligatorio".to_string(),
+        _ => return tool_failure("[Errore] Parametro 'query' obbligatorio"),
     };
     let doc_type = args
         .get("doc_type")
@@ -925,7 +929,7 @@ pub(super) async fn handle_doc_search(db: &PgPool, project_id: Uuid, args: &Valu
 
     let vector = match neural.embed_text("", &query).await {
         Ok(v) => v,
-        Err(e) => return format!("[Errore] Embedding: {e}"),
+        Err(e) => return tool_failure(format!("[Errore] Embedding: {e}")),
     };
 
     let results =
@@ -935,7 +939,7 @@ pub(super) async fn handle_doc_search(db: &PgPool, project_id: Uuid, args: &Valu
             let results: Vec<Value> = hits.iter().map(doc_hit_to_json).collect();
             format_json(&json!({ "results": results, "query": query }))
         }
-        Err(e) => format!("[Errore] Ricerca vettoriale: {e}"),
+        Err(e) => tool_failure(format!("[Errore] Ricerca vettoriale: {e}")),
     }
 }
 
@@ -956,13 +960,14 @@ fn doc_hit_to_json(h: &crate::vector_memory::VectorPointHit) -> Value {
 pub(super) async fn handle_doc_status(db: &PgPool, args: &Value) -> String {
     let doc_id = match parse_uuid(args, "document_id") {
         Ok(u) => u,
-        Err(e) => return e,
+        Err(e) => return tool_failure(e),
     };
     let status = match args.get("status").and_then(Value::as_str) {
         Some(s) if ["draft", "review", "approved", "outdated"].contains(&s) => s.to_string(),
         _ => {
-            return "[Errore] Parametro 'status' obbligatorio (draft|review|approved|outdated)"
-                .to_string()
+            return tool_failure(
+                "[Errore] Parametro 'status' obbligatorio (draft|review|approved|outdated)",
+            )
         }
     };
 
@@ -975,8 +980,73 @@ pub(super) async fn handle_doc_status(db: &PgPool, args: &Value) -> String {
         Ok(r) if r.rows_affected() > 0 => {
             format_json(&json!({ "ok": true, "document_id": doc_id.to_string(), "status": status }))
         }
-        Ok(_) => "[Errore] Documento non trovato".to_string(),
-        Err(e) => format!("[Errore DB] {e}"),
+        Ok(_) => tool_failure("[Errore] Documento non trovato"),
+        Err(e) => tool_failure(format!("[Errore DB] {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tool_failure_tests {
+    use super::*;
+
+    /// Pool Postgres LAZY: non apre connessioni finche' non si interroga il
+    /// DB. Sufficiente per i rami che falliscono PRIMA di qualunque `.await`
+    /// su `db` (parse_uuid, validazione parametri) — regola O: si chiama
+    /// l'handler reale, non una sua imitazione.
+    fn pool_mai_connesso() -> PgPool {
+        PgPool::connect_lazy("postgres://test:test@127.0.0.1:1/test").expect("pool lazy")
+    }
+
+    #[tokio::test]
+    async fn doc_list_con_project_id_invalido_e_un_fallimento_dichiarato() {
+        let db = pool_mai_connesso();
+        let out = handle_doc_list(&db, &json!({ "project_id": "non-un-uuid" })).await;
+        assert!(
+            nexus_types::tool_outcome::is_tool_failure(&out),
+            "project_id invalido deve dichiararsi fallito: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn doc_status_con_document_id_invalido_e_un_fallimento_dichiarato() {
+        let db = pool_mai_connesso();
+        let out = handle_doc_status(&db, &json!({ "document_id": "non-un-uuid" })).await;
+        assert!(
+            nexus_types::tool_outcome::is_tool_failure(&out),
+            "document_id invalido deve dichiararsi fallito: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn doc_status_senza_status_valido_e_un_fallimento_dichiarato() {
+        // Il controllo su `status` avviene DOPO parse_uuid ma PRIMA di
+        // qualunque query: anche questo ramo non tocca davvero il pool.
+        let db = pool_mai_connesso();
+        let doc_id = Uuid::new_v4().to_string();
+        let out = handle_doc_status(
+            &db,
+            &json!({ "document_id": doc_id, "status": "non-uno-stato-valido" }),
+        )
+        .await;
+        assert!(
+            nexus_types::tool_outcome::is_tool_failure(&out),
+            "status non valido deve dichiararsi fallito: {out}"
+        );
+    }
+
+    #[test]
+    fn documento_non_trovato_e_un_fallimento_dichiarato() {
+        // Stesso letterale del ramo Ok(0 righe) di handle_doc_status: la
+        // UPDATE non ha fallito ma non ha trovato il documento, quindi
+        // l'operazione richiesta non e' stata compiuta.
+        let out = tool_failure("[Errore] Documento non trovato");
+        assert!(nexus_types::tool_outcome::is_tool_failure(&out));
+    }
+
+    #[test]
+    fn successo_con_payload_json_non_e_un_fallimento() {
+        let out = format_json(&json!({ "ok": true, "document_id": Uuid::new_v4().to_string() }));
+        assert!(!nexus_types::tool_outcome::is_tool_failure(&out));
     }
 }
 

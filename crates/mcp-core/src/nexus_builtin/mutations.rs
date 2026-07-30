@@ -22,7 +22,7 @@ pub(super) async fn handle_file_mutations_list(
             "count": rows.len(),
             "mutations": rows,
         })),
-        Err(e) => format!("[Errore] list_recent_mutations fallita: {e}"),
+        Err(e) => tool_failure(format!("[Errore] list_recent_mutations fallita: {e}")),
     }
 }
 
@@ -36,13 +36,13 @@ pub(super) async fn handle_file_mutation_diff(
         None => project_id,
     };
     let Some(mid) = args.get("mutation_id").and_then(Value::as_i64) else {
-        return "[Errore] parametro 'mutation_id' obbligatorio".to_string();
+        return tool_failure("[Errore] parametro 'mutation_id' obbligatorio");
     };
 
     match crate::file_mutations::get_mutation_full(db, pid, mid).await {
         Ok(Some(v)) => format_json(&v),
-        Ok(None) => format!("[Errore] mutazione {mid} non trovata nel progetto"),
-        Err(e) => format!("[Errore] get_mutation_full fallita: {e}"),
+        Ok(None) => tool_failure(format!("[Errore] mutazione {mid} non trovata nel progetto")),
+        Err(e) => tool_failure(format!("[Errore] get_mutation_full fallita: {e}")),
     }
 }
 
@@ -115,10 +115,10 @@ pub(super) async fn handle_file_revert(
             .try_get::<String, _>("absolute_path")
             .map(std::path::PathBuf::from)
             .unwrap_or_default(),
-        _ => return "[Errore] workspace primario del progetto non trovato".to_string(),
+        _ => return tool_failure("[Errore] workspace primario del progetto non trovato"),
     };
     if root_path.as_os_str().is_empty() {
-        return "[Errore] project root vuota".to_string();
+        return tool_failure("[Errore] project root vuota");
     }
 
     // Risolvi mutation_id: esplicito, oppure "ultima annullabile".
@@ -142,7 +142,7 @@ pub(super) async fn handle_file_revert(
         match last {
             Some(m) => m,
             None => {
-                return "[Errore] nessuna mutazione annullabile per questo progetto".to_string()
+                return tool_failure("[Errore] nessuna mutazione annullabile per questo progetto")
             }
         }
     };
@@ -185,24 +185,99 @@ pub(super) async fn handle_file_revert(
             }))
         }
         crate::file_mutations::RevertOutcome::NotFound => {
-            format!("[Errore] mutazione {mutation_id} non trovata")
+            tool_failure(format!("[Errore] mutazione {mutation_id} non trovata"))
         }
         crate::file_mutations::RevertOutcome::AlreadyReverted => {
-            format!("[Errore] mutazione {mutation_id} gia' annullata")
+            tool_failure(format!("[Errore] mutazione {mutation_id} gia' annullata"))
         }
         crate::file_mutations::RevertOutcome::NotRevertible(reason) => {
-            format!("[Errore] ripristino non disponibile: {reason}")
+            tool_failure(format!("[Errore] ripristino non disponibile: {reason}"))
         }
         crate::file_mutations::RevertOutcome::Conflict {
             current_sha,
             expected_sha,
-        } => format!(
+        } => tool_failure(format!(
             "[Errore] conflict: il file e' stato modificato dopo la mutazione \
              (current_sha={current_sha}, expected_sha={expected_sha}). \
              Conferma con l'utente e rilancia il tool con force=true."
-        ),
-        crate::file_mutations::RevertOutcome::IoError(e) => {
-            format!("[Errore] {e}")
-        }
+        )),
+        crate::file_mutations::RevertOutcome::IoError(e) => tool_failure(format!("[Errore] {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_failure_dichiara_il_fallimento_sui_rami_di_errore_testuali() {
+        // Chiama il PRODUTTORE reale usato dai rami di errore di questo file
+        // (list/diff/revert): senza il marker in testa questi fallimenti
+        // erano indistinguibili da un risultato riuscito per anti-loop/
+        // supervisore/final_gate (regola M), raggiungibili dal ramo di
+        // fallback `other if other.starts_with("nexus_")` in
+        // `agent_tools::dispatch::execute_agent_tool`.
+        let out = tool_failure(format!("[Errore] mutazione {} non trovata", 42));
+        assert!(nexus_types::tool_outcome::is_tool_failure(&out));
+        assert!(out.contains("mutazione 42 non trovata"));
+    }
+
+    #[test]
+    fn tool_failure_non_raddoppia_il_marker_su_ri_wrap() {
+        // Propagazione a catena: `handle_file_revert` inoltra a volte un
+        // messaggio gia' costruito da un ramo interno (es. IoError che
+        // avvolge un errore gia' marcato altrove); un doppio marker
+        // romperebbe `trim_start_matches` lato consumatore.
+        let una_volta = tool_failure("[Errore] project root vuota");
+        let due_volte = tool_failure(&una_volta);
+        assert_eq!(una_volta, due_volte);
+        assert_eq!(
+            due_volte
+                .matches(nexus_types::tool_outcome::TOOL_FAILURE_MARKER)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn revert_su_mutazione_gia_annullata_e_un_fallimento_non_un_successo() {
+        // Caso critico segnalato dal task: un revert che NON ha compiuto
+        // l'operazione richiesta (perche' la mutazione era gia' revertita)
+        // deve dichiararsi fallito, altrimenti l'agente/il supervisore
+        // resterebbero convinti che il file sia tornato allo stato
+        // precedente quando non e' stato toccato affatto. Riproduce
+        // esattamente il payload prodotto dal ramo
+        // `RevertOutcome::AlreadyReverted` di `handle_file_revert`.
+        let mutation_id: i64 = 7;
+        let out = tool_failure(format!("[Errore] mutazione {mutation_id} gia' annullata"));
+        assert!(nexus_types::tool_outcome::is_tool_failure(&out));
+    }
+
+    #[test]
+    fn revert_in_conflitto_e_un_fallimento() {
+        // Stesso principio per il ramo `Conflict`: il file su disco non
+        // corrisponde all'atteso, il revert si e' fermato senza scrivere
+        // nulla. Deve restare distinguibile da un `Reverted` riuscito.
+        let out = tool_failure(format!(
+            "[Errore] conflict: il file e' stato modificato dopo la mutazione \
+             (current_sha={}, expected_sha={}). \
+             Conferma con l'utente e rilancia il tool con force=true.",
+            "abc123", "def456"
+        ));
+        assert!(nexus_types::tool_outcome::is_tool_failure(&out));
+    }
+
+    #[test]
+    fn un_revert_riuscito_non_porta_il_marker() {
+        // Controprova: il payload di successo (`RevertOutcome::Reverted`,
+        // costruito con `format_json`) non deve MAI portare il marker, o un
+        // revert davvero riuscito verrebbe letto come fallito a valle.
+        let ok_payload = format_json(&json!({
+            "ok": true,
+            "reverted_mutation_id": 7,
+            "new_mutation_id": 8,
+            "message": "Mutazione 7 annullata",
+        }));
+        assert!(!nexus_types::tool_outcome::is_tool_failure(&ok_payload));
     }
 }

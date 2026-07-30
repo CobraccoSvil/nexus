@@ -8,6 +8,7 @@
 //! Il server è registrato con UUID fisso `00000000-0000-0000-0000-000000000001` in `mcp_servers`
 //! e i tool sono caricati da `mcp_server_tools` (upsertati in `seed_tools_and_server()`).
 
+use nexus_types::tool_outcome::tool_failure;
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -1421,11 +1422,10 @@ async fn dispatch_catalog_tool(
     let project_root = match get_project_root(db, project_id).await {
         Ok(path) => PathBuf::from(path),
         Err(e) => {
-            return json!({
+            return builtin_tool_failure(json!({
                 "error": format!("project_root resolution failed: {}", e),
                 "tool": catalog_name,
-            })
-            .to_string();
+            }));
         }
     };
 
@@ -1433,11 +1433,10 @@ async fn dispatch_catalog_tool(
     let catalog = match NexusToolCatalog::global() {
         Some(c) => c,
         None => {
-            return json!({
+            return builtin_tool_failure(json!({
                 "error": "NexusToolCatalog non inizializzato",
                 "tool": catalog_name,
-            })
-            .to_string();
+            }));
         }
     };
 
@@ -1447,12 +1446,23 @@ async fn dispatch_catalog_tool(
     // 4. Esegui via catalog e rendi il Result uniforme
     match catalog.execute(catalog_name, &ctx, arguments).await {
         Ok(value) => format_json(&value),
-        Err(e) => json!({
+        Err(e) => builtin_tool_failure(json!({
             "error": e.to_string(),
             "tool": catalog_name,
-        })
-        .to_string(),
+        })),
     }
+}
+
+/// Costruisce l'esito FALLITO di un tool builtin `nexus_*`: marker + payload
+/// JSON (contratto `nexus_types::tool_outcome`), condiviso da
+/// `dispatch_catalog_tool` (317 dei 362 alias di questo file, regola L) e
+/// dagli handler DB/editor definiti piu' sotto. Senza il marker in testa
+/// questi fallimenti erano indistinguibili da un risultato riuscito per
+/// anti-loop/supervisore/final_gate (leggono solo `is_tool_failure`),
+/// raggiungibili da `agent_tools::dispatch::execute_agent_tool` tramite il
+/// ramo di fallback `other if other.starts_with("nexus_")`.
+fn builtin_tool_failure(payload: Value) -> String {
+    tool_failure(payload.to_string())
 }
 
 /// Handler per `nexus_open_file_in_editor`: chiede al frontend di aprire un file
@@ -1472,53 +1482,48 @@ async fn handle_open_file_in_editor(db: &PgPool, project_id: Uuid, arguments: &V
         .unwrap_or("")
         .trim();
     if path.is_empty() {
-        return json!({
+        return builtin_tool_failure(json!({
             "ok": false,
             "error": "Parametro 'path' mancante o vuoto",
-        })
-        .to_string();
+        }));
     }
     // Security: rifiuta path assoluti o con ".." per traversal.
     if path.starts_with('/') || path.starts_with('\\') {
-        return json!({
+        return builtin_tool_failure(json!({
             "ok": false,
             "error": format!("Path '{path}' deve essere relativo alla root del progetto, non assoluto"),
-        }).to_string();
+        }));
     }
     if path.split('/').any(|seg| seg == "..") {
-        return json!({
+        return builtin_tool_failure(json!({
             "ok": false,
             "error": format!("Path '{path}' contiene '..', non ammesso"),
-        })
-        .to_string();
+        }));
     }
     // Verifica esistenza file nel workspace del progetto.
     let root_path = match get_project_root(db, project_id).await {
         Ok(p) => p,
         Err(e) => {
-            return json!({
+            return builtin_tool_failure(json!({
                 "ok": false,
                 "error": format!("Workspace del progetto non disponibile: {e}"),
-            })
-            .to_string();
+            }));
         }
     };
     let full_path = std::path::Path::new(&root_path).join(path);
     if !full_path.exists() {
-        return json!({
+        return builtin_tool_failure(json!({
             "ok": false,
             "error": format!("File '{path}' non esiste nel workspace ({root_path})"),
             "_ui_action": "open_file",
             "path": path,
-        })
-        .to_string();
+        }));
     }
     if !full_path.is_file() {
-        return json!({
+        return builtin_tool_failure(json!({
             "ok": false,
             "error": format!("Path '{path}' esiste ma non e' un file"),
-        })
-        .to_string();
+        }));
     }
     let line = arguments.get("line").and_then(Value::as_i64);
     // Risposta strutturata: il frontend intercetta `_ui_action: "open_file"` nel
@@ -1577,10 +1582,9 @@ async fn handle_impact_brief(db: &PgPool, project_id: Uuid, arguments: &Value) -
     }
 
     if seed_doc_ids.is_empty() && seed_paths.is_empty() {
-        return json!({
+        return builtin_tool_failure(json!({
             "error": "nexus_impact_brief richiede 'doc_id' (UUID) oppure 'paths' (array) / 'path' (stringa)."
-        })
-        .to_string();
+        }));
     }
 
     // Predicati di dipendenza per filtraggio (CHECK in mig 0295).
@@ -1784,12 +1788,12 @@ async fn handle_db_provision(db: &PgPool, project_id: Uuid, arguments: &Value) -
             let engine = arguments.get("engine").and_then(Value::as_str);
             match crate::project_db_routes::provision_internal_core(db, project_id, name, engine, db_name, crate::project_db_routes::DbRole::App).await {
                 Ok(v) => v.to_string(),
-                Err(e) => json!({ "ok": false, "error": e }).to_string(),
+                Err(e) => builtin_tool_failure(json!({ "ok": false, "error": e })),
             }
         }
         "external" => {
             let Some(conn) = arguments.get("connection_string").and_then(Value::as_str).map(|s| s.trim()).filter(|s| !s.is_empty()) else {
-                return json!({ "ok": false, "error": "connection_string richiesta per mode=external. Per un DB gestito da Nexus usa mode=internal." }).to_string();
+                return builtin_tool_failure(json!({ "ok": false, "error": "connection_string richiesta per mode=external. Per un DB gestito da Nexus usa mode=internal." }));
             };
             let engine = if conn.starts_with("mysql") { "mysql" } else if conn.starts_with("sqlite") { "sqlite" } else { "postgres" };
             let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project_database_config WHERE project_id = $1").bind(project_id).fetch_one(db).await.unwrap_or(0);
@@ -1799,10 +1803,10 @@ async fn handle_db_provision(db: &PgPool, project_id: Uuid, arguments: &Value) -
                 .bind(project_id).bind(name).bind(engine).bind(conn.as_bytes()).bind(is_primary).bind(&meta).execute(db).await;
             match res {
                 Ok(_) => json!({ "ok": true, "mode": "external", "name": name, "engine": engine, "is_primary": is_primary }).to_string(),
-                Err(e) => json!({ "ok": false, "error": format!("registrazione connessione fallita: {e}") }).to_string(),
+                Err(e) => builtin_tool_failure(json!({ "ok": false, "error": format!("registrazione connessione fallita: {e}") })),
             }
         }
-        other => json!({ "ok": false, "error": format!("mode non valido: {other} (attesi internal | external)") }).to_string(),
+        other => builtin_tool_failure(json!({ "ok": false, "error": format!("mode non valido: {other} (attesi internal | external)") })),
     }
 }
 
@@ -1813,7 +1817,7 @@ async fn handle_db_execute_sql(db: &PgPool, project_id: Uuid, arguments: &Value)
         .map(str::trim)
         .filter(|s| !s.is_empty())
     else {
-        return json!({ "ok": false, "error": "Campo sql obbligatorio." }).to_string();
+        return builtin_tool_failure(json!({ "ok": false, "error": "Campo sql obbligatorio." }));
     };
     let connection = arguments.get("connection").and_then(Value::as_str);
     match crate::project_db::exec::execute_query(db, project_id, sql, &[], None, connection).await {
@@ -1827,14 +1831,14 @@ async fn handle_db_execute_sql(db: &PgPool, project_id: Uuid, arguments: &Value)
             }
             payload.to_string()
         }
-        Err(e) => json!({ "ok": false, "error": e.message() }).to_string(),
+        Err(e) => builtin_tool_failure(json!({ "ok": false, "error": e.message() })),
     }
 }
 
 async fn handle_db_apply_schema_file(db: &PgPool, project_id: Uuid, arguments: &Value) -> String {
     let root = match get_project_root(db, project_id).await {
         Ok(r) => r,
-        Err(e) => return json!({ "ok": false, "error": e }).to_string(),
+        Err(e) => return builtin_tool_failure(json!({ "ok": false, "error": e })),
     };
     let connection = arguments.get("connection").and_then(Value::as_str);
     let chosen = match arguments
@@ -1847,18 +1851,18 @@ async fn handle_db_apply_schema_file(db: &PgPool, project_id: Uuid, arguments: &
         None => {
             let candidates = crate::project_db_routes::discover_schema_candidates(&root).await;
             match candidates.len() {
-                0 => return json!({ "ok": false, "error": "Nessun file schema trovato. Indica file_path esplicitamente." }).to_string(),
+                0 => return builtin_tool_failure(json!({ "ok": false, "error": "Nessun file schema trovato. Indica file_path esplicitamente." })),
                 1 => candidates[0].clone(),
-                _ => return json!({ "ok": false, "ambiguous": true, "candidates": candidates, "message": "Piu file schema trovati. Richiama il tool con file_path." }).to_string(),
+                _ => return builtin_tool_failure(json!({ "ok": false, "ambiguous": true, "candidates": candidates, "message": "Piu file schema trovati. Richiama il tool con file_path." })),
             }
         }
     };
     let (rel_file, sql) = match crate::project_db_routes::read_schema_file(&root, &chosen).await {
         Ok(x) => x,
-        Err(e) => return json!({ "ok": false, "error": e }).to_string(),
+        Err(e) => return builtin_tool_failure(json!({ "ok": false, "error": e })),
     };
     if sql.trim().is_empty() {
-        return json!({ "ok": false, "error": "Il file schema e vuoto." }).to_string();
+        return builtin_tool_failure(json!({ "ok": false, "error": "Il file schema e vuoto." }));
     }
     match crate::project_db::exec::execute_query(db, project_id, &sql, &[], None, connection).await
     {
@@ -1868,7 +1872,7 @@ async fn handle_db_apply_schema_file(db: &PgPool, project_id: Uuid, arguments: &
                     .await;
             json!({ "ok": true, "file": rel_file, "statements_run": outcome.statements_executed, "archived_ddl": archive.as_ref().map(|a| json!({ "note_id": a.note_id.to_string(), "migration_filename": a.migration_filename })) }).to_string()
         }
-        Err(e) => json!({ "ok": false, "file": rel_file, "error": e.message() }).to_string(),
+        Err(e) => builtin_tool_failure(json!({ "ok": false, "file": rel_file, "error": e.message() })),
     }
 }
 
@@ -1887,8 +1891,7 @@ async fn handle_db_status(db: &PgPool, project_id: Uuid) -> String {
             })
             .collect(),
         Err(e) => {
-            return json!({ "ok": false, "error": format!("query connessioni fallita: {e}") })
-                .to_string()
+            return builtin_tool_failure(json!({ "ok": false, "error": format!("query connessioni fallita: {e}") }))
         }
     };
     if connections.is_empty() {
@@ -1899,4 +1902,48 @@ async fn handle_db_status(db: &PgPool, project_id: Uuid) -> String {
         Err(e) => json!({ "error": e.message() }),
     };
     json!({ "ok": true, "connections": connections, "tables": tables }).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_tool_failure_dichiara_il_fallimento_e_preserva_il_payload() {
+        // Chiama il PRODUTTORE reale usato dai rami di errore di
+        // `dispatch_catalog_tool` (317 dei 362 alias `nexus_*` di questo file)
+        // e degli handler DB/editor: senza il marker in testa questi
+        // fallimenti erano indistinguibili da un risultato riuscito per
+        // anti-loop/supervisore/final_gate (regola M), raggiungibili dal
+        // ramo di fallback `other if other.starts_with("nexus_")` in
+        // `agent_tools::dispatch::execute_agent_tool`.
+        let out = builtin_tool_failure(json!({
+            "ok": false,
+            "error": "Campo sql obbligatorio.",
+        }));
+        assert!(nexus_types::tool_outcome::is_tool_failure(&out));
+        // Il payload resta JSON valido dopo il marker.
+        let after_marker = out
+            .trim_start_matches(nexus_types::tool_outcome::TOOL_FAILURE_MARKER)
+            .trim_start();
+        let parsed: Value =
+            serde_json::from_str(after_marker).expect("payload dopo il marker e' JSON valido");
+        assert_eq!(parsed["error"], "Campo sql obbligatorio.");
+    }
+
+    #[test]
+    fn builtin_tool_failure_non_raddoppia_il_marker_su_ri_wrap() {
+        // Propagazione a catena: un chiamante che ri-passasse un esito gia'
+        // marcato (es. un fallimento inoltrato da un altro tool) non deve
+        // finire con due marker in testa.
+        let una_volta = builtin_tool_failure(json!({ "error": "boom" }));
+        let due_volte = tool_failure(&una_volta);
+        assert_eq!(una_volta, due_volte);
+        assert_eq!(
+            due_volte
+                .matches(nexus_types::tool_outcome::TOOL_FAILURE_MARKER)
+                .count(),
+            1
+        );
+    }
 }

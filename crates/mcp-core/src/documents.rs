@@ -240,6 +240,25 @@ pub async fn delete_document(
 /// Questo endpoint chiama direttamente `nexus_builtin::handle_doc_generate`
 /// (stesso punto unico usato dal tool) e ritorna l'esito sincrono: il frontend
 /// puo' fare il refresh subito, deterministico.
+/// Ricava il messaggio da mostrare all'utente dal risultato FALLITO di un tool.
+///
+/// L'esito lo dichiara il marker macchina (`is_tool_failure`, regola M): questa
+/// funzione non lo interroga, si limita a spogliarlo insieme al prefisso
+/// "[Errore]"/"[Errore DB]" che alcuni handler antepongono ancora. Senza la
+/// spogliatura la frase che incornicia il messaggio ("Generazione documento
+/// fallita: ...") ripeterebbe la parola "errore" due volte.
+fn messaggio_leggibile_del_fallimento(result: &str) -> String {
+    let dopo_marker = result
+        .trim_start_matches(nexus_types::tool_outcome::TOOL_FAILURE_MARKER)
+        .trim_start();
+    dopo_marker
+        .strip_prefix("[Errore DB]")
+        .or_else(|| dopo_marker.strip_prefix("[Errore]"))
+        .unwrap_or(dopo_marker)
+        .trim()
+        .to_string()
+}
+
 pub async fn generate_document(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -279,8 +298,8 @@ pub async fn generate_document(
     tokio::spawn(async move {
         let result =
             crate::nexus_builtin::handle_doc_generate(&db, project_id, user_id, &args).await;
-        if let Some(msg) = result.strip_prefix("[Errore]") {
-            let msg = msg.trim().to_string();
+        if nexus_types::tool_outcome::is_tool_failure(&result) {
+            let msg = messaggio_leggibile_del_fallimento(&result);
             tracing::warn!(doc_type = %doc_type_for_log, "generate_document (async): {msg}");
             // Notifica il fallimento al pannello (toast), altrimenti l'utente
             // resterebbe in attesa di un documento che non arrivera' mai.
@@ -302,4 +321,54 @@ pub async fn generate_document(
         "status": "accepted",
         "message": "Generazione avviata: il documento comparira' nel pannello al termine."
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexus_types::tool_outcome::tool_failure;
+
+    /// Il fallimento parte da `tool_failure`, il PRODUTTORE reale (regola O):
+    /// una stringa col marker scritto a mano fisserebbe l'assunto da verificare.
+    #[test]
+    fn il_prefisso_errore_db_non_arriva_all_utente() {
+        let grezzo = tool_failure("[Errore DB] connessione rifiutata");
+        assert_eq!(
+            messaggio_leggibile_del_fallimento(&grezzo),
+            "connessione rifiutata"
+        );
+    }
+
+    #[test]
+    fn il_prefisso_errore_semplice_non_arriva_all_utente() {
+        let grezzo = tool_failure("[Errore] doc_type non riconosciuto");
+        assert_eq!(
+            messaggio_leggibile_del_fallimento(&grezzo),
+            "doc_type non riconosciuto"
+        );
+    }
+
+    /// Senza prefisso il messaggio resta integro: la spogliatura non deve
+    /// mangiare testo che non sia il marker o l'etichetta.
+    #[test]
+    fn un_fallimento_senza_prefisso_resta_integro() {
+        let grezzo = tool_failure("il modello non ha prodotto contenuto");
+        assert_eq!(
+            messaggio_leggibile_del_fallimento(&grezzo),
+            "il modello non ha prodotto contenuto"
+        );
+    }
+
+    /// Il marker non deve sopravvivere in nessun caso: e' un segnale macchina,
+    /// e mostrarlo nel toast lo trasformerebbe in decorazione.
+    #[test]
+    fn il_marker_non_sopravvive_alla_spogliatura() {
+        for testo in ["[Errore DB] x", "[Errore] y", "z"] {
+            let out = messaggio_leggibile_del_fallimento(&tool_failure(testo));
+            assert!(
+                !out.contains(nexus_types::tool_outcome::TOOL_FAILURE_MARKER),
+                "marker residuo in {out:?}"
+            );
+        }
+    }
 }

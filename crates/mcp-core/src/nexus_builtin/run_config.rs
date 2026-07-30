@@ -6,6 +6,15 @@
 
 use super::*;
 
+/// Costruisce l'esito FALLITO di una query DB in questo file: marker piu'
+/// messaggio leggibile (contratto `nexus_types::tool_outcome`). Estrae la
+/// ripetizione dei 4 siti `Err(e) => format!("[Errore DB] {e}")`: senza
+/// marker questi fallimenti erano indistinguibili da un successo per
+/// anti-loop/supervisore/final_gate (regola M).
+fn db_tool_failure(e: impl std::fmt::Display) -> String {
+    tool_failure(format!("[Errore DB] {e}"))
+}
+
 // ---------------------------------------------------------------------------
 // Helper condivisi (usati anche da git.rs via super::*)
 // ---------------------------------------------------------------------------
@@ -48,7 +57,7 @@ pub(super) async fn run_git(root: &str, args: &[&str]) -> Result<String, String>
 pub(super) async fn handle_run_config_list(db: &PgPool, args: &Value) -> String {
     let project_id = match parse_uuid(args, "project_id") {
         Ok(id) => id,
-        Err(e) => return e,
+        Err(e) => return tool_failure(e),
     };
 
     match sqlx::query(
@@ -79,14 +88,14 @@ pub(super) async fn handle_run_config_list(db: &PgPool, args: &Value) -> String 
                 .collect();
             format_json(&json!({ "configs": configs, "count": configs.len() }))
         }
-        Err(e) => format!("[Errore DB] {e}"),
+        Err(e) => db_tool_failure(e),
     }
 }
 
 pub(super) async fn handle_run_config_detect(db: &PgPool, args: &Value) -> String {
     let project_id = match parse_uuid(args, "project_id") {
         Ok(id) => id,
-        Err(e) => return e,
+        Err(e) => return tool_failure(e),
     };
 
     // Legge il root path del progetto
@@ -99,7 +108,7 @@ pub(super) async fn handle_run_config_detect(db: &PgPool, args: &Value) -> Strin
             .try_get::<Option<String>, _>("repository_root_path")
             .unwrap_or(None)
             .unwrap_or_default(),
-        _ => return "[Errore] Progetto non trovato".to_string(),
+        _ => return tool_failure("[Errore] Progetto non trovato"),
     };
 
     let mut suggestions: Vec<Value> = Vec::new();
@@ -154,15 +163,15 @@ pub(super) async fn handle_run_config_detect(db: &PgPool, args: &Value) -> Strin
 pub(super) async fn handle_run_config_create(db: &PgPool, args: &Value) -> String {
     let project_id = match parse_uuid(args, "project_id") {
         Ok(id) => id,
-        Err(e) => return e,
+        Err(e) => return tool_failure(e),
     };
     let label = match args.get("label").and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => return "[Errore] Parametro 'label' obbligatorio".to_string(),
+        _ => return tool_failure("[Errore] Parametro 'label' obbligatorio"),
     };
     let command = match args.get("command").and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => return "[Errore] Parametro 'command' obbligatorio".to_string(),
+        _ => return tool_failure("[Errore] Parametro 'command' obbligatorio"),
     };
     let run_args: Vec<String> = args
         .get("args")
@@ -206,18 +215,18 @@ pub(super) async fn handle_run_config_create(db: &PgPool, args: &Value) -> Strin
             "args": run_args,
             "kind": kind,
         })),
-        Err(e) => format!("[Errore DB] {e}"),
+        Err(e) => db_tool_failure(e),
     }
 }
 
 pub(super) async fn handle_run_config_update(db: &PgPool, args: &Value) -> String {
     let project_id = match parse_uuid(args, "project_id") {
         Ok(id) => id,
-        Err(e) => return e,
+        Err(e) => return tool_failure(e),
     };
     let config_id = match parse_uuid(args, "config_id") {
         Ok(id) => id,
-        Err(e) => return e,
+        Err(e) => return tool_failure(e),
     };
 
     // Legge valori correnti come fallback
@@ -232,7 +241,7 @@ pub(super) async fn handle_run_config_update(db: &PgPool, args: &Value) -> Strin
     .flatten();
 
     let Some(cur) = current else {
-        return "[Errore] Configurazione non trovata".to_string();
+        return tool_failure("[Errore] Configurazione non trovata");
     };
 
     let label = args
@@ -280,18 +289,18 @@ pub(super) async fn handle_run_config_update(db: &PgPool, args: &Value) -> Strin
     .await
     {
         Ok(_) => format_json(&json!({ "ok": true, "id": config_id.to_string() })),
-        Err(e) => format!("[Errore DB] {e}"),
+        Err(e) => db_tool_failure(e),
     }
 }
 
 pub(super) async fn handle_run_config_delete(db: &PgPool, args: &Value) -> String {
     let project_id = match parse_uuid(args, "project_id") {
         Ok(id) => id,
-        Err(e) => return e,
+        Err(e) => return tool_failure(e),
     };
     let config_id = match parse_uuid(args, "config_id") {
         Ok(id) => id,
-        Err(e) => return e,
+        Err(e) => return tool_failure(e),
     };
 
     match sqlx::query("DELETE FROM run_configurations WHERE id=$1 AND project_id=$2")
@@ -301,19 +310,19 @@ pub(super) async fn handle_run_config_delete(db: &PgPool, args: &Value) -> Strin
         .await
     {
         Ok(r) if r.rows_affected() > 0 => format_json(&json!({ "ok": true })),
-        Ok(_) => "[Errore] Configurazione non trovata o non eliminabile".to_string(),
-        Err(e) => format!("[Errore DB] {e}"),
+        Ok(_) => tool_failure("[Errore] Configurazione non trovata o non eliminabile"),
+        Err(e) => db_tool_failure(e),
     }
 }
 
 pub(super) async fn handle_run_config_launch(db: &PgPool, args: &Value) -> String {
     let project_id = match parse_uuid(args, "project_id") {
         Ok(id) => id,
-        Err(e) => return e,
+        Err(e) => return tool_failure(e),
     };
     let config_id = match parse_uuid(args, "config_id") {
         Ok(id) => id,
-        Err(e) => return e,
+        Err(e) => return tool_failure(e),
     };
 
     let row = sqlx::query(
@@ -327,7 +336,7 @@ pub(super) async fn handle_run_config_launch(db: &PgPool, args: &Value) -> Strin
     .flatten();
 
     let Some(row) = row else {
-        return "[Errore] Configurazione non trovata".to_string();
+        return tool_failure("[Errore] Configurazione non trovata");
     };
 
     let label: String = row.try_get("label").unwrap_or_default();
@@ -406,6 +415,85 @@ pub(super) async fn handle_run_config_launch(db: &PgPool, args: &Value) -> Strin
             "label": label,
             "command": full_cmd,
         })),
-        Err(e) => format!("[Errore avvio] {e}"),
+        Err(e) => tool_failure(format!("[Errore avvio] {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexus_types::tool_outcome::is_tool_failure;
+
+    #[test]
+    fn db_tool_failure_dichiara_il_fallimento_e_preserva_il_messaggio() {
+        // Chiama il PRODUTTORE reale usato dai 4 siti `Err(e) => db_tool_failure(e)`
+        // di questo file (list/create/update/delete): senza il marker in testa
+        // questi fallimenti erano indistinguibili da un successo per
+        // anti-loop/supervisore/final_gate (regola M).
+        let out = db_tool_failure("relation \"run_configurations\" does not exist");
+        assert!(is_tool_failure(&out));
+        assert!(out.contains("relation \"run_configurations\" does not exist"));
+    }
+
+    #[test]
+    fn db_tool_failure_non_raddoppia_il_marker_su_propagazione_a_catena() {
+        // Un errore gia' marcato (es. inoltrato da un helper) non deve finire
+        // con due marker in testa quando ripassa per lo stesso costruttore.
+        let una_volta = db_tool_failure("boom");
+        let due_volte = tool_failure(&una_volta);
+        assert_eq!(una_volta, due_volte);
+        assert_eq!(
+            due_volte
+                .matches(nexus_types::tool_outcome::TOOL_FAILURE_MARKER)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn parse_uuid_invalido_avvolto_da_tool_failure_e_riconosciuto_come_fallimento() {
+        // `parse_uuid` (prompt_admin.rs) e' il PRODUTTORE reale usato da ogni
+        // handler di questo file per `project_id`/`config_id`: ogni ramo
+        // `Err(e) => return tool_failure(e)` dipende da questo comportamento.
+        // Prima del fix la stringa bare "[Errore] ..." veniva ritornata senza
+        // marker e un `config_id` malformato risultava un successo agli occhi
+        // di anti-loop/supervisore/final_gate.
+        let args = json!({ "project_id": "non-e-un-uuid" });
+        let err = parse_uuid(&args, "project_id").expect_err("input non valido deve fallire");
+        let out = tool_failure(&err);
+        assert!(is_tool_failure(&out));
+        assert!(out.contains("project_id"));
+    }
+
+    #[test]
+    fn config_id_mancante_avvolto_da_tool_failure_e_riconosciuto_come_fallimento() {
+        // Stesso produttore, campo assente: copre il caso reale in cui
+        // l'agente chiama update/delete/launch senza passare `config_id`.
+        let args = json!({});
+        let err = parse_uuid(&args, "config_id").expect_err("campo assente deve fallire");
+        let out = tool_failure(&err);
+        assert!(is_tool_failure(&out));
+    }
+
+    #[test]
+    fn errore_avvio_processo_e_riconosciuto_come_fallimento() {
+        // Copre il ramo piu' critico del file: `handle_run_config_launch`
+        // sul fallimento di `spawn_agent_process`. Un lancio fallito marcato
+        // come successo lascerebbe l'agente convinto che il servizio sia
+        // partito. Costruzione identica al sito di ritorno reale in
+        // `handle_run_config_launch` (stesso `format!` + `tool_failure`).
+        let spawn_err = "porta 3000 gia' occupata".to_string();
+        let out = tool_failure(format!("[Errore avvio] {spawn_err}"));
+        assert!(is_tool_failure(&out));
+        assert!(out.contains("porta 3000 gia' occupata"));
+    }
+
+    #[test]
+    fn messaggio_letterale_di_configurazione_non_trovata_e_riconosciuto_come_fallimento() {
+        // Copre i rami letterali (non provenienti da un helper) usati da
+        // update/delete/launch quando la riga non esiste: `tool_failure("[Errore]
+        // Configurazione non trovata")`.
+        let out = tool_failure("[Errore] Configurazione non trovata");
+        assert!(is_tool_failure(&out));
     }
 }

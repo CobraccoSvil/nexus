@@ -17,6 +17,15 @@ pub(super) fn format_json(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
 }
 
+/// Costruisce l'esito FALLITO di una query DB in questo file: marker piu'
+/// messaggio leggibile (contratto `nexus_types::tool_outcome`). Estrae la
+/// ripetizione dei 4 siti `Err(e) => format!("[Errore DB] {e}")`: senza
+/// marker questi fallimenti erano indistinguibili da un successo per
+/// anti-loop/supervisore/final_gate (regola M).
+fn db_tool_failure(e: impl std::fmt::Display) -> String {
+    tool_failure(format!("[Errore DB] {e}"))
+}
+
 // ---------------------------------------------------------------------------
 // Handler: prompt_template
 // ---------------------------------------------------------------------------
@@ -58,18 +67,18 @@ pub(super) async fn handle_prompt_template_list(db: &PgPool, args: &Value) -> St
                 .collect();
             format_json(&json!({ "templates": templates, "count": templates.len() }))
         }
-        Err(e) => format!("[Errore DB] {e}"),
+        Err(e) => db_tool_failure(e),
     }
 }
 
 pub(super) async fn handle_prompt_template_update(db: &PgPool, args: &Value) -> String {
     let key = match args.get("key").and_then(Value::as_str) {
         Some(k) if !k.trim().is_empty() => k.trim().to_string(),
-        _ => return "[Errore] Parametro 'key' obbligatorio".to_string(),
+        _ => return tool_failure("[Errore] Parametro 'key' obbligatorio"),
     };
     let content = match args.get("content").and_then(Value::as_str) {
         Some(c) if !c.trim().is_empty() => c.to_string(),
-        _ => return "[Errore] Parametro 'content' obbligatorio".to_string(),
+        _ => return tool_failure("[Errore] Parametro 'content' obbligatorio"),
     };
     let change_note: Option<String> = args
         .get("change_note")
@@ -122,8 +131,8 @@ pub(super) async fn handle_prompt_template_update(db: &PgPool, args: &Value) -> 
             let version: i32 = r.try_get("version").unwrap_or(1);
             format_json(&json!({ "ok": true, "key": key, "version": version }))
         }
-        Ok(None) => "[Errore] Aggiornamento fallito".to_string(),
-        Err(e) => format!("[Errore DB] {e}"),
+        Ok(None) => tool_failure("[Errore] Aggiornamento fallito"),
+        Err(e) => db_tool_failure(e),
     }
 }
 
@@ -134,7 +143,7 @@ pub(super) async fn handle_prompt_template_update(db: &PgPool, args: &Value) -> 
 pub(super) async fn handle_admin_setting_get(db: &PgPool, args: &Value) -> String {
     let key = match args.get("key").and_then(Value::as_str) {
         Some(k) if !k.trim().is_empty() => k.trim().to_string(),
-        _ => return "[Errore] Parametro 'key' obbligatorio".to_string(),
+        _ => return tool_failure("[Errore] Parametro 'key' obbligatorio"),
     };
     match sqlx::query("SELECT key, value, description FROM settings WHERE key=$1")
         .bind(&key)
@@ -146,19 +155,19 @@ pub(super) async fn handle_admin_setting_get(db: &PgPool, args: &Value) -> Strin
             "value": r.try_get::<String, _>("value").unwrap_or_default(),
             "description": r.try_get::<Option<String>, _>("description").unwrap_or(None),
         })),
-        Ok(None) => format!("[Non trovato] Setting '{}' non esiste", key),
-        Err(e) => format!("[Errore DB] {e}"),
+        Ok(None) => tool_failure(format!("[Non trovato] Setting '{}' non esiste", key)),
+        Err(e) => db_tool_failure(e),
     }
 }
 
 pub(super) async fn handle_admin_setting_update(db: &PgPool, args: &Value) -> String {
     let key = match args.get("key").and_then(Value::as_str) {
         Some(k) if !k.trim().is_empty() => k.trim().to_string(),
-        _ => return "[Errore] Parametro 'key' obbligatorio".to_string(),
+        _ => return tool_failure("[Errore] Parametro 'key' obbligatorio"),
     };
     let value = match args.get("value").and_then(Value::as_str) {
         Some(v) => v.to_string(),
-        None => return "[Errore] Parametro 'value' obbligatorio".to_string(),
+        None => return tool_failure("[Errore] Parametro 'value' obbligatorio"),
     };
     match sqlx::query(
         "INSERT INTO settings (key, value) VALUES ($1,$2)
@@ -170,6 +179,61 @@ pub(super) async fn handle_admin_setting_update(db: &PgPool, args: &Value) -> St
     .await
     {
         Ok(_) => format_json(&json!({ "ok": true, "key": key, "value": value })),
-        Err(e) => format!("[Errore DB] {e}"),
+        Err(e) => db_tool_failure(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn db_tool_failure_dichiara_il_fallimento_e_preserva_il_messaggio() {
+        // Chiama il PRODUTTORE reale usato dai 4 rami `Err(e)` dei quattro
+        // handler di questo file: senza marker questi fallimenti erano
+        // indistinguibili da un successo per anti-loop/supervisore/
+        // final_gate (regola M), raggiungibili dal ramo di fallback
+        // `other if other.starts_with("nexus_")` in
+        // `agent_tools::dispatch::execute_agent_tool`.
+        let out = db_tool_failure("connessione al DB persa");
+        assert!(nexus_types::tool_outcome::is_tool_failure(&out));
+        assert!(out.contains("[Errore DB] connessione al DB persa"));
+    }
+
+    #[test]
+    fn validazione_parametro_obbligatorio_e_un_fallimento() {
+        // Stessa forma letterale usata nei rami di validazione di
+        // `handle_prompt_template_update` / `handle_admin_setting_get` /
+        // `handle_admin_setting_update` per key/content/value mancanti.
+        let out = tool_failure("[Errore] Parametro 'key' obbligatorio");
+        assert!(nexus_types::tool_outcome::is_tool_failure(&out));
+    }
+
+    #[test]
+    fn aggiornamento_senza_riga_ritornata_e_un_fallimento() {
+        // Ramo `Ok(None)` di `handle_prompt_template_update`: la query non
+        // ha restituito errore ma nemmeno la riga RETURNING attesa, quindi
+        // l'operazione richiesta (scrivere il template) non e' avvenuta.
+        let out = tool_failure("[Errore] Aggiornamento fallito");
+        assert!(nexus_types::tool_outcome::is_tool_failure(&out));
+    }
+
+    #[test]
+    fn setting_non_trovato_e_un_fallimento() {
+        // Ramo `Ok(None)` di `handle_admin_setting_get`: la risorsa
+        // richiesta non esiste e la chiamata si ferma li' (vedi CONTESTO,
+        // criterio "risorsa non trovata e l'intera chiamata si ferma li'").
+        let out = tool_failure(format!("[Non trovato] Setting '{}' non esiste", "foo.bar"));
+        assert!(nexus_types::tool_outcome::is_tool_failure(&out));
+        assert!(out.contains("foo.bar"));
+    }
+
+    #[test]
+    fn successo_con_payload_json_non_e_un_fallimento() {
+        // Controllo di non regressione: i rami di successo (format_json)
+        // di questo file non devono mai essere marcati come falliti, anche
+        // quando il payload contiene la parola "error" o simili come dato.
+        let out = format_json(&json!({ "ok": true, "key": "k", "value": "v" }));
+        assert!(!nexus_types::tool_outcome::is_tool_failure(&out));
     }
 }

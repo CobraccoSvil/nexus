@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// Costruisce l'esito FALLITO di una query DB in questo file: marker piu'
+/// messaggio leggibile (contratto `nexus_types::tool_outcome`). Estrae la
+/// ripetizione dei 7 siti `Err(e) => format!("[Errore DB] {e}")`: senza
+/// marker questi fallimenti erano indistinguibili da un successo per
+/// anti-loop/supervisore/final_gate (regola M).
+fn db_tool_failure(e: impl std::fmt::Display) -> String {
+    tool_failure(format!("[Errore DB] {e}"))
+}
+
 // ---------------------------------------------------------------------------
 // Handler: project
 // ---------------------------------------------------------------------------
@@ -29,14 +38,14 @@ pub(super) async fn handle_project_list(db: &PgPool, user_id: Uuid) -> String {
             })).collect();
             format_json(&json!({ "projects": projects, "count": projects.len() }))
         }
-        Err(e) => format!("[Errore DB] {e}"),
+        Err(e) => db_tool_failure(e),
     }
 }
 
 pub(super) async fn handle_project_analyze(db: &PgPool, args: &Value) -> String {
     let project_id = match parse_uuid(args, "project_id") {
         Ok(id) => id,
-        Err(e) => return e,
+        Err(e) => return tool_failure(e),
     };
     // Avvia un'analisi di base del progetto (aggiorna timestamp analysis)
     match sqlx::query("UPDATE projects SET analyzed_at=NOW() WHERE id=$1 RETURNING id")
@@ -49,15 +58,15 @@ pub(super) async fn handle_project_analyze(db: &PgPool, args: &Value) -> String 
             "message": "Analisi avviata. Usa 'nexus_project_list' per verificare lo stato.",
             "project_id": project_id.to_string()
         })),
-        Ok(None) => "[Errore] Progetto non trovato".to_string(),
-        Err(e) => format!("[Errore DB] {e}"),
+        Ok(None) => tool_failure("[Errore] Progetto non trovato"),
+        Err(e) => db_tool_failure(e),
     }
 }
 
 pub(super) async fn handle_project_quality_scan(db: &PgPool, args: &Value) -> String {
     let project_id = match parse_uuid(args, "project_id") {
         Ok(id) => id,
-        Err(e) => return e,
+        Err(e) => return tool_failure(e),
     };
     match sqlx::query("SELECT id, name, repository_root_path FROM projects WHERE id=$1")
         .bind(project_id)
@@ -73,15 +82,15 @@ pub(super) async fn handle_project_quality_scan(db: &PgPool, args: &Value) -> St
                 "tip": "I risultati esistenti sono disponibili con nexus_project_quality_findings."
             }))
         }
-        Ok(None) => "[Errore] Progetto non trovato".to_string(),
-        Err(e) => format!("[Errore DB] {e}"),
+        Ok(None) => tool_failure("[Errore] Progetto non trovato"),
+        Err(e) => db_tool_failure(e),
     }
 }
 
 pub(super) async fn handle_project_quality_findings(db: &PgPool, args: &Value) -> String {
     let project_id = match parse_uuid(args, "project_id") {
         Ok(id) => id,
-        Err(e) => return e,
+        Err(e) => return tool_failure(e),
     };
     let severity_filter = args
         .get("severity")
@@ -127,7 +136,7 @@ pub(super) async fn handle_project_quality_findings(db: &PgPool, args: &Value) -
                 .collect();
             format_json(&json!({ "findings": findings, "count": findings.len() }))
         }
-        Err(e) => format!("[Errore DB] {e}"),
+        Err(e) => db_tool_failure(e),
     }
 }
 
@@ -156,14 +165,14 @@ pub(super) async fn handle_profile_list(db: &PgPool, user_id: Uuid) -> String {
             })).collect();
             format_json(&json!({ "profiles": profiles, "count": profiles.len() }))
         }
-        Err(e) => format!("[Errore DB] {e}"),
+        Err(e) => db_tool_failure(e),
     }
 }
 
 pub(super) async fn handle_profile_delete(db: &PgPool, user_id: Uuid, args: &Value) -> String {
     let profile_id = match parse_uuid(args, "profile_id") {
         Ok(id) => id,
-        Err(e) => return e,
+        Err(e) => return tool_failure(e),
     };
     match sqlx::query("DELETE FROM user_profiles WHERE id=$1 AND user_id=$2")
         .bind(profile_id)
@@ -172,17 +181,17 @@ pub(super) async fn handle_profile_delete(db: &PgPool, user_id: Uuid, args: &Val
         .await
     {
         Ok(r) if r.rows_affected() > 0 => format_json(&json!({ "ok": true })),
-        Ok(_) => {
-            "[Errore] Profilo non trovato o non eliminabile (non appartiene all'utente)".to_string()
-        }
-        Err(e) => format!("[Errore DB] {e}"),
+        Ok(_) => tool_failure(
+            "[Errore] Profilo non trovato o non eliminabile (non appartiene all'utente)",
+        ),
+        Err(e) => db_tool_failure(e),
     }
 }
 
 pub(super) async fn handle_profile_set_default(db: &PgPool, user_id: Uuid, args: &Value) -> String {
     let profile_id = match parse_uuid(args, "profile_id") {
         Ok(id) => id,
-        Err(e) => return e,
+        Err(e) => return tool_failure(e),
     };
     // Rimuove il default corrente e imposta quello nuovo
     let _ = sqlx::query("UPDATE user_profiles SET is_default=false WHERE user_id=$1")
@@ -199,7 +208,84 @@ pub(super) async fn handle_profile_set_default(db: &PgPool, user_id: Uuid, args:
         Ok(r) if r.rows_affected() > 0 => {
             format_json(&json!({ "ok": true, "default": profile_id.to_string() }))
         }
-        Ok(_) => "[Errore] Profilo non trovato o non modificabile".to_string(),
-        Err(e) => format!("[Errore DB] {e}"),
+        Ok(_) => tool_failure("[Errore] Profilo non trovato o non modificabile"),
+        Err(e) => db_tool_failure(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn db_tool_failure_dichiara_il_fallimento_e_preserva_il_messaggio() {
+        // Chiama il PRODUTTORE reale usato dai 7 rami `Err(e) => db_tool_failure(e)`
+        // di questo file: senza marker questi fallimenti (query fallita, quindi
+        // l'operazione richiesta dal tool NON e' stata compiuta) erano
+        // indistinguibili da un successo per anti-loop/supervisore/final_gate
+        // (regola M), raggiungibili dal ramo di fallback
+        // `other if other.starts_with("nexus_")` in
+        // `agent_tools::dispatch::execute_agent_tool`.
+        let out = db_tool_failure("relation \"projects\" does not exist");
+        assert!(nexus_types::tool_outcome::is_tool_failure(&out));
+        assert!(out.contains("[Errore DB]"));
+        assert!(out.contains("relation \"projects\" does not exist"));
+    }
+
+    #[test]
+    fn db_tool_failure_non_raddoppia_il_marker_su_ri_wrap() {
+        // Propagazione a catena: un chiamante che ri-passasse un esito gia'
+        // marcato non deve finire con due marker in testa.
+        let una_volta = db_tool_failure("boom");
+        let due_volte = tool_failure(&una_volta);
+        assert_eq!(una_volta, due_volte);
+        assert_eq!(
+            due_volte
+                .matches(nexus_types::tool_outcome::TOOL_FAILURE_MARKER)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn progetto_non_trovato_e_un_fallimento_dichiarato() {
+        // Stesso letterale usato nei rami `Ok(None)` di
+        // `handle_project_analyze` e `handle_project_quality_scan`: il
+        // progetto richiesto non esiste, l'operazione non e' stata compiuta.
+        let out = tool_failure("[Errore] Progetto non trovato");
+        assert!(nexus_types::tool_outcome::is_tool_failure(&out));
+    }
+
+    #[test]
+    fn profilo_non_eliminabile_e_un_fallimento_dichiarato() {
+        // Stesso letterale usato nel ramo `Ok(_)` di `handle_profile_delete`
+        // quando la DELETE non tocca alcuna riga (profilo altrui o assente).
+        let out = tool_failure(
+            "[Errore] Profilo non trovato o non eliminabile (non appartiene all'utente)",
+        );
+        assert!(nexus_types::tool_outcome::is_tool_failure(&out));
+    }
+
+    #[test]
+    fn profilo_non_modificabile_e_un_fallimento_dichiarato() {
+        // Stesso letterale usato nel ramo `Ok(_)` di
+        // `handle_profile_set_default` quando la UPDATE non tocca alcuna riga.
+        let out = tool_failure("[Errore] Profilo non trovato o non modificabile");
+        assert!(nexus_types::tool_outcome::is_tool_failure(&out));
+    }
+
+    #[test]
+    fn parse_uuid_invalido_propaga_un_fallimento_dichiarato() {
+        // Il vero produttore dell'errore su project_id/profile_id malformato
+        // e' `parse_uuid` (prompt_admin.rs, convenzione testuale "[Errore]..."
+        // non modificabile in questo task): ogni handler lo avvolge con
+        // `tool_failure(e)` al punto di ritorno, come fanno
+        // `handle_project_analyze`, `handle_project_quality_scan`,
+        // `handle_project_quality_findings`, `handle_profile_delete` e
+        // `handle_profile_set_default`.
+        let err = parse_uuid(&json!({ "project_id": "non-e-un-uuid" }), "project_id")
+            .expect_err("un UUID malformato deve fallire il parse");
+        let out = tool_failure(err);
+        assert!(nexus_types::tool_outcome::is_tool_failure(&out));
     }
 }

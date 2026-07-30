@@ -22,6 +22,10 @@ use uuid::Uuid;
 
 use crate::mcp_connectors;
 use crate::orchestrator::NeuralCoreClient;
+// Contratto di fallimento dei tool agente (regola M / ADR tool_outcome): marker
+// in testa, unico modo per anti-loop/supervisore/final_gate di distinguere un
+// fallimento pieno da un successo. Vedi crates/nexus-types/src/tool_outcome.rs.
+use nexus_types::tool_outcome::tool_failure;
 
 // ── Costanti ─────────────────────────────────────────────────────────────────
 
@@ -482,7 +486,7 @@ async fn handle_mcp_tool_search_inner(
 ) -> String {
     let query = parse_str(arguments.get("query")).unwrap_or_default();
     if query.is_empty() {
-        return format_json(&json!({"error": "query richiesto"}));
+        return mcp_tool_failure(json!({"error": "query richiesto"}));
     }
     let limit = parse_i64(arguments.get("limit"), 10).clamp(1, 50);
 
@@ -850,17 +854,17 @@ pub async fn handle_mcp_tool_call(
         .unwrap_or_else(|| json!({}));
 
     let Some(server_id_str) = server_id_str else {
-        return format_json(&json!({"error": "server_id richiesto"}));
+        return mcp_tool_failure(json!({"error": "server_id richiesto"}));
     };
     let Ok(server_id) = Uuid::parse_str(&server_id_str) else {
-        return format_json(&json!({"error": "server_id non valido"}));
+        return mcp_tool_failure(json!({"error": "server_id non valido"}));
     };
     if tool_name.is_empty() {
-        return format_json(&json!({"error": "tool_name richiesto"}));
+        return mcp_tool_failure(json!({"error": "tool_name richiesto"}));
     }
 
     if !can_access_server(db, server_id, user_id, project_id).await {
-        return format_json(&json!({"error": "server non accessibile o disabilitato"}));
+        return mcp_tool_failure(json!({"error": "server non accessibile o disabilitato"}));
     }
 
     mcp_connectors::execute_mcp_tool(db, server_id, &tool_name, args).await
@@ -881,7 +885,7 @@ pub async fn handle_mcp_tool_reindex(db: &PgPool, arguments: &Value) -> String {
 
     // Crea/verifica collection
     if let Err(e) = ensure_mcp_tools_collection(db).await {
-        return format_json(&json!({"error": format!("Qdrant collection: {e}")}));
+        return mcp_tool_failure(json!({"error": format!("Qdrant collection: {e}")}));
     }
 
     // Carica tool da re-indicizzare
@@ -951,9 +955,128 @@ fn format_json(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
 }
 
+/// Costruisce l'esito FALLITO di un handler `nexus_mcp_tool_*`: marker in
+/// testa (`tool_failure`) + payload JSON nello stesso formato pretty di
+/// `format_json`. Senza il marker questi rami (validazione argomenti fallita,
+/// server non accessibile, collection Qdrant irraggiungibile) erano
+/// indistinguibili da un successo per anti-loop/supervisore/final_gate, che
+/// leggono solo `is_tool_failure`, raggiungibili da
+/// `agent_tools::dispatch::execute_agent_tool` tramite il ramo di fallback
+/// `other if other.starts_with("nexus_")` -> `nexus_builtin::execute`.
+fn mcp_tool_failure(payload: Value) -> String {
+    tool_failure(format_json(&payload))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pool Postgres LAZY: non apre connessioni finche' non si interroga il
+    /// DB. Usato per esercitare i rami di validazione degli handler che
+    /// ritornano PRIMA di qualunque query (regola O: si chiama il produttore
+    /// reale `handle_mcp_tool_*`, non una sua imitazione).
+    fn lazy_pool() -> PgPool {
+        PgPool::connect_lazy("postgres://test:test@127.0.0.1:1/test")
+            .expect("connect_lazy non apre connessioni: l'URL basta che sia ben formata")
+    }
+
+    #[test]
+    fn mcp_tool_failure_dichiara_il_fallimento_e_preserva_il_payload() {
+        let out = mcp_tool_failure(json!({"error": "server_id richiesto"}));
+        assert!(
+            nexus_types::tool_outcome::is_tool_failure(&out),
+            "mcp_tool_failure deve anteporre il marker (regola M)"
+        );
+        assert!(out.contains("server_id richiesto"));
+    }
+
+    #[test]
+    fn mcp_tool_failure_non_raddoppia_il_marker_su_ri_wrap() {
+        let una_volta = mcp_tool_failure(json!({"error": "boom"}));
+        let due_volte = tool_failure(&una_volta);
+        assert_eq!(una_volta, due_volte);
+        assert_eq!(
+            due_volte
+                .matches(nexus_types::tool_outcome::TOOL_FAILURE_MARKER)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_mcp_tool_search_query_vuota_e_un_fallimento() {
+        // Il ramo "query richiesto" ritorna prima di qualunque accesso DB:
+        // il pool lazy non viene mai realmente contattato.
+        let db = lazy_pool();
+        let out =
+            handle_mcp_tool_search(&db, Uuid::nil(), Uuid::nil(), &json!({"query": ""})).await;
+        assert!(
+            nexus_types::tool_outcome::is_tool_failure(&out),
+            "query vuota deve fallire con marker, ottenuto: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_mcp_tool_call_server_id_assente_e_un_fallimento() {
+        let db = lazy_pool();
+        let out = handle_mcp_tool_call(&db, Uuid::nil(), Uuid::nil(), &json!({})).await;
+        assert!(
+            nexus_types::tool_outcome::is_tool_failure(&out),
+            "server_id assente deve fallire con marker, ottenuto: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_mcp_tool_call_server_id_non_valido_e_un_fallimento() {
+        let db = lazy_pool();
+        let out = handle_mcp_tool_call(
+            &db,
+            Uuid::nil(),
+            Uuid::nil(),
+            &json!({"server_id": "non-e-un-uuid", "tool_name": "qualcosa"}),
+        )
+        .await;
+        assert!(
+            nexus_types::tool_outcome::is_tool_failure(&out),
+            "server_id malformato deve fallire con marker, ottenuto: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_mcp_tool_call_tool_name_assente_e_un_fallimento() {
+        // Il controllo su tool_name avviene PRIMA di can_access_server (che
+        // interrogherebbe il DB): anche questo ramo non tocca la rete.
+        let db = lazy_pool();
+        let out = handle_mcp_tool_call(
+            &db,
+            Uuid::nil(),
+            Uuid::nil(),
+            &json!({"server_id": Uuid::new_v4().to_string()}),
+        )
+        .await;
+        assert!(
+            nexus_types::tool_outcome::is_tool_failure(&out),
+            "tool_name assente deve fallire con marker, ottenuto: {out}"
+        );
+    }
+
+    /// Il riepilogo di `handle_mcp_tool_reindex` riporta "errors" come
+    /// CONTEGGIO interno (alcuni tool falliti su N durante l'indicizzazione),
+    /// ma l'operazione RICHIESTA (il reindex) e' stata comunque eseguita:
+    /// non deve mai diventare un tool_failure. Costruito con lo stesso
+    /// `format_json` usato dal return reale (mai wrappato con
+    /// `mcp_tool_failure`, che e' riservato al solo ramo "collection Qdrant
+    /// irraggiungibile" prima che il reindex inizi).
+    #[test]
+    fn reindex_summary_con_errori_parziali_non_e_un_fallimento() {
+        let summary = format_json(&json!({
+            "total_processed": 5,
+            "indexed": 3,
+            "errors": 2,
+            "force": false,
+        }));
+        assert!(!nexus_types::tool_outcome::is_tool_failure(&summary));
+    }
 
     #[test]
     fn embedding_hash_idempotente_a_parita_di_embedder() {
