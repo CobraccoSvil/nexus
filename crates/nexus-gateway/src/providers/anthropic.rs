@@ -490,21 +490,66 @@ fn build_request_body(
     }
 }
 
-/// Costruisce il campo `system` della request. Quando il caching e' attivo e il
-/// system non e' vuoto, lo avvolge in un blocco text con `cache_control` (array
-/// di blocchi, formato accettato da Anthropic). Altrimenti resta una stringa
-/// semplice (o `None` se assente). Guardia: niente `cache_control` su testo
-/// vuoto (Anthropic ritorna HTTP 400).
+/// Costruisce il campo `system` della request, col breakpoint della prompt cache
+/// sulla sola parte STABILE.
+///
+/// Il `cache_control` di Anthropic e' un breakpoint: marca "memorizza fin qui".
+/// Metterlo su un blocco unico che contiene l'intero system include anche cio'
+/// che il grafo ricalcola a ogni turno (la directive di focus, appesa dietro
+/// `CONFINE_DI_TURNO` da `appendi_blocco_di_turno`), e allora il prefisso
+/// memorizzato non si ripete mai: il provider riscrive la cache a ogni turno
+/// invece di rileggerla.
+///
+/// MISURATO il 30/07/2026 contro l'API vera, `claude-haiku-4-5`, tre giri con
+/// prefisso identico di 10.9k token: con system invariato la rilettura e' 99,8%
+/// dal secondo giro; aggiungendo dietro il confine una riga DIVERSA a ogni giro
+/// (cioe' un turno agentico qualunque) la rilettura scende a 0 e la scrittura
+/// risale a 10.955 token ogni volta. Su Anthropic scrivere cache costa 1,25x
+/// l'input e rileggerla 0,1x: e' dodici volte il dovuto, a ogni turno.
+///
+/// La parte stabile la decide `nexus_types::system_prompt::parte_stabile`, lo
+/// STESSO punto unico da cui `openai_compat` deriva `prompt_cache_key` (regola
+/// L): due idee diverse di "quale parte e' stabile" darebbero due prefissi
+/// diversi per la stessa richiesta.
+///
+/// La parte variabile viaggia in un SECONDO blocco senza `cache_control`, non
+/// viene tolta: il modello deve continuare a leggerla, e' il focus del turno.
+/// Guardia invariata: niente `cache_control` su testo vuoto (HTTP 400).
 fn build_system_field(system_text: Option<String>, cache_ttl: CacheTtl) -> Option<AnthropicSystem> {
     let text = system_text?;
-    match cache_ttl.system_cache_control() {
-        Some(cc) if !text.is_empty() => Some(AnthropicSystem::Blocks(vec![AnthropicSystemBlock {
+    let Some(cc) = cache_ttl.system_cache_control() else {
+        return Some(AnthropicSystem::Text(text));
+    };
+    if text.is_empty() {
+        return Some(AnthropicSystem::Text(text));
+    }
+
+    let stabile = nexus_types::system_prompt::parte_stabile(&text);
+    // Nessun blocco di turno: il system e' gia' tutto stabile, un blocco solo.
+    if stabile.len() == text.len() {
+        return Some(AnthropicSystem::Blocks(vec![AnthropicSystemBlock {
             kind: "text".to_string(),
             text,
             cache_control: Some(cc),
-        }])),
-        _ => Some(AnthropicSystem::Text(text)),
+        }]));
     }
+
+    let variabile = text[stabile.len()..].trim_start();
+    let mut blocchi = vec![AnthropicSystemBlock {
+        kind: "text".to_string(),
+        text: stabile.to_string(),
+        cache_control: Some(cc),
+    }];
+    // Un blocco vuoto e' rifiutato da Anthropic: se dietro il confine non
+    // resta testo, il primo blocco basta.
+    if !variabile.is_empty() {
+        blocchi.push(AnthropicSystemBlock {
+            kind: "text".to_string(),
+            text: variabile.to_string(),
+            cache_control: None,
+        });
+    }
+    Some(AnthropicSystem::Blocks(blocchi))
 }
 
 /// Applica il breakpoint cache all'ultimo blocco STABILE della history. Il
@@ -1249,6 +1294,111 @@ struct AnthropicStreamDelta {
 mod tests {
     use super::*;
     use crate::types::{LlmMessage, LlmToolDefinition, RequestMetadata, ToolFunctionDef};
+
+    /// I blocchi del campo `system`, come li vedrebbe Anthropic sul wire:
+    /// `(testo, ha_cache_control)`. Passa dal serializzatore vero, non dai campi
+    /// dello struct, cosi' un cambio di `serde` non sfugge (regola O).
+    fn blocchi_sul_wire(s: &AnthropicSystem) -> Vec<(String, bool)> {
+        let v = serde_json::to_value(s).expect("serializzabile");
+        match v {
+            serde_json::Value::String(t) => vec![(t, false)],
+            serde_json::Value::Array(a) => a
+                .into_iter()
+                .map(|b| {
+                    (
+                        b.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+                        b.get("cache_control").is_some(),
+                    )
+                })
+                .collect(),
+            altro => panic!("forma inattesa del campo system: {altro}"),
+        }
+    }
+
+    /// Il system di un turno agentico: parte stabile del run, poi il blocco che
+    /// il grafo ricalcola ogni volta. Costruito con `appendi_blocco_di_turno`,
+    /// lo stesso produttore della produzione: scrivere il marcatore a mano qui
+    /// fisserebbe l'assunto da verificare (regola O).
+    fn system_di_turno(stabile: &str, focus: &str) -> String {
+        nexus_types::system_prompt::appendi_blocco_di_turno(stabile, focus)
+    }
+
+    const STABILE: &str = "Sei l'agente di sviluppo del progetto. Regole di lavoro invariate per tutto il run.";
+
+    /// IL DIFETTO: il breakpoint copriva l'intero system, blocco di turno
+    /// incluso, quindi il prefisso memorizzato non si ripeteva mai. Misurato
+    /// contro l'API vera: 0% di rilettura su tre turni con prefisso identico.
+    /// Qui il criterio e' che il blocco CON `cache_control` sia identico fra due
+    /// turni diversi -- e' quello che il provider confronta.
+    #[test]
+    fn il_blocco_memorizzato_non_cambia_da_un_turno_all_altro() {
+        let uno = build_system_field(
+            Some(system_di_turno(STABILE, "Focus del turno: verifica il servizio.")),
+            CacheTtl::OneHour,
+        )
+        .expect("system presente");
+        let due = build_system_field(
+            Some(system_di_turno(STABILE, "Focus del turno: correggi il modulo.")),
+            CacheTtl::OneHour,
+        )
+        .expect("system presente");
+
+        let a = blocchi_sul_wire(&uno);
+        let b = blocchi_sul_wire(&due);
+        let cache_a: Vec<_> = a.iter().filter(|(_, cc)| *cc).collect();
+        let cache_b: Vec<_> = b.iter().filter(|(_, cc)| *cc).collect();
+        assert_eq!(cache_a.len(), 1, "un solo breakpoint atteso");
+        assert_eq!(
+            cache_a, cache_b,
+            "il blocco memorizzato deve essere identico fra due turni: se contiene il \
+             focus, il provider riscrive la cache a ogni turno invece di rileggerla"
+        );
+        assert_eq!(cache_a[0].0, STABILE, "il breakpoint sta sulla sola parte stabile");
+    }
+
+    /// La parte variabile non va TOLTA: e' la richiesta del turno, il modello
+    /// deve leggerla. Viaggia nel secondo blocco, senza breakpoint.
+    #[test]
+    fn il_focus_del_turno_arriva_al_modello_senza_breakpoint() {
+        let s = build_system_field(
+            Some(system_di_turno(STABILE, "Focus del turno: esegui i test.")),
+            CacheTtl::OneHour,
+        )
+        .expect("system presente");
+        let b = blocchi_sul_wire(&s);
+        assert_eq!(b.len(), 2, "parte stabile e parte di turno, separate");
+        assert!(!b[1].1, "il blocco di turno non porta cache_control");
+        assert!(
+            b[1].0.contains("esegui i test"),
+            "il focus deve restare nel payload: {:?}",
+            b[1].0
+        );
+    }
+
+    /// Senza blocco di turno il comportamento e' quello di prima: un blocco solo.
+    #[test]
+    fn un_system_tutto_stabile_resta_un_blocco_solo() {
+        let s = build_system_field(Some(STABILE.to_string()), CacheTtl::OneHour)
+            .expect("system presente");
+        let b = blocchi_sul_wire(&s);
+        assert_eq!(b.len(), 1);
+        assert!(b[0].1, "il breakpoint c'e'");
+        assert_eq!(b[0].0, STABILE);
+    }
+
+    /// Caching disattivato: nessun breakpoint, nemmeno con un blocco di turno.
+    #[test]
+    fn con_cache_off_niente_breakpoint() {
+        let s = build_system_field(
+            Some(system_di_turno(STABILE, "Focus del turno: qualunque.")),
+            CacheTtl::Off,
+        )
+        .expect("system presente");
+        assert!(
+            blocchi_sul_wire(&s).iter().all(|(_, cc)| !*cc),
+            "con cache off il system non porta cache_control"
+        );
+    }
 
     fn metadata() -> RequestMetadata {
         RequestMetadata {
