@@ -32,6 +32,19 @@ rc: ./.lefthookrc
 pre-commit:
   parallel: false
   commands:
+    # Premessa di TUTTI i gate sotto: che stiano misurando l'albero che sta
+    # committando. Gli hook sono condivisi fra repo principale e worktree
+    # (core.hooksPath punta a <main>/.git/hooks), quindi quella premessa non e'
+    # garantita da nulla di dichiarato -- e se cade i gate restano verdi mentre
+    # misurano l'altro albero. 'priority: 1' lo fa girare per primo (v1.13.6
+    # esegue i comandi in ordine alfabetico quando priority non c'e': verificato);
+    # nessun glob, cosi' copre anche i gate futuri con altri glob. Costo: due
+    # 'git rev-parse'. Perche' il confronto non e' tautologico: nello script.
+    hook_tree_guard:
+      priority: 1
+      run: bash scripts/check-hook-tree.sh
+      fail_text: "pre-commit: i gate non girano nell'albero che sta committando."
+
     turbo_quick:
       glob:
         - "*.ts"
