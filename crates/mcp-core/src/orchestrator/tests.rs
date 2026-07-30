@@ -187,6 +187,8 @@ fn classified(
         classifier_resolved: true,
         complexity: "medium".to_string(),
         slots: crate::routing_slots::ActionSlots::default(),
+        model_switch: None,
+        competencies: None,
     }
 }
 

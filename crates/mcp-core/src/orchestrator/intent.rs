@@ -42,6 +42,8 @@ fn classified_from_rust(ai: crate::intent_classifier::AgenticIntent) -> Classifi
         classifier_resolved: !ai.fallback_used,
         complexity: ai.complexity,
         slots: ai.slots,
+        model_switch: ai.model_switch,
+        competencies: ai.competencies,
     }
 }
 
@@ -131,6 +133,12 @@ pub struct ClassifiedIntent {
     /// router prova prima la `nexus_routing_slots_matrix` (mig 0133), e
     /// cade sul routing classico (intent, behavior_mode) se non c'e' match.
     pub slots: crate::routing_slots::ActionSlots,
+    /// Cambio di provider/modello che l'utente chiede in QUESTO turno, dichiarato
+    /// dal classifier. `None` = non e' un comando di switch (o il classifier non
+    /// ha risposto: sul fallback neutro vale sempre `None`, mai un'invenzione).
+    /// Il verdetto - la validazione contro `ai_price_catalog` - e' del punto
+    /// unico `crate::model_switch` (regola L).
+    pub model_switch: Option<crate::intent_classifier::ModelSwitchSignal>,
     /// Complessita' del task giudicata dal classifier LLM (`low`/`medium`/`high`).
     /// Consumata dalla DECISIONE AGENTICA di convocare consiglio/multi-provider
     /// (regola M: segnale strutturato del classificatore, non keyword-match sul
@@ -140,6 +148,12 @@ pub struct ClassifiedIntent {
     /// fallback neutro (LLM down/timeout/JSON invalido). I gate a valle usano il
     /// giudizio LLM solo se `true`, altrimenti degradano al percorso keyword.
     pub classifier_resolved: bool,
+    /// Competenze che il task richiede, dichiarate dal classifier nel vocabolario
+    /// del roster figure (regola M: quali lenti servono e' un giudizio semantico,
+    /// non un match di keyword d'asse sul testo). `None` = non dichiarabile ->
+    /// la selezione delle figure ripiega sul vocabolario keyword dei settings.
+    /// Vedi `intent_classifier::AgenticIntent::competencies`.
+    pub competencies: Option<Vec<String>>,
 }
 
 /// Soglia di confidence default sotto la quale ignoriamo la classificazione LLM
@@ -275,6 +289,8 @@ mod tests_classifier_engine {
             }],
             is_ambiguous,
             slots: crate::routing_slots::ActionSlots::default(),
+            model_switch: None,
+            competencies: None,
         }
     }
 

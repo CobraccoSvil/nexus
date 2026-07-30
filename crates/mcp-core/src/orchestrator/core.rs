@@ -88,9 +88,12 @@ impl Orchestrator {
     /// (mig 0133). In caso di no-match o slot incompleti, ritorna `None` e il
     /// caller fa fallback al routing classico `(intent, behavior_mode)`.
     ///
-    /// `min_slot_confidence`: soglia sopra la quale fidarsi degli slot.
-    /// Tipicamente 0.60 — sotto questa soglia il classifier "non e' sicuro"
-    /// di action_verb/scope e meglio cadere sul routing classico testato.
+    /// La soglia sopra la quale fidarsi degli slot si legge QUI, dalla cache delle
+    /// `routing.*` (`slots_min_confidence`, mig 0658), non la passa il chiamante:
+    /// era un `0.60` letterale nel call site, e un secondo consumatore avrebbe
+    /// potuto scriverne un altro senza che nulla lo segnalasse (regola G/L). Se la
+    /// cache non e' disponibile non si inventa una soglia: niente routing
+    /// slot-based e si prosegue col percorso classico.
     ///
     /// Ritorna `Some((provider, model, rationale))` dove rationale spiega
     /// la decisione (utile per audit telemetria + UI debug).
@@ -104,11 +107,19 @@ impl Orchestrator {
         &self,
         db: &sqlx::PgPool,
         slots: &crate::routing_slots::ActionSlots,
-        min_slot_confidence: f32,
     ) -> Option<(String, String, &'static str)> {
         if !slots.is_complete() {
             return None;
         }
+        let min_slot_confidence = match self.routing_thresholds.current_async().await {
+            Ok(t) => t.slots_min_confidence,
+            Err(e) => {
+                tracing::warn!(
+                    "route_by_slots: soglia slot non leggibile ({e}), fallback intent classico"
+                );
+                return None;
+            }
+        };
         if !slots.meets_confidence(min_slot_confidence) {
             tracing::debug!(
                 "route_by_slots: confidence {:.2} < soglia {:.2}, fallback intent classico",

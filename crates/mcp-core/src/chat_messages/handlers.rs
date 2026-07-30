@@ -634,6 +634,15 @@ pub async fn send_chat_message(
     // il client non ha già impostato un override manuale, gestiamo lo switch
     // automaticamente: salviamo la preferenza nella sessione e rispondiamo con
     // un messaggio di conferma senza coinvolgere l'AI.
+    //
+    // Il giudizio "e' un comando o e' lavoro" viene dal classificatore (regola
+    // M), non da un match di keyword: si classifica il turno UNA VOLTA qui,
+    // prima di sapere se diventera' un run agentico o un turno singolo — nessuno
+    // dei due percorsi a valle classifica ANCORA su questo stesso testo grezzo
+    // (spawn_agent_run arricchisce col contesto recente, Orchestrator::run parte
+    // dal messaggio con system_context), quindi non e' una chiamata duplicata
+    // sullo stesso input. La cache TTL del classificatore (24h, chiave
+    // messaggio+vocabolario) rende economico un resend identico.
     if body.provider_override.is_none() {
         // Reset al routing automatico
         if detect_model_reset(content) {
@@ -664,9 +673,17 @@ pub async fn send_chat_message(
             })));
         }
 
-        if let Some((switched_provider, switched_model)) =
-            detect_model_switch(&state.db, content).await
+        let classified_for_switch = state
+            .orchestrator
+            .classify_intent_full(&state.db, content)
+            .await;
+        if let Some(verdict) = crate::model_switch::resolve_switch_verdict(
+            &state.db,
+            classified_for_switch.model_switch.as_ref(),
+        )
+        .await
         {
+            let (switched_provider, switched_model) = (verdict.provider, verdict.model);
             // Persiste la preferenza nella sessione per i messaggi futuri
             let _ = sqlx::query(
                 "UPDATE chat_sessions SET preferred_provider = $1, preferred_model = $2 WHERE id = $3",
@@ -757,7 +774,14 @@ pub async fn send_chat_message(
     // Carica contesto profilo (system_prompt, provider/model/automation override)
     // Passa il testo della richiesta per la selezione automatica (profile_id == "auto")
     let (profile_prompt_block, profile_provider, profile_model, profile_automation) =
-        fetch_profile_context(&state.db, user_id, &profile_id, &body.content).await;
+        fetch_profile_context(
+            &state.db,
+            &state.orchestrator.neural,
+            user_id,
+            &profile_id,
+            &body.content,
+        )
+        .await;
 
     let automation_mode = resolve_automation_mode(
         &body,
@@ -1649,8 +1673,14 @@ pub async fn resend_chat_message(
 
     // ── Agent mode per resend (usa la stessa funzione condivisa di send) ──
     if automation_mode != AutomationMode::Study {
-        let (profile_prompt_block, _, _, _) =
-            fetch_profile_context(&state.db, user_id, &profile_id, &source_prompt).await;
+        let (profile_prompt_block, _, _, _) = fetch_profile_context(
+            &state.db,
+            &state.orchestrator.neural,
+            user_id,
+            &profile_id,
+            &source_prompt,
+        )
+        .await;
         let github_username: Option<String> =
             sqlx::query_scalar("SELECT github_username FROM users WHERE id = $1")
                 .bind(user_id)

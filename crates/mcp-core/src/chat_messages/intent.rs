@@ -160,110 +160,17 @@ pub(crate) fn detect_model_reset(content: &str) -> bool {
         || lower.contains("modello di default")
         || lower.contains("provider di default")
 }
-/// Rileva se il messaggio dell'utente è un comando esplicito di cambio provider/modello.
-///
-/// Restituisce `Some((provider, modello_specifico))` se rilevato, `None` altrimenti.
-/// Considera solo messaggi brevi (< 100 caratteri) per evitare falsi positivi.
-///
-/// I PROVIDER ID (mistral, anthropic, openai, google, deepseek) sono identificatori
-/// stabili Nexus, quindi keyword-based. I MODELLI invece sono letti dal DB
-/// (`ai_price_catalog`) — cosi' aggiungere claude-opus-5 al DB lo rende
-/// automaticamente riconoscibile in chat senza modifiche al codice.
-pub(crate) async fn detect_model_switch(
-    db: &sqlx::PgPool,
-    content: &str,
-) -> Option<(String, Option<String>)> {
-    let lower = content.trim().to_lowercase();
-    // Ignora messaggi lunghi: quasi certamente non è un puro comando di switch
-    if lower.chars().count() > 100 {
-        return None;
-    }
+// `detect_model_switch` (5 liste di keyword provider + 18 pattern di verbo)
+// viveva qui. Rimossa: leggeva "e' un comando di switch?" dal TESTO, e
+// "voglio capire perche' gemini risponde male" (una domanda, non un comando)
+// conteneva sia il nome di un provider sia un verbo d'azione ("voglio"), quindi
+// veniva consumata come switch — il turno non arrivava mai all'agente. Il
+// giudizio "e' un comando o e' lavoro" e' ora del classificatore
+// (`intent_classifier::ModelSwitchSignal`, campo semantico dello stesso schema
+// che gia' produce intent/slot/competenze); la validazione contro il listino e'
+// il punto unico `crate::model_switch::resolve_switch_verdict` (regola L).
+// Vedi `chat_messages::handlers::send`.
 
-    // Identifica il provider richiesto in base a keyword nel messaggio.
-    // I 5 provider id sono identificatori stabili (slug Nexus) — non cambiano.
-    let provider: &'static str =
-        if lower.contains("mistral") || lower.contains("codestral") || lower.contains("mixtral") {
-            "mistral"
-        } else if lower.contains("claude")
-            || lower.contains("anthropic")
-            || lower.contains("sonnet")
-            || lower.contains("opus")
-            || lower.contains("haiku")
-        {
-            "anthropic"
-        } else if lower.contains("openai")
-            || lower.contains("gpt")
-            || lower.contains("chatgpt")
-            || lower.contains("o1")
-            || lower.contains("o3")
-        {
-            "openai"
-        } else if lower.contains("gemini") || lower.contains("google") || lower.contains("bard") {
-            "google"
-        } else if lower.contains("deepseek") {
-            "deepseek"
-        } else {
-            return None;
-        };
-
-    // Verifica che sia presente un verbo d'azione (switch, usa, cambia, ecc.)
-    let has_action = lower.starts_with("usa ")
-        || lower.starts_with("use ")
-        || lower == "usa mistral"
-        || lower == "usa claude"
-        || lower == "usa openai"
-        || lower == "usa gemini"
-        || lower == "usa deepseek"
-        || lower.contains("cambia")
-        || lower.contains("passa a")
-        || lower.contains("passa su")
-        || lower.contains("switch to")
-        || lower.contains("switch su")
-        || lower.contains("rispondi con")
-        || lower.contains("utilizza ")
-        || lower.contains("voglio usare")
-        || lower.contains("voglio ")
-        || lower.contains("usa il modello")
-        || lower.contains("use the model")
-        || lower.contains("imposta ")
-        || lower.contains("setta ");
-
-    if !has_action {
-        return None;
-    }
-
-    // Modello specifico: query DB per i modelli enabled del provider scelto.
-    // Match: il messaggio contiene il model_id intero, o l'ultima componente
-    // (es. "sonnet" matcha "claude-sonnet-4-6") quando il modello ha trattini.
-    // Ordinato per is_featured DESC + costo ASC: se ci sono ambiguita' (es.
-    // "claude" matcha sia haiku che sonnet), vince il piu' "in evidenza".
-    let candidates: Vec<String> = sqlx::query_scalar(
-        "SELECT model FROM ai_price_catalog \
-         WHERE provider = $1 AND is_enabled = TRUE \
-         ORDER BY is_featured DESC, input_cost_per_million_tokens ASC",
-    )
-    .bind(provider)
-    .fetch_all(db)
-    .await
-    .unwrap_or_default();
-
-    let specific_model: Option<String> = candidates.into_iter().find(|m| {
-        let m_lower = m.to_lowercase();
-        // Match diretto: lower contiene l'intero model_id
-        if lower.contains(&m_lower) {
-            return true;
-        }
-        // Match per "famiglia": ogni componente split-trattino del modello
-        // (es. "claude-opus-4-6" -> ["claude", "opus", "4", "6"]) — se nel
-        // messaggio c'e' una componente "opus" (>=4 char per evitare match
-        // di numeri o suffissi tipo "4"), considera match.
-        m_lower
-            .split('-')
-            .any(|part| part.len() >= 4 && lower.contains(part))
-    });
-
-    Some((provider.to_string(), specific_model))
-}
 /// Tipo di query meta auto-referenziale rilevato. Determina quale
 /// messaggio precedente significativo va citato nell'hint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

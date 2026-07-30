@@ -477,8 +477,13 @@ pub async fn fork_profile(
 /// Carica il system_prompt del profilo selezionato.
 /// Cerca prima nei profili utente, poi nei profili di sistema.
 /// Se profile_id == "auto", sceglie automaticamente il profilo più adatto.
+///
+/// `embedder` serve solo al ramo "auto" (richiamo semantico, vedi
+/// `profile_selection`): gli altri rami sono lookup diretti per id e non lo
+/// toccano.
 pub async fn fetch_profile_context(
     db: &sqlx::PgPool,
+    embedder: &dyn nexus_agent_tools::context_core::TextEmbedder,
     user_id: Uuid,
     profile_id: &str,
     request_text: &str,
@@ -488,7 +493,7 @@ pub async fn fetch_profile_context(
     }
 
     if profile_id == "auto" {
-        return auto_select_profile(db, user_id, request_text).await;
+        return auto_select_profile(db, embedder, user_id, request_text).await;
     }
 
     let Ok(uuid) = Uuid::parse_str(profile_id) else {
@@ -513,10 +518,16 @@ pub async fn fetch_profile_context(
     }
 }
 
-/// Sceglie automaticamente il profilo più adatto analizzando il testo della richiesta.
-/// Considera sia profili utente che profili di sistema.
+/// Sceglie automaticamente il profilo più adatto analizzando il testo della
+/// richiesta. Considera sia profili utente che profili di sistema.
+///
+/// Il criterio (soglia, confronto, uscita "nessuno pertinente") e' il punto
+/// unico [`crate::profile_selection`]: qui restano SOLO l'I/O (query DB, lettura
+/// della soglia dai settings) e la traduzione della scelta nel risultato che
+/// `fetch_profile_context` restituisce.
 async fn auto_select_profile(
     db: &sqlx::PgPool,
+    embedder: &dyn nexus_agent_tools::context_core::TextEmbedder,
     user_id: Uuid,
     request_text: &str,
 ) -> (String, Option<String>, Option<String>, Option<String>) {
@@ -541,57 +552,38 @@ async fn auto_select_profile(
         return (String::new(), None, None, None);
     }
 
-    let req_lower = request_text.to_lowercase();
+    let candidates: Vec<crate::profile_selection::ProfileCandidate> = rows
+        .iter()
+        .enumerate()
+        .map(|(idx, row)| {
+            let name = row.try_get::<String, _>("name").unwrap_or_default();
+            let description = row
+                .try_get::<Option<String>, _>("description")
+                .unwrap_or(None)
+                .unwrap_or_default();
+            let prompt = row.try_get::<String, _>("system_prompt").unwrap_or_default();
+            crate::profile_selection::ProfileCandidate::new(idx, &name, &description, &prompt)
+        })
+        .collect();
 
-    let mut best_score: usize = 0;
-    let mut best_idx: Option<usize> = None;
+    let min_similarity = nexus_auth::get_setting(db, "orchestrator.profile_auto_select_min_similarity")
+        .await
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .unwrap_or(crate::profile_selection::DEFAULT_MIN_SIMILARITY);
 
-    for (idx, row) in rows.iter().enumerate() {
-        let name = row
-            .try_get::<String, _>("name")
-            .unwrap_or_default()
-            .to_lowercase();
-        let description = row
-            .try_get::<Option<String>, _>("description")
-            .unwrap_or(None)
-            .unwrap_or_default()
-            .to_lowercase();
-        let prompt = row
-            .try_get::<String, _>("system_prompt")
-            .unwrap_or_default()
-            .to_lowercase();
-
-        let candidate_text = format!(
-            "{} {} {}",
-            name,
-            description,
-            &prompt[..prompt.len().min(300)]
-        );
-        let keywords: Vec<&str> = candidate_text
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|w| w.len() > 3)
-            .collect();
-
-        let score = keywords
-            .iter()
-            .filter(|&&kw| req_lower.contains(kw))
-            .count();
-
-        if score > best_score {
-            best_score = score;
-            best_idx = Some(idx);
-        }
-    }
+    let best_idx =
+        crate::profile_selection::select_best_profile(embedder, request_text, &candidates, min_similarity)
+            .await;
 
     match best_idx {
         // idx proviene da enumerate() su rows, quindi nth(idx) e' sempre Some.
         // Difensivo: se per qualche motivo non lo fosse, ritorniamo default.
-        Some(idx) if best_score > 0 => rows
+        Some(idx) => rows
             .into_iter()
             .nth(idx)
             .map(build_profile_result)
             .unwrap_or_else(|| (String::new(), None, None, None)),
-        _ => (String::new(), None, None, None),
+        None => (String::new(), None, None, None),
     }
 }
 
