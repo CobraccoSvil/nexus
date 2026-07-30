@@ -346,6 +346,7 @@ mod tests {
                 output_tokens: 1,
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
+                reasoning_tokens: None,
             },
             model_used: "deepseek-x".to_string(),
             provider_used: "deepseek".to_string(),

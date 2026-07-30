@@ -32,7 +32,8 @@ use super::gcp_auth::{
 use crate::provider::{ChunkStream, LlmProvider};
 use crate::types::{
     GeneratedImage, ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, LlmStreamChunk,
-    LlmToolCall, LlmUsage, MessageContent, PromptCacheReporting, SensitivityTier, ToolCallDelta,
+    LlmToolCall, LlmUsage, MessageContent, PromptCacheReporting, ReasoningTokens, SensitivityTier,
+    ToolCallDelta,
     ToolCallDeltaFunction, ToolFunctionCall, VideoGenRequest, VideoGenResponse,
 };
 
@@ -2375,6 +2376,9 @@ fn usage_from_metadata(meta: Option<GoogleUsageMetadata>) -> LlmUsage {
             u.cached_content_token_count,
             // L'implicit caching Gemini non fattura la scrittura della voce.
             None,
+            // `candidatesTokenCount` porta il solo testo VISIBILE: il thinking
+            // e' l'altro addendo del totale, e va sommato al fatturabile.
+            ReasoningTokens::Separate(u.thoughts_token_count),
         )
     })
     .unwrap_or(LlmUsage {
@@ -2382,6 +2386,7 @@ fn usage_from_metadata(meta: Option<GoogleUsageMetadata>) -> LlmUsage {
         output_tokens: 0,
         cache_read_tokens: None,
         cache_creation_tokens: None,
+        reasoning_tokens: None,
     })
 }
 
@@ -2594,6 +2599,9 @@ impl GoogleSseParser {
                 u.candidates_token_count,
                 u.cached_content_token_count,
                 None,
+                // Come nel non-streaming: l'`usageMetadata` dell'ultimo chunk ha
+                // la stessa forma, thinking incluso.
+                ReasoningTokens::Separate(u.thoughts_token_count),
             )
         });
 
@@ -2898,6 +2906,19 @@ struct GoogleUsageMetadata {
     /// `promptTokenCount`). Presente solo a cache hit.
     #[serde(rename = "cachedContentTokenCount", default)]
     cached_content_token_count: Option<u32>,
+    /// Token spesi nel thinking. NON sono un sottoinsieme di
+    /// `candidatesTokenCount`, che porta il solo testo visibile: sono l'altro
+    /// addendo di `totalTokenCount`, e Google li fattura alla tariffa di output.
+    ///
+    /// Finche' il campo non era dichiarato qui, serde lo scartava in silenzio e
+    /// ogni turno Google con thinking veniva contabilizzato per il solo
+    /// visibile. Misurato il 30/07/2026 su `gemini-2.5-flash`: `candidates=3`,
+    /// `thoughts=157`, `total=179` su `prompt=19`.
+    ///
+    /// Assente sui turni senza thinking (budget 0 sui turni con tool, o modello
+    /// che non ne produce).
+    #[serde(rename = "thoughtsTokenCount", default)]
+    thoughts_token_count: Option<u32>,
 }
 
 // --- Image generation Imagen (`:predict`) ----------------------------------
@@ -3556,10 +3577,15 @@ mod tests {
         assert_eq!(resp.provider_used, "google");
     }
 
+    /// `finishReason` con cui Gemini dichiara di aver esaurito il tetto di
+    /// output. Ha un nome perche' i test che lo usano stanno a mille righe di
+    /// distanza l'uno dall'altro e devono parlare dello stesso valore.
+    const FINISH_TRONCATO: &str = "MAX_TOKENS";
+
     #[test]
     fn finish_reason_mappato() {
         assert_eq!(map_finish_reason(Some("STOP")), "stop");
-        assert_eq!(map_finish_reason(Some("MAX_TOKENS")), "length");
+        assert_eq!(map_finish_reason(Some(FINISH_TRONCATO)), "length");
         assert_eq!(map_finish_reason(Some("SAFETY")), "content_filter");
         assert_eq!(map_finish_reason(Some("boh")), "stop");
         assert_eq!(map_finish_reason(None), "stop");
@@ -4849,6 +4875,274 @@ mod tests {
         assert_eq!(
             body_retry["tools"][0]["functionDeclarations"][0]["name"],
             "read_file"
+        );
+    }
+
+    // ── Il thinking di Gemini, dal wire al fatturabile ──────────
+    //
+    // `candidatesTokenCount` porta il solo testo VISIBILE: i token spesi nel
+    // thinking stanno in `thoughtsTokenCount`, che finche' non era dichiarato in
+    // `GoogleUsageMetadata` serde scartava in silenzio. Ogni turno Google con
+    // thinking veniva contabilizzato per il solo visibile.
+    //
+    // I numeri qui sotto non sono inventati: sono la risposta REALE dell'API
+    // Gemini misurata il 30/07/2026 su `gemini-2.5-flash`, ramo senza
+    // `thinkingConfig` (il piu' frequente: ogni chiamata Google senza tool).
+
+    /// `usageMetadata` VERBATIM di `gemini-2.5-flash` a una domanda banale, senza
+    /// `thinkingConfig`: tre token di risposta, centocinquantasette di pensiero.
+    /// Il `totalTokenCount` e' la prova che Google li considera entrambi:
+    /// 19 + 3 + 157 = 179.
+    const USAGE_REALE_25_FLASH: &str = r#"{
+        "promptTokenCount": 19,
+        "candidatesTokenCount": 3,
+        "totalTokenCount": 179,
+        "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 19}],
+        "thoughtsTokenCount": 157,
+        "serviceTier": "standard"
+    }"#;
+
+    /// Risposta completa attorno a quell'usage, nella forma che l'API restituisce.
+    fn response_reale_con_thinking() -> String {
+        risposta_google("391", "STOP", USAGE_REALE_25_FLASH.to_string())
+    }
+
+    /// Una risposta Gemini attorno a un `usageMetadata` dato. Il testo e il
+    /// motivo di chiusura restano parametri perche' sono cio' che ogni test
+    /// varia; la forma del guscio no, ed e' la stessa per tutti.
+    fn risposta_google(testo: &str, finish: &str, usage: String) -> String {
+        format!(
+            r#"{{
+                "candidates": [{{
+                    "content": {{"parts": [{{"text": "{testo}"}}]}},
+                    "finishReason": "{finish}"
+                }}],
+                "usageMetadata": {usage}
+            }}"#
+        )
+    }
+
+    /// `usageMetadata` dai soli numeri che il test vuole dire, col totale
+    /// calcolato come lo calcola Google: prompt + visibile + pensiero. Che il
+    /// totale sia una SOMMA e non un numero da ricopiare e' esso stesso il punto
+    /// in discussione, e scriverlo a mano in ogni test permetterebbe di sbagliarlo
+    /// in un test solo — cioe' proprio dove servirebbe accorgersene.
+    fn usage_json(prompt: u32, visibili: u32, pensiero: Option<u32>) -> String {
+        let thoughts = match pensiero {
+            Some(n) => format!(r#", "thoughtsTokenCount": {n}"#),
+            None => String::new(),
+        };
+        let totale = prompt + visibili + pensiero.unwrap_or(0);
+        format!(
+            r#"{{"promptTokenCount": {prompt}, "candidatesTokenCount": {visibili}, "totalTokenCount": {totale}{thoughts}}}"#
+        )
+    }
+
+    /// Il campo si legge, e resta DISTINTO dall'output visibile.
+    ///
+    /// MUTAZIONE: togliendo `thoughtsTokenCount` da `GoogleUsageMetadata` — il
+    /// difetto originario — `reasoning_tokens` torna `None` e la seconda
+    /// asserzione rosseggia con `None != Some(157)`.
+    #[test]
+    fn il_thinking_e_letto_e_tenuto_fuori_dal_visibile() {
+        let parsed: GenerateContentResponse =
+            serde_json::from_str(&response_reale_con_thinking()).unwrap();
+        let resp = from_generate_response(parsed, "gemini-2.5-flash".to_string(), 0);
+
+        // L'output VISIBILE resta il testo prodotto: e' cio' che misura chi
+        // riconosce un turno hollow.
+        assert_eq!(resp.usage.output_tokens, 3);
+        // Il pensiero e' letto, e sta in un campo suo.
+        assert_eq!(resp.usage.reasoning_tokens, Some(157));
+        // E i conti tornano con il totale che Google dichiara: 19 + 3 + 157.
+        assert_eq!(
+            resp.usage.input_tokens
+                + nexus_types::token_usage::completion_tokens_billable(
+                    resp.usage.output_tokens,
+                    resp.usage.reasoning_tokens
+                ),
+            179,
+            "prompt + fatturabile deve ricomporre il totalTokenCount di Google"
+        );
+    }
+
+    /// Stessa lettura sul percorso di streaming, che ha il suo call site.
+    #[test]
+    fn il_thinking_e_letto_anche_in_streaming() {
+        let mut p = GoogleSseParser::new("gemini-2.5-flash".to_string());
+        p.parse_line(&format!(
+            r#"data: {{"candidates":[{{"content":{{"parts":[{{"text":"391"}}]}},"finishReason":"STOP"}}],"usageMetadata":{USAGE_REALE_25_FLASH}}}"#
+        ));
+        let chunk = p.pending.pop_front().expect("chunk finale");
+        let usage = chunk.usage.expect("usage sul chunk finale");
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.reasoning_tokens, Some(157));
+    }
+
+    /// Il turno senza thinking non inventa un addendo.
+    ///
+    /// E' la risposta REALE di `gemini-2.5-flash` con `thinkingBudget: 0` (il
+    /// ramo `DisabledForTools`, cioe' ogni turno agentico con tool): il campo
+    /// manca del tutto e i conti tornano senza di esso — 41 + 364 = 405.
+    #[test]
+    fn senza_thinking_non_c_e_nulla_da_sommare() {
+        let raw = risposta_google("una", "STOP", usage_json(41, 364, None));
+        let parsed: GenerateContentResponse = serde_json::from_str(&raw).unwrap();
+        let resp = from_generate_response(parsed, "gemini-2.5-flash".to_string(), 0);
+        assert_eq!(resp.usage.output_tokens, 364);
+        assert_eq!(
+            resp.usage.reasoning_tokens, None,
+            "campo assente dal wire: non si fattura un pensiero che non c'e'"
+        );
+    }
+
+    /// Il vincolo che impedisce di sostituire questo difetto con un altro.
+    ///
+    /// Il pensiero NON va sommato dentro `output_tokens`: `is_degenerate_completion`
+    /// riconosce un turno hollow proprio dal fatto che quel numero conti il testo
+    /// PRODOTTO. Qui il modello ha bruciato l'intero budget nel thinking e non ha
+    /// prodotto nulla di utile — il caso per cui quel predicato esiste.
+    ///
+    /// MUTAZIONE: facendo sommare il ragionamento dentro `output_tokens` alla
+    /// fonte, l'output diventa 8_001, supera `HOLLOW_OUTPUT_TOKENS_FLOOR` e questo
+    /// test rosseggia: il turno vuoto smetterebbe di ripiegare su un altro
+    /// provider e verrebbe restituito all'utente come una risposta.
+    #[test]
+    fn sommare_il_pensiero_alloutput_renderebbe_invisibile_un_turno_hollow() {
+        let raw = risposta_google(".", FINISH_TRONCATO, usage_json(900, 1, Some(8_000)));
+        let parsed: GenerateContentResponse = serde_json::from_str(&raw).unwrap();
+        let resp = from_generate_response(parsed, "gemini-2.5-flash".to_string(), 0);
+
+        // Il troncamento mappa a "length": e' il segnale su cui poggia il predicato.
+        assert_eq!(resp.finish_reason, map_finish_reason(Some(FINISH_TRONCATO)));
+        assert_eq!(resp.usage.output_tokens, 1, "il VISIBILE resta 1");
+        assert_eq!(resp.usage.reasoning_tokens, Some(8_000));
+        assert!(
+            resp.is_degenerate_completion(),
+            "un turno che ha speso tutto in thinking senza produrre output deve \
+             restare riconoscibile come hollow"
+        );
+        // E intanto gli 8.000 token si pagano lo stesso: le due domande sono
+        // diverse e hanno due numeri diversi.
+        assert_eq!(
+            nexus_types::token_usage::completion_tokens_billable(
+                resp.usage.output_tokens,
+                resp.usage.reasoning_tokens
+            ),
+            8_001
+        );
+    }
+
+    /// LA GIUNTURA: dalla risposta REALE dell'API fino alla riga di ledger.
+    ///
+    /// I test qui sopra provano che il campo si legge; questo prova che arriva
+    /// dove conta. Percorre la strada della produzione per intero — l'adapter
+    /// Google costruisce la `LlmResponse`, la pipeline contabile la scrive — e
+    /// RILEGGE la riga dal database vero, sullo schema applicato dal migrator
+    /// (regola O).
+    ///
+    /// MUTAZIONE: rimettendo `usage.output_tokens` al posto della somma in
+    /// `token_usage_from`, `completion_tokens` torna 3 e `output_cost` scende a
+    /// 3/160 del valore atteso: entrambe le asserzioni rosseggiano.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_thinking_arriva_alla_riga_di_ledger(pool: sqlx::PgPool) {
+        use crate::types::{LlmMessage, MessageContent, RequestMetadata};
+
+        let (user, project) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let run = uuid::Uuid::new_v4();
+
+        // Listino con output a 10 USD/M: rende il costo un numero tondo, cosi'
+        // la differenza fra fatturare 3 e fatturare 160 e' leggibile.
+        //
+        // `ON CONFLICT`: il modello e' REALE e le migrazioni lo hanno gia' messo
+        // a catalogo col suo prezzo di listino. Il test IMPONE le proprie
+        // tariffe invece di aggiungerne una riga, cosi' non dipende da quanto
+        // costa oggi gemini-2.5-flash — e non si rompe al prossimo aggiornamento
+        // dei prezzi, che con un modello inventato non sarebbe nemmeno un rischio
+        // ma toglierebbe al test il suo oggetto.
+        sqlx::query(
+            "INSERT INTO ai_price_catalog (provider, model, \
+                 input_cost_per_million_tokens, output_cost_per_million_tokens, \
+                 currency, pricing_state) \
+             VALUES ('google', 'gemini-2.5-flash', 1.0, 10.0, 'USD', 'priced') \
+             ON CONFLICT (provider, model) DO UPDATE SET \
+                 input_cost_per_million_tokens  = EXCLUDED.input_cost_per_million_tokens, \
+                 output_cost_per_million_tokens = EXCLUDED.output_cost_per_million_tokens, \
+                 currency      = EXCLUDED.currency, \
+                 pricing_state = EXCLUDED.pricing_state",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed listino");
+
+        // La risposta nasce dall'adapter, dal JSON REALE dell'API.
+        let parsed: GenerateContentResponse =
+            serde_json::from_str(&response_reale_con_thinking()).unwrap();
+        let mut resp = from_generate_response(parsed, "gemini-2.5-flash".to_string(), 0);
+
+        let req = LlmRequest {
+            model: "gemini-2.5-flash".into(),
+            messages: vec![LlmMessage {
+                role: "user".into(),
+                content: MessageContent::Text("quanto fa".into()),
+                tool_call_id: None,
+                tool_calls: None,
+                name: None,
+                thinking_signature: None,
+                reasoning: None,
+            }],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            response_format: None,
+            stream: None,
+            thinking: None,
+            tool_choice: None,
+            pin_provider: None,
+            metadata: RequestMetadata {
+                tenant_id: project.to_string(),
+                user_id: user.to_string(),
+                request_id: run.to_string(),
+                sensitivity_tier: 0,
+                feature: "chat".into(),
+            },
+            run_timeout_secs: None,
+        };
+
+        crate::server::billing::record_and_declare(&pool, &req, &mut resp).await;
+
+        let riga = sqlx::query(
+            "SELECT prompt_tokens, completion_tokens, total_tokens, \
+                    output_cost::float8 AS output_cost, total_cost::float8 AS total_cost \
+               FROM ai_usage_ledger WHERE run_id = $1",
+        )
+        .bind(run)
+        .fetch_one(&pool)
+        .await
+        .expect("la riga di ledger deve esistere");
+
+        use sqlx::Row;
+        // Il numero che si paga: 3 visibili + 157 di pensiero.
+        assert_eq!(
+            riga.get::<i32, _>("completion_tokens"),
+            160,
+            "il ledger deve portare l'output FATTURABILE, non il solo visibile"
+        );
+        assert_eq!(riga.get::<i32, _>("prompt_tokens"), 19);
+        assert_eq!(riga.get::<i32, _>("total_tokens"), 179);
+
+        // E la CONSEGUENZA in denaro, che e' il motivo per cui questo difetto
+        // contava: 160 token a 10 USD/M, non 3.
+        let output_cost: f64 = riga.get("output_cost");
+        assert!(
+            (output_cost - 0.001_6).abs() < 1e-12,
+            "output_cost {output_cost}, atteso 0.0016 (160 token a 10 USD/M); \
+             fatturando i soli 3 visibili sarebbe 0.00003"
+        );
+        let total_cost: f64 = riga.get("total_cost");
+        assert!(
+            (total_cost - 0.001_619).abs() < 1e-12,
+            "total_cost {total_cost}, atteso 0.001619 (19 token a 1.0 + 160 a 10.0)"
         );
     }
 }

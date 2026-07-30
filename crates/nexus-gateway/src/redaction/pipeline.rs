@@ -538,6 +538,7 @@ mod tests {
                 output_tokens: 1,
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
+                reasoning_tokens: None,
             },
             model_used: "gw-test".into(),
             provider_used: "test".into(),

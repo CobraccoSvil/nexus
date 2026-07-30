@@ -263,6 +263,44 @@ else
   echo "OK ledger-single-source: il ledger lo scrive solo nexus-ledger"
 fi
 
+# Output fatturabile (2026-07-30): "quanti token di output si pagano" e' UNA
+# domanda, e la somma vive solo in nexus-types::token_usage.
+#
+# Nasce da un difetto che e' stato invisibile per l'intera vita dell'adapter
+# Google: `GoogleUsageMetadata` non dichiarava `thoughtsTokenCount`, serde lo
+# scartava in silenzio, e `candidatesTokenCount` — che porta il solo testo
+# VISIBILE — finiva a ledger come output. Misurato il 30/07/2026 su
+# `gemini-2.5-flash`: 3 token visibili contro 157 di pensiero, entrambi
+# fatturati da Google alla tariffa di output.
+#
+# I due lati che pagano sono due (la riga di ledger nel gateway, il freno di
+# spesa del run in mcp-core) e nessuno dei due vede l'altro: e' esattamente la
+# forma in cui le copie divergono. La somma passa da
+# `nexus_types::token_usage::completion_tokens_billable`.
+#
+# Il guard confina la SOMMA, non la lettura: propagare il campo, mostrarlo o
+# scriverlo in una trace non decide un addebito.
+billable_hits="$(grep -rEn \
+  'reasoning_tokens[^;]*\.unwrap_or\(0\)|(output_tokens|completion_tokens)[^;]*\+[^;]*reasoning_tokens|reasoning_tokens[^;]*\+[^;]*(output_tokens|completion_tokens)' \
+  crates \
+  --include='*.rs' \
+  2>/dev/null \
+  | grep -v '^crates/nexus-types/' \
+  | grep -vE ':[0-9]+: *(//|/\*|\*)' \
+  || true)"
+if [[ -n "$billable_hits" ]]; then
+  echo "!! output-fatturabile: somma del ragionamento fuori da nexus-types::token_usage:" >&2
+  echo "$billable_hits" >&2
+  echo "   Chiama nexus_types::token_usage::completion_tokens_billable(output, reasoning)." >&2
+  echo "   Sommare a mano in un secondo punto e' come il difetto da cui nasce: chi paga" >&2
+  echo "   e' il gateway (riga di ledger) E mcp-core (freno di spesa), e non si vedono." >&2
+  echo "   NON sommare dentro output_tokens: is_degenerate_completion misura il testo" >&2
+  echo "   PRODOTTO, e un turno hollow smetterebbe di essere riconoscibile." >&2
+  fail=1
+else
+  echo "OK output-fatturabile: la somma del ragionamento vive solo in nexus-types"
+fi
+
 # Identificatori canonici (2026-07-09): enum/command identifiers in inglese,
 # niente sinonimi IT negli parser Rust (regola CLAUDE.md sezione N).
 alias_hits="$(grep -rEn \

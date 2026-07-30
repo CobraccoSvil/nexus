@@ -559,7 +559,17 @@ async fn turn_cost_usd(db: &PgPool, provider: &str, model: &str, usage: &LlmUsag
     // listino, unico punto in cui il netto serve.
     let tokens = nexus_pricing::TokenUsage {
         prompt_tokens: usage.prompt_tokens.max(0),
-        completion_tokens: usage.completion_tokens.max(0),
+        // L'output che si PAGA, non quello che si legge: su Google il
+        // ragionamento e' riportato fuori da `completion_tokens` e va sommato.
+        // Stesso punto unico che usa il gateway per la riga di ledger, o questo
+        // costo e quello contabilizzato direbbero due numeri diversi sulla
+        // stessa chiamata — e questo alimenta il FRENO DI SPESA del run.
+        completion_tokens: nexus_types::token_usage::completion_tokens_billable(
+            usage.completion_tokens.max(0).try_into().unwrap_or(u32::MAX),
+            usage
+                .reasoning_tokens
+                .map(|r| r.max(0).try_into().unwrap_or(u32::MAX)),
+        ) as i64,
         cache_read_tokens: usage.cache_read_tokens.unwrap_or(0).max(0),
         cache_creation_tokens: usage.cache_creation_tokens.unwrap_or(0).max(0),
     };
@@ -603,6 +613,9 @@ fn map_gw_response(resp: GwResponse) -> LlmResponse {
             total_tokens: (resp.usage.input_tokens + resp.usage.output_tokens) as i64,
             cache_creation_tokens: resp.usage.cache_creation_tokens.map(|v| v as i64),
             cache_read_tokens: resp.usage.cache_read_tokens.map(|v| v as i64),
+            // Ragionamento tenuto fuori dall'output dal provider (Google): resta
+            // separato anche qui e si somma solo dove si paga (`turn_cost_usd`).
+            reasoning_tokens: resp.usage.reasoning_tokens.map(|v| v as i64),
             // Il /v1/complete del gateway NON riporta il costo del turno (il ledger
             // lo calcola lato gateway, non e' nella response). Resta None: il
             // chiamante lo derivera' altrove se serve (regola G: niente magic).
@@ -1053,6 +1066,7 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
                 output_tokens: 5,
                 cache_read_tokens: Some(3),
                 cache_creation_tokens: Some(7),
+                reasoning_tokens: None,
             },
             model_used: "claude-real".to_string(),
             provider_used: "anthropic".to_string(),

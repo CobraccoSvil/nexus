@@ -1950,6 +1950,7 @@ mod tests {
                 output_tokens: 2,
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
+                reasoning_tokens: None,
             },
             model_used: "mistral-medium-3.5".to_string(),
             provider_used: "mistral".to_string(),

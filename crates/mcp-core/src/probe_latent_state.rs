@@ -636,6 +636,7 @@ mod tests {
                 output_tokens: 40,
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
+                reasoning_tokens: None,
             },
             model_used: "m".to_string(),
             provider_used: "p".to_string(),
