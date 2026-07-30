@@ -288,6 +288,13 @@ pub(crate) fn declared_outcome_kind(state: &AgentState) -> Option<String> {
 ///
 /// Solo le figure hanno questi tool in whitelist, quindi un run generico non
 /// puo' chiudersi per questa via.
+///
+/// DUE consumatori, stessa domanda: l'edge post-ToolDispatch (graph.rs) che
+/// instrada la figura verso la chiusura, e `FinalGateNode::run`, che su una
+/// figura NON applica i criteri d'ambiente — quel contratto e' dell'esecutore,
+/// e misurarci un giudice lega la sua sorte al codice che sta giudicando
+/// (bacheca-attivita, run 1845a0ce, 2026-07-30: verdetto fail valido scartato
+/// come timeout dopo 3 bocciature su `npx tsc`).
 pub(crate) fn declared_role_channel(state: &AgentState) -> Option<&'static str> {
     if state.review_verdict.is_some() {
         return Some("review_verdict");

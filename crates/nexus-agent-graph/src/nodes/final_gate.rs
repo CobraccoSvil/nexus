@@ -892,6 +892,28 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
             return Ok(Self::pass_through());
         }
 
+        // ── Figura col giudizio dichiarato -> il contratto non si applica ─────
+        // Il contratto di questo gate e' dell'ESECUTORE: l'ambiente deve
+        // verificare (build, endpoint). Il deliverable di una FIGURA e' il
+        // GIUDIZIO — review_verdict / advisory_verdict / debate_position, gia'
+        // validato in forma alla dichiarazione — e applicarle i criteri
+        // d'ambiente lega la sua sorte al codice che sta giudicando: un
+        // `verdict: fail` fondato fa fallire ANCHE la build, il gate rimanda
+        // "in correzione" un giudice senza tool di scrittura, e il run cicla
+        // fino al wall-clock, dove il verdetto valido viene scartato come
+        // timeout. Misurato su bacheca-attivita (run 1845a0ce, 2026-07-30):
+        // verdetto fail con 8 finding a 152s dei 240s di budget, poi 3
+        // bocciature su `npx tsc` (i difetti appena certificati) e morte a
+        // 240s esatti. Bastava un `run_command` in history (e' in
+        // fs_mutator_tools) a rendere "software task" il revisore: il gemello
+        // feb8998a, che aveva solo letto file, chiudeva pulito. Punto unico:
+        // declared_role_channel, lo stesso con cui l'edge post-ToolDispatch
+        // instrada qui; solo le figure hanno quei tool in whitelist, quindi un
+        // run esecutore non puo' eludere il gate per questa via.
+        if let Some(delta) = self.chiusura_dichiarativa_della_figura(state, ctx).await {
+            return Ok(delta);
+        }
+
         // ── Cycle (final_gate.py:508-509) ─────────────────────────────────────
         let cycle = state.final_gate_cycle.unwrap_or(0) + 1;
         let max_cycles = self.cfg.max_cycles;
@@ -905,21 +927,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
             serde_json::json!({"cycle": cycle, "max_cycles": max_cycles, "phase": "start"}),
         )
         .await;
-        // ADR 0036, esito ONESTO (regola M): se il profilo di verifica
-        // dell'ambiente non e' disponibile (mai inferito e LLM irraggiungibile)
-        // il gate NON esegue comandi generici di ripiego e lo DICHIARA in
-        // chat, una sola volta (primo ciclo): l'utente sa che la chiusura non
-        // include la verifica tecnica dell'ambiente.
-        if self.cfg.verify_profile_missing && cycle <= 1 {
-            crate::nodes::emit_phase_meta(
-                ctx.emit.as_ref(),
-                self.meta_steps.as_ref(),
-                "final_gate",
-                "Verifica tecnica dell'ambiente NON eseguita: profilo non disponibile (inferenza LLM non riuscita)".to_string(),
-                serde_json::json!({"phase": "profile_missing"}),
-            )
-            .await;
-        }
+        self.dichiara_profilo_mancante(cycle, ctx).await;
 
         // ── Esecuzione criteri (sotto-sistema delegato) ───────────────────────
         // Un guasto infrastrutturale del runner propaga NodeError; un fallimento
@@ -1189,6 +1197,67 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
 }
 
 impl FinalGateNode {
+    /// Figura col giudizio dichiarato: il contratto di questo gate non si
+    /// applica, e il run chiude senza verifica d'ambiente.
+    ///
+    /// Il contratto del gate e' dell'ESECUTORE: l'ambiente deve verificare
+    /// (build, endpoint). Il deliverable di una FIGURA e' il GIUDIZIO —
+    /// review_verdict / advisory_verdict / debate_position, gia' validato in
+    /// forma alla dichiarazione — e applicarle i criteri d'ambiente lega la sua
+    /// sorte al codice che sta giudicando: un `verdict: fail` fondato fa fallire
+    /// ANCHE la build, il gate rimanda "in correzione" un giudice senza tool di
+    /// scrittura, e il run cicla fino al wall-clock, dove il verdetto valido
+    /// viene scartato come timeout. Misurato su bacheca-attivita (run 1845a0ce,
+    /// 2026-07-30): verdetto fail con 8 finding a 152s dei 240s di budget, poi
+    /// 3 bocciature su `npx tsc` (i difetti appena certificati) e morte a 240s
+    /// esatti. Bastava un `run_command` in history (e' in fs_mutator_tools) a
+    /// rendere "software task" il revisore: il gemello feb8998a, che aveva solo
+    /// letto file, chiudeva pulito. Punto unico: declared_role_channel, lo
+    /// stesso con cui l'edge post-ToolDispatch instrada qui; solo le figure
+    /// hanno quei tool in whitelist, quindi un run esecutore non puo' eludere
+    /// il gate per questa via.
+    ///
+    /// `Some(delta)` = la figura chiude qui; `None` = non e' una figura, il
+    /// gate prosegue col proprio contratto.
+    async fn chiusura_dichiarativa_della_figura(
+        &self,
+        state: &AgentState,
+        ctx: &AgentNodeCtx,
+    ) -> Option<OpaqueDelta> {
+        let channel = crate::routing::declared_role_channel(state)?;
+        crate::nodes::emit_phase_meta(
+            ctx.emit.as_ref(),
+            self.meta_steps.as_ref(),
+            "final_gate",
+            format!(
+                "Giudizio dichiarato ({channel}): la verifica dell'ambiente non si applica alla figura"
+            ),
+            serde_json::json!({"phase": "role_deliverable_declared", "channel": channel}),
+        )
+        .await;
+        Some(Self::pass_through())
+    }
+
+    /// ADR 0036, esito ONESTO (regola M): se il profilo di verifica
+    /// dell'ambiente non e' disponibile (mai inferito e LLM irraggiungibile)
+    /// il gate NON esegue comandi generici di ripiego e lo DICHIARA in chat,
+    /// una sola volta (primo ciclo): l'utente sa che la chiusura non include
+    /// la verifica tecnica dell'ambiente. La condizione vive QUI, non nel
+    /// chiamante: `run` delega il "se", oltre al "come".
+    async fn dichiara_profilo_mancante(&self, cycle: i64, ctx: &AgentNodeCtx) {
+        if !self.cfg.verify_profile_missing || cycle > 1 {
+            return;
+        }
+        crate::nodes::emit_phase_meta(
+            ctx.emit.as_ref(),
+            self.meta_steps.as_ref(),
+            "final_gate",
+            "Verifica tecnica dell'ambiente NON eseguita: profilo non disponibile (inferenza LLM non riuscita)".to_string(),
+            serde_json::json!({"phase": "profile_missing"}),
+        )
+        .await;
+    }
+
     /// Delta pass-through (`final_gate.py:506`): il gate non si applica, il
     /// flusso prosegue verso la chiusura.
     ///
@@ -1343,6 +1412,74 @@ mod tests {
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.stop_reason, None);
         assert!(runner.seen.lock().unwrap().is_empty());
+    }
+
+    /// REGRESSIONE (bacheca-attivita, run 1845a0ce, 2026-07-30): il revisore
+    /// aveva dichiarato `review_verdict: fail` a 152s dei 240s di budget, ma un
+    /// `run_command` in history (e' in `fs_mutator_tools`) lo rendeva "software
+    /// task" e il gate gli applicava il contratto dell'ESECUTORE: `npx tsc`
+    /// falliva proprio per i difetti appena certificati dal verdetto, il
+    /// giudice — senza tool di scrittura — veniva rimandato "in correzione" e
+    /// ciclava fino al wall-clock, dove il verdetto valido veniva scartato come
+    /// timeout.
+    ///
+    /// Il test attraversa il NODO reale con lo stesso segnale dell'incidente
+    /// (`run_command` come mutator, criteri che FALLISCONO) e arriva alla
+    /// CONSEGUENZA sull'edge reale (`route_after_final_gate`), per i tre canali
+    /// di ruolo.
+    ///
+    /// MUTAZIONE: rimuovendo il guard `declared_role_channel` dal nodo, la
+    /// route diventa `Executor` (il rimando in correzione del difetto reale) e
+    /// `seen` non e' piu' vuoto.
+    #[tokio::test]
+    async fn il_giudice_non_riceve_il_contratto_dell_esecutore() {
+        use crate::routing::{route_after_final_gate, NodeTarget};
+
+        let ai_run_command = Message::Ai {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "c1".into(),
+                name: "run_command".into(),
+                input: json!({"command": "node -e \"require('sqlite3')\""}),
+                thought_signature: None,
+            }]),
+            tool_calls: vec![],
+            reasoning: None,
+            thinking_signature: None,
+        };
+        let giudizio = json!({"verdict": "fail", "summary": "bug bloccante"});
+        for canale in ["review_verdict", "advisory_verdict", "debate_position"] {
+            let runner = Arc::new(StubCriteriaRunner::with_results(vec![fail_result(
+                "run_command",
+                json!({"excerpt": "error TS2307"}),
+            )]));
+            let node = node_with(FinalGateConfig::default(), runner.clone());
+            let ctx = ctx_with();
+            let mut st = AgentState {
+                messages: vec![ai_run_command.clone()],
+                thread_id: Some("11111111-1111-1111-1111-111111111111".to_string()),
+                ..Default::default()
+            };
+            match canale {
+                "review_verdict" => st.review_verdict = Some(giudizio.clone()),
+                "advisory_verdict" => st.advisory_verdict = Some(giudizio.clone()),
+                _ => st.debate_position = Some(giudizio.clone()),
+            }
+
+            let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
+
+            assert_eq!(
+                route_after_final_gate(&out),
+                NodeTarget::Learner,
+                "una figura col giudizio dichiarato ({canale}) chiude, non va in correzione"
+            );
+            assert!(
+                runner.seen.lock().unwrap().is_empty(),
+                "i criteri d'ambiente non si applicano a una figura ({canale})"
+            );
+            // Il gate non ha giudicato: nessun verdetto proprio, nessun ciclo.
+            assert_eq!(out.final_gate_verdict, None);
+            assert_eq!(out.final_gate_cycle, None);
+        }
     }
 
     // ── Ramo PASSED ─────────────────────────────────────────────────────────────

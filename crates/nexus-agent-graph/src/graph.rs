@@ -214,7 +214,10 @@ pub(crate) fn build_edges(
             // debate_position): emesso quello, la figura ha finito cio' che le e'
             // chiesto. Senza questo ramo ricadeva sull'executor e girava a vuoto
             // fino al wall-clock, dove il verdetto veniva scartato e sostituito da
-            // "[Sub-agent timeout]". Punto unico: declared_role_channel.
+            // "[Sub-agent timeout]". Punto unico: declared_role_channel. Il
+            // final_gate a sua volta NON applica i criteri d'ambiente alla figura
+            // (stesso punto unico, guard nel nodo): la sua e' solo la strada di
+            // chiusura, non una verifica del codice sotto giudizio.
             if crate::routing::declared_role_channel(state).is_some() {
                 return NodeId::FinalGate;
             }
