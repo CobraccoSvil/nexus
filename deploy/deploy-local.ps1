@@ -34,8 +34,19 @@ $ROOT = 'D:\IDEAI'
 # in PowerShell, accanto a quella in Rust, divergerebbe in silenzio.
 . (Join-Path $PSScriptRoot 'lib\nexus-publish.ps1')
 
-# Auto-elevazione: stop/start dei servizi Windows richiede admin.
-if (-not $NoRestart) {
+# MODALITA' DELL'AMBIENTE: risolta QUI, prima dell'auto-elevazione, perche' la
+# decide. Il dettaglio del perche' la distinzione conta sta piu' sotto, al primo
+# uso di $serviziInstallati.
+$rustSvc = 'nexus-mcp-core','nexus-gateway','nexus-admin','nexus-doc','nexus-plugin'
+$serviziInstallati = @(Get-Service -Name $rustSvc -ErrorAction SilentlyContinue).Count -gt 0
+
+# Auto-elevazione: SOLO se ci sono servizi Windows da fermare e far ripartire.
+# In ambiente a PROCESSI si delega a dev-stop/dev-start, che avviano processi
+# utente e non chiedono privilegi: elevare li' significherebbe mostrare un UAC
+# per un'operazione che non ne ha bisogno, e — se l'utente lo annulla — non fare
+# il deploy. Peggio: lo stack ripartirebbe ELEVATO, e il dev-stop successivo,
+# lanciato da una shell normale, non riuscirebbe piu' a fermarlo.
+if (-not $NoRestart -and $serviziInstallati) {
   $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
   if (-not $isAdmin) {
     $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$PSCommandPath)
@@ -46,11 +57,50 @@ if (-not $NoRestart) {
   }
 }
 
+# Punto unico (regola L) dell'esecuzione di un comando NATIVO in questo script.
+#
+# cargo, pnpm/next e vcvars scrivono l'avanzamento su stderr per costruzione
+# ("Compiling ring v0.17.9", "Finished dev profile"). PowerShell 5.1 avvolge ogni
+# riga di stderr di un comando nativo in un ErrorRecord, e con
+# $ErrorActionPreference='Stop' (riga in testa a questo script) la PRIMA riga di
+# avanzamento diventa terminante: il deploy moriva a build perfettamente
+# riuscita. L'esito di un processo e' il suo exit code, mai il testo che ha
+# scritto (regola M) -- e i controlli su $LASTEXITCODE erano gia' scritti nei
+# call site: la preferenza li scavalcava prima che venissero raggiunti.
+function Invoke-Nativo {
+  param(
+    [Parameter(Mandatory)][scriptblock]$Comando,
+    [Parameter(Mandatory)][string]$Cosa
+  )
+  $preferenzaPrec = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { & $Comando } finally { $ErrorActionPreference = $preferenzaPrec }
+  if ($LASTEXITCODE -ne 0) { throw "$Cosa fallito (exit $LASTEXITCODE)" }
+}
+
 function Initialize-Msvc {
   $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+  if (-not (Test-Path $vswhere)) { throw "vswhere.exe non trovato in ${vswhere} -- Visual Studio Build Tools non installati?" }
   $vsPath  = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+  if (-not $vsPath) { throw 'vswhere non ha trovato una installazione con i tool VC x86/x64.' }
   $vcvars  = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
-  cmd /c "`"$vcvars`" && set" | ForEach-Object { if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] } }
+
+  # vcvars64.bat cerca `vswhere` nel PATH; se non c'e' (installazione Build
+  # Tools, dove l'Installer non e' nel PATH) lo scrive su stderr e PROSEGUE col
+  # proprio ripiego -- VsDevCmd.bat lo dichiara: "If vswhere.exe is not found we
+  # skip this section as it doesn't effect operation". cmd esce 0 e l'ambiente
+  # e' caricato.
+  #
+  # Ma PowerShell 5.1 avvolge ogni riga di stderr di un comando nativo in un
+  # ErrorRecord, e con $ErrorActionPreference='Stop' quel rumore diventa
+  # TERMINANTE: il deploy moriva su un messaggio benigno, dopo aver caricato
+  # l'ambiente correttamente. L'esito va letto dal segnale strutturato e dal
+  # FATTO osservabile, mai dal testo (regola M): si accerta che il compilatore
+  # sia raggiungibile, che e' la sola cosa per cui questa funzione esiste.
+  Invoke-Nativo { cmd /c "`"$vcvars`" && set" | ForEach-Object { if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] } } } 'caricamento ambiente MSVC'
+  if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+    throw "ambiente MSVC non caricato: cl.exe non raggiungibile dopo $vcvars"
+  }
 }
 
 function Stop-ServiceTree($name) {
@@ -95,9 +145,8 @@ function Stop-ServiceTree($name) {
 
 $doRust = $Rust -or (-not $Rust -and -not $Web)
 $doWeb  = $Web  -or (-not $Rust -and -not $Web)
-$rustSvc = 'nexus-mcp-core','nexus-gateway','nexus-admin','nexus-doc','nexus-plugin'
-
-# MODALITA' DELL'AMBIENTE: servizi WinSW installati, oppure stack a PROCESSI?
+# MODALITA' DELL'AMBIENTE (risolta in testa, vedi $serviziInstallati): servizi
+# WinSW installati, oppure stack a PROCESSI?
 # Non e' un dettaglio cosmetico: `Stop-ServiceTree` risolve il PID SOLO via
 # Win32_Service, quindi senza servizi installati $procId resta 0, non ferma
 # nulla, e i 5 "Impossibile trovare un servizio" sembrano innocui mentre sono
@@ -106,7 +155,6 @@ $rustSvc = 'nexus-mcp-core','nexus-gateway','nexus-admin','nexus-doc','nexus-plu
 # In modalita' processi si DELEGA a dev-stop.ps1/dev-start.ps1 invece di
 # duplicare qui la loro logica (regola L): sanno gia' leggere i manifest WinSW
 # come fonte unica di eseguibile/env, ruotano i log e tengono il file dei PID.
-$serviziInstallati = @(Get-Service -Name $rustSvc -ErrorAction SilentlyContinue).Count -gt 0
 if (-not $NoRestart -and -not $serviziInstallati) {
   Write-Host '== ambiente a PROCESSI (nessun servizio WinSW installato): delego a dev-stop/dev-start ==' -ForegroundColor Yellow
   Write-Host '   nota: dev-stop/dev-start governano lo stack INTERO (anche qdrant/garnet/web-ide),' -ForegroundColor DarkYellow
@@ -128,8 +176,7 @@ if ($doRust) {
   Write-Host '== build Rust (MSVC, stack ancora attivo) ==' -ForegroundColor Cyan
   Initialize-Msvc
   Set-Location $ROOT
-  cargo build --workspace
-  if ($LASTEXITCODE -ne 0) { throw 'cargo build fallito' }
+  Invoke-Nativo { cargo build --workspace } 'cargo build'
 }
 # NB: la build del web-ide NON sta qui. Compilare a stack acceso e' sicuro solo
 # per i binari Rust, che eseguono da una copia: `next build` invece riscrive
@@ -174,8 +221,7 @@ if ($doWeb -and -not $NoRestart) {
   $nodeEnvPrec = [Environment]::GetEnvironmentVariable('NODE_ENV', 'Process')
   $env:NODE_ENV = 'production'
   try {
-    pnpm exec next build
-    if ($LASTEXITCODE -ne 0) { throw 'next build fallito' }
+    Invoke-Nativo { pnpm exec next build } 'next build'
   } finally {
     if ($null -eq $nodeEnvPrec) { Remove-Item -Path env:NODE_ENV -ErrorAction SilentlyContinue }
     else { $env:NODE_ENV = $nodeEnvPrec }
@@ -229,8 +275,9 @@ if ($doRust -and -not $NoRestart) {
 if ($doRust -and -not $NoRestart) {
   Write-Host '== migrazioni schema META ==' -ForegroundColor Cyan
   Set-Location $ROOT
-  cargo run --quiet -p xtask -- migrate --set meta --apply
-  if ($LASTEXITCODE -ne 0) { throw "migrazioni fallite (exit $LASTEXITCODE): lo stack non viene riavviato su uno schema che non e' quello del codice" }
+  # Un fallimento qui NON deve portare al riavvio: lo stack ripartirebbe su uno
+  # schema che non e' quello del codice.
+  Invoke-Nativo { cargo run --quiet -p xtask -- migrate --set meta --apply } 'migrazioni schema META'
 }
 
 # 3. START
