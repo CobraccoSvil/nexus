@@ -939,7 +939,22 @@ async fn load_profiles(db: &PgPool) -> Vec<ProbeProfile> {
 }
 
 /// `applies_when.declared_capabilities_contains`: il profilo gira solo se il
-/// dichiarato contiene il tag (es. thinking_matrix solo sui reasoning).
+/// dichiarato contiene il tag. `applies_when` assente = si applica a ogni
+/// candidato.
+///
+/// ATTENZIONE nel gatare un profilo su questa condizione: `declared` sono le
+/// `capabilities` del catalog, che nascono da `infer_capabilities_from_name` —
+/// un'euristica sul NOME del modello. Gatare qui una misura il cui scopo e'
+/// CORREGGERE quell'euristica la rende circolare: gira solo dove l'euristica era
+/// gia' d'accordo, e chi il nome classifica male non viene mai misurato.
+///
+/// E' successo con la `thinking_matrix` (mig 0658): gated su "reasoning", girava
+/// su gemini-3.1-pro-preview (il nome contiene "pro") e saltava
+/// gemini-3.1-flash-lite, che restava con la policy indovinata. 85 candidati su
+/// 110 avevano una `agentic_thinking_policy` scritta senza una sola evidenza.
+/// I candidati della batteria sono gia' filtrati da
+/// `nexus-model-eligibility::CONDITIONS` (`is_enabled AND supports_tool_use`):
+/// per una misura che riguarda il tool-loop quel filtro e' gia' quello giusto.
 fn profile_applies(profile: &ProbeProfile, declared: &[String]) -> bool {
     let Some(cond) = &profile.applies_when else {
         return true;
@@ -3552,6 +3567,49 @@ mod tests {
         assert_eq!(banda_measured(63.0, None, 100.0, &b, 3.0), "high");
         // Una banda fuori scala (refuso) non e' un gradino da difendere.
         assert_eq!(banda_measured(63.0, Some("boh"), 100.0, &b, 3.0), "high");
+    }
+
+    /// LA MISURA DEVE RAGGIUNGERE CHI L'EURISTICA CLASSIFICA MALE (mig 0658).
+    ///
+    /// La `thinking_matrix` era gated su
+    /// `applies_when = {"declared_capabilities_contains": "reasoning"}`, e
+    /// `capabilities` nasce da `infer_capabilities_from_name`: per google il nome
+    /// con "pro" produce ["reasoning",...], quello con "flash-lite" produce
+    /// ["chat","simple"]. Il gate era quindi circolare — la misura che serve a
+    /// CORREGGERE l'euristica girava solo dove l'euristica era gia' d'accordo.
+    /// Effetto sul campo: gemini-3.1-pro-preview misurato 24 volte e portato a
+    /// 'none' dai fatti, gemini-3.1-flash-lite mai misurato e fermo alla policy
+    /// indovinata; 85 candidati su 110 con una `agentic_thinking_policy` scritta
+    /// e zero evidenze.
+    ///
+    /// Il test NON ricopia lo stato atteso del profilo: lo legge dal DB migrato
+    /// con `load_profiles` — la stessa funzione, la stessa tabella e lo stesso
+    /// filtro `enabled` della produzione — e lo passa a `profile_applies`, il
+    /// punto che decide davvero (regola O). Rimettendo l'`applies_when` nella
+    /// migrazione, questo test rosseggia.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_matrice_thinking_misura_anche_chi_il_nome_non_dice_reasoning(pool: PgPool) {
+        let profiles = load_profiles(&pool).await;
+        let matrice = profiles
+            .iter()
+            .find(|p| p.kind == "thinking_matrix")
+            .expect("il profilo thinking_matrix deve esistere ed essere enabled");
+
+        // Le capability che `base_caps_from_name` produce per un nome con
+        // "flash-lite": nessun tag "reasoning". E' il caso di gemini-3.1-flash-lite,
+        // che con il gate non veniva mai misurato.
+        let flash_lite = vec!["chat".to_string(), "simple".to_string()];
+        assert!(
+            profile_applies(matrice, &flash_lite),
+            "la matrice deve applicarsi anche a un modello che il NOME non dichiara \
+             reasoning: i candidati della batteria sono gia' filtrati per \
+             is_enabled + supports_tool_use, cioe' sono gia' esattamente i modelli \
+             per cui agentic_thinking_policy ha significato"
+        );
+
+        // E resta applicabile a chi il tag ce l'ha: il fix allarga, non sposta.
+        let pro = vec!["reasoning".to_string(), "chat".to_string()];
+        assert!(profile_applies(matrice, &pro));
     }
 
     /// IL CERCHIO SI CHIUDE: la batteria SCRIVE il tier misurato, e la curatela

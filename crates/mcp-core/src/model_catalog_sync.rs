@@ -2423,6 +2423,19 @@ async fn apply_probe_healthy(db: &PgPool, provider: &str, api_model: &str) {
 /// costa. I due gate sono ortogonali e vanno entrambi superati. Il gate prezzo
 /// tocca solo l'abilitazione: le capability inferite si scrivono comunque, cosi'
 /// il giorno in cui il listino arriva la riga e' gia' completa.
+/// `$7` = `allowed` (booleano), `$8` = la policy (testo). I due NON sono
+/// intercambiabili: fino al 30/07/2026 questo statement usava `$8` sia dove
+/// serviva il booleano (`is_enabled = ($8 AND NOT ...)`) sia dove serviva il
+/// testo (`agentic_thinking_policy = ... THEN $8`), e `$7` non compariva mai.
+/// Postgres deduce il tipo di un parametro dal primo uso, quindi rifiutava lo
+/// statement al parse — «in CASE i tipi text e boolean non combaciano» — e il
+/// `let _ =` sull'`execute` inghiottiva l'errore. La funzione non ha mai scritto
+/// una riga, in silenzio, per tutta la sua vita: il probe dichiarava "modello
+/// abilitato" nei log e nell'audit mentre il catalog restava intatto.
+///
+/// L'errore ora si logga (regola M: l'esito viene dal `Result` di sqlx, non
+/// dall'assenza di sintomi). Resta non fatale — un flag non scritto non deve
+/// interrompere il giro di sync — ma smette di essere invisibile.
 async fn write_probe_healthy_flags(
     db: &PgPool,
     provider: &str,
@@ -2434,11 +2447,11 @@ async fn write_probe_healthy_flags(
     let price_unknown = price_unknown_sql("");
     let sql = format!(
         "UPDATE ai_price_catalog \
-         SET is_enabled = ($8 AND NOT {price_unknown}), \
-             last_probe_healthy_at = CASE WHEN ($8 AND NOT {price_unknown}) THEN NOW() ELSE last_probe_healthy_at END, \
-             auto_disabled_at = CASE WHEN ($8 AND NOT {price_unknown}) THEN NULL ELSE NOW() END, \
+         SET is_enabled = ($7 AND NOT {price_unknown}), \
+             last_probe_healthy_at = CASE WHEN ($7 AND NOT {price_unknown}) THEN NOW() ELSE last_probe_healthy_at END, \
+             auto_disabled_at = CASE WHEN ($7 AND NOT {price_unknown}) THEN NULL ELSE NOW() END, \
              auto_disabled_reason = CASE \
-                 WHEN ($8 AND NOT {price_unknown}) THEN NULL \
+                 WHEN ($7 AND NOT {price_unknown}) THEN NULL \
                  WHEN {price_unknown} THEN '{PRICE_UNKNOWN_REASON}' \
                  ELSE 'fuori model_selection_policy (mig 0320)' END, \
              updated_at = NOW(), \
@@ -2453,17 +2466,25 @@ async fn write_probe_healthy_flags(
              agentic_thinking_policy = CASE WHEN capability_source='auto' THEN $8 ELSE agentic_thinking_policy END \
          WHERE provider = $1 AND model = $2 AND is_enabled = false",
     );
-    let _ = sqlx::query(&sql)
-    .bind(provider)
-    .bind(api_model)
-    .bind(caps_json)
-    .bind(cc.supports_tool_use)
-    .bind(cc.supports_vision)
-    .bind(cc.uses_thinking_mode)
-    .bind(allowed)
-    .bind(cc.agentic_thinking_policy)
-    .execute(db)
-    .await;
+    if let Err(e) = sqlx::query(&sql)
+        .bind(provider)
+        .bind(api_model)
+        .bind(caps_json)
+        .bind(cc.supports_tool_use)
+        .bind(cc.supports_vision)
+        .bind(cc.uses_thinking_mode)
+        .bind(allowed)
+        .bind(cc.agentic_thinking_policy)
+        .execute(db)
+        .await
+    {
+        tracing::warn!(
+            provider,
+            model = api_model,
+            error = %e,
+            "catalog_sync: scrittura flag post-probe fallita (catalog invariato)"
+        );
+    }
 }
 
 /// FIX 2: verifica se un modello e' "recentemente sano" secondo l'account,
@@ -3454,5 +3475,88 @@ mod tests {
              dell'insert); provB senza policy inserisce comunque (unwrap_or(true))"
         );
         assert_eq!(delta.inserted, 2, "due soli insert: good-1 e qualsiasi-1");
+    }
+
+    /// I FLAG POST-PROBE DEVONO ARRIVARE NEL CATALOG.
+    ///
+    /// Lo statement di `write_probe_healthy_flags` usava `$8` sia dove serviva un
+    /// booleano (`is_enabled = ($8 AND NOT ...)`) sia dove serviva un testo
+    /// (`agentic_thinking_policy = ... THEN $8`), e `$7` non compariva mai.
+    /// Postgres deduce il tipo di un parametro dal primo uso, quindi rifiutava lo
+    /// statement al PARSE: «in CASE i tipi text e boolean non combaciano». Il
+    /// `let _ =` sull'`execute` inghiottiva l'errore, cosi' la funzione non ha
+    /// mai scritto una riga — in silenzio, mentre `apply_probe_healthy` loggava
+    /// "probe OK -> abilitato" e scriveva l'audit.
+    ///
+    /// Il test chiama la funzione VERA (regola O): ricopiare la query qui
+    /// avrebbe misurato la copia, e una copia corretta sarebbe restata verde
+    /// sopra una produzione rotta. Ripristinando `$8` al posto di `$7` nello
+    /// statement, questo test rosseggia.
+    #[sqlx::test]
+    async fn i_flag_post_probe_arrivano_nel_catalog(pool: sqlx::PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "ALTER TABLE ai_price_catalog \
+               ADD COLUMN capability_source TEXT NOT NULL DEFAULT 'auto', \
+               ADD COLUMN last_probe_healthy_at TIMESTAMPTZ, \
+               ADD COLUMN auto_disabled_at TIMESTAMPTZ",
+        )
+        .execute(&pool)
+        .await
+        .expect("colonne");
+        // Due righe disabilitate (la WHERE della funzione tocca solo `is_enabled
+        // = false`): una 'auto' che i flag li accetta, una 'manual' che li
+        // rifiuta perche' e' curata a mano.
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+               (provider, model, is_enabled, capability_source, agentic_thinking_policy, \
+                supports_tool_use, pricing_state) \
+             VALUES ('p', 'auto-1',   false, 'auto',   'none', false, 'priced'), \
+                    ('p', 'curato-1', false, 'manual', 'none', false, 'priced')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        let caps = json!(["chat"]);
+        let cc = ClassifiedCaps {
+            supports_tool_use: true,
+            supports_vision: false,
+            uses_thinking_mode: true,
+            agentic_thinking_policy: "disable_for_tools",
+        };
+        write_probe_healthy_flags(&pool, "p", "auto-1", &caps, &cc, true).await;
+        write_probe_healthy_flags(&pool, "p", "curato-1", &caps, &cc, true).await;
+
+        let (enabled, policy, tool_use): (bool, String, bool) = sqlx::query_as(
+            "SELECT is_enabled, agentic_thinking_policy, supports_tool_use \
+               FROM ai_price_catalog WHERE model = 'auto-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("riga auto-1");
+        assert!(
+            enabled,
+            "allowed=true e prezzo noto: la riga va abilitata. Con lo statement \
+             rotto restava false perche' l'UPDATE non partiva affatto"
+        );
+        assert_eq!(
+            (policy.as_str(), tool_use),
+            ("disable_for_tools", true),
+            "su una riga 'auto' i flag classificati devono essere scritti"
+        );
+
+        let (policy_curata, tool_use_curato): (String, bool) = sqlx::query_as(
+            "SELECT agentic_thinking_policy, supports_tool_use \
+               FROM ai_price_catalog WHERE model = 'curato-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("riga curato-1");
+        assert_eq!(
+            (policy_curata.as_str(), tool_use_curato),
+            ("none", false),
+            "una riga 'manual' e' curata a mano: i flag classificati non la toccano"
+        );
     }
 }
