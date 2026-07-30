@@ -33,9 +33,10 @@
 //!   JSON statico. Costante 1:1.
 //! - **`hinted_system`** (`:296-366`, rami ON, [`PlannerNode::build_hinted_system`]):
 //!   `system_text` + RUN_ID hint + `<comprensione_preliminare>` (context_brief) +
-//!   turn_focus PREPEND (riusa [`crate::decisions::turn_focus::build_turn_focus_directive`],
-//!   punto unico, regola L). Ordine di concatenazione 1:1. RAG/backlog/dag = OFF
-//!   (TODO, vedi sotto).
+//!   turn_focus IN CODA dietro il confine di turno (riusa
+//!   [`crate::decisions::turn_focus::build_turn_focus_directive`] per il contenuto
+//!   e `inject_turn_focus` per la posizione, punti unici, regola L).
+//!   RAG/backlog/dag = OFF (TODO, vedi sotto).
 //! - **Fallback chain decision** (`:399-492`,
 //!   [`PlannerNode::resolve_todo_block`]): `next()` su tool_use per
 //!   `nexus_todo_write`; se None -> fallback tool-robust (provider/model diverso,
@@ -95,6 +96,7 @@ use serde_json::{json, Value};
 use nexus_graph::node::{GraphNode, NodeError, NodeId};
 use nexus_graph::StateDelta as OpaqueDelta;
 
+use crate::decisions::context_reduction as ctxr;
 use crate::decisions::orchestration_reason::build_orchestration_context;
 use crate::decisions::turn_focus::build_turn_focus_directive;
 use crate::runtime::ports::{
@@ -141,7 +143,8 @@ pub struct PlannerConfig {
     /// default 3).
     pub clarifying_questions_max: i64,
     /// Anti-contaminazione history attiva (`turn_focus_enabled`, default true).
-    /// RAMO ON: il planner antepone il turn_focus al system (punto unico riusato).
+    /// RAMO ON: il planner appende il turn_focus al system dietro il confine di
+    /// turno (punti unici riusati: contenuto e posizione).
     ///
     /// WIRING (TODO impl mcp-core): va popolato dalla CONTINUITY config
     /// (`agent.context.turn_focus_enabled`), NON da `orchestrator_config`. E' la
@@ -884,14 +887,15 @@ impl PlannerNode {
     }
 
     /// Costruisce `hinted_system` con i SOLI rami ON di default
-    /// (`planner_node.py:296-366`). Ordine di concatenazione 1:1:
+    /// (`planner_node.py:296-366`). Ordine di concatenazione:
     ///   1. `system_text`
     ///   2. RUN_ID hint
     ///   3. `<comprensione_preliminare>` (context_brief, se presente)
-    ///   4. turn_focus PREPEND (se `turn_focus_enabled`, riusa il punto unico)
+    ///   4. turn_focus IN CODA, dietro il confine di turno (se
+    ///      `turn_focus_enabled`, riusa il punto unico dell'iniezione)
     ///
     /// Rami OFF (RAG decisionale, backlog, dag_kb) NON aggiunti (vedi doc modulo).
-    /// PURO: nessun I/O (il turn_focus e' una funzione pura sui messaggi).
+    /// PURO: nessun I/O (il turn_focus e' una funzione pura sullo stato).
     pub fn build_hinted_system(&self, state: &AgentState, run_id: &str) -> String {
         // (1) + (2) system_text + RUN_ID hint (`:296-299`).
         let mut hinted = format!(
@@ -916,17 +920,31 @@ impl PlannerNode {
         // (plan_rationale_enabled / dag_topological_enabled FALSE) il Python NON
         // li attraversa, quindi questa parte e' assente in entrambi (parita').
 
-        // (4) turn_focus PREPEND (`:352-366`, RAMO ON). RIUSA il punto unico
-        // `build_turn_focus_directive` (regola L: NON re-implementato). Best-effort
-        // 1:1 col Python (try/except -> prosegue senza directive): la funzione
-        // Rust e' infallibile (ritorna Option), quindi "errore -> prosegue" diventa
-        // "None -> nessun prepend". `new_topic=false`: il planner Python chiama
+        // (4) turn_focus IN CODA (`:352-366`, RAMO ON). RIUSA i DUE punti unici
+        // (regola L): `build_turn_focus_directive` per il contenuto,
+        // `ctxr::inject_turn_focus` per la POSIZIONE e l'idempotenza — la stessa
+        // chiamata che fa l'executor. Best-effort 1:1 col Python (try/except ->
+        // prosegue senza directive): la funzione Rust e' infallibile (ritorna
+        // Option), quindi "errore -> prosegue" diventa "None -> nessuna
+        // iniezione". `new_topic=false`: il planner Python chiama
         // `build_turn_focus_directive` SENZA il flag new_topic (default del
         // continuity gate non passato qui). Prende lo STATO: la richiesta la
         // porta `turn_task`, non l'ultimo messaggio della cronologia.
+        //
+        // ANTEPOSTA non andava, ed era l'ultimo dei due consumatori dichiarati in
+        // `turn_focus` a cui il confine di turno non era ancora arrivato: il
+        // focus e' ricalcolato dallo stato del run, quindi in testa spostava i
+        // primi caratteri del system e il fornitore non trovava piu' nulla da
+        // riusare di tutto cio' che lo segue. Misurato su questo nodo: fra due
+        // run la testa in comune scendeva da ~5860 caratteri (il
+        // `planner_system_text` fino al RUN_ID) a ~75, sotto qualunque blocco
+        // minimo di cache. Nessuna difesa a valle poteva accorgersene, perche'
+        // `prompt_cache_key` filtra sulla `parte_stabile` e il confine il planner
+        // non lo emetteva mai. In coda la directive non perde forza: e' il testo
+        // adiacente alla conversazione (vedi `inject_turn_focus`).
         if self.cfg.turn_focus_enabled {
             if let Some(focus) = build_turn_focus_directive(state, false) {
-                hinted = format!("{focus}\n\n{hinted}");
+                hinted = ctxr::inject_turn_focus(&hinted, &focus);
             }
         }
 
@@ -2716,6 +2734,95 @@ mod tests {
         let block2 = json!({"input": {"planner_model": "gia-presente", "todos": []}});
         let out2 = build_tool_input(&block2, "RID", "p", "m", None, None);
         assert_eq!(out2["planner_model"], json!("gia-presente"));
+    }
+
+    // ── posizione del focus del turno in hinted_system ───────────────────────
+
+    /// Stato eleggibile col task del turno FISSATO come lo fissa
+    /// `build_initial_state`: senza quel dato il focus non nasce, e un test che
+    /// non lo fissa misurerebbe un prompt senza la parte che vuole guardare.
+    fn stato_con_task(task: &str) -> AgentState {
+        let mut st = eligible_state();
+        st.extra.insert(
+            crate::decisions::turn_task::ORIGINAL_TASK_KEY.to_string(),
+            Value::String(task.to_string()),
+        );
+        st
+    }
+
+    /// CONTRATTO: il focus del turno non apre il prompt del planner.
+    ///
+    /// Il focus e' ricalcolato dallo stato del run: anteposto, sposta i primi
+    /// caratteri del system e taglia il prefisso riusabile di tutto cio' che lo
+    /// segue. Misurato su questo nodo: la testa in comune fra due run scendeva da
+    /// ~5860 caratteri (il `planner_system_text` fino al RUN_ID) a ~75.
+    ///
+    /// Guarda la CONSEGUENZA in due punti, perche' i lettori sono due: il
+    /// fornitore a cache automatica legge i primi caratteri del testo, il
+    /// `prompt_cache_key` del gateway legge la `parte_stabile`. Un test sul solo
+    /// numero di caratteri in comune non basterebbe: il preambolo del focus e'
+    /// fisso e ne vale ~100, quindi due prompt entrambi difettosi ne
+    /// condividerebbero piu' del system stesso.
+    #[test]
+    fn il_focus_del_turno_non_apre_il_prompt_del_planner() {
+        let cfg = cfg_active();
+        let testa = cfg.planner_system_text.clone();
+        let node = node_with(cfg, Arc::new(StubTodoStore::with_todos(vec![])));
+
+        let a = stato_con_task("crea index.html con la pagina di login");
+        let b = stato_con_task("correggi il calcolo del totale in spese.ts");
+        let ha = node.build_hinted_system(&a, "run-1");
+        let hb = node.build_hinted_system(&b, "run-2");
+
+        // Il focus c'e' davvero: senza questo il resto del test passerebbe anche
+        // su un prompt in cui la directive non e' mai stata iniettata.
+        assert!(
+            ha.contains("crea index.html"),
+            "il focus non e' stato iniettato: {ha}"
+        );
+        assert!(hb.contains("correggi il calcolo del totale"));
+
+        // (1) Il primo carattere che il fornitore vede e' il system del planner.
+        assert!(
+            ha.starts_with(&testa),
+            "un blocco variabile apre il prompt: {ha:.200}"
+        );
+        assert!(hb.starts_with(&testa));
+
+        // (2) La parte su cui il gateway costruisce l'identita' del prefisso non
+        // porta il focus, quindi due run non ricevono chiavi diverse per averlo
+        // cambiato.
+        let stabile = nexus_types::system_prompt::parte_stabile(&ha);
+        assert!(
+            !stabile.contains("crea index.html"),
+            "il focus e' finito nella parte stabile: {stabile}"
+        );
+        assert!(
+            stabile.starts_with(&testa),
+            "la parte stabile deve partire dal system del planner: {stabile:.200}"
+        );
+
+        // Idempotenza del punto unico: il confine resta uno.
+        assert_eq!(
+            ha.matches(nexus_types::system_prompt::CONFINE_DI_TURNO)
+                .count(),
+            1
+        );
+    }
+
+    /// Il verso opposto, che tiene onesto il test sopra: col focus spento il
+    /// prompt non porta ne' la directive ne' il confine, cioe' resta bit-identico
+    /// a quello di un run senza turn_focus.
+    #[test]
+    fn focus_spento_non_lascia_traccia_nel_prompt_del_planner() {
+        let cfg = PlannerConfig {
+            turn_focus_enabled: false,
+            ..cfg_active()
+        };
+        let node = node_with(cfg, Arc::new(StubTodoStore::with_todos(vec![])));
+        let h = node.build_hinted_system(&stato_con_task("crea index.html"), "run-1");
+        assert!(!h.contains("FOCUS DEL TURNO"));
+        assert!(!h.contains(nexus_types::system_prompt::CONFINE_DI_TURNO));
     }
 }
 

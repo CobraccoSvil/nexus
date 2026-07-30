@@ -1474,6 +1474,76 @@ else
   fail=1
 fi
 
+# Il corpo che parte da un endpoint OpenAI-compat nasce in UN punto (2026-07-30)
+#
+# La sequenza "risolvi la preferenza di fornitore -> costruisci il body col
+# dialetto di cache del client -> applica i quirk di forma" era ricopiata in
+# `complete_with_reasoning` e `stream_with_reasoning`. La duplicazione non era
+# solo debito: era la ragione per cui nessun test la attraversava (i test
+# chiamavano `build_request_body` a mano passando dialetto e ordine, cioe'
+# fissando l'assunto da verificare). MISURATO: revocando i tre livelli di
+# affinita' nei due call site, `cargo test -p nexus-gateway` restava a 407 verdi.
+# Se la chiamata torna a essere piu' di una, la copertura di quel percorso
+# scende a meta' senza che nulla lo dica.
+if [[ -f crates/nexus-gateway/src/providers/openai_compat.rs ]]; then
+  if awk '
+    /^#\[cfg\(test\)\]/ { exit }
+    /^[[:space:]]*\/\// { next }
+    /build_request_body\(/ && !/fn build_request_body\(/ {
+      n++; righe = righe "   riga " NR ": " $0 "\n"
+    }
+    END {
+      if (n == 1) { exit 1 }
+      printf "   chiamate trovate: %d\n%s", n, righe > "/dev/stderr"
+      exit 0
+    }
+  ' crates/nexus-gateway/src/providers/openai_compat.rs 2>&1; then
+    echo "!! corpo-richiesta-openai-compat: il corpo non nasce in un punto solo." >&2
+    echo "   Attesa UNA chiamata a build_request_body, dentro" >&2
+    echo "   OpenAiCompatClient::corpo_della_richiesta: complete e stream delegano" >&2
+    echo "   a quella. Zero chiamate = la giunzione e' stata rimossa; piu' di una =" >&2
+    echo "   e' tornata duplicata, e i test ne attraversano solo un ramo (regola O)." >&2
+    fail=1
+  else
+    echo "OK corpo-richiesta-openai-compat: una sola giunzione verso il wire"
+  fi
+else
+  echo "!! corpo-richiesta-openai-compat: modulo openai_compat.rs non trovato." >&2
+  echo "   Il check non ha raggiunto il suo oggetto (regola O)." >&2
+  fail=1
+fi
+
+# La POSIZIONE del focus del turno la decide il punto unico (2026-07-30)
+#
+# `build_turn_focus_directive` produce il contenuto; dove va a finire lo decide
+# `inject_turn_focus`, che lo mette dietro il confine di `nexus_types::
+# system_prompt`. Dei due consumatori dichiarati in turn_focus.rs, il planner lo
+# ANTEPONEVA con un `format!` a mano: un blocco ricalcolato messo in testa taglia
+# il prefisso riusabile di tutto cio' che lo segue (misurato sul planner: testa in
+# comune fra due run da ~5860 caratteri a ~75), e nessuna difesa a valle poteva
+# accorgersene, perche' `prompt_cache_key` filtra sulla parte stabile e il confine
+# non veniva emesso. Chi produce la directive deve passare dall'iniezione.
+focus_orfani=""
+while IFS= read -r f; do
+  [[ -z "$f" ]] && continue
+  [[ "$f" == *"/decisions/turn_focus.rs" ]] && continue
+  awk '
+    /^#\[cfg\(test\)\]/ { exit }
+    /^[[:space:]]*\/\// { next }
+    /build_turn_focus_directive\(/ { usa = 1 }
+    /inject_turn_focus\(/ { inietta = 1 }
+    END { exit !(usa && !inietta) }
+  ' "$f" && focus_orfani+="  $f"$'\n'
+done <<< "$(grep -rl --include='*.rs' 'build_turn_focus_directive(' crates 2>/dev/null || true)"
+if [[ -n "$focus_orfani" ]]; then
+  echo "!! posizione-focus-del-turno: la directive entra nel prompt senza passare" >&2
+  echo "   da inject_turn_focus (che la mette dietro il confine di turno):" >&2
+  printf '%s' "$focus_orfani" >&2
+  fail=1
+else
+  echo "OK posizione-focus-del-turno: la posizione la decide il punto unico"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

@@ -158,6 +158,108 @@ impl LlmProvider for GenericOpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::openai_compat::ResolvedReasoning;
+    use crate::types::{LlmMessage, MessageContent, RequestMetadata};
+
+    /// L'instradatore del registry su cui i tre livelli di affinita' del
+    /// prefisso sono stati misurati (29/07/2026).
+    const INSTRADATORE: &str = "openrouter";
+
+    fn richiesta() -> LlmRequest {
+        LlmRequest {
+            model: "qwen/qwen3-235b-a22b-2507".to_string(),
+            messages: vec![LlmMessage {
+                role: "system".to_string(),
+                content: MessageContent::Text("istruzioni di progetto".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+                name: None,
+                thinking_signature: None,
+                reasoning: None,
+            }],
+            temperature: None,
+            max_tokens: Some(64),
+            tools: None,
+            response_format: None,
+            stream: None,
+            thinking: None,
+            tool_choice: None,
+            pin_provider: None,
+            metadata: RequestMetadata {
+                tenant_id: "t".to_string(),
+                user_id: "u".to_string(),
+                request_id: "r".to_string(),
+                sensitivity_tier: 0,
+                feature: "f".to_string(),
+            },
+            run_timeout_secs: None,
+        }
+    }
+
+    /// Dal NOME del registry fino ai campi che partono: e' la catena che questo
+    /// file decide, e non era coperta da nulla.
+    ///
+    /// MISURATO il 29/07/2026: bastavano due caratteri
+    /// (`"openrouter"` -> `"open-router"` in [`cache_keying_per_endpoint`]) per
+    /// spegnere insieme `session_id`, `prompt_cache_key` e `provider.order`
+    /// sull'UNICO instradatore del sistema, e la suite del crate restava a 407
+    /// verdi. I due adapter gemelli (mistral, openai) il test del proprio
+    /// dialetto ce l'avevano: l'unico senza era quello dove i tre livelli si
+    /// applicano tutti (regola O).
+    ///
+    /// Guarda la CONSEGUENZA (i campi sul wire) e non il valore dell'enum: un
+    /// test su `cache_keying()` proverebbe che la riga di `match` ritorna cio'
+    /// che c'e' scritto, non che qualcuno la legga.
+    #[tokio::test]
+    async fn dal_nome_del_registry_ai_campi_di_affinita() {
+        let instradatore = GenericOpenAiProvider::new(
+            Client::new(),
+            "https://openrouter.ai/api/v1",
+            "chiave",
+            INSTRADATORE,
+            vec![0, 1],
+            256_000,
+            true,
+        );
+        let corpo = serde_json::to_value(
+            instradatore
+                .client
+                .corpo_della_richiesta(&richiesta(), false, &ResolvedReasoning::none())
+                .await,
+        )
+        .expect("serializza");
+        let chiave = corpo
+            .get("prompt_cache_key")
+            .and_then(|v| v.as_str())
+            .expect("l'instradatore inoltra la chiave al fornitore a valle");
+        assert_eq!(
+            corpo.get("session_id").and_then(|v| v.as_str()),
+            Some(chiave),
+            "l'instradatore legge session_id per fissare il fornitore"
+        );
+
+        // Un endpoint OpenAI-compat che non instrada verso terzi resta come
+        // prima: un campo sconosciuto e' il solo verso che puo' fare danno.
+        let diretto = GenericOpenAiProvider::new(
+            Client::new(),
+            "https://api.groq.com/openai/v1",
+            "chiave",
+            "groq",
+            vec![0, 1],
+            128_000,
+            true,
+        );
+        let corpo = serde_json::to_value(
+            diretto
+                .client
+                .corpo_della_richiesta(&richiesta(), false, &ResolvedReasoning::none())
+                .await,
+        )
+        .expect("serializza");
+        assert!(corpo.get("prompt_cache_key").is_none());
+        assert!(corpo.get("session_id").is_none());
+        assert!(corpo.get("provider").is_none());
+    }
 
     #[test]
     fn capacita_dai_parametri() {
