@@ -1228,23 +1228,24 @@ mod tests {
     ///
     /// MUTAZIONE: se il ramo `PerProviderAndModel` torna a deduplicare per solo
     /// provider, la prima asserzione fallisce mostrando il candidato unico.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn la_diversita_richiesta_decide_quanti_candidati(pool: sqlx::PgPool) {
-        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): `ai_price_catalog` e `nexus_purpose_model`
+        // (mig 0102) arrivano dalla migrazione. I DELETE isolano dai dati di
+        // produzione. `select_models` legge il gate di qualificazione dai
+        // `settings` VERI (acceso di default, mig 0595): ogni riga del catalog
+        // si dichiara 'qualified'.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
+        sqlx::query("DELETE FROM nexus_purpose_model")
+            .execute(&pool)
+            .await
+            .expect("pulizia purpose model");
         sqlx::query(
-            "CREATE TABLE nexus_purpose_model ( \
-                 purpose TEXT PRIMARY KEY, \
-                 tier TEXT, \
-                 required_capability TEXT, \
-                 requires_tool_use BOOLEAN NOT NULL DEFAULT false \
-             )",
-        )
-        .execute(&pool)
-        .await
-        .expect("nexus_purpose_model");
-        sqlx::query(
-            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
-             VALUES ('reviewer', 'high', NULL, true)",
+            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, required_capability, requires_tool_use) \
+             VALUES ('reviewer', 'fallback-provider', 'fallback-model', 'high', NULL, true)",
         )
         .execute(&pool)
         .await
@@ -1254,8 +1255,10 @@ mod tests {
             sqlx::query(
                 "INSERT INTO ai_price_catalog \
                    (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
-                    performance_tier, capabilities, input_cost_per_million_tokens) \
-                 VALUES ('openrouter', $1, true, true, 'none', 'high', '[\"reasoning\"]'::jsonb, $2)",
+                    performance_tier, capabilities, input_cost_per_million_tokens, output_cost_per_million_tokens, \
+                    qualification_state, qualification_expires_at, currency, last_probe_healthy_at) \
+                 VALUES ('openrouter', $1, true, true, 'none', 'high', '[\"reasoning\"]'::jsonb, $2, $2, \
+                         'qualified', now() + interval '30 days', 'USD', now())",
             )
             .bind(model)
             .bind(costo)
@@ -1301,23 +1304,20 @@ mod tests {
     /// Con piu' provider sani la diversita' di provider viene spesa PRIMA: due
     /// infrastrutture indipendenti battono due modelli della stessa. Solo dopo,
     /// se restano slot, si accetta un secondo modello di un provider gia' preso.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn i_provider_nuovi_vengono_prima_di_un_secondo_modello(pool: sqlx::PgPool) {
-        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): vedi nota sul test precedente.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
+        sqlx::query("DELETE FROM nexus_purpose_model")
+            .execute(&pool)
+            .await
+            .expect("pulizia purpose model");
         sqlx::query(
-            "CREATE TABLE nexus_purpose_model ( \
-                 purpose TEXT PRIMARY KEY, \
-                 tier TEXT, \
-                 required_capability TEXT, \
-                 requires_tool_use BOOLEAN NOT NULL DEFAULT false \
-             )",
-        )
-        .execute(&pool)
-        .await
-        .expect("nexus_purpose_model");
-        sqlx::query(
-            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
-             VALUES ('reviewer', 'high', NULL, true)",
+            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, required_capability, requires_tool_use) \
+             VALUES ('reviewer', 'fallback-provider', 'fallback-model', 'high', NULL, true)",
         )
         .execute(&pool)
         .await
@@ -1333,8 +1333,10 @@ mod tests {
             sqlx::query(
                 "INSERT INTO ai_price_catalog \
                    (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
-                    performance_tier, capabilities, input_cost_per_million_tokens) \
-                 VALUES ($1, $2, true, true, 'none', 'high', '[\"reasoning\"]'::jsonb, $3)",
+                    performance_tier, capabilities, input_cost_per_million_tokens, output_cost_per_million_tokens, \
+                    qualification_state, qualification_expires_at, currency, last_probe_healthy_at) \
+                 VALUES ($1, $2, true, true, 'none', 'high', '[\"reasoning\"]'::jsonb, $3, $3, \
+                         'qualified', now() + interval '30 days', 'USD', now())",
             )
             .bind(provider)
             .bind(model)
@@ -1361,23 +1363,20 @@ mod tests {
     }
 
     /// Fan-out multi-provider: provider distinti dal catalog, dedup per provider.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn resolve_purpose_provider_candidates_deduplica_provider(pool: sqlx::PgPool) {
-        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): vedi nota sui test precedenti.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
+        sqlx::query("DELETE FROM nexus_purpose_model")
+            .execute(&pool)
+            .await
+            .expect("pulizia purpose model");
         sqlx::query(
-            "CREATE TABLE nexus_purpose_model ( \
-                 purpose TEXT PRIMARY KEY, \
-                 tier TEXT, \
-                 required_capability TEXT, \
-                 requires_tool_use BOOLEAN NOT NULL DEFAULT false \
-             )",
-        )
-        .execute(&pool)
-        .await
-        .expect("nexus_purpose_model");
-        sqlx::query(
-            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
-             VALUES ('multi_provider_advisory', 'medium', 'reasoning', true)",
+            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, required_capability, requires_tool_use) \
+             VALUES ('multi_provider_advisory', 'fallback-provider', 'fallback-model', 'medium', 'reasoning', true)",
         )
         .execute(&pool)
         .await
@@ -1391,8 +1390,10 @@ mod tests {
             sqlx::query(
                 "INSERT INTO ai_price_catalog \
                  (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
-                  performance_tier, capabilities, input_cost_per_million_tokens) \
-                 VALUES ($1, $2, true, true, 'none', 'medium', '[\"reasoning\"]'::jsonb, $3)",
+                  performance_tier, capabilities, qualified_capabilities, input_cost_per_million_tokens, output_cost_per_million_tokens, \
+                  qualification_state, qualification_expires_at, currency, last_probe_healthy_at) \
+                 VALUES ($1, $2, true, true, 'none', 'medium', '[\"reasoning\"]'::jsonb, '[\"reasoning\"]'::jsonb, $3, $3, \
+                         'qualified', now() + interval '30 days', 'USD', now())",
             )
             .bind(provider)
             .bind(model)
@@ -1418,17 +1419,19 @@ mod tests {
     /// si convocava affatto, mentre modelli sani stavano un gradino sotto.
     /// Il fix a figura singola non copriva questo path: passava ancora
     /// `&[rule.tier]`, una tier-chain di UN elemento.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn fanout_degrada_quando_il_tier_richiesto_e_esaurito(pool: sqlx::PgPool) {
-        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): vedi nota sui test precedenti.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
+        sqlx::query("DELETE FROM nexus_purpose_model")
+            .execute(&pool)
+            .await
+            .expect("pulizia purpose model");
         sqlx::query(
-            "CREATE TABLE nexus_purpose_model (                  purpose TEXT PRIMARY KEY,                  tier TEXT,                  required_capability TEXT,                  requires_tool_use BOOLEAN NOT NULL DEFAULT false              )",
-        )
-        .execute(&pool)
-        .await
-        .expect("nexus_purpose_model");
-        sqlx::query(
-            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use)              VALUES ('multi_provider_advisory', 'heavy', 'reasoning', true)",
+            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, required_capability, requires_tool_use)              VALUES ('multi_provider_advisory', 'fallback-provider', 'fallback-model', 'heavy', 'reasoning', true)",
         )
         .execute(&pool)
         .await
@@ -1443,7 +1446,7 @@ mod tests {
             ("google", "gemini-high", "high", true, 1.0),
         ] {
             sqlx::query(
-                "INSERT INTO ai_price_catalog                  (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy,                   performance_tier, capabilities, input_cost_per_million_tokens)                  VALUES ($1, $2, $3, true, 'none', $4, '[\"reasoning\"]'::jsonb, $5)",
+                "INSERT INTO ai_price_catalog                  (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy,                   performance_tier, capabilities, qualified_capabilities, input_cost_per_million_tokens, output_cost_per_million_tokens,                   qualification_state, qualification_expires_at, currency, last_probe_healthy_at)                  VALUES ($1, $2, $3, true, 'none', $4, '[\"reasoning\"]'::jsonb, '[\"reasoning\"]'::jsonb, $5, $5, 'qualified', now() + interval '30 days', 'USD', now())",
             )
             .bind(provider)
             .bind(model)
@@ -1481,23 +1484,20 @@ mod tests {
     /// Il tetto (`limit`) e la soglia (`min_providers`) sono due domande diverse:
     /// qui si verifica che la seconda arrivi fino alla selezione e faccia
     /// proseguire la catena.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn fanout_scende_finche_i_provider_distinti_bastano(pool: sqlx::PgPool) {
-        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): vedi nota sui test precedenti.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
+        sqlx::query("DELETE FROM nexus_purpose_model")
+            .execute(&pool)
+            .await
+            .expect("pulizia purpose model");
         sqlx::query(
-            "CREATE TABLE nexus_purpose_model (
-                 purpose TEXT PRIMARY KEY,
-                 tier TEXT,
-                 required_capability TEXT,
-                 requires_tool_use BOOLEAN NOT NULL DEFAULT false
-             )",
-        )
-        .execute(&pool)
-        .await
-        .expect("nexus_purpose_model");
-        sqlx::query(
-            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use)
-             VALUES ('multi_provider_advisory', 'medium', 'reasoning', true)",
+            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, required_capability, requires_tool_use)
+             VALUES ('multi_provider_advisory', 'fallback-provider', 'fallback-model', 'medium', 'reasoning', true)",
         )
         .execute(&pool)
         .await
@@ -1514,8 +1514,10 @@ mod tests {
             sqlx::query(
                 "INSERT INTO ai_price_catalog
                    (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy,
-                    performance_tier, capabilities, input_cost_per_million_tokens)
-                 VALUES ($1, $2, true, true, 'none', $3, '[\"reasoning\"]'::jsonb, $4)",
+                    performance_tier, capabilities, qualified_capabilities, input_cost_per_million_tokens, output_cost_per_million_tokens,
+                    qualification_state, qualification_expires_at, currency, last_probe_healthy_at)
+                 VALUES ($1, $2, true, true, 'none', $3, '[\"reasoning\"]'::jsonb, '[\"reasoning\"]'::jsonb, $4, $4, \
+                         'qualified', now() + interval '30 days', 'USD', now())",
             )
             .bind(provider)
             .bind(model)
@@ -1655,36 +1657,38 @@ mod tests {
     // (che disabilita lo slot-routing) o None/None (routing di default), mai
     // la stringa del modello.
 
+    /// Schema REALE (regola O): `ai_price_catalog` e `nexus_purpose_model`
+    /// arrivano dalla migrazione. I DELETE isolano dai dati di produzione.
     async fn crea_tabella_purpose(pool: &sqlx::PgPool) {
-        crate::test_support::create_ai_price_catalog_table(pool).await;
-        sqlx::query(
-            "CREATE TABLE nexus_purpose_model ( \
-                 purpose TEXT PRIMARY KEY, \
-                 tier TEXT, \
-                 required_capability TEXT, \
-                 requires_tool_use BOOLEAN NOT NULL DEFAULT false \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("nexus_purpose_model");
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(pool)
+            .await
+            .expect("pulizia catalog");
+        sqlx::query("DELETE FROM nexus_purpose_model")
+            .execute(pool)
+            .await
+            .expect("pulizia purpose model");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn auto_remediation_risolto_valorizza_entrambi_gli_override(pool: sqlx::PgPool) {
         crea_tabella_purpose(&pool).await;
         sqlx::query(
-            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
-             VALUES ('auto_remediation', 'heavy', NULL, true)",
+            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, required_capability, requires_tool_use) \
+             VALUES ('auto_remediation', 'fallback-provider', 'fallback-model', 'heavy', NULL, true)",
         )
         .execute(&pool)
         .await
         .expect("purpose");
+        // `resolve_purpose_model_db` attraversa `select_model`, che legge il gate
+        // di qualificazione dai `settings` VERI (acceso di default, mig 0595).
         sqlx::query(
             "INSERT INTO ai_price_catalog \
              (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
-              performance_tier, input_cost_per_million_tokens) \
-             VALUES ('deepseek', 'ds-heavy', true, true, 'none', 'heavy', 0.5)",
+              performance_tier, input_cost_per_million_tokens, output_cost_per_million_tokens, \
+              qualification_state, qualification_expires_at, currency, last_probe_healthy_at) \
+             VALUES ('deepseek', 'ds-heavy', true, true, 'none', 'heavy', 0.5, 0.5, \
+                     'qualified', now() + interval '30 days', 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -1702,14 +1706,14 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn auto_remediation_senza_tier_degrada_al_routing_di_default(pool: sqlx::PgPool) {
         crea_tabella_purpose(&pool).await;
         // Purpose presente ma tier NULL -> NotFound (tier-only). Il rimedio NON
         // si blocca: (None, None) = routing di default, comportamento odierno.
         sqlx::query(
-            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
-             VALUES ('auto_remediation', NULL, NULL, true)",
+            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, required_capability, requires_tool_use) \
+             VALUES ('auto_remediation', 'fallback-provider', 'fallback-model', NULL, NULL, true)",
         )
         .execute(&pool)
         .await
@@ -1721,14 +1725,14 @@ mod tests {
         assert_eq!((p, m), (None, None), "NotFound -> degrado onesto");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn auto_remediation_catalog_vuoto_degrada_al_routing_di_default(pool: sqlx::PgPool) {
         crea_tabella_purpose(&pool).await;
         // Tier valorizzato ma NESSUN modello capace nel catalog -> NoCapableModel
         // -> (None, None). Stessa strada del produttore, ramo diverso.
         sqlx::query(
-            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
-             VALUES ('auto_remediation', 'heavy', NULL, true)",
+            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, required_capability, requires_tool_use) \
+             VALUES ('auto_remediation', 'fallback-provider', 'fallback-model', 'heavy', NULL, true)",
         )
         .execute(&pool)
         .await

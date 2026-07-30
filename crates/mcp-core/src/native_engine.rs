@@ -4580,12 +4580,18 @@ mod tests {
 
     /// FIX-A (scale-controller): il tier del modello iniziale e' letto dal catalog e
     /// scritto in `current_tier` al checkpoint iniziale (routing iniziale).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn resolve_initial_tier_dal_catalog(pool: sqlx::PgPool) {
-        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): `ai_price_catalog` arriva dalla migrazione. Il
+        // DELETE isola dal catalog reale; 'claude-heavy' e' un nome di test, non
+        // un modello di produzione.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         sqlx::query(
-            "INSERT INTO ai_price_catalog (provider, model, performance_tier) \
-             VALUES ('anthropic', 'claude-heavy', 'heavy')",
+            "INSERT INTO ai_price_catalog (provider, model, performance_tier, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) \
+             VALUES ('anthropic', 'claude-heavy', 'heavy', 1.0, 1.0, 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -4599,9 +4605,8 @@ mod tests {
 
     /// FIX-A: modello iniziale NON nel catalog -> fallback deterministico `medium`
     /// (default della colonna `performance_tier`, mig 0032; NON un magic value).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn resolve_initial_tier_fallback_medium_se_ignoto(pool: sqlx::PgPool) {
-        crate::test_support::create_ai_price_catalog_table(&pool).await;
         assert_eq!(
             resolve_initial_tier(&pool, "ignoto", "modello-fantasma").await,
             "medium",

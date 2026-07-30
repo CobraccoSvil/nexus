@@ -241,6 +241,19 @@ pub(crate) async fn seed_todo(pool: &PgPool, run_id: Uuid, seq: i32, status: &st
 /// Crea la tabella `ai_price_catalog` con lo schema canonico usato dai
 /// `#[sqlx::test]` del crate.
 ///
+/// SUPERSTITE VOLUTO (regola O): il grosso dei test che usavano questo specchio
+/// e' stato convertito a `nexus_migrations_embedded::META_MIGRATOR` (schema
+/// REALE della migrazione, non una copia a mano). Restano solo i test di
+/// `agent_tools::subagent_native` che girano su
+/// `#[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]`: hanno
+/// bisogno di tabelle PROJECT vere (`agent_runs`, `chat_sessions`) sullo STESSO
+/// pool dove servono anche `ai_price_catalog`/`nexus_purpose_model` (tabelle
+/// META). `db/migrations` e `db/migrations/project` hanno numerazione
+/// SOVRAPPOSTA (entrambe partono da 0001): applicare i due migrator sullo stesso
+/// DB fa collidere le PK di `_sqlx_migrations`, quindi META_MIGRATOR non e'
+/// un'opzione li' — non e' un caso rimasto indietro, e' un limite dei due set di
+/// migrazioni che restano scritti per DB separati.
+///
 /// L'insieme delle colonne deve restare allineato a quelle lette dal punto unico
 /// `crate::orchestrator::select_models_tierchain` (in particolare i media kind
 /// della mig 0478, sempre referenziati nella WHERE per i purpose testuali). Una

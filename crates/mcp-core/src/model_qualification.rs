@@ -3618,17 +3618,16 @@ mod tests {
     /// E' l'ultimo anello: senza, `derive_tier_measured` calcolava una banda che
     /// nessuno scriveva, e il tier restava per sempre al `synced` (il seme
     /// dell'indice) anche dopo che la batteria aveva DIMOSTRATO la capacita'.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn la_batteria_scrive_il_tier_misurato_ma_non_tocca_la_curatela(pool: PgPool) {
-        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): colonne e tabella arrivano dalla migrazione
+        // (mig 0591 e successive). Il DELETE isola dal catalog di produzione.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         sqlx::query(
-            "ALTER TABLE ai_price_catalog                ADD COLUMN tier_source TEXT,                ADD COLUMN capability_locked BOOLEAN NOT NULL DEFAULT false,                ADD COLUMN capability_source TEXT NOT NULL DEFAULT 'auto',                ADD COLUMN qualified_at TIMESTAMPTZ,                ADD COLUMN qualification_suite_version INT,                ADD COLUMN qualification_reason TEXT,                ADD COLUMN qualification_evidence_id BIGINT,                ADD COLUMN qualification_started_at TIMESTAMPTZ,                ADD COLUMN qualification_attempts INT NOT NULL DEFAULT 0,                ADD COLUMN qualification_backoff_until TIMESTAMPTZ",
-        )
-        .execute(&pool)
-        .await
-        .expect("colonne");
-        sqlx::query(
-            "INSERT INTO ai_price_catalog (provider, model, performance_tier, tier_source) VALUES              ('p', 'stimato', 'medium', 'synced'),              ('p', 'curato',  'light',  'manual')",
+            "INSERT INTO ai_price_catalog (provider, model, performance_tier, tier_source, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES              ('p', 'stimato', 'medium', 'synced', 1.0, 1.0, 'USD', now()),              ('p', 'curato',  'light',  'manual', 1.0, 1.0, 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -3673,17 +3672,15 @@ mod tests {
 
     /// Nessuna banda certificata -> il tier NON viene toccato: resta il prior.
     /// (Il difetto opposto sarebbe azzerare il tier a ogni giro senza bande.)
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn senza_banda_certificata_il_tier_resta_il_prior(pool: PgPool) {
-        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): il DELETE isola dal catalog di produzione.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         sqlx::query(
-            "ALTER TABLE ai_price_catalog                ADD COLUMN tier_source TEXT,                ADD COLUMN capability_locked BOOLEAN NOT NULL DEFAULT false,                ADD COLUMN capability_source TEXT NOT NULL DEFAULT 'auto',                ADD COLUMN qualified_at TIMESTAMPTZ,                ADD COLUMN qualification_suite_version INT,                ADD COLUMN qualification_reason TEXT,                ADD COLUMN qualification_evidence_id BIGINT,                ADD COLUMN qualification_started_at TIMESTAMPTZ,                ADD COLUMN qualification_attempts INT NOT NULL DEFAULT 0,                ADD COLUMN qualification_backoff_until TIMESTAMPTZ",
-        )
-        .execute(&pool)
-        .await
-        .expect("colonne");
-        sqlx::query(
-            "INSERT INTO ai_price_catalog (provider, model, performance_tier, tier_source)              VALUES ('p', 'm', 'high', 'synced')",
+            "INSERT INTO ai_price_catalog (provider, model, performance_tier, tier_source, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at)              VALUES ('p', 'm', 'high', 'synced', 1.0, 1.0, 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -3709,27 +3706,14 @@ mod tests {
             "nessuna banda certificata: il tier resta il prior, non viene azzerato"
         );
     }
-    /// Colonne e settings dello score (mig 0616) sopra lo schema di test.
+    /// Isola il catalog dal seed di produzione e forza i settings dello score
+    /// (mig 0616) ai valori attesi dal test, sovrascrivendo eventuali righe
+    /// reali gia' seminate (regola O: schema vero, valori deterministici).
     async fn colonne_e_settings_score(pool: &PgPool) {
-        sqlx::query(
-            "ALTER TABLE ai_price_catalog \
-               ADD COLUMN tier_source TEXT, \
-               ADD COLUMN measured_score DOUBLE PRECISION, \
-               ADD COLUMN measured_score_at TIMESTAMPTZ, \
-               ADD COLUMN measured_score_suite INT",
-        )
-        .execute(pool)
-        .await
-        .expect("colonne score");
-        // Lo schema REALE dei settings (updated_at compresa): il pass PERSISTE
-        // l'ancora via update_setting_value (regola O: la strada vera).
-        sqlx::query(
-            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, \
-             updated_at TIMESTAMPTZ NOT NULL DEFAULT now())",
-        )
-        .execute(pool)
-        .await
-        .expect("settings");
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(pool)
+            .await
+            .expect("pulizia catalog");
         sqlx::query(
             "INSERT INTO settings (key, value) VALUES \
              ('catalog.measured_band.frontier_pct', '0.92'), \
@@ -3741,7 +3725,8 @@ mod tests {
              ('catalog.measured_band.anchor_at', ''), \
              ('catalog.measured_band.anchor_deadband_pct', '0.03'), \
              ('catalog.measured_band.demote_margin', '3'), \
-             ('catalog.measured_band.min_population', '3')",
+             ('catalog.measured_band.min_population', '3') \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
         )
         .execute(pool)
         .await
@@ -3753,14 +3738,13 @@ mod tests {
     /// il primo misurato di OGNI suite sarebbe frontier per definizione (e' il
     /// 100% di se stesso). Il test attraversa il pass VERO
     /// (`riancora_bande_measured`), non una sua imitazione.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn sotto_min_population_le_bande_measured_non_si_applicano(pool: PgPool) {
-        crate::test_support::create_ai_price_catalog_table(&pool).await;
         colonne_e_settings_score(&pool).await;
         sqlx::query(
             "INSERT INTO ai_price_catalog \
-             (provider, model, performance_tier, tier_source, measured_score, measured_score_suite) \
-             VALUES ('p', 'primo', 'heavy', 'synced', 80.0, 5)",
+             (provider, model, performance_tier, tier_source, measured_score, measured_score_suite, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) \
+             VALUES ('p', 'primo', 'heavy', 'synced', 80.0, 5, 1.0, 1.0, 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -3792,10 +3776,10 @@ mod tests {
         // si fissa sul leader e le bande sono RELATIVE a lui.
         sqlx::query(
             "INSERT INTO ai_price_catalog \
-             (provider, model, performance_tier, tier_source, measured_score, measured_score_suite) \
-             VALUES ('p', 'secondo', 'medium', 'synced', 60.0, 5), \
-                    ('p', 'terzo',   'medium', 'synced', 40.0, 5), \
-                    ('p', 'fuori-suite', 'medium', 'synced', 99.0, 4)",
+             (provider, model, performance_tier, tier_source, measured_score, measured_score_suite, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) \
+             VALUES ('p', 'secondo', 'medium', 'synced', 60.0, 5, 1.0, 1.0, 'USD', now()), \
+                    ('p', 'terzo',   'medium', 'synced', 40.0, 5, 1.0, 1.0, 'USD', now()), \
+                    ('p', 'fuori-suite', 'medium', 'synced', 99.0, 4, 1.0, 1.0, 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -3830,29 +3814,14 @@ mod tests {
 
     /// Lo SCORE atterra nella stessa transazione del verdetto (DerivedWrite::
     /// qualified), e un giro senza score NON tocca le colonne di ieri.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn il_verdetto_scrive_lo_score_e_il_silenzio_non_lo_azzera(pool: PgPool) {
-        crate::test_support::create_ai_price_catalog_table(&pool).await;
-        sqlx::query(
-            "ALTER TABLE ai_price_catalog \
-               ADD COLUMN tier_source TEXT, \
-               ADD COLUMN capability_locked BOOLEAN NOT NULL DEFAULT false, \
-               ADD COLUMN capability_source TEXT NOT NULL DEFAULT 'auto', \
-               ADD COLUMN qualified_at TIMESTAMPTZ, \
-               ADD COLUMN qualification_suite_version INT, \
-               ADD COLUMN qualification_reason TEXT, \
-               ADD COLUMN qualification_evidence_id BIGINT, \
-               ADD COLUMN qualification_started_at TIMESTAMPTZ, \
-               ADD COLUMN qualification_attempts INT NOT NULL DEFAULT 0, \
-               ADD COLUMN qualification_backoff_until TIMESTAMPTZ, \
-               ADD COLUMN measured_score DOUBLE PRECISION, \
-               ADD COLUMN measured_score_at TIMESTAMPTZ, \
-               ADD COLUMN measured_score_suite INT",
-        )
-        .execute(&pool)
-        .await
-        .expect("colonne");
-        sqlx::query("INSERT INTO ai_price_catalog (provider, model) VALUES ('p', 'm')")
+        // Schema REALE (regola O): il DELETE isola dal catalog di produzione.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
+        sqlx::query("INSERT INTO ai_price_catalog (provider, model, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES ('p', 'm', 1.0, 1.0, 'USD', now())")
             .execute(&pool)
             .await
             .expect("seed");
@@ -3948,29 +3917,16 @@ mod tests {
     /// scartati in 10ms — 76 modelli su 116 stanno su quei due provider, quindi
     /// servivano ~9 ore di giri a vuoto prima di toccare un modello misurabile.
     /// La batteria girava, sembrava sana, e non misurava nulla.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn il_claim_salta_i_provider_in_cooldown_invece_di_sprecarci_il_giro(pool: PgPool) {
-        crate::test_support::create_ai_price_catalog_table(&pool).await;
-        // `qualification_state` e `qualification_expires_at` le crea gia'
-        // l'helper: qui solo le colonne del CLAIM che gli mancano.
-        sqlx::query(
-            "ALTER TABLE ai_price_catalog \
-               ADD COLUMN qualification_suite_version INT, \
-               ADD COLUMN qualification_started_at TIMESTAMPTZ, \
-               ADD COLUMN qualification_backoff_until TIMESTAMPTZ",
-        )
-        .execute(&pool)
-        .await
-        .expect("colonne qualification");
-        // La fonte PERSISTENTE del cooldown lungo (ADR 0020).
-        sqlx::query(
-            "CREATE TABLE nexus_provider_health ( \
-               provider TEXT PRIMARY KEY, \
-               billing_cooldown_until TIMESTAMPTZ)",
-        )
-        .execute(&pool)
-        .await
-        .expect("health");
+        // Schema REALE (regola O): `ai_price_catalog` (mig 0591+) e
+        // `nexus_provider_health` (mig 0255) arrivano dalla migrazione, gia'
+        // vuota per quest'ultima (nessun seed di produzione). Il DELETE isola
+        // il catalog dal rumore reale.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         sqlx::query(
             "INSERT INTO nexus_provider_health (provider, billing_cooldown_until) VALUES \
              ('openai', NOW() + INTERVAL '6 hours'), \
@@ -3983,11 +3939,11 @@ mod tests {
         // NULL): senza il filtro vincerebbe entrambi i posti del giro.
         sqlx::query(
             "INSERT INTO ai_price_catalog \
-             (provider, model, is_enabled, supports_tool_use, qualification_state) VALUES \
-             ('openai',  'gpt-in-cooldown-1', true, true, 'unqualified'), \
-             ('openai',  'gpt-in-cooldown-2', true, true, 'unqualified'), \
-             ('mistral', 'sano',              true, true, 'unqualified'), \
-             ('google',  'sano-2',            true, true, 'unqualified')",
+             (provider, model, is_enabled, supports_tool_use, qualification_state, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('openai',  'gpt-in-cooldown-1', true, true, 'unqualified', 1.0, 1.0, 'USD', now()), \
+             ('openai',  'gpt-in-cooldown-2', true, true, 'unqualified', 1.0, 1.0, 'USD', now()), \
+             ('mistral', 'sano',              true, true, 'unqualified', 1.0, 1.0, 'USD', now()), \
+             ('google',  'sano-2',            true, true, 'unqualified', 1.0, 1.0, 'USD', now())",
         )
         .execute(&pool)
         .await

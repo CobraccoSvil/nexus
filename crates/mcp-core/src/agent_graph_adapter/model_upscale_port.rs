@@ -204,24 +204,37 @@ impl ModelUpscalePort for CatalogModelUpscalePort {
 mod tests {
     use super::*;
 
+    /// Schema REALE (regola O): `ai_price_catalog` e `settings` arrivano dalla
+    /// migrazione, gia' popolate dai dati di produzione. Il DELETE isola il test
+    /// dal loro rumore senza sostituire lo schema (colonne/CHECK/FK veri).
     async fn create_schema(pool: &PgPool) {
-        // Schema `ai_price_catalog` dal punto unico condiviso (regola L): una sola
-        // definizione per tutti i #[sqlx::test] del crate, allineata alle colonne
-        // lette da `select_models_tierchain`. Qui in piu' serve `settings` per i
-        // lookup `agent.upscale.*`.
-        crate::test_support::create_ai_price_catalog_table(pool).await;
-        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        sqlx::query("DELETE FROM ai_price_catalog")
             .execute(pool)
             .await
-            .expect("create settings");
+            .expect("pulizia catalog");
     }
 
-    #[sqlx::test]
+    /// Imposta un settings applicativo sovrascrivendo l'eventuale riga reale
+    /// seminata dalla migrazione (regola O: stesso schema, chiavi deterministiche
+    /// per il test).
+    async fn set_setting(pool: &PgPool, key: &str, value: &str) {
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ($1, $2) \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(pool)
+        .await
+        .expect("set setting");
+    }
+
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn context_window_legge_il_max(pool: PgPool) {
         create_schema(&pool).await;
         sqlx::query(
-            "INSERT INTO ai_price_catalog (provider, model, context_window) VALUES \
-             ('a', 'm', 100000), ('b', 'm', 200000)",
+            "INSERT INTO ai_price_catalog (provider, model, context_window, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('a', 'm', 100000, 1.0, 1.0, 'USD', now()), ('b', 'm', 200000, 1.0, 1.0, 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -231,28 +244,29 @@ mod tests {
         assert_eq!(w, 200000, "prende il MAX context_window dichiarato");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn context_window_zero_se_ignoto(pool: PgPool) {
         create_schema(&pool).await;
         let port = CatalogModelUpscalePort::new(pool.clone());
         assert_eq!(port.context_window("inesistente").await.expect("ok"), 0);
     }
 
-    #[sqlx::test]
+    /// `select_model` (dietro `select_upscale_model`) legge `qualification_gate`
+    /// dai `settings` VERI: su META_MIGRATOR il gate e' acceso di default (mig
+    /// 0595), quindi ogni riga seminata deve dichiararsi 'qualified' o il pool
+    /// risulta vuoto — a differenza dello specchio a mano, dove `settings` era
+    /// vuota e il gate restava spento senza che il test se ne accorgesse.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn select_upscale_sceglie_window_piu_grande_nel_tier(pool: PgPool) {
         create_schema(&pool).await;
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES ('agent.upscale.target_tier', 'heavy')",
-        )
-        .execute(&pool)
-        .await
-        .expect("set tier");
+        set_setting(&pool, "agent.upscale.target_tier", "heavy").await;
         sqlx::query(
             "INSERT INTO ai_price_catalog \
-             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, context_window) VALUES \
-             ('openai', 'piccolo', true, 'none', 'heavy', 120000), \
-             ('anthropic', 'grande', true, 'none', 'heavy', 400000), \
-             ('mistral', 'small', true, 'none', 'medium', 1000000)",
+             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, \
+              context_window, qualification_state, qualification_expires_at, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('openai', 'piccolo', true, 'none', 'heavy', 120000, 'qualified', now() + interval '30 days', 1.0, 1.0, 'USD', now()), \
+             ('anthropic', 'grande', true, 'none', 'heavy', 400000, 'qualified', now() + interval '30 days', 1.0, 1.0, 'USD', now()), \
+             ('mistral', 'small', true, 'none', 'medium', 1000000, 'qualified', now() + interval '30 days', 1.0, 1.0, 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -272,19 +286,15 @@ mod tests {
         assert_eq!(pick.tier, "heavy");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn select_upscale_none_se_migliore_e_il_corrente(pool: PgPool) {
         create_schema(&pool).await;
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES ('agent.upscale.target_tier', 'heavy')",
-        )
-        .execute(&pool)
-        .await
-        .expect("set tier");
+        set_setting(&pool, "agent.upscale.target_tier", "heavy").await;
         sqlx::query(
             "INSERT INTO ai_price_catalog \
-             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, context_window) VALUES \
-             ('anthropic', 'grande', true, 'none', 'heavy', 400000)",
+             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, \
+              context_window, qualification_state, qualification_expires_at, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('anthropic', 'grande', true, 'none', 'heavy', 400000, 'qualified', now() + interval '30 days', 1.0, 1.0, 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -298,19 +308,15 @@ mod tests {
         assert!(pick.is_none());
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn select_upscale_esclude_thinking_exclude(pool: PgPool) {
         create_schema(&pool).await;
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES ('agent.upscale.target_tier', 'heavy')",
-        )
-        .execute(&pool)
-        .await
-        .expect("set tier");
+        set_setting(&pool, "agent.upscale.target_tier", "heavy").await;
         sqlx::query(
             "INSERT INTO ai_price_catalog \
-             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, context_window) VALUES \
-             ('x', 'reasoner', true, 'exclude', 'heavy', 999999)",
+             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, \
+              context_window, qualification_state, qualification_expires_at, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('x', 'reasoner', true, 'exclude', 'heavy', 999999, 'qualified', now() + interval '30 days', 1.0, 1.0, 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -345,17 +351,13 @@ mod tests {
     /// ma sufficiente — del fornitore vincolato. Senza vincolo vince il primo.
     async fn scena_due_fornitori_nel_tier(pool: &PgPool) {
         create_schema(pool).await;
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES ('agent.upscale.target_tier', 'heavy')",
-        )
-        .execute(pool)
-        .await
-        .expect("set tier");
+        set_setting(pool, "agent.upscale.target_tier", "heavy").await;
         sqlx::query(
             "INSERT INTO ai_price_catalog \
-             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, context_window) VALUES \
-             ('openai', 'gpt-enorme', true, 'none', 'heavy', 900000), \
-             ('anthropic', 'claude-ampio', true, 'none', 'heavy', 400000)",
+             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, \
+              context_window, qualification_state, qualification_expires_at, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('openai', 'gpt-enorme', true, 'none', 'heavy', 900000, 'qualified', now() + interval '30 days', 1.0, 1.0, 'USD', now()), \
+             ('anthropic', 'claude-ampio', true, 'none', 'heavy', 400000, 'qualified', now() + interval '30 days', 1.0, 1.0, 'USD', now())",
         )
         .execute(pool)
         .await
@@ -365,7 +367,7 @@ mod tests {
     /// PREMESSA: senza vincolo l'upscale esce dal fornitore e prende la finestra
     /// piu' grande. Senza questo, il test seguente potrebbe passare perche' il
     /// candidato dell'altro fornitore non c'era.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn senza_vincolo_l_upscale_prende_la_finestra_piu_grande(pool: PgPool) {
         scena_due_fornitori_nel_tier(&pool).await;
         let port = CatalogModelUpscalePort::new(pool.clone());
@@ -382,7 +384,7 @@ mod tests {
     /// silenzioso: nessun errore, nessun avviso, solo una finestra piu' larga.
     /// Col run vincolato resta dentro il fornitore scelto, anche se fuori c'e' di
     /// meglio.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn vincolo_tiene_l_upscale_dentro_il_fornitore_scelto(pool: PgPool) {
         scena_due_fornitori_nel_tier(&pool).await;
         let port =

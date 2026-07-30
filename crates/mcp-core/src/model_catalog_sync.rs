@@ -3112,23 +3112,17 @@ mod tests {
     /// mistral-large-2512 (agentic 5.5, cioe' quintultimo del parco) classificato
     /// 'heavy' perche' costa $0.50 con 262k di finestra, e le inversioni salite a
     /// 90 — peggio del nome, che ne faceva 64.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn il_tier_viene_dall_indice_non_dal_prezzo(pool: sqlx::PgPool) {
-        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): `ai_price_catalog` (mig 0608) e `settings`
+        // (mig 0002) arrivano dalla migrazione. Il DELETE isola dal catalog
+        // reale; l'ON CONFLICT sovrascrive le soglie coi valori del test.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         sqlx::query(
-            "ALTER TABLE ai_price_catalog                ADD COLUMN tier_source TEXT,                ADD COLUMN agentic_index DOUBLE PRECISION,                ADD COLUMN agentic_index_at TIMESTAMPTZ",
-        )
-        .execute(&pool)
-        .await
-        .expect("colonne");
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-        )
-        .execute(&pool)
-        .await
-        .expect("settings");
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')",
+            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
         )
         .execute(&pool)
         .await
@@ -3137,7 +3131,7 @@ mod tests {
         // (il vecchio prior prezzo+finestra diceva 'heavy') e un agentic_index
         // bassissimo. Solo l'indice parla (mig 0608).
         sqlx::query(
-            "INSERT INTO ai_price_catalog              (provider, model, input_cost_per_million_tokens, context_window,               agentic_index, agentic_index_at, performance_tier, tier_source)              VALUES ('mistral', 'mistral-large-2512', 0.5, 262144, 5.5, NOW(), NULL, NULL)",
+            "INSERT INTO ai_price_catalog              (provider, model, input_cost_per_million_tokens, output_cost_per_million_tokens, context_window,               agentic_index, agentic_index_at, performance_tier, tier_source, currency, last_probe_healthy_at)              VALUES ('mistral', 'mistral-large-2512', 0.5, 0.5, 262144, 5.5, NOW(), NULL, NULL, 'USD', NOW())",
         )
         .execute(&pool)
         .await
@@ -3168,21 +3162,15 @@ mod tests {
     /// scoperti dall'indice (OpenRouter non lista quei nomi) — azzerarli
     /// avrebbe dimezzato il pool. Restano col loro tier finche' la batteria non
     /// scrive 'measured'.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn l_indice_stantio_non_azzera_il_tier_gia_presente(pool: sqlx::PgPool) {
-        crate::test_support::create_ai_price_catalog_table(&pool).await;
-        sqlx::query(
-            "ALTER TABLE ai_price_catalog                ADD COLUMN tier_source TEXT,                ADD COLUMN agentic_index DOUBLE PRECISION,                ADD COLUMN agentic_index_at TIMESTAMPTZ",
-        )
-        .execute(&pool)
-        .await
-        .expect("colonne");
-        sqlx::query("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        // Schema REALE (regola O): vedi nota sul test precedente.
+        sqlx::query("DELETE FROM ai_price_catalog")
             .execute(&pool)
             .await
-            .expect("settings");
+            .expect("pulizia catalog");
         sqlx::query(
-            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')",
+            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
         )
         .execute(&pool)
         .await
@@ -3191,7 +3179,7 @@ mod tests {
         // tier gia' presente resta: toglierlo significherebbe togliere il
         // modello dal routing.
         sqlx::query(
-            "INSERT INTO ai_price_catalog              (provider, model, input_cost_per_million_tokens, context_window,               agentic_index, agentic_index_at, performance_tier, tier_source)              VALUES ('mistral', 'vecchio', 0.5, 262144, 5.5, NOW() - interval '30 days', 'heavy', NULL)",
+            "INSERT INTO ai_price_catalog              (provider, model, input_cost_per_million_tokens, output_cost_per_million_tokens, context_window,               agentic_index, agentic_index_at, performance_tier, tier_source, currency, last_probe_healthy_at)              VALUES ('mistral', 'vecchio', 0.5, 0.5, 262144, 5.5, NOW() - interval '30 days', 'heavy', NULL, 'USD', NOW())",
         )
         .execute(&pool)
         .await
@@ -3219,33 +3207,24 @@ mod tests {
     /// senza tier per sempre, con l'indice inerte nella riga. E' il caso reale
     /// dei 6 modelli che la mig 0608 declassa da 'manual' a NULL (fra cui
     /// claude-opus-4-7, indice 44.4, che il listino non elenca).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn il_giro_set_based_riclassifica_chi_il_listino_non_tocca(pool: sqlx::PgPool) {
-        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): `settings` (mig 0002) ha gia' `updated_at`. Il
+        // DELETE isola il catalog dal parco reale: l'algoritmo di "massimo del
+        // PARCO" (usato per ri-ancorare) e l'assert finale su tutte le righe
+        // dipendono ENTRAMBI dal catalog contenere solo le righe di questo test.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         sqlx::query(
-            "ALTER TABLE ai_price_catalog                ADD COLUMN tier_source TEXT,                ADD COLUMN agentic_index DOUBLE PRECISION,                ADD COLUMN agentic_index_at TIMESTAMPTZ",
-        )
-        .execute(&pool)
-        .await
-        .expect("colonne");
-        // Lo schema REALE dei settings (con updated_at): il giro set-based
-        // PERSISTE l'ancora via update_setting_value, e uno schema finto senza
-        // quella colonna nasconderebbe la scrittura (regola O).
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, \
-             value TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())",
-        )
-        .execute(&pool)
-        .await
-        .expect("settings");
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')",
+            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
         )
         .execute(&pool)
         .await
         .expect("soglie");
         sqlx::query(
-            "INSERT INTO ai_price_catalog              (provider, model, agentic_index, agentic_index_at, performance_tier, tier_source)              VALUES              ('anthropic', 'opus-fossile', 44.4, NOW(), 'medium', NULL),              ('x', 'gia-misurato',  10.0, NOW(), 'frontier', 'measured'),              ('x', 'senza-indice',  NULL, NULL,  'heavy', NULL)",
+            "INSERT INTO ai_price_catalog              (provider, model, agentic_index, agentic_index_at, performance_tier, tier_source, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at)              VALUES              ('anthropic', 'opus-fossile', 44.4, NOW(), 'medium', NULL, 1.0, 1.0, 'USD', NOW()),              ('x', 'gia-misurato',  10.0, NOW(), 'frontier', 'measured', 1.0, 1.0, 'USD', NOW()),              ('x', 'senza-indice',  NULL, NULL,  'heavy', NULL, 1.0, 1.0, 'USD', NOW())",
         )
         .execute(&pool)
         .await
@@ -3289,21 +3268,15 @@ mod tests {
     /// `performance_tier IS DISTINCT FROM $3` l'UPDATE non scattava e il modello
     /// restava a provenienza ignota per sempre — la bugia che questo lavoro
     /// rimuove.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn l_indice_che_conferma_il_tier_ne_registra_la_provenienza(pool: sqlx::PgPool) {
-        crate::test_support::create_ai_price_catalog_table(&pool).await;
-        sqlx::query(
-            "ALTER TABLE ai_price_catalog                ADD COLUMN tier_source TEXT,                ADD COLUMN agentic_index DOUBLE PRECISION,                ADD COLUMN agentic_index_at TIMESTAMPTZ",
-        )
-        .execute(&pool)
-        .await
-        .expect("colonne");
-        sqlx::query("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        // Schema REALE (regola O): vedi nota sui test precedenti.
+        sqlx::query("DELETE FROM ai_price_catalog")
             .execute(&pool)
             .await
-            .expect("settings");
+            .expect("pulizia catalog");
         sqlx::query(
-            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')",
+            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
         )
         .execute(&pool)
         .await
@@ -3311,7 +3284,7 @@ mod tests {
         // Tier 'heavy' fossile (fonte ignota) e indice fresco 36.4 -> heavy: il
         // VALORE non cambia, la PROVENIENZA si'.
         sqlx::query(
-            "INSERT INTO ai_price_catalog              (provider, model, agentic_index, agentic_index_at, performance_tier, tier_source)              VALUES ('deepseek', 'v4-pro', 36.4, NOW(), 'heavy', NULL)",
+            "INSERT INTO ai_price_catalog              (provider, model, agentic_index, agentic_index_at, performance_tier, tier_source, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at)              VALUES ('deepseek', 'v4-pro', 36.4, NOW(), 'heavy', NULL, 1.0, 1.0, 'USD', NOW())",
         )
         .execute(&pool)
         .await
@@ -3417,33 +3390,21 @@ mod tests {
     /// consulta `model_passes_selection_policy` PRIMA di inserire. Un provider
     /// CON policy restrittiva inserisce solo gli allowed; uno SENZA riga policy
     /// inserisce tutti (unwrap_or(true), invariato per i 5 provider storici).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn pezzo2_policy_governa_insert(pool: sqlx::PgPool) {
-        crate::test_support::create_ai_price_catalog_table(&pool).await;
-        // Colonne + UNIQUE che l'INSERT reale di `insert_new_chat_model` usa ma
-        // che lo specchio di test non ha (display_name/currency/effective_from,
-        // ON CONFLICT (provider, model)).
-        sqlx::query(
-            "ALTER TABLE ai_price_catalog \
-               ADD COLUMN display_name TEXT, \
-               ADD COLUMN currency TEXT, \
-               ADD COLUMN effective_from TIMESTAMPTZ, \
-               ADD COLUMN capability_source TEXT NOT NULL DEFAULT 'auto', \
-               ADD CONSTRAINT ux_apc UNIQUE (provider, model)",
-        )
-        .execute(&pool)
-        .await
-        .expect("colonne insert");
-        sqlx::query(
-            "CREATE TABLE nexus_model_selection_policy ( \
-                 provider TEXT PRIMARY KEY, \
-                 allowed_patterns TEXT[] NOT NULL DEFAULT '{}', \
-                 denied_patterns TEXT[] NOT NULL DEFAULT '{}', \
-                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now() )",
-        )
-        .execute(&pool)
-        .await
-        .expect("policy table");
+        // Schema REALE (regola O): `ai_price_catalog` (col vincolo UNIQUE
+        // `uq_price_catalog_provider_model` gia' dalla mig 0032, il
+        // `capability_source` dalla mig successiva) e `nexus_model_selection_policy`
+        // (mig 0320) arrivano dalla migrazione. I DELETE isolano dai dati di
+        // produzione: l'assert finale conta le righe ESATTE del catalog.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
+        sqlx::query("DELETE FROM nexus_model_selection_policy")
+            .execute(&pool)
+            .await
+            .expect("pulizia policy");
         sqlx::query(
             "INSERT INTO nexus_model_selection_policy (provider, allowed_patterns, denied_patterns) \
              VALUES ('provA', ARRAY['^good-']::text[], ARRAY[]::text[])",

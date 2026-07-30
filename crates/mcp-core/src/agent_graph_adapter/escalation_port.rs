@@ -716,90 +716,47 @@ impl EscalationPort for PgEscalationPort {
 mod tests {
     use super::*;
 
-    /// Schema minimale per i test: `settings` (per la disponibilita' provider) +
-    /// `nexus_purpose_model` VUOTA (cosi' `resolve_purpose_model_db` ritorna
-    /// `NotFound` -> `cross_provider = None`: isoliamo il Tier 1 senza dipendere
-    /// da routing) + `ai_price_catalog` con la vista derivata `v_model_escalation_chain`
-    /// (mig 0471/0475), da cui `chain_for` legge la catena. La tabella seed
-    /// `nexus_model_escalation_chain` (mig 0128) e' stata droppata (mig 0474):
-    /// non esiste piu' qui.
+    /// Schema REALE (regola O): `settings`, `nexus_purpose_model`,
+    /// `ai_price_catalog`, `ai_model_health_history` e la vista
+    /// `v_model_escalation_chain` arrivano dalla migrazione (mig 0002/0102/0032/
+    /// 0172/0471, evoluta fino alla 0656), non da uno specchio a mano — lo
+    /// specchio precedente non vedeva l'evoluzione della vista (mancava il
+    /// costo atteso della cache introdotto dalla mig 0656, esercitato dai test
+    /// piu' sotto che gia' giravano su META_MIGRATOR). I DELETE isolano il test
+    /// dai dati di produzione seminati dalle migrazioni senza toccare lo schema.
     async fn create_schema(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE settings ( \
-                 key TEXT PRIMARY KEY, \
-                 value TEXT NOT NULL, \
-                 category TEXT \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create settings");
-        sqlx::query(
-            "CREATE TABLE nexus_purpose_model ( \
-                 purpose TEXT PRIMARY KEY, \
-                 tier TEXT, \
-                 required_capability TEXT, \
-                 requires_tool_use BOOLEAN NOT NULL DEFAULT false \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create nexus_purpose_model");
-        // Catalog dal punto unico condiviso (regola L, `test_support`): la stessa
-        // tabella serve sia la vista v_model_escalation_chain sia il punto unico
-        // `select_models_tierchain` usato dal failover agentico.
-        crate::test_support::create_ai_price_catalog_table(pool).await;
-        // Storico health per la telemetria del failover (`load_model_telemetry`):
-        // vuoto = telemetria neutra dai soli contatori del catalog.
-        sqlx::query(
-            "CREATE TABLE ai_model_health_history ( \
-                 provider TEXT NOT NULL, \
-                 model TEXT NOT NULL, \
-                 healthy BOOLEAN NOT NULL, \
-                 latency_ms BIGINT, \
-                 error_kind TEXT, \
-                 checked_at TIMESTAMPTZ NOT NULL DEFAULT now() \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create ai_model_health_history");
-        // SPECCHIO A MANO della vista viva (mig 0471/0475/0528 + 0598). E' un
-        // test-double fragile e lo si sappia: non e' agganciato alla migrazione,
-        // quindi se la vista cambia i test possono restare verdi su una vista
-        // FANTASMA. Qui e' andata bene — la mig 0598 ha aggiunto tre colonne e i
-        // test sono diventati rossi subito, che e' l'esito desiderabile — ma la
-        // garanzia e' un caso fortunato, non una proprieta'. Sostituirlo con una
-        // fixture derivata dalla migrazione reale e' un lavoro suo (annotato dal
-        // censimento dei punti unici), non da fare dentro questo.
-        sqlx::query(
-            "CREATE VIEW v_model_escalation_chain AS SELECT \
-                 provider, model, performance_tier, speed_tier, is_enabled, \
-                 consecutive_failures, consecutive_tool_failures, supports_tool_use, \
-                 supports_vision, agentic_thinking_policy, capabilities, context_window, \
-                 (input_cost_per_million_tokens * 0.75 + output_cost_per_million_tokens * 0.25) AS blended_cost, \
-                 ((CASE performance_tier WHEN 'light' THEN 0 WHEN 'medium' THEN 1 WHEN 'high' THEN 2 WHEN 'heavy' THEN 3 WHEN 'frontier' THEN 4 ELSE 1 END) * 1000000 \
-                  + round((input_cost_per_million_tokens * 0.75 + output_cost_per_million_tokens * 0.25) * 1000))::bigint AS escalation_rank, \
-                 (CASE performance_tier WHEN 'light' THEN 0 WHEN 'medium' THEN 1 WHEN 'high' THEN 2 WHEN 'heavy' THEN 3 WHEN 'frontier' THEN 4 ELSE 1 END) AS performance_tier_ord, \
-                 qualification_state, qualification_expires_at, auto_disabled_reason \
-             FROM ai_price_catalog WHERE is_enabled = TRUE",
-        )
-        .execute(pool)
-        .await
-        .expect("create v_model_escalation_chain");
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(pool)
+            .await
+            .expect("pulizia catalog");
+        sqlx::query("DELETE FROM ai_model_health_history")
+            .execute(pool)
+            .await
+            .expect("pulizia health history");
+        sqlx::query("DELETE FROM nexus_purpose_model")
+            .execute(pool)
+            .await
+            .expect("pulizia purpose model");
     }
 
     /// Seed del catalog (sorgente della catena derivata). Tuple:
     /// (provider, model, performance_tier, input_cost, is_enabled, supports_tool_use).
     /// La `context_window` resta al default della tabella (8192): per i test che
     /// esercitano il filtro finestra-aware usa [`seed_catalog_window`].
+    ///
+    /// `qualification_state = 'qualified'` non e' un dettaglio: su META_MIGRATOR
+    /// `chain_for` legge il gate dai `settings` VERI (riga 244), acceso di
+    /// default dalla mig 0595 — senza, ogni riga qui sotto nascerebbe
+    /// 'unqualified' e il gate la scarterebbe, svuotando la catena.
     async fn seed_catalog(pool: &PgPool, rows: &[(&str, &str, &str, f64, bool, bool)]) {
         for (provider, model, tier, in_cost, enabled, tool) in rows {
             sqlx::query(
                 "INSERT INTO ai_price_catalog \
                  (provider, model, performance_tier, input_cost_per_million_tokens, \
-                  output_cost_per_million_tokens, is_enabled, supports_tool_use) \
-                 VALUES ($1, $2, $3, $4, 0, $5, $6)",
+                  output_cost_per_million_tokens, is_enabled, supports_tool_use, \
+                  qualification_state, qualification_expires_at, currency, \
+                  last_probe_healthy_at) \
+                 VALUES ($1, $2, $3, $4, 0, $5, $6, 'qualified', now() + interval '30 days', 'USD', now())",
             )
             .bind(provider)
             .bind(model)
@@ -821,8 +778,10 @@ mod tests {
             sqlx::query(
                 "INSERT INTO ai_price_catalog \
                  (provider, model, performance_tier, input_cost_per_million_tokens, \
-                  output_cost_per_million_tokens, is_enabled, supports_tool_use, context_window) \
-                 VALUES ($1, $2, $3, $4, 0, $5, $6, $7)",
+                  output_cost_per_million_tokens, is_enabled, supports_tool_use, context_window, \
+                  qualification_state, qualification_expires_at, currency, \
+                  last_probe_healthy_at) \
+                 VALUES ($1, $2, $3, $4, 0, $5, $6, $7, 'qualified', now() + interval '30 days', 'USD', now())",
             )
             .bind(provider)
             .bind(model)
@@ -837,20 +796,26 @@ mod tests {
         }
     }
 
-    /// Marca un provider come disponibile inserendone la API key in `settings`.
+    /// Marca un provider come disponibile impostando la API key in `settings`.
+    /// La mig 0002 semina gia' `openai_api_key`/`anthropic_api_key`/
+    /// `google_api_key` (valore vuoto): ON CONFLICT sovrascrive col valore del
+    /// test invece di fallire sulla PK.
     async fn set_api_key(pool: &PgPool, provider: &str, value: &str) {
-        sqlx::query("INSERT INTO settings (key, value, category) VALUES ($1, $2, 'providers')")
-            .bind(format!("{provider}_api_key"))
-            .bind(value)
-            .execute(pool)
-            .await
-            .expect("insert api key");
+        sqlx::query(
+            "INSERT INTO settings (key, value, category) VALUES ($1, $2, 'providers') \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(format!("{provider}_api_key"))
+        .bind(value)
+        .execute(pool)
+        .await
+        .expect("insert api key");
     }
 
     /// La catena e' DERIVATA dal catalog (vista v_model_escalation_chain): enumera
     /// i modelli del provider con escalation_rank > corrente, ordinati ASC
     /// (economico/leggero -> capace), esclusi is_enabled=false e supports_tool_use=false.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn catena_derivata_dal_catalog_ordina_per_rank(pool: PgPool) {
         create_schema(&pool).await;
         set_api_key(&pool, "anthropic", "sk-live").await;
@@ -890,7 +855,7 @@ mod tests {
     /// FIX-A (scale-controller): la `ChainEntry` porta il `performance_tier` del
     /// modello di destinazione, letto dalla vista insieme al modello (nessun lookup
     /// extra). Il pick a valle scrivera' `current_tier` con questo valore.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn catena_propaga_il_performance_tier(pool: PgPool) {
         create_schema(&pool).await;
         set_api_key(&pool, "anthropic", "sk-live").await;
@@ -931,7 +896,7 @@ mod tests {
     /// FIX-A: `model_tier` legge il tier dalla vista; `None` se il modello non e' in
     /// catalog (fail-open) o su argomenti vuoti. Punto unico per il cross-provider e
     /// il failover (che arrivano dal router senza tier).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn model_tier_legge_il_tier(pool: PgPool) {
         create_schema(&pool).await;
         seed_catalog(&pool, &[("openai", "gpt-x", "heavy", 1.0, true, true)]).await;
@@ -951,7 +916,7 @@ mod tests {
     /// modello corrente ha finestra grande (1M); il candidato "piu' capace per rank"
     /// ma con finestra piccola (131K) NON deve entrare in catena (manderebbe in
     /// overflow). Resta solo il candidato con finestra >= corrente.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn catena_esclude_finestra_piu_piccola(pool: PgPool) {
         create_schema(&pool).await;
         set_api_key(&pool, "deepseek", "sk-live").await;
@@ -1012,7 +977,7 @@ mod tests {
     /// FINESTRA-AWARE: `model_window` legge la finestra dalla vista; `0` se il
     /// modello non e' in catalog (filtro inattivo -> fail-open). E' il punto unico
     /// usato sia dal filtro catena sia dal guard downgrade del cross-provider.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn model_window_legge_la_finestra(pool: PgPool) {
         create_schema(&pool).await;
         seed_catalog_window(
@@ -1041,7 +1006,7 @@ mod tests {
 
     /// Provider corrente NON disponibile (nessuna API key) -> catena Tier 1
     /// AZZERATA (filtro PR-J1), anche se la tabella avrebbe righe.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn provider_non_registrato_azzera_la_catena(pool: PgPool) {
         create_schema(&pool).await;
         // NESSUNA api key per 'anthropic' -> provider non disponibile: la catena
@@ -1064,7 +1029,7 @@ mod tests {
     }
 
     /// API key presente ma VUOTA -> provider non disponibile (catena azzerata).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn provider_con_api_key_vuota_azzera_la_catena(pool: PgPool) {
         create_schema(&pool).await;
         set_api_key(&pool, "anthropic", "   ").await;
@@ -1087,7 +1052,7 @@ mod tests {
     }
 
     /// Provider/model assenti -> Tier 1 saltato (catena vuota), nessun cooldown.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn coppia_assente_catena_vuota(pool: PgPool) {
         create_schema(&pool).await;
         let port = PgEscalationPort::new(pool.clone());
@@ -1099,7 +1064,7 @@ mod tests {
     }
 
     /// Catena assente per la coppia corrente -> vuota (non un errore).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn coppia_senza_catena_ritorna_vuoto(pool: PgPool) {
         create_schema(&pool).await;
         set_api_key(&pool, "openai", "sk-live").await;
@@ -1117,7 +1082,7 @@ mod tests {
     /// ripartiva dal pavimento fisso 'medium' e sceglieva il piu' economico
     /// (v4-flash), IGNORANDO il high sano (v4-pro). Con la selezione agentica il
     /// tier corrente e' un'indicazione: vince il sostituto piu' vicino.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn failover_sceglie_il_sostituto_vicino_non_il_pavimento(pool: PgPool) {
         create_schema(&pool).await;
         seed_catalog(
@@ -1148,7 +1113,7 @@ mod tests {
     /// La salute (segnale strutturato, regola M) domina l'indicazione di tier:
     /// il candidato piu' vicino ma "recently_failed" (contatori del catalog)
     /// perde contro uno piu' lontano ma sano.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn failover_telemetria_retrocede_il_degradato(pool: PgPool) {
         create_schema(&pool).await;
         seed_catalog(
@@ -1183,7 +1148,7 @@ mod tests {
     }
 
     /// I provider gia' provati (`exclude`) non rientrano mai nel pool.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn failover_esclude_i_provider_gia_provati(pool: PgPool) {
         create_schema(&pool).await;
         seed_catalog(
@@ -1212,7 +1177,7 @@ mod tests {
     /// `current_tier` assente -> risolto dal catalog via (provider, model). Con la
     /// risoluzione attiva l'indicazione 'heavy' preferisce il high; senza (medium
     /// neutro) vincerebbe il medium (distanza 0): il test discrimina i due casi.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn failover_tier_corrente_risolto_dal_catalog(pool: PgPool) {
         create_schema(&pool).await;
         seed_catalog(
@@ -1240,7 +1205,7 @@ mod tests {
     }
 
     /// Catalog vuoto (o tutto escluso) -> `None`, mai un errore (fail-open).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn failover_pool_vuoto_ritorna_none(pool: PgPool) {
         create_schema(&pool).await;
         let port = PgEscalationPort::new(pool.clone());
@@ -1261,7 +1226,7 @@ mod tests {
     /// STRETTAMENTE minore del modello caduto e' escluso, cosi' un contesto gia'
     /// grande non va in overflow (HTTP 413) sul sostituto. Cade google/1M; groq/128k
     /// e' troppo piccolo (escluso), deepseek/1M regge (scelto).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn failover_esclude_sostituto_con_finestra_piu_piccola(pool: PgPool) {
         create_schema(&pool).await;
         seed_catalog_window(
@@ -1320,7 +1285,7 @@ mod tests {
     /// FAIL-OPEN finestra: se il modello caduto era gia' il piu' capiente e nessun
     /// candidato regge la sua finestra, il vincolo svuoterebbe il pool -> si ritenta
     /// senza vincolo (un failover degradato > nessun failover / chiusura Error).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn failover_finestra_fail_open_se_nessuno_regge(pool: PgPool) {
         create_schema(&pool).await;
         seed_catalog_window(
@@ -1364,7 +1329,7 @@ mod tests {
     /// potuto escludere un deepseek 128k -> failover mancato -> il run cicla sul provider
     /// vuoto (9 turni, 0 escalation). Con la causa-awareness, per EmptyCompletion il filtro
     /// finestra e' OFF e deepseek-small viene scelto.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn failover_empty_completion_non_filtra_la_finestra(pool: PgPool) {
         create_schema(&pool).await;
         seed_catalog_window(
@@ -1417,7 +1382,7 @@ mod tests {
     /// e SALTO' proprio questo sito: si poteva salire su un modello che il
     /// routing live scarta, cioe' saltare verso un altro fallimento.
     /// Idem per un modello marcato MORTO dal probe (404 riabilitato a mano).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn catena_esclude_i_modelli_inadatti_ai_tool_loop(pool: PgPool) {
         create_schema(&pool).await;
         seed_catalog(
@@ -1507,8 +1472,8 @@ mod tests {
         // Il cross-provider si risolve per TIER (regola G): `frontier` esiste solo
         // su openai, quindi il candidato e' openai e non un secondo anthropic.
         sqlx::query(
-            "INSERT INTO nexus_purpose_model (purpose, tier, requires_tool_use) \
-             VALUES ('loop_fallback_default', 'frontier', true)",
+            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, requires_tool_use) \
+             VALUES ('loop_fallback_default', 'fallback-provider', 'fallback-model', 'frontier', true)",
         )
         .execute(pool)
         .await
@@ -1520,7 +1485,7 @@ mod tests {
     /// non risolto, filtro di eleggibilita' piu' stretto), il test del pin
     /// resterebbe verde misurando il nulla — passerebbe per assenza del
     /// candidato, non per il vincolo.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn senza_vincolo_il_candidato_cross_provider_c_e(pool: PgPool) {
         scena_intra_e_cross(&pool).await;
         let port = PgEscalationPort::new(pool.clone());
@@ -1547,7 +1512,7 @@ mod tests {
     /// candidato cross, sopravvive la catena intra (salire di modello dentro il
     /// fornitore scelto e' ancora la scelta dell'utente). E' la parte che tiene
     /// in piedi i run lunghi anche col vincolo attivo.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn vincolo_scarta_il_cross_e_tiene_la_catena_intra(pool: PgPool) {
         scena_intra_e_cross(&pool).await;
         let port = PgEscalationPort::new(pool.clone())
@@ -1576,7 +1541,7 @@ mod tests {
     /// dice con `Ok(None)` anche se il catalogo e' pieno di fornitori sani: il
     /// ripiego non e' fallito, non e' stato cercato. Il fornitore caduto e'
     /// quello vincolato (caso normale: e' l'unico che il run puo' usare).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn vincolo_toglie_il_ripiego_cross_provider(pool: PgPool) {
         create_schema(&pool).await;
         seed_catalog(
@@ -1624,7 +1589,7 @@ mod tests {
     ///
     /// MUTAZIONE: togliendo `&& self.veto.ammette(p)` da `candidati_ammessi`, il
     /// sostituto torna a essere deepseek e questa asserzione cade.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn il_veto_tiene_il_giudice_fuori_dal_fornitore_del_worker(pool: PgPool) {
         create_schema(&pool).await;
         seed_catalog(
@@ -1666,7 +1631,7 @@ mod tests {
     ///
     /// MUTAZIONE: togliendo `normalize(...)` da `ProviderVeto::su` il sostituto
     /// torna deepseek, con il veto apparentemente attivo.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn il_veto_riconosce_il_fornitore_a_prescindere_dalle_maiuscole(pool: PgPool) {
         create_schema(&pool).await;
         seed_catalog(
@@ -1700,7 +1665,7 @@ mod tests {
     /// comporta come prima, e il fornitore che il veto escluderebbe resta un
     /// sostituto lecito. Senza questa coppia, il test sopra passerebbe anche se il
     /// filtro scartasse tutto indiscriminatamente.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn senza_veto_il_ripiego_resta_quello_di_prima(pool: PgPool) {
         create_schema(&pool).await;
         seed_catalog(
@@ -1732,7 +1697,7 @@ mod tests {
     /// Seconda difesa: se a cadere e' un fornitore che NON e' quello vincolato
     /// (il ramo di uscita anticipata non scatta), il sostituto puo' essere solo
     /// il vincolato. Senza il filtro sul pool, qui passerebbe openai.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn vincolo_ammette_solo_il_fornitore_scelto_come_sostituto(pool: PgPool) {
         create_schema(&pool).await;
         seed_catalog(
@@ -1765,7 +1730,7 @@ mod tests {
     /// Un run NON vincolato passa per lo stesso codice: il filtro deve essere
     /// l'identita'. E' il controllo che il fix non cambi nulla per chi non ha
     /// premuto "Forza" — cioe' per la quasi totalita' dei run.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn senza_vincolo_il_ripiego_resta_quello_di_prima(pool: PgPool) {
         create_schema(&pool).await;
         seed_catalog(
@@ -1824,8 +1789,8 @@ mod tests {
                (provider, model, performance_tier, input_cost_per_million_tokens, \
                 output_cost_per_million_tokens, cache_read_cost_per_million_tokens, \
                 currency, is_enabled, supports_tool_use, context_window, pricing_state, \
-                qualification_state) \
-             VALUES ($1,$2,$3,$4,$5,$6,'USD',TRUE,TRUE,256000,'priced','qualified')",
+                qualification_state, last_probe_healthy_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,'USD',TRUE,TRUE,256000,'priced','qualified',now())",
         )
         .bind(provider)
         .bind(model)

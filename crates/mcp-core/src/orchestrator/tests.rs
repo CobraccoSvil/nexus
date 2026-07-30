@@ -1,9 +1,7 @@
 //! Test unitari del modulo orchestrator.
 
 use super::*;
-// Schema `ai_price_catalog` dal punto unico condiviso (regola L).
 use crate::orchestrator::provider_choice::InvalidProviderOverrideMode;
-use crate::test_support::create_ai_price_catalog_table;
 
 #[test]
 fn test_route_model_with_mode_file_ops_approfondita() {
@@ -107,7 +105,7 @@ fn needs_catalog_fallback_include_no_model_e_provider_sani_no() {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
 async fn coding_fallback_resta_su_tier_heavy_non_su_google_light(pool: sqlx::PgPool) {
     // Regressione (fix routing coding, regola H): con i provider forti di coding
     // (anthropic, openai) non disponibili, il fallback per un task heavy deve
@@ -116,14 +114,22 @@ async fn coding_fallback_resta_su_tier_heavy_non_su_google_light(pool: sqlx::PgP
     // E' l'invariante su cui poggia il fix: select_agentic_model, consultato dal
     // ramo __no_model__/cooldown di resolve_agent_provider, rispetta il tier
     // dell'intent (heavy) ed esclude per costruzione i modelli light.
-    create_ai_price_catalog_table(&pool).await;
+    //
+    // Schema REALE (regola O): il DELETE isola dal catalog di produzione senza
+    // sostituire lo schema. `select_model` legge il gate di qualificazione dai
+    // `settings` VERI (acceso di default, mig 0595): ogni riga qui sotto si
+    // dichiara 'qualified', altrimenti il gate le scarterebbe tutte.
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
     sqlx::query(
         "INSERT INTO ai_price_catalog \
-         (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, performance_tier, capabilities, is_featured, input_cost_per_million_tokens) VALUES \
-         ('anthropic', 'claude-heavy', true, true, 'disable_for_tools', 'heavy', '[\"reasoning\"]', true,  3.0), \
-         ('openai',    'gpt-heavy',    true, true, 'disable_for_tools', 'heavy', '[\"reasoning\"]', true,  2.0), \
-         ('deepseek',  'reasoner',     true, true, 'none',              'heavy', '[\"reasoning\"]', false, 0.5), \
-         ('google',    'gemini-flash', true, true, 'none',              'light', '[\"reasoning\"]', true,  0.1)",
+         (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, performance_tier, capabilities, qualified_capabilities, is_featured, input_cost_per_million_tokens, output_cost_per_million_tokens, qualification_state, qualification_expires_at, currency, last_probe_healthy_at) VALUES \
+         ('anthropic', 'claude-heavy', true, true, 'disable_for_tools', 'heavy', '[\"reasoning\"]', '[\"reasoning\"]', true,  3.0, 3.0, 'qualified', now() + interval '30 days', 'USD', now()), \
+         ('openai',    'gpt-heavy',    true, true, 'disable_for_tools', 'heavy', '[\"reasoning\"]', '[\"reasoning\"]', true,  2.0, 2.0, 'qualified', now() + interval '30 days', 'USD', now()), \
+         ('deepseek',  'reasoner',     true, true, 'none',              'heavy', '[\"reasoning\"]', '[\"reasoning\"]', false, 0.5, 0.5, 'qualified', now() + interval '30 days', 'USD', now()), \
+         ('google',    'gemini-flash', true, true, 'none',              'light', '[\"reasoning\"]', '[\"reasoning\"]', true,  0.1, 0.1, 'qualified', now() + interval '30 days', 'USD', now())",
     )
     .execute(&pool)
     .await
@@ -242,15 +248,19 @@ fn intent_candidate_e_serializzabile_a_json() {
 // `provider_for_model` ne usa solo provider/model/is_enabled/costo. Idempotenti
 // e indipendenti dall'ordine: ogni test ha il proprio DB.
 
-#[sqlx::test]
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
 async fn provider_for_model_modello_noto_ritorna_provider(pool: sqlx::PgPool) {
-    create_ai_price_catalog_table(&pool).await;
+    // Schema REALE (regola O): il DELETE isola dal catalog di produzione.
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
 
     // Stesso modello su due provider: deve vincere il piu' economico (mistral).
     sqlx::query(
-        "INSERT INTO ai_price_catalog (provider, model, is_enabled, input_cost_per_million_tokens)
-         VALUES ('openai', 'shared-model', true, 5.0),
-                ('mistral', 'shared-model', true, 2.0)",
+        "INSERT INTO ai_price_catalog (provider, model, is_enabled, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at)
+         VALUES ('openai', 'shared-model', true, 5.0, 5.0, 'USD', now()),
+                ('mistral', 'shared-model', true, 2.0, 2.0, 'USD', now())",
     )
     .execute(&pool)
     .await
@@ -264,14 +274,18 @@ async fn provider_for_model_modello_noto_ritorna_provider(pool: sqlx::PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
 async fn provider_for_model_modello_disabilitato_o_ignoto_ritorna_none(pool: sqlx::PgPool) {
-    create_ai_price_catalog_table(&pool).await;
+    // Schema REALE (regola O): il DELETE isola dal catalog di produzione.
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
 
     // Un modello presente ma disabilitato non deve essere risolto.
     sqlx::query(
-        "INSERT INTO ai_price_catalog (provider, model, is_enabled, input_cost_per_million_tokens)
-         VALUES ('mistral', 'disabled-model', false, 1.0)",
+        "INSERT INTO ai_price_catalog (provider, model, is_enabled, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at)
+         VALUES ('mistral', 'disabled-model', false, 1.0, 1.0, 'USD', now())",
     )
     .execute(&pool)
     .await
@@ -420,17 +434,23 @@ async fn test_generate_agent_turn_no_grpc_al_brain() {
 ///
 /// Invariante: quando il tier richiesto e' esaurito, la selezione DEGRADA al
 /// primo tier con un candidato sano invece di fallire.
-#[sqlx::test]
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
 async fn purpose_degrada_quando_il_tier_richiesto_e_esaurito(pool: sqlx::PgPool) {
-    create_ai_price_catalog_table(&pool).await;
+    // Schema REALE (regola O): il DELETE isola dal catalog di produzione; il gate
+    // di qualificazione (settings VERI, acceso di default) impone
+    // qualification_state='qualified' su ogni riga (vedi test sopra).
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
     // Il catalog dell'incidente, in piccolo: gli unici 'heavy' sono dei due
     // provider senza credito; il modello sano vive nel tier sotto.
     sqlx::query(
         "INSERT INTO ai_price_catalog \
-         (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, performance_tier, capabilities, input_cost_per_million_tokens) VALUES \
-         ('openai',    'gpt-heavy',       true, true, 'disable_for_tools', 'heavy',  '[\"reasoning\"]', 2.0), \
-         ('anthropic', 'claude-heavy',    true, true, 'disable_for_tools', 'heavy',  '[\"reasoning\"]', 3.0), \
-         ('deepseek',  'deepseek-v4-pro', true, true, 'none',              'high',   '[\"reasoning\"]', 0.5)",
+         (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, performance_tier, capabilities, qualified_capabilities, input_cost_per_million_tokens, output_cost_per_million_tokens, qualification_state, qualification_expires_at, currency, last_probe_healthy_at) VALUES \
+         ('openai',    'gpt-heavy',       true, true, 'disable_for_tools', 'heavy',  '[\"reasoning\"]', '[\"reasoning\"]', 2.0, 2.0, 'qualified', now() + interval '30 days', 'USD', now()), \
+         ('anthropic', 'claude-heavy',    true, true, 'disable_for_tools', 'heavy',  '[\"reasoning\"]', '[\"reasoning\"]', 3.0, 3.0, 'qualified', now() + interval '30 days', 'USD', now()), \
+         ('deepseek',  'deepseek-v4-pro', true, true, 'none',              'high',   '[\"reasoning\"]', '[\"reasoning\"]', 0.5, 0.5, 'qualified', now() + interval '30 days', 'USD', now())",
     )
     .execute(&pool)
     .await
@@ -468,14 +488,18 @@ async fn purpose_degrada_quando_il_tier_richiesto_e_esaurito(pool: sqlx::PgPool)
 /// Complemento del test sopra: quando il tier richiesto HA un candidato sano,
 /// la degradazione NON deve scattare (niente ripieghi gratuiti su modelli piu'
 /// deboli, che sarebbe il difetto opposto).
-#[sqlx::test]
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
 async fn purpose_resta_sul_tier_richiesto_quando_e_disponibile(pool: sqlx::PgPool) {
-    create_ai_price_catalog_table(&pool).await;
+    // Schema REALE (regola O): vedi nota sul test precedente.
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
     sqlx::query(
         "INSERT INTO ai_price_catalog \
-         (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, performance_tier, capabilities, input_cost_per_million_tokens) VALUES \
-         ('google',   'gemini-heavy',    true, true, 'disable_for_tools', 'heavy', '[\"reasoning\"]', 2.0), \
-         ('deepseek', 'deepseek-v4-pro', true, true, 'none',              'high',  '[\"reasoning\"]', 0.1)",
+         (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, performance_tier, capabilities, qualified_capabilities, input_cost_per_million_tokens, output_cost_per_million_tokens, qualification_state, qualification_expires_at, currency, last_probe_healthy_at) VALUES \
+         ('google',   'gemini-heavy',    true, true, 'disable_for_tools', 'heavy', '[\"reasoning\"]', '[\"reasoning\"]', 2.0, 2.0, 'qualified', now() + interval '30 days', 'USD', now()), \
+         ('deepseek', 'deepseek-v4-pro', true, true, 'none',              'high',  '[\"reasoning\"]', '[\"reasoning\"]', 0.1, 0.1, 'qualified', now() + interval '30 days', 'USD', now())",
     )
     .execute(&pool)
     .await
@@ -503,14 +527,18 @@ async fn purpose_resta_sul_tier_richiesto_quando_e_disponibile(pool: sqlx::PgPoo
 /// un pin su un provider con soli modelli deboli aggancerebbe il run a un tier
 /// inferiore invece di lasciar vincere il modello giusto di un altro provider
 /// (regressione di `pin_non_capable_degrada_al_purpose_normale`).
-#[sqlx::test]
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
 async fn col_pin_non_si_degrada_il_tier(pool: sqlx::PgPool) {
-    create_ai_price_catalog_table(&pool).await;
+    // Schema REALE (regola O): vedi nota sui test precedenti.
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
     sqlx::query(
         "INSERT INTO ai_price_catalog \
-         (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, performance_tier, capabilities, input_cost_per_million_tokens) VALUES \
-         ('mistral',  'mistral-medium', true, true, 'none', 'medium', '[\"code\"]', 1.0), \
-         ('deepseek', 'deepseek-flash', true, true, 'none', 'light',  '[\"code\"]', 0.5)",
+         (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, performance_tier, capabilities, input_cost_per_million_tokens, output_cost_per_million_tokens, qualification_state, qualification_expires_at, currency, last_probe_healthy_at) VALUES \
+         ('mistral',  'mistral-medium', true, true, 'none', 'medium', '[\"code\"]', 1.0, 1.0, 'qualified', now() + interval '30 days', 'USD', now()), \
+         ('deepseek', 'deepseek-flash', true, true, 'none', 'light',  '[\"code\"]', 0.5, 0.5, 'qualified', now() + interval '30 days', 'USD', now())",
     )
     .execute(&pool)
     .await
@@ -547,15 +575,22 @@ async fn col_pin_non_si_degrada_il_tier(pool: sqlx::PgPool) {
 /// mentre lo stesso turno in modalita' agentica degraderebbe e vedrebbe
 /// l'immagine. La capability resta un filtro: il ripiego e' sempre un modello
 /// che sa fare la cosa richiesta, solo meno capace.
-#[sqlx::test]
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
 async fn purpose_non_agentico_degrada_e_resta_capace(pool: sqlx::PgPool) {
-    create_ai_price_catalog_table(&pool).await;
+    // Schema REALE (regola O): il DELETE isola dal catalog di produzione. Il gate
+    // di qualificazione e' un flag del solo path AGENTICO (qui non_agentic), ma
+    // qualification_state='qualified' resta esplicito per non dipendere da quel
+    // dettaglio implementativo.
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
     sqlx::query(
         "INSERT INTO ai_price_catalog \
-         (provider, model, is_enabled, supports_tool_use, supports_vision, performance_tier, input_cost_per_million_tokens) VALUES \
-         ('openai',   'gpt-vision-heavy', true, false, true,  'heavy',  2.0), \
-         ('google',   'gemini-vision',    true, false, true,  'medium', 0.5), \
-         ('deepseek', 'deepseek-cieco',   true, false, false, 'medium', 0.1)",
+         (provider, model, is_enabled, supports_tool_use, supports_vision, performance_tier, input_cost_per_million_tokens, output_cost_per_million_tokens, qualification_state, qualification_expires_at, currency, last_probe_healthy_at) VALUES \
+         ('openai',   'gpt-vision-heavy', true, false, true,  'heavy',  2.0, 2.0, 'qualified', now() + interval '30 days', 'USD', now()), \
+         ('google',   'gemini-vision',    true, false, true,  'medium', 0.5, 0.5, 'qualified', now() + interval '30 days', 'USD', now()), \
+         ('deepseek', 'deepseek-cieco',   true, false, false, 'medium', 0.1, 0.1, 'qualified', now() + interval '30 days', 'USD', now())",
     )
     .execute(&pool)
     .await

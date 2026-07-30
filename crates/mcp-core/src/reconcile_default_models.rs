@@ -132,23 +132,16 @@ mod tests {
     /// "riparava" un default puntandolo a un modello non qualificato o preview —
     /// un guasto silenzioso e duraturo, scritto dal meccanismo che ne ripara un
     /// altro.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn il_default_non_viene_riparato_verso_un_modello_non_qualificato(pool: PgPool) {
-        crate::test_support::create_ai_price_catalog_table(&pool).await;
-        sqlx::query(
-            "CREATE TABLE nexus_provider_default_model (
-                 provider TEXT PRIMARY KEY, model_id TEXT NOT NULL)",
-        )
-        .execute(&pool)
-        .await
-        .expect("tabella default");
-        sqlx::query(
-            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL,
-                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now())",
-        )
-        .execute(&pool)
-        .await
-        .expect("settings");
+        // Schema REALE (regola O): `ai_price_catalog`, `nexus_provider_default_model`
+        // e `settings` arrivano dalla migrazione (mig 0101/0002). Il DELETE isola
+        // il test dal catalog reale senza sostituire lo schema; il provider 'p' e'
+        // fittizio e non collide con le righe reali di `nexus_provider_default_model`.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         // Il default punta a un modello MORTO: va riparato.
         sqlx::query(
             "INSERT INTO nexus_provider_default_model (provider, model_id) VALUES ('p', 'morto')",
@@ -162,10 +155,11 @@ mod tests {
             "INSERT INTO ai_price_catalog \
              (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
               qualification_state, qualification_expires_at, is_featured, \
-              input_cost_per_million_tokens) VALUES \
-             ('p', 'morto',           false, true, 'none', 'qualified',   now() + interval '30 days', false, 1.0), \
-             ('p', 'non-qualificato', true,  true, 'none', 'unqualified', NULL, true,  0.1), \
-             ('p', 'qualificato',     true,  true, 'none', 'qualified',   now() + interval '30 days', false, 5.0)",
+              input_cost_per_million_tokens, output_cost_per_million_tokens, currency, \
+              last_probe_healthy_at) VALUES \
+             ('p', 'morto',           false, true, 'none', 'qualified',   now() + interval '30 days', false, 1.0, 1.0, 'USD', now()), \
+             ('p', 'non-qualificato', true,  true, 'none', 'unqualified', NULL, true,  0.1, 0.1, 'USD', now()), \
+             ('p', 'qualificato',     true,  true, 'none', 'qualified',   now() + interval '30 days', false, 5.0, 5.0, 'USD', now())",
         )
         .execute(&pool)
         .await

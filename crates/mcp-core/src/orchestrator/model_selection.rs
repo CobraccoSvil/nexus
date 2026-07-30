@@ -674,31 +674,20 @@ pub(crate) async fn shadow_compare_per_intent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Schema `ai_price_catalog` dal punto unico condiviso (regola L).
-    use crate::test_support::create_ai_price_catalog_table;
 
+    /// Schema REALE (regola O): `nexus_intent_routing_requirements` arriva dalla
+    /// migrazione (mig 0174), gia' seminata con la riga sentinella `('*','*',
+    /// 0.35, 0.25, 0.20, 0.20, 'asc')` (mig 0379). Il DELETE isola i test dai
+    /// requirement di produzione — incluso il caso "sentinella assente", che con
+    /// lo schema reale altrimenti non sarebbe mai riproducibile.
     async fn create_requirements_table(pool: &sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_intent_routing_requirements ( \
-                 intent TEXT NOT NULL, \
-                 behavior_mode TEXT NOT NULL, \
-                 required_capabilities TEXT[] NOT NULL DEFAULT '{}', \
-                 requires_tool_use BOOLEAN NOT NULL DEFAULT false, \
-                 preferred_tier TEXT NOT NULL DEFAULT 'medium', \
-                 weight_tier REAL NOT NULL DEFAULT 0.35, \
-                 weight_cost REAL NOT NULL DEFAULT 0.25, \
-                 weight_context REAL NOT NULL DEFAULT 0.20, \
-                 weight_capabilities REAL NOT NULL DEFAULT 0.20, \
-                 cost_direction TEXT NOT NULL DEFAULT 'asc', \
-                 PRIMARY KEY (intent, behavior_mode) \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create table requirements");
+        sqlx::query("DELETE FROM nexus_intent_routing_requirements")
+            .execute(pool)
+            .await
+            .expect("pulizia requirements");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn fetch_default_weights_legge_riga_sentinella(pool: sqlx::PgPool) {
         create_requirements_table(&pool).await;
         sqlx::query(
@@ -716,7 +705,7 @@ mod tests {
         assert!((w.capabilities - 0.15).abs() < 1e-6);
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn fetch_default_weights_err_se_sentinella_assente(pool: sqlx::PgPool) {
         create_requirements_table(&pool).await;
         // Solo righe per intent reali, nessuna sentinella '*'.
@@ -733,15 +722,19 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn tierchain_agentico_sceglie_tool_capable_piu_economico(pool: sqlx::PgPool) {
-        create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): il DELETE isola dal catalog di produzione.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         sqlx::query(
             "INSERT INTO ai_price_catalog \
-             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens) VALUES \
-             ('mistral', 'caro', true, 'none', 'heavy', 10.0), \
-             ('openai', 'economico', true, 'none', 'heavy', 2.0), \
-             ('google', 'no-tool', false, 'none', 'heavy', 0.5)",
+             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('mistral', 'caro', true, 'none', 'heavy', 10.0, 10.0, 'USD', now()), \
+             ('openai', 'economico', true, 'none', 'heavy', 2.0, 2.0, 'USD', now()), \
+             ('google', 'no-tool', false, 'none', 'heavy', 0.5, 0.5, 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -784,14 +777,18 @@ mod tests {
     /// precedente (nessuna regressione per i chiamanti storici). Discriminante:
     /// senza pin vince il piu' economico (mistral); col pin='openai' vince openai
     /// anche se piu' caro (il pin e' preferenza-forte tier-aware).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn tierchain_only_provider_restringe_e_none_invariato(pool: sqlx::PgPool) {
-        create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): il DELETE isola dal catalog di produzione.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         sqlx::query(
             "INSERT INTO ai_price_catalog \
-             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens) VALUES \
-             ('mistral', 'm-economico', true, 'none', 'heavy', 2.0), \
-             ('openai', 'o-caro', true, 'none', 'heavy', 10.0)",
+             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('mistral', 'm-economico', true, 'none', 'heavy', 2.0, 2.0, 'USD', now()), \
+             ('openai', 'o-caro', true, 'none', 'heavy', 10.0, 10.0, 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -873,16 +870,20 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn tierchain_preferisce_policy_none_su_dual_mode(pool: sqlx::PgPool) {
-        create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): il DELETE isola dal catalog di produzione.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         // Stesso costo: il TIE-BREAKER (policy='none' DESC, ultimo criterio dopo
         // order_by) fa vincere il nativamente non-thinking A PARITA' di order_by.
         sqlx::query(
             "INSERT INTO ai_price_catalog \
-             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens) VALUES \
-             ('a', 'dual', true, 'disable_for_tools', 'heavy', 1.0), \
-             ('b', 'nativo', true, 'none', 'heavy', 1.0)",
+             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('a', 'dual', true, 'disable_for_tools', 'heavy', 1.0, 1.0, 'USD', now()), \
+             ('b', 'nativo', true, 'none', 'heavy', 1.0, 1.0, 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -919,9 +920,13 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn tierchain_capacita_costo_vince_sul_tiebreaker_thinking(pool: sqlx::PgPool) {
-        create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): il DELETE isola dal catalog di produzione.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         // REGRESSIONE (fix routing agentico, regola H): con i modelli forti moderni
         // tutti dual-mode ('disable_for_tools') e i 'none' rimasti deboli/legacy, il
         // criterio PRIMARIO deve essere order_by (qui: costo), NON la policy thinking.
@@ -930,9 +935,9 @@ mod tests {
         // avrebbe vinto 'debole' (causa radice di "agentic usa deepseek-coder").
         sqlx::query(
             "INSERT INTO ai_price_catalog \
-             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens) VALUES \
-             ('a', 'forte', true, 'disable_for_tools', 'medium', 0.14), \
-             ('b', 'debole', true, 'none', 'medium', 1.0)",
+             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('a', 'forte', true, 'disable_for_tools', 'medium', 0.14, 0.14, 'USD', now()), \
+             ('b', 'debole', true, 'none', 'medium', 1.0, 1.0, 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -969,13 +974,17 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn tierchain_esclude_policy_exclude_quando_richiesto(pool: sqlx::PgPool) {
-        create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): il DELETE isola dal catalog di produzione.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         sqlx::query(
             "INSERT INTO ai_price_catalog \
-             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier) VALUES \
-             ('a', 'escluso', true, 'exclude', 'heavy')",
+             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('a', 'escluso', true, 'exclude', 'heavy', 1.0, 1.0, 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -1008,14 +1017,18 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn tierchain_degrada_al_tier_successivo(pool: sqlx::PgPool) {
-        create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): il DELETE isola dal catalog di produzione.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         // Nessun heavy: la chain deve scendere a medium.
         sqlx::query(
             "INSERT INTO ai_price_catalog \
-             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier) VALUES \
-             ('a', 'medio', true, 'none', 'medium')",
+             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('a', 'medio', true, 'none', 'medium', 1.0, 1.0, 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -1052,14 +1065,18 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn tierchain_vision_via_supports_vision(pool: sqlx::PgPool) {
-        create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): il DELETE isola dal catalog di produzione.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         sqlx::query(
             "INSERT INTO ai_price_catalog \
-             (provider, model, supports_tool_use, supports_vision, performance_tier) VALUES \
-             ('a', 'no-vision', false, false, 'medium'), \
-             ('b', 'vision', false, true, 'medium')",
+             (provider, model, supports_tool_use, supports_vision, performance_tier, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('a', 'no-vision', false, false, 'medium', 1.0, 1.0, 'USD', now()), \
+             ('b', 'vision', false, true, 'medium', 1.0, 1.0, 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -1097,16 +1114,20 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn tierchain_capability_none_esclude_media(pool: sqlx::PgPool) {
-        create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): il DELETE isola dal catalog di produzione.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         // Un image-gen tool-capable (assurdo, ma testa che l'esclusione media
         // scatti a prescindere) NON deve entrare nel routing chat (capability=None).
         sqlx::query(
             "INSERT INTO ai_price_catalog \
-             (provider, model, supports_tool_use, supports_image_gen, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens) VALUES \
-             ('openai', 'dall-e-3', true, true, 'none', 'medium', 0.1), \
-             ('openai', 'gpt-4o', true, false, 'none', 'medium', 1.0)",
+             (provider, model, supports_tool_use, supports_image_gen, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('openai', 'dall-e-3', true, true, 'none', 'medium', 0.1, 0.1, 'USD', now()), \
+             ('openai', 'gpt-4o', true, false, 'none', 'medium', 1.0, 1.0, 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -1144,14 +1165,18 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn tierchain_image_gen_via_supports_image_gen(pool: sqlx::PgPool) {
-        create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): il DELETE isola dal catalog di produzione.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         sqlx::query(
             "INSERT INTO ai_price_catalog \
-             (provider, model, supports_tool_use, supports_image_gen, performance_tier) VALUES \
-             ('openai', 'gpt-4o', false, false, 'light'), \
-             ('openai', 'gpt-image-1', false, true, 'light')",
+             (provider, model, supports_tool_use, supports_image_gen, performance_tier, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('openai', 'gpt-4o', false, false, 'light', 1.0, 1.0, 'USD', now()), \
+             ('openai', 'gpt-image-1', false, true, 'light', 1.0, 1.0, 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -1254,15 +1279,20 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn gate_qualificazione_esclude_i_non_provati_e_gli_scaduti(pool: sqlx::PgPool) {
-        create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): il DELETE isola dal catalog di produzione. Il
+        // gate qui e' INIETTATO da `gate_filter`, non letto da `settings`.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         sqlx::query(
             "INSERT INTO ai_price_catalog \
-             (provider, model, input_cost_per_million_tokens, qualification_state, qualification_expires_at) VALUES \
-             ('a', 'dichiarato-mai-provato', 1.0, 'unqualified', NULL), \
-             ('b', 'provato-ma-scaduto',     2.0, 'qualified',   NOW() - interval '1 hour'), \
-             ('c', 'provato-valido',         3.0, 'qualified',   NOW() + interval '1 day')",
+             (provider, model, input_cost_per_million_tokens, output_cost_per_million_tokens, qualification_state, qualification_expires_at, currency, last_probe_healthy_at) VALUES \
+             ('a', 'dichiarato-mai-provato', 1.0, 1.0, 'unqualified', NULL, 'USD', now()), \
+             ('b', 'provato-ma-scaduto',     2.0, 2.0, 'qualified',   NOW() - interval '1 hour', 'USD', now()), \
+             ('c', 'provato-valido',         3.0, 3.0, 'qualified',   NOW() + interval '1 day', 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -1297,16 +1327,20 @@ mod tests {
         assert_eq!(out.len(), 3, "gate spento = comportamento storico");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn gate_capability_verificata_sul_provato_non_sul_dichiarato(pool: sqlx::PgPool) {
-        create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): il DELETE isola dal catalog di produzione.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         // 'millantatore' DICHIARA reasoning ma il qualificatore non gliel'ha
         // provato; 'provato' ce l'ha in qualified_capabilities.
         sqlx::query(
             "INSERT INTO ai_price_catalog \
-             (provider, model, input_cost_per_million_tokens, capabilities, qualification_state, qualified_capabilities) VALUES \
-             ('a', 'millantatore', 1.0, '[\"chat\",\"reasoning\"]', 'qualified', '[]'), \
-             ('b', 'provato',      2.0, '[\"chat\",\"reasoning\"]', 'qualified', '[\"chat\",\"reasoning\"]')",
+             (provider, model, input_cost_per_million_tokens, output_cost_per_million_tokens, capabilities, qualification_state, qualified_capabilities, currency, last_probe_healthy_at) VALUES \
+             ('a', 'millantatore', 1.0, 1.0, '[\"chat\",\"reasoning\"]', 'qualified', '[]', 'USD', now()), \
+             ('b', 'provato',      2.0, 2.0, '[\"chat\",\"reasoning\"]', 'qualified', '[\"chat\",\"reasoning\"]', 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -1414,17 +1448,21 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn exclude_preview_taglia_i_pre_ga_ma_non_i_ga(pool: sqlx::PgPool) {
-        create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): il DELETE isola dal catalog di produzione.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         sqlx::query(
-            "INSERT INTO ai_price_catalog (provider, model, input_cost_per_million_tokens) VALUES \
-             ('g', 'gemini-3.1-pro-preview',  1.0), \
-             ('g', 'gemini-2.0-flash-exp',    1.1), \
-             ('g', 'gemini-exp-1206',         1.2), \
-             ('x', 'modello-experimental',    1.3), \
-             ('g', 'gemini-2.5-flash',        2.0), \
-             ('m', 'model-express',           3.0)",
+            "INSERT INTO ai_price_catalog (provider, model, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('g', 'gemini-3.1-pro-preview',  1.0, 1.0, 'USD', now()), \
+             ('g', 'gemini-2.0-flash-exp',    1.1, 1.1, 'USD', now()), \
+             ('g', 'gemini-exp-1206',         1.2, 1.2, 'USD', now()), \
+             ('x', 'modello-experimental',    1.3, 1.3, 'USD', now()), \
+             ('g', 'gemini-2.5-flash',        2.0, 2.0, 'USD', now()), \
+             ('m', 'model-express',           3.0, 3.0, 'USD', now())",
         )
         .execute(&pool)
         .await
@@ -1506,12 +1544,17 @@ mod tests {
     /// L'ordinamento REALE sul catalog: il difetto misurato il 15/07 era che
     /// l'escalation "sali al modello piu' capace" sceglieva un heavy scartando i
     /// frontier. Con l'espressione generata il primo e' il frontier.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn ordinare_col_rank_generato_mette_il_frontier_in_testa(pool: sqlx::PgPool) {
         use nexus_agent_graph::decisions::tiers::tier_rank_sql;
-        create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): il DELETE isola dal catalog di produzione —
+        // essenziale qui, l'assert confronta l'ORDINE ESATTO di tutte le righe.
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         sqlx::query(
-            "INSERT INTO ai_price_catalog (provider, model, performance_tier) VALUES              ('openai', 'gpt-frontier', 'frontier'),              ('openai', 'gpt-heavy', 'heavy'),              ('mistral', 'mistral-medium', 'medium'),              ('openai', 'gpt-high', 'high'),              ('openai', 'gpt-light', 'light')",
+            "INSERT INTO ai_price_catalog (provider, model, performance_tier, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES              ('openai', 'gpt-frontier', 'frontier', 1.0, 1.0, 'USD', now()),              ('openai', 'gpt-heavy', 'heavy', 1.0, 1.0, 'USD', now()),              ('mistral', 'mistral-medium', 'medium', 1.0, 1.0, 'USD', now()),              ('openai', 'gpt-high', 'high', 1.0, 1.0, 'USD', now()),              ('openai', 'gpt-light', 'light', 1.0, 1.0, 'USD', now())",
         )
         .execute(&pool)
         .await

@@ -1493,11 +1493,17 @@ mod tests {
     ///
     /// Il gate va applicato dalla STESSA sorgente del routing live
     /// (`qualification_gate`), non da una seconda copia di regole.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn load_catalog_applica_il_gate_di_qualificazione(pool: sqlx::PgPool) {
-        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        // Schema REALE (regola O): niente specchio a mano. Il catalog arriva
+        // dalla migrazione gia' popolato dai modelli reali; il DELETE isola il
+        // test dal loro rumore senza toccare lo schema (colonne/CHECK/FK veri).
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
         sqlx::query(
-            "INSERT INTO ai_price_catalog              (provider, model, is_enabled, supports_tool_use, performance_tier,               capabilities, qualification_state, qualification_expires_at,               input_cost_per_million_tokens, auto_disabled_reason) VALUES              ('p', 'qualificato',      true, true, 'medium', '[\"code\"]'::jsonb, 'qualified',   now() + interval '30 days', 1.0, NULL),              ('p', 'non-qualificato',  true, true, 'medium', '[\"code\"]'::jsonb, 'unqualified', NULL, 0.1, NULL),              ('p', 'scaduto',          true, true, 'medium', '[\"code\"]'::jsonb, 'qualified',   now() - interval '1 day', 0.1, NULL),              ('p', 'gemini-preview',   true, true, 'medium', '[\"code\"]'::jsonb, 'qualified',   now() + interval '30 days', 0.1, NULL),              ('p', 'morto-404',        true, true, 'medium', '[\"code\"]'::jsonb, 'qualified',   now() + interval '30 days', 0.1, 'invalid_model: 404')",
+            "INSERT INTO ai_price_catalog              (provider, model, is_enabled, supports_tool_use, performance_tier,               capabilities, qualification_state, qualification_expires_at,               input_cost_per_million_tokens, output_cost_per_million_tokens, auto_disabled_reason, currency, last_probe_healthy_at) VALUES              ('p', 'qualificato',      true, true, 'medium', '[\"code\"]'::jsonb, 'qualified',   now() + interval '30 days', 1.0, 1.0, NULL, 'USD', now()),              ('p', 'non-qualificato',  true, true, 'medium', '[\"code\"]'::jsonb, 'unqualified', NULL, 0.1, 0.1, NULL, 'USD', now()),              ('p', 'scaduto',          true, true, 'medium', '[\"code\"]'::jsonb, 'qualified',   now() - interval '1 day', 0.1, 0.1, NULL, 'USD', now()),              ('p', 'gemini-preview',   true, true, 'medium', '[\"code\"]'::jsonb, 'qualified',   now() + interval '30 days', 0.1, 0.1, NULL, 'USD', now()),              ('p', 'morto-404',        true, true, 'medium', '[\"code\"]'::jsonb, 'qualified',   now() + interval '30 days', 0.1, 0.1, 'invalid_model: 404', 'USD', now())",
         )
         .execute(&pool)
         .await
