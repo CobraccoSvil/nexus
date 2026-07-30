@@ -2412,13 +2412,46 @@ async fn build_native_engine(
     // da `agent.context.rolling_summary_model`, regola G).
     let summary_store: Arc<dyn SummaryStore> = Arc::new(PgSummaryStore::new(db.clone()));
 
+    // Progetto della sessione: serve al final_gate DUE volte — per gli endpoint
+    // configurati (nel loader) e per il profilo di verifica. Una sola
+    // risoluzione (punto unico `resolve_session_project_root`), condivisa. NON
+    // e' la fonte della radice del criterio `file_exists` (sotto): quella colonna
+    // (`projects.repository_root_path`) e' un'ANAGRAFICA, mai riscritta da un
+    // "port" del progetto — divergente dalla root REALE su cui i tool scrivono.
+    let session_project = resolve_session_project_root(&run_db, &db, input.session_id).await;
+
     // Motore criteri del final_gate / verifier: delega al tool_executor (punto
-    // unico, regola L) per i criteri run_command/list_files + DB per outputs_exist.
+    // unico, regola L) per i criteri run_command + DB per outputs_exist.
     // Il tipo CONCRETO resta visibile per la misura baseline pre-lavoro
     // (measure_command_exit non fa parte del trait CriteriaRunner).
+    //
+    // La radice e' quella su cui il run LAVORA, risolta con lo STESSO punto
+    // unico del ctx REALE dei tool (`ToolRunnerService::resolve_session` ->
+    // `resolve_ctx_root`): `COALESCE(repositories.root_path,
+    // workspaces.absolute_path)`, non `projects.repository_root_path`. Le due
+    // query divergono dopo un port del progetto (la prima segue il port, la
+    // seconda no); usare la seconda darebbe al criterio un'idea dell'albero
+    // diversa da quella con cui il run ha scritto — misurerebbe con sicurezza
+    // un albero che non e' quello vero (regola O).
+    let criteria_root = match crate::tool_runner_server::ToolRunnerService::new(
+        deps.tool_runner_deps.clone(),
+    )
+    .resolve_session(input.session_id)
+    .await
+    {
+        Ok(info) => Some(
+            crate::tool_runner_server::resolve_ctx_root(info.root_path, input.working_root.as_deref())
+                .0,
+        ),
+        // Sessione non risolvibile (nessun progetto, o DB non raggiungibile):
+        // il criterio lo DICHIARA (`EsistenzaFile::NonInterrogabile`), non
+        // finge una radice.
+        Err(_) => None,
+    };
     let criteria_adapter = Arc::new(FinalGateCriteriaRunnerAdapter::new(
         tools.clone(),
         run_db.clone(),
+        criteria_root,
     ));
     let criteria: Arc<dyn CriteriaRunner> = criteria_adapter.clone();
 
@@ -2452,12 +2485,6 @@ async fn build_native_engine(
     // safe-default se la chiave manca (identico ai `_SAFE_DEFAULTS` del brain): mai
     // come magic fallback (regola G).
     let planner_cfg = load_planner_config(&db).await;
-    // Progetto della sessione: serve al final_gate DUE volte — per gli endpoint
-    // configurati (nel loader) e per il profilo di verifica (subito sotto). Una
-    // sola risoluzione (punto unico `resolve_session_project_root`), passata a
-    // entrambi: il loader deve poter costruire il criterio HTTP, e per farlo deve
-    // sapere DI QUALE progetto sta caricando la config.
-    let session_project = resolve_session_project_root(&run_db, &db, input.session_id).await;
     let mut final_gate_cfg =
         load_final_gate_config(&db, session_project.as_ref().map(|(pid, _)| *pid)).await;
     let review_gate_cfg = load_review_gate_config(&db).await;
@@ -5178,6 +5205,8 @@ mod tests {
                 eseguiti: eseguiti.clone(),
             }),
             pool.clone(),
+            // Il test misura le esecuzioni di comando, non l'esistenza di file.
+            None,
         ));
         // Root UNICA per questo test: la chiave di TREE_LOCKS e' globale al
         // processo e i test girano in parallelo (nessun albero viene toccato:
@@ -5262,6 +5291,8 @@ mod tests {
                 eseguiti: eseguiti.clone(),
             }),
             pool.clone(),
+            // Il test misura le esecuzioni di comando, non l'esistenza di file.
+            None,
         );
         let mut steps: Vec<crate::verify_profile::VerifyProfileStep> = Vec::new();
         measure_gate_steps(

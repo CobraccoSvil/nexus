@@ -275,45 +275,22 @@ pub fn http_probes_in_history(messages: &[Message]) -> usize {
 // ──────────────────────────────────────────────────────────────────────────
 //  Detector strutturali su lista messaggi (anti-loop dell'executor)
 //
-//  Porting 1:1 di `helpers.py`. Tutti PURI su `&[Message]`: scansionano i
-//  blocchi tool_use/tool_result. Usano segnali STRUTTURALI (exit_code/is_error)
-//  con fallback lessicale [`TOOL_ERROR_HINTS`], come il Python. Punto unico
-//  (regola L) della domanda "questo tool_use e' riuscito?" -> [`tool_result_outcome_after`].
+//  Tutti PURI su `&[Message]`: scansionano i blocchi tool_use/tool_result.
+//  Leggono SOLO segnali strutturati (exit_code/is_error) e il contratto macchina
+//  che i tool usano per dichiarare il proprio fallimento
+//  ([`nexus_types::tool_outcome`]). Punto unico (regola L) della domanda
+//  "questo tool_use e' riuscito?" -> [`tool_result_outcome_after`].
+//
+//  Qui viveva `TOOL_ERROR_HINTS`: 28 frasi ("timeout", "not found", "error:",
+//  perfino "is_error") cercate nel PAYLOAD del risultato. Il ramo si prendeva
+//  ogni volta che il tool non era un comando, e l'`is_error` letto due righe
+//  sopra veniva ignorato sul ramo negativo — mancava il `return Some(false)`.
+//  Un `read_file` RIUSCITO su un sorgente che contiene la parola "timeout"
+//  contava come tool fallito: falso loop, run abortito, scale-down bloccato.
+//  Il vocabolario e' stato TOLTO, non spostato nel DB: parametrizzarlo avrebbe
+//  dato dignita' di configurazione a una premessa sbagliata, cioe' che l'esito
+//  di una chiamata si legga nella prosa del suo risultato (regola M).
 // ──────────────────────────────────────────────────────────────────────────
-
-/// Pattern testuali che indicano errore in un tool_result (`_TOOL_ERROR_HINTS`
-/// Python, 1:1). Match case-insensitive. SOLO fallback lessicale: i segnali
-/// strutturali (exit_code/is_error) hanno priorita'.
-pub const TOOL_ERROR_HINTS: &[&str] = &[
-    "error:",
-    "errore:",
-    "[error",
-    "exit code: 1",
-    "exit code 1",
-    "command failed",
-    "comando fallito",
-    "traceback",
-    "exception:",
-    "fatal:",
-    "syntax error",
-    "not found",
-    "non trovato",
-    "cannot find module",
-    "module not found",
-    "permission denied",
-    "connection refused",
-    "timed out",
-    "timeout",
-    "404 not found",
-    "500 internal",
-    "econnrefused",
-    "enoent",
-    "enotfound",
-    "eperm",
-    "no such file",
-    "is_error",
-    "[errno",
-];
 
 /// Nome del tool di allocazione porte (`_PORT_REQUEST_TOOL` Python: "request_port").
 const PORT_REQUEST_TOOL: &str = "request_port";
@@ -321,12 +298,6 @@ const PORT_REQUEST_TOOL: &str = "request_port";
 /// Tool che, se presenti nella history recente, indicano risorse gia' attive
 /// note al run (`_resource_tools` Python).
 const RESOURCE_TOOLS: &[&str] = &[PORT_REQUEST_TOOL, "list_active_services", "service_restart"];
-
-/// True se uno degli hint lessicali compare nel testo (case-insensitive).
-fn text_has_error_hint(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    TOOL_ERROR_HINTS.iter().any(|h| lower.contains(h))
-}
 
 /// Estrae i tool_use `(name, input)` di un singolo [`Message::Ai`], guardando
 /// ENTRAMBE le forme: `tool_calls` (OpenAI-compat) e `ContentBlock::ToolUse`
@@ -355,109 +326,84 @@ pub fn message_tool_uses(m: &Message) -> Vec<(&str, &Value)> {
     out
 }
 
-/// Esito strutturato di un campo `content` di tool_result (stringa o struttura).
-/// Replica il fallback lessicale Python sul testo del risultato.
-fn content_value_has_error(content: &Value) -> bool {
-    match content {
-        Value::String(s) => text_has_error_hint(s),
-        Value::Array(arr) => arr.iter().any(|cc| {
-            if let Value::Object(map) = cc {
-                let txt = map
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .or_else(|| map.get("content").and_then(Value::as_str))
-                    .unwrap_or("");
-                text_has_error_hint(txt)
-            } else {
-                false
-            }
-        }),
-        other => text_has_error_hint(&other.to_string()),
-    }
-}
-
 /// Valuta l'esito di UN messaggio se e' un tool_result: `Some(true)`=errore,
 /// `Some(false)`=successo, `None`=non e' un tool_result valutabile.
 ///
 /// Gestisce ENTRAMBE le forme: [`Message::Tool`] (== `ToolMessage` langchain) e
 /// i blocchi [`ContentBlock::ToolResult`] in un qualsiasi messaggio (==
-/// `HumanMessage`+anthropic_content Python). Gerarchia dei segnali (contratto A):
+/// `HumanMessage`+anthropic_content Python). Gerarchia dei segnali:
 ///   1. `exit_code` STRUTTURATO (tool-comando): 0=successo, !=0=errore;
-///   2. `is_error` STRUTTURATO del blocco/messaggio tool;
-///   3. fallback lessicale [`TOOL_ERROR_HINTS`] sul testo.
-/// Il `status` del `ToolMessage` Python (`status == "error"`) non esiste nel
-/// modello Rust: e' coperto dal blocco `is_error`/lessicale equivalente.
-fn message_tool_result_outcome(m: &Message) -> Option<bool> {
-    match m {
-        // ToolMessage langchain: il content puo' essere testo o blocchi.
-        Message::Tool { content, .. } => {
-            match content {
-                MessageContent::Text(s) => Some(text_has_error_hint(s)),
-                MessageContent::Blocks(blocks) => {
-                    // Cerca un blocco con segnale strutturale; poi lessicale.
-                    for b in blocks {
-                        if let ContentBlock::ToolResult {
-                            is_error,
-                            exit_code,
-                            content,
-                            ..
-                        } = b
-                        {
-                            if let Some(ec) = exit_code {
-                                return Some(*ec != 0);
-                            }
-                            if *is_error {
-                                return Some(true);
-                            }
-                            if content_value_has_error(content) {
-                                return Some(true);
-                            }
-                        }
-                    }
-                    // Nessun blocco tool_result strutturato: fallback su testo piatto.
-                    Some(blocks.iter().any(
-                        |b| matches!(b, ContentBlock::Text { text } if text_has_error_hint(text)),
-                    ))
-                }
+///   2. `is_error` STRUTTURATO del blocco/messaggio tool.
+///
+/// Entrambi arrivano dal confine del dispatch, dove l'esito e' gia' strutturato.
+/// Se il blocco c'e' e nessuno dei due dice "errore", il tool e' RIUSCITO: prima
+/// mancava questo `Some(false)` e si scendeva a cercare 28 frasi nel testo del
+/// risultato, cosicche' un file letto correttamente poteva dichiarare fallita la
+/// lettura per una parola contenuta nel proprio codice.
+///
+/// Sul solo ramo senza blocco strutturato (un `ToolMessage` di testo piatto) si
+/// legge il CONTRATTO con cui i tool dichiarano il fallimento
+/// ([`nexus_types::tool_outcome::is_tool_failure`]): e' un marker macchina che
+/// il produttore scrive apposta, non una parola pescata nella prosa.
+///
+/// PUNTO UNICO (regola L) della domanda "questo messaggio porta un tool_result
+/// fallito?". Pubblica perche' la pone anche il rilevatore di anomalie del
+/// supervisore, che prima la risolveva per conto proprio e sul canale sbagliato.
+pub fn message_tool_result_outcome(m: &Message) -> Option<bool> {
+    /// Esito di un blocco `ToolResult` dai suoi soli campi strutturati.
+    fn esito_blocco(is_error: bool, exit_code: Option<i64>) -> bool {
+        match exit_code {
+            // Il tool-comando ha dichiarato il proprio exit code: e' il segnale
+            // primario, e un exit 0 vale successo anche se `is_error` non e'
+            // stato popolato dal costruttore del blocco.
+            Some(ec) => ec != 0,
+            None => is_error,
+        }
+    }
+    /// Esito dei blocchi `ToolResult` presenti: `Some(true)` se ALMENO UNO
+    /// dichiara un fallimento, `Some(false)` se ce n'e' almeno uno e nessuno lo
+    /// dichiara, `None` se non ce ne sono. Un messaggio puo' portare i risultati
+    /// di piu' tool eseguiti in parallelo, e la domanda a cui questo modulo
+    /// risponde ("il tool_use qui sopra e' riuscito?") non discrimina per id:
+    /// l'aggregazione prudente e' quella storica.
+    fn esito_dei_blocchi(blocks: &[ContentBlock]) -> Option<bool> {
+        let mut trovato = false;
+        let mut fallito = false;
+        for b in blocks {
+            if let ContentBlock::ToolResult {
+                is_error,
+                exit_code,
+                ..
+            } = b
+            {
+                trovato = true;
+                fallito |= esito_blocco(*is_error, *exit_code);
             }
         }
+        trovato.then_some(fallito)
+    }
+    match m {
+        // ToolMessage langchain: il content puo' essere testo o blocchi.
+        Message::Tool { content, .. } => match content {
+            MessageContent::Text(s) => Some(nexus_types::tool_outcome::is_tool_failure(s)),
+            MessageContent::Blocks(blocks) => esito_dei_blocchi(blocks).or_else(|| {
+                // Nessun blocco tool_result: resta il testo, e su quello vale il
+                // contratto con cui i tool dichiarano il fallimento.
+                Some(blocks.iter().any(|b| {
+                    matches!(b, ContentBlock::Text { text }
+                        if nexus_types::tool_outcome::is_tool_failure(text))
+                }))
+            }),
+        },
         // anthropic_content tool_result in un HumanMessage (tool_dispatch_node
         // emette il tool_result come HumanMessage; gli AIMessage portano i
         // tool_use, mai i tool_result -> non valutati, come in Python).
-        Message::Human { content } => {
-            let MessageContent::Blocks(blocks) = content else {
-                return None;
-            };
-            let mut found_result = false;
-            for b in blocks {
-                if let ContentBlock::ToolResult {
-                    is_error,
-                    exit_code,
-                    content,
-                    ..
-                } = b
-                {
-                    found_result = true;
-                    // 1) exit_code strutturato.
-                    if let Some(ec) = exit_code {
-                        return Some(*ec != 0);
-                    }
-                    // 2) is_error strutturato.
-                    if *is_error {
-                        return Some(true);
-                    }
-                    // 3) fallback lessicale sul testo.
-                    if content_value_has_error(content) {
-                        return Some(true);
-                    }
-                }
-            }
-            if found_result {
-                Some(false)
-            } else {
-                None
-            }
-        }
+        Message::Human { content } => match content {
+            MessageContent::Blocks(blocks) => esito_dei_blocchi(blocks),
+            // Testo piatto in un HumanMessage: e' il canale su cui viaggiano i
+            // nudge dell'executor e i promemoria di sistema, non un esito.
+            MessageContent::Text(_) => None,
+        },
         // AIMessage: porta tool_use, mai tool_result -> non e' un risultato.
         Message::Ai { .. } => None,
     }
@@ -779,7 +725,8 @@ pub fn has_active_resources_in_history(messages: &[Message], lookback: usize) ->
 /// True se uno degli ultimi `lookback` tool message (default 4) indica errore.
 /// Vedi `_detect_recent_tool_error`: scansiona in ordine INVERSO i soli
 /// [`Message::Tool`] (== `ToolMessage`), si ferma dopo `lookback` di essi, e
-/// segnala errore su `is_error` strutturato o hint lessicale.
+/// segnala errore sul segnale strutturato del blocco, o sul contratto di
+/// dichiarazione ([`nexus_types::tool_outcome`]) quando il content e' testo piatto.
 pub fn detect_recent_tool_error(messages: &[Message], lookback: usize) -> bool {
     let mut checked = 0usize;
     for m in messages.iter().rev() {
@@ -1707,18 +1654,41 @@ mod tests {
     }
 
     #[test]
-    fn outcome_after_lessicale_fallback() {
-        // Niente exit_code/is_error: fallback su _TOOL_ERROR_HINTS.
+    fn outcome_after_is_error_strutturato_vince_sul_testo() {
+        // Niente exit_code, is_error=false STRUTTURATO: successo, anche se il
+        // testo del risultato contiene parole della vecchia lista di hint
+        // lessicali ("not found", "timeout", "error"). E' esattamente il difetto
+        // corretto: un read_file riuscito che restituisce un sorgente con la
+        // parola "timeout" NON deve contare come tool fallito (regola M).
         let msgs = vec![
-            ai_tool_input("run_command", json!({"command": "x"})),
-            human_tool_result(None, false, "bash: command not found"),
+            ai_tool_input("read_file", json!({"path": "retry.rs"})),
+            human_tool_result(
+                None,
+                false,
+                "fn handle_timeout() { /* not found in cache: error path */ }",
+            ),
         ];
-        assert_eq!(tool_result_outcome_after(&msgs, 0, 3), Some(true));
-        let msgs_ok = vec![
+        assert_eq!(tool_result_outcome_after(&msgs, 0, 3), Some(false));
+        // is_error=true STRUTTURATO: errore, anche con un content innocuo.
+        let msgs_err = vec![
             ai_tool_input("run_command", json!({"command": "x"})),
-            human_tool_result(None, false, "Compilato con successo"),
+            human_tool_result(None, true, "tutto bene a parole"),
         ];
-        assert_eq!(tool_result_outcome_after(&msgs_ok, 0, 3), Some(false));
+        assert_eq!(tool_result_outcome_after(&msgs_err, 0, 3), Some(true));
+    }
+
+    #[test]
+    fn tool_message_testo_piatto_legge_il_contratto_marker() {
+        // Un ToolMessage (langchain) con content testuale, senza blocchi
+        // strutturati: l'unico segnale disponibile e' il marker di dichiarazione
+        // del fallimento (regola L: punto unico nexus_types::tool_outcome), mai
+        // una parola pescata nel testo.
+        let fallito = tool_msg("\u{274C} directory non leggibile");
+        assert_eq!(message_tool_result_outcome(&fallito), Some(true));
+        // Un tool RIUSCITO che nomina "error"/"not found" nel proprio output
+        // (es. il contenuto di un file letto) non e' un fallimento.
+        let riuscito = tool_msg("grep: 3 matches for \"error: not found\"");
+        assert_eq!(message_tool_result_outcome(&riuscito), Some(false));
     }
 
     #[test]
@@ -1762,13 +1732,17 @@ mod tests {
 
     #[test]
     fn recent_tool_error_solo_tool_message() {
-        // Ultimo ToolMessage con hint -> errore.
+        // Ultimo ToolMessage col marker di fallimento -> errore.
         assert!(detect_recent_tool_error(
-            &[tool_msg("Error: build failed")],
+            &[tool_msg("\u{274C} build failed")],
             4
         ));
-        // ToolMessage pulito -> nessun errore.
-        assert!(!detect_recent_tool_error(&[tool_msg("done ok")], 4));
+        // ToolMessage pulito -> nessun errore, anche se nomina "error" nel testo
+        // (un log riportato, non una dichiarazione di fallimento del TOOL).
+        assert!(!detect_recent_tool_error(
+            &[tool_msg("done ok, 0 error in log")],
+            4
+        ));
     }
 
     #[test]
@@ -1782,13 +1756,16 @@ mod tests {
             tool_msg("done ok"),
         ];
         assert_eq!(tool_error_stats(&all_ok, 40), (0, 3));
-        // Un errore in coda -> error_count 1, streak 0 (l'ultimo e' errore).
-        let last_err = vec![tool_msg("done ok"), tool_msg("Error: build failed")];
+        // Un errore in coda -> error_count 1, streak 0 (l'ultimo e' errore). Il
+        // tool DICHIARA il fallimento col marker (regola L/M): un tool riuscito
+        // che nomina "error" nel proprio output non deve contare (era il difetto
+        // corretto altrove in questo file).
+        let last_err = vec![tool_msg("done ok"), tool_msg("\u{274C} build failed")];
         assert_eq!(tool_error_stats(&last_err, 40), (1, 0));
         // Errore in mezzo, poi due ok in coda -> error_count 1, streak 2 (la streak
         // parte dall'ultimo all'indietro e si ferma al primo errore).
         let mixed = vec![
-            tool_msg("Error: fallito"),
+            tool_msg("\u{274C} fallito"),
             tool_msg("done ok"),
             tool_msg("done ok"),
         ];
@@ -1799,18 +1776,19 @@ mod tests {
     fn repeated_failed_command_stessa_signature() {
         // Stesso comando fallito 2 volte -> rilevato. _detect_repeated_failed_command
         // valuta SOLO i ToolMessage successivi (1:1 col Python, che guarda
-        // isinstance(nm, ToolMessage)), quindi qui usiamo tool_msg.
+        // isinstance(nm, ToolMessage)), quindi qui usiamo tool_msg. Il fallimento
+        // e' il contratto macchina (marker), non la prosa "error: ...".
         let msgs = vec![
             ai_tool_input(
                 "run_command",
                 json!({"command": "npm i", "working_dir": "/p"}),
             ),
-            tool_msg("error: build failed"),
+            tool_msg("\u{274C} build failed"),
             ai_tool_input(
                 "run_command",
                 json!({"command": "npm i", "working_dir": "/p"}),
             ),
-            tool_msg("error: build failed"),
+            tool_msg("\u{274C} build failed"),
         ];
         let (cmd, count) = detect_repeated_failed_command(&msgs, 12);
         assert_eq!(cmd.as_deref(), Some("npm i"));

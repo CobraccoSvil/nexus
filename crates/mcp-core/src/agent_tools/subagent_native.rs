@@ -1,4 +1,4 @@
-﻿//! Orchestrazione NATIVA dei sub-agenti (porting Rust di `/agent/subagent-run`).
+//! Orchestrazione NATIVA dei sub-agenti (porting Rust di `/agent/subagent-run`).
 //!
 //! Verso zero-Python: prima `dispatch_subagent` (in `nexus-agent-tools`) chiamava
 //! l'endpoint REST `POST /agent/subagent-run` del brain Python, che eseguiva un
@@ -4635,7 +4635,7 @@ async fn finalize_failure(
     provider: &str,
     model: &str,
 ) -> Value {
-    let msg = format!("[errore grafo nativo: {e}]");
+    let msg = format!("\u{274C} [Errore grafo nativo: {e}]");
     let verdict = terminal_verdict("failed", "engine_error");
     // Come per il timeout: un errore del grafo non cancella le chiamate gia'
     // fatturate prima del guasto.

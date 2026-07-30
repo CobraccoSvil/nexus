@@ -340,11 +340,13 @@ async fn nudge_comando_fallito_a_tre() {
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = llm_tool_call("read_file", json!({"path": "x"}));
     let ctx = ctx_with(llm.clone());
-    // Stesso comando fallito 3 volte (run_command + tool_msg errore).
+    // Stesso comando fallito 3 volte (run_command + tool_msg errore). Il
+    // fallimento e' il contratto macchina (marker U+274C), non la prosa
+    // "error: ..." (regola M): un ToolMessage testuale lo dichiara cosi'.
     let mut messages = vec![human("builda")];
     for _ in 0..3 {
         messages.push(ai_tool("run_command", json!({"command": "npm run build"})));
-        messages.push(tool_msg_err("error: build failed"));
+        messages.push(tool_msg_err("\u{274C} build failed"));
     }
     let state = AgentState {
         thread_id: Some("r1".into()),
@@ -4179,14 +4181,15 @@ async fn scale_precedenza_stallo_no_scale_reason() {
     let ctx = ctx_with(llm.clone());
     let mut state = state_scale_turn();
     // Ultimo tool_result = errore -> detect_recent_tool_error true -> stall_active.
-    // `Message::Tool` (ToolMessage) con hint errore: e' la forma che
-    // `detect_recent_tool_error` scandisce (filtra i soli Message::Tool).
+    // `Message::Tool` (ToolMessage) col marker di fallimento (regola M: e' il
+    // contratto macchina, non la prosa): e' la forma che `detect_recent_tool_error`
+    // scandisce (filtra i soli Message::Tool).
     state
         .messages
         .push(ai_tool("write_file", json!({"path": "a.rs"})));
     state.messages.push(Message::Tool {
         tool_call_id: "c1".into(),
-        content: MessageContent::text("Error: permission denied"),
+        content: MessageContent::text("\u{274C} permission denied"),
     });
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);

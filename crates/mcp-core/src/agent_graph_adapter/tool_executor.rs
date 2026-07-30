@@ -163,7 +163,7 @@ fn rendered_from_status(status: &tonic::Status) -> RenderedError {
 /// `is_infrastructure=false`: un errore applicativo del tool (marker `\u{274C}`)
 /// NON e' un guasto infra (il ToolRunner ha risposto). L'infra-error e' segnalato
 /// a monte (build_ctx fallita -> `PortError::Tool`, mappato dal chiamante).
-fn map_result_to_outcome(tool_call_id: &str, result: String) -> ToolOutcome {
+pub(crate) fn map_result_to_outcome(tool_call_id: &str, result: String) -> ToolOutcome {
     let is_error = tool_result_is_error(&result);
     let exit_code = extract_exit_code(&result).map(|c| c as i64);
     ToolOutcome {

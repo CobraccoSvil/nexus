@@ -1464,7 +1464,7 @@ fn resolve_work_path(
     match resolve_relative_path(&ctx.root_path, working_dir) {
         Ok(p) => Ok(p),
         Err(e) => Err(format!(
-            "[Errore percorso: {}]",
+            "\u{274C} [Errore percorso: {}]",
             e.1["error"].as_str().unwrap_or("path error")
         )),
     }
@@ -1511,7 +1511,7 @@ fn detect_test_command(work_path: &Path, test_name: &str) -> Option<String> {
 pub(super) async fn tool_run_specific_test(ctx: &AgentToolContext, input: &Value) -> String {
     let test_name = match input.get("test_name").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s,
-        _ => return "[Errore: parametro 'test_name' obbligatorio]".to_string(),
+        _ => return "\u{274C} [Errore: parametro 'test_name' obbligatorio]".to_string(),
     };
     let working_dir = input
         .get("working_dir")
@@ -1532,7 +1532,7 @@ pub(super) async fn tool_run_specific_test(ctx: &AgentToolContext, input: &Value
         Some(c) => c,
         None => {
             return format!(
-                "[Errore: framework di test non rilevato in '{}'. \
+                "\u{274C} [Errore: framework di test non rilevato in '{}'. \
                  File cercati: Cargo.toml, package.json, pytest.ini, pyproject.toml, mix.exs, go.mod]",
                 work_path.display()
             )
@@ -1578,7 +1578,7 @@ fn detect_lint_command(work_path: &Path, check_only: bool) -> Option<String> {
 /// Esegue il linter con fix automatico (clippy --fix, eslint --fix, ruff --fix).
 pub(super) async fn tool_run_lint_fix(ctx: &AgentToolContext, input: &Value) -> String {
     if !ctx.can_write {
-        return "[Errore: permesso di scrittura non concesso]".to_string();
+        return "\u{274C} [Errore: permesso di scrittura non concesso]".to_string();
     }
     let check_only = input
         .get("check_only")
@@ -1603,7 +1603,7 @@ pub(super) async fn tool_run_lint_fix(ctx: &AgentToolContext, input: &Value) -> 
         Some(c) => c,
         None => {
             return format!(
-                "[Errore: linter non rilevato in '{}'. \
+                "\u{274C} [Errore: linter non rilevato in '{}'. \
                  Supportati: cargo clippy (Rust), eslint (Node), ruff (Python)]",
                 work_path.display()
             )
@@ -1616,11 +1616,11 @@ pub(super) async fn tool_run_lint_fix(ctx: &AgentToolContext, input: &Value) -> 
 /// Formatta un singolo file (rustfmt, prettier, black) in base all'estensione.
 pub(super) async fn tool_format_file(ctx: &AgentToolContext, input: &Value) -> String {
     if !ctx.can_write {
-        return "[Errore: permesso di scrittura non concesso]".to_string();
+        return "\u{274C} [Errore: permesso di scrittura non concesso]".to_string();
     }
     let path_str = match input.get("path").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s,
-        _ => return "[Errore: parametro 'path' obbligatorio]".to_string(),
+        _ => return "\u{274C} [Errore: parametro 'path' obbligatorio]".to_string(),
     };
     let check_only = input
         .get("check_only")
@@ -1631,13 +1631,13 @@ pub(super) async fn tool_format_file(ctx: &AgentToolContext, input: &Value) -> S
         Ok(p) => p,
         Err(e) => {
             return format!(
-                "[Errore percorso: {}]",
+                "\u{274C} [Errore percorso: {}]",
                 e.1["error"].as_str().unwrap_or("path error")
             )
         }
     };
     if !target.is_file() {
-        return format!("[Errore: '{}' non e' un file]", path_str);
+        return format!("\u{274C} [Errore: '{}' non e' un file]", path_str);
     }
 
     let ext = target
@@ -1650,7 +1650,7 @@ pub(super) async fn tool_format_file(ctx: &AgentToolContext, input: &Value) -> S
         Some(c) => c,
         None => {
             return format!(
-                "[Errore: formatter non disponibile per estensione '.{}'. \
+                "\u{274C} [Errore: formatter non disponibile per estensione '.{}'. \
                  Supportati: .rs (rustfmt), .ts/.js/.json/.css/.md (prettier), .py (black), .go (gofmt)]",
                 ext
             )
@@ -1741,7 +1741,7 @@ async fn spawn_and_capture_output(
         .spawn()
     {
         Ok(c) => c,
-        Err(e) => return Err(format!("[Errore avvio: {}]", e)),
+        Err(e) => return Err(format!("\u{274C} [Errore avvio: {}]", e)),
     };
 
     let stdout_handle = child.stdout.take();
@@ -1766,7 +1766,7 @@ async fn spawn_and_capture_output(
 
     let exit_code = match timeout_result {
         Ok(Ok(status)) => status.code().unwrap_or(-1),
-        Ok(Err(e)) => return Err(format!("[Errore attesa processo: {}]", e)),
+        Ok(Err(e)) => return Err(format!("\u{274C} [Errore attesa processo: {}]", e)),
         Err(_) => {
             let _ = child.start_kill();
             return Err(format!(

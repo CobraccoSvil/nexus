@@ -206,7 +206,7 @@ pub async fn tool_batch_analyze_code(ctx: &ToolContextCore, input: &Value) -> St
                         path_str,
                         e
                     );
-                    format!("[Errore lettura file: {e}]")
+                    format!("\u{274C} [Errore lettura file: {e}]")
                 }
             }
         };

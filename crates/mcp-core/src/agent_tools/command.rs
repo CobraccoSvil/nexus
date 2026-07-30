@@ -323,7 +323,7 @@ fn resolve_work_dir(ctx: &AgentToolContext, input: &Value) -> Result<PathBuf, St
         match resolve_relative_path(&ctx.root_path, sub) {
             Ok(p) => Ok(p),
             Err(e) => Err(format!(
-                "[Errore percorso working_dir: {}]",
+                "\u{274C} [Errore percorso working_dir: {}]",
                 e.1["error"].as_str().unwrap_or("path error")
             )),
         }
@@ -335,10 +335,10 @@ fn resolve_work_dir(ctx: &AgentToolContext, input: &Value) -> Result<PathBuf, St
 pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> String {
     let command = match input.get("command").and_then(Value::as_str) {
         Some(s) => s.to_string(),
-        None => return "[Errore: parametro 'command' mancante]".to_string(),
+        None => return "\u{274C} [Errore: parametro 'command' mancante]".to_string(),
     };
     if command.trim().is_empty() {
-        return "[Errore: comando vuoto]".to_string();
+        return "\u{274C} [Errore: comando vuoto]".to_string();
     }
 
     if let Some(msg) = command_security_gate(ctx, &command).await {
@@ -468,7 +468,7 @@ async fn run_command_probe(
             format_command_completed(ctx, command, exit_code, &stdout, &stderr, hints_prefix).await
         }
         Ok(Err(e)) => {
-            format!("[Errore attesa comando '{}': {}]", command, e)
+            format!("\u{274C} [Errore attesa comando '{}': {}]", command, e)
         }
         Err(_) => {
             // Probe timeout.
@@ -512,7 +512,7 @@ async fn spawn_command_child(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("[Errore avvio comando '{}': {}]", command, e))
+        .map_err(|e| format!("\u{274C} [Errore avvio comando '{}': {}]", command, e))
 }
 
 /// Compone l'output finale di `run_command` per un comando terminato entro il
@@ -635,7 +635,7 @@ pub(crate) async fn tool_run_tests(ctx: &AgentToolContext, input: &Value) -> Str
     let command = resolve_test_command(ctx, input);
 
     if command.is_empty() {
-        return "[Errore: impossibile rilevare il comando test per questo progetto. \
+        return "\u{274C} [Errore: impossibile rilevare il comando test per questo progetto. \
                 Specifica il parametro 'command' (es. 'npm test', 'cargo test', 'pytest').]"
             .to_string();
     }
@@ -677,7 +677,7 @@ async fn run_tests_execution(
 
     let mut child = match child {
         Ok(c) => c,
-        Err(e) => return format!("[Errore avvio test '{}': {}]", command, e),
+        Err(e) => return format!("\u{274C} [Errore avvio test '{}': {}]", command, e),
     };
 
     // Drain stdout/stderr in parallelo con child.wait() per evitare deadlock pipe (~64KB).
@@ -694,7 +694,7 @@ async fn run_tests_execution(
             let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
             format_run_tests_output(ctx, command, exit_code, &stdout, &stderr)
         }
-        Ok(Err(e)) => format!("[Errore attesa test '{}': {}]", command, e),
+        Ok(Err(e)) => format!("\u{274C} [Errore attesa test '{}': {}]", command, e),
         Err(_) => {
             let _ = child.kill().await;
             format!(

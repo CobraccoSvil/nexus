@@ -180,21 +180,29 @@ pub fn supervisor_cache_key(iterations: i64) -> String {
     format!("supervisor_decision::{iterations}")
 }
 
+/// Quanti fra gli ultimi `window` messaggi portano un tool_result FALLITO.
+///
+/// Delega al punto unico dell'esito di una chiamata a tool
+/// ([`crate::routing::signals::tool_result_outcome_after`], regola L). Prima
+/// contava a modo proprio, e sbagliava due volte:
+///
+/// - il criterio erano quattro `contains` sul testo appiattito, fra cui
+///   `"error"` NUDO: qualunque risultato che nominasse un campo `error` — un
+///   JSON con `"error": null`, un log citato — valeva un fallimento (regola M);
+/// - guardava i soli [`Message::Tool`], mentre sul percorso nativo i risultati
+///   arrivano come [`Message::Human`] a blocchi: il conteggio era quasi sempre
+///   zero PER COSTRUZIONE, e l'anomalia `repeated_errors` non poteva scattare.
+///
+/// I due difetti si mascheravano a vicenda — un criterio troppo largo su un
+/// canale sbagliato — e a soglia raggiunta questo conteggio innesca il nodo
+/// Supervisor, che e' una chiamata LLM e puo' decidere `Abandon`.
 fn count_recent_tool_errors(messages: &[Message], window: usize) -> i64 {
-    let mut errors = 0i64;
-    for msg in messages.iter().rev().take(window) {
-        if let Message::Tool { content, .. } = msg {
-            let text = content.flatten_text();
-            if text.contains("\"is_error\": true")
-                || text.contains("\"is_error\":true")
-                || text.starts_with("[Errore")
-                || text.contains("\"error\"")
-            {
-                errors += 1;
-            }
-        }
-    }
-    errors
+    messages
+        .iter()
+        .rev()
+        .take(window)
+        .filter(|m| crate::routing::signals::message_tool_result_outcome(m).unwrap_or(false))
+        .count() as i64
 }
 
 fn recent_tool_lines_from_messages(messages: &[Message], max: usize) -> Vec<String> {
@@ -257,7 +265,24 @@ fn detect_tool_loop(messages: &[Message]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::MetaStep;
+    use crate::state::{ContentBlock, MetaStep};
+
+    /// Tool_result come lo emette DAVVERO `tool_dispatch_node` sul percorso
+    /// nativo: `Message::Human` con un blocco `ContentBlock::ToolResult`
+    /// (vedi `tool_dispatch.rs::human_message_from_blocks`) — non un
+    /// `Message::Tool`, che sul percorso nativo non viene mai prodotto per i
+    /// risultati (regola O: lo stesso canale che alimenta il conteggio in
+    /// produzione).
+    fn human_tool_result(is_error: bool, exit_code: Option<i64>, text: &str) -> Message {
+        Message::Human {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "c1".into(),
+                content: Value::String(text.into()),
+                is_error,
+                exit_code,
+            }]),
+        }
+    }
 
     #[test]
     fn continuous_invoke_ogni_iterazione() {
@@ -307,6 +332,53 @@ mod tests {
             ..Default::default()
         };
         assert!(should_invoke(SupervisorMode::Anomaly, 10, cfg, &hot));
+    }
+
+    // ── count_recent_tool_errors: canale REALE (Message::Human a blocchi) ────
+    //
+    // Prima questo conteggio guardava solo Message::Tool: sul percorso nativo,
+    // dove i risultati arrivano SEMPRE come Message::Human (vedi
+    // tool_dispatch_node::human_message_from_blocks), era zero PER COSTRUZIONE
+    // e l'anomalia repeated_errors non poteva mai scattare.
+
+    #[test]
+    fn conta_i_fallimenti_strutturati_sul_canale_umano() {
+        let messages = vec![
+            human_tool_result(true, None, "qualsiasi"),
+            human_tool_result(false, Some(0), "ok"),
+            human_tool_result(true, Some(1), "boom"),
+        ];
+        assert_eq!(count_recent_tool_errors(&messages, 8), 2);
+    }
+
+    #[test]
+    fn non_conta_error_nudo_nel_testo_di_un_risultato_riuscito() {
+        // Il vecchio criterio era `contains("\"error\"")`: un risultato RIUSCITO
+        // (is_error=false) che nomina un campo "error" — qui il contenuto di un
+        // file letto — non deve contare come fallimento del tool (regola M).
+        let messages = vec![human_tool_result(
+            false,
+            Some(0),
+            "{\"error\": null, \"data\": [1,2,3]}",
+        )];
+        assert_eq!(count_recent_tool_errors(&messages, 8), 0);
+    }
+
+    #[test]
+    fn anomalia_scatta_a_tre_fallimenti_sul_canale_umano() {
+        let state = AgentState {
+            messages: vec![
+                human_tool_result(true, None, "e1"),
+                human_tool_result(true, None, "e2"),
+                human_tool_result(true, None, "e3"),
+            ],
+            ..Default::default()
+        };
+        let anomalie = detect_anomalies(&state, SupervisorConfig::default());
+        assert!(
+            anomalie.repeated_errors,
+            "tre tool_result falliti sul canale reale devono innescare l'anomalia"
+        );
     }
 
     #[test]

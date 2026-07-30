@@ -426,12 +426,11 @@ impl ClarifyOrExpandNode {
     /// marcatore o listing in errore (comportamento storico). L'I/O (la
     /// `list_files`) e' del chiamante (dietro `ctx.tools`).
     pub fn build_project_context(listing: &str) -> String {
-        // Guard errori identica al Python (:565): vuoto, prefisso di errore noto.
-        if listing.is_empty()
-            || listing.starts_with('\u{274c}') // simbolo "x rossa" usato dai tool
-            || listing.get(..30).unwrap_or(listing).contains("[Errore")
-            || listing.get(..30).unwrap_or(listing).contains("[Error")
-        {
+        // Guard errori: un listing che DICHIARA un fallimento non descrive un
+        // progetto. Il criterio e' il contratto macchina (punto unico, regola L),
+        // non i prefissi testuali che qui erano ricopiati a mano: il tool che
+        // fallisce lo dichiara, e chi legge non deve conoscerne il vocabolario.
+        if listing.is_empty() || nexus_types::tool_outcome::is_tool_failure(listing) {
             return String::new();
         }
         let lower = listing.to_lowercase();
@@ -1038,9 +1037,18 @@ mod tests {
         assert!(ctx.contains("CONTESTO PROGETTO"));
         assert!(ctx.contains("package.json"));
         assert!(ctx.contains("src/"));
-        // listing in errore -> vuoto.
+        // Listing in errore -> vuoto. La stringa e' quella che `tool_list_files`
+        // produce DAVVERO su un fallimento (col marker in testa, regola O): un
+        // fixture senza marker come "[Errore: dir non trovata]" (la vecchia
+        // forma) passerebbe questo assert per la ragione SBAGLIATA — cadrebbe
+        // nel ramo "nessun marcatore trovato" invece che nella guardia
+        // d'errore, e non proverebbe piu' nulla sulla guardia stessa. Qui il
+        // testo contiene ANCHE parole di dominio ("src", "readme") per
+        // dimostrare che e' la guardia a fermarlo, non l'assenza di marcatori.
         assert_eq!(
-            ClarifyOrExpandNode::build_project_context("[Errore: dir non trovata]"),
+            ClarifyOrExpandNode::build_project_context(
+                "\u{274C} [Errore listing '.': src/ non elencabile, vedi README.md]"
+            ),
             ""
         );
         // nessun marcatore -> vuoto.

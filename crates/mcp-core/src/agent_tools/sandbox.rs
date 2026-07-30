@@ -33,7 +33,7 @@ pub(super) async fn tool_set_sandbox_config(ctx: &AgentToolContext, input: &Valu
             let cpus = cfg.cpus.unwrap_or(2.0);
             format!("Configurazione sandbox aggiornata: memoria={}MB, cpu={}, rete={}. Attiva dalla prossima esecuzione.", mem, cpus, nm)
         }
-        Err(e) => format!("[Errore salvataggio sandbox config: {}]", e),
+        Err(e) => format!("\u{274C} [Errore salvataggio sandbox config: {}]", e),
     }
 }
 

@@ -26,17 +26,17 @@ pub async fn tool_git_stage(ctx: &ToolContextCore, input: &Value) -> String {
         return "Il progetto non e' un repository git.".to_string();
     }
     if !ctx.can_write {
-        return "[Errore: permesso di scrittura non concesso]".to_string();
+        return "\u{274C} [Errore: permesso di scrittura non concesso]".to_string();
     }
     let paths: Vec<String> = match input.get("paths").and_then(Value::as_array) {
         Some(arr) => arr
             .iter()
             .filter_map(|v| v.as_str().map(ToOwned::to_owned))
             .collect(),
-        None => return "[Errore: parametro 'paths' mancante o non valido]".to_string(),
+        None => return "\u{274C} [Errore: parametro 'paths' mancante o non valido]".to_string(),
     };
     if paths.is_empty() {
-        return "[Errore: 'paths' vuoto]".to_string();
+        return "\u{274C} [Errore: 'paths' vuoto]".to_string();
     }
     let mut args = vec!["add"];
     let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
@@ -52,11 +52,11 @@ pub async fn tool_git_commit(ctx: &ToolContextCore, input: &Value) -> String {
         return "Il progetto non e' un repository git.".to_string();
     }
     if !ctx.can_write {
-        return "[Errore: permesso di scrittura non concesso]".to_string();
+        return "\u{274C} [Errore: permesso di scrittura non concesso]".to_string();
     }
     let message = match input.get("message").and_then(Value::as_str) {
         Some(s) => s,
-        None => return "[Errore: parametro 'message' mancante]".to_string(),
+        None => return "\u{274C} [Errore: parametro 'message' mancante]".to_string(),
     };
     match run_git_command(&ctx.root_path, &["commit", "-m", message]).await {
         Ok((stdout, _)) => {
@@ -120,7 +120,7 @@ pub async fn tool_git_push(ctx: &ToolContextCore) -> String {
         return "Il progetto non e' un repository git.".to_string();
     }
     if !ctx.can_write {
-        return "[Errore: permesso di scrittura non concesso]".to_string();
+        return "\u{274C} [Errore: permesso di scrittura non concesso]".to_string();
     }
     match run_git_command(&ctx.root_path, &["push"]).await {
         Ok((stdout, stderr)) => {
@@ -153,7 +153,7 @@ pub async fn tool_git_remote_add(ctx: &ToolContextCore, input: &Value) -> String
         return "Il progetto non e' un repository git.".to_string();
     }
     if !ctx.can_write {
-        return "[Errore: permesso di scrittura non concesso]".to_string();
+        return "\u{274C} [Errore: permesso di scrittura non concesso]".to_string();
     }
     let name = input
         .get("name")
@@ -162,7 +162,7 @@ pub async fn tool_git_remote_add(ctx: &ToolContextCore, input: &Value) -> String
         .trim();
     let url = match input.get("url").and_then(Value::as_str) {
         Some(u) if !u.trim().is_empty() => u.trim(),
-        _ => return "[Errore: parametro 'url' obbligatorio]".to_string(),
+        _ => return "\u{274C} [Errore: parametro 'url' obbligatorio]".to_string(),
     };
 
     // Validazione: name puro alfanumerico/underscore/dash, no path traversal
@@ -171,7 +171,7 @@ pub async fn tool_git_remote_add(ctx: &ToolContextCore, input: &Value) -> String
         .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
     {
         return format!(
-            "[Errore: nome remote non valido '{}' (solo alfanumerico/-/_)]",
+            "\u{274C} [Errore: nome remote non valido '{}' (solo alfanumerico/-/_)]",
             name
         );
     }
@@ -179,7 +179,7 @@ pub async fn tool_git_remote_add(ctx: &ToolContextCore, input: &Value) -> String
     // Validazione: url deve essere https:// o git@ (no file:// path locali per evitare leak)
     if !url.starts_with("https://") && !url.starts_with("git@") && !url.starts_with("ssh://") {
         return format!(
-            "[Errore: url remote deve iniziare con https://, git@ o ssh:// (rifiutato: '{}')]",
+            "\u{274C} [Errore: url remote deve iniziare con https://, git@ o ssh:// (rifiutato: '{}')]",
             url
         );
     }

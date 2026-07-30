@@ -12,7 +12,7 @@
 //! | `run_command` (build) | NATIVO    | tool `run_command` -> confronto `exit_code` vs `expected.exit_code`; evidence con `output_excerpt`/`output_total_chars`/`output_truncated` (chiavi lette da `final_gate::render_failed_block`, ramo build) |
 //! | `service_logs_clean`  | NATIVO    | tool `run_command` -> match dei `patterns` sulle righe di log; inconclusive su comando fallito |
 //! | `http`                | NATIVO    | chiamata REALE via `reqwest` (parita' httpx Python); status singolo o lista + `body_contains` opzionale |
-//! | `file_exists`         | NATIVO    | tool `list_files` sulla parent + match basename (parita' fallback Python) |
+//! | `file_exists`         | NATIVO    | interrogazione DIRETTA del filesystem sulla radice del run (vedi [`EsistenzaFile`]) |
 //! | `outputs_exist`       | NATIVO    | lettura `agent_steps` (tool mutativi file del run) + verifica esistenza via `file_exists` |
 //! | `no_orphan_imported`  | TODO (F3) | grafo degli import BFS (~150 righe Python non portabili rapidamente): ritorna `inconclusive` (passed=true) finche' non portato — un criterio non valutabile NON deve far fallire il gate |
 //!
@@ -30,6 +30,7 @@
 //! per un guasto infrastrutturale del runner stesso (es. lettura `agent_steps`
 //! fallita in `outputs_exist`).
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +40,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use nexus_agent_graph::runtime::ports::{
-    CriteriaRunner, CriterionResult, CriterionSpec, PortError, ToolCall, ToolExecutor,
+    CriteriaRunner, CriterionResult, CriterionSpec, PortError, ToolCall, ToolExecutor, ToolOutcome,
 };
 
 /// Timeout di default per i criteri (parita' col Python: `30.0s`). I criteri con
@@ -69,47 +70,62 @@ pub struct FinalGateCriteriaRunnerAdapter {
     db: PgPool,
     /// Client HTTP per il criterio `http` (chiamata reale all'endpoint).
     http_client: reqwest::Client,
+    /// Radice dell'albero su cui questo run LAVORA: la project_root, oppure il
+    /// worktree effimero di un sub-run isolato. E' la stessa radice che il ctx
+    /// dei tool risolve (`tool_runner_server::resolve_ctx_root`), e va risolta
+    /// con quel punto unico: un criterio che guardasse la project_root mentre il
+    /// run scrive nel worktree misurerebbe un albero diverso da quello prodotto,
+    /// dichiarando l'altro (regola O).
+    ///
+    /// `None` quando la sessione non e' mappata a un progetto: in quel caso
+    /// `file_exists` non puo' guardare, e lo DICHIARA
+    /// ([`EsistenzaFile::NonInterrogabile`]) invece di rispondere "non esiste".
+    run_root: Option<PathBuf>,
 }
 
 impl FinalGateCriteriaRunnerAdapter {
     /// Costruisce il runner sull'esecutore tool condiviso + pool Postgres.
-    pub fn new(tool_executor: Arc<dyn ToolExecutor>, db: PgPool) -> Self {
+    ///
+    /// `run_root`: radice dell'albero del run (vedi il campo omonimo). Argomento
+    /// esplicito e non opzionale nella firma di proposito: un criterio che
+    /// interroga il filesystem senza sapere DOVE guardare non e' un criterio, e
+    /// dimenticarsene deve essere un errore di compilazione, non un `file_exists`
+    /// che tace.
+    pub fn new(tool_executor: Arc<dyn ToolExecutor>, db: PgPool, run_root: Option<PathBuf>) -> Self {
         Self {
             tool_executor,
             db,
             http_client: reqwest::Client::new(),
+            run_root,
         }
     }
 
-    /// Esegue un tool via il PUNTO UNICO [`ToolExecutor`] e ritorna il testo del
-    /// risultato (content). Errore di porta -> propagato al chiamante (che lo mappa
-    /// su evidence o lo gestisce).
-    async fn run_tool(
-        &self,
-        name: &str,
-        input: Value,
-    ) -> Result<String, PortError> {
+    /// Esegue un tool via il PUNTO UNICO [`ToolExecutor`] e ritorna il suo esito
+    /// INTERO. Errore di porta -> propagato al chiamante (che lo mappa su
+    /// evidence o lo gestisce).
+    ///
+    /// Ritorna il [`ToolOutcome`] e non il solo testo perche' l'esito del tool
+    /// (`exit_code`, `is_error`) e' gia' strutturato quando arriva qui: buttarlo
+    /// via al confine costringeva i chiamanti a ri-derivarlo dalla stringa
+    /// appiattita — `extract_exit_code` su un testo che l'`exit_code` ce l'aveva
+    /// gia' accanto, e la lettura del fallimento di `list_files` da quattro
+    /// parole cercate nei suoi primi 80 caratteri (regola M).
+    async fn run_tool(&self, name: &str, input: Value) -> Result<ToolOutcome, PortError> {
         let call = ToolCall {
             id: Uuid::new_v4().to_string(),
             name: name.to_string(),
             input,
             thought_signature: None,
         };
-        let outcome = self.tool_executor.execute(call).await?;
-        // content e' tipicamente una stringa (output del tool); normalizziamo.
-        Ok(match outcome.content {
-            Value::String(s) => s,
-            other => other.to_string(),
-        })
+        self.tool_executor.execute(call).await
     }
 
     /// Misura l'exit code di un comando sull'albero CORRENTE (baseline
-    /// pre-lavoro degli step gate, delta-aware sui criteri). Riusa il PUNTO
-    /// UNICO `run_tool` + `extract_exit_code` (regola L/M: exit code
-    /// strutturato, mai parsing dell'output). `None` = comando non eseguibile
-    /// o exit non estraibile -> il chiamante NON persiste baseline (fail-closed
-    /// nel gate). Chiamata SOLO dal run primario, prima che l'executor tocchi
-    /// file.
+    /// pre-lavoro degli step gate, delta-aware sui criteri). Legge l'exit code
+    /// dal campo STRUTTURATO dell'esito (regola M: mai ri-parsato dal testo).
+    /// `None` = comando non eseguibile o esito senza exit code -> il chiamante
+    /// NON persiste baseline (fail-closed nel gate). Chiamata SOLO dal run
+    /// primario, prima che l'executor tocchi file.
     pub async fn measure_command_exit(
         &self,
         command: &str,
@@ -119,11 +135,7 @@ impl FinalGateCriteriaRunnerAdapter {
         if let Some(wd) = working_dir {
             tool_input["working_dir"] = json!(wd);
         }
-        let raw = self
-            .run_tool("run_command", tool_input)
-            .await
-            .ok()?;
-        crate::tool_runner_server::extract_exit_code(&raw).map(|e| e as i64)
+        self.run_tool("run_command", tool_input).await.ok()?.exit_code
     }
 
     /// Esegue UN criterio. Parita' col `run_criterion` Python: il dispatch per
@@ -314,8 +326,8 @@ task_complete (outcome + summary)"
         }
         // Delega al ToolExecutor. Un guasto di porta -> evidence.error (parita'
         // col try/except Python), non propaga.
-        let raw = match self.run_tool("run_command", tool_input).await {
-            Ok(s) => s,
+        let outcome = match self.run_tool("run_command", tool_input).await {
+            Ok(o) => o,
             Err(e) => {
                 return (
                     false,
@@ -323,13 +335,15 @@ task_complete (outcome + summary)"
                 )
             }
         };
-        // exit_code STRUTTURATO dal punto unico (stesso parser del path gRPC).
-        let actual_exit = crate::tool_runner_server::extract_exit_code(&raw);
+        // exit_code STRUTTURATO dell'esito: arriva gia' cosi' dal confine del
+        // dispatch, non si ri-estrae dal testo che lo trasportava (regola M).
+        let actual_exit = outcome.exit_code;
+        let raw = outcome_text(&outcome);
         let expected_exit = expected
             .get("exit_code")
             .and_then(Value::as_i64)
             .unwrap_or(0);
-        let exit_ok = actual_exit.map(|a| a as i64) == Some(expected_exit);
+        let exit_ok = actual_exit == Some(expected_exit);
 
         // RETE DI SICUREZZA (regola H): alcuni build ESCONO 0 anche quando il
         // bundling FALLISCE (es. `vite build` con "Could not resolve" / "error
@@ -385,7 +399,7 @@ task_complete (outcome + summary)"
         let baseline_exit = spec.get("baseline_exit_code").and_then(Value::as_i64);
         let preexisting_bootstrap = !exit_ok
             && error_files.is_empty()
-            && baseline_exit.is_some_and(|b| b != 0 && actual_exit.map(|a| a as i64) == Some(b));
+            && baseline_exit.is_some_and(|b| b != 0 && actual_exit == Some(b));
         let passed = if delta_applicable {
             // Chiude se il task non ha lasciato errori nei file che ha toccato,
             // anche se il progetto ha debito preesistente altrove.
@@ -475,7 +489,7 @@ task_complete (outcome + summary)"
             .run_tool("run_command", json!({ "command": cmd }))
             .await
         {
-            Ok(s) => s,
+            Ok(o) => outcome_text(&o),
             // Inconclusivo (non un fallimento): non blocchiamo la chiusura su un
             // errore di lettura log (parita' Python: ritorna passed=true).
             Err(e) => {
@@ -560,14 +574,24 @@ task_complete (outcome + summary)"
         )
     }
 
-    // ── file_exists: list_files sulla parent + match basename ─────────────────
+    // ── file_exists: interrogazione diretta del filesystem ────────────────────
 
-    async fn check_file_exists(
-        &self,
-        spec: &Value,
-        expected: &Value,
-        _timeout_s: f64,
-    ) -> (bool, Value) {
+    /// `file_exists`: il file dichiarato dal criterio c'e' sull'albero del run?
+    ///
+    /// Chiede al FILESYSTEM. Prima chiedeva a `list_files` — cioe' a un elenco
+    /// composto per un lettore umano — e ne deduceva due cose leggendo il testo:
+    /// se il tool fosse fallito (quattro parole cercate nei primi 80 caratteri,
+    /// una delle quali, `"non trovato"`, il produttore non ha mai scritto: lui
+    /// scriveva `non trovata`) e se il file ci fosse (match del basename come
+    /// token isolato su una riga di elenco). La seconda deduzione era cieca ai
+    /// dotfile, che quell'elenco NON mostra: un `.env` scritto dal run risultava
+    /// ASSENTE, il criterio falliva, il gate bocciava e apriva un ciclo di
+    /// correzione su un lavoro gia' fatto.
+    ///
+    /// L'esito e' a tre stati ([`EsistenzaFile`]) perche' "non ho potuto
+    /// guardare" e' una risposta diversa da "non c'e'", e confonderle e' proprio
+    /// il modo in cui questo criterio bocciava run corretti.
+    async fn check_file_exists(&self, spec: &Value, expected: &Value, _timeout_s: f64) -> (bool, Value) {
         let path = spec.get("path").and_then(Value::as_str).unwrap_or("");
         if path.is_empty() {
             // file_exists senza path: N/A (pass), parita' Python.
@@ -576,66 +600,39 @@ task_complete (outcome + summary)"
                 json!({ "skipped": "file_exists senza path: criterio non applicabile (N/A)" }),
             );
         }
-        let (parent_dir, basename) = match path.rsplit_once('/') {
-            Some((p, b)) => (if p.is_empty() { "." } else { p }, b),
-            None => (".", path),
-        };
-        let raw = match self
-            .run_tool("list_files", json!({ "directory": parent_dir }))
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                return (
-                    false,
-                    json!({ "error": format!("execute_tool: {e}"), "path": path }),
-                )
-            }
-        };
-        let head = raw.chars().take(80).collect::<String>().to_lowercase();
-        let list_error = raw.starts_with('\u{274C}')
-            || head.contains("[errore")
-            || head.contains("[error")
-            || head.contains("non trovato")
-            || head.contains("not found");
-        if list_error {
-            // list_files in errore: trattiamo come "non esiste" (parita' fallback).
-            let expected_exists = expected
-                .get("exists")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            let passed = !expected_exists; // exists=false == expected_exists?
-            return (
-                passed,
-                json!({
-                    "path": path,
-                    "exists": false,
-                    "expected_exists": expected_exists,
-                    "method": "list_files_error",
-                    "output_excerpt": truncate_chars(&raw, 300),
-                }),
-            );
-        }
-        // Match del basename come token isolato (boundary spazio/slash/quote).
-        let exists = raw
-            .lines()
-            .any(|line| line_contains_basename(line, basename));
         let expected_exists = expected
             .get("exists")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        (
-            exists == expected_exists,
-            json!({
-                "path": path,
-                "exists": exists,
-                "expected_exists": expected_exists,
-                "method": "list_files",
-                "parent_dir": parent_dir,
-                "basename": basename,
-                "output_excerpt": truncate_chars(&raw, 300),
-            }),
-        )
+        let esito = interroga_esistenza(self.run_root.as_deref(), path).await;
+        match esito {
+            EsistenzaFile::NonInterrogabile { motivo } => (
+                // Inconclusivo, non fallito: il verifier non conta i criteri
+                // `inconclusive` ne' fra i pass ne' fra i fail. Rispondere "non
+                // esiste" quando non si e' potuto guardare avrebbe la stessa
+                // forma di una misura, e nessuna delle sue garanzie.
+                true,
+                json!({
+                    "path": path,
+                    "expected_exists": expected_exists,
+                    "inconclusive": true,
+                    "method": "filesystem",
+                    "skipped_reason": motivo,
+                }),
+            ),
+            EsistenzaFile::Esiste | EsistenzaFile::NonEsiste => {
+                let exists = esito == EsistenzaFile::Esiste;
+                (
+                    exists == expected_exists,
+                    json!({
+                        "path": path,
+                        "exists": exists,
+                        "expected_exists": expected_exists,
+                        "method": "filesystem",
+                    }),
+                )
+            }
+        }
     }
 
     // ── outputs_exist: agent_steps (tool mutativi) + file_exists ──────────────
@@ -704,13 +701,22 @@ task_complete (outcome + summary)"
         }
         let mut missing: Vec<String> = Vec::new();
         let mut checked: Vec<String> = Vec::new();
+        // Path per cui `check_file_exists` non ha potuto guardare (radice del
+        // run ignota, percorso non risolvibile): NON sono "assenti" (altrimenti
+        // il gate boccerebbe un run che ha scritto l'output, solo perche' il
+        // criterio non sapeva dove cercarlo) ma nemmeno "verificati" — l'evidence
+        // deve portarne traccia, o un lettore del report legge "checked" e crede
+        // che ogni path sia stato davvero confermato sul disco.
+        let mut inconclusive: Vec<String> = Vec::new();
         // Cap difensivo (parita' Python: 20 output).
         for p in paths.iter().take(20) {
-            let (ok, _ev) = self
+            let (ok, ev) = self
                 .check_file_exists(&json!({ "path": p }), &json!({}), timeout_s)
                 .await;
             checked.push(p.clone());
-            if !ok {
+            if ev.get("inconclusive").and_then(Value::as_bool) == Some(true) {
+                inconclusive.push(p.clone());
+            } else if !ok {
                 missing.push(p.clone());
             }
         }
@@ -720,11 +726,18 @@ task_complete (outcome + summary)"
                 json!({
                     "missing": missing,
                     "checked": checked,
+                    "inconclusive": inconclusive,
                     "verdict": "output dichiarati dagli step assenti sul filesystem a fine run",
                 }),
             ));
         }
-        Ok((true, json!({ "checked": checked })))
+        let mut evidence = json!({ "checked": checked, "inconclusive": inconclusive });
+        if !inconclusive.is_empty() {
+            evidence["verdict"] = json!(
+                "output presenti dove verificabili; alcuni non erano verificabili (radice del run non risolta) -- NON e' una conferma piena"
+            );
+        }
+        Ok((true, evidence))
     }
 }
 
@@ -851,37 +864,78 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
-/// `true` se `basename` appare come token isolato in `line` (boundary inizio/fine
-/// riga o spazio/slash/quote), parita' col regex Python di `_check_file_exists`.
-fn line_contains_basename(line: &str, basename: &str) -> bool {
-    if basename.is_empty() {
-        return false;
+/// Testo del risultato di un tool: il `content` normalizzato a stringa.
+///
+/// I criteri che ISPEZIONANO l'output (errori di build, righe di log) leggono
+/// da qui; quelli che ne valutano l'ESITO leggono i campi strutturati del
+/// [`ToolOutcome`] e non passano di qua.
+fn outcome_text(outcome: &ToolOutcome) -> String {
+    match &outcome.content {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
     }
-    let mut start = 0;
-    while let Some(pos) = line[start..].find(basename) {
-        let abs = start + pos;
-        let before_ok = abs == 0
-            || line[..abs]
-                .chars()
-                .next_back()
-                .map(|c| c.is_whitespace() || matches!(c, '/' | '"' | '\'' | '`'))
-                .unwrap_or(true);
-        let after_idx = abs + basename.len();
-        let after_ok = after_idx >= line.len()
-            || line[after_idx..]
-                .chars()
-                .next()
-                .map(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '`'))
-                .unwrap_or(true);
-        if before_ok && after_ok {
-            return true;
+}
+
+/// Risposta alla domanda "questo file c'e'?", con lo stato che mancava.
+///
+/// `NonInterrogabile` non e' un dettaglio di cortesia: e' cio' che tiene
+/// separato "ho guardato e non c'e'" da "non ho potuto guardare". Fonderli
+/// significa dichiarare assente un file che nessuno ha cercato, ed e' un
+/// verdetto che il gate prende sul serio quanto una misura.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EsistenzaFile {
+    /// Il filesystem lo conferma presente sotto la radice del run.
+    Esiste,
+    /// Il filesystem lo conferma assente: il percorso e' stato risolto e
+    /// interrogato, e non c'e' nulla li'.
+    NonEsiste,
+    /// Non e' stato possibile guardare (radice del run ignota, percorso non
+    /// risolvibile sotto la radice, errore di I/O). Il motivo viaggia con
+    /// l'esito: un inconcludente senza causa e' indistinguibile da una svista.
+    NonInterrogabile { motivo: String },
+}
+
+/// Interroga il FILESYSTEM sull'esistenza di `path`, relativo alla radice del run.
+///
+/// Il percorso si risolve con [`nexus_types::workspace_paths::resolve_workspace_target`]
+/// — lo STESSO punto unico che usano i tool di SCRITTURA (`figma_tools`,
+/// `image_tools`, `video_tools`, `audio_tools`, gli handler HTTP di
+/// `project_files`) per de-duplicare la root e bloccare il traversal `..`,
+/// SENZA richiedere che il target esista gia'. E' la scelta obbligata: il
+/// gemello `nexus_agent_tools::paths::resolve_relative_path` — quello dei tool
+/// di LETTURA — canonicalizza il path INTERO, che fallisce con "non trovato"
+/// per costruzione su un file che non c'e' ancora. Usarlo qui avrebbe reso
+/// ogni file assente `NonInterrogabile` (quindi PASS per il gate) invece di
+/// `NonEsiste`: la stessa premessa sbagliata che questo fix doveva togliere,
+/// solo spostata di una riga (regola O: lo strumento deve poter guardare
+/// esattamente cio' che gli si chiede, non un sottoinsieme che gia' esiste).
+/// Risolverlo qui a modo proprio (un `root.join(path)`) darebbe al gate
+/// un'idea di "dentro il progetto" diversa da quella con cui il run scrive.
+async fn interroga_esistenza(run_root: Option<&Path>, path: &str) -> EsistenzaFile {
+    let Some(root) = run_root else {
+        return EsistenzaFile::NonInterrogabile {
+            motivo: "radice del run non risolta (sessione senza progetto): esistenza non verificabile".to_string(),
+        };
+    };
+    let assoluto = match nexus_types::workspace_paths::resolve_workspace_target(root, path) {
+        Ok((_, assoluto)) => assoluto,
+        Err(e) => {
+            return EsistenzaFile::NonInterrogabile {
+                motivo: format!("percorso non risolvibile sotto la radice del run: {}", e.message()),
+            }
         }
-        start = abs + basename.len();
-        if start >= line.len() {
-            break;
-        }
+    };
+    match tokio::fs::try_exists(&assoluto).await {
+        Ok(true) => EsistenzaFile::Esiste,
+        Ok(false) => EsistenzaFile::NonEsiste,
+        // Permessi, percorso troppo lungo, volume smontato: il file potrebbe
+        // esserci eccome. `try_exists` distingue questo caso da `Ok(false)`
+        // proprio perche' non vanno confusi (a differenza di `Path::exists`,
+        // che li appiattisce entrambi su `false`).
+        Err(e) => EsistenzaFile::NonInterrogabile {
+            motivo: format!("filesystem non interrogabile: {e}"),
+        },
     }
-    false
 }
 
 #[cfg(test)]
@@ -935,11 +989,16 @@ mod tests {
                 .and_then(|v| v.get(idx))
                 .cloned()
                 .unwrap_or_default();
-            Ok(nexus_agent_graph::runtime::ports::ToolOutcome {
-                tool_call_id: call.id,
-                content: Value::String(content),
-                ..Default::default()
-            })
+            // Deriva is_error/exit_code con lo STESSO punto unico della
+            // produzione (`ToolRunnerExecutorAdapter::execute`, regola O): un
+            // fake che li lasciasse a `Default` (sempre `None`/`false`)
+            // mentirebbe su cio' che un ToolExecutor vero produce da un testo
+            // con `EXIT CODE: N`, e i criteri che ora leggono quei campi
+            // strutturati (non piu' il testo) misurerebbero un doppio che non
+            // si comporta come l'originale.
+            Ok(crate::agent_graph_adapter::tool_executor::map_result_to_outcome(
+                &call.id, content,
+            ))
         }
     }
 
@@ -958,7 +1017,7 @@ mod tests {
     #[sqlx::test]
     async fn run_command_build_passa_su_exit_zero(pool: PgPool) {
         let exec = FakeToolExecutor::with(&[("run_command", &["compilato\nEXIT CODE: 0\nok"])]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec.clone(), pool);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec.clone(), pool, None);
         let res = runner
             .run(
                 vec![spec(
@@ -995,7 +1054,7 @@ mod tests {
             (!) Some chunks are larger than 500 kB after minification.\n\
             built in 7.67s\nSTDERR:\n";
         let exec = FakeToolExecutor::with(&[("run_command", &[raw])]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
         let res = runner
             .run(
                 vec![spec(
@@ -1023,7 +1082,7 @@ mod tests {
     async fn run_command_build_fallisce_su_exit_non_zero(pool: PgPool) {
         let exec =
             FakeToolExecutor::with(&[("run_command", &["error[E0432]\nEXIT CODE: 101\nboom"])]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
         let res = runner
             .run(
                 vec![spec(
@@ -1049,7 +1108,7 @@ mod tests {
             "run_command",
             &["Oops! Something went wrong!\nESLint couldn't find a config file.\nEXIT CODE: 2"],
         )]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
         let res = runner
             .run(
                 vec![spec(
@@ -1077,7 +1136,7 @@ mod tests {
         // Exit diverso dalla baseline = comportamento NUOVO (possibile rottura
         // introdotta dal run, es. config cancellata): resta bloccante.
         let exec = FakeToolExecutor::with(&[("run_command", &["boom di bootstrap\nEXIT CODE: 2"])]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
         let res = runner
             .run(
                 vec![spec(
@@ -1104,7 +1163,7 @@ mod tests {
             "run_command",
             &["src/app/x.ts(3,5): error TS2304: Cannot find name 'y'.\nEXIT CODE: 2"],
         )]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
         let res = runner
             .run(
                 vec![spec(
@@ -1132,7 +1191,7 @@ mod tests {
                    src/app/pages/LoginPage.tsx(5,10): error TS2305: no member\n\
                    Found 2 errors.\nEXIT CODE: 2";
         let exec = FakeToolExecutor::with(&[("run_command", &[out])]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
         let res = runner
             .run(
                 vec![spec(
@@ -1162,7 +1221,7 @@ mod tests {
                    src/app/pages/ConfirmationPage.tsx(17,42): error TS2304: Cannot find name\n\
                    Found 2 errors.\nEXIT CODE: 2";
         let exec = FakeToolExecutor::with(&[("run_command", &[out])]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
         let res = runner
             .run(
                 vec![spec(
@@ -1192,7 +1251,7 @@ mod tests {
         let out =
             "src/app/pages/BookingPage.tsx(156,7): error TS2554: Expected 2 args\nEXIT CODE: 2";
         let exec = FakeToolExecutor::with(&[("run_command", &[out])]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
         let res = runner
             .run(
                 vec![spec(
@@ -1213,7 +1272,7 @@ mod tests {
     #[sqlx::test]
     async fn run_command_delega_al_tool_executor(pool: PgPool) {
         let exec = FakeToolExecutor::with(&[("run_command", &["EXIT CODE: 0"])]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec.clone(), pool);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec.clone(), pool, None);
         runner
             .run(vec![spec(
                 "run_command",
@@ -1273,7 +1332,7 @@ mod tests {
     async fn http_post_500_fallisce_e_dice_cosa(pool: PgPool) {
         let url = server_che_risponde(STATUS_500, r#"{"error":"no such column: date"}"#).await;
         let exec = FakeToolExecutor::with(&[]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
         let res = runner
             .run(vec![spec(
                 "http",
@@ -1306,7 +1365,7 @@ mod tests {
     async fn http_post_201_passa(pool: PgPool) {
         let url = server_che_risponde(STATUS_201, r#"{"id":1}"#).await;
         let exec = FakeToolExecutor::with(&[]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
         let res = runner
             .run(vec![spec(
                 "http",
@@ -1322,7 +1381,7 @@ mod tests {
     async fn service_logs_clean_passa_senza_pattern_hit(pool: PgPool) {
         let exec =
             FakeToolExecutor::with(&[("run_command", &["INFO server avviato\nINFO richiesta ok"])]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
         let res = runner
             .run(
                 vec![spec(
@@ -1342,7 +1401,7 @@ mod tests {
             "run_command",
             &["relation \"users\" does not exist\nINFO altro"],
         )]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
         let res = runner
             .run(
                 vec![spec(
@@ -1361,7 +1420,7 @@ mod tests {
     #[sqlx::test]
     async fn no_orphan_imported_e_inconclusive_e_non_blocca(pool: PgPool) {
         let exec = FakeToolExecutor::with(&[]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
         let res = runner
             .run(
                 vec![spec(
@@ -1383,7 +1442,7 @@ mod tests {
         // resume/fan-in, ma la history porta tool_use gia' osservati. Quel segnale
         // strutturato dimostra che il catalogo era disponibile nel run.
         let exec = FakeToolExecutor::with(&[]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
         let res = runner
             .run(
                 vec![spec(
@@ -1402,7 +1461,7 @@ mod tests {
     #[sqlx::test]
     async fn tool_capability_fallisce_senza_catalogo_ne_history(pool: PgPool) {
         let exec = FakeToolExecutor::with(&[]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
         let res = runner
             .run(
                 vec![spec(
@@ -1420,30 +1479,94 @@ mod tests {
     }
 
 
+    // ── file_exists: interroga il filesystem VERO, mai un listing fabbricato ──
+    //
+    // Il vecchio test costruiva a mano una riga di listing ("- README.md\n...")
+    // che nessun produttore emette in quella forma (regola O): fissava
+    // l'assunto — "list_files torna righe con prefisso `- `" — che il criterio
+    // doveva verificare. Questi test scrivono file VERI su un tempdir e
+    // interrogano quello, come fa `check_file_exists` in produzione.
+
     #[sqlx::test]
-    async fn file_exists_trova_basename_nel_listing(pool: PgPool) {
-        let exec =
-            FakeToolExecutor::with(&[("list_files", &["- README.md\n- src/\n- variables.txt"])]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+    async fn file_exists_trova_un_file_scritto_sul_disco(pool: PgPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("variables.txt"), "x").expect("scrittura");
+        let exec = FakeToolExecutor::with(&[]);
+        let runner =
+            FinalGateCriteriaRunnerAdapter::new(exec, pool, Some(dir.path().to_path_buf()));
         let res = runner
-            .run(
-                vec![spec(
-                    "file_exists",
-                    json!({ "path": "variables.txt" }),
-                    json!({}),
-                )],
-            )
+            .run(vec![spec(
+                "file_exists",
+                json!({ "path": "variables.txt" }),
+                json!({}),
+            )])
             .await
             .expect("ok");
-        assert!(res[0].passed, "basename presente nel listing -> esiste");
+        assert!(res[0].passed, "file presente sul disco -> esiste");
         assert_eq!(res[0].evidence["exists"], json!(true));
+        assert_eq!(res[0].evidence["method"], json!("filesystem"));
+    }
+
+    #[sqlx::test]
+    async fn file_exists_trova_un_dotfile_che_il_listing_nascondeva(pool: PgPool) {
+        // Il vecchio criterio, basato su `list_files`, saltava le voci che
+        // iniziano per punto: un `.env` scritto dal run risultava ASSENTE
+        // (regola M). Sul filesystem non c'e' questa distinzione.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".env"), "SECRET=1").expect("scrittura");
+        let exec = FakeToolExecutor::with(&[]);
+        let runner =
+            FinalGateCriteriaRunnerAdapter::new(exec, pool, Some(dir.path().to_path_buf()));
+        let res = runner
+            .run(vec![spec("file_exists", json!({ "path": ".env" }), json!({}))])
+            .await
+            .expect("ok");
+        assert!(res[0].passed, ".env scritto sul disco -> esiste, anche se un listing lo nasconde");
+    }
+
+    #[sqlx::test]
+    async fn file_exists_fallisce_se_il_file_non_ce(pool: PgPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exec = FakeToolExecutor::with(&[]);
+        let runner =
+            FinalGateCriteriaRunnerAdapter::new(exec, pool, Some(dir.path().to_path_buf()));
+        let res = runner
+            .run(vec![spec(
+                "file_exists",
+                json!({ "path": "assente.txt" }),
+                json!({}),
+            )])
+            .await
+            .expect("ok");
+        assert!(!res[0].passed, "file assente -> il criterio fallisce");
+        assert_eq!(res[0].evidence["exists"], json!(false));
+    }
+
+    #[sqlx::test]
+    async fn file_exists_e_inconclusivo_senza_radice_del_run(pool: PgPool) {
+        // Sessione non mappata a un progetto: il criterio non sa DOVE guardare.
+        // "non ho potuto guardare" e "non c'e'" sono risposte diverse — la prima
+        // non deve far fallire il gate (regola M: mai spacciare un'assenza di
+        // misura per una misura).
+        let exec = FakeToolExecutor::with(&[]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
+        let res = runner
+            .run(vec![spec(
+                "file_exists",
+                json!({ "path": "qualsiasi.txt" }),
+                json!({}),
+            )])
+            .await
+            .expect("ok");
+        assert!(res[0].passed, "inconclusivo -> non blocca il gate");
+        assert_eq!(res[0].evidence["inconclusive"], json!(true));
     }
 
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn outputs_exist_na_senza_step(pool: PgPool) {
         let run = crate::test_support::seed_agent_run(&pool).await;
         let exec = FakeToolExecutor::with(&[]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
         let res = runner
             .run(
                 vec![spec(
@@ -1462,7 +1585,7 @@ mod tests {
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn outputs_exist_fallisce_se_output_assente(pool: PgPool) {
         let run = crate::test_support::seed_agent_run(&pool).await;
-        // Step write_file su "nuovo.rs": il file NON e' nel listing -> missing.
+        // Step write_file su "nuovo.rs": il file NON esiste sul disco -> missing.
         sqlx::query(
             "INSERT INTO agent_steps (id, run_id, step_index, tool_name, tool_input, status) \
              VALUES (gen_random_uuid(), $1, 1000, 'write_file', $2, 'completed')",
@@ -1473,9 +1596,13 @@ mod tests {
         .await
         .expect("insert step");
 
-        // list_files della parent (".") NON contiene nuovo.rs.
-        let exec = FakeToolExecutor::with(&[("list_files", &["- vecchio.rs\n- README.md"])]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        // Albero VERO del run: contiene altri file, non "nuovo.rs".
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("vecchio.rs"), "x").expect("scrittura");
+        std::fs::write(dir.path().join("README.md"), "x").expect("scrittura");
+        let exec = FakeToolExecutor::with(&[]);
+        let runner =
+            FinalGateCriteriaRunnerAdapter::new(exec, pool, Some(dir.path().to_path_buf()));
         let res = runner
             .run(
                 vec![spec(
@@ -1490,10 +1617,84 @@ mod tests {
         assert_eq!(res[0].evidence["missing"], json!(["nuovo.rs"]));
     }
 
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn outputs_exist_passa_se_output_presente_sul_disco(pool: PgPool) {
+        let run = crate::test_support::seed_agent_run(&pool).await;
+        sqlx::query(
+            "INSERT INTO agent_steps (id, run_id, step_index, tool_name, tool_input, status) \
+             VALUES (gen_random_uuid(), $1, 1000, 'write_file', $2, 'completed')",
+        )
+        .bind(run)
+        .bind(json!({ "path": "nuovo.rs" }))
+        .execute(&pool)
+        .await
+        .expect("insert step");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("nuovo.rs"), "x").expect("scrittura");
+        let exec = FakeToolExecutor::with(&[]);
+        let runner =
+            FinalGateCriteriaRunnerAdapter::new(exec, pool, Some(dir.path().to_path_buf()));
+        let res = runner
+            .run(
+                vec![spec(
+                    "outputs_exist",
+                    json!({ "run_id": run.to_string() }),
+                    json!({}),
+                )],
+            )
+            .await
+            .expect("ok");
+        assert!(res[0].passed, "output presente sul disco -> passa");
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn outputs_exist_senza_radice_passa_ma_dichiara_inconcludente(pool: PgPool) {
+        // Un output dichiarato, ma nessuna radice del run risolvibile: il
+        // criterio non puo' GUARDARE, quindi non deve bocciare (fail-open, come
+        // il singolo file_exists) -- ma l'evidence deve portare traccia che
+        // quel path non e' stato verificato, non solo "checked". Prima di
+        // questo fix `check_outputs_exist` scartava l'evidence del check
+        // interno (`let (ok, _ev) = ...`): `ok=true` per "esiste" e per "non
+        // verificabile" erano indistinguibili nel report.
+        let run = crate::test_support::seed_agent_run(&pool).await;
+        sqlx::query(
+            "INSERT INTO agent_steps (id, run_id, step_index, tool_name, tool_input, status) \
+             VALUES (gen_random_uuid(), $1, 1000, 'write_file', $2, 'completed')",
+        )
+        .bind(run)
+        .bind(json!({ "path": "nuovo.rs" }))
+        .execute(&pool)
+        .await
+        .expect("insert step");
+
+        let exec = FakeToolExecutor::with(&[]);
+        // run_root=None: nessuna radice, come una sessione senza progetto.
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
+        let res = runner
+            .run(vec![spec(
+                "outputs_exist",
+                json!({ "run_id": run.to_string() }),
+                json!({}),
+            )])
+            .await
+            .expect("ok");
+        assert!(
+            res[0].passed,
+            "non verificabile != assente: non deve bocciare il gate"
+        );
+        assert_eq!(
+            res[0].evidence["inconclusive"],
+            json!(["nuovo.rs"]),
+            "l'evidence deve dichiarare quale output NON e' stato verificato: {:?}",
+            res[0].evidence
+        );
+    }
+
     #[sqlx::test]
     async fn tipo_sconosciuto_fallisce_con_error(pool: PgPool) {
         let exec = FakeToolExecutor::with(&[]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
         let res = runner
             .run(
                 vec![spec("inventato", json!({}), json!({}))],
@@ -1506,22 +1707,6 @@ mod tests {
 
 
     // ── helper puri ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn line_contains_basename_token_isolato() {
-        assert!(line_contains_basename("- variables.txt", "variables.txt"));
-        assert!(line_contains_basename("\"variables.txt\"", "variables.txt"));
-        assert!(line_contains_basename("dir/variables.txt", "variables.txt"));
-        // NON deve matchare un substring di un nome piu' lungo.
-        assert!(!line_contains_basename(
-            "- variables.txt.bak",
-            "variables.txt"
-        ));
-        assert!(!line_contains_basename(
-            "- myvariables.txt",
-            "variables.txt"
-        ));
-    }
 
     #[test]
     fn truncate_chars_non_spezza_utf8() {

@@ -102,7 +102,7 @@ pub fn collect_internal_urls(path: &str, content: &str) -> Vec<UrlFinding> {
 /// Messaggio di rifiuto per la scrittura: istruisce la configurazione governata.
 pub fn format_url_reject_message(path: &str, findings: &[UrlFinding]) -> String {
     let mut msg = format!(
-        "[Errore: scrittura su '{}' rifiutata. Sono stati rilevati {} URL interni hardcoded (localhost/127.0.0.1/host.docker.internal).]\n\nDettaglio:\n",
+        "\u{274C} [Errore: scrittura su '{}' rifiutata. Sono stati rilevati {} URL interni hardcoded (localhost/127.0.0.1/host.docker.internal).]\n\nDettaglio:\n",
         path,
         findings.len()
     );

@@ -13,11 +13,11 @@ use super::ToolContextCore;
 pub async fn tool_create_profile(ctx: &ToolContextCore, input: &Value) -> String {
     let name = match input.get("name").and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => return "[Errore: parametro 'name' obbligatorio]".to_string(),
+        _ => return "\u{274C} [Errore: parametro 'name' obbligatorio]".to_string(),
     };
     let system_prompt = match input.get("system_prompt").and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => return "[Errore: parametro 'system_prompt' obbligatorio]".to_string(),
+        _ => return "\u{274C} [Errore: parametro 'system_prompt' obbligatorio]".to_string(),
     };
     let emoji = input
         .get("emoji")
@@ -100,14 +100,14 @@ pub async fn tool_create_profile(ctx: &ToolContextCore, input: &Value) -> String
             name, emoji,
             profile_id
         ),
-        Err(e) => format!("[Errore creazione profilo: {}]", e),
+        Err(e) => format!("\u{274C} [Errore creazione profilo: {}]", e),
     }
 }
 
 pub async fn tool_update_profile(ctx: &ToolContextCore, input: &Value) -> String {
     let profile_name = match input.get("profile_name").and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => return "[Errore: parametro 'profile_name' obbligatorio]".to_string(),
+        _ => return "\u{274C} [Errore: parametro 'profile_name' obbligatorio]".to_string(),
     };
 
     // Trova il profilo per nome e user_id
@@ -161,6 +161,6 @@ pub async fn tool_update_profile(ctx: &ToolContextCore, input: &Value) -> String
 
     match res {
         Ok(_) => format!("Profilo '{}' aggiornato con successo.", profile_name),
-        Err(e) => format!("[Errore aggiornamento profilo: {}]", e),
+        Err(e) => format!("\u{274C} [Errore aggiornamento profilo: {}]", e),
     }
 }

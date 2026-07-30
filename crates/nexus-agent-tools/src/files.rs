@@ -306,13 +306,13 @@ async fn build_graph_out_of_graph_info(project_id: uuid::Uuid) -> String {
 pub async fn tool_read_file(ctx: &ToolContextCore, input: &Value) -> String {
     let path_str = match input.get("path").and_then(Value::as_str) {
         Some(s) => s,
-        None => return "[Errore: parametro 'path' mancante]".to_string(),
+        None => return "\u{274C} [Errore: parametro 'path' mancante]".to_string(),
     };
     let target = match resolve_relative_path(&ctx.root_path, path_str) {
         Ok(p) => p,
         Err(e) => {
             return format!(
-                "[Errore percorso: {}]",
+                "\u{274C} [Errore percorso: {}]",
                 e.1["error"].as_str().unwrap_or("path error")
             )
         }
@@ -326,7 +326,7 @@ pub async fn tool_read_file(ctx: &ToolContextCore, input: &Value) -> String {
 
     let content = match tokio::fs::read_to_string(&target).await {
         Ok(c) => c,
-        Err(e) => return format!("[Errore lettura '{}': {}]", path_str, e),
+        Err(e) => return format!("\u{274C} [Errore lettura '{}': {}]", path_str, e),
     };
 
     let total_lines = content.lines().count();
@@ -374,7 +374,7 @@ async fn read_max_bytes_guard(
     let meta = tokio::fs::metadata(target).await.ok()?;
     if meta.len() > read_max_bytes {
         return Some(format!(
-            "[Errore lettura '{}': file troppo grande ({} byte > limite {} byte). \
+            "\u{274C} [Errore lettura '{}': file troppo grande ({} byte > limite {} byte). \
              Usa read_file_lines(path, start_line, end_line) per leggere una porzione, \
              o search_file_semantic per trovare le sezioni rilevanti.]",
             path_str,
@@ -460,23 +460,23 @@ fn render_large_file_response(
 fn parse_line_range(input: &Value) -> Result<(usize, usize), String> {
     let start_line: usize = if let Some(n) = input.get("start_line").and_then(Value::as_u64) {
         if n < 1 {
-            return Err("[Errore: 'start_line' deve essere un intero >= 1]".to_string());
+            return Err("\u{274C} [Errore: 'start_line' deve essere un intero >= 1]".to_string());
         }
         n as usize
     } else if let Some(n) = input.get("offset").and_then(Value::as_u64) {
         if n < 1 {
-            return Err("[Errore: 'offset' deve essere un intero >= 1]".to_string());
+            return Err("\u{274C} [Errore: 'offset' deve essere un intero >= 1]".to_string());
         }
         n as usize
     } else {
         return Err(
-            "[Errore: parametro 'start_line' mancante (oppure 'offset' come alias)]".to_string(),
+            "\u{274C} [Errore: parametro 'start_line' mancante (oppure 'offset' come alias)]".to_string(),
         );
     };
 
     let end_line: usize = if let Some(n) = input.get("end_line").and_then(Value::as_u64) {
         if n < start_line as u64 {
-            return Err("[Errore: 'end_line' deve essere >= start_line]".to_string());
+            return Err("\u{274C} [Errore: 'end_line' deve essere >= start_line]".to_string());
         }
         n as usize
     } else if let Some(limit) = input.get("limit").and_then(Value::as_u64) {
@@ -484,7 +484,7 @@ fn parse_line_range(input: &Value) -> Result<(usize, usize), String> {
         (start_line as u64).saturating_add(limit).saturating_sub(1) as usize
     } else {
         return Err(
-            "[Errore: parametro 'end_line' mancante (oppure 'limit' come alias)]".to_string(),
+            "\u{274C} [Errore: parametro 'end_line' mancante (oppure 'limit' come alias)]".to_string(),
         );
     };
 
@@ -496,7 +496,7 @@ fn parse_line_range(input: &Value) -> Result<(usize, usize), String> {
 pub async fn tool_read_file_lines(ctx: &ToolContextCore, input: &Value) -> String {
     let path_str = match input.get("path").and_then(Value::as_str) {
         Some(s) => s,
-        None => return "[Errore: parametro 'path' mancante]".to_string(),
+        None => return "\u{274C} [Errore: parametro 'path' mancante]".to_string(),
     };
 
     let (start_line, end_line) = match parse_line_range(input) {
@@ -508,14 +508,14 @@ pub async fn tool_read_file_lines(ctx: &ToolContextCore, input: &Value) -> Strin
         Ok(p) => p,
         Err(e) => {
             return format!(
-                "[Errore percorso: {}]",
+                "\u{274C} [Errore percorso: {}]",
                 e.1["error"].as_str().unwrap_or("path error")
             )
         }
     };
     let content = match tokio::fs::read_to_string(&target).await {
         Ok(c) => c,
-        Err(e) => return format!("[Errore lettura '{}': {}]", path_str, e),
+        Err(e) => return format!("\u{274C} [Errore lettura '{}': {}]", path_str, e),
     };
 
     render_line_range(&content, path_str, start_line, end_line)
@@ -529,7 +529,7 @@ fn render_line_range(content: &str, path_str: &str, start_line: usize, end_line:
     let total_lines = content.lines().count();
     if start_line > total_lines {
         return format!(
-            "[Errore: start_line {} supera il numero totale di righe del file ({})]",
+            "\u{274C} [Errore: start_line {} supera il numero totale di righe del file ({})]",
             start_line, total_lines
         );
     }
@@ -580,7 +580,7 @@ async fn prepare_write_and_track(
     // Crea directory intermedie se necessario
     if let Some(parent) = target.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return Err(format!("[Errore creazione directory: {}]", e));
+            return Err(format!("\u{274C} [Errore creazione directory: {}]", e));
         }
     }
     let existed_before = target.exists();
@@ -616,21 +616,21 @@ fn read_write_params<'a>(
     input: &'a Value,
 ) -> Result<(&'a str, &'a str), String> {
     if !ctx.can_write {
-        return Err("[Errore: permesso di scrittura non concesso su questo progetto]".to_string());
+        return Err("\u{274C} [Errore: permesso di scrittura non concesso su questo progetto]".to_string());
     }
     let path_str = input
         .get("path")
         .and_then(Value::as_str)
-        .ok_or_else(|| "[Errore: parametro 'path' mancante]".to_string())?;
+        .ok_or_else(|| "\u{274C} [Errore: parametro 'path' mancante]".to_string())?;
     if !ctx.is_nexus_operator {
         if let Some(pattern) = is_protected_path(path_str) {
-            return Err(format!("[Errore: il file '{}' è protetto (pattern: '{}') e non può essere modificato dall'agente. Modifica manualmente se necessario.]", path_str, pattern));
+            return Err(format!("\u{274C} [Errore: il file '{}' è protetto (pattern: '{}') e non può essere modificato dall'agente. Modifica manualmente se necessario.]", path_str, pattern));
         }
     }
     let content = input
         .get("content")
         .and_then(Value::as_str)
-        .ok_or_else(|| "[Errore: parametro 'content' mancante]".to_string())?;
+        .ok_or_else(|| "\u{274C} [Errore: parametro 'content' mancante]".to_string())?;
     Ok((path_str, content))
 }
 
@@ -653,7 +653,7 @@ pub async fn tool_write_file(ctx: &ToolContextCore, input: &Value) -> String {
 
     // Preflight build graph (ADR 0020): blocca file generati, avvisa OOG.
     let bg_warning = match run_build_graph_preflight(ctx, path_str).await {
-        BuildGraphPreflight::Block(msg) => return format!("[Errore: {}]", msg),
+        BuildGraphPreflight::Block(msg) => return format!("\u{274C} [Errore: {}]", msg),
         BuildGraphPreflight::Warn(msg) => Some(msg),
         BuildGraphPreflight::Allow => None,
     };
@@ -663,7 +663,7 @@ pub async fn tool_write_file(ctx: &ToolContextCore, input: &Value) -> String {
     // (assoluto o relativo) viene normalizzato a relativo prima del join.
     let target = match resolve_write_target(&ctx.root_path, path_str) {
         Ok(p) => p,
-        Err(e) => return format!("[Errore: {e}]"),
+        Err(e) => return format!("\u{274C} [Errore: {e}]"),
     };
 
     let (existed_before, unchanged) =
@@ -681,7 +681,7 @@ pub async fn tool_write_file(ctx: &ToolContextCore, input: &Value) -> String {
             unchanged,
             bg_warning,
         ),
-        Err(e) => format!("[Errore scrittura '{}': {}]", path_str, e),
+        Err(e) => format!("\u{274C} [Errore scrittura '{}': {}]", path_str, e),
     }
 }
 
@@ -916,7 +916,7 @@ pub async fn tool_list_files(ctx: &ToolContextCore, input: &Value) -> String {
             Ok(p) => p,
             Err(e) => {
                 return format!(
-                    "[Errore percorso: {}]",
+                    "\u{274C} [Errore percorso: {}]",
                     e.1["error"].as_str().unwrap_or("path error")
                 )
             }
@@ -925,7 +925,7 @@ pub async fn tool_list_files(ctx: &ToolContextCore, input: &Value) -> String {
 
     let mut entries = match tokio::fs::read_dir(&target).await {
         Ok(rd) => rd,
-        Err(e) => return format!("[Errore listing '{}': {}]", dir_str, e),
+        Err(e) => return format!("\u{274C} [Errore listing '{}': {}]", dir_str, e),
     };
 
     let mut lines = Vec::new();
@@ -945,7 +945,12 @@ pub async fn tool_list_files(ctx: &ToolContextCore, input: &Value) -> String {
     }
     lines.sort();
     if lines.is_empty() {
-        format!("Directory '{}' vuota o non trovata.", dir_str)
+        // "vuota o non trovata" era una disgiunzione che il codice sa risolvere:
+        // se `read_dir` e' RIUSCITA la directory esiste, punto — l'inesistenza
+        // esce dal ramo `Err` qui sopra. Quel testo faceva credere il contrario
+        // a chi lo leggeva, e un consumatore del final gate ci cercava dentro
+        // "non trovato" per dedurre un fallimento che non c'era.
+        format!("Directory '{}' vuota (nessuna voce visibile).", dir_str)
     } else {
         lines.join("\n")
     }
@@ -954,7 +959,7 @@ pub async fn tool_list_files(ctx: &ToolContextCore, input: &Value) -> String {
 pub async fn tool_search_in_files(ctx: &ToolContextCore, input: &Value) -> String {
     let pattern = match input.get("pattern").and_then(Value::as_str) {
         Some(s) => s,
-        None => return "[Errore: parametro 'pattern' mancante]".to_string(),
+        None => return "\u{274C} [Errore: parametro 'pattern' mancante]".to_string(),
     };
     // Punto unico (regola L): de-duplica la root se l'agente l'ha inclusa nel
     // path e blocca il traversal ".." (resolve_relative_path -> normalize_into_root).
@@ -963,7 +968,7 @@ pub async fn tool_search_in_files(ctx: &ToolContextCore, input: &Value) -> Strin
             Ok(path) => path,
             Err(e) => {
                 return format!(
-                    "[Errore percorso: {}]",
+                    "\u{274C} [Errore percorso: {}]",
                     e.1["error"].as_str().unwrap_or("path error")
                 )
             }
@@ -1223,11 +1228,11 @@ fn append_file_matches(
 
 pub async fn tool_delete_file(ctx: &ToolContextCore, input: &Value) -> String {
     if !ctx.can_write {
-        return "[Errore: permesso di scrittura non concesso su questo progetto]".to_string();
+        return "\u{274C} [Errore: permesso di scrittura non concesso su questo progetto]".to_string();
     }
     let path_str = match input.get("path").and_then(Value::as_str) {
         Some(s) => s,
-        None => return "[Errore: parametro 'path' mancante]".to_string(),
+        None => return "\u{274C} [Errore: parametro 'path' mancante]".to_string(),
     };
     let recursive = input
         .get("recursive")
@@ -1238,7 +1243,7 @@ pub async fn tool_delete_file(ctx: &ToolContextCore, input: &Value) -> String {
         Ok(p) => p,
         Err(e) => {
             return format!(
-                "[Errore percorso: {}]",
+                "\u{274C} [Errore percorso: {}]",
                 e.1["error"].as_str().unwrap_or("path error")
             )
         }
@@ -1259,7 +1264,7 @@ pub async fn tool_delete_file(ctx: &ToolContextCore, input: &Value) -> String {
             );
             format!("File '{}' eliminato con successo", path_str)
         }
-        Err(e) => format!("[Errore eliminazione '{}': {}]", path_str, e),
+        Err(e) => format!("\u{274C} [Errore eliminazione '{}': {}]", path_str, e),
     }
 }
 
@@ -1273,13 +1278,13 @@ async fn delete_directory(target: &Path, path_str: &str, recursive: bool) -> Str
                 "Directory '{}' eliminata ricorsivamente con successo",
                 path_str
             ),
-            Err(e) => format!("[Errore eliminazione directory '{}': {}]", path_str, e),
+            Err(e) => format!("\u{274C} [Errore eliminazione directory '{}': {}]", path_str, e),
         }
     } else {
         match tokio::fs::remove_dir(target).await {
             Ok(()) => format!("Directory '{}' eliminata con successo", path_str),
             Err(e) => format!(
-                "[Errore eliminazione directory '{}': {} (se non e' vuota usa recursive:true)]",
+                "\u{274C} [Errore eliminazione directory '{}': {} (se non e' vuota usa recursive:true)]",
                 path_str, e
             ),
         }
@@ -1288,22 +1293,22 @@ async fn delete_directory(target: &Path, path_str: &str, recursive: bool) -> Str
 
 pub async fn tool_rename_file(ctx: &ToolContextCore, input: &Value) -> String {
     if !ctx.can_write {
-        return "[Errore: permesso di scrittura non concesso su questo progetto]".to_string();
+        return "\u{274C} [Errore: permesso di scrittura non concesso su questo progetto]".to_string();
     }
     let from_str = match input.get("from").and_then(Value::as_str) {
         Some(s) => s,
-        None => return "[Errore: parametro 'from' mancante]".to_string(),
+        None => return "\u{274C} [Errore: parametro 'from' mancante]".to_string(),
     };
     let to_str = match input.get("to").and_then(Value::as_str) {
         Some(s) => s,
-        None => return "[Errore: parametro 'to' mancante]".to_string(),
+        None => return "\u{274C} [Errore: parametro 'to' mancante]".to_string(),
     };
 
     let from = match resolve_relative_path(&ctx.root_path, from_str) {
         Ok(p) => p,
         Err(e) => {
             return format!(
-                "[Errore percorso sorgente: {}]",
+                "\u{274C} [Errore percorso sorgente: {}]",
                 e.1["error"].as_str().unwrap_or("path error")
             )
         }
@@ -1314,18 +1319,18 @@ pub async fn tool_rename_file(ctx: &ToolContextCore, input: &Value) -> String {
     // de-duplica la root come per la sorgente e blocca traversal/uscita dalla root.
     let to = match resolve_write_target(&ctx.root_path, to_str) {
         Ok(p) => p,
-        Err(e) => return format!("[Errore percorso destinazione: {e}]"),
+        Err(e) => return format!("\u{274C} [Errore percorso destinazione: {e}]"),
     };
 
     if let Some(parent) = to.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return format!("[Errore creazione directory destinazione: {}]", e);
+            return format!("\u{274C} [Errore creazione directory destinazione: {}]", e);
         }
     }
 
     match tokio::fs::rename(&from, &to).await {
         Ok(()) => format!("Rinominato '{}' → '{}'", from_str, to_str),
-        Err(e) => format!("[Errore rinomina '{}' → '{}': {}]", from_str, to_str, e),
+        Err(e) => format!("\u{274C} [Errore rinomina '{}' → '{}': {}]", from_str, to_str, e),
     }
 }
 
@@ -1468,7 +1473,7 @@ fn build_old_string_ambiguous_message(
     // messaggio testuale storico — meglio che un estratto vuoto.
     if hit_lines.is_empty() {
         return format!(
-            "[Errore: old_string trovato {} volte in '{}'. Deve essere unico: aggiungi piu' contesto (righe circostanti) per renderlo univoco.]",
+            "\u{274C} [Errore: old_string trovato {} volte in '{}'. Deve essere unico: aggiungi piu' contesto (righe circostanti) per renderlo univoco.]",
             count, path_str
         );
     }
@@ -1485,7 +1490,7 @@ fn build_old_string_ambiguous_message(
     };
 
     format!(
-        "[Errore: old_string trovato {count} volte in '{path}' \u{2014} deve essere UNICO.{more}\n\
+        "\u{274C} [Errore: old_string trovato {count} volte in '{path}' \u{2014} deve essere UNICO.{more}\n\
         \u{26a0} NON chiamare read_file: il contesto delle occorrenze e' gia' qui sotto.\n\
         Aggiungi al tuo old_string abbastanza righe circostanti (prese dall'estratto numerato) \
         da identificare UNA SOLA occorrenza, poi riprova:\n\n\
@@ -1609,7 +1614,7 @@ fn build_old_string_not_found_message(
     };
 
     format!(
-        "[Errore: old_string non trovato nel file '{}'.{approx_hint}\n\
+        "\u{274C} [Errore: old_string non trovato nel file '{}'.{approx_hint}\n\
         \u{26a0} NON chiamare read_file o read_file_lines \u{2014} il contenuto del file e' gia' incluso qui sotto.\n\
         Confronta il tuo old_string con le righe reali e correggi spazi, newline o testo che differiscono:\n\n\
         {header_label}:\n{excerpt}{more_hint}]",
@@ -1626,25 +1631,25 @@ fn read_edit_params<'a>(
     input: &'a Value,
 ) -> Result<(&'a str, &'a str, &'a str), String> {
     if !ctx.can_write {
-        return Err("[Errore: permesso di scrittura non concesso su questo progetto]".to_string());
+        return Err("\u{274C} [Errore: permesso di scrittura non concesso su questo progetto]".to_string());
     }
     let path_str = input
         .get("path")
         .and_then(Value::as_str)
-        .ok_or_else(|| "[Errore: parametro 'path' mancante]".to_string())?;
+        .ok_or_else(|| "\u{274C} [Errore: parametro 'path' mancante]".to_string())?;
     if !ctx.is_nexus_operator {
         if let Some(pattern) = is_protected_path(path_str) {
-            return Err(format!("[Errore: il file '{}' è protetto (pattern: '{}') e non può essere modificato dall'agente.]", path_str, pattern));
+            return Err(format!("\u{274C} [Errore: il file '{}' è protetto (pattern: '{}') e non può essere modificato dall'agente.]", path_str, pattern));
         }
     }
     let old_string = input
         .get("old_string")
         .and_then(Value::as_str)
-        .ok_or_else(|| "[Errore: parametro 'old_string' mancante]".to_string())?;
+        .ok_or_else(|| "\u{274C} [Errore: parametro 'old_string' mancante]".to_string())?;
     let new_string = input
         .get("new_string")
         .and_then(Value::as_str)
-        .ok_or_else(|| "[Errore: parametro 'new_string' mancante]".to_string())?;
+        .ok_or_else(|| "\u{274C} [Errore: parametro 'new_string' mancante]".to_string())?;
     Ok((path_str, old_string, new_string))
 }
 
@@ -1666,7 +1671,7 @@ pub async fn tool_edit_file(ctx: &ToolContextCore, input: &Value) -> String {
 
     // Preflight build graph (ADR 0020).
     let bg_warning = match run_build_graph_preflight(ctx, path_str).await {
-        BuildGraphPreflight::Block(msg) => return format!("[Errore: {}]", msg),
+        BuildGraphPreflight::Block(msg) => return format!("\u{274C} [Errore: {}]", msg),
         BuildGraphPreflight::Warn(msg) => Some(msg),
         BuildGraphPreflight::Allow => None,
     };
@@ -1675,7 +1680,7 @@ pub async fn tool_edit_file(ctx: &ToolContextCore, input: &Value) -> String {
         Ok(p) => p,
         Err(e) => {
             return format!(
-                "[Errore percorso: {}]",
+                "\u{274C} [Errore percorso: {}]",
                 e.1["error"].as_str().unwrap_or("path error")
             )
         }
@@ -1698,7 +1703,7 @@ async fn edit_matched_content(
 ) -> String {
     let raw_content = match tokio::fs::read_to_string(target).await {
         Ok(c) => c,
-        Err(e) => return format!("[Errore lettura '{}': {}]", path_str, e),
+        Err(e) => return format!("\u{274C} [Errore lettura '{}': {}]", path_str, e),
     };
 
     // Normalizza CRLF → LF per matching consistente (il code block nel prompt è sempre LF).
@@ -1820,7 +1825,7 @@ async fn apply_edit_and_persist(
                 None => base,
             }
         }
-        Err(e) => format!("[Errore scrittura '{}': {}]", path_str, e),
+        Err(e) => format!("\u{274C} [Errore scrittura '{}': {}]", path_str, e),
     }
 }
 
@@ -1836,17 +1841,17 @@ fn spawn_edit_reindex(ctx: &ToolContextCore, target: &Path, path_str: &str) {
 /// Crea una directory con semantica `-p` (idempotente, crea genitori).
 pub async fn tool_fs_mkdir(ctx: &ToolContextCore, input: &Value) -> String {
     if !ctx.can_write {
-        return "[Errore: permesso di scrittura non concesso su questo progetto]".to_string();
+        return "\u{274C} [Errore: permesso di scrittura non concesso su questo progetto]".to_string();
     }
     let path_str = match input.get("path").and_then(Value::as_str) {
         Some(s) => s,
-        None => return "[Errore: parametro 'path' mancante]".to_string(),
+        None => return "\u{274C} [Errore: parametro 'path' mancante]".to_string(),
     };
     let target = match resolve_relative_path(&ctx.root_path, path_str) {
         Ok(p) => p,
         Err(e) => {
             return format!(
-                "[Errore percorso: {}]",
+                "\u{274C} [Errore percorso: {}]",
                 e.1["error"].as_str().unwrap_or("path error")
             )
         }
@@ -1856,22 +1861,22 @@ pub async fn tool_fs_mkdir(ctx: &ToolContextCore, input: &Value) -> String {
     }
     match tokio::fs::create_dir_all(&target).await {
         Ok(()) => format!("Directory '{}' creata con successo", path_str),
-        Err(e) => format!("[Errore creazione directory '{}': {}]", path_str, e),
+        Err(e) => format!("\u{274C} [Errore creazione directory '{}': {}]", path_str, e),
     }
 }
 
 /// Copia un file o una directory (ricorsiva) dentro la root del progetto.
 pub async fn tool_fs_copy(ctx: &ToolContextCore, input: &Value) -> String {
     if !ctx.can_write {
-        return "[Errore: permesso di scrittura non concesso su questo progetto]".to_string();
+        return "\u{274C} [Errore: permesso di scrittura non concesso su questo progetto]".to_string();
     }
     let from_str = match input.get("from").and_then(Value::as_str) {
         Some(s) => s,
-        None => return "[Errore: parametro 'from' mancante]".to_string(),
+        None => return "\u{274C} [Errore: parametro 'from' mancante]".to_string(),
     };
     let to_str = match input.get("to").and_then(Value::as_str) {
         Some(s) => s,
-        None => return "[Errore: parametro 'to' mancante]".to_string(),
+        None => return "\u{274C} [Errore: parametro 'to' mancante]".to_string(),
     };
     let overwrite = input
         .get("overwrite")
@@ -1884,12 +1889,12 @@ pub async fn tool_fs_copy(ctx: &ToolContextCore, input: &Value) -> String {
     };
 
     if !from.exists() {
-        return format!("[Errore: sorgente '{}' non esiste]", from_str);
+        return format!("\u{274C} [Errore: sorgente '{}' non esiste]", from_str);
     }
 
     if to.exists() && !overwrite {
         return format!(
-            "[Errore: destinazione '{}' esiste gia'. Usa overwrite:true per sovrascrivere]",
+            "\u{274C} [Errore: destinazione '{}' esiste gia'. Usa overwrite:true per sovrascrivere]",
             to_str
         );
     }
@@ -1904,7 +1909,7 @@ async fn copy_from_to(from: &Path, to: &Path, from_str: &str, to_str: &str) -> S
         // Crea directory genitore se non esiste
         if let Some(parent) = to.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                return format!("[Errore creazione directory destinazione: {}]", e);
+                return format!("\u{274C} [Errore creazione directory destinazione: {}]", e);
             }
         }
         match tokio::fs::copy(from, to).await {
@@ -1912,7 +1917,7 @@ async fn copy_from_to(from: &Path, to: &Path, from_str: &str, to_str: &str) -> S
                 "File copiato '{}' -> '{}' ({} byte)",
                 from_str, to_str, bytes
             ),
-            Err(e) => format!("[Errore copia file: {}]", e),
+            Err(e) => format!("\u{274C} [Errore copia file: {}]", e),
         }
     } else if from.is_dir() {
         match copy_dir_recursive(from, to).await {
@@ -1920,10 +1925,10 @@ async fn copy_from_to(from: &Path, to: &Path, from_str: &str, to_str: &str) -> S
                 "Directory copiata '{}' -> '{}' ({} file)",
                 from_str, to_str, count
             ),
-            Err(e) => format!("[Errore copia directory: {}]", e),
+            Err(e) => format!("\u{274C} [Errore copia directory: {}]", e),
         }
     } else {
-        format!("[Errore: '{}' non e' un file ne' una directory]", from_str)
+        format!("\u{274C} [Errore: '{}' non e' un file ne' una directory]", from_str)
     }
 }
 
@@ -1963,13 +1968,13 @@ fn resolve_from_to(
 ) -> Result<(PathBuf, PathBuf), String> {
     let from = resolve_relative_path(root, from_str).map_err(|e| {
         format!(
-            "[Errore percorso sorgente: {}]",
+            "\u{274C} [Errore percorso sorgente: {}]",
             e.1["error"].as_str().unwrap_or("path error")
         )
     })?;
     let to = resolve_relative_path(root, to_str).map_err(|e| {
         format!(
-            "[Errore percorso destinazione: {}]",
+            "\u{274C} [Errore percorso destinazione: {}]",
             e.1["error"].as_str().unwrap_or("path error")
         )
     })?;
@@ -1979,15 +1984,15 @@ fn resolve_from_to(
 /// Sposta (rinomina) un file o una directory. Atomico se sullo stesso filesystem.
 pub async fn tool_fs_move(ctx: &ToolContextCore, input: &Value) -> String {
     if !ctx.can_write {
-        return "[Errore: permesso di scrittura non concesso su questo progetto]".to_string();
+        return "\u{274C} [Errore: permesso di scrittura non concesso su questo progetto]".to_string();
     }
     let from_str = match input.get("from").and_then(Value::as_str) {
         Some(s) => s,
-        None => return "[Errore: parametro 'from' mancante]".to_string(),
+        None => return "\u{274C} [Errore: parametro 'from' mancante]".to_string(),
     };
     let to_str = match input.get("to").and_then(Value::as_str) {
         Some(s) => s,
-        None => return "[Errore: parametro 'to' mancante]".to_string(),
+        None => return "\u{274C} [Errore: parametro 'to' mancante]".to_string(),
     };
 
     let (from, to) = match resolve_from_to(&ctx.root_path, from_str, to_str) {
@@ -1996,22 +2001,22 @@ pub async fn tool_fs_move(ctx: &ToolContextCore, input: &Value) -> String {
     };
 
     if !from.exists() {
-        return format!("[Errore: sorgente '{}' non esiste]", from_str);
+        return format!("\u{274C} [Errore: sorgente '{}' non esiste]", from_str);
     }
     if to.exists() {
-        return format!("[Errore: destinazione '{}' esiste gia']", to_str);
+        return format!("\u{274C} [Errore: destinazione '{}' esiste gia']", to_str);
     }
 
     // Crea directory genitore se non esiste
     if let Some(parent) = to.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return format!("[Errore creazione directory destinazione: {}]", e);
+            return format!("\u{274C} [Errore creazione directory destinazione: {}]", e);
         }
     }
 
     match tokio::fs::rename(&from, &to).await {
         Ok(()) => format!("Spostato '{}' -> '{}'", from_str, to_str),
-        Err(e) => format!("[Errore spostamento: {}]", e),
+        Err(e) => format!("\u{274C} [Errore spostamento: {}]", e),
     }
 }
 
@@ -2171,6 +2176,61 @@ mod tests {
         );
     }
 
+    // ── tool_list_files: produttore REALE (non righe fabbricate a mano) ──────
+    //
+    // `check_file_exists`/`build_project_context` interpretavano il testo di
+    // QUESTO tool con vocabolari propri (regola O): questi test lo eseguono
+    // davvero, su un tempdir vero, e fissano cio' che produce davvero — non
+    // cio' che un consumatore assumeva producesse.
+
+    #[tokio::test]
+    async fn list_files_salta_i_dotfile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("README.md"), "x").expect("seed");
+        std::fs::write(dir.path().join(".env"), "SECRET=1").expect("seed");
+        let hooks = Arc::new(HookRegistranti::default());
+        let ctx = ctx_di_prova(dir.path().to_path_buf(), hooks);
+
+        let out = super::tool_list_files(&ctx, &serde_json::json!({})).await;
+
+        assert!(out.contains("README.md"), "listing: {out}");
+        // Il dotfile NON compare nel listing per un umano: e' proprio la ragione
+        // per cui `file_exists` non puo' piu' fidarsi di questo testo per
+        // decidere se un file esiste (deve interrogare il filesystem).
+        assert!(!out.contains(".env"), "listing: {out}");
+    }
+
+    #[tokio::test]
+    async fn list_files_directory_vuota_non_e_un_fallimento() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks = Arc::new(HookRegistranti::default());
+        let ctx = ctx_di_prova(dir.path().to_path_buf(), hooks);
+
+        let out = super::tool_list_files(&ctx, &serde_json::json!({})).await;
+
+        // Una directory VUOTA E' un successo (list_dir e' riuscita, semplicemente
+        // non ha trovato voci): il vecchio testo "vuota o non trovata" affermava
+        // anche il contrario, e un consumatore ci cercava "non trovat*" dentro
+        // per dedurre un fallimento che non c'era mai stato.
+        assert!(!nexus_types::tool_outcome::is_tool_failure(&out), "{out}");
+        assert!(!out.to_lowercase().contains("non trovata"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn list_files_directory_assente_dichiara_il_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks = Arc::new(HookRegistranti::default());
+        let ctx = ctx_di_prova(dir.path().to_path_buf(), hooks);
+
+        let out = super::tool_list_files(&ctx, &serde_json::json!({ "directory": "assente" }))
+            .await;
+
+        // QUESTO e' un fallimento vero (read_dir su un path che non esiste), e
+        // deve dichiararlo col contratto macchina: prima non lo faceva mai, e
+        // `is_error` restava falso anche qui.
+        assert!(nexus_types::tool_outcome::is_tool_failure(&out), "{out}");
+    }
+
     /// Il gate e' BLOCCANTE: se `enforce_on_write` rifiuta, il file non deve
     /// esistere e nessun hook successivo deve partire. Mutazione che rende
     /// rosso: ignorare il valore di ritorno del gate e proseguire.
@@ -2179,7 +2239,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let hooks = Arc::new(HookRegistranti {
             eventi: Mutex::new(Vec::new()),
-            rifiuto: Some("[Errore: porta hardcoded]".to_string()),
+            rifiuto: Some("\u{274C} [Errore: porta hardcoded]".to_string()),
         });
         let ctx = ctx_di_prova(dir.path().to_path_buf(), hooks.clone());
 
@@ -2189,7 +2249,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(out, "[Errore: porta hardcoded]");
+        assert_eq!(out, "\u{274C} [Errore: porta hardcoded]");
         assert_eq!(hooks.eventi(), vec!["enforce:write_file:note.txt".to_string()]);
         assert!(
             !dir.path().join("note.txt").exists(),
@@ -2395,7 +2455,7 @@ mod tests {
 
         // 1. Messaggio originale conservato.
         assert!(
-            msg.starts_with("[Errore: old_string non trovato nel file 'src/lib.rs'."),
+            msg.starts_with("\u{274C} [Errore: old_string non trovato nel file 'src/lib.rs'."),
             "header originale non preservato: {}",
             msg
         );

@@ -28,7 +28,7 @@ fn is_allowed_flag(key: &str) -> bool {
 pub async fn tool_dispatcher_emit_event(ctx: &ToolContextCore, input: &Value) -> String {
     let event_name = match input.get("kind").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
-        _ => return "[Errore: parametro 'kind' obbligatorio]".to_string(),
+        _ => return "\u{274C} [Errore: parametro 'kind' obbligatorio]".to_string(),
     };
     let resource = input
         .get("resource")
@@ -63,13 +63,13 @@ pub async fn tool_dispatcher_post_notification(
         .to_string();
     if !["info", "success", "warning", "error"].contains(&severity.as_str()) {
         return format!(
-            "[Errore: severity '{}' non valida. Valori ammessi: info, success, warning, error]",
+            "\u{274C} [Errore: severity '{}' non valida. Valori ammessi: info, success, warning, error]",
             severity
         );
     }
     let message = match input.get("message").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
-        _ => return "[Errore: parametro 'message' obbligatorio]".to_string(),
+        _ => return "\u{274C} [Errore: parametro 'message' obbligatorio]".to_string(),
     };
     let panel = input
         .get("panel")
@@ -96,15 +96,15 @@ pub async fn tool_dispatcher_post_notification(
 
 pub async fn tool_dispatcher_set_flag(ctx: &ToolContextCore, input: &Value) -> String {
     if !ctx.can_write {
-        return "[Errore: permesso di scrittura non concesso]".to_string();
+        return "\u{274C} [Errore: permesso di scrittura non concesso]".to_string();
     }
     let key = match input.get("key").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
-        _ => return "[Errore: parametro 'key' obbligatorio]".to_string(),
+        _ => return "\u{274C} [Errore: parametro 'key' obbligatorio]".to_string(),
     };
     if !is_allowed_flag(&key) {
         return format!(
-            "[Errore: chiave '{}' non ammessa. Prefissi consentiti: {}]",
+            "\u{274C} [Errore: chiave '{}' non ammessa. Prefissi consentiti: {}]",
             key,
             FLAG_KEY_PREFIXES.join(", ")
         );
@@ -124,7 +124,7 @@ pub async fn tool_dispatcher_set_flag(ctx: &ToolContextCore, input: &Value) -> S
     .await;
 
     if let Err(e) = res {
-        return format!("[Errore DB: {}]", e);
+        return format!("\u{274C} [Errore DB: {}]", e);
     }
 
     let env = dispatcher::emit(
@@ -144,11 +144,11 @@ pub async fn tool_dispatcher_update_monitor(
 ) -> String {
     let monitor_id = match input.get("monitor_id").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
-        _ => return "[Errore: parametro 'monitor_id' obbligatorio]".to_string(),
+        _ => return "\u{274C} [Errore: parametro 'monitor_id' obbligatorio]".to_string(),
     };
     let value = match input.get("value") {
         Some(v) => v.clone(),
-        None => return "[Errore: parametro 'value' obbligatorio]".to_string(),
+        None => return "\u{274C} [Errore: parametro 'value' obbligatorio]".to_string(),
     };
     let label = input
         .get("label")
@@ -176,7 +176,7 @@ pub async fn tool_dispatcher_highlight_panel(
 ) -> String {
     let panel = match input.get("panel").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
-        _ => return "[Errore: parametro 'panel' obbligatorio]".to_string(),
+        _ => return "\u{274C} [Errore: parametro 'panel' obbligatorio]".to_string(),
     };
     let duration_ms = input
         .get("duration_ms")

@@ -70,7 +70,17 @@ impl ToolRunnerService {
     /// Il brain e' trusted: non applichiamo qui il check di accesso
     /// (avviene gia' a monte negli handler chat di mcp-core al momento
     /// dell'invio del messaggio utente).
-    async fn resolve_session(&self, session_id: Uuid) -> Result<SessionInfo, Status> {
+    /// PUNTO UNICO (regola L) della root REALE di una sessione: la stessa che
+    /// [`Self::build_ctx_with_root`] usa per il ctx dei tool (`COALESCE(
+    /// repositories.root_path, workspaces.absolute_path)`). Un consumatore che
+    /// avesse bisogno SOLO della root — non dell'intero `AgentToolContext` —
+    /// deve chiamare questo, non re-implementare la query: `projects.
+    /// repository_root_path` (letta altrove per popolare l'HTTP endpoint del
+    /// final_gate) e' una colonna diversa, mai aggiornata da un "port" del
+    /// progetto, e usarla al posto di questa da' al chiamante un'idea
+    /// dell'albero del run STALE rispetto a dove i tool scrivono davvero
+    /// (regola O: la misura deve raggiungere l'oggetto come la produzione).
+    pub(crate) async fn resolve_session(&self, session_id: Uuid) -> Result<SessionInfo, Status> {
         // Separazione DB (sempre attiva, mig 0527): `chat_sessions` vive nel DB
         // per-progetto, mentre `projects`/`project_members`/`workspaces`/
         // `repositories` restano nel meta. Il JOIN cross-DB non e' eseguibile su
@@ -258,13 +268,13 @@ impl ToolRunnerService {
     }
 }
 
-struct SessionInfo {
-    project_id: Uuid,
-    user_id: Uuid,
-    root_path: PathBuf,
-    is_git_repo: bool,
-    can_write: bool,
-    user_role: String,
+pub(crate) struct SessionInfo {
+    pub(crate) project_id: Uuid,
+    pub(crate) user_id: Uuid,
+    pub(crate) root_path: PathBuf,
+    pub(crate) is_git_repo: bool,
+    pub(crate) can_write: bool,
+    pub(crate) user_role: String,
 }
 
 /// PUNTO UNICO (regola L) della decisione root + isolamento del ctx tool.
@@ -277,7 +287,7 @@ struct SessionInfo {
 ///
 /// Funzione pura (nessun I/O): la regola di override e' definita in un solo posto
 /// e coperta da unit test senza DB.
-fn resolve_ctx_root(session_root: PathBuf, override_root: Option<&Path>) -> (PathBuf, bool) {
+pub(crate) fn resolve_ctx_root(session_root: PathBuf, override_root: Option<&Path>) -> (PathBuf, bool) {
     match override_root {
         Some(p) => (p.to_path_buf(), true),
         None => (session_root, false),
@@ -307,15 +317,19 @@ pub(crate) fn extract_exit_code(result: &str) -> Option<i32> {
 
 /// `true` se il risultato testuale di un tool e' un ERRORE applicativo.
 ///
-/// PUNTO UNICO (regola L) della derivazione `is_error` dal testo del tool: il
-/// contratto e' "il risultato inizia col marker `\u{274C}`" (prodotto dal
-/// resolver `agent_tools::tool_not_found` e dai tool su fallimento). Prima questa
-/// stessa condizione (`trim_start().starts_with('\u{274C}')`) era scritta in
-/// `execute_tool`; ora la usano sia il path gRPC sia l'adapter `ToolExecutor` del
-/// grafo Rust, cosi' Real (output di `execute_agent_tool`) e Replay (testo riletto
-/// da `agent_steps`) classificano l'errore allo stesso modo.
+/// Traduce nel vocabolario di mcp-core il CONTRATTO dichiarato in
+/// [`nexus_types::tool_outcome`], a cui delega: il criterio "cosa conta come
+/// fallimento di un tool" e' uno solo, e vive accanto al costruttore che i tool
+/// usano per dichiararlo (regola L). Scriverlo di nuovo qui — com'era, con la
+/// condizione `trim_start().starts_with('\u{274C}')` ricopiata — significava
+/// tenere il lettore e lo scrittore del contratto in due crate che non si
+/// vedono, liberi di divergere in silenzio.
+///
+/// La usano sia il path gRPC sia l'adapter `ToolExecutor` del grafo Rust, cosi'
+/// Real (output di `execute_agent_tool`) e Replay (testo riletto da
+/// `agent_steps`) classificano l'errore allo stesso modo.
 pub(crate) fn tool_result_is_error(result: &str) -> bool {
-    result.trim_start().starts_with('\u{274C}')
+    nexus_types::tool_outcome::is_tool_failure(result)
 }
 
 #[tonic::async_trait]

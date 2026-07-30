@@ -1474,6 +1474,48 @@ else
   fail=1
 fi
 
+
+# «Questo tool ha fallito?» (2026-07-30, censimento confronti semantici)
+#
+# I tool agente ritornano una String nuda: l'unico canale d'errore e' il
+# marker U+274C in testa al risultato (nexus-types::tool_outcome). Tre
+# consumatori (anti-loop, final_gate, supervisore) lo leggevano prima da un
+# vocabolario testuale ricopiato a mano in piu' punti — regola L violata dalla
+# fonte. tool_failure/is_tool_failure devono restare gli UNICI costruttore e
+# riconoscitore del contratto: se ricompaiono altrove, il prossimo consumatore
+# torna a indovinare.
+assert_single "contratto-fallimento-tool" 'fn tool_failure\(|fn is_tool_failure\(' \
+  'crates/nexus-types/src/tool_outcome.rs' crates
+
+# Il guard che conta: nessuna riga di CODICE (non commenti, non test — dove
+# asserire che un produttore emetta il marker e' la fixture legittima, non una
+# violazione) ricostruisce a mano la condizione che is_tool_failure incapsula
+# (`.starts_with()` sul marker). E' esattamente la duplicazione che c'era prima
+# di questo fix fra tool_runner_server.rs e signals.rs, con vocabolari
+# leggermente diversi che potevano divergere in silenzio. Il filtro commenti/test
+# passa da awk (stessa forma di `stile-applicato`/`focus-non-legge-la-cronologia`
+# sopra); il match sul marker passa da grep -F (stringa fissa, niente ambiguita'
+# di escape fra bash/awk/regex sulla sequenza `\u{274C}`).
+contratto_ricopiato=""
+for f in $(grep -rlF "starts_with(" --include='*.rs' \
+    --exclude-dir=target --exclude-dir=node_modules crates 2>/dev/null); do
+  [[ "$f" == "crates/nexus-types/src/tool_outcome.rs" ]] && continue
+  hit="$(awk '
+    /^#\[cfg\(test\)\]/ { exit }
+    /^[[:space:]]*\/\// { next }
+    { print NR ": " $0 }
+  ' "$f" | grep -F -e "starts_with('\u{274C}')" -e "starts_with('\u{274c}')" || true)"
+  [[ -n "$hit" ]] && contratto_ricopiato+="  $f"$'\n'"$hit"$'\n'
+done
+if [[ -n "$contratto_ricopiato" ]]; then
+  echo "!! contratto-fallimento-tool: la condizione del marker e' ricopiata a mano:" >&2
+  printf '%s' "$contratto_ricopiato" >&2
+  echo "   Chiama nexus_types::tool_outcome::is_tool_failure(risultato)." >&2
+  fail=1
+else
+  echo "OK contratto-fallimento-tool: nessun call site ricopia la condizione del marker"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

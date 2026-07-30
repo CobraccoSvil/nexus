@@ -291,10 +291,10 @@ struct ServiceLaunch {
 async fn validate_service_command(ctx: &AgentToolContext, input: &Value) -> Result<String, String> {
     let command = match input.get("command").and_then(Value::as_str) {
         Some(s) => s.to_string(),
-        None => return Err("[Errore: parametro 'command' mancante]".to_string()),
+        None => return Err("\u{274C} [Errore: parametro 'command' mancante]".to_string()),
     };
     if command.trim().is_empty() {
-        return Err("[Errore: comando vuoto]".to_string());
+        return Err("\u{274C} [Errore: comando vuoto]".to_string());
     }
     if let Some(msg) = crate::security::redaction_guard::enforce_no_redacted_placeholder(
         ctx,
@@ -619,7 +619,7 @@ async fn spawn_service_process(
         None,
     )
     .await
-    .map_err(|e| format!("[Errore avvio servizio '{}': {}]", label, e))
+    .map_err(|e| format!("\u{274C} [Errore avvio servizio '{}': {}]", label, e))
 }
 
 /// Legge l'output iniziale di un servizio appena avviato, registra la porta
@@ -955,7 +955,7 @@ fn resolve_service_work_dir(
     match resolve_relative_path(root, sub) {
         Ok(p) => Ok(p),
         Err(e) => Err(format!(
-            "[Errore percorso: {}]",
+            "\u{274C} [Errore percorso: {}]",
             e.1["error"].as_str().unwrap_or("path error")
         )),
     }
@@ -979,7 +979,7 @@ async fn refuse_if_same_scope_active(ctx: &AgentToolContext, kind: &str) -> Opti
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "?".to_string());
             Some(format!(
-                "[Errore: servizio '{}' di tipo {} gia' ATTIVO sulla porta {}. \
+                "\u{274C} [Errore: servizio '{}' di tipo {} gia' ATTIVO sulla porta {}. \
                  Riusalo invece di crearne uno nuovo (puoi accedere a http://localhost:{}). \
                  Se vuoi davvero riavviarlo usa `service_restart` con label='{}'.]",
                 res.label, kind, port, port, res.label
@@ -1022,7 +1022,7 @@ async fn check_container_quotas(
             Ok(p) => p,
             Err(e) => {
                 return Some(format!(
-                    "[Errore: DB del progetto non disponibile, quote container non verificabili: {e}]"
+                    "\u{274C} [Errore: DB del progetto non disponibile, quote container non verificabili: {e}]"
                 ))
             }
         };
@@ -1084,7 +1084,7 @@ async fn allocate_web_port_env(
         label,
     )
     .await
-    .map_err(|e| format!("[Errore porta per servizio '{}': {}]", label, e))?;
+    .map_err(|e| format!("\u{274C} [Errore porta per servizio '{}': {}]", label, e))?;
     Ok(Some(env))
 }
 
@@ -1167,7 +1167,7 @@ pub(super) async fn tool_read_service_output(ctx: &AgentToolContext, input: &Val
         // Se non specificato, leggi l'ultimo processo del progetto
         let rows = match crate::agent_processes::list_processes(&ctx.db, ctx.project_id).await {
             Ok(r) => r,
-            Err(e) => return format!("[Errore: {}]", e),
+            Err(e) => return format!("\u{274C} [Errore: {}]", e),
         };
         if rows.is_empty() {
             return "Nessun servizio avviato per questo progetto.".to_string();
@@ -1177,18 +1177,18 @@ pub(super) async fn tool_read_service_output(ctx: &AgentToolContext, input: &Val
             .await
         {
             Ok(info) => format_process_output(&info),
-            Err(e) => format!("[Errore lettura output: {}]", e),
+            Err(e) => format!("\u{274C} [Errore lettura output: {}]", e),
         }
     } else {
         let process_id = match Uuid::parse_str(process_id_str) {
             Ok(id) => id,
-            Err(_) => return "[Errore: process_id non valido]".to_string(),
+            Err(_) => return "\u{274C} [Errore: process_id non valido]".to_string(),
         };
         match crate::agent_processes::read_process_output(&ctx.db, ctx.project_id, process_id, 4000)
             .await
         {
             Ok(info) => format_process_output(&info),
-            Err(e) => format!("[Errore lettura output: {}]", e),
+            Err(e) => format!("\u{274C} [Errore lettura output: {}]", e),
         }
     }
 }
@@ -1197,11 +1197,11 @@ pub(super) async fn tool_read_service_output(ctx: &AgentToolContext, input: &Val
 pub(super) async fn tool_stop_service(ctx: &AgentToolContext, input: &Value) -> String {
     let process_id_str = match input.get("process_id").and_then(Value::as_str) {
         Some(s) => s,
-        None => return "[Errore: parametro 'process_id' mancante]".to_string(),
+        None => return "\u{274C} [Errore: parametro 'process_id' mancante]".to_string(),
     };
     let process_id = match Uuid::parse_str(process_id_str) {
         Ok(id) => id,
-        Err(_) => return "[Errore: process_id non valido]".to_string(),
+        Err(_) => return "\u{274C} [Errore: process_id non valido]".to_string(),
     };
     match crate::agent_processes::stop_process(&ctx.db, ctx.project_id, process_id).await {
         Ok(msg) => {
@@ -1214,7 +1214,7 @@ pub(super) async fn tool_stop_service(ctx: &AgentToolContext, input: &Value) -> 
             );
             msg
         }
-        Err(e) => format!("[Errore stop servizio: {}]", e),
+        Err(e) => format!("\u{274C} [Errore stop servizio: {}]", e),
     }
 }
 
@@ -1222,7 +1222,7 @@ pub(super) async fn tool_build_project_image(ctx: &AgentToolContext) -> String {
     use crate::sandbox::build_project_service_image;
     match build_project_service_image(ctx.project_id, &ctx.root_path, &ctx.root_path).await {
         Ok(tag) => format!("Immagine Docker progetto buildata con successo: {}. I servizi avviati con run_service useranno questa immagine.", tag),
-        Err(e) => format!("[Errore build immagine: {}]", e),
+        Err(e) => format!("\u{274C} [Errore build immagine: {}]", e),
     }
 }
 
@@ -1231,19 +1231,19 @@ pub(super) async fn tool_build_project_image(ctx: &AgentToolContext) -> String {
 pub(super) async fn tool_service_restart(ctx: &AgentToolContext, input: &Value) -> String {
     let label = match input.get("label").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
-        _ => return "[Errore: parametro 'label' obbligatorio]".to_string(),
+        _ => return "\u{274C} [Errore: parametro 'label' obbligatorio]".to_string(),
     };
 
     // Cerca il processo esistente con questa label per recuperare il comando
     let existing = match crate::agent_processes::list_processes(&ctx.db, ctx.project_id).await {
         Ok(r) => r,
-        Err(e) => return format!("[Errore lista processi: {}]", e),
+        Err(e) => return format!("\u{274C} [Errore lista processi: {}]", e),
     };
 
     let matching: Vec<_> = existing.iter().filter(|p| p.label == label).collect();
     if matching.is_empty() {
         return format!(
-            "[Errore: nessun servizio trovato con label '{}'. Usa run_service per avviarlo.]",
+            "\u{274C} [Errore: nessun servizio trovato con label '{}'. Usa run_service per avviarlo.]",
             label
         );
     }
@@ -1323,7 +1323,7 @@ async fn stop_matching_processes(
         if let Err(e) = crate::agent_processes::stop_process(&ctx.db, ctx.project_id, proc.id).await
         {
             return Err(format!(
-                "[Errore restart '{}': stop del processo esistente non verificato: {}]",
+                "\u{274C} [Errore restart '{}': stop del processo esistente non verificato: {}]",
                 label, e
             ));
         }
@@ -1364,7 +1364,7 @@ pub(super) async fn tool_tail_service_logs(ctx: &AgentToolContext, input: &Value
         .await
         {
             Ok(info) => format_process_output(&info),
-            Err(e) => format!("[Errore lettura output: {}]", e),
+            Err(e) => format!("\u{274C} [Errore lettura output: {}]", e),
         };
     }
 
@@ -1380,11 +1380,11 @@ async fn resolve_process_id_or_last(
 ) -> Result<Uuid, String> {
     if !process_id_str.is_empty() {
         return Uuid::parse_str(process_id_str)
-            .map_err(|_| "[Errore: process_id non valido]".to_string());
+            .map_err(|_| "\u{274C} [Errore: process_id non valido]".to_string());
     }
     let rows = crate::agent_processes::list_processes(&ctx.db, ctx.project_id)
         .await
-        .map_err(|e| format!("[Errore: {}]", e))?;
+        .map_err(|e| format!("\u{274C} [Errore: {}]", e))?;
     match rows.first() {
         Some(p) => Ok(p.id),
         None => Err("Nessun servizio avviato per questo progetto.".to_string()),
@@ -1470,7 +1470,7 @@ fn append_new_output(
 pub(super) async fn tool_list_active_services(ctx: &AgentToolContext, _input: &Value) -> String {
     let rows = match crate::agent_processes::list_processes(&ctx.db, ctx.project_id).await {
         Ok(r) => r,
-        Err(e) => return format!("[Errore: {}]", e),
+        Err(e) => return format!("\u{274C} [Errore: {}]", e),
     };
 
     if rows.is_empty() {

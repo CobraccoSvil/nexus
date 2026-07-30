@@ -28,6 +28,7 @@ pub mod settings_dto;
 pub mod system_prompt;
 pub mod tiers;
 pub mod token_usage;
+pub mod tool_outcome;
 pub mod vector_dto;
 pub mod workspace_paths;
 pub use routing_client::resolve_purpose_via_http;

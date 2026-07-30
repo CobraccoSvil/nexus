@@ -29,7 +29,7 @@ pub async fn tool_request_port(ctx: &AgentToolContext, input: &Value) -> String 
     let label = match label {
         Some(l) => l.to_string(),
         None => {
-            return "[Errore: parametro 'label' obbligatorio (es. 'backend-dev', 'frontend-dev')]"
+            return "\u{274C} [Errore: parametro 'label' obbligatorio (es. 'backend-dev', 'frontend-dev')]"
                 .to_string();
         }
     };
@@ -63,7 +63,7 @@ pub async fn tool_request_port(ctx: &AgentToolContext, input: &Value) -> String 
             })
             .to_string()
         }
-        Err(e) => format!("[Errore allocazione porta: {}]", e),
+        Err(e) => format!("\u{274C} [Errore allocazione porta: {}]", e),
     }
 }
 
@@ -104,7 +104,7 @@ pub async fn tool_nexus_list_ports(ctx: &AgentToolContext, _input: &Value) -> St
             })
             .collect(),
         Err(e) => {
-            return format!("[Errore lettura allocazioni porte: {}]", e);
+            return format!("\u{274C} [Errore lettura allocazioni porte: {}]", e);
         }
     };
 

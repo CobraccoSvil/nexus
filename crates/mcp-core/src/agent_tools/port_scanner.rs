@@ -392,7 +392,7 @@ pub fn scan_content(path: &str, content: &str) -> PortScanOutcome {
 /// `None`. NON tocca le porte fuori-bucket (gestite da `scan_content`).
 fn format_unallocated_message(path: &str, findings: &[PortFinding]) -> String {
     let mut msg = format!(
-        "[Errore: scrittura su '{}' rifiutata. Sono state rilevate {} porta/e NON allocate a questo progetto.]\n\n\
+        "\u{274C} [Errore: scrittura su '{}' rifiutata. Sono state rilevate {} porta/e NON allocate a questo progetto.]\n\n\
          La porta non si sceglie a mano: chiedila a `request_port(label=\"...\")`, che ne \
          alloca una libera, la registra ed evita le collisioni con gli altri progetti e \
          con i servizi di Nexus. Poi scrivi ESATTAMENTE il numero che ti restituisce.\n\n\
@@ -603,7 +603,7 @@ fn audit_port_rejection(
 pub fn format_reject_message(path: &str, findings: &[PortFinding]) -> String {
     let mut msg = String::new();
     msg.push_str(&format!(
-        "[Errore: scrittura su '{}' rifiutata. Sono state rilevate {} porta/e TCP hardcoded fuori dal bucket Nexus (20000-39999).]\n",
+        "\u{274C} [Errore: scrittura su '{}' rifiutata. Sono state rilevate {} porta/e TCP hardcoded fuori dal bucket Nexus (20000-39999).]\n",
         path,
         findings.len()
     ));

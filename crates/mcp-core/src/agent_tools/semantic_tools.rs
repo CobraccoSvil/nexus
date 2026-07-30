@@ -235,10 +235,10 @@ pub(super) async fn tool_search_file_semantic(
     chunk_lines: usize,
 ) -> String {
     if query.is_empty() {
-        return "[Errore: parametro 'query' mancante]".to_string();
+        return "\u{274C} [Errore: parametro 'query' mancante]".to_string();
     }
     if path_str.is_empty() {
-        return "[Errore: parametro 'path' mancante]".to_string();
+        return "\u{274C} [Errore: parametro 'path' mancante]".to_string();
     }
 
     // Risolvi il percorso (supporta assoluti e relativi alla root progetto)
@@ -249,7 +249,7 @@ pub(super) async fn tool_search_file_semantic(
             Ok(p) => p,
             Err(e) => {
                 return format!(
-                    "[Errore percorso: {}]",
+                    "\u{274C} [Errore percorso: {}]",
                     e.1["error"].as_str().unwrap_or("path error")
                 )
             }
@@ -258,7 +258,7 @@ pub(super) async fn tool_search_file_semantic(
 
     let content = match tokio::fs::read_to_string(&target).await {
         Ok(c) => c,
-        Err(e) => return format!("[Errore lettura '{}': {}]", path_str, e),
+        Err(e) => return format!("\u{274C} [Errore lettura '{}': {}]", path_str, e),
     };
 
     let all_lines: Vec<&str> = content.lines().collect();
@@ -277,7 +277,7 @@ pub(super) async fn tool_search_file_semantic(
         .collect();
 
     if query_tokens.is_empty() {
-        return "[Errore: query non contiene termini di ricerca validi]".to_string();
+        return "\u{274C} [Errore: query non contiene termini di ricerca validi]".to_string();
     }
 
     // Overlap: 20% del chunk_lines per non perdere contesto ai bordi
