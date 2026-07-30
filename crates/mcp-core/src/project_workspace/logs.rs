@@ -62,9 +62,13 @@ fn sort_problems(items: &mut [Value]) {
 /// get_quality_findings). La vecchia `quality_findings` (mig 0001) non e' mai
 /// stata scritta da alcun INSERT — tabella morta — ed e' stata droppata
 /// (mig 0487). Il pannello "Problemi" e' la vista aggregata e include anche i
-/// quality finding, escludendo quelli gia' risolti (fixed_at) o marcati come
-/// falsi positivi (is_false_positive): stesso criterio di get_quality_findings
-/// e dell'evento FindingsUpdated emesso dall'auto-scan per-file.
+/// quality finding, escludendo quelli gia' risolti (fixed_at), marcati come
+/// falsi positivi (is_false_positive) o auto-soppressi dalla passata
+/// vettoriale N+1 (is_auto_suppressed): stesso criterio di
+/// get_quality_findings e dell'evento FindingsUpdated emesso dall'auto-scan
+/// per-file (regola L: prima `is_auto_suppressed` non compariva in nessuno
+/// dei tre, e un finding auto-soppresso comparso in tabella restava visibile
+/// ovunque senza spiegazione, difetto reale del 30/07/2026).
 async fn collect_quality_problems(
     db: &sqlx::PgPool,
     project_id: Uuid,
@@ -76,6 +80,7 @@ async fn collect_quality_problems(
         WHERE project_id = $1
           AND fixed_at IS NULL
           AND (is_false_positive = FALSE OR is_false_positive IS NULL)
+          AND (is_auto_suppressed = FALSE OR is_auto_suppressed IS NULL)
         ORDER BY scanned_at DESC
         LIMIT 100
         "#,

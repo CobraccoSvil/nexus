@@ -1782,7 +1782,8 @@ async fn dashboard(State(state): State<AppState>) -> Json<serde_json::Value> {
     // cronico 0 in dashboard. "Aperto" = non risolto e non falso positivo.
     let quality_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM project_quality_findings \
-         WHERE fixed_at IS NULL AND (is_false_positive = FALSE OR is_false_positive IS NULL)",
+         WHERE fixed_at IS NULL AND (is_false_positive = FALSE OR is_false_positive IS NULL) \
+         AND (is_auto_suppressed = FALSE OR is_auto_suppressed IS NULL)",
     )
     .fetch_one(&state.db)
     .await

@@ -942,6 +942,19 @@ async fn query_findings_filtered(
     }
 }
 
+/// Condizione WHERE di un finding ATTIVO (regola L): non falso positivo NE'
+/// auto-soppresso dalla passata vettoriale N+1 (vedi `classify_n_plus_one`).
+/// Le query di lista/conteggio che alimentano il pannello Ottimizzazione, il
+/// pannello Problemi e l'evento `FindingsUpdated` ripetevano identico il solo
+/// filtro `is_false_positive`: quando la passata vettoriale ha guadagnato la
+/// propria esclusione (`is_auto_suppressed`, mig 0637) e' rimasta FUORI da
+/// tutte queste query — il conteggio calcolato a fine scansione
+/// (`count_findings_into`, che la rispetta) e la lista/i conteggi riletti dal
+/// pannello (che non la rispettavano) potevano quindi mostrare due totali
+/// diversi per la stessa scansione (difetto reale, 30/07/2026).
+const ACTIVE_FINDING_FILTER_SQL: &str = "(is_false_positive = FALSE OR is_false_positive IS NULL) \
+     AND (is_auto_suppressed = FALSE OR is_auto_suppressed IS NULL)";
+
 /// Caso `severity == "all" && category == "all"`: tutti i finding non
 /// falsi-positivi, ordinati per severity poi file_path.
 async fn query_findings_all_severities(
@@ -949,13 +962,13 @@ async fn query_findings_all_severities(
     project_id: Uuid,
     limit: i64,
 ) -> Result<Vec<sqlx::postgres::PgRow>, sqlx::Error> {
-    sqlx::query(
+    sqlx::query(&format!(
         "SELECT id, file_path, category, severity, title, detail, line_number, fixed_at, scanned_at, confidence, context_snippet, related_files \
          FROM project_quality_findings \
-         WHERE project_id = $1 AND (is_false_positive = FALSE OR is_false_positive IS NULL) \
+         WHERE project_id = $1 AND {ACTIVE_FINDING_FILTER_SQL} \
          ORDER BY CASE severity WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, file_path \
-         LIMIT $2",
-    )
+         LIMIT $2"
+    ))
     .bind(project_id)
     .bind(limit)
     .fetch_all(db)
@@ -972,32 +985,32 @@ async fn query_findings_by_severity(
 ) -> Result<Vec<sqlx::postgres::PgRow>, sqlx::Error> {
     match severity {
         "all" => query_findings_all_severities(db, project_id, limit).await,
-        "high" => sqlx::query(
+        "high" => sqlx::query(&format!(
             "SELECT id, file_path, category, severity, title, detail, line_number, fixed_at, scanned_at, confidence, context_snippet, related_files \
              FROM project_quality_findings \
-             WHERE project_id = $1 AND severity = 'high' AND (is_false_positive = FALSE OR is_false_positive IS NULL) \
-             ORDER BY file_path LIMIT $2",
-        )
+             WHERE project_id = $1 AND severity = 'high' AND {ACTIVE_FINDING_FILTER_SQL} \
+             ORDER BY file_path LIMIT $2"
+        ))
         .bind(project_id)
         .bind(limit)
         .fetch_all(db)
         .await,
-        "medium" => sqlx::query(
+        "medium" => sqlx::query(&format!(
             "SELECT id, file_path, category, severity, title, detail, line_number, fixed_at, scanned_at, confidence, context_snippet, related_files \
              FROM project_quality_findings \
-             WHERE project_id = $1 AND severity IN ('high','medium') AND (is_false_positive = FALSE OR is_false_positive IS NULL) \
-             ORDER BY CASE severity WHEN 'high' THEN 1 ELSE 2 END, file_path LIMIT $2",
-        )
+             WHERE project_id = $1 AND severity IN ('high','medium') AND {ACTIVE_FINDING_FILTER_SQL} \
+             ORDER BY CASE severity WHEN 'high' THEN 1 ELSE 2 END, file_path LIMIT $2"
+        ))
         .bind(project_id)
         .bind(limit)
         .fetch_all(db)
         .await,
-        _ => sqlx::query(
+        _ => sqlx::query(&format!(
             "SELECT id, file_path, category, severity, title, detail, line_number, fixed_at, scanned_at, confidence, context_snippet, related_files \
              FROM project_quality_findings \
-             WHERE project_id = $1 AND severity = $2 AND (is_false_positive = FALSE OR is_false_positive IS NULL) \
-             ORDER BY file_path LIMIT $3",
-        )
+             WHERE project_id = $1 AND severity = $2 AND {ACTIVE_FINDING_FILTER_SQL} \
+             ORDER BY file_path LIMIT $3"
+        ))
         .bind(project_id)
         .bind(severity)
         .bind(limit)
@@ -1013,12 +1026,12 @@ async fn query_findings_by_category(
     category: &str,
     limit: i64,
 ) -> Result<Vec<sqlx::postgres::PgRow>, sqlx::Error> {
-    sqlx::query(
+    sqlx::query(&format!(
         "SELECT id, file_path, category, severity, title, detail, line_number, fixed_at, scanned_at, confidence, context_snippet, related_files \
          FROM project_quality_findings \
-         WHERE project_id = $1 AND category = $2 AND (is_false_positive = FALSE OR is_false_positive IS NULL) \
-         ORDER BY CASE severity WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END LIMIT $3",
-    )
+         WHERE project_id = $1 AND category = $2 AND {ACTIVE_FINDING_FILTER_SQL} \
+         ORDER BY CASE severity WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END LIMIT $3"
+    ))
     .bind(project_id)
     .bind(category)
     .bind(limit)
@@ -1904,15 +1917,16 @@ async fn emit_findings_updated_for_project(
     project_id: Uuid,
     resolved_ids: Vec<Uuid>,
 ) {
-    // Totali correnti (esclusi i falsi positivi, coerente con get_quality_findings).
-    let counts: Option<(i64, i64, i64)> = sqlx::query_as(
+    // Totali correnti (esclusi i falsi positivi e gli auto-soppressi, coerente
+    // con get_quality_findings).
+    let counts: Option<(i64, i64, i64)> = sqlx::query_as(&format!(
         "SELECT \
             COUNT(*) AS total, \
             COUNT(*) FILTER (WHERE severity = 'high') AS critical, \
             COUNT(*) FILTER (WHERE severity = 'medium') AS warnings \
          FROM project_quality_findings \
-         WHERE project_id = $1 AND (is_false_positive = FALSE OR is_false_positive IS NULL)",
-    )
+         WHERE project_id = $1 AND {ACTIVE_FINDING_FILTER_SQL}"
+    ))
     .bind(project_id)
     .fetch_optional(db)
     .await
@@ -2047,6 +2061,61 @@ mod schema_meta {
             r.try_get::<Option<Vec<String>>, _>("related_files").unwrap(),
             Some(vec!["src/altro.rs".to_string()])
         );
+    }
+
+    /// Il difetto reale (30/07/2026): un finding auto-soppresso dalla passata
+    /// N+1 (`is_auto_suppressed=true`) resta scritto in tabella (come da
+    /// intento originale, commento su `project_quality_findings.is_auto_suppressed`),
+    /// ma NESSUNA query di lettura lo escludeva mai — solo il conteggio
+    /// calcolato IN MEMORIA a fine scansione (`count_findings_into`) lo
+    /// rispettava. Risultato: il totale della scansione e la lista/i conteggi
+    /// riletti dal pannello potevano divergere sulla stessa scansione.
+    ///
+    /// MUTAZIONE: togliere `AND (is_auto_suppressed = FALSE OR
+    /// is_auto_suppressed IS NULL)` da `ACTIVE_FINDING_FILTER_SQL` rende
+    /// rosso questo test (il finding soppresso ricompare in `righe`).
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn finding_auto_soppresso_non_ricompare_nella_lista_del_pannello(db: PgPool) {
+        let project_id = semina_progetto(&db).await;
+
+        let batch = vec![
+            FindingRow {
+                file: "src/lib.rs".to_string(),
+                category: "reliability".to_string(),
+                severity: "medium".to_string(),
+                title: "possibile N+1".to_string(),
+                detail: "query in ciclo".to_string(),
+                line_number: Some(10),
+                confidence: Some("low".to_string()),
+                context_snippet: Some("for x in rows { fetch(url) }".to_string()),
+                related_files: None,
+                is_auto_suppressed: true,
+            },
+            FindingRow {
+                file: "src/db.rs".to_string(),
+                category: "reliability".to_string(),
+                severity: "high".to_string(),
+                title: "N+1 vera".to_string(),
+                detail: "query in ciclo".to_string(),
+                line_number: Some(20),
+                confidence: Some("high".to_string()),
+                context_snippet: Some("for x in rows { db.query(..) }".to_string()),
+                related_files: None,
+                is_auto_suppressed: false,
+            },
+        ];
+        insert_findings_batch(&db, project_id, &batch).await;
+
+        let righe = query_findings_all_severities(&db, project_id, 10)
+            .await
+            .expect("la query del pannello gira sullo schema ricostruito");
+        assert_eq!(
+            righe.len(),
+            1,
+            "il finding auto-soppresso non deve comparire nella lista del pannello"
+        );
+        let file: String = righe[0].try_get("file_path").unwrap();
+        assert_eq!(file, "src/db.rs");
     }
 }
 
