@@ -224,6 +224,13 @@ pub struct NativeRunInput {
     pub prompt_key: Option<String>,
     /// Messaggio iniziale dell'utente (con blocco allegati gia' inline).
     pub initial_msg: String,
+    /// Kind REALE (magic byte, `attachment_inspector::detect_kind`) di ciascun
+    /// allegato di QUESTO messaggio, calcolato da `build_initial_msg_with_attachments`
+    /// sugli stessi file gia' letti per il blocco `<allegati>`. Alimenta il gate
+    /// `attachment_kind` del playbook matcher (punto unico, regola M: mai dedotto
+    /// dal testo del prompt). Vuoto per i run senza allegati nuovi e per i percorsi
+    /// che non ricostruiscono il messaggio (resume/sub-run/retry).
+    pub attachment_kinds: Vec<String>,
     /// History conversazione in forma LangChain (`Vec<Value>`): convertita in
     /// `Message` col PUNTO UNICO `lc_serde::from_lc` (regola L).
     pub conversation_history: Vec<serde_json::Value>,
@@ -1373,18 +1380,6 @@ async fn load_routing_config(db: &PgPool) -> RoutingConfig {
             d.todo_isolation_enabled,
         )
         .await,
-        pending_steps_detection_enabled: setting_bool(
-            db,
-            "agent.closure.pending_steps_detection_enabled",
-            d.pending_steps_detection_enabled,
-        )
-        .await,
-        pending_steps_min_items: setting_i64(
-            db,
-            "agent.closure.pending_steps_min_items",
-            d.pending_steps_min_items,
-        )
-        .await,
         final_gate_software_intents: setting_csv(
             db,
             "agent.final_gate.software_intents",
@@ -1919,20 +1914,6 @@ async fn load_executor_config(
             db,
             "agent.context.rolling_summary_offload_enabled",
             d.rolling_summary_offload_enabled,
-        )
-        .await,
-        // ADR 0018 fase 3: rilevamento report passi pendenti nei rami G1/report
-        // dell'executor (stesse chiavi della RoutingConfig, regola L).
-        pending_steps_detection_enabled: setting_bool(
-            db,
-            "agent.closure.pending_steps_detection_enabled",
-            d.pending_steps_detection_enabled,
-        )
-        .await,
-        pending_steps_min_items: setting_i64(
-            db,
-            "agent.closure.pending_steps_min_items",
-            d.pending_steps_min_items,
         )
         .await,
         // ── hard cap post-brake (ADR 0016 fase D2, mig 0286) ──────────────────
@@ -3251,11 +3232,20 @@ async fn run_engine(
             // project_root None: i trigger con `project_markers` non sono valutati
             // qui (root non risolta nel punto di costruzione dello state); i
             // playbook senza markers — es. verify.design_align — matchano comunque.
+            // TRAPPOLA DISINNESCATA (non riattivarla passando Some senza aver
+            // riletto playbook_engine::trigger_matches): un playbook con
+            // `project_markers` valorizzato (es. implement.figma_make) resta
+            // irraggiungibile qui finche' project_root e' None — per design, non
+            // per un bug. Gli assi intent/keyword sono pero' gia' in AND e
+            // attachment_kind legge il kind reale (non il testo): quando in futuro
+            // questo parametro verra' valorizzato, il trigger non potra' scattare
+            // su un match casuale di parole nel prompt decorato.
             if let Some(pm) = crate::playbook_engine::match_playbook(
                 &deps.db,
                 input.intent_hint.as_deref(),
                 &input.initial_msg,
                 None,
+                &input.attachment_kinds,
             )
             .await
             {
@@ -3649,6 +3639,7 @@ mod tests {
             system_text: "sei un assistente".to_string(),
             prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
             initial_msg: "Scrivi src/main.rs".to_string(),
+            attachment_kinds: Vec::new(),
             conversation_history: vec![serde_json::json!({
                 "role": "user",
                 "content": "ciao, contesto pregresso"

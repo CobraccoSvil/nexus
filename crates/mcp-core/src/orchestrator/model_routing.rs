@@ -160,7 +160,7 @@ const AGENTIC_MIN_TIER_KEY: &str = "agent.routing.agentic_min_tier";
 
 /// Default del pavimento agentico se il setting e' assente. NON e' un nome
 /// modello (regola G non si applica): e' una soglia di policy locale, come
-/// `agent.enforce_port_allocation`='true' o `pending_steps_min_items`. Resta
+/// `agent.enforce_port_allocation`='true' o `agent.g1_max_nudges`. Resta
 /// configurabile da DB; questo e' solo il valore quando la riga manca.
 const AGENTIC_MIN_TIER_DEFAULT: &str = "medium";
 

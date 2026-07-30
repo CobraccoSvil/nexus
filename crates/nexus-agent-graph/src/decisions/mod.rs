@@ -205,7 +205,9 @@ pub use tool_dispatch::{
     ContextMessage, MAX_CONTEXT_CHARS, MAX_TOOL_RESULT_CHARS, RUN_NOTES_MAX_CHARS,
     TOKEN_CHARS_DIVISOR, VALID_OUTCOMES,
 };
-pub use turn_focus::{build_turn_focus_directive, user_text_only, TURN_FOCUS_MARKER};
+pub use turn_focus::{
+    build_turn_focus_directive, sanitize_for_system_block, user_text_only, TURN_FOCUS_MARKER,
+};
 pub use turn_task::{current_turn_task, extract_original_task, ORIGINAL_TASK_KEY};
 
 #[cfg(test)]

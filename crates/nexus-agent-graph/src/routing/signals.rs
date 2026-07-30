@@ -7,10 +7,14 @@
 //!
 //! Riferimenti Python (`brain/agents/nodes/helpers.py` salvo nota).
 //! `_detect_unfulfilled_intent` (blacklist lessicale INTENT_NARRATION) e' stato
-//! RIMOSSO (ADR 0018 fase 3): il segnale strutturale
-//! [`crate::decisions::helpers::structural_unfulfilled_signal`] +
-//! [`detect_pending_steps_report`] + task_complete (ADR 0034) lo sostituiscono.
-//!   - `detect_pending_steps_report`       -> [`detect_pending_steps_report`]
+//! RIMOSSO (ADR 0018 fase 3); il secondo residuo lessicale,
+//! `_PENDING_STEPS_LABELS` (62 etichette in 5 lingue, `detect_pending_steps_report`),
+//! e' stato eliminato a sua volta: il `closure_verdict` che ne era il presunto
+//! fallback non ha mai avuto un produttore nel motore nativo (ADR 0034), quindi
+//! il ramo lessicale era l'UNICO decisore, non una difesa in profondita'. Il
+//! segnale strutturale [`crate::decisions::structural_unfulfilled_signal`] +
+//! `declared_outcome` (ADR 0034, task_complete) lo sostituiscono — vedi
+//! [`unfulfilled_signal_with`].
 //!   - `has_productive_action_in_history`  -> [`has_productive_action_in_history`]
 //!   - `has_filesystem_mutation_in_history`-> [`has_filesystem_mutation_in_history`]
 //!   - `_unfulfilled_signal`               -> [`unfulfilled_signal`] (routing.py)
@@ -18,9 +22,6 @@
 //!   - `_final_gate_eligible` (routing.py) -> [`final_gate_eligible`]
 //!   - `todo_isolation_active` (orchestrator_config.py) -> [`todo_isolation_active`]
 
-use std::sync::LazyLock;
-
-use regex::Regex;
 use serde_json::Value;
 
 use crate::decisions::loop_signatures::build_signature;
@@ -1214,168 +1215,73 @@ fn pick_top(list: &[(String, i64)], last: Option<&str>) -> Option<(String, i64)>
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-//  Segnale STRUTTURALE "report con passi pendenti" (detect_pending_steps_report)
-// ──────────────────────────────────────────────────────────────────────────
-
-/// `_PENDING_STEPS_LABELS` Python (1:1). Etichette-trigger multilingua di un
-/// elenco di passi pendenti. Match come substring lower-case.
-const PENDING_STEPS_LABELS: &[&str] = &[
-    // Italiano.
-    "prossimi passi necessari",
-    "prossimi passi",
-    "prossimi step",
-    "passi successivi",
-    "passi rimanenti",
-    "passi da svolgere",
-    "passi da completare",
-    "passi da fare",
-    "step successivi",
-    "step rimanenti",
-    "step da fare",
-    "cosa manca",
-    "cosa resta da fare",
-    "lavoro rimanente",
-    "azioni rimanenti",
-    "azioni da svolgere",
-    "azioni da completare",
-    "azioni necessarie",
-    "da fare",
-    "todo",
-    "to do",
-    "to-do",
-    // Inglese.
-    "next steps",
-    "next step",
-    "remaining steps",
-    "remaining work",
-    "remaining tasks",
-    "pending steps",
-    "pending tasks",
-    "outstanding tasks",
-    "outstanding work",
-    "to be done",
-    "still to do",
-    "things to do",
-    "what's left",
-    "whats left",
-    "what remains",
-    "follow-up actions",
-    "follow up actions",
-    "action items",
-    // Spagnolo.
-    "próximos pasos",
-    "proximos pasos",
-    "pasos siguientes",
-    "pasos restantes",
-    "pendientes",
-    "por hacer",
-    "queda por hacer",
-    // Francese.
-    "prochaines étapes",
-    "prochaines etapes",
-    "étapes suivantes",
-    "etapes suivantes",
-    "étapes restantes",
-    "etapes restantes",
-    "à faire",
-    "a faire",
-    "reste à faire",
-    "reste a faire",
-    // Tedesco.
-    "nächste schritte",
-    "naechste schritte",
-    "verbleibende schritte",
-    "noch zu tun",
-    "offene aufgaben",
-];
-
-// `_PENDING_ITEM_RE`: item numerato "1." / "1)" / bullet "- " / "* " / "•".
-static PENDING_ITEM_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^\s*(?:[0-9]{1,2}[.)]|[-*+•])\s+\S").expect("regex pending item valida")
-});
-
-/// Sottostringa di `s` a partire dal byte successivo all'etichetta, lunga al
-/// massimo 1500 CODEPOINT (come `text[start:start+1500]` Python). `start` e' un
-/// indice di codepoint (numero di char prima dell'etichetta nel testo originale).
-fn window_after(text: &str, char_start: usize, len_chars: usize) -> String {
-    text.chars().skip(char_start).take(len_chars).collect()
-}
-
-/// True se `text` e' un REPORT con elenco esplicito di passi ancora da svolgere.
-/// Vedi `detect_pending_steps_report`. `min_items`/`enabled` arrivano dalla config.
-pub fn detect_pending_steps_report(text: Option<&str>, cfg: &RoutingConfig) -> bool {
-    detect_pending_steps_report_with(
-        text,
-        cfg.pending_steps_detection_enabled,
-        cfg.pending_steps_min_items,
-    )
-}
-
-/// PUNTO UNICO parametrico (regola L) del rilevamento "report con passi
-/// pendenti": la variante con `RoutingConfig` delega qui; l'executor (che ha
-/// una config propria, `ExecutorConfig`) chiama direttamente questa firma con
-/// le STESSE chiavi DB `agent.closure.pending_steps_*` (ADR 0018 fase 3: e' il
-/// sostituto strutturale del vecchio fallback lessicale rimosso).
-pub fn detect_pending_steps_report_with(text: Option<&str>, enabled: bool, min_items: i64) -> bool {
-    let Some(text) = text else {
-        return false;
-    };
-    if text.trim().is_empty() {
-        return false;
-    }
-    if !enabled {
-        return false;
-    }
-    let min_items = min_items.max(1) as usize;
-
-    let lower = text.to_lowercase();
-    // Trova la PRIMA etichetta-trigger e analizza l'elenco subito sotto.
-    for label in PENDING_STEPS_LABELS {
-        // Indice in BYTE nella stringa lower-case (per trovare l'etichetta).
-        let Some(byte_idx) = lower.find(label) else {
-            continue;
-        };
-        // start = idx + len(label) in codepoint (Python conta in caratteri).
-        // Converto: numero di char prima dell'etichetta + lunghezza etichetta.
-        let chars_before = lower[..byte_idx].chars().count();
-        let label_chars = label.chars().count();
-        let char_start = chars_before + label_chars;
-        // Finestra di 1500 codepoint sul testo ORIGINALE (come Python).
-        let window = window_after(text, char_start, 1500);
-        let matches = PENDING_ITEM_RE.find_iter(&window).count();
-        if matches >= min_items {
-            return true;
-        }
-    }
-    false
-}
-
-// ──────────────────────────────────────────────────────────────────────────
 //  Segnale SEMANTICO "esito non compiuto" (_unfulfilled_signal, routing.py)
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Estrae il bool `fulfilled` da `closure_verdict` se presente e di tipo bool.
-fn closure_verdict_fulfilled(state: &AgentState) -> Option<bool> {
-    match &state.closure_verdict {
-        Some(Value::Object(map)) => match map.get("fulfilled") {
-            Some(Value::Bool(b)) => Some(*b),
-            _ => None,
-        },
-        _ => None,
+/// PUNTO UNICO parametrico (regola L) del segnale "esito non compiuto": la
+/// variante su stato/config ([`unfulfilled_signal`]) delega qui; l'executor
+/// (config propria `ExecutorConfig`, `conteggio_g1`) e il resoconto onesto
+/// (`applica_resoconto_onesto`) chiamano direttamente questa firma coi segnali
+/// gia' risolti.
+///
+/// Precedenza (ADR 0034):
+///   1. `declared_outcome` (tool `task_complete`) presente -> la dichiarazione
+///      del modello DECIDE: ritorna `false`. E' l'UNICO produttore reale di un
+///      esito strutturato nel motore nativo — `closure_judge`/`closure_verdict`
+///      non e' mai stato portato (nessun codice nel motore nativo lo scrive,
+///      ADR 0034 nota finale: "resta una via complementare NON portata al
+///      nativo"). Consultare quel campo non era un fallback dietro un segnale
+///      primario: era un ramo morto che nascondeva il vero decisore (regola O).
+///   2. altrimenti [`crate::decisions::structural_unfulfilled_signal`] ("ha
+///      smesso senza fare nulla": tool disponibili, nessuna tool call in
+///      QUESTO turno, turno action-oriented, entro la finestra di forcing) —
+///      un segnale REALE calcolato dai campi dello stato corrente, mai
+///      un'etichetta lessicale cercata nel testo del modello.
+///
+/// ADR 0018 fase 3 aveva gia' rimosso la blacklist NARRAZIONE
+/// (`detect_unfulfilled_intent`); questo punto elimina il secondo residuo
+/// lessicale, `_PENDING_STEPS_LABELS` (62 etichette in 5 lingue + conteggio
+/// bullet): un match casuale di "todo"/"next steps"/... nel testo del modello
+/// (incluso il testo GIA' DECORATO da blocchi di sistema in alcuni call site)
+/// riapriva il turno (G1Continue), alimentava il conteggio di re-route/
+/// escalation e sostituiva il resoconto mostrato all'utente — mentre il
+/// presunto fallback strutturale (`closure_verdict`) non scattava MAI, quindi
+/// il ramo lessicale era di fatto l'UNICO decisore, non una difesa in
+/// profondita'. Il vocabolario non va spostato nel DB: configurarlo
+/// confermerebbe la premessa sbagliata che si riconosca dalla prosa se restano
+/// passi da fare.
+pub fn unfulfilled_signal_with(
+    declared_outcome_present: bool,
+    had_tools_available: bool,
+    no_tool_call_this_turn: bool,
+    action_oriented: bool,
+    iteration: i64,
+    max_iteration: i64,
+) -> bool {
+    if declared_outcome_present {
+        return false;
     }
+    crate::decisions::structural_unfulfilled_signal(
+        had_tools_available,
+        no_tool_call_this_turn,
+        action_oriented,
+        iteration,
+        max_iteration,
+    )
 }
 
-/// Segnale SEMANTICO "esito non compiuto", SOLO strutturale (ADR 0018 fase 3:
-/// il fallback lessicale `detect_unfulfilled_intent` e' stato RIMOSSO — le
-/// leve 0/1/2 + task_complete ADR 0034 coprono i casi che intercettava).
-/// Ordine:
-///   1. verdetto closure_judge (bool) -> `not fulfilled`;
-///   2. segnale strutturale `detect_pending_steps_report(result)`.
+/// Segnale "esito non compiuto" per lo stato/config del grafo: vedi
+/// [`unfulfilled_signal_with`] per la precedenza. Usato da `route_after_executor`
+/// (reroute G1).
 pub fn unfulfilled_signal(state: &AgentState, cfg: &RoutingConfig) -> bool {
-    if let Some(fulfilled) = closure_verdict_fulfilled(state) {
-        return !fulfilled;
-    }
-    detect_pending_steps_report(state.result.as_deref(), cfg)
+    unfulfilled_signal_with(
+        super::declared_outcome_kind(state).is_some(),
+        super::had_tools(state),
+        !super::has_pending(state),
+        crate::decisions::turn_action_oriented(state.action_oriented),
+        super::iterations(state),
+        cfg.tool_choice_forcing_max_iteration,
+    )
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -2223,32 +2129,75 @@ mod tests {
     }
 
     #[test]
-    fn pending_steps_report_min_items() {
-        let cfg = RoutingConfig::default();
-        let report =
-            "Stato attuale: ok.\nProssimi passi necessari:\n1. Verificare X\n2. Eseguire Y";
-        assert!(detect_pending_steps_report(Some(report), &cfg));
-        // Un solo item < min_items(2).
-        let uno = "Prossimi passi:\n1. Solo questo";
-        assert!(!detect_pending_steps_report(Some(uno), &cfg));
+    fn unfulfilled_signal_with_declared_outcome_precede_su_tutto() {
+        // ADR 0034: qualunque dichiarazione decide, anche quando i segnali
+        // strutturali "griderebbero" unfulfilled (mai riscritta dall'euristica).
+        assert!(!unfulfilled_signal_with(true, true, true, true, 1, 2));
     }
 
     #[test]
-    fn pending_steps_report_with_parametrico() {
-        // Punto unico parametrico (ADR 0018 fase 3): stessa semantica della
-        // variante con RoutingConfig, per i call site con ExecutorConfig.
-        let report = "Prossimi passi:\n1. Verificare X\n2. Eseguire Y";
-        assert!(detect_pending_steps_report_with(Some(report), true, 2));
-        assert!(!detect_pending_steps_report_with(Some(report), false, 2));
-        assert!(!detect_pending_steps_report_with(Some(report), true, 3));
-        assert!(!detect_pending_steps_report_with(None, true, 1));
-        // La narrazione futura SENZA elenco puntato non e' piu' un segnale
-        // (blacklist lessicale rimossa): copre task_complete + iteration cap.
-        assert!(!detect_pending_steps_report_with(
-            Some("Ottimo. Adesso creerò il file."),
-            true,
-            2
-        ));
+    fn unfulfilled_signal_with_ha_smesso_senza_fare_nulla() {
+        // Nessuna dichiarazione, tool disponibili, nessuna tool call in questo
+        // turno, turno action-oriented, entro la finestra -> unfulfilled.
+        assert!(unfulfilled_signal_with(false, true, true, true, 1, 2));
+    }
+
+    #[test]
+    fn unfulfilled_signal_with_non_action_oriented_mai_unfulfilled() {
+        assert!(!unfulfilled_signal_with(false, true, true, false, 1, 2));
+    }
+
+    #[test]
+    fn unfulfilled_signal_with_oltre_la_finestra_non_unfulfilled() {
+        assert!(!unfulfilled_signal_with(false, true, true, true, 5, 2));
+    }
+
+    #[test]
+    fn unfulfilled_signal_di_stato_ignora_una_parola_pending_nel_testo() {
+        // MUTAZIONE del vecchio lessicale (_PENDING_STEPS_LABELS, rimosso): prima
+        // "prossimi passi necessari:\n1...\n2..." nel testo del modello bastava DA
+        // SOLO a riaprire il turno. Ora il testo del `result` non e' nemmeno
+        // consultato: senza tool disponibili (tools_json vuoto) il segnale
+        // strutturale e' strutturalmente falso, a prescindere dalla prosa.
+        let cfg = RoutingConfig::default();
+        let state = AgentState {
+            result: Some(
+                "Stato attuale: ok.\nProssimi passi necessari:\n1. Verificare X\n2. Eseguire Y"
+                    .into(),
+            ),
+            action_oriented: Some(true),
+            iterations: Some(1),
+            ..Default::default()
+        };
+        assert!(!unfulfilled_signal(&state, &cfg));
+    }
+
+    #[test]
+    fn unfulfilled_signal_di_stato_declared_outcome_precede_lo_strutturale() {
+        let cfg = RoutingConfig::default();
+        let state = AgentState {
+            declared_outcome: Some(json!({"outcome": "partial", "summary": "fatto in parte"})),
+            tools_json: Some(vec![json!({"name": "read_file"})]),
+            pending_tool_uses: Some(Vec::new()),
+            action_oriented: Some(true),
+            iterations: Some(1),
+            ..Default::default()
+        };
+        assert!(!unfulfilled_signal(&state, &cfg));
+    }
+
+    #[test]
+    fn unfulfilled_signal_di_stato_strutturale_senza_dichiarazione() {
+        let cfg = RoutingConfig::default();
+        let state = AgentState {
+            declared_outcome: None,
+            tools_json: Some(vec![json!({"name": "read_file"})]),
+            pending_tool_uses: Some(Vec::new()),
+            action_oriented: Some(true),
+            iterations: Some(1),
+            ..Default::default()
+        };
+        assert!(unfulfilled_signal(&state, &cfg));
     }
 
     #[test]

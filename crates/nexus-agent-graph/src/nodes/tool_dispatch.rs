@@ -1628,10 +1628,17 @@ fn apply_declared_outcome(delta: &mut StateDelta, state: &AgentState, declared_o
     let Some(last) = declared_outcomes.last() else {
         if state.declared_outcome.is_some() {
             delta.declared_outcome = Some(None);
+            delta.declared_outcome_iteration = Some(None);
         }
         return;
     };
     delta.declared_outcome = Some(Some(last.clone()));
+    // Timbro di freschezza (vedi doc `AgentState::declared_outcome_iteration`):
+    // `state.iterations` e' il valore che il turno SUCCESSIVO ricevera' come
+    // `iters_in` (l'executor l'ha gia' scritto nel proprio delta, gia' applicato
+    // qui). Chi consuma la dichiarazione per riscrivere testo visibile
+    // all'utente si fida solo se il confronto e' un'uguaglianza esatta.
+    delta.declared_outcome_iteration = Some(Some(state.iterations.unwrap_or(0)));
     let done_now = declared_outcomes
         .iter()
         .filter(|d| d.get("outcome").and_then(Value::as_str) == Some("done"))
@@ -3084,6 +3091,10 @@ mod tests {
             json!("done")
         );
         assert_eq!(out.declared_done_count, Some(1));
+        // Timbro di freschezza (regola O: verificato sul PRODUTTORE reale, non
+        // costruito a mano dal test del consumatore in executor/tests.rs):
+        // state_with_pending non imposta iterations -> unwrap_or(0) = 0.
+        assert_eq!(out.declared_outcome_iteration, Some(0));
         // Nessun tool eseguito via ToolExecutor (entrambi brain-only).
         assert!(tools.seen.lock().unwrap().is_empty());
     }
@@ -3101,10 +3112,15 @@ mod tests {
         let ctx = ctx_with(CancellationToken::new());
         let mut st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
         st.declared_outcome = Some(json!({"outcome": "partial", "summary": "meta'"}));
+        st.declared_outcome_iteration = Some(0);
         st.declared_done_count = Some(0);
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         // Dichiarazione stantia azzerata; il contatore done resta cumulativo.
         assert!(out.declared_outcome.is_none());
+        // Il timbro di freschezza va azzerato INSIEME alla dichiarazione: se
+        // restasse valorizzato, un futuro declared_outcome scritto altrove
+        // potrebbe leggerlo per errore come ancora fresco.
+        assert!(out.declared_outcome_iteration.is_none());
     }
 
     #[tokio::test]

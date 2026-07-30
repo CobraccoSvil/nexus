@@ -2729,18 +2729,17 @@ async fn next_actions_derive_fallita_blocco_comunque_rimosso() {
 
 #[tokio::test]
 async fn unfulfilled_report_sostituisce_in_confirm() {
-    // Modalita' confirm (assente == confirm) + intento NON compiuto + turno NON
-    // action-oriented -> il result e' sostituito dal resoconto onesto (py:3404-3429).
+    // Modalita' confirm (assente == confirm) + intento NON compiuto (declared_outcome
+    // "partial", ADR 0034) + turno NON action-oriented -> il result e' sostituito dal
+    // resoconto onesto (py:3404-3429).
     let rc = Arc::new(StubRunControlStore::default());
     let next_actions = Arc::new(StubNextActionsDeriver::default());
     let billing = Arc::new(StubBillingCooldownPort::default());
     let upscale = Arc::new(StubModelUpscalePort::default());
     let (n, _m) = node_ports(cfg_resolved(), rc, next_actions, billing, upscale);
-    // Report STRUTTURALE di passi pendenti (ADR 0018 fase 3: il segnale del
-    // ramo report e' detect_pending_steps_report_with, non piu' la narrazione).
-    let llm = Arc::new(StubLlmGateway::with_text(
-        "Analisi fatta. Prossimi passi:\n1. Avviare il servizio\n2. Verificare il login",
-    ));
+    // Testo NEUTRO (nessuna etichetta lessicale "prossimi passi"/"todo"/...): il
+    // segnale che pilota la sostituzione e' declared_outcome, mai il testo.
+    let llm = Arc::new(StubLlmGateway::with_text("Ho sistemato la validazione del form."));
     let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
@@ -2749,6 +2748,12 @@ async fn unfulfilled_report_sostituisce_in_confirm() {
             ai_tool("write_file", json!({"path": "login.ts"})),
         ],
         action_oriented: Some(false),
+        iterations: Some(0),
+        declared_outcome: Some(json!({"outcome": "partial", "summary": "form sistemato"})),
+        // Dichiarazione FRESCA: emessa esattamente al turno che precede questo
+        // (iters_in=0), la condizione che applica_resoconto_onesto richiede per
+        // fidarsene (vedi AgentState::declared_outcome_iteration).
+        declared_outcome_iteration: Some(0),
         // automation_mode assente -> Python default "confirm" -> sostituisce.
         tools_json: Some(vec![json!({"name": "read_file"})]),
         ..Default::default()
@@ -2760,6 +2765,46 @@ async fn unfulfilled_report_sostituisce_in_confirm() {
     assert!(result.contains("NON e' completato"));
     // Il resoconto cita il file toccato dalla history.
     assert!(result.contains("login.ts"));
+}
+
+#[tokio::test]
+async fn unfulfilled_report_ignora_declared_outcome_stale() {
+    // Trovato in revisione avversariale: senza un controllo di freschezza, una
+    // dichiarazione "partial" di TURNI FA (il run e' proseguito via G1Continue
+    // solo-testo, senza mai richiamare task_complete) continuerebbe a
+    // sovrascrivere un turno di chiusura genuino con "...NON e' completato",
+    // fuorviando l'utente su un lavoro che nel frattempo e' stato completato.
+    // Qui: declared_outcome_iteration=0 (dichiarato al turno 0) ma iters_in=3
+    // (turno corrente, 3 iterazioni dopo): NON fresco -> nessuna sostituzione.
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::default());
+    let billing = Arc::new(StubBillingCooldownPort::default());
+    let upscale = Arc::new(StubModelUpscalePort::default());
+    let (n, _m) = node_ports(cfg_resolved(), rc, next_actions, billing, upscale);
+    let testo = "Ho completato anche il resto: tutto sistemato.";
+    let llm = Arc::new(StubLlmGateway::with_text(testo));
+    let ctx = ctx_with(llm.clone());
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![
+            human("sistema il login"),
+            ai_tool("write_file", json!({"path": "login.ts"})),
+        ],
+        action_oriented: Some(false),
+        iterations: Some(3),
+        declared_outcome: Some(json!({"outcome": "partial", "summary": "form sistemato"})),
+        // Dichiarazione STALE: emessa al turno 0, ma siamo al turno 3 senza che
+        // nessun nuovo task_complete l'abbia mai ri-confermata o azzerata (il
+        // run e' proseguito solo con turni di testo, mai un altro ToolDispatch).
+        declared_outcome_iteration: Some(0),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Result INVARIATO: la dichiarazione stale non deve sovrascrivere un
+    // resoconto di chiusura potenzialmente genuino.
+    assert_eq!(out.result.as_deref(), Some(testo));
 }
 
 #[tokio::test]
@@ -2831,22 +2876,18 @@ async fn unfulfilled_report_non_sostituisce_in_automatic() {
 }
 
 #[tokio::test]
-async fn unfulfilled_report_segue_il_segnale_post_ignorando_closure_fulfilled() {
-    // DISTINZIONE LOAD-BEARING (regola L): il ramo report POST end_turn valuta il
-    // TESTO FINALE (report strutturale di passi pendenti, ADR 0018 fase 3) e NON
-    // consulta closure_verdict, a differenza del ramo G1 (closure-first).
-    // Setup adversariale: closure_verdict = fulfilled (compiuto, potenzialmente
-    // stale del turno precedente) MA il testo finale elenca passi pendenti. Il
-    // ramo report DEVE seguire il segnale sul testo -> SOSTITUIRE col resoconto
-    // onesto, ignorando il verdetto closure fulfilled.
+async fn unfulfilled_report_ignora_testo_pending_senza_declared_outcome() {
+    // MUTAZIONE del vecchio `detect_pending_steps_report_with`: prima un testo
+    // col solo elenco "prossimi passi:\n1...\n2..." bastava DA SOLO a sostituire
+    // il result. Ora il testo NON e' piu' consultato: senza declared_outcome
+    // "partial" il ramo report non sostituisce, qualunque cosa dica la prosa.
     let rc = Arc::new(StubRunControlStore::default());
     let next_actions = Arc::new(StubNextActionsDeriver::default());
     let billing = Arc::new(StubBillingCooldownPort::default());
     let upscale = Arc::new(StubModelUpscalePort::default());
     let (n, _m) = node_ports(cfg_resolved(), rc, next_actions, billing, upscale);
-    let llm = Arc::new(StubLlmGateway::with_text(
-        "Analisi fatta. Prossimi passi:\n1. Avviare il servizio\n2. Verificare il login",
-    ));
+    let testo = "Analisi fatta. Prossimi passi:\n1. Avviare il servizio\n2. Verificare il login";
+    let llm = Arc::new(StubLlmGateway::with_text(testo));
     let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
@@ -2855,44 +2896,87 @@ async fn unfulfilled_report_segue_il_segnale_post_ignorando_closure_fulfilled() 
             ai_tool("write_file", json!({"path": "login.ts"})),
         ],
         action_oriented: Some(false),
-        // closure_verdict fulfilled=true: il ramo report (lessicale-puro) lo IGNORA.
-        closure_verdict: Some(json!({"fulfilled": true})),
-        // automation_mode assente -> "confirm" -> ramo report attivo.
+        // Nessun declared_outcome: il ramo report non ha segnale -> NON sostituisce.
+        // automation_mode assente -> "confirm" -> ramo report altrimenti attivo.
         tools_json: Some(vec![json!({"name": "read_file"})]),
         ..Default::default()
     };
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
-    let result = out.result.as_deref().unwrap();
-    // SOSTITUITO dal resoconto onesto: il report strutturale sul testo finale ha
-    // prevalso sul closure "fulfilled" (che qui e' deliberatamente ignorato).
-    assert!(result.contains("resoconto onesto"));
-    assert!(result.contains("NON e' completato"));
-    assert!(result.contains("login.ts"));
+    // Result INVARIATO: nessuna sostituzione, nonostante il testo "urli" passi
+    // pendenti — la prosa non e' piu' un segnale (regola M).
+    assert_eq!(out.result.as_deref(), Some(testo));
 }
 
 #[tokio::test]
-async fn g1_resta_closure_first_non_conta_se_closure_fulfilled() {
-    // CONTROPROVA della distinzione: il ramo G1-conteggio e' closure-first 1:1 col
-    // Python (py:1913-1917, mig 0422). In una re-entry G1 autentica (prev=end_turn,
-    // iter=1, no pending) con turno NON action-oriented, il conteggio dipende SOLO
-    // dal segnale unfulfilled. Qui closure_verdict = fulfilled -> unfulfilled_for_g1
-    // = false -> il reroute G1 NON viene contato (resta 0). Se G1 usasse il
-    // lessicale (come il ramo report), il testo-promessa lo avrebbe contato a 1.
+async fn g1_ignora_testo_con_etichette_pending_senza_action_oriented() {
+    // MUTAZIONE: `_PENDING_STEPS_LABELS` eliminato (era l'UNICO decisore reale:
+    // `closure_verdict` non ha mai un produttore nel motore nativo, ADR 0034).
+    // Prima un'etichetta come "prossimi passi:" + elenco numerato bastava DA SOLA
+    // a far contare la re-entry G1 anche su un turno NON action-oriented
+    // (detect_pending_steps_report_with su last_assistant_text). Ora, senza
+    // declared_outcome, il segnale strutturale (`structural_unfulfilled_signal`)
+    // e' sempre falso quando action_oriented=false: la re-entry NON deve
+    // contare, nonostante il testo "urli" passi pendenti.
+    //
+    // L'etichetta va nell'ULTIMO messaggio AI di `state.messages`: e' quello che
+    // conteggio_g1 legge (calcolato PRIMA della chiamata LLM del turno corrente,
+    // mai la risposta che lo stub sta per restituire ORA) — mettere il testo
+    // nella risposta dello stub non eserciterebbe affatto il path che questo
+    // test dichiara di proteggere.
     let rc = Arc::new(StubRunControlStore::default());
     let next_actions = Arc::new(StubNextActionsDeriver::default());
     let billing = Arc::new(StubBillingCooldownPort::default());
     let upscale = Arc::new(StubModelUpscalePort::default());
     let (n, _m) = node_ports(cfg_resolved(), rc, next_actions, billing, upscale);
-    // Testo-promessa monca: il detector lessicale direbbe unfulfilled.
+    // Testo NEUTRO per QUESTO turno: conteggio_g1 non lo vede mai (gira prima
+    // della chiamata LLM), quindi non deve influenzare l'esito.
+    let llm = Arc::new(StubLlmGateway::with_text("Procedo."));
+    let ctx = ctx_with(llm.clone());
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        // Re-entry G1 autentica: turno precedente chiuso end_turn senza agire,
+        // con un'etichetta "pending" nell'ULTIMO messaggio AI gia' in history.
+        messages: vec![
+            human("sistema il login"),
+            Message::Ai {
+                content: MessageContent::text(
+                    "Prossimi passi:\n1. Avviare il servizio\n2. Verificare il login",
+                ),
+                tool_calls: vec![],
+                reasoning: None,
+                thinking_signature: None,
+            },
+        ],
+        stop_reason: Some(StopReason::EndTurn),
+        iterations: Some(1),
+        action_oriented: Some(false),
+        g1_reroute_count: Some(0),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.g1_reroute_count, Some(0));
+}
+
+#[tokio::test]
+async fn g1_ignora_closure_verdict_campo_morto() {
+    // closure_verdict non ha mai un produttore reale nel motore nativo (ADR
+    // 0034): anche "fulfilled=false" (che urlerebbe "non compiuto" e, sotto il
+    // vecchio codice, avrebbe fatto contare la re-entry) non deve avere alcun
+    // effetto sul conteggio G1.
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::default());
+    let billing = Arc::new(StubBillingCooldownPort::default());
+    let upscale = Arc::new(StubModelUpscalePort::default());
+    let (n, _m) = node_ports(cfg_resolved(), rc, next_actions, billing, upscale);
     let llm = Arc::new(StubLlmGateway::with_text(
         "Ora attendo che il servizio parta e poi verifichero' il risultato.",
     ));
     let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
-        // Re-entry G1: turno precedente chiuso end_turn senza agire, l'ultima
-        // assistant e' una promessa monca (lessicale unfulfilled).
         messages: vec![
             human("sistema il login"),
             Message::Ai {
@@ -2908,14 +2992,12 @@ async fn g1_resta_closure_first_non_conta_se_closure_fulfilled() {
         iterations: Some(1),
         action_oriented: Some(false),
         g1_reroute_count: Some(0),
-        // closure_verdict fulfilled=true: il ramo G1 (closure-first) NON conta.
-        closure_verdict: Some(json!({"fulfilled": true})),
+        closure_verdict: Some(json!({"fulfilled": false})),
         tools_json: Some(vec![json!({"name": "write_file"})]),
         ..Default::default()
     };
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
-    // Closure-first: fulfilled -> unfulfilled_for_g1=false -> reroute NON contato.
     assert_eq!(out.g1_reroute_count, Some(0));
 }
 

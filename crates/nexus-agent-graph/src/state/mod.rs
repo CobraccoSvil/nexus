@@ -390,7 +390,24 @@ pub struct AgentState {
     // ── Esito dichiarato / governance chiusura ───────────────────────────────
     /// Esito dichiarato dal modello via tool task_complete.
     pub declared_outcome: Option<Value>,
+    /// Iterazione del run in cui `declared_outcome` e' stato scritto (valore di
+    /// `iterations` visto da `apply_declared_outcome` in tool_dispatch.rs, cioe'
+    /// quello che il turno SUCCESSIVO ricevera' come `iters_in`). Punto unico di
+    /// FRESCHEZZA: `declared_outcome` sopravvive nello stato finche' un tool NON
+    /// viene ridispatchato (un turno solo-testo non lo tocca), quindi un run che
+    /// continua a lungo via G1Continue senza mai richiamare `task_complete`
+    /// vedrebbe una dichiarazione "partial" di N turni fa come se fosse di
+    /// adesso. Chi consuma `declared_outcome` per riscrivere il TESTO mostrato
+    /// all'utente (`ExecutorNode::applica_resoconto_onesto`) confronta questo
+    /// campo con `iters_in` corrente e si fida SOLO a uguaglianza esatta (il
+    /// turno immediatamente successivo alla dichiarazione, mai uno piu' in la').
+    pub declared_outcome_iteration: Option<i64>,
     /// Verdetto del closure_judge (LLM) quando l'esito non e' dichiarato.
+    /// NESSUN codice del motore nativo lo scrive (ADR 0034: "resta una via
+    /// complementare NON portata al nativo") — il campo resta per compatibilita'
+    /// di checkpoint/serializzazione, ma nessun decisore lo consulta piu'
+    /// (regola O: un ramo che lo leggesse non sarebbe un fallback, sarebbe
+    /// morto). Vedi `routing::signals::unfulfilled_signal_with`.
     pub closure_verdict: Option<Value>,
     /// Verdetto strutturato del REVISORE via tool review_verdict (Fase B
     /// ultracode): dict normalizzato {verdict, summary, findings[]}. Propagato

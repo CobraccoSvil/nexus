@@ -842,6 +842,10 @@ async fn build_session_attachments_block(
         let mime: String = r.try_get("mime_type").unwrap_or_default();
         let size: i64 = r.try_get("size_bytes").unwrap_or(0);
         let kind: String = r.try_get("kind").unwrap_or_default();
+        // file_name e' sanificato alla persistenza (sanitize_attachment_filename,
+        // solo [A-Za-z0-9._-]); mime_type NON lo e' (persist_message_attachments
+        // salva il valore RAW della richiesta): stessa difesa del chunk RAG.
+        let mime = nexus_agent_graph::decisions::sanitize_for_system_block(&mime);
         b.push_str(&format!(
             "- {} ({}, {} byte, kind={}) [ID: {}]\n",
             name, mime, size, kind, id
@@ -859,6 +863,58 @@ async fn build_session_attachments_block(
     b
 }
 
+/// Kind REALE (magic byte) rilevato per ciascun allegato del turno + testo del
+/// messaggio iniziale gia' decorato col blocco `<allegati>`.
+///
+/// I kind alimentano il gate `attachment_kind` del playbook matcher
+/// (`playbook_engine::trigger_matches`, regola M): quel gate non deve MAI
+/// leggere il testo del prompt (dove vive anche questo stesso blocco), solo il
+/// contenuto reale dei file, esattamente come fa `nexus_inspect_attachment`.
+pub(crate) struct InitialMsgWithAttachments {
+    pub text: String,
+    pub attachment_kinds: Vec<String>,
+}
+
+/// Riga di `chat_message_attachments` per gli allegati DEL MESSAGGIO corrente:
+/// serve `file_path` (index sincrono di fallback + rilevamento kind reale),
+/// mime/chunk_count.
+struct AttRow {
+    id: String,
+    file_name: String,
+    file_path: String,
+    mime_type: String,
+    chunk_count: i64,
+}
+
+/// Rileva il kind reale (magic byte, stesso decisore di `nexus_inspect_attachment`)
+/// di ciascun allegato gia' caricato su disco. Tollerante: un allegato il cui
+/// header non si legge viene semplicemente omesso dall'elenco (nessun panic,
+/// nessun kind inventato).
+async fn detect_real_attachment_kinds(rows: &[AttRow]) -> Vec<String> {
+    let mut kinds = Vec::with_capacity(rows.len());
+    for row in rows {
+        let path = std::path::Path::new(&row.file_path);
+        let header = match nexus_agent_tools::attachment_inspector::read_header(path).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(
+                    file = %row.file_name,
+                    error = %e,
+                    "playbook attachment_kind: lettura header fallita, allegato omesso dal rilevamento"
+                );
+                continue;
+            }
+        };
+        let (kind, _mime_reale, _ext_reale) = nexus_agent_tools::attachment_inspector::detect_kind(
+            &header,
+            &row.file_name,
+            &row.mime_type,
+        );
+        kinds.push(kind);
+    }
+    kinds
+}
+
 pub(crate) async fn build_initial_msg_with_attachments(
     // Pool del DB PER-PROGETTO (chat_message_attachments e' migrata): risolto dal
     // chiamante via project_data_pool_by_session_from.
@@ -868,7 +924,7 @@ pub(crate) async fn build_initial_msg_with_attachments(
     user_message_id: Uuid,
     project_id: Uuid,
     session_id: Uuid,
-) -> String {
+) -> InitialMsgWithAttachments {
     if attachments.is_empty() {
         // ROOT CAUSE (2026-06-10, "ha perso il riferimento al file allegato"):
         // il blocco <allegati> copriva SOLO gli allegati del messaggio corrente.
@@ -878,8 +934,13 @@ pub(crate) async fn build_initial_msg_with_attachments(
         // andava a cercare il file nel filesystem del progetto, concludendo
         // che non esiste. Qui si inietta un blocco METADATA-ONLY con gli
         // allegati di sessione (niente pre-extraction: l'investigazione passa
-        // dai tool, ADR 0010/0012).
-        return build_session_attachments_block(db, content, session_id, user_message_id).await;
+        // dai tool, ADR 0010/0012). Nessun allegato NUOVO in questo turno:
+        // niente kind da rilevare per il playbook matcher.
+        let text = build_session_attachments_block(db, content, session_id, user_message_id).await;
+        return InitialMsgWithAttachments {
+            text,
+            attachment_kinds: Vec::new(),
+        };
     }
 
     let n = attachments.len();
@@ -891,13 +952,6 @@ pub(crate) async fn build_initial_msg_with_attachments(
     // Risolvo path fisici e stato di indicizzazione leggendo direttamente
     // chat_message_attachments: serve file_path (per index sincrono di
     // fallback), mime/kind e chunk_count.
-    struct AttRow {
-        id: String,
-        file_name: String,
-        file_path: String,
-        mime_type: String,
-        chunk_count: i64,
-    }
     let saved_rows: Vec<AttRow> = match sqlx::query(
         r#"SELECT id, file_name, file_path, mime_type, chunk_count
            FROM chat_message_attachments WHERE message_id = $1 ORDER BY created_at ASC"#,
@@ -929,6 +983,16 @@ pub(crate) async fn build_initial_msg_with_attachments(
         }
     };
 
+    // Kind REALE degli allegati di QUESTO turno (magic byte, stesso decisore di
+    // `nexus_inspect_attachment`): calcolato UNA volta qui sugli stessi file
+    // gia' risolti sopra, indipendente dall'esito RAG sotto (alimenta il
+    // playbook matcher anche quando il fallback metadata scatta).
+    let attachment_kinds = detect_real_attachment_kinds(&saved_rows).await;
+    let wrap = |text: String| InitialMsgWithAttachments {
+        text,
+        attachment_kinds: attachment_kinds.clone(),
+    };
+
     // Blocco di fallback con soli metadata + istruzione tool, usato quando il
     // RAG e' disabilitato o non produce hit. Mai contenuto inventato.
     let metadata_block = |reason: &str| -> String {
@@ -941,9 +1005,14 @@ pub(crate) async fn build_initial_msg_with_attachments(
         ));
         for att in attachments.iter() {
             let id_label = att.id.map(|u| format!(" [ID: {}]", u)).unwrap_or_default();
+            // name/mime_type sono campi LIBERI del body della richiesta (mai
+            // sanificati come il file_name persistito su disco): stesso rischio
+            // del chunk RAG, stessa difesa (regola M).
+            let name = nexus_agent_graph::decisions::sanitize_for_system_block(&att.name);
+            let mime = nexus_agent_graph::decisions::sanitize_for_system_block(&att.mime_type);
             b.push_str(&format!(
                 "- {} ({}, {} byte){}\n",
-                att.name, att.mime_type, att.size_bytes, id_label
+                name, mime, att.size_bytes, id_label
             ));
         }
         b.push_str(
@@ -962,15 +1031,15 @@ pub(crate) async fn build_initial_msg_with_attachments(
         Ok(c) if c.enabled => c,
         Ok(_) => {
             tracing::info!("initial_msg: RAG disabilitato, fallback metadata + tool");
-            return format!("{}\n\n{}", content, metadata_block("RAG disabilitato"));
+            return wrap(format!("{}\n\n{}", content, metadata_block("RAG disabilitato")));
         }
         Err(e) => {
             tracing::warn!("initial_msg: config RAG non disponibile ({e}), fallback metadata");
-            return format!(
+            return wrap(format!(
                 "{}\n\n{}",
                 content,
                 metadata_block("configurazione RAG non disponibile")
-            );
+            ));
         }
     };
 
@@ -1033,11 +1102,11 @@ pub(crate) async fn build_initial_msg_with_attachments(
         Ok(h) => h,
         Err(e) => {
             tracing::warn!("initial_msg RAG: search fallita ({e}), fallback metadata");
-            return format!(
+            return wrap(format!(
                 "{}\n\n{}",
                 content,
                 metadata_block("recupero semantico non disponibile")
-            );
+            ));
         }
     };
 
@@ -1049,15 +1118,15 @@ pub(crate) async fn build_initial_msg_with_attachments(
 
     if relevant.is_empty() {
         tracing::info!("initial_msg RAG: 0 hit rilevanti, fallback metadata + tool");
-        return format!(
+        return wrap(format!(
             "{}\n\n{}",
             content,
             metadata_block("nessun estratto rilevante recuperato dal contenuto vettorializzato")
-        );
+        ));
     }
 
     let name_for = |source_id: &str| -> String {
-        attachments
+        let raw = attachments
             .iter()
             .find(|a| a.id.map(|u| u.to_string()).as_deref() == Some(source_id))
             .map(|a| a.name.clone())
@@ -1067,7 +1136,10 @@ pub(crate) async fn build_initial_msg_with_attachments(
                     .find(|r| r.id == source_id)
                     .map(|r| r.file_name.clone())
             })
-            .unwrap_or_else(|| source_id.to_string())
+            .unwrap_or_else(|| source_id.to_string());
+        // Il primo ramo (att.name) e' il campo LIBERO della richiesta, non il
+        // file_name sanificato persistito su disco: stessa difesa del chunk RAG.
+        nexus_agent_graph::decisions::sanitize_for_system_block(&raw)
     };
 
     let mut block = String::new();
@@ -1081,9 +1153,12 @@ pub(crate) async fn build_initial_msg_with_attachments(
     ));
     for att in attachments.iter() {
         let id_label = att.id.map(|u| format!(" [ID: {}]", u)).unwrap_or_default();
+        // name/mime_type non fidati: stessa difesa del chunk RAG sotto (regola M).
+        let name = nexus_agent_graph::decisions::sanitize_for_system_block(&att.name);
+        let mime = nexus_agent_graph::decisions::sanitize_for_system_block(&att.mime_type);
         block.push_str(&format!(
             "- {} ({}, {} byte){}\n",
-            att.name, att.mime_type, att.size_bytes, id_label
+            name, mime, att.size_bytes, id_label
         ));
     }
 
@@ -1091,6 +1166,12 @@ pub(crate) async fn build_initial_msg_with_attachments(
     let n_hits = relevant.len();
     for h in relevant.iter() {
         let chunk = trunc_chars(h.chunk_text.clone(), CHUNK_INJECT_CAP);
+        // Contenuto NON fidato (estratto da un documento caricato dall'utente):
+        // se contiene letteralmente "</allegati>" farebbe chiudere PREMATURAMENTE
+        // il blocco allo strip di user_text_only (playbook_engine::match_playbook),
+        // lasciando la coda reale del blocco visibile al match dei trigger come
+        // testo utente. Va sanificato PRIMA dell'iniezione (regola M).
+        let chunk = nexus_agent_graph::decisions::sanitize_for_system_block(&chunk);
         block.push_str(&format!(
             "\n[score {:.2}, da {}]\n{}\n",
             h.score,
@@ -1118,7 +1199,7 @@ pub(crate) async fn build_initial_msg_with_attachments(
         block.len()
     );
 
-    format!("{}\n\n{}", content, block)
+    wrap(format!("{}\n\n{}", content, block))
 }
 /// Punto unico (regola L) dell'invariante "al piu' UN run agentico attivo per
 /// session_id". Applica il last-wins: marca 'cancelled' + `cancellation_requested`
@@ -4449,7 +4530,10 @@ pub(crate) async fn spawn_agent_run(
     // chat_message_attachments vive nel DB del progetto (separazione DB): riusa
     // msgs_pool (stesso DB, risolto una volta a inizio spawn), coerente con il
     // worklog piu' sotto.
-    let initial_msg = build_initial_msg_with_attachments(
+    let InitialMsgWithAttachments {
+        text: initial_msg,
+        attachment_kinds,
+    } = build_initial_msg_with_attachments(
         &msgs_pool,
         &params.content,
         &params.attachments,
@@ -4555,6 +4639,7 @@ pub(crate) async fn spawn_agent_run(
     // partenza a meno che l'utente non abbia premuto "Forza".
     let provider_pin_clone = crate::orchestrator::ProviderPin::from_choice(&params.provider_choice);
     let initial_msg_clone = initial_msg.clone();
+    let attachment_kinds_clone = attachment_kinds.clone();
     let system_text_clone = system_text.clone();
     let recent_history_for_brain = recent_history;
     // L'intent classificato pilota la decisione di retry "hollow completion":
@@ -4649,6 +4734,7 @@ pub(crate) async fn spawn_agent_run(
                     // ReflectionNode per attribuire la reflection al template.
                     prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
                     initial_msg: initial_msg_clone.clone(),
+                    attachment_kinds: attachment_kinds_clone.clone(),
                     conversation_history: recent_history_for_brain.clone(),
                     tools_json: tools_json_for_brain.clone(),
                     intent_hint: intent_hint_for_brain.clone(),
@@ -4961,6 +5047,8 @@ pub(crate) async fn confirm_native_run(
         system_text: String::new(),
         prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
         initial_msg: String::new(),
+        // Resume da checkpoint: nessun messaggio nuovo, nessun allegato da rilevare.
+        attachment_kinds: Vec::new(),
         conversation_history: Vec::new(),
         tools_json: serde_json::json!([]),
         intent_hint: None,
@@ -5358,6 +5446,8 @@ pub(crate) async fn resume_fanin(
         system_text: String::new(),
         prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
         initial_msg: String::new(),
+        // Resume fan-in da checkpoint: nessun messaggio nuovo, nessun allegato.
+        attachment_kinds: Vec::new(),
         conversation_history: Vec::new(),
         tools_json: serde_json::json!([]),
         intent_hint: None,

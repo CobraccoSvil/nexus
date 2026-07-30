@@ -3760,6 +3760,8 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         // principale.
         prompt_key: Some(prompt_key.clone()),
         initial_msg,
+        // Sub-run: il task e' descritto nel prompt, nessun allegato proprio.
+        attachment_kinds: Vec::new(),
         // Sub-run isolato: NIENTE history del main (parita' col brain `run_subagent`,
         // che parte da messages=[Human(task)]).
         conversation_history: Vec::new(),
