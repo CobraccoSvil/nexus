@@ -153,7 +153,6 @@ use crate::decisions::end_turn::{
 use crate::decisions::escalation::{
     cap_candidates_one_step, pick_escalation_model, CrossProviderCandidate, EscalationPick,
 };
-use crate::decisions::switch_reason::SwitchReason;
 use crate::decisions::g1_accounting::{g1_accounting, G1Signals};
 use crate::decisions::helpers::{
     provider_style_supports_forcing, should_force_tool_choice, structural_loop_stall_signal,
@@ -171,22 +170,24 @@ use crate::decisions::scale_reason::{
     effective_token_brake, resolve_sizing_overrides, scale_cache_key, scale_trigger,
     ScaleHysteresisConfig, ScaleSizingConfig, ScaleTriggerConfig, SizingBaseline,
 };
+use crate::decisions::switch_reason::SwitchReason;
 use crate::decisions::text_repetition::{detect_repetition_collapse, RepetitionThresholds};
 use crate::decisions::tool_dispatch::{
     current_context_token_estimate, estimate_context_chars, flatten_context_text, ContextMessage,
 };
 use crate::decisions::turn_focus::build_turn_focus_directive;
+use crate::nodes::final_gate::FINAL_GATE_ESCALATION_KEY;
 use crate::nodes::scale_control::{
     SCALE_CONTEXT_KEY, SCALE_HYSTERESIS_CFG_KEY, SCALE_MOVE_CACHE_KEY_KEY, SCALE_SIZING_CFG_KEY,
     SCALE_SIZING_OVERRIDES_KEY,
 };
-use crate::nodes::final_gate::FINAL_GATE_ESCALATION_KEY;
 use crate::nodes::stall_recovery::{stall_move_key, STALL_CONTEXT_KEY};
 use crate::routing::signals::{
     count_recent_request_port, detect_recent_tool_error, detect_repeated_action_detailed,
     detect_repeated_failed_command, has_active_resources_in_history, has_recent_productive_action,
     has_tool_calls_in_history, modified_files_from_messages, recent_ai_turn_counts,
-    tool_error_stats, unfulfilled_signal_with, EXPLORATION_ONLY_TOOLS,
+    tool_error_stats, unfulfilled_signal_with, verifying_after_productive_work,
+    EXPLORATION_ONLY_TOOLS,
 };
 use crate::runtime::ports::RecoveryMove;
 use crate::runtime::ports::{
@@ -2645,34 +2646,30 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
 /// contatore reroute, piu' il segnale "output non compiuto" che il gate del cap
 /// riusa senza ricalcolarlo (regola L).
 ///
-/// ATTENZIONE (debito noto, non chiuso da questo modulo): [`unfulfilled`]
-/// porta la finestra STRETTA di [`unfulfilled_signal_with`]
+/// [`unfulfilled`] porta la finestra STRETTA di [`unfulfilled_signal_with`]
 /// (`tool_choice_forcing_max_iteration`, default 2), corretta per
-/// [`g1_accounting`] ma troppo stretta per il backstop "loop conclamato" di
-/// [`ExecutorNode::g1_cap_effettivo`] (soglia minima 12): quel branch resta
-/// di fatto irraggiungibile oltre le prime iterazioni. Un tentativo di
-/// sganciarlo dalla finestra (segnale gemello senza vincolo) e' stato
-/// scartato: senza vincolo di iterazione, `structural_unfulfilled_signal` e'
-/// vero per QUALUNQUE turno action-oriented con tool disponibili a inizio
-/// turno (la condizione "nessuna tool call IN CORSO" e' banalmente sempre
-/// vera al bordo del turno), quindi il backstop scattava anche su run sani a
-/// iterazioni alte — rottura misurata su 3 test esistenti (finestra
-/// forced-text, py:2032+). Serve un segnale genuinamente diverso (assenza di
-/// progresso SOSTENUTO, non solo "nessuna tool call adesso"); non e' nello
-/// scope di questo fix. Vedi task di follow-up.
+/// [`g1_accounting`] ma da sola troppo stretta per il backstop "loop
+/// conclamato" di [`ExecutorNode::g1_cap_effettivo`] (soglia minima 12): un
+/// segnale gemello senza vincolo di iterazione era stato scartato perche'
+/// `structural_unfulfilled_signal` e' vero per QUALUNQUE turno
+/// action-oriented con tool disponibili a inizio turno (la condizione
+/// "nessuna tool call IN CORSO" e' banalmente sempre vera al bordo del
+/// turno), quindi scattava anche su run sani ad iterazioni alte — rottura
+/// misurata su 3 test esistenti (finestra forced-text). Il backstop resta
+/// raggiungibile in OR con [`structural_loop_stall_signal`] (vedi
+/// [`ExecutorNode::g1_cap_effettivo`]): quello e' un CONTEGGIO di turni AI
+/// nella finestra recente senza azione produttiva, non un ri-controllo del
+/// bordo del turno corrente, e per costruzione richiede evidenza di
+/// ripetizione (`min_ai_turns` turni distinti), non un singolo turno isolato.
 struct ConteggioG1 {
     /// `g1_reroute_count` aggiornato: viaggia fino al delta finale del turno.
     reroute_count: i64,
     /// Cap re-entry "pulito" raggiunto (segnale di [`g1_accounting`]).
     cap_reached: bool,
     /// Esito del turno precedente NON compiuto (finestra stretta, vedi doc
-    /// dello struct). Alimenta sia [`g1_accounting`] sia
-    /// [`ExecutorNode::g1_cap_effettivo`].
-    ///
-    /// NOTA: `g1_cap_effettivo` allarga questo segnale in OR con
-    /// [`structural_loop_stall_signal`] (turni AI ripetuti senza azione
-    /// produttiva): leggere questo campo da solo non basta a sapere se il ramo
-    /// "loop conclamato" scattera'.
+    /// dello struct). `g1_cap_effettivo` allarga questo segnale in OR con
+    /// [`structural_loop_stall_signal`]: leggere questo campo da solo non
+    /// basta a sapere se il ramo "loop conclamato" scattera'.
     unfulfilled: bool,
     /// Escalation gia' fatte nel run: la soglia del loop conclamato ci cresce
     /// sopra, cosi' ogni promosso riceve un budget di iterazioni suo.
@@ -4509,13 +4506,13 @@ oppure riprova piu' tardi."
     /// loop G1 CONCLAMATO: molte iterazioni e output ancora non compiuto. "Non
     /// compiuto" e' l'OR di due segnali STRUTTURALI indipendenti (mai un terzo
     /// pattern testuale libero, regola M):
-    ///   - `g1.unfulfilled`: report ESPLICITO di passi pendenti (etichetta tipo
-    ///     "prossimi passi" seguita da un elenco, invariato);
+    ///   - `g1.unfulfilled`: segnale di [`unfulfilled_signal_with`] (finestra
+    ///     stretta, vedi doc di [`ConteggioG1`]);
     ///   - [`structural_loop_stall_signal`]: almeno `G1_LOOP_STALL_MIN_AI_TURNS`
     ///     turni AI nella finestra recente, NESSUNO produttivo. Copre il caso
-    ///     GENERICO che il solo report testuale non intercettava mai: un modello
-    ///     debole che descrive in prosa QUALSIASI (mai un elenco formattato) o
-    ///     chiama SOLO tool di sola esplorazione, senza mai convergere.
+    ///     GENERICO che la sola finestra stretta non intercetta mai oltre le
+    ///     prime iterazioni: un modello debole che descrive in prosa o chiama
+    ///     SOLO tool di sola esplorazione, senza mai convergere.
     ///
     /// Il pattern piu' insidioso e' quello in cui il modello non emette MAI un
     /// `end_turn` (solo tool_use di sola esplorazione ripetuti a oltranza): li'
@@ -4540,13 +4537,31 @@ oppure riprova piu' tardi."
     ///
     /// Anti falso-negativo (regola H): un run che ha PRODOTTO lavoro di recente
     /// (`productive_turns_in_lookback > 0`, derivato dallo STESSO conteggio di
-    /// `recent_ai_turn_counts`: nessuna seconda scansione della history) non va
+    /// [`recent_ai_turn_counts`]: nessuna seconda scansione della history) non va
     /// abortito. Lookback in messaggi (~5-6 iterazioni: AI tool_use + tool_result),
     /// ampio da non scattare su un run che ha appena agito, stretto da non
     /// mascherare un loop davvero a vuoto. `G1_LOOP_STALL_MIN_AI_TURNS` protegge
     /// dal falso positivo simmetrico: un SOLO turno AI nella finestra (nessuna
     /// ripetizione osservabile, es. il turno che precede la finestra forced-text)
     /// non e' evidenza di loop.
+    ///
+    /// Secondo anti-falso-positivo, PIU' INSIDIOSO del primo perche' sopravvive
+    /// anche a lookback ampi: un run che ha gia' lavorato (edit_file/write_file)
+    /// e poi passa a una fase di VERIFICA legittima e prolungata con SOLO tool di
+    /// osservazione RUNTIME (`RUNTIME_OBSERVATION_TOOLS`:
+    /// `read_service_output`/`tail_service_logs`/`list_active_services`/
+    /// `nexus_list_ports`) va scoperto una volta che le azioni produttive
+    /// escono dalla finestra — a differenza del primo caso, qui allargare
+    /// SOLO il lookback sposterebbe il bug invece di chiuderlo (una verifica
+    /// abbastanza lunga lo farebbe scattare comunque). [`verifying_after_productive_work`]
+    /// copre questo caso guardando OLTRE la finestra fissa (evidenza di lavoro
+    /// pregresso in tutta la history) SOLO quando la finestra recente e'
+    /// ESCLUSIVAMENTE monitoraggio runtime riuscito — mai per tool statici come
+    /// `read_file`/`grep`, che restano fuori da `RUNTIME_OBSERVATION_TOOLS` e
+    /// quindi non ottengono questo credito (il loop DESCRITTIVO generico sopra
+    /// resta intercettato). Stessa classe di falso positivo gia' incontrata dal
+    /// signature-loop sul run 2c41b145 (vedi `EXPLORATION_ONLY_TOOLS`), qui sul
+    /// gate G1 invece che sul detector di firme ripetute.
     ///
     /// `!declaration_pending` (ADR 0034): con un turno dichiarativo PENDENTE i gate
     /// di chiusura pre-LLM lasciano passare — al rientro dal delta dichiarativo la
@@ -4576,12 +4591,20 @@ oppure riprova piu' tardi."
                 .saturating_mul(g1.escalations + 1),
             sizing_ov,
         );
-        let (g1_loop_ai_turns, g1_loop_productive_turns) =
+        let (g1_loop_ai_turns, g1_loop_productive_turns, g1_loop_monitoring_turns) =
             recent_ai_turn_counts(messages, G1_LOOP_PRODUCTIVE_LOOKBACK);
         // Stessa domanda di has_recent_productive_action ("esiste un turno
         // produttivo nella finestra?"), derivata dal conteggio sopra invece di
-        // ri-scandire la history una seconda volta (regola L).
-        let g1_recent_productive = g1_loop_productive_turns > 0;
+        // ri-scandire la history una seconda volta (regola L). Allargata dal
+        // credito di verifica post-lavoro quando la finestra e' PURA
+        // osservazione runtime riuscita e il run ha gia' agito altrove nella
+        // history (vedi doc sopra).
+        let g1_recent_productive = g1_loop_productive_turns > 0
+            || verifying_after_productive_work(
+                messages,
+                g1_loop_ai_turns,
+                g1_loop_monitoring_turns,
+            );
         let g1_unfulfilled_or_stalled = g1.unfulfilled
             || structural_loop_stall_signal(
                 g1_loop_ai_turns,
@@ -4589,7 +4612,9 @@ oppure riprova piu' tardi."
                 G1_LOOP_STALL_MIN_AI_TURNS,
             );
         (g1.cap_reached
-            || (g1_unfulfilled_or_stalled && iters_in >= g1_loop_threshold && !g1_recent_productive))
+            || (g1_unfulfilled_or_stalled
+                && iters_in >= g1_loop_threshold
+                && !g1_recent_productive))
             && !declaration_pending
     }
 

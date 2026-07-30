@@ -7,6 +7,13 @@ use std::sync::Arc;
 
 use nexus_graph::node::GraphNode;
 use nexus_graph::GraphState as _;
+// I nomi dei tool di osservazione runtime vengono dalla lista che il gate
+// legge davvero: una stringa ricopiata qui resterebbe verde anche dopo che
+// quel tool e' uscito da `RUNTIME_OBSERVATION_TOOLS` (regola O).
+use crate::routing::signals::{
+    LIST_ACTIVE_SERVICES_TOOL, NEXUS_LIST_PORTS_TOOL, READ_SERVICE_OUTPUT_TOOL,
+    TAIL_SERVICE_LOGS_TOOL,
+};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
@@ -1059,6 +1066,122 @@ async fn run_produttivo_alte_iterazioni_non_scatena_g1() {
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
     assert_ne!(out.stop_reason, Some(StopReason::G1CapReached));
+    assert_ne!(out.stop_reason, Some(StopReason::G1Escalated));
+    assert!(
+        !llm.seen.lock().unwrap().is_empty(),
+        "il turno prosegue: l'LLM viene chiamato"
+    );
+}
+
+/// History del difetto residuo (revisione avversaria del fix sopra, non una
+/// regressione nuova): lavoro produttivo REALE (edit_file/write_file) seguito
+/// da una fase di VERIFICA prolungata con SOLO tool di osservazione RUNTIME
+/// (`read_service_output`/`tail_service_logs`/`list_active_services`/
+/// `nexus_list_ports`, mai un tool statico come `read_file`/`grep`), tutti a
+/// esito RIUSCITO. Il numero di round di verifica (8 = G1_LOOP_PRODUCTIVE_LOOKBACK/2)
+/// e' calibrato per riempire ESATTAMENTE la finestra di lookback e spingere
+/// tutte le azioni produttive fuori da essa, riproducendo la precondizione
+/// del falso positivo: senza il credito di verifica post-lavoro, questa
+/// history farebbe scattare lo stesso `structural_loop_stall_signal` del test
+/// `loop_conclamato_di_sola_esplorazione_scatta_cap_g1` sopra.
+fn history_verifica_dopo_lavoro_produttivo() -> Vec<Message> {
+    let mut msgs = vec![human(
+        "Applica la migrazione multi-valuta e verifica che il servizio resti stabile",
+    )];
+    let lavoro: &[(&str, Value, &str)] = &[
+        (
+            "edit_file",
+            json!({"path": "src/payments/mod.rs"}),
+            "applicato",
+        ),
+        (
+            "write_file",
+            json!({"path": "src/payments/currency.rs"}),
+            "scritto",
+        ),
+        (
+            "edit_file",
+            json!({"path": "src/payments/gateway.rs"}),
+            "applicato",
+        ),
+    ];
+    for (name, input, result) in lavoro {
+        msgs.push(ai_tool(name, input.clone()));
+        msgs.push(Message::Human {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "c1".into(),
+                content: Value::String((*result).into()),
+                is_error: false,
+                exit_code: None,
+            }]),
+        });
+    }
+    let verifica: &[(&str, Value, &str)] = &[
+        (
+            LIST_ACTIVE_SERVICES_TOOL,
+            json!({}),
+            "payments-service: running",
+        ),
+        (NEXUS_LIST_PORTS_TOOL, json!({}), "8080: LISTEN"),
+        (TAIL_SERVICE_LOGS_TOOL, json!({}), "[info] richiesta gestita"),
+        (READ_SERVICE_OUTPUT_TOOL, json!({}), "server avviato su :8080"),
+        (
+            LIST_ACTIVE_SERVICES_TOOL,
+            json!({}),
+            "payments-service: running",
+        ),
+        (NEXUS_LIST_PORTS_TOOL, json!({}), "8080: LISTEN"),
+        (TAIL_SERVICE_LOGS_TOOL, json!({}), "[info] richiesta gestita"),
+        (READ_SERVICE_OUTPUT_TOOL, json!({}), "server avviato su :8080"),
+    ];
+    for (name, input, result) in verifica {
+        msgs.push(ai_tool(name, input.clone()));
+        msgs.push(Message::Human {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "c1".into(),
+                content: Value::String((*result).into()),
+                is_error: false,
+                exit_code: None,
+            }]),
+        });
+    }
+    msgs
+}
+
+#[tokio::test]
+async fn verifica_runtime_dopo_lavoro_produttivo_non_scatena_g1() {
+    // FIX (difetto residuo): 8 round di sola osservazione runtime riuscita
+    // riempiono ESATTAMENTE la finestra di lookback (16 messaggi) e spingono
+    // il lavoro produttivo fuori da essa, a iterazioni ben oltre la soglia
+    // (20 > 12): senza il credito di verifica post-lavoro il gate G1
+    // scatterebbe per errore su un run che sta ancora verificando
+    // legittimamente, non stallando.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = llm_tool_call(LIST_ACTIVE_SERVICES_TOOL, json!({}));
+    let ctx = ctx_with(llm.clone());
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: history_verifica_dopo_lavoro_produttivo(),
+        iterations: Some(20),
+        stop_reason: Some(StopReason::ToolUse),
+        tools_json: Some(vec![
+            json!({"name": "edit_file"}),
+            json!({"name": "write_file"}),
+            json!({"name": LIST_ACTIVE_SERVICES_TOOL}),
+            json!({"name": NEXUS_LIST_PORTS_TOOL}),
+            json!({"name": TAIL_SERVICE_LOGS_TOOL}),
+            json!({"name": READ_SERVICE_OUTPUT_TOOL}),
+        ]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_ne!(
+        out.stop_reason,
+        Some(StopReason::G1CapReached),
+        "verifica runtime legittima dopo lavoro produttivo non e' loop conclamato"
+    );
     assert_ne!(out.stop_reason, Some(StopReason::G1Escalated));
     assert!(
         !llm.seen.lock().unwrap().is_empty(),

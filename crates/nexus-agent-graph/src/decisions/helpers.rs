@@ -310,6 +310,18 @@ mod tests {
     }
 
     #[test]
+    fn loop_stall_richiede_evidenza_di_ripetizione() {
+        // Sotto soglia (2 turni AI su min=3): nessuna ripetizione osservabile,
+        // anche con zero produttivi -> non e' stallo.
+        assert!(!structural_loop_stall_signal(2, 0, 3));
+        // Soglia raggiunta ma con almeno un turno produttivo -> non e' stallo.
+        assert!(!structural_loop_stall_signal(5, 1, 3));
+        // Soglia raggiunta e zero produttivi -> stallo conclamato.
+        assert!(structural_loop_stall_signal(3, 0, 3));
+        assert!(structural_loop_stall_signal(8, 0, 3));
+    }
+
+    #[test]
     fn action_oriented_default_none() {
         assert!(turn_action_oriented(None));
         assert!(!turn_action_oriented(Some(false)));

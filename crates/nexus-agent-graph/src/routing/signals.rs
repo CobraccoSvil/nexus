@@ -69,6 +69,15 @@ fn ai_tool_use_names(messages: &[Message]) -> Vec<&str> {
     names
 }
 
+/// Nomi dei tool di osservazione runtime che ricorrono in piu' liste e nei
+/// test. Stessa convenzione di [`PORT_REQUEST_TOOL`]: un nome citato da piu'
+/// punti si scrive una volta sola, cosi' un test non puo' verificare una
+/// stringa che nessuna lista contiene piu'.
+pub(crate) const READ_SERVICE_OUTPUT_TOOL: &str = "read_service_output";
+pub(crate) const TAIL_SERVICE_LOGS_TOOL: &str = "tail_service_logs";
+pub(crate) const LIST_ACTIVE_SERVICES_TOOL: &str = "list_active_services";
+pub(crate) const NEXUS_LIST_PORTS_TOOL: &str = "nexus_list_ports";
+
 /// Tool di SOLA esplorazione (`_EXPLORATION_ONLY_TOOLS` Python): leggono/ispezionano
 /// senza produrre side-effect. Un tool_use con nome NON in questo set conta come
 /// azione produttiva. Lista tenuta allineata 1:1 a helpers.py.
@@ -103,10 +112,31 @@ pub const EXPLORATION_ONLY_TOOLS: &[&str] = &[
     // correzione e l'altra). Da read-only ereditano: sconto post-progresso nel
     // signature-loop, soglia repeated_action piu' alta, conteggio nel budget
     // esplorazione (il polling infinito a vuoto resta guidato/interrotto).
-    "read_service_output",
-    "tail_service_logs",
-    "list_active_services",
-    "nexus_list_ports",
+    READ_SERVICE_OUTPUT_TOOL,
+    TAIL_SERVICE_LOGS_TOOL,
+    LIST_ACTIVE_SERVICES_TOOL,
+    NEXUS_LIST_PORTS_TOOL,
+];
+
+/// Sottoinsieme di [`EXPLORATION_ONLY_TOOLS`] che osserva stato RUNTIME in
+/// evoluzione (log/servizi/porte) invece di un contenuto statico (file,
+/// grep, allegati): per natura da POLLING, la stessa domanda ripetuta a
+/// intervalli e' l'uso previsto, non un sintomo di stallo (vedi il commento
+/// sopra sull'incidente run 2c41b145). Punto unico (regola L) del
+/// sottoinsieme "verifica post-lavoro" letto da [`recent_ai_turn_counts`] e
+/// [`verifying_after_productive_work`] — usato dal gate G1 loop-conclamato
+/// (`nodes::executor::ExecutorNode::g1_cap_effettivo`) per NON confondere una
+/// fase di monitoraggio legittima dopo lavoro gia' fatto con uno stallo
+/// genuino. L'invariante "ogni voce qui compare anche in
+/// `EXPLORATION_ONLY_TOOLS`" e' coperta da test
+/// (`runtime_observation_tools_e_sottoinsieme_di_exploration_only`), non
+/// dalla struttura dati (le due liste rispondono a domande diverse: "non
+/// muta nulla" contro "osserva qualcosa che evolve da solo").
+pub const RUNTIME_OBSERVATION_TOOLS: &[&str] = &[
+    READ_SERVICE_OUTPUT_TOOL,
+    TAIL_SERVICE_LOGS_TOOL,
+    LIST_ACTIVE_SERVICES_TOOL,
+    NEXUS_LIST_PORTS_TOOL,
 ];
 
 /// True se il run ha gia' eseguito almeno UN'azione PRODUTTIVA (tool_use con
@@ -119,57 +149,102 @@ pub fn has_productive_action_in_history(messages: &[Message]) -> bool {
         .any(|name| !EXPLORATION_ONLY_TOOLS.contains(&name))
 }
 
-/// Conta, negli ultimi `lookback` messaggi, i turni AI (`Message::Ai`) totali e
-/// quanti di essi hanno emesso almeno un tool_use PRODUTTIVO (nome fuori da
-/// [`EXPLORATION_ONLY_TOOLS`]). Ritorna `(ai_turns_in_lookback,
-/// productive_turns_in_lookback)`.
+/// Conta, negli ultimi `lookback` messaggi, i turni AI (`Message::Ai`) totali,
+/// quanti hanno emesso almeno un tool_use PRODUTTIVO RIUSCITO (nome fuori da
+/// [`EXPLORATION_ONLY_TOOLS`] e con esito diverso da errore, via
+/// [`tool_result_outcome_after`]) e quanti sono turni di sola OSSERVAZIONE
+/// RUNTIME riuscita (tutti i tool_use del turno in [`RUNTIME_OBSERVATION_TOOLS`],
+/// esito RIUSCITO). Ritorna `(ai_turns, productive_turns, monitoring_turns)`.
 ///
 /// Punto unico (regola L) del fatto strutturale "la history recente mostra
-/// azione produttiva?": [`has_recent_productive_action`] e' un thin wrapper su
-/// questo conteggio (`productive_turns_in_lookback > 0`), e il gate G1
-/// loop-conclamato (`nodes::executor::ExecutorNode::g1_cap_effettivo`) legge
-/// entrambe le componenti dallo STESSO conteggio invece di ri-scandire la
-/// history due volte con due implementazioni distinte. Riusa
-/// `message_tool_uses`/`tail_messages`, non re-implementa l'estrazione
-/// tool_use.
-pub fn recent_ai_turn_counts(messages: &[Message], lookback: usize) -> (usize, usize) {
+/// azione produttiva / verifica legittima?": [`has_recent_productive_action`]
+/// e' un thin wrapper su questo conteggio (`productive_turns > 0`), e il gate
+/// G1 loop-conclamato legge tutte e tre le componenti dallo STESSO conteggio
+/// invece di ri-scandire la history con implementazioni distinte.
+///
+/// "Produttivo" richiede successo, non solo il nome del tool: un tool fuori da
+/// `EXPLORATION_ONLY_TOOLS` che FALLISCE sempre (`is_error=true` a ogni
+/// tentativo) non e' evidenza che il run stia progredendo, e non deve
+/// sottrarre un turno al conteggio di stallo. Riusa
+/// [`tool_result_outcome_after`] (stesso punto unico di
+/// [`modified_files_from_messages`]), un solo calcolo dell'esito per turno.
+pub fn recent_ai_turn_counts(messages: &[Message], lookback: usize) -> (usize, usize, usize) {
     let window = tail_messages(messages, lookback);
+    /// Stesso raggio di [`modified_files_from_messages`]: il tool_result di un
+    /// tool_use segue di norma entro poche posizioni nella history.
+    const OUTCOME_LOOKAHEAD: usize = 3;
     let mut ai_turns = 0usize;
     let mut productive_turns = 0usize;
-    for m in window {
+    let mut monitoring_turns = 0usize;
+    for (idx, m) in window.iter().enumerate() {
         if !matches!(m, Message::Ai { .. }) {
             continue;
         }
         ai_turns += 1;
-        // NOTA: "produttivo" e' giudicato dal NOME del tool richiesto, non
-        // dall'ESITO (tool_result): un tool fuori da EXPLORATION_ONLY_TOOLS che
-        // fallisce sempre (is_error=true a ogni tentativo) resta contato come
-        // produttivo qui. Un loop di tentativi falliti su un tool "giusto" non
-        // e' intercettato da questo conteggio (limite noto, non una regressione:
-        // il comportamento pre-esistente non lo copriva nemmeno lui).
-        let is_productive = message_tool_uses(m)
-            .into_iter()
-            .any(|(name, _)| !EXPLORATION_ONLY_TOOLS.contains(&name));
-        if is_productive {
+        let tool_uses = message_tool_uses(m);
+        if tool_uses.is_empty() {
+            continue;
+        }
+        let outcome = tool_result_outcome_after(window, idx, OUTCOME_LOOKAHEAD);
+        let has_productive_name = tool_uses
+            .iter()
+            .any(|(name, _)| !EXPLORATION_ONLY_TOOLS.contains(name));
+        if has_productive_name && outcome != Some(true) {
             productive_turns += 1;
         }
+        let all_monitoring = tool_uses
+            .iter()
+            .all(|(name, _)| RUNTIME_OBSERVATION_TOOLS.contains(name));
+        if all_monitoring && outcome == Some(false) {
+            monitoring_turns += 1;
+        }
     }
-    (ai_turns, productive_turns)
+    (ai_turns, productive_turns, monitoring_turns)
 }
 
 /// Come [`has_productive_action_in_history`] ma limitata agli ULTIMI `lookback`
-/// messaggi: distingue "il run sta producendo lavoro ADESSO" da "ha agito
-/// all'inizio e ora gira a vuoto". Usata dal gate G1 loop-conclamato per NON
-/// abortire un run che ha appena eseguito azioni concrete (anti falso-negativo,
-/// regola H): un run reale aveva installato i browser Playwright + system-deps e
-/// fatto passare il test E2E, ma il vecchio gate lessicale "non compiuto"
-/// (blacklist NARRAZIONE, rimossa con ADR 0018 fase 3) lo abortiva ignorando i
-/// 16 tool riusciti, sostituendo il successo con un messaggio di resa. Il
-/// segnale STRUTTURALE prevale sempre. Thin wrapper su
-/// [`recent_ai_turn_counts`] (regola L): stessa finestra, stessa nozione di
-/// "produttivo", un solo posto che la definisce.
+/// messaggi: distingue "il run sta producendo lavoro ADESSO" da "ha agito all'inizio
+/// e ora gira a vuoto". Usata dal gate G1 loop-conclamato per NON abortire un run che
+/// ha appena eseguito azioni concrete (anti falso-negativo, regola H): un run reale
+/// aveva installato i browser Playwright + system-deps e fatto passare il test E2E,
+/// ma il vecchio gate lessicale "non compiuto" (blacklist NARRAZIONE, rimossa con
+/// ADR 0018 fase 3) lo abortiva ignorando i 16 tool riusciti, sostituendo il
+/// successo con un messaggio di resa. Il segnale STRUTTURALE prevale sempre. Thin
+/// wrapper su [`recent_ai_turn_counts`] (regola L): stessa finestra, stessa
+/// nozione di "produttivo", un solo posto che la definisce.
 pub fn has_recent_productive_action(messages: &[Message], lookback: usize) -> bool {
     recent_ai_turn_counts(messages, lookback).1 > 0
+}
+
+/// True se il run sta VERIFICANDO dopo aver gia' lavorato: nella finestra
+/// recente OGNI turno AI con tool_use e' un turno di sola osservazione
+/// RUNTIME riuscita (`monitoring_turns_in_lookback == ai_turns_in_lookback`,
+/// entrambi da [`recent_ai_turn_counts`]) e altrove nella history — anche
+/// FUORI dalla finestra, dove il gate G1 non guarderebbe piu' — c'e' evidenza
+/// di almeno un'azione produttiva ([`has_productive_action_in_history`]).
+///
+/// Punto unico (regola L) del credito "verifica legittima dopo lavoro", letto
+/// da `nodes::executor::ExecutorNode::g1_cap_effettivo` per allargare
+/// `g1_recent_productive` oltre la finestra fissa. Senza questo credito, un
+/// run che ha gia' scritto/editato e poi passa a 8+ turni di solo
+/// `read_service_output`/`tail_service_logs`/`list_active_services`/
+/// `nexus_list_ports` (mai un tool statico come `read_file`/`grep`, che
+/// resta FUORI da `RUNTIME_OBSERVATION_TOOLS` e quindi non ottiene credito)
+/// vede le proprie azioni produttive uscire dalla finestra di lookback e
+/// viene trattato come loop conclamato — la stessa classe di falso positivo
+/// gia' incontrata dal signature-loop sul run 2c41b145 (vedi
+/// `EXPLORATION_ONLY_TOOLS` sopra), qui sul gate G1 invece che sul
+/// detector di firme ripetute. Un run che monitora SENZA aver mai lavorato
+/// non riceve credito (nessuna azione produttiva da nessuna parte nella
+/// history): resta soggetto al gate come prima.
+pub fn verifying_after_productive_work(
+    messages: &[Message],
+    ai_turns_in_lookback: usize,
+    monitoring_turns_in_lookback: usize,
+) -> bool {
+    ai_turns_in_lookback > 0
+        && monitoring_turns_in_lookback == ai_turns_in_lookback
+        && has_productive_action_in_history(messages)
 }
 
 /// Elenca i file modificati con SUCCESSO (edit_file/write_file con tool_result NON
@@ -338,7 +413,7 @@ const PORT_REQUEST_TOOL: &str = "request_port";
 
 /// Tool che, se presenti nella history recente, indicano risorse gia' attive
 /// note al run (`_resource_tools` Python).
-const RESOURCE_TOOLS: &[&str] = &[PORT_REQUEST_TOOL, "list_active_services", "service_restart"];
+const RESOURCE_TOOLS: &[&str] = &[PORT_REQUEST_TOOL, LIST_ACTIVE_SERVICES_TOOL, "service_restart"];
 
 /// Estrae i tool_use `(name, input)` di un singolo [`Message::Ai`], guardando
 /// ENTRAMBE le forme: `tool_calls` (OpenAI-compat) e `ContentBlock::ToolUse`
@@ -1499,6 +1574,114 @@ mod tests {
             tool_call_id: "c1".into(),
             content: MessageContent::text(text),
         }
+    }
+
+    #[test]
+    fn runtime_observation_tools_e_sottoinsieme_di_exploration_only() {
+        for tool in RUNTIME_OBSERVATION_TOOLS {
+            assert!(
+                EXPLORATION_ONLY_TOOLS.contains(tool),
+                "{tool} deve comparire anche in EXPLORATION_ONLY_TOOLS"
+            );
+        }
+    }
+
+    #[test]
+    fn recent_ai_turn_counts_ignora_produttivo_sempre_fallito() {
+        // Un tool produttivo (fuori da EXPLORATION_ONLY_TOOLS) il cui esito e'
+        // SEMPRE errore non e' evidenza di progresso: non deve contare come
+        // "produttivo" (chiude il buco minore: prima si guardava solo il NOME).
+        let msgs = vec![
+            ai_tool_input("edit_file", json!({"path": "a.rs"})),
+            human_tool_result(Some(1), true, "errore: file non trovato"),
+        ];
+        assert_eq!(recent_ai_turn_counts(&msgs, 16), (1, 0, 0));
+    }
+
+    #[test]
+    fn recent_ai_turn_counts_monitoraggio_runtime_conta_solo_se_successo() {
+        // Tool di osservazione runtime con esito RIUSCITO -> monitoring_turns=1.
+        let ok = vec![
+            ai_tool_input(READ_SERVICE_OUTPUT_TOOL, json!({})),
+            human_tool_result(None, false, "log stabile"),
+        ];
+        assert_eq!(recent_ai_turn_counts(&ok, 16), (1, 0, 1));
+
+        // Stesso tool ma esito FALLITO -> non e' monitoraggio legittimo.
+        let failing = vec![
+            ai_tool_input(READ_SERVICE_OUTPUT_TOOL, json!({})),
+            human_tool_result(None, true, "errore: servizio non raggiungibile"),
+        ];
+        assert_eq!(recent_ai_turn_counts(&failing, 16), (1, 0, 0));
+
+        // Turno che mischia un tool di osservazione runtime con un tool
+        // statico (read_file): non e' "tutto monitoraggio runtime".
+        let mixed = Message::Ai {
+            content: MessageContent::Blocks(vec![
+                ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: READ_SERVICE_OUTPUT_TOOL.into(),
+                    input: json!({}),
+                    thought_signature: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "c2".into(),
+                    name: "read_file".into(),
+                    input: json!({"path": "a.rs"}),
+                    thought_signature: None,
+                },
+            ]),
+            tool_calls: vec![],
+            reasoning: None,
+            thinking_signature: None,
+        };
+        let mixed_msgs = vec![mixed, human_tool_result(None, false, "ok")];
+        assert_eq!(recent_ai_turn_counts(&mixed_msgs, 16), (1, 0, 0));
+    }
+
+    #[test]
+    fn verifying_after_productive_work_richiede_lavoro_pregresso_e_monitoraggio_totale() {
+        // Storia: 1 round produttivo + 2 round di monitoraggio runtime riuscito.
+        let messages = vec![
+            ai_tool_input("write_file", json!({"path": "a.rs"})),
+            human_tool_result(None, false, "scritto"),
+            ai_tool_input(READ_SERVICE_OUTPUT_TOOL, json!({})),
+            human_tool_result(None, false, "log 1"),
+            ai_tool_input(TAIL_SERVICE_LOGS_TOOL, json!({})),
+            human_tool_result(None, false, "log 2"),
+        ];
+        // Finestra di 4 messaggi = ultimi 2 round, ENTRAMBI monitoraggio: il
+        // lavoro produttivo e' fuori finestra ma resta visibile nella history
+        // intera -> credito concesso.
+        let (ai_turns, productive, monitoring) = recent_ai_turn_counts(&messages, 4);
+        assert_eq!((ai_turns, productive, monitoring), (2, 0, 2));
+        assert!(verifying_after_productive_work(
+            &messages, ai_turns, monitoring
+        ));
+
+        // Stessa finestra ma SENZA alcun lavoro produttivo in tutta la history
+        // (il round write_file non esiste) -> nessun credito: un run che si
+        // limita a monitorare senza aver mai agito resta soggetto al gate.
+        let solo_monitoraggio = &messages[2..];
+        let (ai_turns_sm, _prod_sm, monitoring_sm) = recent_ai_turn_counts(solo_monitoraggio, 4);
+        assert!(!verifying_after_productive_work(
+            solo_monitoraggio,
+            ai_turns_sm,
+            monitoring_sm
+        ));
+
+        // Un tool STATICO (read_file, non in RUNTIME_OBSERVATION_TOOLS) nella
+        // finestra rompe "tutto monitoraggio": niente credito, il loop
+        // descrittivo generico resta intercettato.
+        let mut mixed = messages[..4].to_vec();
+        mixed.push(ai_tool_input("read_file", json!({"path": "b.rs"})));
+        mixed.push(human_tool_result(None, false, "contenuto"));
+        let (ai_turns_mx, _prod_mx, monitoring_mx) = recent_ai_turn_counts(&mixed, 4);
+        assert!(!verifying_after_productive_work(
+            &mixed,
+            ai_turns_mx,
+            monitoring_mx
+        ));
     }
 
     #[test]
