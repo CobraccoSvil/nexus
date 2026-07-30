@@ -170,10 +170,49 @@ pub async fn snapshot_after_mutation(
     let tmp_index_str = tmp_index.to_string_lossy().to_string();
     let env: &[(&str, &str)] = &[("GIT_INDEX_FILE", tmp_index_str.as_str())];
 
-    // 1) bootstrap index temp da HEAD (idempotente: copre anche rebase utente)
-    if let Err((code, err)) = git(project_root, &["read-tree", "HEAD"], env).await {
+    // Tip del branch di sessione, se la sessione ne ha gia' prodotto uno: e' la
+    // base del cumulo (passo 1) E il parent del nuovo commit (passo 4). Una sola
+    // interrogazione per entrambi: due `rev-parse` distinti potrebbero osservare
+    // due valori diversi e comporre un commit la cui base non e' il suo parent.
+    let session_tip = git(project_root, &["rev-parse", &branch_ref], env)
+        .await
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    // 1) bootstrap dell'index temp.
+    //
+    // La base e' il TIP DEL BRANCH DI SESSIONE, non HEAD: il presidio promette
+    // un cumulo (`git diff` cumulativi della sessione, doc di modulo) e con
+    // `read-tree HEAD` incondizionato non lo era. L'index ripartiva da HEAD a
+    // ogni mutazione e vi si stagiava il solo file appena scritto, quindi il
+    // tree del commit N riportava ogni ALTRO file alla versione di HEAD: la
+    // catena dei parent era corretta (N -> N-1) e faceva sembrare cumulativa
+    // una storia in cui ogni commit annullava il precedente.
+    //
+    // Il ri-ancoraggio a HEAD non sparisce, diventa una CONDIZIONE: se l'utente
+    // committa sotto la sessione, HEAD smette di essere antenato del branch e
+    // ripartire dal tip riporterebbe indietro il lavoro dell'utente. La domanda
+    // la pone git (`merge-base --is-ancestor`), non un confronto fra hash: fra
+    // HEAD e il tip puo' esserci un numero qualunque di commit.
+    let base = match &session_tip {
+        Some(tip)
+            if git(
+                project_root,
+                &["merge-base", "--is-ancestor", "HEAD", tip],
+                env,
+            )
+            .await
+            .is_ok() =>
+        {
+            tip.as_str()
+        }
+        _ => "HEAD",
+    };
+    if let Err((code, err)) = git(project_root, &["read-tree", base], env).await {
         tracing::warn!(
-            session = %short, code, "session_autocommit: read-tree HEAD fallito: {err}"
+            session = %short, code, base = %base,
+            "session_autocommit: read-tree fallito: {err}"
         );
         return;
     }
@@ -200,11 +239,13 @@ pub async fn snapshot_after_mutation(
     };
     let tree = tree_out.trim();
 
-    // 4) parent: ultimo commit del branch nexus se esiste, altrimenti HEAD
-    let parent_out = git(project_root, &["rev-parse", &branch_ref], env).await;
-    let parent = match parent_out {
-        Ok(s) => s.trim().to_string(),
-        Err(_) => match git(project_root, &["rev-parse", "HEAD"], env).await {
+    // 4) parent: ultimo commit del branch nexus se esiste, altrimenti HEAD.
+    // Riusa il tip letto al passo 1: la storia resta lineare anche quando la
+    // base e' tornata a HEAD (ri-ancoraggio), perche' il branch non deve
+    // perdere i propri commit precedenti — solo smettere di riproporne il tree.
+    let parent = match &session_tip {
+        Some(tip) => tip.clone(),
+        None => match git(project_root, &["rev-parse", "HEAD"], env).await {
             Ok(s) => s.trim().to_string(),
             Err((code, err)) => {
                 tracing::warn!(
@@ -277,7 +318,81 @@ pub async fn snapshot_after_mutation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::time::Duration;
+
+    /// git SINCRONO per il setup del repo di prova. Fuori dal path di produzione:
+    /// qui `expect` e' ammesso (regola F).
+    fn git_sync(cwd: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("git spawn");
+        assert!(status.success(), "git {args:?} fallito in {cwd:?}");
+    }
+
+    /// Come [`git_sync`] ma ritorna stdout: serve a INTERROGARE il repo dopo che
+    /// la produzione l'ha scritto, invece di dedurne lo stato (regola O).
+    fn git_out(cwd: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git spawn");
+        assert!(
+            out.status.success(),
+            "git {args:?} fallito in {cwd:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Repo git temporaneo con un commit iniziale, cioe' un HEAD risolvibile:
+    /// e' la precondizione di `snapshot_after_mutation` (senza HEAD non c'e'
+    /// base da cui partire ne' parent per il primo commit).
+    fn temp_repo() -> (tempfile::TempDir, PathBuf) {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().join("repo");
+        std::fs::create_dir_all(&root).expect("mkdir repo");
+        git_sync(&root, &["init", "-q"]);
+        git_sync(&root, &["config", "user.name", "nexus-test"]);
+        git_sync(&root, &["config", "user.email", "test@nexus.local"]);
+        git_sync(&root, &["checkout", "-q", "-B", "main"]);
+        std::fs::write(root.join("README.md"), "riga iniziale\n").expect("write README");
+        git_sync(&root, &["add", "-A"]);
+        git_sync(&root, &["commit", "-q", "-m", "commit iniziale"]);
+        (td, root)
+    }
+
+    /// L'index temporaneo vive in `std::env::temp_dir()`, FUORI dal tempdir del
+    /// test: senza questa pulizia ogni esecuzione ne lascerebbe uno.
+    struct IndexTemp(PathBuf);
+    impl Drop for IndexTemp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Semina i due settings che [`load_config`] legge davvero. Il prefisso NON e'
+    /// quello di default apposta: se la lettura dal DB non avvenisse, il branch
+    /// nascerebbe altrove e `ls-tree` fallirebbe invece di passare in silenzio.
+    async fn crea_settings(pool: &PgPool, prefix: &str) {
+        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(pool)
+            .await
+            .expect("create table settings");
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES \
+             ('agent.autocommit.enabled', 'true'), ('agent.autocommit.branch_prefix', $1)",
+        )
+        .bind(prefix)
+        .execute(pool)
+        .await
+        .expect("seed settings autocommit");
+    }
 
     /// Soppressione FASE 2 (buco B2): con `isolated_subrun=true` la funzione e' un
     /// NO-OP immediato — esce PRIMA di `load_config(db)` e di qualunque comando git.
@@ -306,6 +421,122 @@ mod tests {
         assert!(
             res.is_ok(),
             "isolated_subrun=true deve essere no-op immediato (nessun I/O DB/git)"
+        );
+    }
+
+    /// La rete di sicurezza e' CUMULATIVA: il tree dell'ultimo commit di sessione
+    /// contiene TUTTE le mutazioni della sessione, non solo l'ultima.
+    ///
+    /// E' la promessa del doc di modulo ("`git diff` cumulativi della sessione")
+    /// ed e' l'unica che rende utile il presidio nel caso per cui esiste: il DB
+    /// perde le righe di `file_mutations` e il branch resta l'unica copia.
+    ///
+    /// Il difetto misurato: l'index temporaneo ripartiva da `HEAD` a ogni
+    /// mutazione e vi si stagiava il SOLO file appena scritto, quindi il commit N
+    /// riportava ogni altro file alla versione di HEAD. La catena dei parent era
+    /// corretta (N -> N-1) e faceva sembrare cumulativa una storia in cui ogni
+    /// commit ANNULLAVA il precedente: `git log` mostrava tre commit,
+    /// `git diff HEAD..<branch>` un file solo.
+    ///
+    /// Il test attraversa la produzione per intero (regola O): repo git vero,
+    /// settings letti dal DB, e la verifica interroga git (`ls-tree`, `show`)
+    /// invece di dedurre lo stato dalle chiamate fatte.
+    #[sqlx::test]
+    async fn il_branch_di_sessione_accumula_tutte_le_mutazioni(pool: PgPool) {
+        let prefix = "nexus-test/sessione/";
+        crea_settings(&pool, prefix).await;
+
+        let (_td, root) = temp_repo();
+        let sid = Uuid::new_v4();
+        let short = short_session(sid);
+        let _idx = IndexTemp(std::env::temp_dir().join(format!("nexus-autocommit-{short}.idx")));
+        let branch = format!("refs/heads/{}{short}", prefix);
+
+        // Tre mutazioni della stessa sessione: due file distinti, poi il ritocco
+        // del primo (il caso "modify" dopo che un ALTRO file e' stato toccato).
+        std::fs::write(root.join("primo.txt"), "alfa\n").expect("write primo");
+        snapshot_after_mutation(&pool, &root, true, Some(sid), false, "create", "primo.txt").await;
+
+        std::fs::write(root.join("secondo.txt"), "beta\n").expect("write secondo");
+        snapshot_after_mutation(&pool, &root, true, Some(sid), false, "create", "secondo.txt").await;
+
+        std::fs::write(root.join("primo.txt"), "alfa corretto\n").expect("rewrite primo");
+        snapshot_after_mutation(&pool, &root, true, Some(sid), false, "modify", "primo.txt").await;
+
+        let elencati = git_out(&root, &["ls-tree", "-r", "--name-only", &branch]);
+        let presenti: Vec<&str> = elencati
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+
+        assert!(
+            presenti.contains(&"secondo.txt"),
+            "il tree dell'ultimo commit di sessione deve conservare le mutazioni \
+             PRECEDENTI, non solo l'ultima; contenuto: {presenti:?}"
+        );
+        assert!(
+            presenti.contains(&"primo.txt"),
+            "il file mutato per ultimo deve esserci; contenuto: {presenti:?}"
+        );
+
+        // Non basta il nome: il cumulo deve portare il contenuto AGGIORNATO del
+        // file ritoccato, non la sua prima versione.
+        let primo = git_out(&root, &["show", &format!("{branch}:primo.txt")]);
+        assert_eq!(primo, "alfa corretto\n", "l'ultima versione del file mutato");
+        let secondo = git_out(&root, &["show", &format!("{branch}:secondo.txt")]);
+        assert_eq!(secondo, "beta\n", "la mutazione intermedia, intatta");
+
+        // La storia resta lineare: un commit per mutazione, sopra il commit
+        // iniziale dell'utente.
+        let n = git_out(&root, &["rev-list", "--count", &branch]);
+        assert_eq!(n.trim(), "4", "3 mutazioni + il commit iniziale");
+    }
+
+    /// Il ri-ancoraggio a HEAD non e' scomparso col cumulo: quando l'utente
+    /// COMMITTA sotto la sessione (HEAD non e' piu' antenato del branch), la base
+    /// torna a HEAD, cosi' lo snapshot successivo riflette il lavoro dell'utente
+    /// invece di riportarlo indietro.
+    ///
+    /// E' la ragione per cui il `read-tree HEAD` era incondizionato; qui e'
+    /// conservata come CONDIZIONE, non come reset a ogni mutazione.
+    #[sqlx::test]
+    async fn head_che_avanza_riancora_lo_snapshot(pool: PgPool) {
+        let prefix = "nexus-test/sessione/";
+        crea_settings(&pool, prefix).await;
+
+        let (_td, root) = temp_repo();
+        let sid = Uuid::new_v4();
+        let short = short_session(sid);
+        let _idx = IndexTemp(std::env::temp_dir().join(format!("nexus-autocommit-{short}.idx")));
+        let branch = format!("refs/heads/{}{short}", prefix);
+
+        std::fs::write(root.join("agente.txt"), "scritto dall'agente\n").expect("write agente");
+        snapshot_after_mutation(&pool, &root, true, Some(sid), false, "create", "agente.txt").await;
+
+        // L'utente committa sul PROPRIO branch: HEAD avanza e smette di essere
+        // antenato del branch di sessione.
+        std::fs::write(root.join("utente.txt"), "scritto dall'utente\n").expect("write utente");
+        git_sync(&root, &["add", "-A"]);
+        git_sync(&root, &["commit", "-q", "-m", "lavoro dell'utente"]);
+
+        std::fs::write(root.join("agente2.txt"), "ancora l'agente\n").expect("write agente2");
+        snapshot_after_mutation(&pool, &root, true, Some(sid), false, "create", "agente2.txt").await;
+
+        let elencati = git_out(&root, &["ls-tree", "-r", "--name-only", &branch]);
+        let presenti: Vec<&str> = elencati
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert!(
+            presenti.contains(&"utente.txt"),
+            "dopo un commit dell'utente lo snapshot riparte da HEAD e ne include \
+             il lavoro; contenuto: {presenti:?}"
+        );
+        assert!(
+            presenti.contains(&"agente2.txt"),
+            "la mutazione in corso resta nello snapshot; contenuto: {presenti:?}"
         );
     }
 }
