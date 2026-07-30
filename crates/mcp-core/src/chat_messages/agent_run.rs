@@ -1690,6 +1690,9 @@ pub(crate) async fn native_outcome_to_run_result(
         // Classe d'errore STRUTTURATA dal grafo (extra.error_class, es.
         // context_overflow — ADR 0016 D2): segnale macchina, mai dal testo.
         error_class: outcome.error_class,
+        // Gemello di forced_close_unverified (vedi NativeRunOutcome::provider_error_close):
+        // sopravvive alla riscrittura di stop_reason nel path resume.
+        provider_error_close: outcome.provider_error_close,
         stop_reason,
         // Intent del turno: pilota la decisione hollow/conversational del
         // finalizzatore (parita' col nexus_task_type del path Python).
@@ -1753,27 +1756,44 @@ fn compose_unconfirmed_report(
 
 /// Riconosce il messaggio di errore provider sintetizzato dall'executor del
 /// grafo nativo (nexus-agent-graph, ramo "agent_turn fallita"): la
-/// `final_answer` inizia col marker `[Errore provider`. Punto unico di
-/// detection (regola L) per l'esito-certo: il marker e' emesso in un solo posto
-/// (executor.rs) e qui lo riconosciamo per declassare a Failed un run che
-/// altrimenti risulterebbe `completed` pur essendo fallito perche' il provider
-/// non era disponibile (cooldown / gateway irraggiungibile).
-pub(crate) fn is_provider_error_answer(answer: &str) -> bool {
+/// `final_answer` inizia col marker `[Errore provider`.
+///
+/// FALLBACK per i run STORICI, persistiti prima che l'executor scrivesse
+/// `AgentState::provider_error_close` (regola M): quel campo tipizzato e'
+/// ORA il criterio primario (vedi [`is_provider_error_completion`]), letto da
+/// `result.provider_error_close`, non da questa funzione. Il marker resta
+/// riconosciuto QUI SOLO per i run gia' nel DB al momento del deploy di questo
+/// fix, che non hanno mai valorizzato quel campo — la loro unica prova e'
+/// ancora il testo. Un run nuovo che passasse SOLO da questa funzione (segnale
+/// strutturato assente/false) e testo comunque marcato sarebbe un difetto nel
+/// produttore (`executor::gestisci_errore_gateway`), non un caso da coprire qui.
+fn is_provider_error_answer(answer: &str) -> bool {
     answer.trim_start().starts_with("[Errore provider")
 }
 
 /// True se il run, pur risultando `Completed`, e' in realta' un fallimento per
-/// provider non disponibile: nessun token di completion prodotto E `final_answer`
-/// = messaggio di errore provider sintetizzato dall'executor. Punto unico (regola
-/// L) della regola "esito certo: errore provider -> Failed", invocato sia dal
-/// finalizzatore dello spawn principale sia da `canonical_run_status` (path resume).
+/// provider non disponibile: nessun token di completion prodotto E il turno ha
+/// chiuso per un errore del gateway LLM. Punto unico (regola L) della regola
+/// "esito certo: errore provider -> Failed", invocato sia dal finalizzatore
+/// dello spawn principale sia da `canonical_run_status` (path resume).
+///
+/// Criterio PRIMARIO (regola M): `result.provider_error_close`, il segnale
+/// STRUTTURATO gemello di `forced_close_unverified` che l'executor scrive alla
+/// FONTE (`AgentState::provider_error_close` -> `NativeRunOutcome` ->
+/// `AgentRunResult`), non dedotto rileggendo il testo. Prima questa funzione
+/// riconosceva SOLO il prefisso `[Errore provider` della `final_answer`: un
+/// contratto tenuto per copia fra due crate, in ITALIANO, dentro un campo di
+/// DISPLAY — una traduzione del messaggio lo avrebbe rotto senza far cadere un
+/// test. Il testo resta un fallback per i run storici (vedi
+/// [`is_provider_error_answer`]).
 pub(crate) fn is_provider_error_completion(result: &crate::agent_types::AgentRunResult) -> bool {
     matches!(result.status, crate::agent_types::AgentRunStatus::Completed)
         && result.completion_tokens == 0
-        && result
-            .final_answer
-            .as_deref()
-            .is_some_and(is_provider_error_answer)
+        && (result.provider_error_close
+            || result
+                .final_answer
+                .as_deref()
+                .is_some_and(is_provider_error_answer))
 }
 
 /// Totali aggregati dal ledger di billing (`ai_usage_ledger`) per un singolo
@@ -1978,6 +1998,9 @@ pub(crate) fn native_engine_failure_result(
         total_cost: 0.0,
         last_prompt_tokens: None,
         error_class: None,
+        // Fallimento del MOTORE (grafo), non del provider: come error_class,
+        // nessun segnale di provider-error da propagare.
+        provider_error_close: false,
         stop_reason: Some("error".to_string()),
         hollow_completion: false,
         hollow_no_tools: false,
@@ -7051,6 +7074,7 @@ mod tests_finalize_turn {
             total_cost: 0.0,
             last_prompt_tokens: None,
             error_class: None,
+            provider_error_close: false,
             stop_reason: None,
             nexus_task_type: task_type.map(str::to_string),
             hollow_completion,
@@ -7168,6 +7192,45 @@ mod tests_finalize_turn {
         );
         assert!(is_provider_error_completion(&r));
         assert_eq!(canonical_run_status(&r), AgentRunStatus::Failed);
+    }
+
+    #[test]
+    fn errore_provider_via_segnale_strutturato_senza_marker_testuale() {
+        // Il criterio PRIMARIO (regola M): provider_error_close=true declassa a
+        // Failed anche quando il testo NON contiene "[Errore provider" — la
+        // prova che una traduzione del messaggio (o un formato diverso) non
+        // rompe piu' silenziosamente questo contratto. Prima del fix questo
+        // caso era INDISTINGUIBILE da una risposta vuota legittima.
+        let mut r = mk_result(
+            AgentRunStatus::Completed,
+            vec![write_step()],
+            Some("Fornitore momentaneamente non disponibile, riprova piu' tardi."),
+            false,
+            "",
+            Some("agentic_default"),
+        );
+        r.provider_error_close = true;
+        assert!(is_provider_error_completion(&r));
+        assert_eq!(canonical_run_status(&r), AgentRunStatus::Failed);
+    }
+
+    #[test]
+    fn provider_error_close_false_e_testo_estraneo_resta_completed() {
+        // Contro-prova: segnale strutturato assente E testo che non contiene il
+        // marker legacy -> nessun declassamento. Il fallback testuale non deve
+        // diventare un secondo modo di dire "provider error" per un testo che
+        // il produttore reale non emetterebbe mai in quella forma.
+        let mut r = mk_result(
+            AgentRunStatus::Completed,
+            vec![write_step()],
+            Some("Ho completato il task con successo."),
+            false,
+            "",
+            Some("agentic_default"),
+        );
+        r.provider_error_close = false;
+        assert!(!is_provider_error_completion(&r));
+        assert_eq!(canonical_run_status(&r), AgentRunStatus::Completed);
     }
 
     #[test]
@@ -8017,6 +8080,7 @@ mod tests_native_mapping {
             advisory_verdict: None,
             debate_position: None,
             error_class: None,
+            provider_error_close: false,
             forced_close_unverified: false,
             final_gate_passed: None,
             final_gate_unverified: None,

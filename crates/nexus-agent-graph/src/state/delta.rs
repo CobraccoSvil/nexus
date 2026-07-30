@@ -918,6 +918,13 @@ pub struct StateDelta {
         skip_serializing_if = "Option::is_none"
     )]
     pub forced_close_unverified: Option<Option<bool>>,
+    /// Vedi `AgentState::provider_error_close`.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub provider_error_close: Option<Option<bool>>,
 
     // ── Sticky cascade ──────────────────────────────────────────────────────────
     /// Vedi `AgentState::sticky_provider`.

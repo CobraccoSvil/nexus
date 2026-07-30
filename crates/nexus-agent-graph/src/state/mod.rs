@@ -735,6 +735,18 @@ pub struct AgentState {
     pub progress_strategy_axes: Option<Vec<String>>,
     /// `true` quando un abort coordinato ha chiuso senza verifica.
     pub forced_close_unverified: Option<bool>,
+    /// `true` quando QUESTO turno ha chiuso perche' il gateway LLM ha fallito
+    /// (provider down/billing/rate-limit/richiesta troppo grande) e l'executor
+    /// ha sintetizzato il testo `[Errore provider ...]` (regola M). Segnale
+    /// STRUTTURATO gemello di `forced_close_unverified`, per lo stesso identico
+    /// motivo: senza, mcp-core doveva rileggere il PREFISSO di quel testo per
+    /// sapere se un run "completed" fosse in realta' un fallimento
+    /// infrastrutturale — un contratto tenuto per copia fra due crate, in
+    /// italiano, dentro un campo di DISPLAY. Scritto ESPLICITAMENTE ad ogni
+    /// turno (`Some(true)`/`Some(false)`, mai lasciato ereditato): il turno
+    /// riuscito lo azzera, cosi' un run che si e' ripreso dopo un errore
+    /// gateway non resta etichettato per sempre.
+    pub provider_error_close: Option<bool>,
 
     // ── Sticky cascade ──────────────────────────────────────────────────────────
     /// Provider sticky dopo un cascade riuscito.

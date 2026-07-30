@@ -495,6 +495,18 @@ pub struct NativeRunOutcome {
     /// `context_overflow` — ADR 0016 D2): segnale MACCHINA per il finalizzatore
     /// (regola M: mai dedotta dal testo). `None` se il run non ha classificato.
     pub error_class: Option<String>,
+    /// Segnale AUTORITATIVO gemello di `forced_close_unverified` (stessa
+    /// motivazione, stesso meccanismo di trasporto): `true` quando l'ULTIMO
+    /// turno del grafo (`AgentState::provider_error_close`) ha chiuso perche' il
+    /// gateway LLM e' fallito e l'executor ha sintetizzato `[Errore provider
+    /// ...]`. Sopravvive alla riscrittura di `stop_reason` per lo stesso motivo
+    /// di `forced_close_unverified`: senza questo trasporto, il path RESUME
+    /// (`chat_messages::agent_run::canonical_run_status`, che rilegge un
+    /// `AgentRunResult` gia' persistito) doveva rileggere il PREFISSO testuale
+    /// della `final_answer` per sapere se un run "completed" fosse in realta' un
+    /// fallimento infrastrutturale — un contratto tenuto per copia fra due
+    /// crate, in italiano, dentro un campo di DISPLAY.
+    pub provider_error_close: bool,
     /// Segnale AUTORITATIVO (mig 0386) che il run e' stato chiuso da un abort
     /// anti-loop senza verifica: sopravvive alla riscrittura di `stop_reason`
     /// operata dal final_gate sul ramo forced_close. Senza questo trasporto il
@@ -3385,6 +3397,7 @@ pub(crate) fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome 
             .get("error_class")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        provider_error_close: state.provider_error_close.unwrap_or(false),
         forced_close_unverified: state.forced_close_unverified.unwrap_or(false),
         // Esito della review adversariale dal SEGNALE del ReviewGate (regola M),
         // match esaustivo: un ramo nuovo del nodo non compila finche' non
@@ -4838,6 +4851,7 @@ mod tests {
             advisory_verdict: None,
             debate_position: None,
             error_class: None,
+            provider_error_close: false,
             forced_close_unverified: false,
             final_gate_passed: None,
             final_gate_unverified: None,

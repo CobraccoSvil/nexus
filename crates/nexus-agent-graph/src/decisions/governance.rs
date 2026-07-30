@@ -123,7 +123,7 @@ impl Default for GovernancePolicy {
 }
 
 /// Categorie d'errore PROVIDER-WIDE (regola M, semantica del `model_health_probe`
-/// e di `reason_is_billing`/`provider_error_classifier`): NON sono colpa del
+/// e di `provider_error_classifier`): NON sono colpa del
 /// modello, quindi non lo penalizzano nel punteggio (retriable a livello provider,
 /// gestite dal cooldown/gate, non dalla governance del modello). Match su
 /// sottostringa della categoria strutturata (non del testo umano dell'errore).

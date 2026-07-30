@@ -631,101 +631,128 @@ enum CooldownKind {
 /// modulo condivisa dai due step di classificazione (regola L: un solo punto).
 const BILLING_REASON: &str = "Quota AI esaurita o credito insufficiente";
 
-/// Marker testuali di quota/credito esaurito. Un HTTP 429 e' AMBIGUO: puo'
-/// essere un rate-limit transitorio (finestra di richieste, cooldown breve)
-/// oppure quota/credito esaurito (cooldown lungo come credit_balance_too_low).
-/// La distinzione si fa SOLO sul contenuto del messaggio: se compare uno di
-/// questi marker e' billing/quota, altrimenti rate-limit transitorio.
-/// `lower` deve gia' essere lowercased dal chiamante.
-fn msg_has_billing_marker(lower: &str) -> bool {
-    (lower.contains("credit balance") && lower.contains("too low"))
-        || lower.contains("insufficient_quota")
-        || lower.contains("insufficient quota")
-        || lower.contains("exceeded your current quota")
-        || lower.contains("billing_hard_limit_reached")
-        || lower.contains("billing hard limit")
-        || lower.contains("plans & billing")
-        || lower.contains("upgrade or purchase credits")
-        || lower.contains("upgrade or purchase")
-        || lower.contains("billing required")
-        || lower.contains("payment required")
-        || lower.contains("account is not active")
-        || lower.contains("no credits")
-        || lower.contains("quota ai esaurita")
-        || lower.contains("credito insufficiente")
+/// Reason di un cooldown BREVE nato da un SOSPETTO lessicale di credito esaurito.
+/// Distinta da [`BILLING_REASON`] perche' descrive un fatto diverso: li' il gateway
+/// ha dichiarato il credito finito, qui lo ha solo suggerito la prosa. Tenerle
+/// separate serve a chi legge il registro dei cooldown — e a non far passare per
+/// accertato cio' che non lo e'.
+const BILLING_SOSPETTO_REASON: &str =
+    "Sospetto credito o quota esaurita, non accertato: nuovo tentativo a breve";
+
+/// Cosa dice la classe STRUTTURATA sul cooldown del fornitore.
+///
+/// Esiste per distinguere due risposte che prima erano lo stesso `None`, e che
+/// hanno conseguenze opposte: "classe nota, e dice di non toccare il fornitore"
+/// contro "classe assente, guarda la prosa". Confuse insieme, un errore
+/// model-specific gia' classificato dal gateway (`context_too_long`,
+/// `invalid_request`, `not_found`) finiva comunque al ripiego lessicale — e la
+/// prosa di un 413 di groq, che nomina la pagina di fatturazione nell'URL di
+/// documentazione, lo trasformava in un cooldown billing su un fornitore sano.
+/// Un `None` che significa due cose e' un segnale perso (regola M).
+enum ClasseStrutturata {
+    /// Classe nota: questa e' la decisione. Il testo non la rivede.
+    Cooldown(&'static str, CooldownKind, &'static str),
+    /// Classe nota, e dice che il fornitore NON c'entra: la richiesta era
+    /// malformata, o il modello non esiste, o non ci stava nel contesto. Nessun
+    /// cooldown E nessun ripiego: il gateway ha gia' risposto alla domanda.
+    NessunCooldown,
+    /// Classe assente o fuori vocabolario: e' l'UNICO caso in cui si guarda la prosa.
+    Sconosciuta,
 }
 
-/// Step 1 della classificazione: `error_class` esplicito propagato dal brain.
-/// Ritorna `None` se `error_class` non e' uno dei valori noti (si passa allo
-/// step 2 sul testo).
-fn classify_by_error_class(
-    error_class: Option<&str>,
-    has_billing_marker: bool,
-) -> Option<(&'static str, CooldownKind, &'static str)> {
+/// Step 1 della classificazione: `error_class` STRUTTURATO, cioe' la classe che
+/// il gateway ha dichiarato alla fonte (status HTTP + codice macchina del
+/// provider, via `error_class_from_primary_cause`). Ritorna `None` se non e' uno
+/// dei valori noti: allora, e solo allora, si passa al ripiego lessicale.
+///
+/// La classe strutturata NON viene rivista dal testo. Prima il ramo `rate_limit`
+/// accettava un `has_billing_marker` dedotto dalla prosa e, se acceso, promuoveva
+/// a `billing_error` + cooldown 6h: il ripiego scavalcava il segnale. E' l'incidente
+/// groq del 2026-07-16, documentato in `provider_error_classifier`
+/// (`error_class_from_primary_cause`): un 413 per tetto token/minuto il cui
+/// messaggio invitava ad alzare il piano "at https://console.groq.com/settings/
+/// billing" -> la parola `billing` trovata DENTRO L'URL DELLA DOCUMENTAZIONE ->
+/// groq spento 6h su tutto il sistema mentre rispondeva 200 alle chiamate normali.
+///
+/// Il caso che la promozione voleva coprire — un 429 mis-classificato a monte —
+/// non si cura indovinando: si cura ALLA FONTE, dove `billing` e `transient` sono
+/// gia' due `primary_cause` distinte del gateway.
+fn classify_by_error_class(error_class: Option<&str>) -> ClasseStrutturata {
+    use ClasseStrutturata as C;
     match error_class {
         Some("billing_error")
         | Some("billing_required")
         | Some("quota_exceeded")
         | Some("credit_balance_too_low")
-        | Some("insufficient_quota") => Some(("billing_error", CooldownKind::Long, BILLING_REASON)),
-        Some("rate_limit") => {
-            // Anche con error_class=rate_limit esplicito, un 429 puo' in realta'
-            // essere quota/credito esaurito: il brain (o un altro provider) puo'
-            // aver mappato il 429 a rate_limit senza esaminare il messaggio.
-            // Se il testo contiene marker billing, promuovi a cooldown lungo,
-            // altrimenti resta rate-limit transitorio (cooldown breve).
-            if has_billing_marker {
-                Some(("billing_error", CooldownKind::Long, BILLING_REASON))
-            } else {
-                Some(("rate_limit", CooldownKind::Short, "Rate limit raggiunto"))
-            }
+        | Some("insufficient_quota") => {
+            C::Cooldown("billing_error", CooldownKind::Long, BILLING_REASON)
         }
+        Some("rate_limit") => C::Cooldown("rate_limit", CooldownKind::Short, "Rate limit raggiunto"),
         Some("overloaded")
         | Some("provider_error")
         | Some("server_error")
         | Some("service_unavailable")
         | Some("bad_gateway")
-        | Some("internal_server_error") => Some((
+        | Some("internal_server_error") => C::Cooldown(
             "provider_error",
             CooldownKind::Short,
             "Provider sovraccarico o errore temporaneo",
-        )),
-        Some("auth_error") | Some("forbidden") => Some((
+        ),
+        Some("auth_error") | Some("forbidden") => C::Cooldown(
             "auth_error",
             CooldownKind::Long,
             "Credenziali o accesso provider non validi",
-        )),
-        Some("not_found") | Some("invalid_model") => None,
+        ),
+        // Il modello non esiste, la richiesta non era valida, il contesto non ci
+        // stava: il FORNITORE e' sano e ha risposto correttamente. Il gateway lo ha
+        // gia' stabilito — non si chiede una seconda opinione alla prosa.
+        Some("not_found") | Some("invalid_model") => C::NessunCooldown,
         Some("invalid_request")
         | Some("unprocessable")
         | Some("context_too_long")
-        | Some("unsupported") => None,
-        _ => None,
+        | Some("unsupported") => C::NessunCooldown,
+        _ => C::Sconosciuta,
     }
 }
 
-/// Mappa il classificatore testuale unificato (`provider_error_classifier`) su
-/// cooldown. Usato SOLO quando `error_class` strutturato e' assente (regola M).
-fn map_classifier_to_cooldown(
+/// Il RIPIEGO LESSICALE: la classe dedotta dalla PROSA dell'errore
+/// (`provider_error_classifier::classify_text`), usata SOLO quando il segnale
+/// strutturato non c'e'. Ritorna `(classe, frase)` — e non la SEVERITA'.
+///
+/// Questo tipo di ritorno e' la regola, scritta nella firma perche' non possa
+/// essere aggirata da un ramo aggiunto in futuro: **un ripiego lessicale non puo'
+/// spegnere un fornitore in modo permanente**. La severita' la mette il chiamante,
+/// ed e' sempre [`CooldownKind::Short`].
+///
+/// Il motivo e' la sproporzione fra la certezza del segnale e la sua conseguenza:
+/// `billing_error` toglie un fornitore dalla routing matrix per SEI ORE, per tutto
+/// il sistema — chat, worker e batterie insieme. Una regex su prosa che il provider
+/// puo' riscrivere a ogni versione dell'API non e' un accertamento sufficiente a
+/// tanto (la sola parola `billing` in un URL di documentazione bastava). Un sospetto
+/// non accertato ottiene al massimo un cooldown transitorio: se il credito e'
+/// davvero finito, il tentativo successivo fallisce di nuovo e questa volta il
+/// gateway lo dira' in modo strutturato (402 / `insufficient_quota`), che e' la sola
+/// provenienza legittima di `billing_error`.
+///
+/// La CLASSE resta quella vera (finisce in `last_error_class` e nei log): a essere
+/// negata e' la conseguenza permanente, non la diagnosi.
+fn classe_dal_ripiego_lessicale(
     c: &crate::provider_error_classifier::ClassifiedError,
-) -> Option<(&'static str, CooldownKind, &'static str)> {
+) -> Option<(&'static str, &'static str)> {
     match c.stop_reason.as_str() {
-        "billing_error" => Some(("billing_error", CooldownKind::Long, BILLING_REASON)),
-        "rate_limit" => Some(("rate_limit", CooldownKind::Short, "Rate limit raggiunto")),
+        "billing_error" => Some(("billing_error", BILLING_SOSPETTO_REASON)),
+        "rate_limit" => Some(("rate_limit", "Rate limit raggiunto")),
         "overloaded" | "service_unavailable" | "bad_gateway" | "provider_error" => Some((
             "provider_error",
-            CooldownKind::Short,
             "Provider sovraccarico o errore temporaneo",
         )),
         "timeout" | "connection_error" => Some((
             "timeout",
-            CooldownKind::Short,
             "Provider sovraccarico o errore temporaneo",
         )),
         "auth_error" | "forbidden" => Some((
             "auth_error",
-            CooldownKind::Long,
-            "Credenziali o accesso provider non validi",
+            "Credenziali o accesso provider non validi (sospetto non accertato)",
         )),
         // Model-specific / client: nessun cooldown provider.
         "not_found" | "invalid_request" | "context_too_long" | "unprocessable" | "unsupported" => {
@@ -735,32 +762,34 @@ fn map_classifier_to_cooldown(
     }
 }
 
-/// Step 2 legacy rimosso: usare [`map_classifier_to_cooldown`] via
-/// `provider_error_classifier` (regola M).
-/// Classifica un errore del provider e suggerisce il tipo di cooldown.
+/// Classifica un errore del provider e la severita' del cooldown che merita.
 /// Ritorna `(error_class_normalizzato, kind, human_reason)`.
-/// Priorita': `error_class` strutturato (SSE brain/gateway), poi classificatore
-/// unificato `provider_error_classifier` — MAI parsing billing ad-hoc sul testo
-/// (regola M).
+///
+/// Due gradini, in ordine di CERTEZZA (regola M):
+///  1. [`classify_by_error_class`] sulla classe STRUTTURATA — status HTTP e codice
+///     macchina, dichiarati dal gateway alla fonte. E' l'unico gradino che puo'
+///     produrre un cooldown permanente ([`CooldownKind::Long`]);
+///  2. [`classe_dal_ripiego_lessicale`] sulla prosa, quando il segnale non c'e'.
+///     La severita' non gliela chiediamo: e' `Short` qui, in un punto solo.
+///
+/// Il gradino 1 non viene rivisto dal 2. Un ripiego che contraddice un accertamento
+/// non e' una "difesa in profondita'": e' il ripiego che vince sul fatto.
 fn classify_provider_error(
     error_class: Option<&str>,
     msg: &str,
 ) -> Option<(&'static str, CooldownKind, &'static str)> {
     if let Some(ec) = error_class.map(str::trim).filter(|s| !s.is_empty() && *s != "ok") {
-        // Un error_class esplicito puo' essere una MIS-classificazione del brain: un
-        // 429 mappato a `rate_limit` e' in realta' quota/credito esaurito quando il
-        // MESSAGGIO porta un marker billing. Passiamo il marker (dal punto unico
-        // `classify_text`, regola L) cosi' `classify_by_error_class` promuove a
-        // billing/cooldown-lungo invece di lasciare il provider a-crediti-zero nel
-        // cascade (bug live: l'error_class esplicito short-circuitava la promozione).
-        let has_billing_marker =
-            crate::provider_error_classifier::classify_text(msg).stop_reason == "billing_error";
-        if let Some(hit) = classify_by_error_class(Some(ec), has_billing_marker) {
-            return Some(hit);
+        match classify_by_error_class(Some(ec)) {
+            ClasseStrutturata::Cooldown(class, kind, reason) => return Some((class, kind, reason)),
+            ClasseStrutturata::NessunCooldown => return None,
+            ClasseStrutturata::Sconosciuta => {}
         }
     }
     let classified = crate::provider_error_classifier::classify_text(msg);
-    map_classifier_to_cooldown(&classified)
+    // `CooldownKind::Short` compare QUI e solo qui per il ripiego: e' cosi' che il
+    // divieto di spegnere un fornitore su un sospetto resta vero anche domani.
+    classe_dal_ripiego_lessicale(&classified)
+        .map(|(class, reason)| (class, CooldownKind::Short, reason))
 }
 
 /// Punto unico per i worker/purpose che invocano LLM fuori dallo stream agente:
@@ -1850,16 +1879,105 @@ mod tests {
 
     // ── Classificazione errori provider / cooldown ────────────────────────────
 
+    /// Il corpo REALE del 500 aggregato del gateway (`routes.rs`: `primary_cause`
+    /// = classe del primo fallimento, `failures[].status` = status del provider).
+    /// I test partono da qui e non da una struct riempita a mano: e' la stessa
+    /// strada della produzione (regola O).
+    fn errore_dal_gateway(primary_cause: &str, status: u16, messaggio: &str) -> anyhow::Error {
+        let body = json!({
+            "error": format!("tutti i provider hanno fallito -> groq ({messaggio})"),
+            "code": "PROVIDER_ERROR",
+            "details": {
+                "primary_cause": primary_cause,
+                "failures": [{ "provider": "groq", "status": status, "class": primary_cause }],
+            },
+        })
+        .to_string();
+        anyhow::Error::new(crate::nexus_gateway::GatewayHttpError::from_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body,
+        ))
+    }
+
+    /// La classe e il messaggio come li vede chi decide il cooldown: prodotti dal
+    /// punto unico del turno d'errore, non ricostruiti dal test.
+    fn classe_e_messaggio(err: &anyhow::Error) -> (Option<String>, String) {
+        let turn =
+            crate::orchestrator::neural_client::error_agent_turn_from_error("groq", "llama", err);
+        (
+            turn.get("error_class")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            turn.get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        )
+    }
+
     #[test]
-    fn quota_429_e_billing_cooldown_lungo() {
-        // Caso live: OpenAI risponde HTTP 429 "You exceeded your current quota".
-        // E' quota/credito esaurito, NON un rate-limit transitorio: deve dare
-        // cooldown lungo come credit_balance_too_low.
+    fn il_413_di_groq_non_tocca_un_fornitore_sano() {
+        // 2026-07-16, incidente reale. groq rifiuta per tetto token/minuto (413) e
+        // il messaggio invita ad alzare il piano "at https://console.groq.com/
+        // settings/billing". Il gateway lo classifica `context_too_long`: il
+        // FORNITORE e' sano, e' la singola richiesta a non entrarci.
+        //
+        // Prima: la classe strutturata cadeva nel ripiego, la regex trovava la
+        // parola `billing` DENTRO L'URL DELLA DOCUMENTAZIONE, e groq spariva dalla
+        // routing matrix per sei ore mentre rispondeva 200 a tutto il resto.
+        let err = errore_dal_gateway(
+            "context_too_long",
+            413,
+            "Request too large for model. Limit 8000, Requested 20083. \
+             Need more tokens? Upgrade at https://console.groq.com/settings/billing",
+        );
+        let (classe, messaggio) = classe_e_messaggio(&err);
+        assert_eq!(classe.as_deref(), Some("context_too_long"));
+        assert!(
+            messaggio.contains("billing"),
+            "il messaggio deve contenere la parola che traeva in inganno, \
+             altrimenti il test non misura il difetto"
+        );
+        assert_eq!(
+            classify_provider_error(classe.as_deref(), &messaggio),
+            None,
+            "un errore model-specific gia' classificato dal gateway non mette in \
+             cooldown il fornitore, e la sua prosa non viene riletta"
+        );
+    }
+
+    #[test]
+    fn il_credito_esaurito_accertato_dal_gateway_spegne_il_fornitore() {
+        // Il rovescio del test sopra: quando il credito e' finito DAVVERO, il
+        // gateway lo dichiara (402 / codice `insufficient_quota` -> causa
+        // `billing`) e il cooldown lungo si applica. Il fix non ha disarmato
+        // l'unica provenienza legittima di `billing_error`.
+        let err = errore_dal_gateway("billing", 402, "insufficient credit balance");
+        let (classe, messaggio) = classe_e_messaggio(&err);
+        assert_eq!(classe.as_deref(), Some("billing_error"));
+        let (class, kind, _) = classify_provider_error(classe.as_deref(), &messaggio)
+            .expect("il credito esaurito accertato deve produrre un cooldown");
+        assert_eq!(class, "billing_error");
+        assert_eq!(kind, CooldownKind::Long);
+    }
+
+    #[test]
+    fn quota_dal_solo_testo_non_spegne_il_fornitore_per_ore() {
+        // Nessuna classe strutturata: resta solo la prosa. La diagnosi puo' anche
+        // essere giusta (`billing_error`), ma un ripiego lessicale non e' un
+        // accertamento e non puo' togliere un fornitore a tutto il sistema per sei
+        // ore: al massimo un cooldown transitorio. Se il credito e' finito davvero,
+        // il tentativo dopo fallisce ancora e il gateway lo dira' in modo
+        // strutturato.
         let msg = "Error code: 429 - {'error': {'message': 'You exceeded your current quota, please check your plan and billing details.', 'type': 'insufficient_quota'}}";
         let (class, kind, _) =
             classify_provider_error(None, msg).expect("429 quota deve essere classificato");
-        assert_eq!(class, "billing_error");
-        assert_eq!(kind, CooldownKind::Long);
+        assert_eq!(class, "billing_error", "la diagnosi resta quella vera");
+        assert_eq!(
+            kind,
+            CooldownKind::Short,
+            "a essere negata e' la conseguenza permanente, non la diagnosi"
+        );
     }
 
     #[test]
@@ -1874,17 +1992,21 @@ mod tests {
     }
 
     #[test]
-    fn error_class_rate_limit_ma_messaggio_quota_promosso_a_billing() {
-        // Difesa in profondita': anche se il brain (o un provider) ha mappato
-        // il 429 a error_class=rate_limit, se il messaggio contiene marker di
-        // quota la classe va promossa a billing/cooldown-lungo. Senza questo,
-        // l'error_class esplicito short-circuitava il pattern matching e il
-        // provider con quota esaurita restava nel cascade (bug live).
+    fn la_prosa_non_promuove_una_classe_strutturata_a_billing() {
+        // Questo test asseriva l'OPPOSTO, e cosi' proteggeva il difetto: con
+        // `error_class=rate_limit` gia' dichiarato, un messaggio "billing" faceva
+        // promuovere a cooldown 6h. Era il ripiego che vinceva sull'accertamento.
+        //
+        // Il caso che la promozione voleva coprire — un 429 mis-classificato a
+        // monte — si cura ALLA FONTE: `billing` e `transient` sono due
+        // `primary_cause` distinte del gateway, e chi le confonde va corretto li'.
+        // Indovinare a valle non recupera il segnale: lo sovrascrive, e con la
+        // stessa disinvoltura sovrascrive quelli giusti.
         let msg = "You exceeded your current quota, please check your plan and billing details.";
         let (class, kind, _) =
             classify_provider_error(Some("rate_limit"), msg).expect("deve essere classificato");
-        assert_eq!(class, "billing_error");
-        assert_eq!(kind, CooldownKind::Long);
+        assert_eq!(class, "rate_limit", "vince la classe strutturata");
+        assert_eq!(kind, CooldownKind::Short);
     }
 
     #[test]
@@ -1907,12 +2029,65 @@ mod tests {
     }
 
     #[test]
-    fn billing_hard_limit_reached_e_billing() {
-        // Marker OpenAI billing_hard_limit_reached -> cooldown lungo.
+    fn billing_hard_limit_dal_solo_testo_resta_transitorio() {
+        // Marker OpenAI `billing_hard_limit_reached` visto nella sola prosa: la
+        // classe e' billing, la conseguenza no (vedi
+        // `quota_dal_solo_testo_non_spegne_il_fornitore_per_ore`).
         let msg = "Error code: 429 - billing_hard_limit_reached";
         let (class, kind, _) =
             classify_provider_error(None, msg).expect("deve essere classificato");
         assert_eq!(class, "billing_error");
-        assert_eq!(kind, CooldownKind::Long);
+        assert_eq!(kind, CooldownKind::Short);
+    }
+
+    #[test]
+    fn nessun_ripiego_lessicale_puo_produrre_un_cooldown_permanente() {
+        // La regola, verificata sull'INTERO vocabolario del ripiego invece che su
+        // un caso per volta: nessun testo, quale che sia, puo' spegnere un
+        // fornitore in modo permanente. Un ramo aggiunto domani con
+        // `CooldownKind::Long` fa rosseggiare qui — che e' il punto: la firma di
+        // `classe_dal_ripiego_lessicale` non espone la severita', e questo test
+        // difende quella scelta dal call site.
+        let prose = [
+            "credit balance is too low",
+            "insufficient_quota",
+            "upgrade or purchase credits",
+            "payment required",
+            "account is not active",
+            "invalid api key",
+            "unauthorized",
+            "rate limit reached",
+            "503 service unavailable",
+            "connection timed out",
+        ];
+        for msg in prose {
+            if let Some((class, kind, _)) = classify_provider_error(None, msg) {
+                assert_eq!(
+                    kind,
+                    CooldownKind::Short,
+                    "il ripiego lessicale ha prodotto un cooldown permanente su \
+                     '{msg}' (classe {class}): solo un segnale strutturato puo'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn una_classe_strutturata_nota_non_viene_riletta_dalla_prosa() {
+        // I due `None` che prima erano lo stesso valore. `not_found` e
+        // `invalid_request` sono classi NOTE che dicono "il fornitore e' sano":
+        // devono fermare la catena, non farla scivolare al ripiego. Il messaggio
+        // porta di proposito la parola che il ripiego cercherebbe.
+        for classe in ["not_found", "invalid_request", "context_too_long", "unsupported"] {
+            assert_eq!(
+                classify_provider_error(Some(classe), "see your billing page for credits"),
+                None,
+                "la classe '{classe}' dice che il fornitore non c'entra: nessun \
+                 cooldown e nessuna seconda opinione dalla prosa"
+            );
+        }
+        // Una classe FUORI vocabolario e' un'altra cosa: li' la prosa e' tutto
+        // quello che resta, e si guarda.
+        assert!(classify_provider_error(Some("boh_mai_visto"), "rate limit reached").is_some());
     }
 }

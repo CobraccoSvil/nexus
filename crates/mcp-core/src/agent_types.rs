@@ -349,6 +349,17 @@ pub struct AgentRunResult {
     /// corretto (lungo per billing, breve per transient 5xx/429).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_class: Option<String>,
+    /// Segnale STRUTTURATO gemello di `forced_close_unverified` (regola M): `true`
+    /// quando l'ULTIMO turno del grafo ha chiuso perche' il gateway LLM e' fallito
+    /// (`NativeRunOutcome::provider_error_close`, che a sua volta viene da
+    /// `AgentState::provider_error_close`). Sopravvive alla riscrittura di
+    /// `stop_reason`, cosi' il path RESUME (`canonical_run_status`, che rilegge
+    /// questo `AgentRunResult` gia' persistito) non deve piu' rileggere il
+    /// PREFISSO testuale della `final_answer` per saperlo. Default `false` per i
+    /// run storici (persistiti prima di questo campo): `is_provider_error_answer`
+    /// resta il fallback per loro.
+    #[serde(default)]
+    pub provider_error_close: bool,
     /// Stop reason finale: end_turn | tool_use | error | loop_detected | timeout.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,

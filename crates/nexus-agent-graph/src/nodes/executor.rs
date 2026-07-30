@@ -2087,6 +2087,12 @@ struct ChiaviExtraDelTurno {
     signature_loop_promoted: bool,
     declaring_turn: bool,
     declaring_role_turn: bool,
+    /// Classe STRUTTURATA dell'errore gateway di questo turno (regola M,
+    /// [`error_class_da_port_error`]). `None` su turno riuscito: rimuove
+    /// `extra.error_class` invece di ereditare quello di un turno precedente,
+    /// cosi' un run che si e' ripreso dopo un errore gateway non resta
+    /// etichettato per sempre come fallimento infrastrutturale.
+    error_class_gateway: Option<String>,
 }
 
 /// `extra` del delta finale del turno. `extra` e' overwrite secco (regola di
@@ -2132,6 +2138,19 @@ fn extra_del_turno(state: &AgentState, chiavi: ChiaviExtraDelTurno) -> Map<Strin
         // che il modello abbia dichiarato o no — l'anti-loop resta il
         // one-shot di ADVISORY_GRACE_USED_KEY.
         extra_out.remove("force_role_declaration");
+    }
+    // `error_class` del turno CORRENTE (regola M): esplicito in entrambe le
+    // direzioni. I due produttori piu' vecchi (context_overflow,
+    // gateway_deterministic, sopra in questo file) chiudono il run con un
+    // `return` immediato e non attraversano mai questo punto: qui l'unica fonte
+    // e' il turno che sta per chiudersi ORA.
+    match &chiavi.error_class_gateway {
+        Some(classe) => {
+            extra_out.insert("error_class".to_string(), json!(classe));
+        }
+        None => {
+            extra_out.remove("error_class");
+        }
     }
     extra_out
 }
@@ -2232,6 +2251,15 @@ struct RispostaDelTurno {
     /// persistito nel delta finale; su turno riuscito viene rimosso.
     det_streak_val: Option<Value>,
     turn_thinking: Option<String>,
+    /// Classe STRUTTURATA (regola M) quando questo turno e' un errore gateway
+    /// sintetizzato (`[Errore provider ...]`): da [`error_class_da_port_error`].
+    /// `None` su turno riuscito -> il delta finale rimuove `extra.error_class`
+    /// invece di ereditare quello di un turno precedente.
+    error_class_gateway: Option<String>,
+    /// `true` quando questo turno e' il ramo errore-gateway (indipendentemente
+    /// dal fatto che la classe sia stata riconosciuta): alimenta
+    /// `AgentState::provider_error_close`.
+    gateway_errored: bool,
 }
 
 /// Esito della chiamata al modello: o il turno chiude qui, o prosegue con la
@@ -2249,7 +2277,14 @@ enum EsitoChiamata {
 /// chiusura (clippy::large_enum_variant).
 enum EsitoErroreGateway {
     Chiude(OpaqueDelta),
-    Sintetica(Box<crate::runtime::ports::LlmResponse>, Option<Value>),
+    /// Risposta sintetica + streak deterministico + classe STRUTTURATA
+    /// dell'errore (regola M, [`error_class_da_port_error`]), da riportare nel
+    /// delta finale unificato.
+    Sintetica(
+        Box<crate::runtime::ports::LlmResponse>,
+        Option<Value>,
+        Option<&'static str>,
+    ),
 }
 
 /// Provider gia' tentati in questo run, col corrente in coda se assente: la
@@ -2966,6 +3001,8 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
             resp,
             det_streak_val,
             turn_thinking,
+            error_class_gateway,
+            gateway_errored,
         } = match self
             .interroga_modello(state, ctx, &messages, &richiesta, force_tc)
             .await
@@ -3271,6 +3308,10 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
             // Costo cumulativo del run (freno di spesa in dollari, NON si resetta
             // all'escalation): reducer overwrite col totale accumulato.
             run_cost_cumulative_usd: Some(Some(new_cost_total)),
+            // Segnale STRUTTURATO gemello di forced_close_unverified (regola M):
+            // ESPLICITO in entrambe le direzioni, mai ereditato. Vedi
+            // `AgentState::provider_error_close`.
+            provider_error_close: Some(Some(gateway_errored)),
             ..Default::default()
         };
         // Cutoff di generazione persistito solo al cambio fase (py:3458-3459).
@@ -3286,6 +3327,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
                 signature_loop_promoted,
                 declaring_turn: catalogo.declaring_turn,
                 declaring_role_turn: catalogo.declaring_role_turn,
+                error_class_gateway: error_class_gateway.clone(),
             },
         ));
         marca_chiusura_non_verificata(
@@ -5494,14 +5536,15 @@ modello piu' capace.",
             }
             Some(r) => r,
         };
-        let (mut resp, gateway_errored, det_streak_val) = match complete_result {
-            Ok(r) => (r, false, None),
+        let (mut resp, gateway_errored, det_streak_val, error_class_gateway) = match complete_result
+        {
+            Ok(r) => (r, false, None, None),
             Err(err) => match self
                 .gestisci_errore_gateway(state, ctx, messages, richiesta, err)
                 .await
             {
                 EsitoErroreGateway::Chiude(delta) => return EsitoChiamata::Chiude(delta),
-                EsitoErroreGateway::Sintetica(resp, det) => (*resp, true, det),
+                EsitoErroreGateway::Sintetica(resp, det, classe) => (*resp, true, det, classe),
             },
         };
         self.retry_senza_forcing(ctx, richiesta, force_tc, gateway_errored, &mut resp)
@@ -5513,6 +5556,8 @@ modello piu' capace.",
             resp,
             det_streak_val,
             turn_thinking,
+            error_class_gateway: error_class_gateway.map(str::to_string),
+            gateway_errored,
         }))
     }
 
@@ -5642,6 +5687,11 @@ modello piu' capace.",
         // os_error=10061)". Il dettaglio tecnico resta nel `tracing::error!`
         // qui sopra.
         let err_short = port_error_message(&err);
+        // Classe STRUTTURATA (regola M), calcolata PRIMA che `err` sia consumato
+        // dal formatter sotto: e' cio' che sostituisce, a valle in mcp-core, la
+        // rilettura del prefisso testuale del messaggio che sta per essere
+        // sintetizzato.
+        let error_class = error_class_da_port_error(&err);
         let err_text = testo_errore_provider(
             &richiesta.provider,
             &err_short,
@@ -5661,6 +5711,7 @@ modello piu' capace.",
                 ..Default::default()
             }),
             det_streak_val,
+            error_class,
         )
     }
 
@@ -8970,8 +9021,10 @@ fn deterministic_close_delta(
 /// Ora la frase arriva gia' fatta dal punto unico di presentazione: i tipi
 /// d'errore la portano nel loro [`RenderedError`], costruito dove i segnali
 /// strutturati (status, codice, natura del trasporto) erano ancora vivi. Il
-/// MARKER `[Errore provider` del chiamante non cambia: la detection
-/// dell'esito-certo in mcp-core (`is_provider_error_answer`) resta valida.
+/// MARKER `[Errore provider` del chiamante non cambia (resta il fallback per i
+/// run storici in mcp-core, `is_provider_error_answer`): il criterio PRIMARIO
+/// dell'esito-certo e' ORA `AgentState::provider_error_close`, scritto dal
+/// chiamante di [`testo_errore_provider`] indipendentemente da questo testo.
 pub(crate) fn port_error_message(err: &PortError) -> String {
     let msg = match err {
         PortError::Llm(r) | PortError::Tool(r) => r.message.clone(),
@@ -9022,6 +9075,58 @@ fn testo_errore_provider(
 
 fn is_forcing_failure(resp: &crate::runtime::ports::LlmResponse) -> bool {
     resp.stop_reason.as_deref() == Some("error")
+}
+
+/// Classe STRUTTURATA del [`PortError`] quando l'executor chiude il turno
+/// sintetizzando `[Errore provider ...]`. Punto unico (regola L) del ponte fra i
+/// tipi di questo crate (`PortError`/`ProviderFailureCause`/`RenderedError.code`)
+/// e il vocabolario `error_class` che mcp-core gia' riconosce
+/// (`is_provider_error_completion`/`error_class_indicates_cooldown` in
+/// `chat_messages::agent_run`, popolato da `AgentRunResult.error_class` <-
+/// `extra.error_class`).
+///
+/// Esiste perche' prima QUESTO ramo era l'unico dei tre produttori di
+/// `[Errore provider`/`[Error:` a non scrivere `extra.error_class`: gli altri due
+/// (`context_overflow`, `gateway_deterministic`, poco sopra in questo file) lo
+/// fanno gia'. Senza, mcp-core doveva rileggere il PREFISSO del testo per sapere
+/// se un run "completato" era in realta' un fallimento infrastrutturale — un
+/// contratto tenuto per COPIA fra due crate, in italiano, dentro un campo di
+/// DISPLAY: una traduzione del messaggio lo avrebbe rotto senza far cadere un
+/// test. mcp-core non dipende da questo crate (e' l'inverso), quindi non puo'
+/// chiamare `provider_error_classifier` di mcp-core: questo e' un mapping
+/// dedicato, non un doppione del punto unico che vive dall'altro lato del
+/// confine tra i due processi/crate.
+///
+/// `None` quando la causa non riguarda il provider in modo cooldown-rilevante
+/// (richiesta rifiutata / policy / modello ignoto): il fornitore resta sano e
+/// nessun segnale deve suggerire di spegnerlo.
+fn error_class_da_port_error(err: &crate::runtime::ports::PortError) -> Option<&'static str> {
+    use crate::runtime::ports::{PortError, ProviderFailureCause as Causa};
+    match err {
+        PortError::ProviderUnavailable(info) => match info.cause {
+            Causa::Billing => Some("billing_error"),
+            Causa::Cooldown => Some("provider_error"),
+            Causa::EmptyCompletion => Some("empty_completion"),
+            Causa::ContextTooLong => Some("context_too_long"),
+            // Il fornitore e' sano: la richiesta era rifiutata, o esclusa da
+            // policy, o la causa non e' determinabile. Nessun cooldown.
+            Causa::ClientError | Causa::PolicyTierExcluded | Causa::Unknown => None,
+        },
+        PortError::Llm(rendered) => match rendered.code.as_str() {
+            "provider_quota" => Some("billing_error"),
+            "provider_rate_limited" => Some("rate_limit"),
+            "provider_auth" => Some("auth_error"),
+            "provider_cooldown" | "provider_timeout" | "transport_unreachable"
+            | "transport_failed" => Some("provider_error"),
+            "provider_request_too_large" => Some("context_too_long"),
+            "provider_empty" => Some("empty_completion"),
+            // Modello ignoto / policy: non e' il provider a essere giu'.
+            "provider_model_unknown" | "policy_excluded" => None,
+            _ => None,
+        },
+        // Fallimento di un TOOL, non del provider LLM: non c'entra col cooldown.
+        PortError::Tool(_) => None,
+    }
 }
 
 /// Crea un `Message::Human` con testo (per i nudge iniettati).

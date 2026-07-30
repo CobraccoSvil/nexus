@@ -167,32 +167,61 @@ pub fn is_provider_in_cooldown(provider: &str) -> bool {
     false
 }
 
-/// True se la `reason` di un cooldown indica credito/quota esaurito (billing),
-/// non un errore transiente (rate-limit/timeout/rete). Punto unico (regola L)
-/// della classificazione billing di una reason di cooldown: stessa semantica
-/// della nota di esaurimento mostrata all'utente.
-pub fn reason_is_billing(reason: &str) -> bool {
-    let r = reason.to_lowercase();
-    r.contains("credit") || r.contains("quota") || r.contains("billing") || r.contains("balance")
+/// Severita' REGISTRATA del cooldown di un provider: non una deduzione dal
+/// testo della `reason`, ma il fatto di QUALE delle due funzioni lo ha messo in
+/// cooldown ([`put_provider_in_long_cooldown`] vs [`put_provider_in_short_cooldown`]).
+/// E' gia' la classificazione giusta per costruzione: le due funzioni sono
+/// chiamate esclusivamente dai rami billing/auth/budget (Long) e dai rami
+/// transient (Short) — chi chiama sa gia' quale dei due sta invocando.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CooldownSeverity {
+    /// Persistente (billing/quota/credito/auth/budget): il recovery e' del
+    /// loop dedicato, mai del probe periodico generico.
+    Long,
+    /// Transiente (rate-limit/5xx/rete): il probe periodico lo ripinga.
+    Short,
 }
 
-/// True se il provider e' ATTUALMENTE in cooldown e la causa e' billing
-/// (credito/quota esaurito). Il re-probe dei provider in billing cooldown e'
-/// gestito ESCLUSIVAMENTE dal loop dedicato `billing_cooldown_recovery_loop`
-/// (re-probe a `BILLING_REPROBE_INTERVAL_S`): il probe periodico generico
-/// (`run_one_round`) li salta, cosi' non rinnova il cooldown lungo ne' martella
-/// il gateway con 500 a cascata (incidente Beauty-Book). I cooldown transient
-/// restano invece pingati dal probe periodico per il recovery rapido.
+/// Registro della severita' di ogni cooldown attivo, in parallelo a
+/// `PROVIDER_COOLDOWN_REASONS`. Sostituisce la vecchia `reason_is_billing`, che
+/// indovinava "e' billing?" da 4 sottostringhe INGLESI sulla `reason` — un campo
+/// che i produttori riempiono liberamente, anche in italiano (`"API key non
+/// valida"`, `"budget_exhausted"`): nessuna delle due matchava, e quei provider
+/// restavano fuori dalla protezione del loop dedicato, martellati dal probe
+/// periodico generico ogni ~5 minuti (la stessa classe di incidente gia' fissata
+/// per gli altri billing, Beauty-Book, ma non per questi due). Qui la domanda
+/// "e' un cooldown lungo?" ha gia' una risposta certa: quale funzione lo ha
+/// creato, non cosa dice il messaggio.
+static PROVIDER_COOLDOWN_SEVERITY: OnceLock<Mutex<HashMap<String, CooldownSeverity>>> =
+    OnceLock::new();
+
+fn set_cooldown_severity(provider: &str, severity: CooldownSeverity) {
+    let store = PROVIDER_COOLDOWN_SEVERITY.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut map) = store.lock() {
+        map.insert(provider.to_lowercase(), severity);
+    }
+}
+
+/// True se il provider e' ATTUALMENTE in cooldown e la severita' REGISTRATA e'
+/// `Long` (billing/quota/credito/auth/budget esaurito). Il re-probe dei provider
+/// in cooldown lungo e' gestito ESCLUSIVAMENTE dal loop dedicato
+/// `billing_cooldown_recovery_loop` (re-probe a `BILLING_REPROBE_INTERVAL_S`):
+/// il probe periodico generico (`run_one_round`) li salta, cosi' non rinnova il
+/// cooldown ne' martella il gateway con 500 a cascata (incidente Beauty-Book).
+/// I cooldown short restano invece pingati dal probe periodico per il recovery
+/// rapido. Assenza di severita' registrata (mai dovrebbe capitare quando il
+/// cooldown esiste) -> `false`, conservativo: meglio un probe di troppo che un
+/// billing mai ripescato.
 pub fn is_provider_in_billing_cooldown(provider: &str) -> bool {
     if !is_provider_in_cooldown(provider) {
         return false;
     }
     let key = provider.to_lowercase();
-    PROVIDER_COOLDOWN_REASONS
+    PROVIDER_COOLDOWN_SEVERITY
         .get()
         .and_then(|s| s.lock().ok())
-        .and_then(|m| m.get(&key).cloned())
-        .map(|r| reason_is_billing(&r))
+        .and_then(|m| m.get(&key).copied())
+        .map(|s| s == CooldownSeverity::Long)
         .unwrap_or(false)
 }
 
@@ -236,6 +265,11 @@ pub fn remove_cooldown(provider: &str) {
     // Rimuovi reason
     let reasons = PROVIDER_COOLDOWN_REASONS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = reasons.lock() {
+        map.remove(&key);
+    }
+    // Rimuovi severita' registrata
+    let severities = PROVIDER_COOLDOWN_SEVERITY.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut map) = severities.lock() {
         map.remove(&key);
     }
     // Rimuovi da Redis (se persistito)
@@ -470,6 +504,7 @@ pub fn put_provider_in_long_cooldown(provider: &str, reason: &str) {
     if let Ok(mut map) = reasons.lock() {
         map.insert(provider.to_lowercase(), reason.to_string());
     }
+    set_cooldown_severity(provider, CooldownSeverity::Long);
     // Persistenza Redis fire-and-forget. Stesso schema usato da
     // `gateway_providers_handler` (chiave `nexus:billing_cooldown:<provider>`)
     // cosi' il restore al riavvio funziona uniformemente.
@@ -572,6 +607,7 @@ pub fn put_provider_in_short_cooldown(provider: &str, reason: &str, duration_sec
     if let Ok(mut map) = reasons.lock() {
         map.insert(provider.to_lowercase(), reason.to_string());
     }
+    set_cooldown_severity(provider, CooldownSeverity::Short);
 }
 
 /// Registro dei motivi di cooldown ("credit balance too low", "rate limit", …).
@@ -603,7 +639,10 @@ pub fn cooldown_snapshot() -> Vec<(String, u64, Option<String>)> {
 }
 
 /// Ripristina un cooldown (billing) da un timestamp letto da Redis dopo riavvio.
-/// `remaining_secs`: secondi rimasti al momento della lettura.
+/// `remaining_secs`: secondi rimasti al momento della lettura. La chiave Redis
+/// `nexus:billing_cooldown:*` che alimenta questa funzione e' scritta ESCLUSIVAMENTE
+/// da [`put_provider_in_long_cooldown`] (vedi la sua persistenza): un cooldown
+/// ripristinato da qui e' sempre `Long` per costruzione, mai dedotto dalla reason.
 pub fn restore_cooldown(provider: &str, remaining_secs: u64, reason: &str) {
     let store = PROVIDER_COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = store.lock() {
@@ -620,6 +659,7 @@ pub fn restore_cooldown(provider: &str, remaining_secs: u64, reason: &str) {
     if let Ok(mut map) = reasons.lock() {
         map.insert(provider.to_lowercase(), reason.to_string());
     }
+    set_cooldown_severity(provider, CooldownSeverity::Long);
 }
 
 /// Bootstrap del cooldown billing dal DB persistente al riavvio (ADR 0020).
@@ -759,32 +799,58 @@ mod tests {
     }
 
     #[test]
-    fn reason_is_billing_classifica_credito_quota() {
-        assert!(reason_is_billing("credit_balance_too_low"));
-        assert!(reason_is_billing("quota_exceeded"));
-        assert!(reason_is_billing("insufficient balance"));
-        assert!(reason_is_billing("BILLING required"));
-        assert!(!reason_is_billing("rate_limit"));
-        assert!(!reason_is_billing("timeout"));
-        assert!(!reason_is_billing("connection_error"));
+    fn budget_exhausted_e_api_key_non_valida_sono_riconosciuti_billing() {
+        // Regressione del difetto reale: `reason_is_billing` cercava 4
+        // sottostringhe INGLESI ("credit"/"quota"/"billing"/"balance") su un
+        // campo che i produttori riempiono liberamente. Ne' "budget_exhausted"
+        // (provider_health_probe.rs, budget mensile esaurito) ne' "API key non
+        // valida" (model_health_probe.rs, auth_error in italiano) contenevano
+        // una di quelle parole: quei provider restavano FUORI dalla protezione
+        // del loop dedicato, martellati dal probe periodico ogni ~5 minuti
+        // esattamente come nell'incidente Beauty-Book che quella protezione
+        // doveva coprire. Ora la severita' e' REGISTRATA da chi chiama
+        // (put_provider_in_long_cooldown), non indovinata dal testo: qualunque
+        // reason, in qualunque lingua, e' billing se e' arrivata da li'.
+        let p_budget = "__test_budget_exhausted_probe";
+        let p_auth = "__test_auth_non_valida_probe";
+        put_provider_in_long_cooldown(p_budget, "budget_exhausted");
+        put_provider_in_long_cooldown(p_auth, "API key non valida");
+        assert!(is_provider_in_billing_cooldown(p_budget));
+        assert!(is_provider_in_billing_cooldown(p_auth));
+        remove_cooldown(p_budget);
+        remove_cooldown(p_auth);
     }
 
     #[test]
     fn billing_cooldown_distinto_da_transient() {
         // Il probe periodico salta i billing (gestiti dal recovery loop) ma
         // continua a pingare i transient. is_provider_in_billing_cooldown e'
-        // il discriminante.
+        // il discriminante, e la severita' e' quella REGISTRATA da chi ha
+        // messo il provider in cooldown (quale funzione ha chiamato), non una
+        // deduzione dalla reason: entrambe le reason sotto sono deliberatamente
+        // ambigue sul testo per provarlo.
         let p_bill = "__test_billing_cd_probe";
         let p_trans = "__test_transient_cd_probe";
         assert!(!is_provider_in_billing_cooldown(p_bill));
-        restore_cooldown(p_bill, 3600, "credit_balance_too_low");
+        put_provider_in_long_cooldown(p_bill, "causa qualsiasi");
         assert!(is_provider_in_billing_cooldown(p_bill));
-        restore_cooldown(p_trans, 60, "rate_limit");
+        put_provider_in_short_cooldown(p_trans, "causa qualsiasi", 60);
         assert!(is_provider_in_cooldown(p_trans));
         assert!(!is_provider_in_billing_cooldown(p_trans));
         remove_cooldown(p_bill);
         remove_cooldown(p_trans);
         assert!(!is_provider_in_billing_cooldown(p_bill));
+    }
+
+    #[test]
+    fn restore_cooldown_da_redis_e_sempre_billing() {
+        // La chiave Redis che alimenta restore_cooldown e' scritta SOLO da
+        // put_provider_in_long_cooldown: un ripristino da li' e' Long per
+        // costruzione, indipendentemente dal testo della reason.
+        let p = "__test_restore_e_sempre_long";
+        restore_cooldown(p, 3600, "motivo qualsiasi senza marker billing");
+        assert!(is_provider_in_billing_cooldown(p));
+        remove_cooldown(p);
     }
 
     #[test]

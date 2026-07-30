@@ -1037,14 +1037,17 @@ pub(crate) fn completion_has_error(completion: &Value) -> bool {
             return true;
         }
     }
-    completion
-        .get("content")
-        .and_then(Value::as_str)
-        .map(|content| {
-            let trimmed = content.trim_start();
-            trimmed.starts_with("[Error:") || trimmed.starts_with("[error:")
-        })
-        .unwrap_or(false)
+    // Non c'e' un terzo ramo che rilegge il PREFISSO del `content` (ex
+    // `"[Error:"`/`"[error:"`): i DUE produttori del Value neural
+    // (`completion_value_from_gw`/`error_completion_value` in neural_client.rs)
+    // scrivono SEMPRE `error`/`error_class` non-null quando il content porta quel
+    // prefisso — sono lo stesso ramo del gateway che scrive `"[Error: {raw_error}]"`
+    // e imposta `error: raw_error` nello stesso Value. Il terzo ramo era quindi
+    // ridondante (zero veri positivi raggiungibili attraverso i produttori reali)
+    // e SOLO falso-positivo: una risposta LEGITTIMA il cui testo comincia per
+    // "[Error:" (l'utente chiede di scrivere quella stringa, o un log che la cita)
+    // veniva scartata come fallimento, bruciando un failover a vuoto.
+    false
 }
 
 /// `true` se un value neural (completion/agent-turn) e' un FALLIMENTO ritentabile
@@ -1227,13 +1230,30 @@ mod neural_failure_tests {
         ));
         // error_class a root non-null -> fallimento (via completion_has_error/error).
         assert!(neural_value_is_failure(&json!({ "error": "llm_error", "content": "" })));
-        // Prosa [Error: ...] -> fallimento.
-        assert!(neural_value_is_failure(&json!({ "content": "[Error: quota]" })));
+        // Prosa [Error: ...] CON error/error_class non-null (la forma REALE che
+        // produce error_completion_value in neural_client.rs) -> fallimento.
+        assert!(neural_value_is_failure(
+            &json!({ "content": "[Error: quota]", "error": "quota", "error_class": "billing_error" })
+        ));
         // CONTENT VUOTO senza error (caso Gemini finish_reason=length) -> fallimento.
         assert!(neural_value_is_failure(&json!({ "content": "   " })));
         assert!(neural_value_is_failure(&json!({ "content": "" })));
         // content assente -> fallimento (nessun output utile per un purpose text).
         assert!(neural_value_is_failure(&json!({ "metadata": {} })));
+    }
+
+    #[test]
+    fn prosa_error_senza_campo_error_non_e_un_fallimento() {
+        // Il ramo terzo di `completion_has_error` (prefisso testuale "[Error:")
+        // e' stato rimosso: era ridondante sui produttori reali (che scrivono
+        // SEMPRE anche `error` non-null) e produceva SOLO falsi positivi su una
+        // risposta legittima il cui testo comincia per quella stringa (es.
+        // l'utente chiede di scrivere codice che stampa un messaggio "[Error:
+        // ...]", o un log incollato in chat). Nessun `error`/`error_class` nel
+        // Value -> non e' un fallimento, per costruzione dei due produttori.
+        assert!(!neural_value_is_failure(
+            &json!({ "content": "[Error: connessione rifiutata] gestito dal retry applicativo" })
+        ));
     }
 }
 

@@ -1683,8 +1683,123 @@ async fn errore_gateway_persiste_contatori() {
         out.extra.get("auto_escalations").and_then(Value::as_i64),
         Some(0)
     );
+    // Lo stub costruisce PortError::Llm da una stringa grezza (code
+    // "unspecified", non un vero codice del vocabolario `render_provider_code`):
+    // il mapping non ha nulla da tradurre -> nessun extra.error_class scritto.
+    // Il caso col codice reale e' nel test dedicato subito sotto.
+    assert!(out.extra.get("error_class").is_none());
     // UNA sola chiamata LLM: nessun retry-senza-forcing sul ramo error gateway.
     assert_eq!(llm.seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn errore_gateway_billing_scrive_error_class_strutturata() {
+    // Il quarto contratto per copia (regola L, punto 4 del censimento): prima
+    // mcp-core sapeva che un run "completed" era in realta' un fallimento
+    // infrastrutturale SOLO rileggendo il prefisso testuale "[Errore provider"
+    // della final_answer — un contratto tenuto per copia fra due crate, in
+    // italiano, dentro un campo di DISPLAY. Ora l'executor scrive ANCHE
+    // `extra.error_class`, il segnale STRUTTURATO che mcp-core gia' sa leggere
+    // (is_provider_error_completion/error_class_indicates_cooldown).
+    //
+    // PortError::ProviderUnavailable con causa Billing esplicita (lo stesso
+    // segnale che userebbe il gateway reale su credito esaurito), attraverso il
+    // ramo SENZA candidato di failover: il turno chiude Error con la sintesi.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc); // porta escalation vuota
+    let llm = Arc::new(StubLlmGateway::with_provider_unavailable_cause(
+        crate::runtime::ports::ProviderFailureCause::Billing,
+        "credito esaurito",
+    ));
+    let ctx = ctx_with(llm.clone());
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("scrivi il file")],
+        provider_used: Some("anthropic".into()),
+        model_used: Some("claude-x".into()),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run NON deve abortire");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::Error));
+    assert!(out.result.as_deref().unwrap().contains("[Errore provider"));
+    assert_eq!(
+        out.extra.get("error_class").and_then(Value::as_str),
+        Some("billing_error"),
+        "il segnale strutturato deve accompagnare il testo, non sostituirlo: {:?}",
+        out.extra
+    );
+}
+
+#[test]
+fn error_class_da_port_error_provider_unavailable_copre_le_cause() {
+    // ProviderUnavailable: la causa tipizzata e' gia' la classe, tranne dove il
+    // fornitore e' sano (ClientError/PolicyTierExcluded/Unknown -> None: nessun
+    // cooldown su un fornitore che ha risposto correttamente).
+    use crate::runtime::ports::{ProviderFailureCause as Causa, ProviderUnavailableInfo};
+    let casi_cause = [
+        (Causa::Billing, Some("billing_error")),
+        (Causa::Cooldown, Some("provider_error")),
+        (Causa::EmptyCompletion, Some("empty_completion")),
+        (Causa::ContextTooLong, Some("context_too_long")),
+        (Causa::ClientError, None),
+        (Causa::PolicyTierExcluded, None),
+        (Causa::Unknown, None),
+    ];
+    for (causa, atteso) in casi_cause {
+        let err = PortError::ProviderUnavailable(ProviderUnavailableInfo::new(causa, "x"));
+        assert_eq!(
+            error_class_da_port_error(&err),
+            atteso,
+            "causa {causa:?} -> atteso {atteso:?}"
+        );
+    }
+}
+
+#[test]
+fn error_class_da_port_error_llm_copre_i_code_del_gateway() {
+    // PortError::Llm: mappato dal `code` di RenderedError, il vocabolario che
+    // `render_provider_code`/`render_provider_class`/`render_provider_status`
+    // (nexus-types::error_presentation) producono davvero sul lato gateway.
+    use nexus_types::error_presentation::RenderedError;
+    let casi_code = [
+        ("provider_quota", Some("billing_error")),
+        ("provider_rate_limited", Some("rate_limit")),
+        ("provider_auth", Some("auth_error")),
+        ("provider_cooldown", Some("provider_error")),
+        ("provider_timeout", Some("provider_error")),
+        ("transport_unreachable", Some("provider_error")),
+        ("transport_failed", Some("provider_error")),
+        ("provider_request_too_large", Some("context_too_long")),
+        ("provider_empty", Some("empty_completion")),
+        ("provider_model_unknown", None),
+        ("policy_excluded", None),
+        ("unspecified", None),
+    ];
+    for (code, atteso) in casi_code {
+        let err = PortError::Llm(RenderedError {
+            code: code.to_string(),
+            message: "x".to_string(),
+            detail: String::new(),
+        });
+        assert_eq!(
+            error_class_da_port_error(&err),
+            atteso,
+            "code {code} -> atteso {atteso:?}"
+        );
+    }
+}
+
+#[test]
+fn error_class_da_port_error_tool_mai_correlato_al_provider() {
+    use nexus_types::error_presentation::RenderedError;
+    let tool_err = PortError::Tool(RenderedError {
+        code: "provider_quota".to_string(),
+        message: "x".to_string(),
+        detail: String::new(),
+    });
+    assert_eq!(error_class_da_port_error(&tool_err), None);
 }
 
 #[tokio::test]
