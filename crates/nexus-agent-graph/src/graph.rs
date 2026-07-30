@@ -517,6 +517,10 @@ mod tests {
     struct ScriptedLlmGateway {
         turns: Vec<LlmResponse>,
         calls: Mutex<usize>,
+        /// System prompt di OGNI richiesta, nell'ordine in cui e' stata fatta:
+        /// e' cio' che il modello legge davvero, l'unico modo per verificare le
+        /// iniezioni nel system senza rifarne il calcolo nel test (regola O).
+        systems: Mutex<Vec<Option<String>>>,
     }
 
     impl ScriptedLlmGateway {
@@ -524,17 +528,26 @@ mod tests {
             Self {
                 turns,
                 calls: Mutex::new(0),
+                systems: Mutex::new(Vec::new()),
             }
         }
 
         fn call_count(&self) -> usize {
             *self.calls.lock().expect("lock calls")
         }
+
+        fn systems(&self) -> Vec<Option<String>> {
+            self.systems.lock().expect("lock systems").clone()
+        }
     }
 
     #[async_trait]
     impl LlmGateway for ScriptedLlmGateway {
-        async fn complete(&self, _req: LlmRequest) -> Result<LlmResponse, PortError> {
+        async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, PortError> {
+            self.systems
+                .lock()
+                .expect("lock systems")
+                .push(req.system_text.clone());
             let mut n = self.calls.lock().expect("lock calls");
             let idx = (*n).min(self.turns.len().saturating_sub(1));
             *n += 1;
@@ -786,16 +799,30 @@ mod tests {
     /// pass-through (zero I/O LLM nel nodo di chiusura). Niente plan_phase ->
     /// final_gate eleggibile sul task software (write_file e' mutator fs).
     fn initial_state(run_id: Uuid) -> AgentState {
+        // `extra[ORIGINAL_TASK_KEY]` come lo fissa `native_engine::build_initial_state`
+        // su OGNI run: e' da li' che supervisore e focus del turno leggono la
+        // richiesta (punto unico `decisions::turn_task`). Ometterlo qui darebbe
+        // un motore che nei test non ha il dato che in produzione ha sempre.
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            crate::decisions::turn_task::ORIGINAL_TASK_KEY.to_string(),
+            json!(RICHIESTA_DEL_TURNO),
+        );
         AgentState {
             messages: vec![Message::Human {
-                content: MessageContent::text("Scrivi src/main.rs con uno scheletro."),
+                content: MessageContent::text(RICHIESTA_DEL_TURNO),
             }],
             thread_id: Some(run_id.to_string()),
             intent_hint: Some("chat".to_string()),
             automation_mode: Some(AutomationMode::Automatic),
+            extra,
             ..Default::default()
         }
     }
+
+    /// La richiesta dell'utente del turno: una sola definizione, cosi' i test che
+    /// la cercano nel prompt non ne ricopiano una variante.
+    const RICHIESTA_DEL_TURNO: &str = "Scrivi src/main.rs con uno scheletro.";
 
     // ── Mapping NodeTarget -> NodeId ──────────────────────────────────────────
 
@@ -1586,6 +1613,73 @@ mod tests {
             edge.resolve(&parziale),
             NodeId::Executor,
             "`partial` e' dichiarazione onesta di lavoro incompleto: prosegue"
+        );
+    }
+
+    /// REGRESSIONE (motore reale, grafo completo): il blocco "FOCUS DEL TURNO
+    /// CORRENTE" dichiara al modello quale sia la richiesta dell'utente ADESSO.
+    /// Era costruito sull'ULTIMO `Message::Human` della cronologia, e dal secondo
+    /// turno in poi quel messaggio non e' piu' l'utente: e' quello che
+    /// `tool_dispatch` produce coi risultati dei tool. Il blocco spariva (i
+    /// tool_result sono blocchi tipizzati, `flatten_text` li ignora) oppure —
+    /// quando un promemoria `<system-reminder>` era appeso ai risultati —
+    /// restava dichiarando quel promemoria come richiesta dell'utente.
+    ///
+    /// Qui si misura cio' che il modello LEGGE: il `system_text` di ogni
+    /// richiesta al gateway, dopo un giro completo executor -> tool_dispatch ->
+    /// executor. Il test prova anche che la richiesta sopravvive ai nodi
+    /// attraversati (ogni nodo che scrive `extra` deve preservarne le chiavi).
+    ///
+    /// Verifica per mutazione: ripristinando l'euristica "ultimo Human" il
+    /// secondo system resta senza il blocco e il test fallisce.
+    #[tokio::test]
+    async fn il_focus_del_turno_cita_la_richiesta_anche_dopo_i_tool() {
+        let gateway = Arc::new(ScriptedLlmGateway::new(vec![turn_tool_use(), turn_end()]));
+        let llm: Arc<dyn LlmGateway> = gateway.clone();
+        let tools = stub_tools();
+        let run_id = Uuid::new_v4();
+
+        let nodes = build_stub_nodes(tools.clone());
+        let engine = build_agent_graph(
+            nodes,
+            RoutingConfig::default(),
+            PlannerConfig::default(),
+            SupervisorConfig::default(),
+            Arc::new(MemoryCheckpointer::default()),
+        );
+
+        let ctx = ctx_with(llm, tools, run_id);
+        engine
+            .run_until_interrupt(run_id, Some(initial_state(run_id)), &ctx)
+            .await
+            .expect("il run end-to-end deve completare senza errore");
+
+        // Le uniche due chiamate al gateway sono i due turni dell'executor
+        // (1: tool_use -> tool_dispatch, 2: end_turn), come da
+        // `run_completo_attraversa_il_loop_e_chiude`.
+        let systems = gateway.systems();
+        assert_eq!(systems.len(), 2, "attesi due turni dell'executor: {systems:?}");
+
+        for (i, system) in systems.iter().enumerate() {
+            let system = system
+                .as_deref()
+                .unwrap_or_else(|| panic!("turno {i}: system_text assente"));
+            assert!(
+                system.contains(crate::decisions::turn_focus::TURN_FOCUS_MARKER),
+                "turno {i}: il focus del turno non e' stato iniettato"
+            );
+            assert!(
+                system.contains(RICHIESTA_DEL_TURNO),
+                "turno {i}: il focus non cita la richiesta dell'utente"
+            );
+        }
+
+        // Il secondo turno e' quello che segue il tool_dispatch: se il focus
+        // seguisse i messaggi, li' citerebbe l'esito del tool.
+        let secondo = systems[1].as_deref().expect("system del secondo turno");
+        assert!(
+            !secondo.contains("contenuto del file letto"),
+            "il focus ha dichiarato l'output di un tool come richiesta: {secondo}"
         );
     }
 }

@@ -921,10 +921,11 @@ impl PlannerNode {
         // 1:1 col Python (try/except -> prosegue senza directive): la funzione
         // Rust e' infallibile (ritorna Option), quindi "errore -> prosegue" diventa
         // "None -> nessun prepend". `new_topic=false`: il planner Python chiama
-        // `build_turn_focus_directive(messages)` SENZA il flag new_topic (default
-        // del continuity gate non passato qui).
+        // `build_turn_focus_directive` SENZA il flag new_topic (default del
+        // continuity gate non passato qui). Prende lo STATO: la richiesta la
+        // porta `turn_task`, non l'ultimo messaggio della cronologia.
         if self.cfg.turn_focus_enabled {
-            if let Some(focus) = build_turn_focus_directive(&state.messages, false) {
+            if let Some(focus) = build_turn_focus_directive(state, false) {
                 hinted = format!("{focus}\n\n{hinted}");
             }
         }

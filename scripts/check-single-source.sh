@@ -1432,6 +1432,48 @@ else
   fail=1
 fi
 
+# «Qual e' la richiesta dell'utente per QUESTO turno?» (2026-07-29)
+#
+# Una domanda, una risposta: il task fissato all'origine del run. Aveva DUE
+# consumatori con due euristiche diverse sulla cronologia — il supervisore col
+# primo `Message::Human` (incidente Chat 11), il focus del turno con l'ultimo,
+# che in un run agentico e' un tool_result o un `<system-reminder>`.
+assert_single "task-del-turno" 'fn current_turn_task' \
+  'crates/nexus-agent-graph/src/decisions/turn_task.rs' crates
+assert_single "chiave-task-del-turno" '"original_task"' \
+  'crates/nexus-agent-graph/src/decisions/turn_task.rs' crates
+
+# Il guard che conta: il focus del turno NON torna a leggere la cronologia.
+#
+# Il ruolo `user` sul canale interno significa "questo lo legge il modello",
+# non "questo lo ha scritto l'utente": tool_dispatch, i promemoria e i nudge
+# anti-stallo producono tutti `Message::Human`. Un ripiego sulla history —
+# anche solo "se il task manca, prendi l'ultimo messaggio" — rimette in piedi
+# il difetto, e lo rimette dove nessun test lo guarda: nel caso in cui il dato
+# non c'e'. Si guardano le sole righe di CODICE fino a `#[cfg(test)]`: nei
+# commenti quei nomi servono a spiegare il difetto, nei test sono la fixture.
+if [[ -f crates/nexus-agent-graph/src/decisions/turn_focus.rs ]]; then
+  if awk '
+    /^#\[cfg\(test\)\]/ { exit }
+    /^[[:space:]]*\/\// { next }
+    /Message::Human|\.messages|state\.messages/ {
+      trovato = 1; print "   riga " NR ": " $0 > "/dev/stderr"
+    }
+    END { exit !trovato }
+  ' crates/nexus-agent-graph/src/decisions/turn_focus.rs 2>&1; then
+    echo "!! focus-non-legge-la-cronologia: il focus del turno torna sui messaggi." >&2
+    echo "   La richiesta si legge da decisions::turn_task (fissata all'origine)," >&2
+    echo "   non dalla history: li' il ruolo 'user' non identifica l'utente." >&2
+    fail=1
+  else
+    echo "OK focus-non-legge-la-cronologia: il focus legge il task, non i messaggi"
+  fi
+else
+  echo "!! focus-non-legge-la-cronologia: modulo turn_focus.rs non trovato." >&2
+  echo "   Il check non ha raggiunto il suo oggetto (regola O)." >&2
+  fail=1
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

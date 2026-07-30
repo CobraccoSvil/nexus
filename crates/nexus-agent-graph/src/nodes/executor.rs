@@ -2898,7 +2898,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
 
         // Iniezioni system_text (P3, idempotenti) nell'ordine del Python +
         // forced_rag_reminder sulla history (py:2907-2911).
-        self.inietta_direttive_system(&mut system_text, &messages);
+        self.inietta_direttive_system(&mut system_text, state);
         let rag_est = self.estimate_history_tokens(&hist);
         let (hist_rag, _) = ctxr::inject_forced_rag_reminder(
             &hist,
@@ -6056,14 +6056,19 @@ della finestra {effective_window} del modello {provider}/{model}"
     /// Iniezioni system_text (P3, idempotenti) nell'ordine del Python:
     /// promemoria di lingua, focus del turno (py:2864-2878), direttiva di
     /// verifica.
-    fn inietta_direttive_system(&self, system_text: &mut String, messages: &[Message]) {
+    ///
+    /// Il focus prende lo STATO, non i messaggi: la richiesta dell'utente si
+    /// legge dove il turno l'ha fissata (`turn_task`), e la cronologia da questo
+    /// nodo in poi contiene tool_result, promemoria e nudge — tutti con ruolo
+    /// `user` sul canale interno.
+    fn inietta_direttive_system(&self, system_text: &mut String, state: &AgentState) {
         *system_text = ctxr::inject_language_reminder(
             system_text,
             self.cfg.language_reminder_enabled,
             &self.cfg.language_reminder_text,
         );
         if self.cfg.turn_focus_enabled {
-            if let Some(directive) = build_turn_focus_directive(messages, false) {
+            if let Some(directive) = build_turn_focus_directive(state, false) {
                 *system_text = ctxr::inject_turn_focus(system_text, &directive);
             }
         }

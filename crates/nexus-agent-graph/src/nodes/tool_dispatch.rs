@@ -64,6 +64,14 @@
 //! Il `tool_dispatch_node` NON tocca `turn_focus` (lo inietta l'executor nel
 //! prompt): nessuna replica qui.
 //!
+//! Va pero' saputo che il messaggio prodotto da [`build_tool_message`] ha ruolo
+//! `user` sul canale interno pur non venendo dall'utente: porta i tool_result e,
+//! in coda, i promemoria `<system-reminder>` della barriera advisory e dei todo.
+//! Finche' il focus del turno lo leggeva come "ultimo messaggio dell'utente",
+//! dal secondo turno in poi dichiarava al modello che la richiesta ADESSO era un
+//! promemoria di sistema. La richiesta si legge da `decisions::turn_task`, non
+//! da qui: chi aggiunge un consumatore della cronologia se lo ricordi.
+//!
 //! ## Cosa NON porta (parita' Python documentata)
 //!
 //! - `_tool_runner is None` / `session_id` assente (error_blocks): in Rust la
@@ -3415,6 +3423,124 @@ mod tests {
         } else {
             panic!("atteso HumanMessage a blocchi");
         }
+    }
+
+    // ── Il focus del turno NON segue i messaggi che questo nodo produce ─────────
+
+    /// REGRESSIONE: la directive "FOCUS DEL TURNO CORRENTE" dichiara al modello
+    /// quale sia la richiesta dell'utente ADESSO. Era costruita sull'ULTIMO
+    /// `Message::Human` della cronologia — che da questo nodo in poi non e' piu'
+    /// l'utente: e' il messaggio di risultati che il nodo stesso produce, con i
+    /// tool_result e i promemoria `<system-reminder>` appesi in coda.
+    ///
+    /// La history del test la scrive il NODO REALE (regola O): niente
+    /// `Message::Human` fabbricato a mano, altrimenti si verificherebbe la
+    /// propria idea del messaggio di risultati invece di quello vero — e la
+    /// forma esatta (blocchi tipizzati + blocco di testo col tag) e' proprio cio'
+    /// che rendeva il difetto invisibile.
+    ///
+    /// Verifica per mutazione: rimettendo l'euristica "ultimo Human" la directive
+    /// cita il promemoria dei todo al posto della richiesta.
+    #[tokio::test]
+    async fn il_focus_del_turno_ignora_i_messaggi_prodotti_dal_dispatch() {
+        use crate::decisions::turn_focus::build_turn_focus_directive;
+        use crate::decisions::turn_task::ORIGINAL_TASK_KEY;
+
+        struct ReminderStore;
+        #[async_trait]
+        impl TodoStore for ReminderStore {
+            async fn list_todos(
+                &self,
+                _r: &str,
+            ) -> Result<Vec<crate::decisions::dag_scheduler::Todo>, PortError> {
+                Ok(vec![])
+            }
+            async fn mark_status(
+                &self,
+                _id: &str,
+                _s: crate::decisions::dag_scheduler::TodoStatus,
+            ) -> Result<(), PortError> {
+                Ok(())
+            }
+            async fn build_reminder_text(&self, _r: &str) -> Result<Option<String>, PortError> {
+                Ok(Some("CHECKLIST: 1) rifai il layout della dashboard".to_string()))
+            }
+        }
+
+        let cfg = ToolDispatchConfig {
+            todo_reminder_every_n_steps: 1,
+            ..Default::default()
+        };
+        let tools = Arc::new(MapToolExecutor::new().with(
+            "read_file",
+            ToolOutcome {
+                tool_call_id: "c1".into(),
+                content: Value::String("export const dashboard = 1;".into()),
+                is_error: false,
+                ..Default::default()
+            },
+        ));
+        let n = ToolDispatchNode::new(
+            cfg,
+            tools,
+            Arc::new(StubAgentStepStore::default()),
+            Arc::new(StubRunControlStore::default()),
+            Arc::new(ReminderStore),
+            Arc::new(StubContextOffload::default()),
+            Arc::new(StubMetaStepStore::default()),
+        );
+        let ctx = ctx_with(CancellationToken::new());
+
+        // Stato come lo fissa `native_engine::build_initial_state`: la richiesta
+        // del turno in `extra`, e la stessa in coda ai messaggi.
+        const RICHIESTA: &str = "Aggiungi il filtro per data alla lista spese";
+        let mut st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
+        st.plan_phase_active = Some(true);
+        st.extra
+            .insert(ORIGINAL_TASK_KEY.to_string(), json!(RICHIESTA));
+        st.messages = vec![Message::Human {
+            content: MessageContent::text(RICHIESTA),
+        }];
+
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+
+        // PREMESSA del test, verificata invece che assunta: il nodo ha davvero
+        // messo in coda un Human coi risultati e col promemoria.
+        let ultimo = out.messages.last().expect("il nodo appende un messaggio");
+        assert!(
+            matches!(ultimo, Message::Human { .. }),
+            "il messaggio dei risultati ha ruolo user sul canale interno"
+        );
+        let blocchi = blocks_of(ultimo);
+        assert!(
+            blocchi.iter().any(|b| b["type"] == "tool_result"),
+            "atteso il tool_result nel messaggio prodotto: {blocchi:?}"
+        );
+        assert!(
+            blocchi.iter().any(|b| b["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("system-reminder"))),
+            "atteso il promemoria appeso dal nodo: {blocchi:?}"
+        );
+
+        // La directive resta ancorata alla richiesta.
+        let focus = build_turn_focus_directive(&out, false).expect("directive");
+        assert!(
+            focus.contains(RICHIESTA),
+            "il focus deve citare la richiesta dell'utente, era: {focus}"
+        );
+        assert!(
+            !focus.contains("system-reminder"),
+            "il focus dichiarava un promemoria di sistema come richiesta: {focus}"
+        );
+        assert!(
+            !focus.contains("CHECKLIST"),
+            "il focus dichiarava il promemoria dei todo come richiesta: {focus}"
+        );
+        assert!(
+            !focus.contains("export const dashboard"),
+            "il focus dichiarava l'output di un tool come richiesta: {focus}"
+        );
     }
 
     // ── (9) context-budget cap: troncamento aggressivo con offload ───────────────

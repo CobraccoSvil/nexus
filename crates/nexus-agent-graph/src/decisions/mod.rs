@@ -119,6 +119,7 @@ pub mod text_repetition;
 pub mod tiers;
 pub mod tool_dispatch;
 pub mod turn_focus;
+pub mod turn_task;
 pub mod ui_surface;
 
 pub use adversarial_review::{
@@ -193,9 +194,9 @@ pub use scale_reason::{
     validate_scale_move, ScaleHysteresisConfig, ScaleTriggerConfig,
 };
 pub use supervisor::{
-    build_anomaly_block, build_steps_summary, detect_anomalies, extract_original_task,
-    should_invoke, supervisor_cache_key, validate_supervisor_response, SupervisorAnomalies,
-    SupervisorConfig, SupervisorDecision, ORIGINAL_TASK_KEY,
+    build_anomaly_block, build_steps_summary, detect_anomalies, should_invoke,
+    supervisor_cache_key, validate_supervisor_response, SupervisorAnomalies, SupervisorConfig,
+    SupervisorDecision,
 };
 pub use text_repetition::{detect_repetition_collapse, RepetitionHit, RepetitionThresholds};
 pub use tool_dispatch::{
@@ -205,6 +206,7 @@ pub use tool_dispatch::{
     TOKEN_CHARS_DIVISOR, VALID_OUTCOMES,
 };
 pub use turn_focus::{build_turn_focus_directive, user_text_only, TURN_FOCUS_MARKER};
+pub use turn_task::{current_turn_task, extract_original_task, ORIGINAL_TASK_KEY};
 
 #[cfg(test)]
 mod golden_tests;

@@ -1,47 +1,77 @@
 //! `turn_focus`: PUNTO UNICO (regola L) della direttiva "focus del turno
 //! corrente" (anti-contaminazione della history pregressa).
 //!
-//! Porting 1:1 di `build_turn_focus_directive`
-//! (`brain/agents/nodes/helpers.py:866-927`). Funzione PURA e idempotente: stesso
-//! input -> stesso output, nessun side effect, nessuna lettura DB.
-//!
 //! Causa radice che risolve: con una history grande su un certo task, i modelli
 //! (specie gli small) seguono il "peso" del contesto storico invece dell'ultima
-//! istruzione. Questa direttiva ancora il turno corrente all'ultima richiesta
-//! utente a prescindere dalla similarita' semantica. La useranno SIA il planner
-//! SIA l'executor (entrambi la antepongono al system): un solo punto autoritativo
-//! qui, i due nodi delegano.
+//! istruzione. Questa direttiva ancora il turno corrente alla richiesta
+//! dell'utente a prescindere dalla similarita' semantica. La useranno SIA il
+//! planner SIA l'executor: un solo punto autoritativo qui, i due nodi delegano.
+//!
+//! ## Da dove viene la richiesta
+//!
+//! Da [`crate::decisions::turn_task::current_turn_task`], cioe' da dove il run
+//! l'ha FISSATA all'origine, e non piu' dall'ultimo `Message::Human` della
+//! cronologia.
+//!
+//! L'euristica precedente era falsa gia' dal secondo turno di un run agentico:
+//! `tool_dispatch` consegna i risultati dei tool come `Message::Human` a blocchi
+//! e vi appende i promemoria della barriera advisory e dei todo come blocchi
+//! `{"type":"text","text":"<system-reminder>...</system-reminder>"}`; l'executor
+//! inietta i nudge anti-stallo come `Message::Human` di testo; il resume HITL ne
+//! aggiunge uno di conferma. `flatten_text` concatena i blocchi di testo, e
+//! [`user_text_only`] toglie solo i blocchi `<allegati>`/`<allegati_sessione>`/
+//! `<task_playbook>`: il risultato era una directive che dichiarava al modello,
+//! con la massima autorita' del system prompt, che la richiesta dell'utente
+//! "ADESSO" era un promemoria di sistema o l'output di un tool.
+//!
+//! Nota su cosa NON era: il difetto non e' che il tag `<system-reminder>`
+//! sfuggisse al filtro. Aggiungerlo alla regex avrebbe zittito il caso peggiore
+//! lasciando in piedi gli altri (i nudge non hanno tag, i tool_result sono
+//! blocchi tipizzati) e avrebbe confermato la premessa sbagliata: che la
+//! richiesta dell'utente si possa riconoscere guardando il contenuto dei
+//! messaggi (regola M). La richiesta e' un dato, e ha gia' un posto suo.
+//!
+//! ## Perche' senza il dato non si scrive nulla
+//!
+//! Se `current_turn_task` non sa rispondere, la funzione ritorna `None` e il
+//! blocco non viene iniettato. Nessun ripiego sulla cronologia: una directive
+//! che AFFERMA "la richiesta e' X" quando X non e' la richiesta e' peggio della
+//! sua assenza, perche' sposta il lavoro sull'oggetto sbagliato invece di
+//! lasciare che il modello legga la conversazione da se'. Il ripiego del
+//! supervisore (che una stringa la vuole comunque, per riempire un campo del
+//! prompt) resta esplicito e locale a lui.
 //!
 //! Regola G (no hardcode/no lettura DB nella primitiva): il flag che la governa
-//! (`agent.context.turn_focus_enabled`, default `true`, letto dal brain in
-//! `_load_continuity_config`) NON e' letto qui dentro. La funzione e' pura; il
-//! chiamante (planner/executor) decide se invocarla in base al flag e passa il
-//! parametro `new_topic`.
+//! (`agent.context.turn_focus_enabled`, default `true`) NON e' letto qui dentro.
+//! La funzione e' PURA — legge solo lo stato in memoria; il chiamante decide se
+//! invocarla in base al flag e passa il parametro `new_topic`.
 //!
-//! Regola L (riuso): l'estrazione del testo dai messaggi delega a
-//! [`crate::state::MessageContent::flatten_text`] (NON re-implementata) e la
-//! rimozione dei blocchi di sistema delega a [`user_text_only`] (gemello Rust di
-//! `task_playbook._user_text_only`, qui consolidato come punto unico locale).
+//! Parita' col Python: divergenza VOLUTA e non piu' misurabile (il brain e' stato
+//! rimosso). Il golden `gen_golden_turn_focus.py` esercitava proprio l'euristica
+//! "ultimo messaggio umano" — cioe' il difetto — quindi e' stato tolto invece di
+//! essere adattato: avrebbe misurato l'errore, con la faccia seria del verde
+//! (regola O). Stessa scelta gia' fatta per `inject_turn_focus` quando il blocco
+//! e' passato in coda alla parte stabile del system.
 
 use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::state::Message;
+use crate::decisions::turn_task::current_turn_task;
+use crate::state::AgentState;
 
-/// Marcatore di idempotenza dell'iniezione nel system_text. Identico a
-/// `_TURN_FOCUS_MARKER` Python (`helpers.py:650`). Esposto perche' i chiamanti
-/// (planner/executor) lo useranno per l'iniezione idempotente nel system.
+/// Marcatore di idempotenza dell'iniezione nel system_text. Esposto perche' i
+/// chiamanti (planner/executor) lo usano per l'iniezione idempotente.
 pub const TURN_FOCUS_MARKER: &str = "[[NEXUS_TURN_FOCUS]]";
 
-/// Soglia di troncamento dell'estratto (in CARATTERI Unicode, come il Python che
-/// usa `len()`/slice su `str`). Identico a `helpers.py:907`.
+/// Soglia di troncamento dell'estratto (in CARATTERI Unicode).
 const EXCERPT_MAX_CHARS: usize = 600;
 
-// Blocchi di SISTEMA iniettati da mcp-core nel messaggio utente: vanno RIMOSSI
-// prima di estrarre la richiesta corrente. Replica di `_SYSTEM_BLOCK_RE`
-// (`task_playbook.py:142-145`): `<(allegati|allegati_sessione|task_playbook)...>
-// ...</tag>` con DOTALL + IGNORECASE.
+// Blocchi di SISTEMA che mcp-core impagina DENTRO il messaggio del turno prima
+// di consegnarlo al motore (allegati, playbook): vanno RIMOSSI prima di
+// mostrarne l'estratto. Replica di `_SYSTEM_BLOCK_RE` (`task_playbook.py`):
+// `<(allegati|allegati_sessione|task_playbook)...>...</tag>` con DOTALL +
+// IGNORECASE.
 //
 // Il Python usa il backreference `\1` per far combaciare il tag di chiusura con
 // quello di apertura; la crate `regex` di Rust NON supporta i backreference.
@@ -58,71 +88,54 @@ static SYSTEM_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Testo utente PULITO: rimuove i blocchi di sistema (`<allegati>`,
-/// `<allegati_sessione>`, `<task_playbook>`) dal contenuto. Gemello Rust di
-/// `task_playbook._user_text_only` (punto unico, regola L): se in futuro serve a
-/// piu' nodi, e' qui che si estende.
+/// `<allegati_sessione>`, `<task_playbook>`) impaginati nel messaggio del turno.
+/// Gemello Rust di `task_playbook._user_text_only` (punto unico, regola L): se in
+/// futuro serve a piu' nodi, e' qui che si estende.
 pub fn user_text_only(text: &str) -> String {
     SYSTEM_BLOCK_RE.replace_all(text, "").into_owned()
 }
 
 /// Costruisce il blocco "focus del turno corrente" (anti-contaminazione della
-/// history). Funzione PURA e idempotente. Porting 1:1 di
-/// `build_turn_focus_directive` (`helpers.py:866-927`).
+/// history). Funzione PURA e idempotente.
 ///
-/// Cosa estrae: l'ULTIMO `Message::Human` (iterazione dal fondo), ripulito dai
-/// blocchi di sistema via [`user_text_only`]. Per i contenuti a blocchi usa
-/// [`MessageContent::flatten_text`] (regola L: NON re-implementa l'estrazione);
-/// nota di parita': il Python fa `str(content)` sui contenuti non-stringa, forma
-/// non riproducibile 1:1 e fuori contratto per l'utente — qui, coerentemente con
-/// gli altri nodi del crate (`clarify_or_expand::last_user_message`), si
-/// concatenano i blocchi Text.
+/// Cosa estrae: la richiesta dell'utente del turno, letta dal punto unico
+/// [`current_turn_task`] e ripulita dai blocchi di sistema via
+/// [`user_text_only`]. NON scorre `state.messages` (vedi doc del modulo).
 ///
-/// Casi limite (identici al Python):
-/// - `messages` vuoto -> `None` (Python: `""`).
-/// - nessun `Human` valido / testo vuoto dopo `trim` -> `None` (Python: `""`).
+/// Casi limite:
+/// - task del turno non fissato nello stato -> `None`;
+/// - testo vuoto dopo la rimozione dei blocchi di sistema e il `trim` -> `None`;
 /// - richiesta > 600 caratteri -> primi 600 char + `rstrip` + `" [...]"`.
-///
-/// Ritorna `Option<String>`: `None` mappa la stringa vuota del Python (no-op a
-/// monte), `Some(directive)` il blocco pronto da anteporre al system.
 ///
 /// `new_topic`: se `true` (il continuity gate ha rilevato un cambio
 /// d'argomento) aggiunge la riga di rinforzo finale.
 ///
-/// Regola G: il flag `turn_focus_enabled` NON e' letto qui (funzione pura); il
-/// chiamante decide se invocare e passa `new_topic`.
-pub fn build_turn_focus_directive(messages: &[Message], new_topic: bool) -> Option<String> {
-    if messages.is_empty() {
-        return None;
-    }
-    // Ultimo messaggio umano, ripulito dai blocchi di sistema (punto unico del
-    // parser, regola L), come `apply_continuity_trim`.
-    let mut last_user = String::new();
-    for m in messages.iter().rev() {
-        if let Message::Human { content } = m {
-            // `flatten_text()` rende la forma stringa (Text) cosi' com'e' e
-            // concatena i blocchi Text (surrogato di `str(content)` Python, vedi
-            // doc). Poi rimuoviamo i blocchi di sistema come `_user_text_only`.
-            let raw = content.flatten_text();
-            last_user = user_text_only(&raw);
-            break;
-        }
-    }
-    let last_user = last_user.trim();
-    if last_user.is_empty() {
+/// Regola G: il flag `turn_focus_enabled` NON e' letto qui; il chiamante decide
+/// se invocare e passa `new_topic`.
+pub fn build_turn_focus_directive(state: &AgentState, new_topic: bool) -> Option<String> {
+    let task = current_turn_task(state)?;
+    let pulito = user_text_only(task);
+    let pulito = pulito.trim();
+    if pulito.is_empty() {
         return None;
     }
     // Estratto compatto: la directive deve restare leggera e cacheabile. Conteggio
-    // e slice su CARATTERI Unicode (come Python `len()`/`[:600]` su `str`).
-    let excerpt: String = if last_user.chars().count() <= EXCERPT_MAX_CHARS {
-        last_user.to_string()
+    // e slice su CARATTERI Unicode.
+    let excerpt: String = if pulito.chars().count() <= EXCERPT_MAX_CHARS {
+        pulito.to_string()
     } else {
-        let head: String = last_user.chars().take(EXCERPT_MAX_CHARS).collect();
+        let head: String = pulito.chars().take(EXCERPT_MAX_CHARS).collect();
         format!("{} [...]", head.trim_end())
     };
 
     let mut lines: Vec<String> = vec![
         "### FOCUS DEL TURNO CORRENTE ###".to_string(),
-        "La richiesta da portare a termine ADESSO e' l'ultimo messaggio dell'utente:".to_string(),
+        // NON "l'ultimo messaggio dell'utente": cio' che segue e' la richiesta
+        // con cui il turno e' partito, e l'ultimo messaggio della conversazione
+        // in un run agentico e' un risultato di tool. La riga descriveva la
+        // vecchia euristica, e mandava il modello a cercare la richiesta nel
+        // posto sbagliato.
+        "La richiesta da portare a termine ADESSO e':".to_string(),
         format!("\"{excerpt}\""),
         String::new(),
         "La cronologia precedente e' CONTESTO DI SUPPORTO, non l'oggetto di questa \
@@ -146,8 +159,22 @@ salvo quanto serve a soddisfarla."
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{ContentBlock, MessageContent};
+    use crate::decisions::turn_task::ORIGINAL_TASK_KEY;
+    use crate::state::{ContentBlock, Message, MessageContent};
     use serde_json::Value;
+
+    /// Stato con il task del turno FISSATO come lo fissa `build_initial_state`.
+    fn stato_con_task(task: &str) -> AgentState {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            ORIGINAL_TASK_KEY.to_string(),
+            Value::String(task.to_string()),
+        );
+        AgentState {
+            extra,
+            ..Default::default()
+        }
+    }
 
     fn human(text: &str) -> Message {
         Message::Human {
@@ -155,53 +182,67 @@ mod tests {
         }
     }
 
-    fn ai(text: &str) -> Message {
-        Message::Ai {
-            content: MessageContent::text(text),
-            tool_calls: vec![],
-            reasoning: None,
-            thinking_signature: None,
-        }
-    }
-
     #[test]
-    fn vuoto_se_nessun_messaggio() {
-        assert_eq!(build_turn_focus_directive(&[], false), None);
-    }
-
-    #[test]
-    fn vuoto_se_nessun_human() {
-        let msgs = vec![ai("ciao")];
-        assert_eq!(build_turn_focus_directive(&msgs, false), None);
+    fn vuoto_se_il_task_del_turno_non_e_fissato() {
+        assert_eq!(
+            build_turn_focus_directive(&AgentState::default(), false),
+            None
+        );
     }
 
     #[test]
     fn vuoto_se_solo_blocchi_di_sistema() {
         // Dopo la rimozione dei blocchi di sistema resta solo whitespace -> None.
-        let msgs = vec![human("<allegati_sessione>foo.txt</allegati_sessione>")];
-        assert_eq!(build_turn_focus_directive(&msgs, false), None);
+        let st = stato_con_task("<allegati_sessione>foo.txt</allegati_sessione>");
+        assert_eq!(build_turn_focus_directive(&st, false), None);
     }
 
     #[test]
-    fn estrae_ultimo_human() {
-        let msgs = vec![
+    fn estrae_il_task_del_turno_non_l_ultimo_messaggio() {
+        // La cronologia contiene, in coda, cio' che il motore agentico vi mette:
+        // il risultato di un tool e un promemoria di sistema. Nessuno dei due e'
+        // la richiesta dell'utente, e il focus non deve nominarli.
+        let mut st = stato_con_task("crea index.html");
+        st.messages = vec![
             human("vecchia richiesta su bookingService.ts"),
-            ai("ho lavorato sul booking"),
-            human("crea index.html"),
+            Message::Ai {
+                content: MessageContent::text("ho lavorato sul booking"),
+                tool_calls: vec![],
+                reasoning: None,
+                thinking_signature: None,
+            },
+            Message::Human {
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "t1".to_string(),
+                        content: Value::String("contenuto del file letto".to_string()),
+                        is_error: false,
+                        exit_code: None,
+                    },
+                    ContentBlock::Text {
+                        text: "<system-reminder>\nCHECKLIST: 1) fai X\n</system-reminder>"
+                            .to_string(),
+                    },
+                ]),
+            },
+            human("Prosegui con l'analisi richiesta."),
         ];
-        let out = build_turn_focus_directive(&msgs, false).expect("directive");
+        let out = build_turn_focus_directive(&st, false).expect("directive");
         assert!(out.starts_with("### FOCUS DEL TURNO CORRENTE ###"));
         assert!(out.contains("\"crea index.html\""));
-        // NON deve agganciare la richiesta vecchia.
+        assert!(!out.contains("system-reminder"), "focus contaminato: {out}");
+        assert!(!out.contains("CHECKLIST"), "focus contaminato: {out}");
+        assert!(!out.contains("contenuto del file letto"));
         assert!(!out.contains("bookingService"));
+        assert!(!out.contains("Prosegui con l'analisi"));
     }
 
     #[test]
     fn rimuove_blocco_allegati_sessione() {
-        let msgs = vec![human(
+        let st = stato_con_task(
             "<allegati_sessione>\nPL.make\n</allegati_sessione>quante tabelle nel db?",
-        )];
-        let out = build_turn_focus_directive(&msgs, false).expect("directive");
+        );
+        let out = build_turn_focus_directive(&st, false).expect("directive");
         assert!(out.contains("\"quante tabelle nel db?\""));
         assert!(!out.contains("PL.make"));
     }
@@ -209,8 +250,8 @@ mod tests {
     #[test]
     fn troncamento_oltre_600_char() {
         let lunga = "x".repeat(700);
-        let msgs = vec![human(&lunga)];
-        let out = build_turn_focus_directive(&msgs, false).expect("directive");
+        let st = stato_con_task(&lunga);
+        let out = build_turn_focus_directive(&st, false).expect("directive");
         // 600 char + suffisso " [...]" dentro le virgolette.
         let attesa = format!("\"{} [...]\"", "x".repeat(600));
         assert!(out.contains(&attesa));
@@ -218,132 +259,15 @@ mod tests {
 
     #[test]
     fn new_topic_aggiunge_riga() {
-        let msgs = vec![human("nuovo task")];
-        let con = build_turn_focus_directive(&msgs, true).expect("directive");
-        let senza = build_turn_focus_directive(&msgs, false).expect("directive");
+        let st = stato_con_task("nuovo task");
+        let con = build_turn_focus_directive(&st, true).expect("directive");
+        let senza = build_turn_focus_directive(&st, false).expect("directive");
         assert!(con.contains("rilevato un cambio di argomento"));
         assert!(!senza.contains("rilevato un cambio di argomento"));
     }
 
     #[test]
-    fn blocchi_text_concatenati() {
-        // Contenuto a blocchi: flatten_text concatena i Text con spazio.
-        let msgs = vec![Message::Human {
-            content: MessageContent::Blocks(vec![
-                ContentBlock::Text {
-                    text: "prima parte".to_string(),
-                },
-                ContentBlock::ToolResult {
-                    tool_use_id: "t1".to_string(),
-                    content: Value::Null,
-                    is_error: false,
-                    exit_code: None,
-                },
-                ContentBlock::Text {
-                    text: "seconda parte".to_string(),
-                },
-            ]),
-        }];
-        let out = build_turn_focus_directive(&msgs, false).expect("directive");
-        assert!(out.contains("\"prima parte seconda parte\""));
-    }
-
-    #[test]
     fn marker_costante() {
         assert_eq!(TURN_FOCUS_MARKER, "[[NEXUS_TURN_FOCUS]]");
-    }
-}
-
-#[cfg(test)]
-mod golden {
-    //! Golden-test di PARITA' 1:1 vs Python per `build_turn_focus_directive`.
-    //!
-    //! Lo script `scripts/gen_golden_turn_focus.py` importa la funzione REALE dal
-    //! brain (`brain.agents.nodes.helpers.build_turn_focus_directive`), la esercita
-    //! su N casi rappresentativi e salva `{case_id, messages, new_topic, output}`
-    //! in `/tmp/golden_turn_focus.json`. Qui ricostruiamo l'input come `Message`,
-    //! chiamiamo la funzione Rust e verifichiamo `output == golden Python`.
-    //!
-    //! Il test e' `#[ignore]` perche' dipende dal file generato. Comando:
-    //!   python3 crates/nexus-agent-graph/scripts/gen_golden_turn_focus.py
-    //!   cargo test -p nexus-agent-graph --lib golden_turn_focus_parita -- --ignored
-    //!
-    //! Nota di parita': i casi golden usano SOLO contenuti `Text` (stringa) sui
-    //! messaggi umani, dove la forma Python (`m.content`) e la forma Rust
-    //! (`flatten_text`) coincidono byte-per-byte. La forma `str(content)` Python
-    //! sui contenuti a blocchi NON e' riproducibile 1:1 ed e' fuori contratto per
-    //! l'utente (vedi doc della funzione), quindi NON e' confrontata col golden;
-    //! e' coperta dal test unitario `blocchi_text_concatenati`.
-
-    use super::build_turn_focus_directive;
-    use crate::state::{Message, MessageContent};
-    use serde::Deserialize;
-
-    /// Un messaggio dell'input golden: ruolo + testo (solo `Text`).
-    #[derive(Debug, Deserialize)]
-    struct GoldenMsg {
-        role: String,
-        text: String,
-    }
-
-    /// Un caso golden: id + history + new_topic + output atteso (`null` == None).
-    #[derive(Debug, Deserialize)]
-    struct GoldenCase {
-        case_id: String,
-        messages: Vec<GoldenMsg>,
-        #[serde(default)]
-        new_topic: bool,
-        output: Option<String>,
-    }
-
-    fn to_messages(raw: &[GoldenMsg]) -> Vec<Message> {
-        raw.iter()
-            .map(|m| {
-                let content = MessageContent::text(m.text.clone());
-                match m.role.as_str() {
-                    "user" | "human" => Message::Human { content },
-                    "assistant" | "ai" => Message::Ai {
-                        content,
-                        tool_calls: vec![],
-                        reasoning: None,
-                        thinking_signature: None,
-                    },
-                    "tool" => Message::Tool {
-                        tool_call_id: "golden".to_string(),
-                        content,
-                    },
-                    other => panic!("ruolo golden sconosciuto: {other}"),
-                }
-            })
-            .collect()
-    }
-
-    #[test]
-    #[ignore = "richiede /tmp/golden_turn_focus.json generato da gen_golden_turn_focus.py"]
-    fn golden_turn_focus_parita() {
-        let Some(raw) =
-            crate::golden_util::load_golden("golden_turn_focus.json", "gen_golden_turn_focus.py")
-        else {
-            return;
-        };
-        let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
-        assert!(
-            cases.len() >= 15,
-            "attesi >=15 casi golden, trovati {}",
-            cases.len()
-        );
-
-        let mut checked = 0usize;
-        for c in &cases {
-            let msgs = to_messages(&c.messages);
-            let got = build_turn_focus_directive(&msgs, c.new_topic);
-            assert_eq!(
-                got, c.output,
-                "PARITA' FALLITA caso {} (new_topic={}):\n  rust   = {:?}\n  python = {:?}",
-                c.case_id, c.new_topic, got, c.output
-            );
-            checked += 1;
-        }
-        println!("golden turn_focus: {checked} casi verificati, tutti verdi");
     }
 }

@@ -13,9 +13,10 @@ use nexus_graph::StateDelta as OpaqueDelta;
 use serde_json::json;
 
 use crate::decisions::supervisor::{
-    build_anomaly_block, build_steps_summary, detect_anomalies, extract_original_task,
-    supervisor_cache_key, SupervisorConfig, SupervisorDecision,
+    build_anomaly_block, build_steps_summary, detect_anomalies, supervisor_cache_key,
+    SupervisorConfig, SupervisorDecision,
 };
+use crate::decisions::turn_task::extract_original_task;
 use crate::runtime::ports::{MetaReasonerPort, SupervisorContext};
 use crate::runtime::AgentNodeCtx;
 use crate::state::{

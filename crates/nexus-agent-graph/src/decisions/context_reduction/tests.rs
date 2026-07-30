@@ -351,13 +351,18 @@ fn lang_reminder_idempotente() {
 #[test]
 fn turn_focus_idempotente_col_marker() {
     let msgs = vec![human_text("crea index.html")];
-    let directive = build_turn_focus_directive(
-        &[crate::state::Message::Human {
-            content: crate::state::MessageContent::text("crea index.html"),
-        }],
-        false,
-    )
-    .expect("directive");
+    // Il focus si costruisce dal task del turno fissato nello stato, non dai
+    // messaggi (vedi `decisions::turn_task`).
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        crate::decisions::turn_task::ORIGINAL_TASK_KEY.to_string(),
+        serde_json::Value::String("crea index.html".to_string()),
+    );
+    let state = crate::state::AgentState {
+        extra,
+        ..Default::default()
+    };
+    let directive = build_turn_focus_directive(&state, false).expect("directive");
     let s1 = inject_turn_focus("SYS", &directive);
     // La directive sta DOPO la parte stabile: e' ricalcolata a ogni turno, e in
     // testa spostava i primi caratteri del system a ogni chiamata (vedi
