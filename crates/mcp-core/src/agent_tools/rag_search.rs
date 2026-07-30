@@ -10,6 +10,15 @@ use uuid::Uuid;
 use crate::rag::{self, SourceKind};
 
 use super::AgentToolContext;
+use nexus_types::tool_outcome::tool_failure;
+
+/// Costruisce l'esito FALLITO del tool: marker + payload JSON (contratto
+/// `nexus_types::tool_outcome`). Senza il marker in testa questi fallimenti
+/// erano indistinguibili da una ricerca riuscita per anti-loop/supervisore/
+/// final_gate, che leggono solo `is_tool_failure`.
+fn search_failure(payload: Value) -> String {
+    tool_failure(payload.to_string())
+}
 
 pub async fn tool_nexus_search_semantic(ctx: &AgentToolContext, input: &Value) -> String {
     let query = input
@@ -19,7 +28,7 @@ pub async fn tool_nexus_search_semantic(ctx: &AgentToolContext, input: &Value) -
         .trim()
         .to_string();
     if query.is_empty() {
-        return json!({"error": "campo 'query' obbligatorio"}).to_string();
+        return search_failure(json!({"error": "campo 'query' obbligatorio"}));
     }
     let top_k = input
         .get("top_k")
@@ -67,7 +76,26 @@ pub async fn tool_nexus_search_semantic(ctx: &AgentToolContext, input: &Value) -
         .to_string(),
         Err(e) => {
             tracing::warn!("nexus_search_semantic: {}", e);
-            json!({"error": format!("rag search fallita: {e}"), "hits": []}).to_string()
+            search_failure(json!({"error": format!("rag search fallita: {e}"), "hits": []}))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_failure_dichiara_il_fallimento_e_preserva_il_payload() {
+        // Chiama il PRODUTTORE reale usato dai 2 rami di errore del tool
+        // (query mancante, ricerca semantica fallita).
+        let out = search_failure(json!({"error": "rag search fallita: qdrant down", "hits": []}));
+        assert!(nexus_types::tool_outcome::is_tool_failure(&out));
+        let after_marker = out
+            .trim_start_matches(nexus_types::tool_outcome::TOOL_FAILURE_MARKER)
+            .trim_start();
+        let parsed: Value =
+            serde_json::from_str(after_marker).expect("payload dopo il marker e' JSON valido");
+        assert_eq!(parsed["error"], "rag search fallita: qdrant down");
     }
 }

@@ -36,6 +36,7 @@ use super::attachment_inspector::{detect_kind, load_attachment, read_header, Att
 use super::AgentToolContext;
 use crate::projects::resolve_workspace_target;
 use crate::settings;
+use nexus_types::tool_outcome::tool_failure;
 
 // ── Default safe (usati solo se il setting manca o non e' parsabile; il DB e'
 //    la fonte di verita', mig 0214). Documentati, non "magic fallback". ──────
@@ -140,13 +141,15 @@ pub(super) async fn tool_nexus_visual_compare(ctx: &AgentToolContext, input: &Va
     let shot = match capture_screenshot(&ctx.root_path, &url, &cfg).await {
         Ok(bytes) => bytes,
         Err(e) => {
-            return json!({
-                "error": format!("cattura screenshot fallita: {e}"),
-                "hint": "Verifica che il dev server sia avviato e raggiungibile all'url indicato, \
-                         e che Playwright sia installato nel progetto (npx playwright install chromium). \
-                         Non insistere in loop: risolvi la causa o procedi senza la verifica visiva.",
-            })
-            .to_string();
+            return tool_failure(
+                json!({
+                    "error": format!("cattura screenshot fallita: {e}"),
+                    "hint": "Verifica che il dev server sia avviato e raggiungibile all'url indicato, \
+                             e che Playwright sia installato nel progetto (npx playwright install chromium). \
+                             Non insistere in loop: risolvi la causa o procedi senza la verifica visiva.",
+                })
+                .to_string(),
+            );
         }
     };
 
@@ -184,15 +187,17 @@ pub(super) async fn tool_nexus_visual_compare(ctx: &AgentToolContext, input: &Va
             "parse_error": v.parse_error,
         })
         .to_string(),
-        Err(e) => json!({
-            "error": format!("confronto vision fallito: {e}"),
-            "screenshot_path": screenshot_path,
-            "reference_source": reference.source,
-            "hint": "Lo screenshot e' stato salvato. La vision non e' disponibile o non e' \
-                     configurata (nexus_purpose_model.visual_compare, mig 0214). Non insistere \
-                     in loop: segnala il problema e procedi.",
-        })
-        .to_string(),
+        Err(e) => tool_failure(
+            json!({
+                "error": format!("confronto vision fallito: {e}"),
+                "screenshot_path": screenshot_path,
+                "reference_source": reference.source,
+                "hint": "Lo screenshot e' stato salvato. La vision non e' disponibile o non e' \
+                         configurata (nexus_purpose_model.visual_compare, mig 0214). Non insistere \
+                         in loop: segnala il problema e procedi.",
+            })
+            .to_string(),
+        ),
     }
 }
 
@@ -204,8 +209,12 @@ struct ReferenceImage {
     source: String,
 }
 
+/// Costruisce l'esito FALLITO del tool: marker + payload JSON (contratto
+/// `nexus_types::tool_outcome`). Senza il marker in testa questi fallimenti
+/// erano indistinguibili da un report riuscito per anti-loop/supervisore/
+/// final_gate, che leggono solo `is_tool_failure`.
 fn err(msg: &str) -> String {
-    json!({ "error": msg }).to_string()
+    tool_failure(json!({ "error": msg }).to_string())
 }
 
 /// Carica i parametri dal DB con default safe documentati.
@@ -608,6 +617,16 @@ mod tests {
             zw.finish().unwrap();
         }
         buf
+    }
+
+    #[test]
+    fn err_dichiara_il_fallimento_e_preserva_il_messaggio() {
+        // Chiama il PRODUTTORE reale usato da tutti i rami di errore semplici
+        // del tool (url mancante, permesso di scrittura assente, reference
+        // inutilizzabile, salvataggio screenshot fallito).
+        let out = err("motivo del fallimento");
+        assert!(nexus_types::tool_outcome::is_tool_failure(&out));
+        assert!(out.contains("motivo del fallimento"));
     }
 
     #[test]

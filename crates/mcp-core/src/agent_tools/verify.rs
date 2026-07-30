@@ -18,6 +18,16 @@
 use super::*;
 
 use crate::verify_profile::VerifyProfileStep;
+use nexus_types::tool_outcome::tool_failure;
+
+/// Costruisce l'esito FALLITO del tool: marker + payload JSON (contratto
+/// `nexus_types::tool_outcome`), condiviso dai rami di errore qui sotto
+/// (kill-switch disattivo, profilo assente, scope invalido). Senza il marker
+/// in testa questi fallimenti erano indistinguibili da un report riuscito per
+/// anti-loop/supervisore/final_gate (leggono solo `is_tool_failure`).
+fn verify_failure(payload: Value) -> String {
+    tool_failure(payload.to_string())
+}
 
 /// Comando risolto per uno step, con la provenienza (per il report).
 struct ResolvedCmd {
@@ -80,11 +90,10 @@ pub(super) async fn tool_nexus_verify_change(ctx: &AgentToolContext, input: &Val
         })
         .unwrap_or(false);
     if !enabled {
-        return serde_json::json!({
+        return verify_failure(serde_json::json!({
             "error": "verify_disabled",
             "detail": "agent.verify.enabled non attivo: catena di verifica disabilitata dall'admin."
-        })
-        .to_string();
+        }));
     }
 
     let scope = input
@@ -102,11 +111,10 @@ pub(super) async fn tool_nexus_verify_change(ctx: &AgentToolContext, input: &Val
     if profile.is_empty() {
         // NESSUN comando generico di ripiego (decisione utente): esito
         // strutturato onesto, il chiamante sa che la verifica non e' partita.
-        return serde_json::json!({
+        return verify_failure(serde_json::json!({
             "error": "profile_unavailable",
             "detail": "Profilo di verifica dell'ambiente non disponibile: inferenza LLM non riuscita e nessun profilo salvato. Riprova quando il modello e' raggiungibile, oppure definisci run_configurations con role di verifica.",
-        })
-        .to_string();
+        }));
     }
     let available: Vec<&str> = profile.iter().map(|s| s.step.as_str()).collect();
     let steps: Vec<&VerifyProfileStep> = match scope.as_str() {
@@ -117,14 +125,13 @@ pub(super) async fn tool_nexus_verify_change(ctx: &AgentToolContext, input: &Val
         name => {
             let hit: Vec<&VerifyProfileStep> = profile.iter().filter(|s| s.step == name).collect();
             if hit.is_empty() {
-                return serde_json::json!({
+                return verify_failure(serde_json::json!({
                     "error": "invalid_scope",
                     "detail": format!(
                         "scope '{name}' non presente nel profilo: usa quick|full oppure uno step del profilo"
                     ),
                     "available_steps": available,
-                })
-                .to_string();
+                }));
             }
             hit
         }
@@ -244,6 +251,25 @@ pub(super) async fn tool_nexus_verify_change(ctx: &AgentToolContext, input: &Val
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_failure_dichiara_il_fallimento_e_preserva_il_payload() {
+        // Chiama il PRODUTTORE reale usato dai 3 rami di errore del tool: se
+        // domani uno di quei rami smettesse di passare da qui, resterebbe
+        // invisibile ad anti-loop/supervisore/final_gate (regola M).
+        let out = verify_failure(serde_json::json!({
+            "error": "profile_unavailable",
+            "detail": "profilo assente",
+        }));
+        assert!(nexus_types::tool_outcome::is_tool_failure(&out));
+        // Il payload resta leggibile (per l'umano/il modello) dopo il marker.
+        let after_marker = out
+            .trim_start_matches(nexus_types::tool_outcome::TOOL_FAILURE_MARKER)
+            .trim_start();
+        let parsed: Value =
+            serde_json::from_str(after_marker).expect("payload dopo il marker e' JSON valido");
+        assert_eq!(parsed["error"], "profile_unavailable");
+    }
 
     #[test]
     fn excerpt_preserva_testa_e_coda() {

@@ -27,14 +27,25 @@ use crate::project_db::exec::{
     self, archive_ddl, execute_query, open_pool, outcome_to_json, resolve_project_conn,
     QueryExecError,
 };
+use nexus_types::tool_outcome::tool_failure;
+
+/// Costruisce l'esito FALLITO di uno dei tool `nexus_db_*`: marker + payload
+/// JSON (contratto `nexus_types::tool_outcome`), qualunque sia la forma del
+/// payload. Senza il marker in testa questi fallimenti erano indistinguibili
+/// da un risultato riuscito per anti-loop/supervisore/final_gate, che leggono
+/// solo `is_tool_failure`.
+fn db_tool_failure(payload: Value) -> String {
+    tool_failure(payload.to_string())
+}
 
 /// Tool `nexus_db_query`. Thin wrapper sopra `crate::project_db::exec::execute_query`.
 pub(super) async fn tool_nexus_db_query(ctx: &AgentToolContext, input: &Value) -> String {
     let sql = match input.get("sql").and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => {
-            return json!({"error": "Parametro 'sql' obbligatorio (stringa non vuota)."})
-                .to_string();
+            return db_tool_failure(
+                json!({"error": "Parametro 'sql' obbligatorio (stringa non vuota)."}),
+            );
         }
     };
 
@@ -49,7 +60,7 @@ pub(super) async fn tool_nexus_db_query(ctx: &AgentToolContext, input: &Value) -
     )
     .await
     {
-        return json!({ "error": msg }).to_string();
+        return db_tool_failure(json!({ "error": msg }));
     }
 
     let params: Vec<Option<String>> = match input.get("params") {
@@ -75,7 +86,7 @@ pub(super) async fn tool_nexus_db_query(ctx: &AgentToolContext, input: &Value) -
         )
         .await
         {
-            return json!({ "error": msg }).to_string();
+            return db_tool_failure(json!({ "error": msg }));
         }
     }
 
@@ -106,11 +117,10 @@ pub(super) async fn tool_nexus_db_query(ctx: &AgentToolContext, input: &Value) -
                 entry = entry.with_actor_session(s);
             }
             crate::security::record_audit(entry);
-            return json!({
+            return db_tool_failure(json!({
                 "error": format!("Query rifiutata dalla governance DB: {reason}"),
                 "blocked": true,
-            })
-            .to_string();
+            }));
         }
     }
 
@@ -161,13 +171,12 @@ pub(super) async fn tool_nexus_db_query(ctx: &AgentToolContext, input: &Value) -
             payload.to_string()
         }
         Err(e) => match e {
-            QueryExecError::ConnectionError(m) => json!({"error": m}).to_string(),
-            QueryExecError::Timeout => json!({"error": e.message()}).to_string(),
-            QueryExecError::Sql(_) => json!({
+            QueryExecError::ConnectionError(m) => db_tool_failure(json!({"error": m})),
+            QueryExecError::Timeout => db_tool_failure(json!({"error": e.message()})),
+            QueryExecError::Sql(_) => db_tool_failure(json!({
                 "error": e.message(),
                 "sql_excerpt": sql.chars().take(200).collect::<String>(),
-            })
-            .to_string(),
+            })),
         },
     }
 }
@@ -198,7 +207,7 @@ async fn resolve_schema_and_pool(
 pub(super) async fn tool_nexus_db_tables(ctx: &AgentToolContext, input: &Value) -> String {
     let (schema, pool) = match resolve_schema_and_pool(ctx, input).await {
         Ok(v) => v,
-        Err(e) => return json!({"error": e}).to_string(),
+        Err(e) => return db_tool_failure(json!({"error": e})),
     };
 
     let rows = sqlx::query(
@@ -213,21 +222,23 @@ pub(super) async fn tool_nexus_db_tables(ctx: &AgentToolContext, input: &Value) 
     .fetch_all(&pool)
     .await;
 
-    let result = match rows {
-        Ok(r) => {
-            let tables: Vec<Value> = r
-                .iter()
-                .map(|row| {
-                    json!({
-                        "name": row.try_get::<String, _>("table_name").unwrap_or_default(),
-                        "estimated_rows": row.try_get::<i64, _>("est_rows").unwrap_or(0),
-                    })
-                })
-                .collect();
-            json!({"ok": true, "schema": schema, "table_count": tables.len(), "tables": tables})
+    let tables_result = match rows {
+        Ok(r) => r,
+        Err(e) => {
+            pool.close().await;
+            return db_tool_failure(json!({"error": format!("errore listing tabelle: {e}")}));
         }
-        Err(e) => json!({"error": format!("errore listing tabelle: {e}")}),
     };
+    let tables: Vec<Value> = tables_result
+        .iter()
+        .map(|row| {
+            json!({
+                "name": row.try_get::<String, _>("table_name").unwrap_or_default(),
+                "estimated_rows": row.try_get::<i64, _>("est_rows").unwrap_or(0),
+            })
+        })
+        .collect();
+    let result = json!({"ok": true, "schema": schema, "table_count": tables.len(), "tables": tables});
     pool.close().await;
     result.to_string()
 }
@@ -236,11 +247,11 @@ pub(super) async fn tool_nexus_db_tables(ctx: &AgentToolContext, input: &Value) 
 pub(super) async fn tool_nexus_db_describe(ctx: &AgentToolContext, input: &Value) -> String {
     let table = match input.get("table").and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => return json!({"error": "Parametro 'table' obbligatorio."}).to_string(),
+        _ => return db_tool_failure(json!({"error": "Parametro 'table' obbligatorio."})),
     };
     let (schema, pool) = match resolve_schema_and_pool(ctx, input).await {
         Ok(v) => v,
-        Err(e) => return json!({"error": e}).to_string(),
+        Err(e) => return db_tool_failure(json!({"error": e})),
     };
 
     let col_rows = sqlx::query(
@@ -270,17 +281,16 @@ pub(super) async fn tool_nexus_db_describe(ctx: &AgentToolContext, input: &Value
             .collect(),
         Err(e) => {
             pool.close().await;
-            return json!({"error": format!("errore descrizione colonne: {e}")}).to_string();
+            return db_tool_failure(json!({"error": format!("errore descrizione colonne: {e}")}));
         }
     };
 
     if columns.is_empty() {
         pool.close().await;
-        return json!({
+        return db_tool_failure(json!({
             "error": format!("Tabella '{schema}.{table}' non trovata o senza colonne."),
             "hint": "Usa nexus_db_tables per vedere le tabelle disponibili."
-        })
-        .to_string();
+        }));
     }
 
     let idx_rows = sqlx::query(
@@ -320,4 +330,32 @@ pub(super) async fn tool_nexus_db_describe(ctx: &AgentToolContext, input: &Value
         }
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn db_tool_failure_dichiara_il_fallimento_e_preserva_il_payload() {
+        // Chiama il PRODUTTORE reale usato da tutti i rami di errore dei 3
+        // tool `nexus_db_*`: senza il marker in testa questi fallimenti erano
+        // indistinguibili da un risultato riuscito per anti-loop/supervisore/
+        // final_gate (regola M).
+        let out = db_tool_failure(json!({
+            "error": "sql fallita",
+            "sql_excerpt": "SELECT 1",
+        }));
+        assert!(nexus_types::tool_outcome::is_tool_failure(&out));
+        assert!(out.contains("sql fallita"));
+        assert!(out.contains("sql_excerpt"));
+        // Il payload resta JSON valido dopo il marker: chi vuole ri-estrarlo
+        // strutturalmente puo' farlo togliendo il solo prefisso.
+        let after_marker = out
+            .trim_start_matches(nexus_types::tool_outcome::TOOL_FAILURE_MARKER)
+            .trim_start();
+        let parsed: Value =
+            serde_json::from_str(after_marker).expect("payload dopo il marker e' JSON valido");
+        assert_eq!(parsed["error"], "sql fallita");
+    }
 }
