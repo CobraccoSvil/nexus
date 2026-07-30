@@ -500,6 +500,67 @@ riscrive la query, se il gate risolve il path da solo — non stai misurando il
 sistema. Un PR che aggiunge un test che fabbrica un input gia' prodotto altrove e'
 rifiutato come una toppa (regola H).
 
+## P. Il lavoro non committato di un worktree non esiste per nessuna query
+
+Il working tree e' l'unico posto del repo senza rete di sicurezza: non e' in
+`git log --all`, non e' un branch, non e' una PR, e non ha reflog. Rimuovere il
+worktree lo DISTRUGGE. Misurato il 29-30/07/2026: su tredici sessioni CCD
+completate, SETTE si sono fermate col lavoro solo nel worktree (fino a 26 file, un
+modulo nuovo e due punti unici nuovi fra questi).
+
+### Le cause, misurate sui transcript (non assunte)
+
+Sono tre, e vogliono rimedi diversi. L'ipotesi piu' ovvia — il pre-commit ucciso
+per esaurimento di memoria — non e' fra loro: `Killed` compare in **una** sessione
+su tredici, e non e' una di quelle rimaste appese.
+
+| causa | quante | come si riconosce |
+|---|---|---|
+| il commit non e' nel modello di "finito" | 3 | chiude con "Non ho committato — dimmi tu" / "non me l'hai chiesto". La frase compare in 19 sessioni sul totale storico: e' la modalita' prevalente, non un incidente |
+| il turno finisce prima del commit | 2 | ultimo evento a meta' di un gate. Il pre-commit fa `cargo check --workspace` con `CARGO_INCREMENTAL=0`: in un worktree a target freddo e' un cold build dell'intero workspace, piu' lungo del turno. Una sessione chiude con "In attesa del completamento del commit" — il commit era nel futuro, non dimenticato |
+| blocco reale sull'infrastruttura | 1 | tenta, trova un difetto vero (lefthook risolve la propria root dal percorso del binario in `D:\IDEAI\node_modules`, quindi esegue i gate con CWD `D:\IDEAI` e materializza lo staged del worktree nel repo principale) e si ferma a chiedere. Comportamento corretto: NON forzare `--no-verify` |
+
+Solo la prima e' un difetto dell'agente. La seconda e' un costo, la terza e' un bug
+dell'ambiente: chiedere "committa" piu' forte non tocca nessuna delle due.
+
+### Il presidio
+
+`scripts/worktree-wip.ps1` — `-Report` (censimento, exit 1 se c'e' lavoro non
+salvato), `-Save`, `-List`, `-Restore`. Test end-to-end incluso il caso distruttivo:
+`scripts/worktree-wip-selftest.sh`.
+
+- **Mettere al sicuro non e' dichiarare pronto.** I salvataggi stanno in
+  `refs/wip/<worktree>`, FUORI da `refs/heads`: non mergeabili per sbaglio, assenti
+  da `git branch`, esclusi da `git push --all`. Uno dei recuperi del 30/07 non
+  compilava: un commit automatico su un branch l'avrebbe presentato come finito.
+- **Funziona quando il commit non puo' funzionare.** Plumbing (`write-tree`,
+  `commit-tree`, `update-ref`, come `crates/mcp-core/src/session_autocommit.rs` fa
+  per i progetti utente): nessun hook, quindi nessun gate rosso, cold build o
+  lefthook rotto lo blocca.
+- **Non dipende dalla sessione.** Tutte e sette avevano l'istruzione nel prompt: un
+  rimedio che richieda alla sessione di ricordarsi qualcosa non copre il caso
+  osservato. `-Save` e' idempotente sul contenuto, quindi si registra come attivita'
+  periodica (comando in testa allo script).
+- **Fuori portata del repo:** rifiutare l'archiviazione di un worktree sporco.
+  Rimuoverlo e' azione di CCD, non passa da git: nessun hook in cui interporsi.
+
+### Recuperare a mano: due forme sbagliate
+
+Misurato dal selftest, su un worktree con modifica in staging, modifica non in
+staging, file nuovo e file cancellato:
+
+- `git diff > patch` confronta il working tree con l'**indice**: perde tutto cio'
+  che la sessione aveva messo in staging. E' l'errore del 30/07 su
+  `interesting-wozniak` — patch di 25 file applicata pulita, e mancava un terzo del
+  lavoro (un modulo nuovo e sei file di un altro crate). Se ne e' accorto solo
+  `cargo check`, con "file not found for module".
+- `git diff HEAD > patch` recupera lo staging ma perde ancora i file **non
+  tracciati**: un diff non li vede. Il 30/07 non si e' visto solo perche' quel
+  modulo era in staging.
+
+Non esiste una forma di `git diff` che li copra tutti: usare `-Save` + `-Restore`,
+che parte dall'indice reale e fa `add -A`.
+
 ## Esecuzione locale canonica
 
 - Ambiente di sviluppo locale: **Windows nativo**, repo Git in `D:\IDEAI`. Shell:
@@ -521,5 +582,6 @@ rifiutato come una toppa (regola H).
 - `docs/tech-debt-ts.md` — backlog `any`/strict
 - `docs/tech-debt-dup.md` — metrica duplicazione e baseline ratchet (regola L)
 - `docs/tech-debt-markers.md` — marker di debito e frasi di inerzia, gate ratchet (regola O)
+- `scripts/worktree-wip.ps1` — censimento e messa in sicurezza del lavoro non committato dei worktree (regola P)
 - `docs/.nexus-vault/adr/0026-punto-unico-de-duplicazione.md` — catalogo punti unici + meccanismo
 - `config/policies/` — profili cloud/onprem/hybrid (contratto gateway LLM)
