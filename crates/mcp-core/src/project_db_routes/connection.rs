@@ -938,6 +938,53 @@ fn infer_engine_from_url(url: &str) -> String {
 /// Test postgres: pool monoconnessione, versione server e numero tabelle dello
 /// schema `public`. Un errore di connessione non e' un errore HTTP: viene
 /// riportato nel payload con `ok: false`.
+/// Classifica un fallimento di connessione Postgres da segnali STRUTTURATI —
+/// SQLSTATE (`DatabaseError::code`) e `std::io::ErrorKind` — mai dal testo del
+/// messaggio (regola M).
+///
+/// Il `Display` di `sqlx::Error::Database` e' fisso: `"error returned from
+/// database: {message del server}"` (sqlx-core 0.8.6, error.rs). Quel prefisso
+/// contiene SEMPRE la parola "database", quindi qualunque classificazione
+/// testuale a valle che cerchi "does not exist" insieme a "database" scambia
+/// un ruolo/tabella/estensione inesistente (qualunque `does not exist` del
+/// server) per un database inesistente — verificato sul sorgente sqlx, non
+/// assunto (regola O). Lo SQLSTATE non compare mai nel Display: e' raggiungibile
+/// solo via `.code()`.
+fn classify_pg_connection_error(e: &sqlx::Error) -> &'static str {
+    match e {
+        sqlx::Error::Database(db_err) => match db_err.code().as_deref() {
+            // 3D000 invalid_catalog_name: il database indicato non esiste.
+            Some("3D000") => "no_database",
+            // Classe 28 (invalid_authorization_specification / invalid_password):
+            // Postgres restituisce indifferentemente 28000 o 28P01 per ruolo
+            // inesistente o password errata (non distingue i due casi per non
+            // rivelare se il ruolo esiste).
+            Some(code) if code.starts_with("28") => "auth_failed",
+            // Classe 08 (connection_exception): il server ha accettato il TCP
+            // ma ha rifiutato/chiuso la sessione applicativa.
+            Some(code) if code.starts_with("08") => "unreachable",
+            _ => "unknown",
+        },
+        // La richiesta non e' mai arrivata a un server Postgres: nessuno SQLSTATE
+        // possibile, il segnale e' il kind del socket.
+        sqlx::Error::Io(io_err) => match io_err.kind() {
+            std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::TimedOut => "unreachable",
+            _ => "unknown",
+        },
+        // Pool che non riesce ad aprire la prima connessione entro il timeout:
+        // stesso esito pratico di un socket che non risponde.
+        sqlx::Error::PoolTimedOut => "unreachable",
+        sqlx::Error::Tls(_) => "unreachable",
+        _ => "unknown",
+    }
+}
+
 async fn test_postgres_engine(url: &str, started: std::time::Instant) -> ApiResult {
     // Converte stringhe ADO.NET (Host=...;Port=...) in URL postgres://...
     let pg_url = normalize_pg_connection_string(url);
@@ -964,11 +1011,15 @@ async fn test_postgres_engine(url: &str, started: std::time::Instant) -> ApiResu
                 "latency_ms": started.elapsed().as_millis() as u64,
             })))
         }
-        Err(e) => Ok(Json(json!({
-            "ok": false,
-            "engine": "postgres",
-            "error": e.to_string(),
-        }))),
+        Err(e) => {
+            let category = classify_pg_connection_error(&e);
+            Ok(Json(json!({
+                "ok": false,
+                "engine": "postgres",
+                "error": e.to_string(),
+                "category": category,
+            })))
+        }
     }
 }
 
@@ -1329,5 +1380,127 @@ services:
     image: redis:7
 "#;
         assert!(extract_compose_connection_string(compose).is_none());
+    }
+}
+
+#[cfg(test)]
+mod classify_pg_connection_error_tests {
+    use super::classify_pg_connection_error;
+
+    /// Mock del trait `sqlx::error::DatabaseError`: `PgDatabaseError` non e'
+    /// costruibile fuori da `sqlx-postgres` (campo interno privato), quindi il
+    /// test attraversa lo stesso trait object del produttore reale
+    /// (`Box<dyn DatabaseError>`, regola O) senza dipendere da un server.
+    #[derive(Debug)]
+    struct MockDbError {
+        message: String,
+        code: Option<String>,
+    }
+
+    impl std::fmt::Display for MockDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for MockDbError {}
+
+    impl sqlx::error::DatabaseError for MockDbError {
+        fn message(&self) -> &str {
+            &self.message
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            self.code.as_deref().map(std::borrow::Cow::Borrowed)
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn db_error(code: &str, message: &str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(MockDbError {
+            message: message.to_string(),
+            code: Some(code.to_string()),
+        }))
+    }
+
+    #[test]
+    fn sqlstate_3d000_database_inesistente() {
+        // Messaggio reale: contiene "database" E "does not exist" nel
+        // prefisso sqlx ("error returned from database: ..."). Prima del fix
+        // il TS ci sarebbe arrivato comunque per caso; qui verifichiamo che il
+        // segnale primario (SQLSTATE) lo classifichi correttamente.
+        let e = db_error("3D000", "database \"nonexistent\" does not exist");
+        assert_eq!(classify_pg_connection_error(&e), "no_database");
+    }
+
+    #[test]
+    fn sqlstate_28000_ruolo_inesistente_e_auth_failed_non_no_database() {
+        // Questo e' il caso che il matching testuale sbagliava: il messaggio
+        // "role \"foo\" does not exist" contiene "does not exist", e il
+        // prefisso fisso di sqlx::Error::Database ("error returned from
+        // database: ...") contiene "database" — un matcher testuale che
+        // cerca does_not_exist+database lo classificherebbe "no_database".
+        // Il SQLSTATE dice la verita': e' un problema di autorizzazione.
+        let e = db_error("28000", "role \"foo\" does not exist");
+        assert_eq!(classify_pg_connection_error(&e), "auth_failed");
+    }
+
+    #[test]
+    fn sqlstate_28p01_password_errata_e_auth_failed() {
+        let e = db_error("28P01", "password authentication failed for user \"foo\"");
+        assert_eq!(classify_pg_connection_error(&e), "auth_failed");
+    }
+
+    #[test]
+    fn sqlstate_classe_08_e_unreachable() {
+        let e = db_error("08006", "connection failure");
+        assert_eq!(classify_pg_connection_error(&e), "unreachable");
+    }
+
+    #[test]
+    fn sqlstate_ignoto_e_unknown() {
+        let e = db_error("42P01", "relation \"foo\" does not exist");
+        assert_eq!(classify_pg_connection_error(&e), "unknown");
+    }
+
+    #[test]
+    fn io_connection_refused_e_unreachable() {
+        // Nessun server ha risposto: non esiste alcuno SQLSTATE, il segnale
+        // e' il socket. Il Display di reqwest/sqlx per un io::Error e' generico
+        // ("error communicating with database: ...") — stesso principio del
+        // fix in task_watchdog.rs per reqwest.
+        let io_err = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        let e = sqlx::Error::Io(io_err);
+        assert_eq!(classify_pg_connection_error(&e), "unreachable");
+    }
+
+    #[test]
+    fn io_timed_out_e_unreachable() {
+        let io_err = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        let e = sqlx::Error::Io(io_err);
+        assert_eq!(classify_pg_connection_error(&e), "unreachable");
+    }
+
+    #[test]
+    fn pool_timed_out_e_unreachable() {
+        assert_eq!(
+            classify_pg_connection_error(&sqlx::Error::PoolTimedOut),
+            "unreachable"
+        );
     }
 }

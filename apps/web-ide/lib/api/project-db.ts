@@ -247,6 +247,10 @@ export interface ProjectDbTestResult {
   latency_ms?: number;
   error?: string;
   hint?: string | null;
+  /** Classificazione strutturata del fallimento (solo motore postgres, da
+   *  SQLSTATE lato Rust — vedi classify_pg_connection_error). Assente per gli
+   *  altri motori: il frontend ricade su categorizeDbError. */
+  category?: "unreachable" | "no_database" | "auth_failed" | "tables_missing" | "unknown";
 }
 
 export async function testProjectDbConnection(
