@@ -31,7 +31,7 @@ pub use clarify_or_expand::{
     ClarifyConfig, ClarifyMode, ClarifyOrExpandNode, DecisionCategory, GateOutcome, LlmDecision,
 };
 pub use executor::{ExecutorConfig, ExecutorNode, ScaleConfig};
-pub use review_gate::{ReviewGateConfig, ReviewGateNode};
+pub use review_gate::{ReviewGateConfig, ReviewGateNode, REVIEW_GATE_ESCALATION_KEY};
 pub use final_gate::{
     build_error_files, count_build_errors, error_file_matches_touched, FinalGateConfig,
     FinalGateNode, FINAL_GATE_ESCALATION_KEY,

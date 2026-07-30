@@ -2964,6 +2964,100 @@ async fn final_gate_nonconvergence_senza_candidato_chiude() {
 }
 
 #[tokio::test]
+async fn rimando_review_a_vuoto_promuove_e_consuma_flag() {
+    // Rientro dal review_gate con REVIEW_GATE_ESCALATION_KEY in extra (rimando in
+    // correzione andato a vuoto: CorrectionProgress non-Effettivo): l'executor
+    // delega al PUNTO UNICO maybe_escalate_nonconvergence, come per il final_gate.
+    // E' il gap misurato su bacheca-attivita (run e8433555, claude-haiku): il ciclo
+    // di correzione non aveva NESSUN trigger di escalation e restava sul modello
+    // small fino al cap dei rimandi.
+    //
+    // MUTAZIONE: togliere la chiamata a gate_rimando_review_a_vuoto da
+    // gates_di_testa (reintroduce il bug) lascia sticky_model a None e questo
+    // test rosseggia.
+    let rc = Arc::new(StubRunControlStore::default());
+    let esc = Arc::new(StubEscalationPort::with_chain_tier(
+        &["claude-piu-capace"],
+        "heavy",
+    ));
+    let (n, meta, _s) = node_esc(cfg_resolved(), rc, esc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone());
+    let mut extra = serde_json::Map::new();
+    extra.insert(crate::nodes::REVIEW_GATE_ESCALATION_KEY.into(), json!(true));
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("crea x")],
+        stop_reason: Some(StopReason::ToolUse),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        extra,
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
+    assert_eq!(out.sticky_provider.as_deref(), Some("anthropic"));
+    assert_eq!(out.sticky_model.as_deref(), Some("claude-piu-capace"));
+    assert_eq!(
+        out.extra.get("auto_escalations").and_then(Value::as_i64),
+        Some(1)
+    );
+    // Flag CONSUMATO nel punto unico: il promosso non ri-scatta il ramo al rientro.
+    assert!(out
+        .extra
+        .get(crate::nodes::REVIEW_GATE_ESCALATION_KEY)
+        .is_none());
+    // Nessuna chiamata LLM: il self-loop rientra col promosso.
+    assert!(llm.seen.lock().unwrap().is_empty());
+    // Il motivo dichiarato e' il fatto del REVIEW gate, non quello del final_gate
+    // (regola M: il trigger dichiara cio' che e' stato misurato).
+    let steps = meta.meta_steps.lock().unwrap();
+    assert!(
+        steps.iter().any(|m| {
+            m.get("payload")
+                .and_then(|p| p.get("reason"))
+                .and_then(Value::as_str)
+                == Some("review_correction_stalled")
+        }),
+        "il meta-step di escalation deve portare reason=review_correction_stalled"
+    );
+}
+
+#[tokio::test]
+async fn rimando_review_a_vuoto_senza_candidato_prosegue() {
+    // Flag review presente ma catena di escalation VUOTA: a differenza del
+    // final_gate (che al cap ha esaurito i suoi tentativi e chiude), il rimando
+    // review ha ancora il suo backstop — il cap dei rimandi del review_gate — e
+    // il messaggio di contestazione e' gia' nei messaggi: il turno PROSEGUE col
+    // modello corrente (la chiamata LLM avviene), nessuna chiusura forzata.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc); // porta escalation vuota
+    let llm = Arc::new(StubLlmGateway::with_text("proseguo con la correzione"));
+    let ctx = ctx_with(llm.clone());
+    let mut extra = serde_json::Map::new();
+    extra.insert(crate::nodes::REVIEW_GATE_ESCALATION_KEY.into(), json!(true));
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("crea x")],
+        stop_reason: Some(StopReason::ToolUse),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        extra,
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_ne!(
+        out.forced_close_unverified,
+        Some(true),
+        "senza candidato NON si chiude: il cap dei rimandi resta il backstop"
+    );
+    assert!(
+        !llm.seen.lock().unwrap().is_empty(),
+        "il turno deve proseguire col modello corrente (chiamata LLM avvenuta)"
+    );
+}
+
+#[tokio::test]
 async fn billing_fail_fast_chiude_loop_abort() {
     // Soglia esplorazione raggiunta + il PROVIDER IN USO in cooldown billing ->
     // chiusura onesta loop_abort PRIMA della chiamata LLM (py:2072-2092 + fix

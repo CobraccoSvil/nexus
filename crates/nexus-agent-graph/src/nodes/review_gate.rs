@@ -52,6 +52,21 @@
 //!  2. **Il rimando smette di essere liquidabile**: il fatto misurato entra nel
 //!     rimando successivo come contestazione opponibile ("nessun file e'
 //!     cambiato"), invece di lasciare che "gia' fatto" valga come risposta.
+//!  3. **Il rimando a vuoto e' un trigger di ESCALATION** (30/07/2026): un
+//!     modello che riceve il verdetto e non tocca un file ha dimostrato di non
+//!     farcela, e ridargli lo stesso rimando e' la definizione di aspettarsi un
+//!     esito diverso ripetendo l'input. Misurato su bacheca-attivita (run
+//!     e8433555, claude-haiku): il ciclo di correzione restava sul modello small
+//!     fino al cap mentre il percorso principale aveva gia' la sua escalation
+//!     (`FINAL_GATE_ESCALATION_KEY`) — il run del giorno prima aveva sciolto uno
+//!     stallo proprio cambiando modello. Il gate posa
+//!     [`REVIEW_GATE_ESCALATION_KEY`] sul rimando NON definitivo; l'executor lo
+//!     consuma al rientro delegando al punto unico
+//!     `maybe_escalate_nonconvergence` (regola L: il gate non ha la porta di
+//!     escalation, l'executor si' — stesso paradigma del final_gate). A catena
+//!     esaurita l'executor prosegue col modello corrente: il cap dei rimandi
+//!     resta il backstop, il flag lo governa questo nodo (posato solo dal
+//!     rimando a vuoto, rimosso da ogni esito successivo del panel).
 //!
 //! Il criterio di cosa sia progresso NON vive qui: e' il punto unico puro
 //! [`crate::decisions::correction_progress`] (regola L), cosi' la stessa domanda
@@ -70,6 +85,15 @@ use crate::state::{
 };
 use crate::state::delta::StateDelta;
 use crate::AgentNodeCtx;
+
+/// Trigger STRUTTURATO di escalation (regola M): posato in `extra` quando un
+/// rimando in correzione risulta a vuoto (`CorrectionProgress` non-Effettivo) e
+/// il run rientra comunque in correzione. L'executor lo consuma al rientro
+/// promuovendo il modello via `maybe_escalate_nonconvergence` (gemello di
+/// `FINAL_GATE_ESCALATION_KEY`, regola L: stesso meccanismo, secondo produttore).
+/// Nasce SOLO dalla misura sulle scritture registrate, mai dal testo con cui
+/// l'agente ha liquidato il rimando.
+pub const REVIEW_GATE_ESCALATION_KEY: &str = "review_gate_escalation_pending";
 
 /// Config DB-driven del gate (regola G: risolta dal chiamante, mai letta qui).
 #[derive(Debug, Clone)]
@@ -237,7 +261,15 @@ impl ReviewGateNode {
         state: &AgentState,
         panel: &PanelOutcome,
     ) -> serde_json::Map<String, serde_json::Value> {
-        crate::state::delta::put_extra(state, "review_panel_last", panel.to_value())
+        let mut extra = crate::state::delta::put_extra(state, "review_panel_last", panel.to_value());
+        // Un nuovo esito del panel SOSTITUISCE il segnale del rimando a vuoto
+        // precedente: se il trigger di escalation e' rimasto pendente (catena
+        // esaurita al rientro), non deve sopravvivere a un giro in cui il codice
+        // e' cambiato e il panel ha giudicato di nuovo — l'escalation che ne
+        // nascesse dichiarerebbe un fatto ("rimando senza correzioni") non piu'
+        // vero (regola M).
+        extra.remove(REVIEW_GATE_ESCALATION_KEY);
+        extra
     }
 
     /// Elenco dei difetti, PUNTO UNICO del formato: lo usano sia il rimando dopo
@@ -632,6 +664,16 @@ impl ReviewGateNode {
             delta.stop_reason = Some(Some(StopReason::ToolUse));
             delta.pending_tool_uses = Some(Some(vec![]));
             delta.review_correction_watermark = Some(self.watermark_corrente().await);
+            // Il modello ha ricevuto il verdetto e non ha toccato un file: prima
+            // di ridargli lo STESSO rimando, l'executor deve poter promuovere a
+            // un modello piu' capace. Il trigger e' la misura (`progresso`
+            // non-Effettivo), mai la prosa dell'agente (regola M). Solo sul
+            // rimando: su una chiusura definitiva non c'e' un turno da promuovere.
+            delta.extra = Some(crate::state::delta::put_extra(
+                state,
+                REVIEW_GATE_ESCALATION_KEY,
+                serde_json::json!(true),
+            ));
         }
         delta.into_opaque()
     }
@@ -1354,6 +1396,94 @@ mod tests {
         assert!(
             ultimo_human.contains("backend/server.cjs"),
             "i difetti ancora aperti restano elencati: {ultimo_human}"
+        );
+    }
+
+    // ── TRIGGER DI ESCALATION: il rimando a vuoto lo posa, un esito lo rimuove ─
+
+    /// Il rimando a vuoto NON definitivo posa [`REVIEW_GATE_ESCALATION_KEY`]:
+    /// e' il segnale strutturato (regola M) con cui l'executor promuove il
+    /// modello PRIMA di ridargli lo stesso rimando. E' il difetto misurato su
+    /// bacheca-attivita (run e8433555): il ciclo di correzione restava su
+    /// claude-haiku fino al cap, senza mai la salita di modello che il percorso
+    /// principale aveva gia'.
+    ///
+    /// MUTAZIONE: togliere la posa del flag da `rimando_a_vuoto` (reintroduce il
+    /// bug: correzione muta per l'escalation) rende rosso questo assert.
+    #[tokio::test]
+    async fn rimando_a_vuoto_posa_il_trigger_di_escalation() {
+        let (_, s) = due_giri(
+            3,
+            Some(Arc::new(StubMutations {
+                facts: Vec::new(),
+                letture: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })),
+        )
+        .await;
+        assert!(
+            crate::routing::gate_rimanda_in_correzione(&s),
+            "premessa: siamo su un rimando, non su una chiusura"
+        );
+        assert_eq!(
+            s.extra.get(REVIEW_GATE_ESCALATION_KEY),
+            Some(&json!(true)),
+            "il rimando a vuoto deve chiedere l'escalation all'executor"
+        );
+    }
+
+    /// Sulla chiusura DEFINITIVA (cap dei rimandi raggiunto) il flag NON nasce:
+    /// non c'e' un turno di correzione da promuovere, il run sta chiudendo
+    /// bocciato.
+    #[tokio::test]
+    async fn rimando_a_vuoto_definitivo_non_posa_il_trigger() {
+        let (_, s) = due_giri(
+            1,
+            Some(Arc::new(StubMutations {
+                facts: Vec::new(),
+                letture: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })),
+        )
+        .await;
+        assert_eq!(
+            s.review_gate_verdict,
+            Some(ReviewGateVerdict::RejectedNoCorrection),
+            "premessa: il secondo giro chiude al cap"
+        );
+        assert!(
+            s.extra.get(REVIEW_GATE_ESCALATION_KEY).is_none(),
+            "nessuna escalation da chiedere su una chiusura definitiva"
+        );
+    }
+
+    /// Un flag rimasto pendente (catena di escalation esaurita al rientro) NON
+    /// sopravvive a un nuovo esito del panel: se il giro successivo ha prodotto
+    /// modifiche e il panel ha giudicato di nuovo, un'escalation nata da quel
+    /// flag dichiarerebbe un fatto ("rimando senza correzioni") non piu' vero
+    /// (regola M). La rimozione sta in `extra_with_panel`, il punto da cui
+    /// passano ENTRAMBI gli esiti (bocciatura e approvazione).
+    #[tokio::test]
+    async fn un_nuovo_esito_del_panel_rimuove_il_trigger_pendente() {
+        let node = nodo(3, ReviewPanelReport::Convened(panel_bocciato()))
+            .with_mutation_progress(Arc::new(StubMutations {
+                facts: vec![scrittura("prima", "dopo")],
+                letture: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }));
+        let mut s = stato_done();
+        s.review_gate_cycle = Some(1);
+        s.review_correction_watermark = Some(50);
+        s.extra
+            .insert(REVIEW_GATE_ESCALATION_KEY.to_string(), json!(true));
+        let delta = node.run(&s, &ctx_with()).await.expect("nodo ok");
+        let out = apply(s, delta);
+        assert_eq!(
+            out.review_gate_verdict,
+            Some(ReviewGateVerdict::PendingCorrection),
+            "premessa: il panel ha giudicato di nuovo (bocciatura, nuovo rimando)"
+        );
+        assert!(
+            out.extra.get(REVIEW_GATE_ESCALATION_KEY).is_none(),
+            "il segnale del rimando a vuoto precedente non deve sopravvivere a \
+             un esito nuovo del panel"
         );
     }
 
