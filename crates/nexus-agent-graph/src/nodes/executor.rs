@@ -177,6 +177,7 @@ use crate::decisions::tool_dispatch::{
 };
 use crate::decisions::turn_focus::build_turn_focus_directive;
 use crate::nodes::final_gate::FINAL_GATE_ESCALATION_KEY;
+use crate::nodes::review_gate::REVIEW_GATE_ESCALATION_KEY;
 use crate::nodes::scale_control::{
     SCALE_CONTEXT_KEY, SCALE_HYSTERESIS_CFG_KEY, SCALE_MOVE_CACHE_KEY_KEY, SCALE_SIZING_CFG_KEY,
     SCALE_SIZING_OVERRIDES_KEY,
@@ -3428,6 +3429,9 @@ impl ExecutorNode {
         if let Some(delta) = self.gate_nonconvergenza_final_gate(state, ctx, iters_in).await {
             return Some(delta);
         }
+        if let Some(delta) = self.gate_rimando_review_a_vuoto(state, ctx, iters_in).await {
+            return Some(delta);
+        }
         self.gate_chiusura_post_dichiarazione(state, ctx, iters_in, declaration_pending)
             .await
     }
@@ -3526,6 +3530,56 @@ oppure riprova piu' tardi."
             "final_gate_nonconvergence_no_escalation",
             json!({ "auto_escalations": auto_escalations }),
         ))
+    }
+
+    /// ── CONSUMO trigger di ESCALATION da RIMANDO REVIEW a vuoto ───────────
+    /// Rientro dal review_gate con [`REVIEW_GATE_ESCALATION_KEY`] in extra
+    /// (posato quando il rimando precedente NON ha prodotto modifiche —
+    /// `CorrectionProgress` non-Effettivo, segnale strutturato regola M): il
+    /// modello corrente ha ricevuto il verdetto del panel e non ha toccato un
+    /// file, ridargli lo stesso rimando e' spesa senza attesa di esito diverso.
+    /// PRIMA del turno, PROMUOVI via il PUNTO UNICO
+    /// [`Self::maybe_escalate_nonconvergence`] (regola L: terzo trigger, stesso
+    /// meccanismo del final_gate — misurato su bacheca-attivita, run e8433555:
+    /// il ciclo di correzione restava su claude-haiku fino al cap mentre il
+    /// percorso principale la sua escalation la aveva gia').
+    ///   - Some -> delta di promozione (sticky + budget del turno azzerato +
+    ///     ENTRAMBI i flag pendenti consumati dentro maybe_escalate_nonconvergence).
+    ///   - None (catena esaurita / max_escalations / cooldown) -> NESSUNA
+    ///     chiusura, a differenza del final_gate: il rimando con la contestazione
+    ///     e' gia' nei messaggi e il cap dei rimandi (`review_max_correction_
+    ///     cycles`) resta il backstop naturale. Il flag resta posato e lo governa
+    ///     il review_gate: un nuovo esito del panel lo rimuove; se un provider
+    ///     esce dal cooldown durante QUESTO ciclo di correzione, la promozione
+    ///     tardiva e' ancora pertinente (il rimando a vuoto e' ancora il rimando
+    ///     corrente).
+    async fn gate_rimando_review_a_vuoto(
+        &self,
+        state: &AgentState,
+        ctx: &AgentNodeCtx,
+        iters_in: i64,
+    ) -> Option<OpaqueDelta> {
+        if !flag_extra(state, REVIEW_GATE_ESCALATION_KEY) {
+            return None;
+        }
+        let delta = self
+            .maybe_escalate_nonconvergence(
+                state,
+                iters_in,
+                SwitchReason::ReviewCorrectionStalled,
+                ctx,
+                false,
+            )
+            .await;
+        if delta.is_none() {
+            tracing::warn!(
+                target: "nexus_agent_graph::executor",
+                auto_escalations = escalations_finora(state),
+                "rimando review a vuoto: nessun modello di escalation disponibile -> si prosegue \
+                 col modello corrente (il cap dei rimandi resta il backstop)"
+            );
+        }
+        delta
     }
 
     /// ── Chiusura del turno DICHIARATIVO forzato (ADR 0034) ────────────────
@@ -7388,33 +7442,53 @@ una tool call, non descrivere.",
             reason = reason.code(),
             "non-convergenza: ESCALATION agentica di un gradino -> budget del turno azzerato per il promosso"
         );
+        // Il motivo nel titolo NASCE dal trigger strutturato (regola M): per il
+        // rimando review "non-convergenza sul budget del turno" affermerebbe un
+        // fatto falso (il budget non c'entra). Vive QUI perche' questo e' il
+        // punto unico dell'escalation-da-non-convergenza (regola L).
+        let motivo_titolo = match reason {
+            SwitchReason::ReviewCorrectionStalled => "rimando della review senza correzioni",
+            _ => "non-convergenza sul budget del turno",
+        };
         self.emit_phase(
             ctx,
             "escalation",
-            format!(
-                "Passo a {}/{} (non-convergenza sul budget del turno)",
-                pick.provider, pick.model
-            ),
+            format!("Passo a {}/{} ({motivo_titolo})", pick.provider, pick.model),
             // Punto unico del payload switch (regola L): senza from_provider/from_model
             // la card "CAMBIO PROVIDER" mostrava "Da: <provider> / ?". La coppia
             // corrente e' gia' in scope da escalation_current_pair (:5464).
             stall_switch_payload(&cur_provider, &cur_model, &pick.provider, &pick.model, reason),
         )
         .await;
-        let esc_nudge = human_msg(
-            "Il modello precedente non ha completato il compito entro il budget del turno. \
+        // Nudge per-trigger, nello stesso punto unico: quello storico manda a
+        // "proseguire da dove e' arrivato", ma sul rimando review il predecessore
+        // non e' arrivato da nessuna parte — la consegna giusta e' il rimando
+        // stesso (correggere o confutare), gia' nei messaggi qui sopra.
+        let esc_nudge = human_msg(match reason {
+            SwitchReason::ReviewCorrectionStalled => {
+                "Il modello precedente ha ricevuto il rimando della review qui sopra e non ha \
+applicato alcuna correzione. Prosegui tu: CORREGGI i difetti elencati nel rimando con i tool \
+di scrittura, oppure confuta i rilievi infondati portando l'evidenza. Ripetere che il task \
+e' gia' completo non e' nessuna delle due."
+            }
+            _ => {
+                "Il modello precedente non ha completato il compito entro il budget del turno. \
 Prosegui tu da dove e' arrivato: NON ricominciare da capo ne' descrivere, procedi con \
-azioni concrete e mirate verso il completamento.",
-        );
+azioni concrete e mirate verso il completamento."
+            }
+        });
         let mut extra_out = state.extra.clone();
         extra_out.insert("auto_escalations".to_string(), json!(escal + 1));
         // Grazia post-escalation: finestra pulita sugli assi anti-loop per il promosso.
         extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
-        // Consumo del trigger di non-convergenza del final_gate (se presente): il
-        // modello promosso NON deve ri-scattare quel ramo al prossimo turno (sarebbe
-        // un'escalation a raffica senza che abbia lavorato). No-op per gli altri
-        // trigger (budget_token/iteration_cap non posano il flag).
+        // Consumo dei trigger di escalation PENDENTI (final_gate e review_gate,
+        // se presenti): il modello promosso NON deve ri-scattare quei rami al
+        // prossimo turno (sarebbe un'escalation a raffica senza che abbia
+        // lavorato). UNA promozione consuma OGNI pending: qualunque trigger
+        // l'abbia chiesta, la risposta e' la stessa salita di gradino. No-op per
+        // i trigger che non posano flag (budget_token/iteration_cap).
         extra_out.remove(FINAL_GATE_ESCALATION_KEY);
+        extra_out.remove(REVIEW_GATE_ESCALATION_KEY);
         Some(
             StateDelta {
                 messages: Some(vec![esc_nudge]),

@@ -44,6 +44,10 @@ pub enum SwitchReason {
     /// La verifica finale non passa entro i tentativi previsti: si sale di
     /// capacita' (escalation).
     FinalGateNonconvergence,
+    /// Il rimando in correzione della review e' andato a vuoto (nessun file
+    /// cambiato, misura `CorrectionProgress`): il modello ha ricevuto il
+    /// verdetto e non ha corretto, si sale di capacita'.
+    ReviewCorrectionStalled,
     /// Tetto di iterazioni raggiunto.
     IterationCap,
     /// Tetto del gate G1 raggiunto (troppi turni senza chiudere un obiettivo).
@@ -66,6 +70,7 @@ impl SwitchReason {
             Self::RepeatedAction => "repeated_action",
             Self::StallRecovery => "stall_recovery",
             Self::FinalGateNonconvergence => "final_gate_nonconvergence",
+            Self::ReviewCorrectionStalled => "review_correction_stalled",
             Self::IterationCap => "iteration_cap",
             Self::G1Cap => "g1_cap",
             Self::BudgetToken => "budget_token",
@@ -98,6 +103,9 @@ impl SwitchReason {
             Self::StallRecovery => "il lavoro si era fermato: riparto con un altro modello",
             Self::FinalGateNonconvergence => {
                 "la verifica finale non e' stata superata nei tentativi previsti: passo a un modello piu' capace"
+            }
+            Self::ReviewCorrectionStalled => {
+                "il rimando della review non ha prodotto correzioni: passo a un modello piu' capace"
             }
             Self::IterationCap => {
                 "raggiunto il numero massimo di passaggi: continuo con un modello piu' capace"
@@ -133,6 +141,7 @@ mod tests {
         SwitchReason::RepeatedAction,
         SwitchReason::StallRecovery,
         SwitchReason::FinalGateNonconvergence,
+        SwitchReason::ReviewCorrectionStalled,
         SwitchReason::IterationCap,
         SwitchReason::G1Cap,
         SwitchReason::BudgetToken,
