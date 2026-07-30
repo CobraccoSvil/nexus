@@ -592,7 +592,7 @@ pub struct NativeRunOutcome {
     /// Solo `requirements`: `recommendations` e' l'altra lista della stessa
     /// sintesi e una raccomandazione non applicata non e' uno scostamento
     /// (punto unico `decisions::requirement_conformance`).
-    pub council_requirements: Vec<String>,
+    pub council_requirements: Vec<nexus_agent_graph::decisions::Requirement>,
     /// ESITO del riscontro dei requisiti sopra, sul contenuto reale dei file.
     /// `None` quando non c'era nulla da riscontrare (nessun requisito). Mai
     /// `None` per "non ho potuto guardare": quel caso e' un report con tutti i
@@ -3527,7 +3527,7 @@ const MAX_BYTE_FILE_RISCONTRO: u64 = 2 * 1024 * 1024;
 async fn verifica_conformita_requisiti(
     deps: &NativeDeps,
     input: &NativeRunInput,
-    requirements: &[String],
+    requirements: &[nexus_agent_graph::decisions::Requirement],
 ) -> Option<nexus_agent_graph::decisions::ConformanceReport> {
     if requirements.is_empty() {
         return None;
@@ -3556,7 +3556,7 @@ async fn verifica_conformita_requisiti(
 /// nessun riscontro inventato.
 async fn riscontro_su_disco(
     root: String,
-    requirements: Vec<String>,
+    requirements: Vec<nexus_agent_graph::decisions::Requirement>,
 ) -> Option<nexus_agent_graph::decisions::ConformanceReport> {
     match tokio::task::spawn_blocking(move || {
         riscontra_requisiti_su_root(std::path::Path::new(&root), &requirements)
@@ -3607,7 +3607,7 @@ async fn radice_progetto_del_run(deps: &NativeDeps, input: &NativeRunInput) -> O
 /// lettura per conto proprio misurerebbe la propria imitazione.
 pub(crate) fn riscontra_requisiti_su_root(
     root: &std::path::Path,
-    requirements: &[String],
+    requirements: &[nexus_agent_graph::decisions::Requirement],
 ) -> nexus_agent_graph::decisions::ConformanceReport {
     nexus_agent_graph::decisions::compose_conformance(requirements, |rel| {
         leggi_file_di_progetto(root, rel)
@@ -3844,13 +3844,13 @@ mod tests {
         let out = map_outcome(StepOutcome::Completed(state));
         assert_eq!(
             out.council_requirements,
-            vec![REQ.to_string()],
+            vec![REQ.into()],
             "il requisito attraversa lo stato dal prompt del coordinatore al riscontro"
         );
         assert!(
             !out.council_requirements
                 .iter()
-                .any(|r| r.contains("health probe")),
+                .any(|r| r.text.contains("health probe")),
             "la raccomandazione non e' un requisito e non entra nella misura"
         );
     }

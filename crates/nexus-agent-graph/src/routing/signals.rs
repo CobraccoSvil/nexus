@@ -897,6 +897,43 @@ pub struct RepeatedActionHit {
     /// (tool_result con errore). Discrimina "edit_file fallito da correggere"
     /// dalle altre ripetizioni: alimenta il nudge specifico del controller.
     pub failed: bool,
+    /// `true` se l'azione ripetuta e' l'esecuzione di un comando di
+    /// build/test riconosciuto (vedi [`is_build_or_test_command`]). Segnale
+    /// STRUTTURATO (tool_name + primo token del comando), mai un `contains()`
+    /// sulla label leggibile: quella include il bersaglio per intero, e un
+    /// path come `frontend-test-utils` la farebbe scattare per errore (bug
+    /// reale chiuso il 30/07/2026 in `progress_controller`).
+    pub is_build_or_test: bool,
+}
+
+/// Vocabolario dei comandi di build/test riconosciuti dal PRIMO TOKEN del
+/// comando (mai da un `contains()` su tutta la command line: un path o un
+/// pacchetto che CONTIENE "test" — es. `pnpm install
+/// packages/frontend-test-utils` — non deve bastare). Specchio ridotto dello
+/// storico vocabolario di `progress_controller::BUILD_TEST_LABEL_KEYWORDS`,
+/// che matchava anche parole generiche (`test`, `lint`, `compile`) proprio
+/// come substring: qui restano solo comandi ESEGUIBILI reali, confrontati per
+/// UGUAGLIANZA col primo token.
+const BUILD_TEST_FIRST_TOKENS: &[&str] = &[
+    "cargo", "npm", "pnpm", "yarn", "tsc", "make", "pytest", "gradle", "mvn", "go", "eslint",
+];
+
+/// `true` se l'azione e' l'esecuzione di un COMANDO (`run_command`/
+/// `run_service`/`run_in_terminal`) il cui primo token e' un comando di
+/// build/test noto. Un tool diverso (`edit_file`, `read_file`, ...) non e'
+/// mai build/test a prescindere dal bersaglio: il tool_name struttura la
+/// domanda PRIMA di guardare il testo, che e' esattamente il "residuo" che
+/// resta da giudicare (regola M: segnale strutturato, poi un confronto
+/// deterministico sul solo token rilevante — mai un modello nel ciclo caldo).
+fn is_build_or_test_command(tool_name: &str, target: &str) -> bool {
+    if !matches!(tool_name, "run_command" | "run_service" | "run_in_terminal") {
+        return false;
+    }
+    let primo_token = target.split_whitespace().next().unwrap_or("");
+    // Il token puo' comparire con un path davanti (`./node_modules/.bin/pnpm`):
+    // si confronta l'ultimo segmento, non l'intero percorso.
+    let comando = primo_token.rsplit(['/', '\\']).next().unwrap_or(primo_token);
+    BUILD_TEST_FIRST_TOKENS.contains(&comando)
 }
 
 /// Rileva la ripetizione IDENTICA di un'azione produttiva (scrittura/comando),
@@ -929,6 +966,9 @@ pub fn detect_repeated_action_detailed(
     let mut tool_names: Vec<(String, String)> = Vec::new();
     // sig -> esito dell'ULTIMA occorrenza (true = fallita).
     let mut last_failed: Vec<(String, bool)> = Vec::new();
+    // sig -> l'azione e' un comando di build/test riconosciuto (tool_name +
+    // primo token, regola M): alimenta `RepeatedActionHit::is_build_or_test`.
+    let mut build_test: Vec<(String, bool)> = Vec::new();
     let mut succeeded: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Target (file) con un edit_file/write_file RIUSCITO visto finora nella finestra:
     // una rilettura read-only di uno di questi DOPO la modifica e' VERIFICA del
@@ -1041,6 +1081,9 @@ pub fn detect_repeated_action_detailed(
             let label_value: String = target.chars().take(120).collect();
             set_label(&mut labels, &sig, format!("{name}: {label_value}"));
             set_label(&mut tool_names, &sig, name.to_string());
+            // Sul TARGET completo (non troncato), non sulla label: il primo
+            // token va letto dal comando vero, non dalla sua resa a 120 char.
+            set_bool(&mut build_test, &sig, is_build_or_test_command(name, &target));
             last_sig = Some(sig.clone());
             // Un edit/write RIUSCITO (outcome == Some(false)) segna il target come
             // modificato: le successive riletture read-only dello stesso file sono
@@ -1056,7 +1099,7 @@ pub fn detect_repeated_action_detailed(
                 succeeded.insert(sig.clone());
             }
             // Memorizza l'esito dell'ULTIMA occorrenza vista (None -> non fallita).
-            set_failed(&mut last_failed, &sig, outcome == Some(true));
+            set_bool(&mut last_failed, &sig, outcome == Some(true));
         }
     }
     // Rimuove le signature riuscite (mai stallo da abort).
@@ -1077,11 +1120,17 @@ pub fn detect_repeated_action_detailed(
         .find(|(s, _)| *s == sig)
         .map(|(_, f)| *f)
         .unwrap_or(false);
+    let is_build_or_test = build_test
+        .iter()
+        .find(|(s, _)| *s == sig)
+        .map(|(_, f)| *f)
+        .unwrap_or(false);
     Some(RepeatedActionHit {
         label,
         count,
         tool_name,
         failed,
+        is_build_or_test,
     })
 }
 
@@ -1128,13 +1177,15 @@ fn set_label(list: &mut Vec<(String, String)>, sig: &str, label: String) {
     }
 }
 
-/// Imposta/aggiorna l'esito (fallita?) dell'ULTIMA occorrenza di una signature.
-/// Sovrascrive sempre: alla fine resta l'esito della chiamata piu' recente.
-fn set_failed(list: &mut Vec<(String, bool)>, sig: &str, failed: bool) {
+/// Imposta/aggiorna un flag booleano dell'ULTIMA occorrenza di una signature
+/// (sovrascrive sempre: alla fine resta il valore della chiamata piu'
+/// recente). Punto unico (regola L) per `last_failed` e `build_test`: stessa
+/// forma `sig -> bool`, stessa semantica "vince l'ultima".
+fn set_bool(list: &mut Vec<(String, bool)>, sig: &str, value: bool) {
     if let Some(entry) = list.iter_mut().find(|(s, _)| s == sig) {
-        entry.1 = failed;
+        entry.1 = value;
     } else {
-        list.push((sig.to_string(), failed));
+        list.push((sig.to_string(), value));
     }
 }
 
@@ -1595,6 +1646,74 @@ mod tests {
         let hit = detect_repeated_action_detailed(&msgs, 24).expect("stallo atteso");
         assert!(hit.count >= 3);
         assert!(hit.failed);
+    }
+
+    /// Il difetto reale (30/07/2026): il vecchio `is_build_or_test_label` di
+    /// `progress_controller` cercava le keyword su TUTTA la label
+    /// (`"{tool}: {bersaglio}"`), quindi un bersaglio che CONTIENE "test" per
+    /// caso (un path, un nome di pacchetto) bastava a far scattare il ramo
+    /// "e' un build/test" — che nel force_diagnose ordina di NON dichiararsi
+    /// bloccati anche quando la causa e' davvero esterna. Il segnale
+    /// STRUTTURATO deve venire dal tool_name + dal PRIMO TOKEN del comando,
+    /// mai da un `contains()` sull'intero bersaglio.
+    ///
+    /// MUTAZIONE: tornare a un `contains("test")` sull'intero `target` in
+    /// [`is_build_or_test_command`] rende rosso questo test.
+    #[test]
+    fn is_build_or_test_ignora_il_resto_del_bersaglio() {
+        let cerca = || {
+            ai_tool_input(
+                "run_command",
+                json!({"command": "ls packages/frontend-test-utils"}),
+            )
+        };
+        let msgs = vec![
+            cerca(),
+            human_tool_result(Some(1), true, "ENOENT"),
+            cerca(),
+            human_tool_result(Some(1), true, "ENOENT"),
+        ];
+        let hit = detect_repeated_action_detailed(&msgs, 24).expect("stallo atteso");
+        assert!(
+            !hit.is_build_or_test,
+            "'ls' non e' un comando di build/test anche se il bersaglio contiene 'test': {hit:?}"
+        );
+    }
+
+    /// Contro-prova: un comando di build/test VERO viene riconosciuto dal
+    /// primo token, anche con un path davanti al binario.
+    #[test]
+    fn is_build_or_test_riconosce_il_comando_vero() {
+        let cerca = || {
+            ai_tool_input(
+                "run_command",
+                json!({"command": "./node_modules/.bin/pnpm test --filter api"}),
+            )
+        };
+        let msgs = vec![
+            cerca(),
+            human_tool_result(Some(1), true, "1 failing"),
+            cerca(),
+            human_tool_result(Some(1), true, "1 failing"),
+        ];
+        let hit = detect_repeated_action_detailed(&msgs, 24).expect("stallo atteso");
+        assert!(hit.is_build_or_test, "'pnpm test' e' un comando di test: {hit:?}");
+    }
+
+    /// Un tool DIVERSO da run_command/run_service/run_in_terminal non e' MAI
+    /// build/test, a prescindere da cosa contenga il bersaglio: elimina per
+    /// costruzione il falso positivo su path (`edit_file` su un file il cui
+    /// nome contiene "test").
+    #[test]
+    fn is_build_or_test_falso_per_costruzione_su_tool_non_comando() {
+        assert!(!is_build_or_test_command(
+            "edit_file",
+            "cargo test --workspace"
+        ));
+        assert!(!is_build_or_test_command(
+            "read_file",
+            "src/build_test_runner.rs"
+        ));
     }
 
     #[test]

@@ -228,14 +228,71 @@ fn has_interpolation(lang: Lang, line: &str) -> bool {
     }
 }
 
+/// Riduce la riga al solo CODICE potenzialmente rilevante per la severity:
+/// tutto cio' che sta FUORI da un letterale stringa, piu' il contenuto delle
+/// sotto-espressioni di interpolazione che vivono DENTRO un letterale
+/// (`{ident}` in Rust/Python, `${ident}` in TS/JS). Il resto del testo
+/// letterale — nomi di colonna/tabella SQL scritti a mano nella query, es.
+/// `filename` in `WHERE filename = ...` — non e' mai una variabile e non deve
+/// mai contribuire alla severity: e' il difetto reale (30/07/2026) per cui
+/// `filename` veniva triagizzato "high" (la keyword-vocabolario ci trova
+/// "name" dentro il nome di una COLONNA, non di una variabile interpolata),
+/// mentre una injection vera su una variabile chiamata `slug` restava
+/// "medium" senza che il nome-colonna la coprisse.
+///
+/// I caratteri del letterale scartati sono sostituiti con uno spazio (non
+/// rimossi) cosi' due token adiacenti nel codice circostante non si fondono.
+fn code_only(lang: Lang, line: &str) -> String {
+    // TS/JS interpola solo con `${`; Rust/Python usano `{` nudo (format!/f-string).
+    let interp_needs_dollar = lang == Lang::TsJs;
+    let mut out = String::with_capacity(line.len());
+    let mut in_str: Option<char> = None;
+    let mut interp_depth: u32 = 0;
+    let mut prev = '\0';
+    for ch in line.chars() {
+        match in_str {
+            None => {
+                if matches!(ch, '"' | '\'' | '`') {
+                    in_str = Some(ch);
+                    out.push(' ');
+                } else {
+                    out.push(ch);
+                }
+            }
+            Some(q) => {
+                if interp_depth > 0 {
+                    // Dentro una sotto-espressione di interpolazione: e' CODICE.
+                    if ch == '{' {
+                        interp_depth += 1;
+                    } else if ch == '}' {
+                        interp_depth -= 1;
+                    }
+                    out.push(ch);
+                } else if ch == q && prev != '\\' {
+                    in_str = None;
+                    out.push(' ');
+                } else if ch == '{' && (!interp_needs_dollar || prev == '$') {
+                    interp_depth = 1;
+                    out.push(ch);
+                } else {
+                    out.push(' ');
+                }
+            }
+        }
+        prev = ch;
+    }
+    out
+}
+
 /// Determina la severity in base al nome della variabile interpolata.
 /// high se suggerisce input esterno, medium altrimenti.
-fn severity_for(line: &str) -> &'static str {
-    // Valuta ogni identificatore della riga (potenziale nome variabile), saltando
-    // le keyword di linguaggio/SQL che potrebbero contenere per caso una substring
-    // sospetta (es. `format` -> "form"). high solo se un nome-variabile reale
-    // suggerisce input esterno.
-    for m in IDENT_RE.find_iter(line) {
+fn severity_for(lang: Lang, line: &str) -> &'static str {
+    // Valuta ogni identificatore del solo CODICE (mai del testo letterale
+    // della query, vedi `code_only`), saltando le keyword di linguaggio/SQL
+    // che potrebbero contenere per caso una substring sospetta (es. `format`
+    // -> "form"). high solo se un nome-variabile reale suggerisce input esterno.
+    let code = code_only(lang, line);
+    for m in IDENT_RE.find_iter(&code) {
         let ident = m.as_str();
         let lower = ident.to_ascii_lowercase();
         if IGNORED_IDENTS.contains(&lower.as_str()) {
@@ -281,7 +338,7 @@ pub fn detect_sql_injection(file_path: &str, source: &str) -> Vec<InjectionFindi
             continue;
         }
 
-        let severity = severity_for(line).to_string();
+        let severity = severity_for(lang, line).to_string();
         let mut snippet = line.to_string();
         if snippet.chars().count() > 160 {
             snippet = snippet.chars().take(160).collect();
@@ -358,6 +415,50 @@ mod tests {
         // Nessun nome che suggerisce input esterno => medium.
         let src = r#"let q = format!("SELECT * FROM {} ORDER BY id", table);"#;
         let f = detect_sql_injection("x.rs", src);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].severity, "medium");
+    }
+
+    /// Il difetto reale (30/07/2026): un nome di COLONNA scritto nel testo
+    /// letterale della query (`filename`) contiene "name", che e' nel
+    /// vocabolario di `EXTERNAL_INPUT_RE` — ma non e' una variabile, e' testo
+    /// SQL statico. La variabile davvero interpolata (`slug`) non matcha il
+    /// vocabolario: il triage corretto e' "medium" (nessun nome-variabile
+    /// sospetto), non "high" per un nome di colonna innocuo.
+    ///
+    /// MUTAZIONE: tornare a scandire `line` intera invece di `code_only(...)`
+    /// in [`severity_for`] rende rosso questo test con severity "high".
+    #[test]
+    fn rust_nome_colonna_nel_letterale_non_alza_la_severity() {
+        let src = r#"let q = format!("SELECT * FROM files WHERE filename = '{}'", slug);"#;
+        let f = detect_sql_injection("x.rs", src);
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            f[0].severity, "medium",
+            "'filename' e' un nome di colonna nel letterale, non una variabile: {:?}",
+            f[0].severity
+        );
+    }
+
+    /// Contro-prova: con la STESSA colonna innocua nel letterale, una
+    /// variabile REALMENTE sospetta (`user_input`, trailing arg) resta
+    /// riconosciuta "high": il fix restringe il CAMPO scandito, non
+    /// indebolisce il rilevamento dei casi veri.
+    #[test]
+    fn rust_variabile_sospetta_resta_high_nonostante_colonna_innocua() {
+        let src = r#"let q = format!("SELECT * FROM files WHERE filename = '{}'", user_input);"#;
+        let f = detect_sql_injection("x.rs", src);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].severity, "high");
+    }
+
+    /// Stesso difetto in Python: `filename` nel testo dell'f-string (fuori da
+    /// `{}`) non deve contare; `user_id` DENTRO `{}` (variabile interpolata
+    /// vera) si'.
+    #[test]
+    fn python_fstring_colonna_nel_letterale_non_alza_la_severity() {
+        let src = r#"sql = f"SELECT * FROM files WHERE filename = '{slug}'""#;
+        let f = detect_sql_injection("x.py", src);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].severity, "medium");
     }

@@ -108,6 +108,9 @@ impl From<DecideInput> for ProgressSignals {
             // Segnale Rust-only (fallimento strutturale generico, regola M): non nei
             // golden Python, resta false -> non altera i casi di parita' esistenti.
             repeated_action_failed: false,
+            // Segnale Rust-only (build/test da tool_name + primo token, regola M):
+            // non nei golden Python, resta false -> non altera i casi di parita'.
+            repeated_action_is_build_or_test: false,
             action_oriented: i.action_oriented,
             reallocation_count: i.reallocation_count,
             reallocation_threshold: i.reallocation_threshold,

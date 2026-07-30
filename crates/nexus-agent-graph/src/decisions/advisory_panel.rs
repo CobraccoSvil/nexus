@@ -22,6 +22,7 @@
 use serde_json::Value;
 
 use super::panel_quorum::{classify_panel, required_valid, PanelClass, QuorumPolicy, QuorumTally};
+use super::requirement_conformance::Direction;
 use super::severity::rank as severity_rank;
 
 /// Roster del panel advisory: il DENOMINATORE del quorum e' un input esplicito
@@ -161,8 +162,9 @@ pub struct AdvisorySynthesis {
     /// Le figure valide NON concordano (piu' di un verdetto distinto).
     pub dissent: bool,
     /// Requisiti/vincoli uniti da tutti i pareri validi, deduplicati mantenendo
-    /// l'ordine di prima apparizione (input per il piano dell'esecuzione).
-    pub requirements: Vec<String>,
+    /// l'ordine di prima apparizione (input per il piano dell'esecuzione), con
+    /// la direzione dichiarata da ciascuna figura quando presente.
+    pub requirements: Vec<Requirement>,
     /// Rischi aggregati da tutti i pareri validi, ordinati per severity
     /// (alta -> media -> bassa) con ordine di apparizione stabile a parita'.
     pub risks: Vec<Value>,
@@ -195,7 +197,7 @@ impl AdvisorySynthesis {
                 "block": self.block,
             },
             "dissent": self.dissent,
-            "requirements": self.requirements,
+            "requirements": self.requirements.iter().map(Requirement::to_value).collect::<Vec<_>>(),
             "risks": self.risks,
             "recommendations": self.recommendations,
             "contested_decision": self.contested_decision,
@@ -207,7 +209,7 @@ impl AdvisorySynthesis {
 struct Advice {
     verdict: AdvisoryVerdict,
     has_high_severity: bool,
-    requirements: Vec<String>,
+    requirements: Vec<Requirement>,
     risks: Vec<Value>,
     recommendations: Vec<String>,
     /// Decisione architetturale CONTESA dichiarata da questa figura (innesca il
@@ -215,8 +217,8 @@ struct Advice {
     contested_decision: Option<Value>,
 }
 
-/// Estrae la lista di stringhe non vuote da un campo array (`requirements`,
-/// `recommendations`), con trim; ignora elementi non-stringa o vuoti.
+/// Estrae la lista di stringhe non vuote da un campo array (`recommendations`),
+/// con trim; ignora elementi non-stringa o vuoti.
 fn string_list(advisory: &Value, key: &str) -> Vec<String> {
     advisory
         .get(key)
@@ -230,6 +232,98 @@ fn string_list(advisory: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Un requisito con la direzione dichiarata dalla figura ALLA FONTE, quando
+/// l'ha dichiarata (regola M): mai piu' indovinata da un parser testuale a
+/// valle. Bug reale chiuso da questo campo (30/07/2026): "Sostituire
+/// `port: 33649`" contiene solo verbi di presenza per l'euristica di
+/// [`super::requirement_conformance`], che lo leggerebbe come "deve
+/// presenziare" invertendo il verdetto su un requisito di rimozione.
+///
+/// `direction: None` quando l'elemento arriva nel formato storico (stringa
+/// nuda) o la figura non ha valorizzato il campo: il consumatore degrada
+/// onestamente all'euristica sui verbi, comportamento invariato.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Requirement {
+    pub text: String,
+    pub direction: Option<Direction>,
+}
+
+impl Requirement {
+    fn to_value(&self) -> Value {
+        let mut o = serde_json::Map::new();
+        o.insert("text".to_string(), Value::String(self.text.clone()));
+        if let Some(d) = self.direction {
+            o.insert("direction".to_string(), Value::String(d.as_str().to_string()));
+        }
+        Value::Object(o)
+    }
+}
+
+impl From<&str> for Requirement {
+    /// Costruisce un requisito SENZA direzione dichiarata: comodo per i
+    /// chiamanti (e i test) che esercitano solo l'euristica sui verbi in
+    /// [`super::requirement_conformance`].
+    fn from(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            direction: None,
+        }
+    }
+}
+
+impl From<String> for Requirement {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            direction: None,
+        }
+    }
+}
+
+/// Estrae i requisiti dal campo `key` (`requirements` per `advisory_verdict`,
+/// [`super::requirement_conformance::CAMPO_REQUISITI`] per la sintesi
+/// composta — stesso parser per entrambi i livelli, regola L). Ogni elemento
+/// e' o una stringa nuda (formato storico, direzione assente) o un oggetto
+/// `{text, direction?}` (formato dichiarato, emesso da
+/// [`super::tool_dispatch::normalize_advisory_verdict`]): entrambe le forme
+/// sono tollerate qui perche' e' anche il punto in cui i test di questo
+/// modulo costruiscono l'`advisory` a mano, bypassando la normalizzazione.
+/// Elementi senza testo non vuoto sono scartati.
+pub(super) fn requirement_list(advisory: &Value, key: &str) -> Vec<Requirement> {
+    advisory
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(parse_one_requirement).collect())
+        .unwrap_or_default()
+}
+
+/// Un singolo elemento dell'array `requirements` (stringa nuda o oggetto
+/// `{text, direction?}`), estratto in funzione propria: tenere il match fuori
+/// dalla closure di [`requirement_list`] evita l'annidamento profondo di due
+/// livelli (iteratore + match) sullo stesso corpo.
+fn parse_one_requirement(v: &Value) -> Option<Requirement> {
+    match v {
+        Value::String(s) => {
+            let t = s.trim();
+            (!t.is_empty()).then(|| Requirement {
+                text: t.to_string(),
+                direction: None,
+            })
+        }
+        Value::Object(o) => {
+            let text = o.get("text").and_then(Value::as_str)?.trim();
+            (!text.is_empty()).then(|| Requirement {
+                text: text.to_string(),
+                direction: o
+                    .get("direction")
+                    .and_then(Value::as_str)
+                    .and_then(Direction::parse),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Estrae il parere da UN blocco esito strutturato (`outcome`). `None` se non e'
@@ -253,7 +347,7 @@ fn extract_advice(outcome: &Value) -> Option<Advice> {
     Some(Advice {
         verdict,
         has_high_severity,
-        requirements: string_list(advisory, "requirements"),
+        requirements: requirement_list(advisory, "requirements"),
         risks,
         recommendations: string_list(advisory, "recommendations"),
         // Ri-validata QUI e non data per buona: l'outcome puo' arrivare da un
@@ -265,10 +359,14 @@ fn extract_advice(outcome: &Value) -> Option<Advice> {
     })
 }
 
-/// Aggiunge le stringhe nuove (non gia' presenti) a `acc`, preservando l'ordine
-/// di prima apparizione (dedup stabile, regola L: unica sede della dedup stringhe
-/// del panel).
-fn extend_dedup(acc: &mut Vec<String>, items: Vec<String>) {
+/// Aggiunge gli elementi nuovi (non gia' presenti) a `acc`, preservando l'ordine
+/// di prima apparizione (dedup stabile, regola L: unica sede della dedup del
+/// panel, generica su stringhe e su [`Requirement`] invece di due funzioni
+/// copiate). Per `Requirement` l'uguaglianza e' sull'intero valore (testo E
+/// direzione): due dichiarazioni con lo stesso testo ma direzione diversa sono
+/// un disaccordo fra figure, non un duplicato — restano entrambe visibili
+/// invece di scomparire silenziosamente sotto la prima.
+fn extend_dedup<T: PartialEq>(acc: &mut Vec<T>, items: Vec<T>) {
     for it in items {
         if !acc.iter().any(|e| e == &it) {
             acc.push(it);
@@ -311,7 +409,7 @@ pub fn compose_advisory_synthesis(
     let mut proceed_with_changes = 0;
     let mut block = 0;
     let mut any_high_severity_block = false;
-    let mut requirements: Vec<String> = Vec::new();
+    let mut requirements: Vec<Requirement> = Vec::new();
     let mut recommendations: Vec<String> = Vec::new();
     let mut risks: Vec<Value> = Vec::new();
     let mut contested_decision: Option<Value> = None;
@@ -463,7 +561,13 @@ mod tests {
         assert!(out.verdict.is_veto());
         assert!(out.dissent, "proceed + block = dissenso");
         assert_eq!(out.risks.len(), 1);
-        assert_eq!(out.requirements, vec!["usa PKCE".to_string()]);
+        assert_eq!(
+            out.requirements,
+            vec![Requirement {
+                text: "usa PKCE".to_string(),
+                direction: None
+            }]
+        );
     }
 
     #[test]
@@ -511,7 +615,13 @@ mod tests {
         .unwrap();
         assert_eq!(out.verdict, AdvisoryPanelVerdict::ProceedWithChanges);
         assert!(out.dissent);
-        assert_eq!(out.requirements, vec!["valida input".to_string()]);
+        assert_eq!(
+            out.requirements,
+            vec![Requirement {
+                text: "valida input".to_string(),
+                direction: None
+            }]
+        );
     }
 
     #[test]
@@ -624,8 +734,38 @@ mod tests {
         .unwrap();
         // B compare una sola volta, ordine di prima apparizione.
         assert_eq!(
+            out.requirements.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            vec!["A", "B", "C"]
+        );
+    }
+
+    /// Il difetto reale (30/07/2026): una figura dichiara la direzione nel
+    /// campo strutturato invece di lasciarla indovinare dai verbi a valle.
+    /// La sintesi la porta fino in fondo, e la dedup non la perde.
+    #[test]
+    fn direzione_dichiarata_sopravvive_alla_sintesi() {
+        let requirements = json!([
+            {"text": "Sostituire `port: 33649` con una porta dinamica", "direction": "must_be_absent"},
+            {"text": "Aggiungere `strictPort: false`", "direction": "must_be_present"},
+        ]);
+        let out = compose_advisory_synthesis(
+            &[figure("proceed_with_changes", json!([]), requirements)],
+            &AdvisoryPolicy::default(),
+            AdvisoryRoster::Convened(1),
+        )
+        .unwrap();
+        assert_eq!(
             out.requirements,
-            vec!["A".to_string(), "B".to_string(), "C".to_string()]
+            vec![
+                Requirement {
+                    text: "Sostituire `port: 33649` con una porta dinamica".to_string(),
+                    direction: Some(Direction::DeveMancare),
+                },
+                Requirement {
+                    text: "Aggiungere `strictPort: false`".to_string(),
+                    direction: Some(Direction::DevePresenziare),
+                },
+            ]
         );
     }
 

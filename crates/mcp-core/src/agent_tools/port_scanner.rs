@@ -145,11 +145,29 @@ pub enum PortScanOutcome {
     Reject(Vec<PortFinding>),
 }
 
+/// Provenienza della porta rilevata, valorizzata QUI (nel punto di push, dove
+/// il regex che ha trovato la porta e' noto con certezza) e MAI re-indovinata
+/// a valle da un secondo giudizio testuale sullo snippet (regola L/M): un
+/// consumatore come `security::resource_linter` che rifacesse la domanda "ha
+/// un fallback env?" sul solo testo dello snippet divergerebbe strutturalmente
+/// da questo produttore ogni volta che aggiunge un pattern qui e non li'.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortOrigin {
+    /// La porta e' il valore di FALLBACK di una lettura da env riconosciuta da
+    /// [`DEFAULT_PORT_REGEX`] o [`ENV_FALLBACK_PORT_REGEXES`] (`${VAR:-N}`,
+    /// `process.env.PORT || N`, `env::var(..).unwrap_or(N)`,
+    /// `os.getenv(..) or N`, ...).
+    EnvFallback,
+    /// Porta letterale semplice, senza lettura da env riconosciuta sulla riga.
+    Literal,
+}
+
 #[derive(Debug, Clone)]
 pub struct PortFinding {
     pub line: usize,
     pub port: u32,
     pub snippet: String,
+    pub origin: PortOrigin,
 }
 
 pub async fn is_enforcement_enabled(db: &PgPool) -> bool {
@@ -269,6 +287,7 @@ fn collect_ports(content: &str, keep: impl Fn(u32) -> bool) -> Vec<PortFinding> 
                             line: line_idx + 1,
                             port,
                             snippet: snip(raw_line),
+                            origin: PortOrigin::EnvFallback,
                         });
                     }
                 }
@@ -287,6 +306,7 @@ fn collect_ports(content: &str, keep: impl Fn(u32) -> bool) -> Vec<PortFinding> 
                                 line: line_idx + 1,
                                 port,
                                 snippet: snip(raw_line),
+                                origin: PortOrigin::EnvFallback,
                             });
                         }
                     }
@@ -305,6 +325,7 @@ fn collect_ports(content: &str, keep: impl Fn(u32) -> bool) -> Vec<PortFinding> 
                         line: line_idx + 1,
                         port: *opt,
                         snippet: snip(raw_line),
+                        origin: PortOrigin::Literal,
                     });
                 }
             }
@@ -318,6 +339,7 @@ fn collect_ports(content: &str, keep: impl Fn(u32) -> bool) -> Vec<PortFinding> 
                                 line: line_idx + 1,
                                 port,
                                 snippet: snip(raw_line),
+                                origin: PortOrigin::Literal,
                             });
                         }
                     }

@@ -22,6 +22,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::requirement_conformance::Direction;
+
 /// Cap delle note di run (tail-preserving). Vedi `RUN_NOTES_MAX_CHARS` Python.
 pub const RUN_NOTES_MAX_CHARS: usize = 2400;
 
@@ -279,6 +281,61 @@ fn normalize_risk_list(obj: &serde_json::Map<String, Value>) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// Sanifica la lista `requirements` di `advisory_verdict`. Ogni elemento e' un
+/// oggetto `{text, direction?}` (regola M: la figura dichiara la direzione
+/// ALLA FONTE, punto unico `requirement_conformance::Direction`). `text`
+/// obbligatorio (trim, scarto se vuoto dopo); `direction` letta SOLO se vale
+/// un identificatore canonico (`Direction::parse`) e omessa altrimenti — mai
+/// un default indovinato: a valle, `requirement_conformance::derive_criterion`
+/// degrada onestamente all'euristica sui verbi quando il campo manca, che e'
+/// il comportamento di sempre e non una novita' introdotta qui.
+///
+/// Formato storico (stringa nuda, senza direzione) tollerato in lettura da
+/// [`super::advisory_panel`] per i produttori non ancora aggiornati; questa
+/// funzione — che sanifica l'input GREZZO del modello — emette sempre la
+/// forma oggetto, cosi' il resto della catena vede un'unica forma canonica.
+///
+/// `key` e' parametrico come in [`normalize_string_list`] (stesso motivo: non
+/// e' questa la sede che decide la conformita' dei requisiti — quella e'
+/// `requirement_conformance::requirements_from_synthesis`, sul campo GIA'
+/// composto dalla sintesi — qui si sanifica solo l'input grezzo di UNA figura).
+fn normalize_requirement_list(obj: &serde_json::Map<String, Value>, key: &str) -> Vec<Value> {
+    obj.get(key)
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(normalize_one_requirement)
+                .take(ADVISORY_LIST_CAP)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Un singolo elemento dell'array `requirements` grezzo, sanificato in
+/// funzione propria: tenere il corpo fuori dalla closure di
+/// [`normalize_requirement_list`] evita l'annidamento profondo di due livelli
+/// (iteratore + estrazione campi) sullo stesso corpo.
+fn normalize_one_requirement(r: &Value) -> Option<Value> {
+    let text = r.as_object().and_then(|o| o.get("text")).and_then(Value::as_str)?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut out = serde_json::Map::new();
+    out.insert("text".to_string(), Value::String(text.to_string()));
+    let direction = r
+        .as_object()
+        .and_then(|o| o.get("direction"))
+        .and_then(Value::as_str)
+        .and_then(Direction::parse);
+    if let Some(direction) = direction {
+        out.insert(
+            "direction".to_string(),
+            Value::String(direction.as_str().to_string()),
+        );
+    }
+    Some(Value::Object(out))
+}
+
 /// Cap sul numero di findings accettati (stesso razionale di
 /// [`FILES_TOUCHED_CAP`]: self-report bounded, mai illimitato).
 const FINDINGS_CAP: usize = 50;
@@ -510,7 +567,9 @@ const ADVISORY_LIST_CAP: usize = 30;
 ///
 /// L'output mantiene SEMPRE `verdict` e `summary`; `requirements`/`risks`/
 /// `recommendations` inclusi solo se non vuoti dopo la sanificazione. Ogni
-/// requirement/recommendation e' una stringa non vuota (trim); ogni risk richiede
+/// recommendation e' una stringa non vuota (trim); ogni requirement e' un
+/// oggetto `{text, direction?}` con la direzione dichiarata dalla figura
+/// quando presente (vedi [`normalize_requirement_list`]); ogni risk richiede
 /// `description` non vuota, `severity` fuori enum ricade su `media`, `area`
 /// inclusa solo se non vuota. La forma dell'output e' quella letta dal punto unico
 /// [`super::advisory_panel::compose_advisory_synthesis`] nel campo `advisory`.
@@ -526,7 +585,7 @@ pub fn normalize_advisory_verdict(tool_input: &Value) -> Result<Value, Declarati
         .unwrap_or("")
         .trim()
         .to_string();
-    let requirements = normalize_string_list(obj, "requirements");
+    let requirements = normalize_requirement_list(obj, "requirements");
     let recommendations = normalize_string_list(obj, "recommendations");
     let risks = normalize_risk_list(obj);
     // Veto senza evidenza: rifiutato alla fonte (regola M — il coordinatore non
@@ -1140,13 +1199,22 @@ mod tests {
         let b = normalize_advisory_verdict(&json!({
             "verdict": "block",
             "summary": "manca PKCE",
-            "requirements": [" usa PKCE ", ""],
+            "requirements": [
+                {"text": " usa PKCE ", "direction": "must_be_present"},
+                {"text": ""},
+                {"text": "senza direzione dichiarata"},
+            ],
             "risks": [{"severity": "ALTA", "area": " auth ", "description": " redirect aperto "}],
             "recommendations": ["aggiungi test"]
         }))
         .unwrap();
         assert_eq!(b["verdict"], json!("block"));
-        assert_eq!(b["requirements"], json!(["usa PKCE"]));
+        assert_eq!(b["requirements"], json!([
+                {"text": "usa PKCE", "direction": "must_be_present"},
+                {"text": "senza direzione dichiarata"},
+            ]),
+            "il testo vuoto e' scartato; senza 'direction' valida il campo e' omesso, non indovinato"
+        );
         let r = &b["risks"][0];
         assert_eq!(r["severity"], json!("alta"));
         assert_eq!(r["area"], json!("auth"));
@@ -1179,12 +1247,42 @@ mod tests {
         let out = normalize_advisory_verdict(&json!({
             "verdict": "proceed_with_changes",
             "summary": "quasi",
-            "requirements": ["valida input"]
+            "requirements": [{"text": "valida input", "direction": "must_be_present"}]
         }))
         .unwrap();
         assert_eq!(out["verdict"], json!("proceed_with_changes"));
-        assert_eq!(out["requirements"], json!(["valida input"]));
+        assert_eq!(out["requirements"],
+            json!([{"text": "valida input", "direction": "must_be_present"}])
+        );
         assert!(out.get("risks").is_none());
+    }
+
+    /// Il difetto reale (30/07/2026): un `direction` fuori vocabolario o un
+    /// elemento senza `text` non deve produrre un valore indovinato ne' far
+    /// cadere l'intero parere. `text` mancante/vuoto -> elemento scartato;
+    /// `direction` invalida -> campo omesso (il consumatore a valle degrada
+    /// all'euristica sui verbi, comportamento invariato).
+    ///
+    /// MUTAZIONE: far passare `direction` fuori enum senza normalizzarla
+    /// (usarla cosi' com'e') rende rosso questo test.
+    #[test]
+    fn normalize_advisory_verdict_direzione_fuori_vocabolario_o_assente() {
+        let out = normalize_advisory_verdict(&json!({
+            "verdict": "proceed_with_changes",
+            "summary": "x",
+            "requirements": [
+                {"text": "valore fuori enum", "direction": "delete_it"},
+                {"direction": "must_be_absent"},
+                "formato storico stringa nuda",
+            ]
+        }))
+        .unwrap();
+        assert_eq!(out["requirements"],
+            json!([{"text": "valore fuori enum"}]),
+            "direzione fuori enum omessa, elemento senza 'text' scartato, stringa nuda scartata \
+             (il tool_input grezzo deve gia' essere un oggetto: la tolleranza sul formato storico \
+             vive nel consumatore, non qui)"
+        );
     }
 
     #[test]

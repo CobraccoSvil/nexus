@@ -2875,7 +2875,7 @@ pub(crate) fn render_council_synthesis(s: &AdvisorySynthesis) -> String {
     if !s.requirements.is_empty() {
         out.push_str("Requisiti obbligatori:\n");
         for r in &s.requirements {
-            out.push_str(&format!("- {r}\n"));
+            out.push_str(&format!("- {}\n", r.text));
         }
     }
     if !s.risks.is_empty() {
@@ -2913,7 +2913,7 @@ pub(crate) fn render_multi_provider_synthesis(s: &AdvisorySynthesis) -> String {
     if !s.requirements.is_empty() {
         out.push_str("Requisiti obbligatori convergenti:\n");
         for r in &s.requirements {
-            out.push_str(&format!("- {r}\n"));
+            out.push_str(&format!("- {}\n", r.text));
         }
     }
     if !s.risks.is_empty() {
@@ -7469,11 +7469,11 @@ mod tests {
         assert_eq!(synth.verdict.as_str(), "proceed_with_changes");
         assert_eq!(synth.valid, 2);
         assert_eq!((synth.convened, synth.required_valid), (2, 1));
-        assert!(synth.requirements.iter().any(|r| r == "validare input"));
+        assert!(synth.requirements.iter().any(|r| r.text == "validare input"));
         assert!(synth
             .requirements
             .iter()
-            .any(|r| r == "logging strutturato"));
+            .any(|r| r.text == "logging strutturato"));
     }
 
     #[test]

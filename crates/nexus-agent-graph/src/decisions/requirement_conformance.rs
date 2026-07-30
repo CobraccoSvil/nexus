@@ -117,6 +117,16 @@ impl Direction {
             Self::DevePresenziare => "must_be_present",
         }
     }
+
+    /// Riconosce l'identificatore canonico (regola N). `None` fuori
+    /// vocabolario: mai un default indovinato, ne' qui ne' nel chiamante.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "must_be_absent" => Some(Self::DeveMancare),
+            "must_be_present" => Some(Self::DevePresenziare),
+            _ => None,
+        }
+    }
 }
 
 /// La domanda meccanica derivata da UN requisito: "il letterale L compare (o non
@@ -459,20 +469,14 @@ const MAX_RILIEVI: usize = 8;
 ///
 /// Legge il campo `requirements` e SOLO quello: `recommendations` e' l'altra
 /// lista, e una raccomandazione non applicata non e' uno scostamento (vedi doc di
-/// modulo). Vuoto se il campo manca o non e' un array di stringhe.
-pub fn requirements_from_synthesis(synthesis: &Value) -> Vec<String> {
-    synthesis
-        .get(CAMPO_REQUISITI)
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+/// modulo). Delega al parser unico [`super::advisory_panel::requirement_list`]
+/// (regola L): e' lo STESSO formato `{text, direction?}` — o stringa nuda,
+/// storico — che quella funzione gia' sa leggere per il livello sotto (il
+/// parere grezzo di UNA figura); qui il `Value` e' quello, gia' composto,
+/// della sintesi intera dopo l'andata e ritorno attraverso `state.extra`.
+/// Vuoto se il campo manca o non e' un array.
+pub fn requirements_from_synthesis(synthesis: &Value) -> Vec<super::advisory_panel::Requirement> {
+    super::advisory_panel::requirement_list(synthesis, CAMPO_REQUISITI)
 }
 
 /// Verbi che indicano "questo deve sparire".
@@ -499,7 +503,19 @@ const VERBI_PRESENZA: &[&str] = &[
 ///
 /// Non "legge lo stato tecnico dal testo" (lo vieta la regola M): costruisce la
 /// DOMANDA da porre al file. La risposta arriva solo da [`judge`], sul contenuto.
-pub fn derive_criterion(text: &str) -> Result<RequirementCriterion, Unverifiable> {
+///
+/// `declared_direction` e' la direzione dichiarata dalla figura ALLA FONTE
+/// (campo strutturato `advisory_verdict.requirements[].direction`, regola M):
+/// quando presente VINCE su [`direzione`], che resta l'euristica sui verbi
+/// solo per i requisiti senza dichiarazione (formato storico, o produttore
+/// che non l'ha valorizzata). E' la correzione del bug reale (30/07/2026):
+/// "Sostituire `port: 33649`" contiene solo verbi di presenza per
+/// l'euristica, che da sola lo leggerebbe come "deve presenziare" invertendo
+/// il verdetto su un requisito di rimozione.
+pub fn derive_criterion(
+    text: &str,
+    declared_direction: Option<Direction>,
+) -> Result<RequirementCriterion, Unverifiable> {
     let backticked = estrai_backtick(text);
     // I path si cercano PRIMA fra i letterali in backtick (e' li' che una figura
     // scrive un percorso), poi nel testo nudo: "Modificare vite.config.js per
@@ -534,7 +550,9 @@ pub fn derive_criterion(text: &str) -> Result<RequirementCriterion, Unverifiable
         _ => return Err(Unverifiable::PiuLetterali),
     };
 
-    let direction = direzione(text).ok_or(Unverifiable::DirezioneAssente)?;
+    let direction = declared_direction
+        .or_else(|| direzione(text))
+        .ok_or(Unverifiable::DirezioneAssente)?;
     Ok(RequirementCriterion {
         path,
         literal,
@@ -603,15 +621,18 @@ pub fn judge(criterion: &RequirementCriterion, evidence: &FileEvidence) -> Requi
 /// `leggi` e' il confine I/O parametrizzato: riceve il path relativo dichiarato
 /// dal requisito e ritorna il fatto. Il chiamante decide come leggere (e con
 /// quali limiti); qui si decide solo cosa significhi cio' che ha letto.
-pub fn compose_conformance<F>(requirements: &[String], mut leggi: F) -> ConformanceReport
+pub fn compose_conformance<F>(
+    requirements: &[super::advisory_panel::Requirement],
+    mut leggi: F,
+) -> ConformanceReport
 where
     F: FnMut(&str) -> FileEvidence,
 {
     let verdicts = requirements
         .iter()
-        .map(|req| match derive_criterion(req) {
+        .map(|req| match derive_criterion(&req.text, req.direction) {
             Err(motivo) => RequirementVerdict {
-                requirement: req.clone(),
+                requirement: req.text.clone(),
                 criterion: None,
                 outcome: RequirementOutcome::NonVerificabile { motivo },
             },
@@ -619,7 +640,7 @@ where
                 let evidence = leggi(&criterion.path);
                 let outcome = judge(&criterion, &evidence);
                 RequirementVerdict {
-                    requirement: req.clone(),
+                    requirement: req.text.clone(),
                     criterion: Some(criterion),
                     outcome,
                 }
@@ -633,12 +654,14 @@ where
 /// progetto. Esiste come funzione (e non come "salta la verifica") perche' il
 /// silenzio e' proprio il difetto: un run senza progetto deve dire che non ha
 /// guardato, non far credere che sia tutto a posto.
-pub fn conformance_senza_progetto(requirements: &[String]) -> ConformanceReport {
+pub fn conformance_senza_progetto(
+    requirements: &[super::advisory_panel::Requirement],
+) -> ConformanceReport {
     ConformanceReport {
         verdicts: requirements
             .iter()
             .map(|req| RequirementVerdict {
-                requirement: req.clone(),
+                requirement: req.text.clone(),
                 criterion: None,
                 outcome: RequirementOutcome::NonVerificabile {
                     motivo: Unverifiable::ProgettoAssente,
@@ -844,7 +867,13 @@ mod tests {
         "Aggiungere un health probe che verifichi la disponibilita' della porta prima dell'avvio";
 
     fn criterio(text: &str) -> RequirementCriterion {
-        derive_criterion(text).expect("criterio derivabile")
+        derive_criterion(text, None).expect("criterio derivabile")
+    }
+
+    /// Come [`criterio`], ma con la direzione dichiarata dalla figura (le
+    /// nuove regressioni del 30/07/2026 la esercitano esplicitamente).
+    fn criterio_con_direzione(text: &str, direction: Direction) -> RequirementCriterion {
+        derive_criterion(text, Some(direction)).expect("criterio derivabile")
     }
 
     /// Il caso (a) della regola O: un requisito APPLICATO risulta soddisfatto.
@@ -893,9 +922,12 @@ mod tests {
     #[test]
     fn requisito_descrittivo_risulta_non_verificabile() {
         // Nessun file nominato: la domanda non e' nemmeno formulabile.
-        assert_eq!(derive_criterion(REQ_DESCRITTIVO), Err(Unverifiable::NessunFile));
+        assert_eq!(
+            derive_criterion(REQ_DESCRITTIVO, None),
+            Err(Unverifiable::NessunFile)
+        );
 
-        let report = compose_conformance(&[REQ_DESCRITTIVO.to_string()], |_| {
+        let report = compose_conformance(&[REQ_DESCRITTIVO.into()], |_| {
             panic!("non si legge alcun file per un requisito non formulabile")
         });
         assert_eq!(report.unverifiable(), 1);
@@ -1007,30 +1039,126 @@ mod tests {
         assert_eq!(criterio(&req_rimozione()).direction, Direction::DeveMancare);
     }
 
+    /// Il difetto reale (30/07/2026): "Sostituire `port: 33649`" (senza
+    /// "rimuovere") contiene SOLO verbi di presenza per l'euristica — "sostitu"
+    /// e' in `VERBI_PRESENZA` — che da sola lo leggerebbe come
+    /// `DevePresenziare`, invertendo il verdetto su un requisito di rimozione.
+    /// La figura dichiara la direzione alla FONTE: il criterio derivato segue
+    /// la dichiarazione, non il verbo.
+    ///
+    /// MUTAZIONE: ignorare `declared_direction` in [`derive_criterion`]
+    /// (tornare sempre a [`direzione`]) rende rosso questo test con
+    /// `Direction::DevePresenziare`.
+    #[test]
+    fn direzione_dichiarata_vince_sul_verbo_ambiguo() {
+        let solo_verbo_presenza =
+            "Sostituire `port: 33649` in `frontend/vite.config.js` con un valore dinamico";
+        // Prova che il testo nudo, senza dichiarazione, e' il difetto: lo
+        // legge come presenza perche' "sostitu" e' classificato li'.
+        assert_eq!(
+            derive_criterion(solo_verbo_presenza, None)
+                .expect("criterio derivabile")
+                .direction,
+            Direction::DevePresenziare,
+            "senza dichiarazione l'euristica sui soli verbi legge (erroneamente) presenza"
+        );
+        assert_eq!(
+            criterio_con_direzione(solo_verbo_presenza, Direction::DeveMancare).direction,
+            Direction::DeveMancare,
+            "la direzione dichiarata dalla figura vince sul verbo ambiguo"
+        );
+    }
+
+    /// Il verso opposto: un testo senza alcun verbo riconosciuto (oggi
+    /// `DirezioneAssente`) diventa verificabile grazie alla direzione
+    /// dichiarata — la dichiarazione non serve solo a CORREGGERE un verbo
+    /// sbagliato, basta anche da SOLA quando l'euristica non troverebbe nulla.
+    #[test]
+    fn direzione_dichiarata_di_presenza_e_rispettata() {
+        let senza_verbo_riconosciuto = "Il file `vite.config.js` deve avere `strictPort: false`";
+        assert_eq!(
+            derive_criterion(senza_verbo_riconosciuto, None),
+            Err(Unverifiable::DirezioneAssente),
+            "senza dichiarazione e senza verbo riconosciuto resta ambiguo"
+        );
+        let c = criterio_con_direzione(senza_verbo_riconosciuto, Direction::DevePresenziare);
+        assert_eq!(c.direction, Direction::DevePresenziare);
+    }
+
+    /// Catena intera (regola O): la figura dichiara la direzione nel campo
+    /// strutturato del tool `advisory_verdict`, la sintesi del Consiglio la
+    /// porta fino al riscontro finale senza che nessun punto in mezzo debba
+    /// indovinarla dai verbi. Il testo e' la forma esatta del bug reale.
+    #[test]
+    fn la_direzione_dichiarata_attraversa_la_sintesi_del_consiglio() {
+        use super::super::advisory_panel::{
+            compose_advisory_synthesis, AdvisoryPolicy, AdvisoryRoster,
+        };
+        let testo = "Sostituire `port: 33649` in `frontend/vite.config.js` con una porta dinamica";
+        let parere = serde_json::json!({
+            "success": true,
+            "advisory": {
+                "verdict": "block",
+                "risks": [{"description": "porta fissa in conflitto"}],
+                "requirements": [{"text": testo, "direction": "must_be_absent"}],
+                "recommendations": [],
+            }
+        });
+        let synth = compose_advisory_synthesis(
+            &[parere],
+            &AdvisoryPolicy::default(),
+            AdvisoryRoster::Convened(1),
+        )
+        .expect("sintesi composta");
+
+        let reqs = requirements_from_synthesis(&synth.to_value());
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].direction, Some(Direction::DeveMancare));
+
+        // Porta fissa RIMOSSA: applicato.
+        let report_ok = compose_conformance(&reqs, |_| {
+            FileEvidence::Contenuto("export default { server: { port: process.env.PORT } }".into())
+        });
+        assert_eq!(report_ok.satisfied(), 1);
+
+        // Porta fissa ANCORA presente: non applicato (e non "presente per
+        // errore", come l'euristica sui soli verbi avrebbe concluso).
+        let report_ko = compose_conformance(&reqs, |_| {
+            FileEvidence::Contenuto("export default { server: { port: 33649 } }".into())
+        });
+        assert_eq!(report_ko.violated(), 1);
+    }
+
     /// L'ambiguita' non si risolve tirando a indovinare: piu' file o piu'
     /// letterali distinti -> non verificabile col motivo dichiarato.
     #[test]
     fn ambiguita_dichiarata_non_indovinata() {
         assert_eq!(
-            derive_criterion("Rimuovere `port: 1` da `a/vite.config.js` e da `b/vite.config.js`"),
+            derive_criterion(
+                "Rimuovere `port: 1` da `a/vite.config.js` e da `b/vite.config.js`",
+                None
+            ),
             Err(Unverifiable::PiuFile)
         );
         assert_eq!(
-            derive_criterion("In `vite.config.js` sostituire `port: 3` con `process.env.PORT`"),
+            derive_criterion(
+                "In `vite.config.js` sostituire `port: 3` con `process.env.PORT`",
+                None
+            ),
             Err(Unverifiable::PiuLetterali),
             "due letterali con direzioni opposte: quale valga sarebbe un'ipotesi"
         );
         assert_eq!(
-            derive_criterion("Il file `vite.config.js` contiene `port: 3`"),
+            derive_criterion("Il file `vite.config.js` contiene `port: 3`", None),
             Err(Unverifiable::DirezioneAssente),
             "senza un verbo non si sa cosa ci si aspetti di trovare"
         );
         assert_eq!(
-            derive_criterion("Rimuovere `port: 1` da `/etc/nexus/vite.config.js`"),
+            derive_criterion("Rimuovere `port: 1` da `/etc/nexus/vite.config.js`", None),
             Err(Unverifiable::PathFuoriProgetto)
         );
         assert_eq!(
-            derive_criterion("Rimuovere `port: 1` da `../altro/vite.config.js`"),
+            derive_criterion("Rimuovere `port: 1` da `../altro/vite.config.js`", None),
             Err(Unverifiable::PathFuoriProgetto)
         );
     }
@@ -1061,9 +1189,9 @@ mod tests {
         .expect("sintesi composta");
 
         let reqs = requirements_from_synthesis(&synth.to_value());
-        assert_eq!(reqs, vec![req_rimozione()]);
+        assert_eq!(reqs, vec![req_rimozione().into()]);
         assert!(
-            !reqs.iter().any(|r| r == REQ_DESCRITTIVO),
+            !reqs.iter().any(|r| r.text == REQ_DESCRITTIVO),
             "una raccomandazione non applicata non e' uno scostamento"
         );
     }
@@ -1072,7 +1200,7 @@ mod tests {
     /// distingue "verificato, conforme" da "nessuno ha guardato".
     #[test]
     fn la_nota_dichiara_anche_la_conformita() {
-        let report = compose_conformance(&[req_rimozione()], |_| {
+        let report = compose_conformance(&[req_rimozione().into()], |_| {
             FileEvidence::Contenuto("server: { port: process.env.PORT }".into())
         });
         let nota = report.nota().expect("una nota c'e'");
@@ -1090,9 +1218,9 @@ mod tests {
     fn nota_separa_scostamenti_e_non_verificabili() {
         let report = compose_conformance(
             &[
-                req_rimozione(),
-                REQ_DESCRITTIVO.to_string(),
-                REQ_PRESENZA.to_string(),
+                req_rimozione().into(),
+                REQ_DESCRITTIVO.into(),
+                REQ_PRESENZA.into(),
             ],
             |path| match path {
                 // La porta fissa e' ancora li'.
@@ -1124,7 +1252,7 @@ mod tests {
     /// esiste, con tutti i requisiti dichiarati non verificabili.
     #[test]
     fn senza_progetto_il_report_lo_dichiara() {
-        let report = conformance_senza_progetto(&[req_rimozione()]);
+        let report = conformance_senza_progetto(&[req_rimozione().into()]);
         assert_eq!(report.unverifiable(), 1);
         assert_eq!(report.satisfied(), 0);
         let nota = report.nota().expect("una nota c'e'");

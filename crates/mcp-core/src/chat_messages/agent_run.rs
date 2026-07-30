@@ -2825,17 +2825,24 @@ async fn render_automation_instructions(state: &AppState, mode: &AutomationMode)
     }
 }
 
+/// Il gate di `render_test_instructions`, isolato come funzione PURA per
+/// essere testato senza DB (regola O: e' il gate che il bug reale del
+/// 30/07/2026 rendeva sbagliato, non il rendering del corpo). Legge i segnali
+/// STRUTTURATI del classifier di intent (Livello 4 NLU), mai un
+/// `contains("test")` sul testo del messaggio: quel confronto matchava anche
+/// "contesto", "protesta", "latest", iniettando la direttiva TDD su turni che
+/// non la richiedevano. `intent == "test"` copre "scrivi test per X";
+/// `target_type == "tests"` copre anche "esegui i test e correggi i fail"
+/// (intent=debug, target_type=tests).
+fn is_test_fix_test_intent(intent: &str, target_type: &str) -> bool {
+    intent == "test" || target_type == "tests"
+}
+
 /// Istruzioni TDD per cicli test-fix-test iterativi. La direttiva viene dal DB
-/// (regola G/L): il gate (intent di test) resta strutturale, solo il testo vive
-/// in system.test_fix_test_directive.
-async fn render_test_instructions(state: &AppState, content: &str) -> String {
-    let l = content.to_lowercase();
-    let is_test_intent = l.contains("test")
-        || l.contains("testa")
-        || l.contains("verifica che funzion")
-        || l.contains("tdd")
-        || l.contains("fai passare");
-    if is_test_intent {
+/// (regola G/L): il gate ([`is_test_fix_test_intent`]) resta strutturale,
+/// solo il testo vive in system.test_fix_test_directive.
+async fn render_test_instructions(state: &AppState, intent: &str, target_type: &str) -> String {
+    if is_test_fix_test_intent(intent, target_type) {
         let body = crate::prompt_templates::get_template_or_default(
             &state.db,
             &state.template_cache,
@@ -2845,6 +2852,38 @@ async fn render_test_instructions(state: &AppState, content: &str) -> String {
         format!("\n{body}\n")
     } else {
         String::new()
+    }
+}
+
+#[cfg(test)]
+mod tests_test_fix_test_gate {
+    use super::is_test_fix_test_intent;
+
+    /// Il difetto reale (30/07/2026): il vecchio gate cercava "test" come
+    /// substring nel TESTO del messaggio utente, quindi "conTESTo",
+    /// "proTESTa", "laTEST" bastavano a iniettare la direttiva TDD. Il nuovo
+    /// gate non riceve nemmeno piu' il testo del messaggio: legge SOLO
+    /// `intent`/`target_type` strutturati, quindi il falso positivo e'
+    /// impossibile per costruzione, non solo evitato da un pattern migliore.
+    ///
+    /// MUTAZIONE: far tornare `is_test_fix_test_intent` a leggere `.contains`
+    /// su un testo grezzo invece che confrontare `intent`/`target_type` per
+    /// uguaglianza fa rosseggiare questo test sul primo caso (`"chat"` con
+    /// `target_type="code"` non deve mai attivare il gate).
+    #[test]
+    fn gate_da_segnali_strutturati_non_da_substring_nel_testo() {
+        // Nessuna combinazione intent/target_type "innocua" attiva il gate,
+        // qualunque cosa il messaggio originale contenesse alla lettera.
+        assert!(!is_test_fix_test_intent("chat", "code"));
+        assert!(!is_test_fix_test_intent("docs", "docs"));
+        assert!(!is_test_fix_test_intent("architecture", "service"));
+        // intent=test copre "scrivi test per X" (action_verb=write).
+        assert!(is_test_fix_test_intent("test", "code"));
+        // target_type=tests copre "esegui i test e correggi i fail" (intent
+        // resta debug/fix, ma il BERSAGLIO e' l'area test): il ciclo
+        // test-fix-test si applica comunque.
+        assert!(is_test_fix_test_intent("debug", "tests"));
+        assert!(is_test_fix_test_intent("fix", "tests"));
     }
 }
 
@@ -4417,7 +4456,8 @@ pub(crate) async fn spawn_agent_run(
     // Istruzioni per modalita' automazione e TDD: vedi i rispettivi helper.
     let automation_instructions =
         render_automation_instructions(&state, &params.automation_mode).await;
-    let test_instructions = render_test_instructions(&state, &params.content).await;
+    let test_instructions =
+        render_test_instructions(&state, classified.intent, &classified.slots.target_type).await;
 
     // Istruzioni specifiche per-progetto (auto-generate da analyze_project o modificate manualmente)
     let project_custom_instructions = custom_instructions_opt
