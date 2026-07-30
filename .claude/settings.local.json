@@ -74,7 +74,27 @@
       "Read(//c/Users/CBRAC/.ssh//**)",
       "Bash(find D:/Sviluppo/IDEAI -name deploy* -o -name Makefile -o -name *.sh)",
       "Bash(ssh-add -l)",
-      "mcp__Claude_in_Chrome__computer"
+      "mcp__Claude_in_Chrome__computer",
+      "PowerShell(git -C $w diff --cached --name-status)",
+      "PowerShell(git -C $w diff --name-status)",
+      "PowerShell(git -C $w ls-files --others --exclude-standard)",
+      "PowerShell($w=\"D:\\\\IDEAI-worktrees\\\\objective-margulis-7da85c\")",
+      "Bash(export GIT_DIR=\"D:/IDEAI/.git/worktrees/objective-margulis-7da85c\")",
+      "Read(//d/IDEAI-worktrees/objective-margulis-7da85c/**)",
+      "Bash(bash scripts/check-hook-tree.sh)",
+      "Bash(bash /d/IDEAI-worktrees/objective-margulis-7da85c/scripts/check-hook-tree.sh)",
+      "Bash(echo \"exit=$?\")",
+      "PowerShell(git -C D:\\\\IDEAI log -2 --format='%B%n---FINE---')",
+      "PowerShell(Select-String -Path \"D:\\\\IDEAI\\\\.git\\\\hooks\\\\pre-commit\" -Pattern 'lefthookrc|^\\\\. ' -SimpleMatch:$false)",
+      "PowerShell(Select-String -Path \"D:\\\\IDEAI\\\\.git\\\\hooks\\\\commit-msg\" -Pattern 'lefthookrc|^\\\\. ' -SimpleMatch:$false)",
+      "PowerShell(foreach \\($u in @\\('Administrator','Public','CBRAC'\\)\\) { $b = \"C:\\\\Users\\\\$u\"; Write-Output \"=== $u ===\"; try { Get-ChildItem $b -Force -ErrorAction Stop | Where-Object { $_.Name -match 'claude|\\\\.claude' } | Select-Object -ExpandProperty FullName } catch { Write-Output \"ACCESSO NEGATO/ASSENTE: $\\($_.Exception.Message\\)\" } })",
+      "PowerShell($p=\"C:\\\\Users\\\\CBRAC\\\\AppData\\\\Roaming\\\\Claude\\\\claude-code-sessions\"; Get-ChildItem $p -Force | Select-Object Name, Mode, Length, LastWriteTime | Sort-Object LastWriteTime -Descending | Select-Object -First 30; Write-Output \"TOT: $\\(\\(Get-ChildItem $p -Recurse -Force -File\\).Count\\) file\")",
+      "PowerShell($base=\"C:\\\\Users\\\\CBRAC\\\\AppData\\\\Roaming\\\\Claude\\\\claude-code-sessions\"; foreach \\($d in Get-ChildItem $base -Directory\\) { Write-Output \"=== $\\($d.Name\\) ===\"; Get-ChildItem $d.FullName -Recurse -File | Group-Object { $_.Directory.Name } | Select-Object Name, Count | Select-Object -First 15 })",
+      "PowerShell($d=\"C:\\\\Users\\\\CBRAC\\\\AppData\\\\Roaming\\\\Claude\\\\claude-code-sessions\\\\4ee30d78-849a-4672-8f93-61f966c3768a\\\\59f48461-d2a2-4c5b-b866-83e20628854a\"; Get-ChildItem $d -File | Sort-Object LastWriteTime -Descending | Select-Object Name, @{n='KB';e={[math]::Round\\($_.Length/1KB\\)}}, LastWriteTime | Select-Object -First 25)",
+      "PowerShell($d=\"C:\\\\Users\\\\CBRAC\\\\AppData\\\\Roaming\\\\Claude\\\\claude-code-sessions\\\\7fefe91c-19db-4462-82d5-8edabbb57fdd\\\\76e4d625-f713-48d8-8595-5c8bda245f5b\"; Get-ChildItem $d -File | Select-Object Name, @{n='KB';e={[math]::Round\\($_.Length/1KB\\)}}, LastWriteTime; Write-Output \"---contenuto del piu' recente---\"; $f = Get-ChildItem $d -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1; $j = Get-Content $f.FullName -Raw | ConvertFrom-Json; $j | Select-Object sessionId, cliSessionId, cwd, title, model, createdAt, lastActivityAt, isArchived | ConvertTo-Json)",
+      "PowerShell(git -C D:\\\\IDEAI show --stat --format=\"%s\" 15806936)",
+      "PowerShell(git -C D:\\\\IDEAI log --oneline cae81f22..main)",
+      "Bash(cd /d/IDEAI-worktrees/keen-snyder-44bc6b/crates/mcp-core/src/nexus_builtin && echo \"=== come e fatto il catalogo ===\" && grep -n \"dispatch_catalog_tool\" mod.rs | head -5 && echo \"=== forma delle voci ===\" && grep -n 'catalog\\\\|=> {' mod.rs | sed -n '1,20p')"
     ]
   },
   "hooks": {
