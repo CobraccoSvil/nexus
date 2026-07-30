@@ -127,7 +127,7 @@ pub use adversarial_review::{
 };
 pub use advisory_panel::{
     compose_advisory_synthesis, AdvisoryPanelVerdict, AdvisoryPolicy, AdvisoryRoster,
-    AdvisorySynthesis, AdvisoryVerdict,
+    AdvisorySynthesis, AdvisoryVerdict, Requirement,
 };
 pub use clarify_signature::{clarify_signature, normalize_question};
 pub use context_reduction::{
@@ -142,7 +142,8 @@ pub use correction_progress::{
 };
 pub use requirement_conformance::{
     compose_conformance, conformance_senza_progetto, requirements_from_synthesis,
-    ConformanceReport, FileEvidence, RequirementCriterion, RequirementOutcome, RequirementVerdict,
+    ConformanceReport, Direction, FileEvidence, RequirementCriterion, RequirementOutcome,
+    RequirementVerdict,
 };
 pub use dag_scheduler::{
     compute_ready_layer, descendants, pick_next_todo, should_parallelize, DagConfig, Todo,
