@@ -360,6 +360,17 @@ pub struct LlmUsage {
     /// Token LETTI dalla cache di prompt (Anthropic `cache_read_input_tokens`):
     /// risparmio della KV-cache. `None` se il provider non la espone.
     pub cache_read_tokens: Option<i64>,
+    /// Token di ragionamento che il provider NON conta in `completion_tokens`
+    /// (oggi il solo Google). Non e' un dettaglio come i due campi di cache: e'
+    /// un ADDENDO che si paga alla tariffa di output, e chi calcola un costo lo
+    /// somma dal punto unico
+    /// `nexus_types::token_usage::completion_tokens_billable`.
+    ///
+    /// Resta fuori da `completion_tokens` — che misura il testo PRODOTTO e ha
+    /// consumatori che lo leggono come tale — e fuori da `total_tokens`, che
+    /// misura il CONTESTO: il ragionamento consuma il tetto di output del turno
+    /// ma non torna nella finestra del turno seguente.
+    pub reasoning_tokens: Option<i64>,
     /// Costo del turno in USD calcolato dal gateway (`compute_turn_cost`). `None`
     /// se non calcolato. Il nodo lo legge gia' pronto, non lo calcola.
     pub total_cost_usd: Option<f64>,

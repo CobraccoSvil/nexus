@@ -31,7 +31,7 @@ use crate::provider::{ChunkStream, LlmProvider};
 use crate::providers::openai_compat::parse_models_response;
 use crate::types::{
     LlmRequest, LlmResponse, LlmStreamChunk, LlmToolCall, LlmUsage, MessageContent,
-    PromptCacheReporting, SensitivityTier, ToolFunctionCall,
+    PromptCacheReporting, ReasoningTokens, SensitivityTier, ToolFunctionCall,
 };
 
 /// Tier ammessi: pubblico/interno/confidenziale (mai tier 3, riservato a onprem).
@@ -797,6 +797,9 @@ fn from_anthropic_message(
             resp.usage.output_tokens,
             resp.usage.cache_read_input_tokens,
             resp.usage.cache_creation_input_tokens,
+            // L'`output_tokens` di Anthropic comprende gia' i token di extended
+            // thinking: non c'e' un secondo addendo da sommare.
+            ReasoningTokens::IncludedInOutput,
         ),
         model_used,
         provider_used: "anthropic".to_string(),
@@ -1012,6 +1015,7 @@ impl AnthropicSseParser {
                         self.output_tokens,
                         self.cache_read_tokens,
                         self.cache_creation_tokens,
+                        ReasoningTokens::IncludedInOutput, // come sopra: gia' dentro
                     )),
                     provider_used: Some("anthropic".to_string()),
                     model_used: Some(self.model_used.clone()),

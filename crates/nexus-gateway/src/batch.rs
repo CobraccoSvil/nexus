@@ -27,7 +27,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    LlmRequest, LlmResponse, LlmToolCall, LlmUsage, PromptCacheReporting, ToolFunctionCall,
+    LlmRequest, LlmResponse, LlmToolCall, LlmUsage, PromptCacheReporting, ReasoningTokens,
+    ToolFunctionCall,
 };
 
 /// Versione API Messages richiesta dall'header `anthropic-version`. Allineata al
@@ -393,6 +394,9 @@ fn result_line_to_item(line: AnthropicResultLine) -> BatchResultItem {
                     message.usage.output_tokens,
                     message.usage.cache_read_input_tokens,
                     message.usage.cache_creation_input_tokens,
+                    // Come nel percorso sincrono: Anthropic conta il thinking
+                    // dentro `output_tokens`.
+                    ReasoningTokens::IncludedInOutput,
                 ),
                 model_used: message.model.unwrap_or_default(),
                 provider_used: "anthropic".to_string(),

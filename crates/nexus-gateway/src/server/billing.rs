@@ -203,9 +203,15 @@ pub async fn record_media_usage_to_ledger(
 /// Dalla `LlmUsage` (gia' normalizzata dall'adapter al prompt LORDO, vedi
 /// `LlmUsage::normalized`) ai token che il ledger registra e il listino tariffa.
 ///
-/// Trasporto e basta: i due contratti hanno la stessa convenzione — prompt
+/// Quasi trasporto: i due contratti hanno la stessa convenzione sul prompt —
 /// lordo, cache come sottoinsieme — e lo scorporo lo fa `nexus-pricing` al
 /// momento di moltiplicare per le tariffe.
+///
+/// L'unica cosa che qui si DECIDE e' l'output, perche' i due contratti non
+/// coincidono: la `LlmUsage` tiene distinto il testo prodotto dal ragionamento
+/// riportato a parte (Google), il ledger vuole cio' che si paga. La somma passa
+/// dal punto unico `nexus_types::token_usage::completion_tokens_billable`, lo
+/// stesso che usa mcp-core per il costo del turno.
 ///
 /// PUNTO UNICO della conversione (regola L): e' l'unico passaggio fra il
 /// contratto del gateway e quello della contabilita'. Prima le due quantita' di
@@ -215,7 +221,10 @@ pub async fn record_media_usage_to_ledger(
 fn token_usage_from(usage: &crate::types::LlmUsage) -> TokenUsage {
     TokenUsage {
         prompt_tokens: usage.input_tokens as i64,
-        completion_tokens: usage.output_tokens as i64,
+        completion_tokens: nexus_types::token_usage::completion_tokens_billable(
+            usage.output_tokens,
+            usage.reasoning_tokens,
+        ) as i64,
         cache_read_tokens: usage.cache_read_tokens.unwrap_or(0) as i64,
         cache_creation_tokens: usage.cache_creation_tokens.unwrap_or(0) as i64,
     }
@@ -319,6 +328,7 @@ mod tests {
             20,
             Some(900),
             Some(50),
+            crate::types::ReasoningTokens::IncludedInOutput,
         );
         let t = token_usage_from(&anthropic);
         assert_eq!(t.prompt_tokens, 1_050, "il wire era al netto: 100+900+50");
@@ -333,6 +343,7 @@ mod tests {
             20,
             Some(900),
             None,
+            crate::types::ReasoningTokens::IncludedInOutput,
         );
         let t = token_usage_from(&openai);
         assert_eq!(t.prompt_tokens, 1_000, "il wire era gia' lordo");
@@ -340,6 +351,43 @@ mod tests {
         // Il totale resta 1.020 come prima di questo lavoro: la serie storica
         // di quote e report non ha un gradino al deploy.
         assert_eq!(t.total_tokens(), 1_020);
+    }
+
+    /// L'output che si paga non e' sempre quello che si legge.
+    ///
+    /// Su Google il ragionamento e' riportato FUORI da `candidatesTokenCount` e
+    /// va sommato qui; su tutti gli altri e' gia' dentro il conteggio del wire e
+    /// sommarlo sarebbe un doppio addebito. La distinzione la porta il tipo che
+    /// l'adapter dichiara, e questa e' l'unica funzione che la traduce in un
+    /// numero fatturabile.
+    #[test]
+    fn il_ragionamento_riportato_a_parte_entra_nel_fatturabile() {
+        // Google, dal produttore: 3 token visibili e 157 di pensiero (misura
+        // reale su gemini-2.5-flash).
+        let google = crate::types::LlmUsage::normalized(
+            crate::types::PromptCacheReporting::CachedIncludedInPrompt,
+            19,
+            3,
+            None,
+            None,
+            crate::types::ReasoningTokens::Separate(Some(157)),
+        );
+        assert_eq!(google.output_tokens, 3, "il VISIBILE resta distinto");
+        let t = token_usage_from(&google);
+        assert_eq!(t.completion_tokens, 160, "si paga il visibile piu' il pensiero");
+        assert_eq!(t.total_tokens(), 179, "e ricompone il totale di Google");
+
+        // Anthropic/OpenAI: il thinking e' gia' dentro `output_tokens`. Sommarlo
+        // qui lo conterebbe due volte.
+        let incluso = crate::types::LlmUsage::normalized(
+            crate::types::PromptCacheReporting::CachedIncludedInPrompt,
+            19,
+            160,
+            None,
+            None,
+            crate::types::ReasoningTokens::IncludedInOutput,
+        );
+        assert_eq!(token_usage_from(&incluso).completion_tokens, 160);
     }
 
     /// La CONSEGUENZA sul costo, sulla stessa strada del ledger: con la tariffa
@@ -360,6 +408,7 @@ mod tests {
             0,
             Some(900_000),
             None,
+            crate::types::ReasoningTokens::IncludedInOutput,
         );
         let tokens = token_usage_from(&usage);
         let costo = calculate_cost_breakdown(&price, &tokens);
@@ -450,6 +499,7 @@ mod tests {
                 400_000,
                 Some(2_000_000),
                 Some(500_000),
+                crate::types::ReasoningTokens::IncludedInOutput,
             ),
             model_used: "claude-x".to_string(),
             provider_used: "anthropic".to_string(),

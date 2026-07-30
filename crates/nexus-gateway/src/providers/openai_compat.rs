@@ -27,7 +27,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::provider::ChunkStream;
 use crate::types::{
     GeneratedImage, ImageGenResponse, LlmRequest, LlmResponse, LlmStreamChunk, LlmToolCall,
-    LlmUsage, MessageContent, PromptCacheKeying, PromptCacheReporting, ToolCallDelta,
+    LlmUsage, MessageContent, PromptCacheKeying, PromptCacheReporting, ReasoningTokens,
+    ToolCallDelta,
     ToolCallDeltaFunction, ToolFunctionCall, TranscribeResponse,
 };
 
@@ -1107,6 +1108,11 @@ fn from_chat_completion(
         // Nessun dialetto OpenAI-compatibile espone un costo di SCRITTURA della
         // cache: il caching e' automatico e il miss paga la tariffa input piena.
         None,
+        // Nel dialetto OpenAI il ragionamento e' DENTRO `completion_tokens`
+        // (`completion_tokens_details.reasoning_tokens` ne e' il dettaglio, non
+        // un addendo): vale per o1/o3, per il `reasoning_content` DeepSeek e per
+        // ogni compatibile. Sommarlo qui raddoppierebbe l'addebito.
+        ReasoningTokens::IncludedInOutput,
     );
 
     // Citazioni top-level (Perplexity): estratte prima di costruire la risposta.
@@ -1154,6 +1160,8 @@ fn chunk_from_sse(
             u.completion_tokens,
             u.cached_input_tokens(),
             None,
+            // Come nel non-streaming: gia' dentro `completion_tokens`.
+            ReasoningTokens::IncludedInOutput,
         )
     });
 

@@ -44,9 +44,40 @@ pub fn prompt_tokens_gross(
         .saturating_add(cache_creation_tokens.unwrap_or(0))
 }
 
+/// Output FATTURABILE: il testo prodotto piu' il ragionamento che il provider
+/// tiene FUORI dal proprio conteggio di output.
+///
+/// PUNTO UNICO (regola L) della somma, per la stessa ragione di
+/// `prompt_tokens_gross`: la pongono i due lati del sistema — il gateway quando
+/// scrive la riga di ledger, mcp-core quando calcola il costo del turno che
+/// alimenta il freno di spesa del run — e due copie divergerebbero.
+///
+/// Il verso lo decide l'adapter, che e' l'unico a conoscere il formato che
+/// deserializza, e lo dichiara con un tipo (`nexus_gateway::ReasoningTokens`):
+/// quasi tutti i provider contano il ragionamento DENTRO l'output del wire
+/// (Anthropic `output_tokens`, OpenAI `completion_tokens`, che comprende
+/// `completion_tokens_details.reasoning_tokens`) e per loro non c'e' nulla da
+/// sommare; Google no — `candidatesTokenCount` porta il solo testo VISIBILE e
+/// `thoughtsTokenCount` viaggia a parte, per quanto Google li fatturi entrambi
+/// alla tariffa di output. Misurato il 30/07/2026 su `gemini-2.5-flash`:
+/// `candidatesTokenCount=3` contro `thoughtsTokenCount=157`.
+///
+/// I due addendi restano DISTINTI nella `LlmUsage` a monte di questa somma, e
+/// non per pulizia: `is_degenerate_completion` riconosce un turno hollow proprio
+/// dal fatto che `output_tokens` conti il testo prodotto. Sommare alla fonte
+/// sostituirebbe una sottostima del costo con un turno vuoto che non si vede
+/// piu'.
+///
+/// `None` significa "il provider non lo riporta", che per la somma vale zero.
+/// Somma satura: i due addendi arrivano da un provider e un dato incoerente non
+/// deve produrre un wrap.
+pub fn completion_tokens_billable(output_tokens: u32, reasoning_tokens: Option<u32>) -> u32 {
+    output_tokens.saturating_add(reasoning_tokens.unwrap_or(0))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::prompt_tokens_gross;
+    use super::{completion_tokens_billable, prompt_tokens_gross};
 
     #[test]
     fn somma_le_tre_quantita_disgiunte() {
@@ -68,5 +99,27 @@ mod tests {
             u32::MAX,
             "la somma deve saturare"
         );
+    }
+
+    /// I numeri sono quelli MISURATI su `gemini-2.5-flash` il 30/07/2026, ramo
+    /// senza `thinkingConfig`: il visibile era 3 token, il ragionamento 157.
+    /// Fatturare i soli 3 e' la sottostima da cui nasce questo punto unico.
+    #[test]
+    fn il_ragionamento_riportato_a_parte_e_fatturabile() {
+        assert_eq!(completion_tokens_billable(3, Some(157)), 160);
+    }
+
+    #[test]
+    fn ragionamento_gia_dentro_loutput_non_si_somma() {
+        // Anthropic/OpenAI: l'adapter passa `None` perche' il conteggio del wire
+        // lo comprende gia'. Sommare qui lo conterebbe due volte.
+        assert_eq!(completion_tokens_billable(500, None), 500);
+        // Un provider che lo riporta a parte ma non ne ha prodotti: zero.
+        assert_eq!(completion_tokens_billable(500, Some(0)), 500);
+    }
+
+    #[test]
+    fn anche_loutput_fatturabile_satura() {
+        assert_eq!(completion_tokens_billable(u32::MAX, Some(10)), u32::MAX);
     }
 }

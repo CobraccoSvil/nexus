@@ -886,6 +886,7 @@ mod gateway_mapping_tests {
                 output_tokens: 34,
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
+                reasoning_tokens: None,
             },
             model_used: "m-real".to_string(),
             provider_used: "anthropic".to_string(),

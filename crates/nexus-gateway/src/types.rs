@@ -423,6 +423,41 @@ pub struct LlmUsage {
     /// `input_tokens`, con la loro tariffa. Vedi sopra.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_tokens: Option<u32>,
+    /// Token di ragionamento che il provider tiene FUORI da `output_tokens`.
+    ///
+    /// A differenza dei due campi di cache — che sono un DETTAGLIO di
+    /// `input_tokens` — questo e' un ADDENDO: si somma all'output per ottenere
+    /// il fatturabile, e la somma la fa il punto unico
+    /// `nexus_types::token_usage::completion_tokens_billable`.
+    ///
+    /// `None` su quasi tutti i provider, e non perche' non pensino: significa
+    /// che il conteggio di output del wire li comprende gia' (vedi
+    /// [`ReasoningTokens`]). Valorizzato oggi dal solo adapter Google.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
+}
+
+/// Convenzione con cui un provider riporta i token di ragionamento, dichiarata
+/// dall'adapter che ne deserializza il formato.
+///
+/// E' un tipo e non un `Option<u32>` perche' la distinzione che conta non e'
+/// "quanti", ma "erano gia' contati?" — e la risposta sbagliata non produce un
+/// numero strano, produce un addebito doppio. Con questa forma un adapter non
+/// puo' portare un numero dichiarando che e' gia' incluso: la variante che
+/// afferma l'inclusione non ha posto dove metterlo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningTokens {
+    /// Il conteggio di output del wire COMPRENDE gia' il ragionamento: nulla da
+    /// sommare. E' il caso di Anthropic (`output_tokens`) e di OpenAI
+    /// (`completion_tokens`, di cui `completion_tokens_details.reasoning_tokens`
+    /// e' un dettaglio), quindi di tutto il dialetto OpenAI-compatibile.
+    IncludedInOutput,
+    /// Il wire riporta l'output VISIBILE e il ragionamento a parte: i due vanno
+    /// sommati per ottenere il fatturabile. E' il caso di Google, dove
+    /// `candidatesTokenCount` esclude `thoughtsTokenCount` mentre
+    /// `totalTokenCount` li comprende entrambi. `None` quando il turno non ne ha
+    /// prodotti (campo assente dalla risposta).
+    Separate(Option<u32>),
 }
 
 impl LlmUsage {
@@ -431,13 +466,20 @@ impl LlmUsage {
     ///
     /// PUNTO UNICO (regola L): e' l'unico posto del workspace dove si decide se
     /// i token di cache vanno sommati al prompt. Gli adapter passano i numeri
-    /// VERBATIM dal wire e dichiarano soltanto la propria convenzione.
+    /// VERBATIM dal wire e dichiarano soltanto la propria convenzione — sul
+    /// prompt ([`PromptCacheReporting`]) e sul ragionamento ([`ReasoningTokens`]).
+    ///
+    /// Il ragionamento NON viene sommato all'output qui: resta un campo a se',
+    /// perche' `output_tokens` ha un secondo consumatore che misura il testo
+    /// PRODOTTO (`is_degenerate_completion`). La somma verso il fatturabile
+    /// avviene al confine con la contabilita'.
     pub fn normalized(
         reporting: PromptCacheReporting,
         prompt_tokens_wire: u32,
         output_tokens: u32,
         cache_read_tokens: Option<u32>,
         cache_creation_tokens: Option<u32>,
+        reasoning: ReasoningTokens,
     ) -> Self {
         let input_tokens = match reporting {
             // Il wire e' gia' lordo: nulla da fare. Sottrarre qui — come faceva
@@ -454,11 +496,21 @@ impl LlmUsage {
                 )
             }
         };
+        // Lo zero e' il caso di gran lunga piu' frequente sui provider che
+        // riportano a parte (turno senza ragionamento) e non e' informazione:
+        // `None` e "zero token" dicono la stessa cosa a chi somma, e tenerli
+        // distinti moltiplicherebbe i casi da asserire nei test senza che
+        // nessun consumatore sappia farci qualcosa.
+        let reasoning_tokens = match reasoning {
+            ReasoningTokens::IncludedInOutput => None,
+            ReasoningTokens::Separate(n) => n.filter(|&n| n > 0),
+        };
         Self {
             input_tokens,
             output_tokens,
             cache_read_tokens,
             cache_creation_tokens,
+            reasoning_tokens,
         }
     }
 }
@@ -858,6 +910,7 @@ mod tests {
                 output_tokens: 0,
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
+                reasoning_tokens: None,
             },
             model_used: "m".to_string(),
             provider_used: "p".to_string(),
@@ -943,6 +996,7 @@ mod tests {
             5,
             Some(4),
             None,
+            ReasoningTokens::IncludedInOutput,
         );
         assert_eq!(incluso.input_tokens, 10);
         assert_eq!(incluso.cache_read_tokens, Some(4));
@@ -956,6 +1010,7 @@ mod tests {
             5,
             Some(4),
             None,
+            ReasoningTokens::IncludedInOutput,
         );
         assert_eq!(separato.input_tokens, 14);
         assert_eq!(separato.cache_read_tokens, Some(4));
@@ -967,6 +1022,7 @@ mod tests {
             20,
             Some(900),
             Some(50),
+            ReasoningTokens::IncludedInOutput,
         );
         assert_eq!(con_creazione.input_tokens, 1_050);
 
@@ -976,7 +1032,14 @@ mod tests {
             PromptCacheReporting::CachedIncludedInPrompt,
             PromptCacheReporting::CachedReportedSeparately,
         ] {
-            let u = LlmUsage::normalized(reporting, 42, 7, None, None);
+            let u = LlmUsage::normalized(
+                reporting,
+                42,
+                7,
+                None,
+                None,
+                ReasoningTokens::IncludedInOutput,
+            );
             assert_eq!(u.input_tokens, 42);
         }
     }
@@ -992,6 +1055,7 @@ mod tests {
             1,
             Some(999),
             Some(1),
+            ReasoningTokens::IncludedInOutput,
         );
         assert_eq!(u.input_tokens, u32::MAX);
     }

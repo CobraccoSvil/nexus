@@ -161,6 +161,17 @@ pub struct GwUsage {
     /// Token scritti in cache (creazione voce). Vedi sopra.
     #[serde(default)]
     pub cache_creation_tokens: Option<u32>,
+    /// Token di ragionamento che il provider tiene FUORI da `output_tokens`
+    /// (oggi il solo Google: `candidatesTokenCount` porta il testo visibile,
+    /// `thoughtsTokenCount` viaggia a parte). A differenza dei due campi di
+    /// cache, che sono un dettaglio del prompt, questo e' un ADDENDO
+    /// dell'output: chi paga somma dal punto unico
+    /// `nexus_types::token_usage::completion_tokens_billable`.
+    ///
+    /// `None` sui provider che lo contano gia' dentro (Anthropic, dialetto
+    /// OpenAI) e sui turni senza ragionamento.
+    #[serde(default)]
+    pub reasoning_tokens: Option<u32>,
 }
 
 /// Funzione chiamata in una tool-call (forma OpenAI Chat Completions): `arguments`
@@ -1017,7 +1028,7 @@ mod confine_wire_tests {
     use ::nexus_gateway::server::billing::record_and_declare;
     use ::nexus_gateway::types::{
         LlmMessage, LlmRequest, LlmResponse, LlmUsage, MessageContent, PromptCacheReporting,
-        RequestMetadata,
+        ReasoningTokens, RequestMetadata,
     };
     use sqlx::PgPool;
     use uuid::Uuid;
@@ -1084,6 +1095,7 @@ mod confine_wire_tests {
                 400_000,
                 None,
                 None,
+                ReasoningTokens::IncludedInOutput,
             ),
             model_used: "claude-x".into(),
             provider_used: "anthropic".into(),
