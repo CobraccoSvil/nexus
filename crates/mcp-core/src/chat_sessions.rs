@@ -310,8 +310,9 @@ pub struct UpdateChatSessionRequest {
     /// campo assente = non toccare; "auto" o stringa vuota = azzera (NULL,
     /// routing automatico); altro valore = pin. Punto unico di persistenza:
     /// chat_sessions.preferred_provider, la stessa colonna gia' usata dal
-    /// comando testuale "usa <modello>" (detect_model_switch) e letta da
-    /// send_chat_message come override di default dei run successivi.
+    /// comando testuale "usa <modello>" (verdetto di
+    /// `model_switch::resolve_switch_verdict` sul segnale del classificatore)
+    /// e letta da send_chat_message come override di default dei run successivi.
     pub preferred_provider: Option<String>,
     /// Come preferred_provider, per il modello.
     pub preferred_model: Option<String>,

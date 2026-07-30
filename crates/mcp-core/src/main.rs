@@ -54,6 +54,7 @@ mod model_catalog_sync;
 mod model_health_probe;
 mod model_observation;
 mod model_qualification;
+mod model_switch;
 mod runtime_health;
 mod models;
 mod mutations_api;
@@ -74,6 +75,7 @@ mod plugins;
 mod port_registry;
 mod process_resume;
 mod process_util;
+mod profile_selection;
 mod profiles;
 // Estratto in crate workspace (split 7.4): re-export per mantenere
 // validi i path crate::project_db:: dei moduli esistenti.

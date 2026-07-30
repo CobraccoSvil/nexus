@@ -2446,31 +2446,36 @@ async fn disambiguation_outcome(
 /// Prima del routing classico (intent, behavior_mode) proviamo la matrice
 /// slots: e' piu' precisa perche' indicizzata su 4 slot canonici (action_verb,
 /// target_type, framework, scope) estratti dal classifier LLM. Se nessun
-/// riscontro O slots incompleti, cadiamo sul routing classico testato. Soglia
-/// confidence: 0.60.
+/// riscontro O slots incompleti, cadiamo sul routing classico testato. La soglia
+/// di confidence e' un punto unico dentro `route_by_slots` (settings
+/// `routing.slots_min_confidence`), non un letterale qui.
 ///
-/// Safety-net: se il classifier LLM non ha estratto slot (es. JSON parse fail
-/// con Gemini Flash) ma il messaggio chiaramente descrive una "test failure
-/// resolution" via keyword detection, ricostruiamo slots minimi euristicamente
-/// per non perdere il routing capable.
+/// Senza slot dal classificatore NON si indovina: gli slot restano vuoti e
+/// decide il routing classico. Qui viveva un "safety-net" che li ricostruiva da
+/// liste di keyword e si assegnava `confidence: 0.65` — sopra la soglia del
+/// consumatore per costruzione (vedi `routing_slots`). Il ripiego onesto di
+/// questa domanda e' l'astensione: gli slot governano provider e modello
+/// dell'intero run, e una stima che non puo' essere respinta e' peggio di
+/// nessuna stima.
 async fn resolve_slot_routing_hit(
     state: &AppState,
     params: &SpawnAgentParams,
     classified: &crate::orchestrator::ClassifiedIntent,
 ) -> Option<(String, String, &'static str)> {
-    let effective_slots = if classified.slots.is_complete() {
-        classified.slots.clone()
-    } else {
-        crate::routing_slots::infer_slots_heuristic(&params.content)
-    };
-    if params.provider_choice.provider().is_none() && params.model_override.is_none() {
-        state
-            .orchestrator
-            .route_by_slots(&state.db, &effective_slots, 0.60)
-            .await
-    } else {
-        None
+    if params.provider_choice.provider().is_some() || params.model_override.is_some() {
+        return None;
     }
+    if !classified.slots.is_complete() {
+        tracing::debug!(
+            classifier_resolved = classified.classifier_resolved,
+            "routing slot-based: slot non dichiarati dal classificatore, si usa il routing classico"
+        );
+        return None;
+    }
+    state
+        .orchestrator
+        .route_by_slots(&state.db, &classified.slots)
+        .await
 }
 
 /// Override effettivi (provider, modello) passati al routing intelligente.
@@ -4512,6 +4517,7 @@ pub(crate) async fn spawn_agent_run(
         plan: deliberation.plan,
         complexity: sizing_complexity,
         scope_system_wide: sizing_scope_system_wide,
+        competencies: classified.competencies.clone(),
     };
     // OVERLAP (mig 0606) o attesa del verdetto: vedi `resolve_upstream_advisory`.
     let advisory = resolve_upstream_advisory(
@@ -5687,6 +5693,10 @@ struct UpstreamInputs {
     plan: Option<nexus_agent_graph::decisions::orchestration_sizing::OrchestrationPlan>,
     complexity: Option<nexus_agent_graph::decisions::orchestration_sizing::TaskComplexity>,
     scope_system_wide: bool,
+    /// Competenze dichiarate dal classificatore per QUESTO turno (regola M).
+    /// `None` = non dichiarabile, il selettore ripiega sulle keyword d'ambito.
+    /// Vedi `agent_tools::subagent_native::select_council_figures`.
+    competencies: Option<Vec<String>>,
 }
 
 /// Esito dei panel a monte: i blocchi testuali per il prompt + il verdetto
@@ -5754,6 +5764,7 @@ async fn run_upstream_panels(inp: &UpstreamInputs) -> UpstreamPanels {
             &inp.user_text,
             inp.deliberate,
             inp.plan.as_ref().map(|p| p.council_figures),
+            inp.competencies.as_deref(),
         ),
         maybe_convene_multi_provider_panel(
             &inp.state,
@@ -6097,6 +6108,7 @@ async fn maybe_convene_council(
     user_text: &str,
     deliberate: bool,
     figure_target: Option<usize>,
+    declared_competencies: Option<&[String]>,
 ) -> Option<crate::agent_tools::subagent_native::CouncilConveneOutcome> {
     use crate::agent_tools::subagent_native::{
         CouncilConveneOutcome, CouncilDegradeReason,
@@ -6125,8 +6137,12 @@ async fn maybe_convene_council(
     // cioe' proprio le figure d'ambito. `Some(0)` = panel azzerato dal budget
     // (il meta-step `orchestration_plan` lo documenta) -> lista vuota.
     let cfg = crate::agent_tools::subagent_native::read_council_config(&state.db).await;
-    let figures =
-        crate::agent_tools::subagent_native::select_council_figures(user_text, &cfg, figure_target);
+    let figures = crate::agent_tools::subagent_native::select_council_figures(
+        user_text,
+        &cfg,
+        figure_target,
+        declared_competencies,
+    );
     if figures.is_empty() {
         return None;
     }

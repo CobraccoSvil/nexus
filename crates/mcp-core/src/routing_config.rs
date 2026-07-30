@@ -32,6 +32,16 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone)]
 pub struct RoutingThresholds {
     pub llm_classifier_min_confidence: f32,
+    /// Sotto questa confidence gli SLOT d'azione del classificatore non guidano
+    /// il routing e si torna al percorso classico (intent, behavior_mode).
+    /// Sorgente: `settings.routing.slots_min_confidence` (mig 0658).
+    ///
+    /// Distinta da [`Self::llm_classifier_min_confidence`], che pesa la classe
+    /// dell'intent: sono due giudizi separati e il classificatore li dichiara con
+    /// due confidence diverse. Prima questa soglia era un `0.60` letterale nel
+    /// call site, mentre il ripiego keyword si dava `0.65` — un valore scelto per
+    /// stare SOPRA quel letterale, cioe' per non poter essere respinto.
+    pub slots_min_confidence: f32,
     pub llm_classifier_timeout_seconds: f32,
     pub token_threshold_chat_breve: u32,
     pub token_threshold_chat_media: u32,
@@ -49,6 +59,7 @@ impl RoutingThresholds {
     fn defaults() -> Self {
         Self {
             llm_classifier_min_confidence: 0.60,
+            slots_min_confidence: 0.60,
             llm_classifier_timeout_seconds: 5.0,
             token_threshold_chat_breve: 400,
             token_threshold_chat_media: 1_500,
@@ -113,6 +124,7 @@ async fn fetch_thresholds_from_db(db: &PgPool) -> Result<RoutingThresholds, Stri
     };
     Ok(RoutingThresholds {
         llm_classifier_min_confidence: parse_f32("routing.llm_classifier_min_confidence", 0.60),
+        slots_min_confidence: parse_f32("routing.slots_min_confidence", 0.60),
         llm_classifier_timeout_seconds: parse_f32("routing.llm_classifier_timeout_seconds", 5.0),
         token_threshold_chat_breve: parse_u32("routing.token_threshold_chat_breve", 400),
         token_threshold_chat_media: parse_u32("routing.token_threshold_chat_media", 1_500),
@@ -534,9 +546,10 @@ mod tests {
 
     #[test]
     fn test_routing_thresholds_defaults_match_migration_seed() {
-        // I default in defaults() devono coincidere col seed mig 0111.
+        // I default in defaults() devono coincidere col seed mig 0111/0658.
         let d = RoutingThresholds::defaults();
         assert!((d.llm_classifier_min_confidence - 0.60).abs() < 1e-6);
+        assert!((d.slots_min_confidence - 0.60).abs() < 1e-6);
         assert!((d.llm_classifier_timeout_seconds - 5.0).abs() < 1e-6);
         assert_eq!(d.token_threshold_chat_breve, 400);
         assert_eq!(d.token_threshold_chat_media, 1_500);

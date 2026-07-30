@@ -1512,10 +1512,10 @@ pub(crate) async fn read_council_config(db: &sqlx::PgPool) -> CouncilConfig {
 /// Selettore PURO (regola L, testabile senza DB) delle figure del consiglio per un
 /// dato testo, gia' DIMENSIONATO al `target` del piano di orchestrazione.
 ///
-/// Le figure di un asse d'ambito ATTIVO entrano per prime, e il taglio non le
-/// tocca: le ha scelte un segnale del task (le sue keyword), mentre le base sono
-/// un default cieco. Il `target` decide QUANTE figure in tutto, non quali si
-/// possono perdere: le base riempiono i posti che restano.
+/// Le figure "d'ambito" entrano per prime, e il taglio non le tocca: le ha
+/// scelte un segnale del task, mentre le base sono un default cieco. Il
+/// `target` decide QUANTE figure in tutto, non quali si possono perdere: le
+/// base riempiono i posti che restano.
 ///
 /// Prima il taglio stava in DUE punti — `truncate(max_figures)` qui e
 /// `truncate(target)` nel chiamante — e mordeva sempre la CODA, cioe' proprio le
@@ -1524,7 +1524,15 @@ pub(crate) async fn read_council_config(db: &sqlx::PgPool) -> CouncilConfig {
 /// testo veniva scartata a favore delle prime tre voci di un CSV. Ogni asse
 /// nuovo avrebbe ereditato lo stesso silenzio.
 ///
-/// L'attivazione riusa il PUNTO UNICO del match d'ambito a parola intera
+/// `declared_competencies` e' il giudizio SEMANTICO del classificatore
+/// (`intent_classifier::AgenticIntent::competencies`, gia' validato contro il
+/// roster figure): quando presente, GOVERNA la scelta d'ambito al posto delle
+/// keyword — sono le competenze che il task richiede DAVVERO, non quelle che
+/// hanno la fortuna di condividere una parola col testo. `Some(vec![])` e' un
+/// giudizio valido ("nessuna lente d'ambito serve"), diverso da `None`
+/// ("non dichiarabile": classifier caduto o vocabolario non iniettato), che fa
+/// ripiegare sulle keyword d'ambito — l'unico caso in cui restano usate.
+/// L'attivazione da keyword riusa il PUNTO UNICO del match a parola intera
 /// [`crate::prompt_templates::touches_domain_keyword`] (regola L): a
 /// sottostringa un vocabolario d'ambito non e' affidabile — `log` trova
 /// `login`, `app` trova `approccio`.
@@ -1534,18 +1542,28 @@ pub(crate) fn select_council_figures(
     user_text: &str,
     cfg: &CouncilConfig,
     target: Option<usize>,
+    declared_competencies: Option<&[String]>,
 ) -> Vec<String> {
     let push = |f: &String, figures: &mut Vec<String>| {
         if !f.is_empty() && !figures.iter().any(|e| e == f) {
             figures.push(f.clone());
         }
     };
-    // Figure degli assi attivi: scelte dal contenuto del task.
     let mut figures: Vec<String> = Vec::new();
-    for axis in &cfg.domain_axes {
-        if crate::prompt_templates::touches_domain_keyword(user_text, &axis.keywords) {
-            for f in &axis.figures {
-                push(f, &mut figures);
+    if let Some(declared) = declared_competencies {
+        // Giudizio semantico gia' validato dal classificatore: le competenze
+        // dichiarate SONO le figure d'ambito, niente match testuale.
+        for f in declared {
+            push(f, &mut figures);
+        }
+    } else {
+        // Ripiego keyword: SOLO quando il classificatore non ha potuto
+        // dichiarare (caduto, o vocabolario non iniettato nel prompt).
+        for axis in &cfg.domain_axes {
+            if crate::prompt_templates::touches_domain_keyword(user_text, &axis.keywords) {
+                for f in &axis.figures {
+                    push(f, &mut figures);
+                }
             }
         }
     }
@@ -6988,7 +7006,7 @@ mod tests {
     #[test]
     fn select_figures_solo_base_senza_ambito_infra() {
         let cfg = council_cfg();
-        let got = select_council_figures("aggiungi il login con OTP via email", &cfg, None);
+        let got = select_council_figures("aggiungi il login con OTP via email", &cfg, None, None);
         assert_eq!(
             got,
             vec![
@@ -7004,7 +7022,7 @@ mod tests {
     #[test]
     fn select_figures_aggiunge_sysadmin_su_ambito_deploy() {
         let cfg = council_cfg();
-        let got = select_council_figures("prepara il deploy con docker in produzione", &cfg, None);
+        let got = select_council_figures("prepara il deploy con docker in produzione", &cfg, None, None);
         assert!(
             got.iter().any(|f| f == "sysadmin"),
             "atteso sysadmin: {got:?}"
@@ -7020,7 +7038,7 @@ mod tests {
     fn target_non_scarta_la_figura_scelta_dal_task() {
         let cfg = council_cfg();
         let got =
-            select_council_figures("prepara il deploy con docker in produzione", &cfg, Some(3));
+            select_council_figures("prepara il deploy con docker in produzione", &cfg, Some(3), None);
         assert_eq!(got.len(), 3, "il target dimensiona il panel: {got:?}");
         assert_eq!(
             got[0], "sysadmin",
@@ -7040,6 +7058,7 @@ mod tests {
             "rifai l'interfaccia della pagina e sistema il deploy docker",
             &cfg,
             Some(1),
+            None,
         );
         assert_eq!(
             got,
@@ -7055,14 +7074,14 @@ mod tests {
             domain_axes: vec![axis("ui", &["pagina"], &["ui_ux_designer", "functional_analyst"])],
             max_figures: 1,
         };
-        let got = select_council_figures("sistema la pagina", &cfg, Some(5));
+        let got = select_council_figures("sistema la pagina", &cfg, Some(5), None);
         assert_eq!(got, vec!["ui_ux_designer"], "cap assoluto: {got:?}");
     }
 
     #[test]
     fn target_zero_non_convoca_nessuno() {
         let cfg = council_cfg();
-        assert!(select_council_figures("rifai la pagina", &cfg, Some(0)).is_empty());
+        assert!(select_council_figures("rifai la pagina", &cfg, Some(0), None).is_empty());
     }
 
     #[test]
@@ -7080,7 +7099,7 @@ mod tests {
             )],
             max_figures: 2,
         };
-        let got = select_council_figures("deploy dell'app", &cfg, None);
+        let got = select_council_figures("deploy dell'app", &cfg, None, None);
         // Dedup: security_engineer una sola volta (asse + base); cap 2 -> tronca.
         assert_eq!(got, vec!["security_engineer", "sysadmin"]);
     }
@@ -7149,6 +7168,7 @@ mod tests {
             "creami un'app per la gestione delle spese di casa",
             &cfg,
             Some(target),
+            None,
         );
         assert!(
             figures.iter().any(|f| f == "ui_ux_designer"),
@@ -7188,7 +7208,64 @@ mod tests {
             domain_axes: vec![],
             max_figures: 6,
         };
-        assert!(select_council_figures("qualunque testo", &cfg, None).is_empty());
+        assert!(select_council_figures("qualunque testo", &cfg, None, None).is_empty());
+    }
+
+    // ─── Competenze dichiarate dal classificatore governano al posto delle keyword ───
+
+    /// Le competenze dichiarate ENTRANO come figure d'ambito anche se il testo
+    /// non contiene NESSUNA keyword d'asse: e' il punto del fix — un giudizio
+    /// semantico non e' vincolato a condividere una parola col messaggio.
+    #[test]
+    fn competenze_dichiarate_convocano_senza_bisogno_di_keyword() {
+        let cfg = council_cfg();
+        let got = select_council_figures(
+            "gestisci la messa in sicurezza dell'accesso",
+            &cfg,
+            None,
+            Some(&["sysadmin".to_string()]),
+        );
+        assert!(
+            got.iter().any(|f| f == "sysadmin"),
+            "la competenza dichiarata deve convocare sysadmin: {got:?}"
+        );
+    }
+
+    /// `Some(vec![])` e' un giudizio: "nessuna lente d'ambito serve". Anche col
+    /// testo che contiene una keyword d'asse (qui "deploy"), le competenze
+    /// dichiarate governano — la vecchia strada keyword non deve piu' scattare.
+    #[test]
+    fn competenze_dichiarate_vuote_non_convocano_ambito_anche_con_keyword_nel_testo() {
+        let cfg = council_cfg();
+        let got = select_council_figures(
+            "prepara il deploy con docker in produzione",
+            &cfg,
+            None,
+            Some(&[]),
+        );
+        assert!(
+            !got.iter().any(|f| f == "sysadmin"),
+            "competencies=Some(vec![]) e' un giudizio esplicito, niente ripiego keyword: {got:?}"
+        );
+        assert_eq!(got, vec![
+            "functional_analyst",
+            "software_architect",
+            "security_engineer",
+            "project_manager"
+        ]);
+    }
+
+    /// `None` (classificatore non ha potuto dichiarare) e' l'UNICO caso in cui
+    /// le keyword d'ambito restano usate: comportamento pre-esistente invariato.
+    #[test]
+    fn competenze_non_dichiarabili_ripiegano_sulle_keyword() {
+        let cfg = council_cfg();
+        let got =
+            select_council_figures("prepara il deploy con docker in produzione", &cfg, None, None);
+        assert!(
+            got.iter().any(|f| f == "sysadmin"),
+            "ripiego keyword atteso quando competencies=None: {got:?}"
+        );
     }
 
     #[test]
