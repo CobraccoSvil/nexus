@@ -54,7 +54,9 @@ impl AgentStepStore for PgAgentStepStore {
         };
         // step_index deterministico (i32 in DB, mig 0009). iteration/idx sono
         // limitati (iteration < ~1000, idx < 1000): clamp difensivo a i32::MAX.
-        let step_index: i32 = (iteration * 1000 + idx).clamp(0, i32::MAX as i64) as i32;
+        let step_index: i32 = (iteration * nexus_agent_graph::runtime::ports::STEP_INDEX_STRIDE
+            + idx)
+            .clamp(0, i32::MAX as i64) as i32;
         // tool_name / tool_result derivati dal block/result per riempire le colonne
         // NOT NULL della tabella. Il block e' il blocco grezzo dell'iterazione
         // (tool_use/testo); il nome del tool, se presente, popola tool_name.

@@ -878,14 +878,22 @@ pub trait RunControlStore: Send + Sync {
     ) -> Result<(), PortError>;
 }
 
+/// Passo della convenzione `step_index = iteration * STEP_INDEX_STRIDE + idx`
+/// di [`AgentStepStore`]. Punto unico (regola L) della convenzione: la usano
+/// l'impl concreta (INSERT su `agent_steps`), il mock di test e la derivazione
+/// INVERSA (`MAX(step_index) / STEP_INDEX_STRIDE` = ultima iterazione che ha
+/// lasciato un passo persistito) con cui la chiusura dei run morti senza
+/// outcome (timeout, errore del grafo) recupera il contatore dai fatti.
+pub const STEP_INDEX_STRIDE: i64 = 1000;
+
 /// Persistenza dei singoli step dell'agente su `agent_steps`
 /// (modello: [`VerifierRunStore`]). Ogni blocco prodotto in un'iterazione
 /// (tool_use, tool_result, testo) e' uno step indicizzato. Confine d'inversione:
 /// SOLO l'INSERT, nessuna logica.
 ///
-/// `step_index` deterministico = `iteration * 1000 + idx` (idx = posizione del
-/// blocco nell'iterazione): garantisce ordinamento globale stabile senza
-/// contatore condiviso. L'impl concreta DEVE usare `ON CONFLICT DO NOTHING`
+/// `step_index` deterministico = `iteration * STEP_INDEX_STRIDE + idx` (idx =
+/// posizione del blocco nell'iterazione): garantisce ordinamento globale stabile
+/// senza contatore condiviso. L'impl concreta DEVE usare `ON CONFLICT DO NOTHING`
 /// (idempotente sui retry) + guard `untracked_run` (non inserire step per run non
 /// tracciati, evita FK orfane).
 #[async_trait]

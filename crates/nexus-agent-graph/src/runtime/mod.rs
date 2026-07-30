@@ -526,10 +526,10 @@ pub mod test_doubles {
             block: serde_json::Value,
             result: Option<serde_json::Value>,
         ) -> Result<(), PortError> {
-            // step_index deterministico = iteration*1000 + idx (come l'impl concreta).
+            // step_index deterministico (stessa costante dell'impl concreta).
             self.steps.lock().expect("lock steps").push((
                 run_id.to_string(),
-                iteration * 1000 + idx,
+                iteration * crate::runtime::ports::STEP_INDEX_STRIDE + idx,
                 block,
                 result,
             ));

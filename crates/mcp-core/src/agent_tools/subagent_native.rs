@@ -4603,7 +4603,7 @@ async fn finalize_success(
         SubRunClosure {
             status,
             summary: &summary,
-            iterations: o.iterations,
+            iterations: Some(o.iterations),
             tokens_prompt: o.prompt_tokens,
             tokens_completion: o.completion_tokens,
             cost_usd: o.total_cost,
@@ -4750,7 +4750,11 @@ async fn ensure_child_agent_run(
 struct SubRunClosure<'a> {
     status: &'a str,
     summary: &'a str,
-    iterations: i64,
+    /// `Some(n)` = conteggio del grafo ([`NativeRunOutcome::iterations`]).
+    /// `None` = il grafo e' morto senza consegnare l'outcome (timeout, errore):
+    /// l'ignoto e' dichiarato dal TIPO (regola M), mai da uno 0 — e `mark_run`
+    /// lo risolve dai fatti persistiti (`agent_steps`), non lo inventa.
+    iterations: Option<i64>,
     tokens_prompt: i64,
     tokens_completion: i64,
     cost_usd: f64,
@@ -4772,9 +4776,14 @@ impl<'a> SubRunClosure<'a> {
     /// $0,04; sulla chat 25, 19 run in timeout dichiaravano $0 contro $1,28 reali).
     /// Azzerare qui non "non contava": sottraeva spesa reale al cap.
     ///
-    /// `iterations` resta 0: il conteggio vive solo nello stato del grafo, che qui
-    /// non c'e'. Il ledger conosce il costo, non le iterazioni — meglio un
-    /// contatore onestamente ignoto che un costo inventato.
+    /// `iterations` e' `None`: il conteggio VIVO sta nello stato del grafo, che
+    /// qui non c'e' — ma non e' perduto, perche' ogni iterazione lascia i suoi
+    /// passi su `agent_steps`. Scriverci 0 non era "onestamente ignoto": era un
+    /// numero che mente (misurato il 30/07/2026, run 1845a0ce su
+    /// bacheca-attivita: status='timeout', iteration_count=0, 38 step fino a
+    /// step_index 23000 = iterazione 23 — chi legge conclude "non ha fatto
+    /// nulla" su un run che aveva lavorato parecchio). `None` dichiara l'ignoto
+    /// e `mark_run` lo risolve dai fatti persistiti.
     fn from_ledger(
         status: &'a str,
         summary: &'a str,
@@ -4784,7 +4793,7 @@ impl<'a> SubRunClosure<'a> {
         Self {
             status,
             summary,
-            iterations: 0,
+            iterations: None,
             tokens_prompt: ledger.prompt_tokens,
             tokens_completion: ledger.completion_tokens,
             cost_usd: ledger.total_cost,
@@ -4825,6 +4834,14 @@ fn terminal_verdict(verdict: &str, error_class: &str) -> Value {
 /// id limita l'effetto); stessi status (completed/paused/timeout/failed):
 /// `agent_runs.status` e' TEXT libero. Il `verdict` strutturato (regola M) va
 /// SOLO sulla riga sub (la gemella eredita l'esito dal finalizzatore del padre).
+///
+/// Iterazioni: `Some(n)` (conteggio del grafo) e' autoritativo e si scrive
+/// tal quale; `None` (run morto senza outcome: timeout, errore del motore) si
+/// risolve QUI, nel punto unico della chiusura (regola L), dai fatti gia'
+/// persistiti: `MAX(step_index) / STEP_INDEX_STRIDE` su `agent_steps` =
+/// l'ultima iterazione che ha lasciato un passo (premessa dichiarata, regola
+/// O). Senza step persistiti il derivato e' 0, che stavolta e' vero.
+///
 /// Best-effort per i chiamanti (la finalizzazione non deve fallire per un
 /// errore di persistenza) ma MAI muto: l'UPDATE respinto lascerebbe la riga
 /// 'running' per sempre (depth chain bloccata, poll che non converge) e senza
@@ -4835,23 +4852,31 @@ async fn mark_run(
     c: SubRunClosure<'_>,
 ) -> Result<(), sqlx::Error> {
     let compact = c.summary.chars().take(4000).collect::<String>();
-    let res = sqlx::query(
-        "WITH sub AS (
+    let sql = format!(
+        "WITH iters AS (
+            SELECT COALESCE(
+                $3::int4,
+                (SELECT COALESCE(MAX(step_index) / {stride}, 0)::int4
+                   FROM agent_steps WHERE run_id = $7)
+            ) AS n
+        ), sub AS (
             UPDATE nexus_subagent_runs SET
-                status = $1, final_summary = $2, iterations = $3,
+                status = $1, final_summary = $2, iterations = (SELECT n FROM iters),
                 tokens_prompt = $4, tokens_completion = $5, cost_usd = $6,
                 verdict = $8, completed_at = NOW()
              WHERE id = $7
         )
         UPDATE agent_runs SET
-            status = $1, final_answer = $2, iteration_count = $3,
+            status = $1, final_answer = $2, iteration_count = (SELECT n FROM iters),
             prompt_tokens = $4, completion_tokens = $5,
             total_tokens = $4 + $5, total_cost = $6, completed_at = NOW()
          WHERE id = $7",
-    )
+        stride = nexus_agent_graph::runtime::ports::STEP_INDEX_STRIDE,
+    );
+    let res = sqlx::query(&sql)
     .bind(c.status)
     .bind(&compact)
-    .bind(c.iterations as i32)
+    .bind(c.iterations.map(|n| n.clamp(0, i32::MAX as i64) as i32))
     .bind(c.tokens_prompt as i32)
     .bind(c.tokens_completion as i32)
     .bind(c.cost_usd)
@@ -5368,6 +5393,11 @@ mod tests {
         );
         assert_eq!(c.tokens_prompt, 120_000);
         assert_eq!(c.status, "timeout");
+        assert!(
+            c.iterations.is_none(),
+            "l'ignoto si dichiara col tipo, mai con uno 0 (regola M): \
+             il derivato dai fatti lo scrive mark_run"
+        );
     }
 
     #[test]
@@ -6550,10 +6580,10 @@ mod tests {
         );
     }
 
-    /// `mark_run` chiude ENTRAMBE le righe del figlio (nexus_subagent_runs +
-    /// gemella agent_runs) nella stessa statement, con status/metriche coerenti.
-    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
-    async fn mark_run_chiude_anche_la_riga_agent_runs(pool: sqlx::PgPool) {
+    /// Helper: riga sub-run 'running' + gemella `agent_runs` tracciata (via il
+    /// produttore reale `ensure_child_agent_run`), pronta per una chiusura con
+    /// `mark_run`. Punto unico del seeding dei test di chiusura.
+    async fn seed_sub_con_gemella(pool: &sqlx::PgPool) -> Uuid {
         let child = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO nexus_subagent_runs \
@@ -6562,17 +6592,42 @@ mod tests {
                      'running')",
         )
         .bind(child)
-        .execute(&pool)
+        .execute(pool)
         .await
         .expect("sub-run");
-        ensure_child(&pool, child, Uuid::new_v4(), "mistral", "mistral-medium-3").await;
+        ensure_child(pool, child, Uuid::new_v4(), "mistral", "mistral-medium-3").await;
+        child
+    }
+
+    /// Helper: iterazioni persistite dalla chiusura, su ENTRAMBE le righe
+    /// (`nexus_subagent_runs.iterations`, `agent_runs.iteration_count`).
+    async fn iterazioni_persistite(pool: &sqlx::PgPool, child: Uuid) -> (i32, i32) {
+        let sub: i32 =
+            sqlx::query_scalar("SELECT iterations FROM nexus_subagent_runs WHERE id = $1")
+                .bind(child)
+                .fetch_one(pool)
+                .await
+                .expect("riga sub");
+        let run: i32 = sqlx::query_scalar("SELECT iteration_count FROM agent_runs WHERE id = $1")
+            .bind(child)
+            .fetch_one(pool)
+            .await
+            .expect("riga gemella");
+        (sub, run)
+    }
+
+    /// `mark_run` chiude ENTRAMBE le righe del figlio (nexus_subagent_runs +
+    /// gemella agent_runs) nella stessa statement, con status/metriche coerenti.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn mark_run_chiude_anche_la_riga_agent_runs(pool: sqlx::PgPool) {
+        let child = seed_sub_con_gemella(&pool).await;
         mark_run(
             &pool,
             child,
             SubRunClosure {
                 status: "completed",
                 summary: "fatto",
-                iterations: 7,
+                iterations: Some(7),
                 tokens_prompt: 1000,
                 tokens_completion: 200,
                 cost_usd: 0.05,
@@ -6610,6 +6665,118 @@ mod tests {
         assert_eq!(run.2, 7);
         assert_eq!(run.3, 1200, "total = prompt + completion");
         assert!(run.4, "completed_at valorizzato");
+    }
+
+    /// Il caso MISURATO il 30/07/2026 (bacheca-attivita, run 1845a0ce): chiusura
+    /// in timeout con 38 step persistiti fino a step_index 23000, e la riga
+    /// dichiarava iteration_count=0 — chi legge i dati concludeva "non ha fatto
+    /// nulla" su un run all'iterazione 23. La chiusura senza outcome
+    /// (`from_ledger`) dichiara l'ignoto e `mark_run` lo risolve dai fatti: gli
+    /// step del test li scrive il PRODUTTORE REALE della convenzione
+    /// `step_index` (`PgAgentStepStore`, regola O), mai un INSERT fabbricato.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn chiusura_timeout_deriva_le_iterazioni_dagli_step_persistiti(pool: sqlx::PgPool) {
+        use nexus_agent_graph::runtime::ports::AgentStepStore as _;
+        let child = seed_sub_con_gemella(&pool).await;
+        let store =
+            crate::agent_graph_adapter::agent_step_store::PgAgentStepStore::new(pool.clone());
+        for (iteration, idx) in [(0i64, 0i64), (0, 1), (23, 0)] {
+            store
+                .persist_step(
+                    &child.to_string(),
+                    iteration,
+                    idx,
+                    json!({"name": "read_file", "input": {"path": "src/main.rs"}}),
+                    None,
+                )
+                .await
+                .expect("step persistito");
+        }
+        mark_run(
+            &pool,
+            child,
+            SubRunClosure::from_ledger(
+                "timeout",
+                "[Sub-agent timeout]",
+                json!({}),
+                &crate::chat_messages::LedgerTotals::default(),
+            ),
+        )
+        .await
+        .expect("mark ok");
+        let status: String = sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = $1")
+            .bind(child)
+            .fetch_one(&pool)
+            .await
+            .expect("gemella");
+        assert_eq!(status, "timeout");
+        assert_eq!(
+            iterazioni_persistite(&pool, child).await,
+            (23, 23),
+            "MAX(step_index)/STRIDE su ENTRAMBE le righe: il lavoro fatto \
+             prima del timeout non sparisce dai contatori"
+        );
+    }
+
+    /// Il conteggio del GRAFO (`Some`) resta autoritativo: la derivazione dagli
+    /// step NON sovrascrive un outcome consegnato (un run completato in 7
+    /// iterazioni non ne "guadagna" 23 dagli step persistiti).
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn chiusura_con_outcome_non_deriva_dagli_step(pool: sqlx::PgPool) {
+        use nexus_agent_graph::runtime::ports::AgentStepStore as _;
+        let child = seed_sub_con_gemella(&pool).await;
+        let store =
+            crate::agent_graph_adapter::agent_step_store::PgAgentStepStore::new(pool.clone());
+        store
+            .persist_step(
+                &child.to_string(),
+                23,
+                0,
+                json!({"name": "run_command", "input": {"command": "ls"}}),
+                None,
+            )
+            .await
+            .expect("step persistito");
+        mark_run(
+            &pool,
+            child,
+            SubRunClosure {
+                status: "completed",
+                summary: "fatto",
+                iterations: Some(7),
+                tokens_prompt: 10,
+                tokens_completion: 5,
+                cost_usd: 0.01,
+                verdict: json!({"verdict": "completed", "success": true}),
+            },
+        )
+        .await
+        .expect("mark ok");
+        assert_eq!(
+            iterazioni_persistite(&pool, child).await,
+            (7, 7),
+            "l'outcome del grafo vince sugli step"
+        );
+    }
+
+    /// Ignoto + NESSUNO step persistito -> 0, che stavolta e' un fatto (zero
+    /// passi registrati), non un contatore mai scritto.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn chiusura_senza_outcome_ne_step_scrive_zero(pool: sqlx::PgPool) {
+        let child = seed_sub_con_gemella(&pool).await;
+        mark_run(
+            &pool,
+            child,
+            SubRunClosure::from_ledger(
+                "failed",
+                "[Errore grafo nativo]",
+                json!({}),
+                &crate::chat_messages::LedgerTotals::default(),
+            ),
+        )
+        .await
+        .expect("mark ok");
+        assert_eq!(iterazioni_persistite(&pool, child).await, (0, 0));
     }
 
     /// GUARD di forma (regola L): il blocco esito dei rami TERMINALI
