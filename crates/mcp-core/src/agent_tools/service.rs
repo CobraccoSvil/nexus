@@ -335,22 +335,67 @@ async fn resolve_service_launch(
     // Risoluzione working directory (punto unico riusato anche dal restart).
     let work_dir = resolve_service_work_dir(&ctx.root_path, input)?;
 
-    // Derivazione label (refuse per scopo: dopo dedup in tool_run_service).
-    let label = resolve_service_label(
+    // Derivazione identita' (refuse per scopo: dopo dedup in tool_run_service).
+    // La conseguenza sulla classificazione la dichiara l'identita' stessa
+    // (`classifica`), non il chiamante: un `kind='service'` senza identita' non
+    // e' un servizio di progetto e viene declassato come il one-shot qui sopra.
+    let (kind, label) = resolve_service_label(
         input,
         &command,
         kind,
         &ctx.root_path,
         &work_dir,
         ctx.project_id,
-    );
+    )
+    .classifica(kind);
 
     Ok(ServiceLaunch {
         command,
-        kind: kind.to_string(),
+        kind,
         label,
         work_dir,
     })
+}
+
+/// Label priva di scopo, deliberata: la porta chi NON e' un servizio di progetto
+/// (task one-shot, comando qualunque instradato qui con `background=true`).
+/// Generica per costruzione, quindi `visible_windows_services` la nasconde dal
+/// pannello appena il processo muore e `stop_similar_running_services` non la fa
+/// mai combaciare con un servizio vero.
+const LABEL_NON_SERVIZIO: &str = "Service";
+
+/// Identita' di un servizio: cio' che lo distingue DENTRO il progetto, e la
+/// conseguenza che ne discende sulla classificazione.
+///
+/// Esiste come tipo perche' le tre risposte non sono la stessa cosa detta in
+/// modi diversi: due danno un nome al servizio, la terza dice che un servizio
+/// non c'e'. Prima erano tutte una `String`, e "non lo so" era indistinguibile
+/// da un'identita' vera.
+enum ServiceIdentity {
+    /// Un segnale dice il RUOLO: label esplicita, comando, cartella di lavoro.
+    Ruolo(String),
+    /// Nessun segnale dice il ruolo, ma il comando avvia un server: gli servira'
+    /// una porta, quindi gli serve un nome stabile fra i riavvii per riceverla e
+    /// conservarla. Ancorato al progetto per COSTRUZIONE (l'uuid), mai per NOME.
+    SoloAncoraggio(String),
+    /// Non e' un servizio di progetto: nessuna identita' da dare.
+    NonServizio,
+}
+
+impl ServiceIdentity {
+    /// `(kind, label)` conseguenti. Punto unico della traduzione: il tool e i
+    /// test attraversano questa, cosi' nessuno dei due ricopia l'altro (regola O).
+    ///
+    /// Un `kind='service'` senza identita' diventa `task`: il processo gira
+    /// identico (stessa tabella, stop/read_output per id), ma non ha unit, non
+    /// riceve allocazione e non compare nel pannello Servizi. E' il trattamento
+    /// gia' riservato al one-shot declassato, per la stessa ragione.
+    fn classifica(self, kind: &str) -> (String, String) {
+        match self {
+            Self::Ruolo(label) | Self::SoloAncoraggio(label) => (kind.to_string(), label),
+            Self::NonServizio => ("task".to_string(), LABEL_NON_SERVIZIO.to_string()),
+        }
+    }
 }
 
 /// IDENTITA' del servizio, mai generica. Il refuse per duplicato attivo e' in
@@ -373,10 +418,24 @@ async fn resolve_service_launch(
 /// Ordine di derivazione, dal segnale piu' specifico al piu' stabile:
 /// 1. label esplicita dell'agente, se dice qualcosa;
 /// 2. scopo (frontend/backend) dedotto da comando + working directory;
-/// 3. nome della cartella da cui il servizio gira, risalendo fino alla radice
-///    del progetto (la prima che porti una parola propria);
-/// 4. ancoraggio al progetto: brutto ma stabile fra i riavvii e non generico,
-///    quindi capace di ricevere una porta e di conservarla.
+/// 3. nome della cartella da cui il servizio gira, SOTTO la radice del progetto
+///    (la prima che porti una parola propria);
+/// 4. nessuno: e allora si dichiara che non c'e' (vedi [`ServiceIdentity`]).
+///
+/// Il nome della cartella di PROGETTO non e' un candidato, e non lo e' per
+/// costruzione: l'unit e' gia' `{slug}-{label}.service`, quindi lo slug e' la
+/// parte che il progetto mette e la label e' la parte che distingue un servizio
+/// dall'altro DENTRO quel progetto. Ripetere li' il nome del progetto produce
+/// `{slug}-{slug}.service`, che non aggiunge nessuna parola distintiva: dice due
+/// volte cio' che si sapeva gia', e non dice il ruolo. E' la stessa forma del
+/// difetto gia' tolto a `resource_resolver::orphan_placeholder_label` — dare un
+/// nome inventato quando manca il segnale, e lasciarlo entrare nella stessa
+/// lista dei nomi veri, dove nessuno potra' piu' distinguerli.
+///
+/// Misurato il 30/07/2026 su bacheca-attivita: l'UNICA identita' mai prodotta da
+/// quel ripiego, sull'intero parco progetti, era `npx -w backend eslint . --ext
+/// .ts` lanciato dalla radice — un lint, non un servizio, che il pannello
+/// mostrava come `bacheca-attivita-bacheca-attivita.service`.
 fn resolve_service_label(
     input: &Value,
     command: &str,
@@ -384,7 +443,7 @@ fn resolve_service_label(
     root: &std::path::Path,
     work_dir: &std::path::Path,
     project_id: uuid::Uuid,
-) -> String {
+) -> ServiceIdentity {
     let explicit_label = input
         .get("label")
         .and_then(Value::as_str)
@@ -392,7 +451,7 @@ fn resolve_service_label(
         .filter(|s| !s.is_empty())
         .filter(|s| !crate::agent_processes::is_generic_service_label(s));
     if let Some(label) = explicit_label {
-        return label.to_string();
+        return ServiceIdentity::Ruolo(label.to_string());
     }
 
     // Un task one-shot (`npm install`, `playwright test`) NON e' un servizio:
@@ -401,20 +460,39 @@ fn resolve_service_label(
     // con il servizio omonimo: `stop_similar_running_services`, che gira per
     // ogni kind, fermerebbe il backend vero perche' l'install gira in backend/.
     if kind != "service" {
-        return "Service".to_string();
+        return ServiceIdentity::NonServizio;
     }
 
     if let Some(hint) = derive_kind_hint(command, "", scope_dir(root, work_dir).as_deref()) {
-        return hint.to_string();
+        return ServiceIdentity::Ruolo(hint.to_string());
     }
-    identita_dal_percorso(root, work_dir)
-        .unwrap_or_else(|| format!("service-{}", &project_id.simple().to_string()[..8]))
+    if let Some(dal_percorso) = identita_dal_percorso(root, work_dir) {
+        return ServiceIdentity::Ruolo(dal_percorso);
+    }
+    // Nessun segnale di ruolo. Il comando dice se un servizio c'e' comunque:
+    // solo chi avvia un server ha bisogno di una porta, e solo per lui vale la
+    // pena di un nome di ripiego. Per tutto il resto (un lint, un `git diff`,
+    // un comando qualunque arrivato qui con `background=true`) l'assenza di
+    // identita' e' la risposta giusta, non un problema da aggirare.
+    if looks_like_web_service(command) {
+        return ServiceIdentity::SoloAncoraggio(format!(
+            "service-{}",
+            &project_id.simple().to_string()[..8]
+        ));
+    }
+    ServiceIdentity::NonServizio
 }
 
 /// Identita' derivata dal PERCORSO: nome della cartella da cui il servizio gira,
-/// risalendo verso la radice del progetto (inclusa) fino alla prima che porti una
+/// risalendo verso la radice del progetto (ESCLUSA) fino alla prima che porti una
 /// parola propria. `services/pagamenti` -> "pagamenti"; working dir sulla radice
-/// -> nome della cartella di progetto ("gestione-spese").
+/// -> `None`, perche' sopra non c'e' piu' niente che parli del ruolo.
+///
+/// La radice e' esclusa dallo stesso confine che `scope_dir` traccia gia' per lo
+/// scopo: solo la parte SOTTO la radice descrive il servizio, il resto descrive
+/// il progetto. Le due domande ("che ruolo ha" e "come si chiama") guardano
+/// percio' lo stesso pezzo di percorso, e non possono piu' rispondere da fonti
+/// diverse.
 ///
 /// Il vaglio "porta una parola propria" e' `is_generic_service_label` (punto
 /// unico del vocabolario label, regola L): una cartella `app/` o `server/` non
@@ -427,10 +505,8 @@ fn identita_dal_percorso(root: &std::path::Path, work_dir: &std::path::Path) -> 
         .map(|c| c.as_os_str().to_string_lossy().to_string())
         .collect();
     // Dalla cartella piu' specifica verso la radice: il ruolo sta piu' vicino al
-    // servizio che al progetto. Il nome della cartella di progetto e' l'ultima
-    // carta, non la prima.
+    // servizio che al progetto.
     candidati.reverse();
-    candidati.extend(root.file_name().map(|n| n.to_string_lossy().to_string()));
     candidati
         .iter()
         .map(|nome| normalizza_label(nome))
@@ -1478,21 +1554,24 @@ mod tests {
     }
 
     /// Identita' come la produce il tool: dallo STESSO input JSON, passando per il
-    /// produttore vero della working dir. Ritorna anche l'unit, che e' la
-    /// conseguenza a valle (`nexus_port_allocations.service_unit`).
-    fn identita(nome_progetto: &str, root: &Path, input: &serde_json::Value, kind: &str) -> (String, String) {
+    /// produttore vero della working dir e per la STESSA traduzione
+    /// identita' -> (kind, label) che usa `resolve_service_launch` (regola O:
+    /// ricopiarla qui renderebbe verde un test che misura la propria copia).
+    /// Ritorna anche l'unit, che e' la conseguenza a valle
+    /// (`nexus_port_allocations.service_unit`).
+    fn identita(
+        nome_progetto: &str,
+        root: &Path,
+        input: &serde_json::Value,
+        kind: &str,
+    ) -> (String, String, String) {
         let command = input["command"].as_str().unwrap_or_default().to_string();
         let work_dir = resolve_service_work_dir(root, input).expect("working dir risolta");
-        let label = resolve_service_label(
-            input,
-            &command,
-            kind,
-            root,
-            &work_dir,
-            id("1a2b3c4d"),
-        );
+        let (kind, label) =
+            resolve_service_label(input, &command, kind, root, &work_dir, id("1a2b3c4d"))
+                .classifica(kind);
         let unit = service_unit_name(&project_service_slug(nome_progetto), &label);
-        (label, unit)
+        (label, unit, kind)
     }
 
     /// REGRESSIONE (caso reale, progetto gestione-spese): il backend girava con
@@ -1508,7 +1587,7 @@ mod tests {
         let (_tmp, root) = progetto("gestione-spese", &["backend"]);
         let input = json!({ "command": "npm start", "working_dir": "backend" });
 
-        let (label, unit) = identita("Gestione Spese", &root, &input, "service");
+        let (label, unit, _) = identita("Gestione Spese", &root, &input, "service");
 
         assert_eq!(label, "backend", "la working dir dice il ruolo che il comando tace");
         // La conseguenza: e' l'unit che il pannello ricostruisce dalla label del
@@ -1529,32 +1608,74 @@ mod tests {
         // Comando muto, cartella che non dice un ruolo ma ha un nome proprio.
         let (_tmp, root) = progetto("gestione-spese", &["services/pagamenti"]);
         let input = json!({ "command": "npm start", "working_dir": "services/pagamenti" });
-        let (label, _) = identita("Gestione Spese", &root, &input, "service");
+        let (label, _, _) = identita("Gestione Spese", &root, &input, "service");
         assert_eq!(label, "pagamenti");
-        assert!(!is_generic_service_label(&label));
-
-        // Servizio che gira dalla radice: resta il nome del progetto.
-        let input = json!({ "command": "npm start" });
-        let (label, unit) = identita("Gestione Spese", &root, &input, "service");
-        assert_eq!(label, "gestione-spese");
-        assert_eq!(unit, "gestione-spese-gestione-spese.service");
         assert!(!is_generic_service_label(&label));
     }
 
-    /// Caso limite dichiarato: nemmeno la radice ha una parola propria (cartella
-    /// `app/`). L'identita' si ancora al progetto: brutta da leggere, ma stabile
-    /// fra i riavvii e NON generica, quindi capace di ricevere una porta. Il nome
-    /// generico, quello, si sa gia' che non potra' mai riceverne una.
+    /// REGRESSIONE (misurata il 30/07/2026, progetto bacheca-attivita): il
+    /// pannello Servizi elencava `bacheca-attivita-bacheca-attivita.service`, che
+    /// non identifica un ruolo — ripete il progetto due volte. Nasceva dal
+    /// ripiego sul nome della cartella di progetto, e cio' che aveva registrato
+    /// era `npx -w backend eslint . --ext .ts` lanciato dalla radice: un lint,
+    /// non un servizio.
+    ///
+    /// Due asserzioni distinte, perche' sono due fatti distinti: lo slug non e'
+    /// un'identita', e cio' che non ha identita' non e' un servizio di progetto.
     #[test]
-    fn radice_senza_nome_proprio_ancora_l_identita_al_progetto() {
-        let (_tmp, root) = progetto("app", &[]);
+    fn dalla_radice_senza_ruolo_non_nasce_un_servizio_che_ripete_il_progetto() {
+        let (_tmp, root) = progetto("bacheca-attivita", &["backend"]);
+        let input = json!({ "command": "npx -w backend eslint . --ext .ts" });
+
+        let (label, unit, kind) = identita("bacheca-attivita", &root, &input, "service");
+
+        assert_eq!(
+            kind, "task",
+            "un comando senza ruolo e senza bisogno di porta non e' un servizio: {label}"
+        );
+        assert_ne!(label, "bacheca-attivita", "il nome del progetto non e' un ruolo");
+        assert_ne!(
+            unit, "bacheca-attivita-bacheca-attivita.service",
+            "l'unit fantasma vista nel pannello"
+        );
+        // Declassato a task, il pannello lo nasconde appena muore: la label e'
+        // generica per costruzione (`visible_windows_services`).
+        assert!(is_generic_service_label(&label));
+    }
+
+    /// Un servizio VERO che gira dalla radice (progetto mono-servizio) ha bisogno
+    /// di una porta, quindi di un nome stabile fra i riavvii per riceverla e
+    /// conservarla. Lo distingue il comando, non il percorso: `npm start` avvia un
+    /// server, `npx eslint` no. Il nome di ripiego si ancora al progetto per
+    /// COSTRUZIONE (l'uuid), mai per NOME: brutto da leggere, ma dichiara di
+    /// essere un ripiego invece di sembrare una scelta.
+    #[test]
+    fn il_servizio_web_dalla_radice_riceve_un_ancoraggio_non_il_nome_del_progetto() {
+        let (_tmp, root) = progetto("gestione-spese", &[]);
         let input = json!({ "command": "npm start" });
-        let (label, _) = identita("App", &root, &input, "service");
-        assert_eq!(label, "service-1a2b3c4d", "identita' ancorata al progetto");
+
+        let (label, unit, kind) = identita("Gestione Spese", &root, &input, "service");
+
+        assert_eq!(kind, "service", "un server resta un servizio");
+        assert_eq!(label, "service-1a2b3c4d");
+        assert_eq!(unit, "gestione-spese-service-1a2b3c4d.service");
         assert!(
             !is_generic_service_label(&label),
             "un'identita' che il sistema considera vuota non riceve porte: {label}"
         );
+    }
+
+    /// Caso limite dichiarato: nemmeno la cartella di lavoro ha una parola propria
+    /// (`app/`). Stessa risposta del caso sopra — il vaglio sulle cartelle e
+    /// quello sul comando sono due domande separate, e la seconda decide da sola.
+    #[test]
+    fn cartella_senza_nome_proprio_ancora_l_identita_al_progetto() {
+        let (_tmp, root) = progetto("gestione-spese", &["app"]);
+        let input = json!({ "command": "npm start", "working_dir": "app" });
+        let (label, _, kind) = identita("Gestione Spese", &root, &input, "service");
+        assert_eq!(kind, "service");
+        assert_eq!(label, "service-1a2b3c4d", "identita' ancorata al progetto");
+        assert!(!is_generic_service_label(&label));
     }
 
     /// La label esplicita dell'agente e' il segnale piu' specifico e vince; ma se
@@ -1564,13 +1685,13 @@ mod tests {
         let (_tmp, root) = progetto("gestione-spese", &["backend"]);
 
         let input = json!({ "command": "npm start", "working_dir": "backend", "label": "Checkout API" });
-        let (label, _) = identita("Gestione Spese", &root, &input, "service");
+        let (label, _, _) = identita("Gestione Spese", &root, &input, "service");
         assert_eq!(label, "Checkout API");
 
         // "Service" proposta dall'agente: scartata come quando la sceglieva il
         // sistema, si ricade sul segnale della working dir.
         let input = json!({ "command": "npm start", "working_dir": "backend", "label": "Service" });
-        let (label, _) = identita("Gestione Spese", &root, &input, "service");
+        let (label, _, _) = identita("Gestione Spese", &root, &input, "service");
         assert_eq!(label, "backend");
     }
 
@@ -1582,8 +1703,9 @@ mod tests {
     fn il_task_one_shot_non_eredita_l_identita_del_servizio() {
         let (_tmp, root) = progetto("gestione-spese", &["backend"]);
         let input = json!({ "command": "npm install", "working_dir": "backend" });
-        let (label, _) = identita("Gestione Spese", &root, &input, "task");
+        let (label, _, kind) = identita("Gestione Spese", &root, &input, "task");
         assert_eq!(label, "Service");
+        assert_eq!(kind, "task");
         assert!(
             !similar_service_labels(&label, "backend"),
             "un task non deve deduplicare il servizio backend"
