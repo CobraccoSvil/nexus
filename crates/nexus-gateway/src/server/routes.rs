@@ -606,11 +606,31 @@ fn resolve_providers(
 ) -> (Vec<ResolvedProvider>, bool) {
     let mut out = Vec::new();
     let mut any_tier_mismatch = false;
+    // Un nome fisico NUDO non dice a chi appartenga (vedi `Attribuzione`): vale
+    // per il primo provider utilizzabile della catena — quello che il routing ha
+    // scelto — e non per i successivi. `resolve` da solo non puo' saperlo,
+    // perche' vede un provider per volta e per un nome nudo risponde "usalo
+    // as-is": corretto quando il chiamante ha pinnato il fornitore, sbagliato
+    // quando dietro c'e' una cascata. Propagarlo ha mandato `open-mistral-nemo`
+    // a DeepSeek (HTTP 400 "you passed open-mistral-nemo", misurato il
+    // 30/07/2026): il gateway l'ha classificato irrimediabile e non ha ritentato,
+    // ma la richiesta era gia' persa e il chiamante ha ricevuto 500.
+    let nome_nudo = matches!(
+        aliases.attribuzione(logical_model),
+        crate::model_alias_resolver::Attribuzione::Nuda
+    );
     for name in names {
         let Some(provider) = built.iter().find(|p| p.name() == name) else {
             // Provider deciso dalla policy ma non costruito (es. chiave mancante).
             continue;
         };
+        if nome_nudo && !out.is_empty() {
+            tracing::debug!(
+                provider = %name, model = %logical_model,
+                "gateway: nome fisico non attribuibile, non propagato oltre il primo provider"
+            );
+            continue;
+        }
         match aliases.resolve(logical_model, name, tier) {
             Ok(model) => out.push(ResolvedProvider {
                 provider: provider.clone(),
@@ -3075,6 +3095,57 @@ mod tests {
     fn aliases() -> ModelAliasResolver {
         // Modello diretto stesso provider -> passthrough (strip prefisso).
         ModelAliasResolver::from_yaml_str("aliases: {}").unwrap()
+    }
+
+    /// IL DIFETTO: un nome fisico NUDO veniva propagato a tutta la catena, e il
+    /// fornitore successivo riceveva il modello di un altro. Misurato il
+    /// 30/07/2026: DeepSeek ha risposto 400 "The supported API model names are
+    /// deepseek-v4-pro or deepseek-v4-flash, but you passed open-mistral-nemo",
+    /// il gateway l'ha giustamente classificato irrimediabile e il chiamante ha
+    /// ricevuto 500. La catena e' costruita col PRODUTTORE vero
+    /// (`resolve_providers`), non con una lista scritta a mano (regola O).
+    #[test]
+    fn un_nome_fisico_nudo_non_viaggia_oltre_il_primo_provider() {
+        let mistral: Arc<dyn LlmProvider> = FakeProvider::new("mistral", Behaviour::Ok);
+        let deepseek: Arc<dyn LlmProvider> = FakeProvider::new("deepseek", Behaviour::Ok);
+        let built = vec![mistral, deepseek];
+        let (resolved, _) = resolve_providers(
+            &["mistral".into(), "deepseek".into()],
+            &built,
+            &aliases(),
+            "open-mistral-nemo",
+            0,
+        );
+        assert_eq!(
+            resolved.len(),
+            1,
+            "un nome fisico nudo vale per il provider a cui e' indirizzato: \
+             propagarlo manda il modello di un fornitore a un altro"
+        );
+        assert_eq!(resolved[0].provider.name(), "mistral");
+        assert_eq!(resolved[0].model, "open-mistral-nemo");
+    }
+
+    /// Controprova: un nome col PREFISSO attraversa la catena, perche' ogni
+    /// provider sa se sia suo (stesso provider -> strip; altro -> fallback o
+    /// esclusione). Senza questo, il fix sopra avrebbe accorciato ogni catena.
+    #[test]
+    fn un_nome_col_prefisso_resta_valutabile_da_tutta_la_catena() {
+        let openai: Arc<dyn LlmProvider> = FakeProvider::new("openai", Behaviour::Ok);
+        let deepseek: Arc<dyn LlmProvider> = FakeProvider::new("deepseek", Behaviour::Ok);
+        let built = vec![openai, deepseek];
+        let (resolved, _) = resolve_providers(
+            &["openai".into(), "deepseek".into()],
+            &built,
+            &aliases(),
+            "openai/gpt-x",
+            0,
+        );
+        // deepseek esce per assenza di fallback cross-provider, non per il taglio
+        // del nome nudo: il primo resta e la valutazione del secondo e' avvenuta.
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].provider.name(), "openai");
+        assert_eq!(resolved[0].model, "gpt-x");
     }
 
     #[test]

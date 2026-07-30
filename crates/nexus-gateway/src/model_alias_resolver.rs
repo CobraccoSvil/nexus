@@ -49,6 +49,25 @@ pub enum AliasError {
     Unavailable { model: String, provider: String },
 }
 
+/// Quanto il nome di un modello dice sul fornitore che deve servirlo.
+///
+/// Serve a decidere fin dove quel nome puo' viaggiare lungo la catena di
+/// fallback: un alias logico ha una traduzione per ogni provider, un nome con
+/// prefisso porta il fornitore con se', un nome nudo non dice nulla.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attribuzione {
+    /// Alias logico noto: il file alias dichiara il modello reale per ciascun
+    /// provider, quindi il nome attraversa la catena tradotto ogni volta.
+    Alias,
+    /// `provider/modello`: il fornitore e' scritto nel nome.
+    Esplicita,
+    /// Nome fisico senza prefisso (`open-mistral-nemo`, `deepseek-chat`): il
+    /// file alias scrive i modelli reali sempre come `provider/modello`, quindi
+    /// un nome nudo che non sia un alias NON dice a chi appartenga. Vale per il
+    /// provider a cui la richiesta e' indirizzata, non per i successivi.
+    Nuda,
+}
+
 /// Risolutore di alias modello. Immutabile dopo la costruzione (la tabella
 /// alias e' di sola lettura), quindi condivisibile tra task dietro `Arc`.
 #[derive(Debug, Clone)]
@@ -70,6 +89,22 @@ impl ModelAliasResolver {
         Ok(Self {
             aliases: parsed.aliases,
         })
+    }
+
+    /// Che cosa dice il NOME del modello su chi debba servirlo.
+    ///
+    /// Punto unico della domanda (regola L): la usa `resolve_providers` per
+    /// sapere fin dove un nome puo' viaggiare lungo la catena di fallback.
+    pub fn attribuzione(&self, logical_model: &str) -> Attribuzione {
+        if self.aliases.contains_key(logical_model) {
+            // Il file dichiara il modello reale per ciascun provider.
+            Attribuzione::Alias
+        } else if logical_model.contains('/') {
+            // `provider/modello`: il fornitore viaggia col nome.
+            Attribuzione::Esplicita
+        } else {
+            Attribuzione::Nuda
+        }
     }
 
     /// Risolve `logical_model` per `provider` ed `effective_tier`, ritornando il
