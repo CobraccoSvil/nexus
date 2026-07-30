@@ -1263,9 +1263,28 @@ mod tests {
 
         // Il criterio e' la CONSEGUENZA, non l'uguaglianza: le direttive di turno
         // possono cambiare (e devono, e' il loro mestiere), ma il tratto iniziale
-        // che i turni condividono deve coprire almeno il system che il chiamante
-        // ha fornito. Misurato in caratteri effettivamente comuni, non chiedendo
-        // al codice sotto misura dove passa il proprio confine.
+        // che i turni condividono deve CONTENERE il system che il chiamante ha
+        // fornito. Misurato sui caratteri effettivamente comuni, non chiedendo al
+        // codice sotto misura dove passa il proprio confine.
+        //
+        // Perche' il contenimento e non la lunghezza: `comune >= len(SYSTEM)` e'
+        // cieco per aritmetica. Le direttive di turno hanno un preambolo FISSO
+        // (l'intestazione del focus ne vale ~100 caratteri, il SYSTEM di questo
+        // test 76), quindi due prompt entrambi difettosi — con un blocco
+        // variabile ANTEPOSTO — condividerebbero piu' caratteri del system stesso
+        // e il test passerebbe col difetto in produzione. Se il tratto comune
+        // deve invece arrivare a coprire il system per intero, un blocco che
+        // diverge prima taglia il prefisso PRIMA di esso e il test cade.
+        //
+        // Cosa NON copre, dichiarato: un blocco anteposto che resti IDENTICO in
+        // tutti i turni di questo run (il focus, ora che nasce dal task fissato
+        // all'origine, e' di quelli). Dentro un run non fa danno — e' il riuso fra
+        // RUN diversi che perde, e li' il metro e' un altro: due run con task
+        // diverso, misurato in `planner::tests::il_focus_del_turno_non_apre_il_
+        // prompt_del_planner`, dove la testa non deve nemmeno cominciare con un
+        // blocco di turno. Pretendere qui `starts_with(SYSTEM)` sarebbe piu'
+        // severo ma falso: il promemoria di lingua, quando la config lo accende,
+        // precede il system per progetto ed e' fisso.
         let attesi = SYSTEM.chars().count();
         let (sys0, tool0) = teste[0].clone();
         for (i, (sys, tools)) in teste.iter().enumerate().skip(1) {
@@ -1275,12 +1294,14 @@ mod tests {
                  ({tool0:?} -> {tools:?}): il prefisso non e' piu' riusabile"
             );
             let comune = prefisso_comune(&sys0, sys);
+            let condiviso: String = sys0.chars().take(comune).collect();
             assert!(
-                comune >= attesi,
-                "turno {i}: la testa condivisa col primo turno e' di {comune} caratteri, \
-                 ne servono almeno {attesi} (il system del run). Un blocco variabile e' \
-                 finito PRIMA della parte stabile: da li' in poi il fornitore non ha \
-                 nulla da riusare.\nprimo turno: {sys0:?}\nturno {i}: {sys:?}"
+                condiviso.contains(SYSTEM),
+                "turno {i}: la testa condivisa col primo turno e' di {comune} caratteri \
+                 (il system del run ne vale {attesi}) e NON lo contiene per intero. Un \
+                 blocco variabile e' finito PRIMA della parte stabile: da li' in poi il \
+                 fornitore non ha nulla da riusare.\ncondiviso: {condiviso:?}\nprimo \
+                 turno: {sys0:?}\nturno {i}: {sys:?}"
             );
         }
     }

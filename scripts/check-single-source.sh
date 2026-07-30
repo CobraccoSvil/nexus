@@ -1554,8 +1554,48 @@ else
   echo "OK contratto-fallimento-tool: nessun call site ricopia la condizione del marker"
 fi
 
+# Il corpo che parte da un endpoint OpenAI-compat nasce in UN punto (2026-07-30)
+#
+# La sequenza "risolvi la preferenza di fornitore -> costruisci il body col
+# dialetto di cache del client -> applica i quirk di forma" era ricopiata in
+# `complete_with_reasoning` e `stream_with_reasoning`. La duplicazione non era
+# solo debito: era la ragione per cui nessun test la attraversava (i test
+# chiamavano `build_request_body` a mano passando dialetto e ordine, cioe'
+# fissando l'assunto da verificare). MISURATO: revocando i tre livelli di
+# affinita' nei due call site, `cargo test -p nexus-gateway` restava a 407 verdi.
+# Se la chiamata torna a essere piu' di una, la copertura di quel percorso
+# scende a meta' senza che nulla lo dica.
+if [[ -f crates/nexus-gateway/src/providers/openai_compat.rs ]]; then
+  if awk '
+    /^#\[cfg\(test\)\]/ { exit }
+    /^[[:space:]]*\/\// { next }
+    /build_request_body\(/ && !/fn build_request_body\(/ {
+      n++; righe = righe "   riga " NR ": " $0 "\n"
+    }
+    END {
+      if (n == 1) { exit 1 }
+      printf "   chiamate trovate: %d\n%s", n, righe > "/dev/stderr"
+      exit 0
+    }
+  ' crates/nexus-gateway/src/providers/openai_compat.rs 2>&1; then
+    echo "!! corpo-richiesta-openai-compat: il corpo non nasce in un punto solo." >&2
+    echo "   Attesa UNA chiamata a build_request_body, dentro" >&2
+    echo "   OpenAiCompatClient::corpo_della_richiesta: complete e stream delegano" >&2
+    echo "   a quella. Zero chiamate = la giunzione e' stata rimossa; piu' di una =" >&2
+    echo "   e' tornata duplicata, e i test ne attraversano solo un ramo (regola O)." >&2
+    fail=1
+  else
+    echo "OK corpo-richiesta-openai-compat: una sola giunzione verso il wire"
+  fi
+else
+  echo "!! corpo-richiesta-openai-compat: modulo openai_compat.rs non trovato." >&2
+  echo "   Il check non ha raggiunto il suo oggetto (regola O)." >&2
+  fail=1
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1
+
 fi
 echo "OK check-single-source: nessuna regressione sui punti unici attivi."

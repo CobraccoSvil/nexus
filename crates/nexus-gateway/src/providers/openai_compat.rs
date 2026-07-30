@@ -13,10 +13,11 @@
 //! Regola G: nessun modello hardcoded, arriva sempre da `req.model`.
 //! Regola F: mai loggare prompt/response in chiaro.
 
+use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
-use std::time::Duration;
-
+use dashmap::DashMap;
 use futures::StreamExt;
 use nexus_cache::TtlCache;
 use reqwest::Client;
@@ -95,12 +96,51 @@ pub struct OpenAiCompatClient {
     /// Preferenza per modello, con la TTL delle altre cache del gateway (60s,
     /// punto unico `TtlCache`). `None` in valore = misurato assente, e va
     /// ricordato: senza, ogni chiamata su un modello senza riga interrogherebbe
-    /// il DB da capo.
+    /// il DB da capo. Vi entra SOLO cio' che si e' letto: un errore non e' una
+    /// misura, e scriverlo qui cristallizzerebbe per 60s un'ignoranza
+    /// momentanea.
     upstream_order: TtlCache<String, Option<Vec<String>>>,
+    /// Ultimo esito LETTO con successo, senza scadenza: e' cio' che si serve
+    /// mentre il DB non risponde, invece di degradare a "nessuna preferenza"
+    /// (stesso pattern di `RoutingMatrixCache`, regola G — la cache tiene
+    /// l'ultimo valore valido e il refresh fallito resta un WARN).
+    ///
+    /// Non maschera una riconfigurazione: viene sovrascritto a ogni lettura
+    /// riuscita, quindi una riga rimossa o disattivata vi finisce come `None`.
+    /// Copre il solo caso in cui il DB non ha parlato.
+    ultimo_ordine_letto: Arc<DashMap<String, Option<Vec<String>>>>,
 }
 
 /// TTL della cache delle preferenze di fornitore (come `policy_engine`/`cooldown`).
 const UPSTREAM_AFFINITY_TTL: Duration = Duration::from_secs(60);
+
+/// SQLSTATE `undefined_table`: la tabella dell'affinita' non esiste su questo DB,
+/// cioe' la mig 0657 non e' applicata. E' il caso peggiore (funzionalita' inerte
+/// al 100%) e va detto per nome, non confuso con "nessuna preferenza".
+const SQLSTATE_TABELLA_ASSENTE: &str = "42P01";
+
+/// Perche' la preferenza non si e' potuta leggere, dal segnale STRUTTURATO
+/// dell'errore e non dal suo messaggio (regola M): lo SQLSTATE del database, o
+/// l'assenza di codice quando l'errore e' del trasporto (pool esaurito,
+/// connessione caduta) e non del server.
+fn causa_preferenza_illeggibile(sqlstate: Option<&str>) -> &'static str {
+    match sqlstate {
+        Some(SQLSTATE_TABELLA_ASSENTE) => {
+            "tabella assente: la migrazione 0657 non e' applicata su questo DB"
+        }
+        Some(_) => "il database ha rifiutato la query",
+        None => "il database non e' raggiungibile",
+    }
+}
+
+/// SQLSTATE dell'errore, se l'errore viene dal server e non dal trasporto.
+/// Estratto qui perche' il campo sia leggibile una volta e prestato al log senza
+/// tenere in vita un temporaneo.
+fn sqlstate_di(e: &sqlx::Error) -> Option<String> {
+    e.as_database_error()
+        .and_then(|d| d.code())
+        .map(|c| c.into_owned())
+}
 
 /// Legge il CSV di `nexus_router_upstream_affinity.upstream_order`.
 ///
@@ -144,6 +184,7 @@ impl OpenAiCompatClient {
             cache_keying: PromptCacheKeying::ProviderManaged,
             db: None,
             upstream_order: TtlCache::new(UPSTREAM_AFFINITY_TTL),
+            ultimo_ordine_letto: Arc::new(DashMap::new()),
         }
     }
 
@@ -165,9 +206,20 @@ impl OpenAiCompatClient {
     /// Fornitori a valle preferiti per questo modello, in ordine.
     ///
     /// Interroga solo se l'endpoint e' un instradatore: su un provider diretto la
-    /// domanda non ha senso e la riga non esisterebbe. Un DB assente o una query
-    /// fallita valgono "nessuna preferenza": si perde il riuso del prefisso, non
-    /// la chiamata — l'opposto di quello che farebbe rifiutare la richiesta.
+    /// domanda non ha senso e la riga non esisterebbe. Nessun DB agganciato vale
+    /// "nessuna preferenza": si perde il riuso del prefisso, non la chiamata —
+    /// l'opposto di quello che farebbe rifiutare la richiesta.
+    ///
+    /// Una query FALLITA e' un'altra cosa, e prima finiva nella stessa casella:
+    /// `unwrap_or(None)` appiattiva l'errore in "riga assente" e lo scriveva in
+    /// cache, cioe' cristallizzava per 60s una risposta che nessuno aveva dato
+    /// (regola M). Nessun log lo diceva, e il costo non era simmetrico: su
+    /// `minimax/minimax-m2` la riga esiste per ESCLUDERE un fornitore che sullo
+    /// stesso prefisso fattura il prompt il doppio (20.011 token contro 10.162
+    /// misurati il 29/07/2026), quindi perderla non costa un riuso mancato ma una
+    /// sovrafatturazione. Qui l'errore: (1) si dichiara, con la sua causa
+    /// strutturata; (2) NON entra in cache, cosi' la chiamata dopo ritenta;
+    /// (3) non cancella cio' che si era gia' letto.
     async fn upstream_order_for(&self, model: &str) -> Option<Vec<String>> {
         if !self.cache_keying.requires_upstream_pinning() {
             return None;
@@ -176,18 +228,42 @@ impl OpenAiCompatClient {
             return v;
         }
         let db = self.db.as_ref()?;
-        let row: Option<(String,)> = sqlx::query_as(
+        let letto: Result<Option<(String,)>, sqlx::Error> = sqlx::query_as(
             "SELECT upstream_order FROM nexus_router_upstream_affinity \
              WHERE provider = $1 AND model_id = $2 AND is_active",
         )
         .bind(&self.provider_name)
         .bind(model)
         .fetch_optional(db)
-        .await
-        .unwrap_or(None);
-        let ordine = row.and_then(|(csv,)| parse_upstream_order(&csv));
-        self.upstream_order.insert(model.to_string(), ordine.clone());
-        ordine
+        .await;
+        match letto {
+            Ok(row) => {
+                let ordine = row.and_then(|(csv,)| parse_upstream_order(&csv));
+                self.upstream_order.insert(model.to_string(), ordine.clone());
+                self.ultimo_ordine_letto
+                    .insert(model.to_string(), ordine.clone());
+                ordine
+            }
+            Err(e) => {
+                let noto = self
+                    .ultimo_ordine_letto
+                    .get(model)
+                    .and_then(|v| v.value().clone());
+                let sqlstate = sqlstate_di(&e);
+                // Regola F: niente prompt/payload nei campi; qui viaggiano solo
+                // identificatori di configurazione e la causa strutturata.
+                tracing::warn!(
+                    provider = %self.provider_name,
+                    model = %model,
+                    causa = causa_preferenza_illeggibile(sqlstate.as_deref()),
+                    sqlstate = sqlstate.as_deref(),
+                    servito_ultimo_noto = noto.is_some(),
+                    "affinita' di fornitore a valle non leggibile: il prefisso puo' \
+                     atterrare su un fornitore diverso"
+                );
+                noto
+            }
+        }
     }
 
     /// Come questo client dichiara il riuso del prefisso. Esposto perche' il
@@ -199,6 +275,37 @@ impl OpenAiCompatClient {
 
     fn endpoint(&self) -> String {
         format!("{}/chat/completions", self.base_url)
+    }
+
+    /// PUNTO UNICO (regola L) del corpo che parte da QUESTO client: risolve la
+    /// preferenza di fornitore a valle, costruisce il body col dialetto di cache
+    /// che il client DICHIARA, e applica i quirk di forma dell'endpoint.
+    ///
+    /// Perche' esiste: la sequenza era ricopiata in `complete_with_reasoning` e
+    /// `stream_with_reasoning`, e la duplicazione era la ragione per cui nessun
+    /// test la attraversava — i test del body chiamavano
+    /// [`build_request_body`] a mano, passando `cache_keying` e ordine come
+    /// argomenti, cioe' fissando l'assunto che volevano verificare (regola O).
+    /// MISURATO il 29/07/2026: sostituendo i due call site con
+    /// `PromptCacheKeying::ProviderManaged, None` — cioe' revocando in blocco i
+    /// tre livelli di affinita' del prefisso — `cargo test -p nexus-gateway`
+    /// dava 407 passati e 0 falliti, identico alla baseline.
+    ///
+    /// Con un punto solo, i test che lo attraversano coprono ENTRAMBI i
+    /// percorsi, e la stessa mutazione ora fa rosseggiare la suite.
+    pub(crate) async fn corpo_della_richiesta(
+        &self,
+        req: &LlmRequest,
+        stream: bool,
+        reasoning: &ResolvedReasoning,
+    ) -> ChatCompletionRequest {
+        let ordine = self.upstream_order_for(&req.model).await;
+        let mut body =
+            build_request_body(req, stream, reasoning, self.cache_keying, ordine.as_deref());
+        if provider_requires_user_or_tool_last(&self.provider_name) {
+            strip_trailing_assistant(&mut body.messages);
+        }
+        body
     }
 
     /// Esegue una completion non-streaming e mappa il risultato in
@@ -216,12 +323,7 @@ impl OpenAiCompatClient {
         req: &LlmRequest,
         reasoning: &ResolvedReasoning,
     ) -> anyhow::Result<LlmResponse> {
-        let ordine = self.upstream_order_for(&req.model).await;
-        let mut body =
-            build_request_body(req, false, reasoning, self.cache_keying, ordine.as_deref());
-        if provider_requires_user_or_tool_last(&self.provider_name) {
-            strip_trailing_assistant(&mut body.messages);
-        }
+        let body = self.corpo_della_richiesta(req, false, reasoning).await;
         let start = Instant::now();
 
         let resp = self
@@ -273,12 +375,7 @@ impl OpenAiCompatClient {
         req: &LlmRequest,
         reasoning: &ResolvedReasoning,
     ) -> anyhow::Result<ChunkStream> {
-        let ordine = self.upstream_order_for(&req.model).await;
-        let mut body =
-            build_request_body(req, true, reasoning, self.cache_keying, ordine.as_deref());
-        if provider_requires_user_or_tool_last(&self.provider_name) {
-            strip_trailing_assistant(&mut body.messages);
-        }
+        let body = self.corpo_della_richiesta(req, true, reasoning).await;
 
         let resp = self
             .http
@@ -1547,8 +1644,12 @@ pub fn classify_provider_error(err: &anyhow::Error) -> ProviderErrorKind {
 // gateway.
 // ---------------------------------------------------------------------------
 
+/// Corpo `/chat/completions`. `pub(crate)` per il solo tipo (i campi restano
+/// privati): e' cio' che [`OpenAiCompatClient::corpo_della_richiesta`] ritorna, e
+/// i test degli adapter che lo compongono devono poterlo serializzare per
+/// guardare i campi che partono davvero.
 #[derive(Debug, Serialize)]
-struct ChatCompletionRequest {
+pub(crate) struct ChatCompletionRequest {
     model: String,
     messages: Vec<WireMessage>,
     /// Identificatore stabile del gruppo di chiamate che condividono il
@@ -2155,6 +2256,70 @@ mod tests {
         );
     }
 
+    /// La GIUNZIONE, non `build_request_body`: il corpo lo costruisce il client
+    /// dal dialetto che ha in mano, e i due percorsi di produzione (`complete`,
+    /// `stream`) passano solo da li'.
+    ///
+    /// Perche' serve, dato che il test sopra guarda gli stessi campi: quello
+    /// passa `cache_keying` a mano, quindi prova che la funzione lo onora, non
+    /// che qualcuno glielo dia. Revocando il fix nel client (`self.cache_keying`
+    /// -> `PromptCacheKeying::ProviderManaged`) quel test resta verde e la
+    /// richiesta parte senza chiave — che e' esattamente il difetto da cui il
+    /// modulo nasce (regola O).
+    #[tokio::test]
+    async fn il_client_dichiara_il_proprio_dialetto_nel_corpo() {
+        let apri = |nome: &str, keying| {
+            OpenAiCompatClient::new(Client::new(), "https://esempio.invalid/v1", "chiave", nome)
+                .with_prompt_cache_keying(keying)
+        };
+        let mut req = sample_request();
+        req.messages.insert(0, msg("system", "istruzioni di progetto"));
+
+        // Instradatore: entrambi i campi, perche' i lettori sono due.
+        let instradatore = apri(INSTRADATORE, PromptCacheKeying::RequiresSessionId);
+        let corpo = serde_json::to_value(
+            instradatore
+                .corpo_della_richiesta(&req, false, &ResolvedReasoning::none())
+                .await,
+        )
+        .expect("serializza");
+        let chiave = corpo
+            .get("prompt_cache_key")
+            .and_then(|v| v.as_str())
+            .expect("l'instradatore deve ricevere la chiave di raggruppamento");
+        assert_eq!(
+            corpo.get("session_id").and_then(|v| v.as_str()),
+            Some(chiave)
+        );
+
+        // Lo stream e' l'altro percorso di produzione, e passa dalla stessa
+        // giunzione: se un giorno divergesse, il campo sparirebbe da meta' delle
+        // chiamate senza che nulla lo dica.
+        let in_stream = serde_json::to_value(
+            instradatore
+                .corpo_della_richiesta(&req, true, &ResolvedReasoning::none())
+                .await,
+        )
+        .expect("serializza");
+        assert_eq!(
+            in_stream.get("prompt_cache_key").and_then(|v| v.as_str()),
+            Some(chiave),
+            "lo stream deve dichiarare lo stesso gruppo del non-streaming"
+        );
+        assert_eq!(in_stream.get("stream").and_then(|v| v.as_bool()), Some(true));
+
+        // Provider a cache automatica: nessun campo, come oggi.
+        let diretto = apri("mistral", PromptCacheKeying::ProviderManaged);
+        let senza = serde_json::to_value(
+            diretto
+                .corpo_della_richiesta(&req, false, &ResolvedReasoning::none())
+                .await,
+        )
+        .expect("serializza");
+        assert!(senza.get("prompt_cache_key").is_none());
+        assert!(senza.get("session_id").is_none());
+    }
+
     /// Il criterio sta nell'enum, non sparso nei call site (regola L): questo
     /// test guarda il punto unico, cosi' un nuovo instradatore aggiunto a
     /// `cache_keying_per_endpoint` eredita il livello senza altre modifiche.
@@ -2224,17 +2389,25 @@ mod tests {
         );
 
         // E arriva fino al body, che e' cio' che il fornitore legge davvero.
+        // Dalla GIUNZIONE, non da `build_request_body`: quest'ultima vuole
+        // l'ordine come argomento, e passarglielo a mano proverebbe soltanto che
+        // lo scrive nel campo — cioe' l'unica parte che non era in dubbio. Il
+        // difetto da cui nasce il modulo era una richiesta che partiva SENZA il
+        // campo che credevamo di mandare, quindi il body deve nascere dove nasce
+        // in produzione: il client lo legge dal DB da se' (regola O).
         let mut req = sample_request();
         req.model = MODELLO_MISURATO.to_string();
-        let body = serde_json::to_value(build_request_body(
-            &req,
-            false,
-            &ResolvedReasoning::none(),
-            client.cache_keying(),
-            Some(&ordine),
-        ))
+        let body = serde_json::to_value(
+            client
+                .corpo_della_richiesta(&req, false, &ResolvedReasoning::none())
+                .await,
+        )
         .expect("serializza");
-        assert_eq!(body[CAMPO_PROVIDER]["order"][0].as_str(), Some(PREFERITO));
+        assert_eq!(
+            body[CAMPO_PROVIDER]["order"][0].as_str(),
+            Some(PREFERITO),
+            "la preferenza letta dal DB non e' arrivata nel corpo: {body}"
+        );
 
         // Una riga disattivata non e' una preferenza: serve a togliere un
         // fornitore diventato cattivo senza cancellare la misura che lo diceva.
@@ -2255,6 +2428,84 @@ mod tests {
         // ma il livello non esiste.
         let diretto = apri("mistral", PromptCacheKeying::RequiresKey);
         assert_eq!(diretto.upstream_order_for(MODELLO_MISURATO).await, None);
+    }
+
+    /// Il modello su cui perdere la preferenza NON costa un riuso mancato: la
+    /// riga della 0657 esiste per ESCLUDERE un fornitore che sullo stesso
+    /// prefisso fattura il prompt il doppio (20.011 token contro 10.162).
+    const MODELLO_SOVRAFATTURATO: &str = "minimax/minimax-m2";
+
+    /// Un DB che non risponde non e' "nessuna preferenza", e non lo diventa per
+    /// i 60s successivi.
+    ///
+    /// L'errore lo produce il database VERO: la tabella viene resa invisibile con
+    /// un rename, non ricreata da uno schema ricopiato nel test — quella copia
+    /// divergerebbe dalla 0657 e il test misurerebbe se stesso (regola O). Il
+    /// rename e' anche l'unico modo di riportare indietro la tabella con i suoi
+    /// dati, che e' cio' che serve per provare il ritento.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn un_errore_del_db_non_diventa_nessuna_preferenza(pool: sqlx::PgPool) {
+        let client =
+            OpenAiCompatClient::new(Client::new(), "https://esempio.invalid/v1", "chiave", INSTRADATORE)
+                .with_prompt_cache_keying(PromptCacheKeying::RequiresSessionId)
+                .with_db(Some(pool.clone()));
+        let sposta = |da: &'static str, a: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(&format!("ALTER TABLE {da} RENAME TO {a}"))
+                    .execute(&pool)
+                    .await
+                    .expect("rinomina la tabella");
+            }
+        };
+        const NASCOSTA: &str = "affinita_nascosta_dal_test";
+        const VERA: &str = "nexus_router_upstream_affinity";
+
+        // (1) Cio' che si e' letto quando il DB parlava.
+        assert_eq!(
+            client.upstream_order_for(MODELLO_SOVRAFATTURATO).await,
+            Some(vec![PREFERITO.to_string(), "Minimax".to_string()])
+        );
+
+        // (2) Col DB muto, l'ultimo valore letto continua a partire: e' il
+        // pattern che la regola G prescrive (la cache tiene l'ultimo valore
+        // valido, il refresh fallito e' un WARN). L'invalidazione della casella
+        // TTL e' cio' che il tempo farebbe da se': `get` di una entry scaduta
+        // ritorna `None` esattamente come dopo un `invalidate`.
+        sposta(VERA, NASCOSTA).await;
+        client.upstream_order.invalidate(MODELLO_SOVRAFATTURATO);
+        assert_eq!(
+            client.upstream_order_for(MODELLO_SOVRAFATTURATO).await,
+            Some(vec![PREFERITO.to_string(), "Minimax".to_string()]),
+            "il DB non ha risposto: la preferenza gia' letta non va buttata, o la \
+             chiamata atterra sul fornitore che fattura il doppio"
+        );
+
+        // (3) Su un modello mai letto non c'e' nulla da conservare, e l'errore
+        // non autorizza a inventare un ordine.
+        assert_eq!(client.upstream_order_for(MODELLO_MISURATO).await, None);
+
+        // (4) E non si e' cristallizzato: appena il DB torna, la chiamata dopo
+        // ritenta. Col vecchio `unwrap_or(None)` l'errore finiva in cache come
+        // "nessuna riga" e questo assert cadeva, perche' la preferenza restava
+        // perduta per tutto il TTL senza che nulla lo dicesse.
+        sposta(NASCOSTA, VERA).await;
+        assert_eq!(
+            client.upstream_order_for(MODELLO_MISURATO).await,
+            Some(vec![PREFERITO.to_string()]),
+            "l'errore e' stato scritto in cache: la preferenza resta perduta per 60s"
+        );
+    }
+
+    /// La causa si legge dallo SQLSTATE, non dal messaggio dell'errore (regola
+    /// M): il caso peggiore — la 0657 non applicata sul DB di destinazione, in
+    /// cui la funzionalita' e' inerte al 100% — deve distinguersi da "il DB non
+    /// risponde" e da "nessuna preferenza configurata".
+    #[test]
+    fn la_causa_arriva_dal_codice_strutturato() {
+        assert!(causa_preferenza_illeggibile(Some(SQLSTATE_TABELLA_ASSENTE)).contains("0657"));
+        assert!(!causa_preferenza_illeggibile(Some("53300")).contains("0657"));
+        assert!(causa_preferenza_illeggibile(None).contains("raggiungibile"));
     }
 
     #[test]
