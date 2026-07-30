@@ -95,6 +95,41 @@ pub fn user_text_only(text: &str) -> String {
     SYSTEM_BLOCK_RE.replace_all(text, "").into_owned()
 }
 
+/// Sequenze di CHIUSURA riservate dei blocchi di sistema, le stesse tre
+/// alternative di [`SYSTEM_BLOCK_RE`] (case-insensitive, gemella per costruzione:
+/// se qui si aggiunge un tag va aggiunto anche li').
+static UNTRUSTED_CLOSE_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)</(allegati_sessione|allegati|task_playbook)>")
+        .expect("regex tag di chiusura valida")
+});
+
+/// Neutralizza, in un testo NON fidato che sta per essere iniettato DENTRO un
+/// blocco di sistema (`<allegati>`/`<allegati_sessione>`/`<task_playbook>`), le
+/// sequenze di chiusura riservate (`</allegati>`, `</allegati_sessione>`,
+/// `</task_playbook>`, case-insensitive).
+///
+/// Perche' serve: [`SYSTEM_BLOCK_RE`] e' non-greedy e si ferma al PRIMO
+/// letterale di chiusura che trova scandendo dal tag di apertura. Un documento
+/// indicizzato (es. un PDF/DOCX il cui testo estratto contiene letteralmente
+/// "</allegati>") farebbe terminare PREMATURAMENTE lo strip di
+/// [`user_text_only`] su quel tag fasullo, lasciando la CODA REALE del blocco
+/// (comprese le istruzioni di sistema successive) visibile a valle come se
+/// fosse testo scritto dall'utente — riaprendo esattamente la classe di
+/// difetto "una parola nel blocco di sistema fa scattare un trigger" (regola M),
+/// stavolta col contenuto di un documento invece che col nome file.
+///
+/// Da chiamare SEMPRE prima di iniettare contenuto non fidato (es. un chunk
+/// RAG estratto da un allegato) dentro uno di questi blocchi — MAI dopo, ne'
+/// sull'intero messaggio gia' assemblato (a quel punto il tag fasullo e' gia'
+/// indistinguibile da uno vero). Inserisce uno zero-width space (U+200B) subito
+/// dopo lo slash: spezza il letterale per la regex senza alterare la resa
+/// visiva del testo per chi legge (umano o modello).
+pub fn sanitize_for_system_block(text: &str) -> String {
+    UNTRUSTED_CLOSE_TAG_RE
+        .replace_all(text, "</\u{200B}$1>")
+        .into_owned()
+}
+
 /// Costruisce il blocco "focus del turno corrente" (anti-contaminazione della
 /// history). Funzione PURA e idempotente.
 ///

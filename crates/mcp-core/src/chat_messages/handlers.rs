@@ -1222,6 +1222,8 @@ async fn try_resume_interrupted_run(
             system_text: String::new(),
             prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
             initial_msg: resume_prompt,
+            // Prompt sintetico di ripresa ("continua"): nessun allegato nuovo.
+            attachment_kinds: Vec::new(),
             conversation_history: resume_history,
             tools_json: tools_for_resume,
             // Resume di un run interrotto: nessuna disambiguazione da risolvere.

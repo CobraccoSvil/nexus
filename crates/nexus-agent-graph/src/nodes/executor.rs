@@ -18,8 +18,9 @@
 //! - `routing::signals`: TUTTI i detector pre-LLM/G1 — [`detect_repeated_failed_command`],
 //!   [`detect_repeated_action_detailed`], [`count_recent_request_port`],
 //!   [`has_active_resources_in_history`], [`detect_recent_tool_error`],
-//!   [`detect_pending_steps_report_with`] (ADR 0018 fase 3: sostituto
-//!   strutturale della detection lessicale rimossa), [`unfulfilled_signal`],
+//!   [`unfulfilled_signal_with`] (punto unico parametrico: declared_outcome ->
+//!   structural_unfulfilled_signal, il residuo lessicale `_PENDING_STEPS_LABELS`
+//!   e' stato eliminato), [`unfulfilled_signal`],
 //!   [`has_tool_calls_in_history`], lista [`EXPLORATION_ONLY_TOOLS`].
 //! - `decisions::g1_accounting`: [`g1_accounting`] (CONTEGGIO re-entry/cap G1).
 //! - `decisions::escalation`: [`pick_escalation_model`] (SELEZIONE pura del modello
@@ -182,10 +183,10 @@ use crate::nodes::scale_control::{
 use crate::nodes::final_gate::FINAL_GATE_ESCALATION_KEY;
 use crate::nodes::stall_recovery::{stall_move_key, STALL_CONTEXT_KEY};
 use crate::routing::signals::{
-    count_recent_request_port, detect_pending_steps_report_with, detect_recent_tool_error,
-    detect_repeated_action_detailed, detect_repeated_failed_command,
-    has_active_resources_in_history, has_recent_productive_action, has_tool_calls_in_history,
-    modified_files_from_messages, tool_error_stats, EXPLORATION_ONLY_TOOLS,
+    count_recent_request_port, detect_recent_tool_error, detect_repeated_action_detailed,
+    detect_repeated_failed_command, has_active_resources_in_history, has_recent_productive_action,
+    has_tool_calls_in_history, modified_files_from_messages, tool_error_stats,
+    unfulfilled_signal_with, EXPLORATION_ONLY_TOOLS,
 };
 use crate::runtime::ports::RecoveryMove;
 use crate::runtime::ports::{
@@ -476,13 +477,6 @@ pub struct ExecutorConfig {
     /// Vuoto = messaggio deterministico coi soli numeri (il testo redazionale
     /// vive SOLO nel DB, regola G).
     pub overflow_message_template: String,
-    /// Rilevamento "report con passi pendenti" attivo
-    /// (`agent.closure.pending_steps_detection_enabled`, stessa chiave della
-    /// RoutingConfig — ADR 0018 fase 3: e' il sostituto strutturale del vecchio
-    /// fallback lessicale nei rami G1/report dell'executor).
-    pub pending_steps_detection_enabled: bool,
-    /// Item minimi dell'elenco pendenti (`agent.closure.pending_steps_min_items`).
-    pub pending_steps_min_items: i64,
     /// `true` se il meta-reasoner LLM di recovery-da-stallo e' attivo
     /// (`agent.stall_recovery.enabled`, mig 0510, default `false`). Con OFF il
     /// gate di EMISSIONE dello `StallReason` non scatta MAI: la gerarchia fissa
@@ -682,10 +676,6 @@ impl Default for ExecutorConfig {
             // `agent.context.hard_cap_ratio`, 0.95 in produzione).
             hard_cap_ratio: 0.0,
             overflow_message_template: String::new(),
-            // Default identici ai safe-default della RoutingConfig (stesse
-            // chiavi DB agent.closure.pending_steps_*).
-            pending_steps_detection_enabled: true,
-            pending_steps_min_items: 2,
             // Default safe-DB-down = seed mig 0510: meta-reasoner OFF, budget 6.
             // Con OFF il gate di emissione StallReason non scatta mai -> il motore
             // resta bit-identico a oggi (il wiring mcp-core passa i valori reali).
@@ -2654,13 +2644,30 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
 /// Conteggio G1 del turno: esito di [`g1_accounting`] gia' applicato al
 /// contatore reroute, piu' il segnale "output non compiuto" che il gate del cap
 /// riusa senza ricalcolarlo (regola L).
+///
+/// ATTENZIONE (debito noto, non chiuso da questo modulo): [`unfulfilled`]
+/// porta la finestra STRETTA di [`unfulfilled_signal_with`]
+/// (`tool_choice_forcing_max_iteration`, default 2), corretta per
+/// [`g1_accounting`] ma troppo stretta per il backstop "loop conclamato" di
+/// [`ExecutorNode::g1_cap_effettivo`] (soglia minima 12): quel branch resta
+/// di fatto irraggiungibile oltre le prime iterazioni. Un tentativo di
+/// sganciarlo dalla finestra (segnale gemello senza vincolo) e' stato
+/// scartato: senza vincolo di iterazione, `structural_unfulfilled_signal` e'
+/// vero per QUALUNQUE turno action-oriented con tool disponibili a inizio
+/// turno (la condizione "nessuna tool call IN CORSO" e' banalmente sempre
+/// vera al bordo del turno), quindi il backstop scattava anche su run sani a
+/// iterazioni alte — rottura misurata su 3 test esistenti (finestra
+/// forced-text, py:2032+). Serve un segnale genuinamente diverso (assenza di
+/// progresso SOSTENUTO, non solo "nessuna tool call adesso"); non e' nello
+/// scope di questo fix. Vedi task di follow-up.
 struct ConteggioG1 {
     /// `g1_reroute_count` aggiornato: viaggia fino al delta finale del turno.
     reroute_count: i64,
     /// Cap re-entry "pulito" raggiunto (segnale di [`g1_accounting`]).
     cap_reached: bool,
-    /// Esito del turno precedente NON compiuto (verdetto closure oppure report
-    /// STRUTTURALE di passi pendenti).
+    /// Esito del turno precedente NON compiuto (finestra stretta, vedi doc
+    /// dello struct). Alimenta sia [`g1_accounting`] sia
+    /// [`ExecutorNode::g1_cap_effettivo`].
     unfulfilled: bool,
     /// Escalation gia' fatte nel run: la soglia del loop conclamato ci cresce
     /// sopra, cosi' ogni promosso riceve un budget di iterazioni suo.
@@ -4431,29 +4438,41 @@ oppure riprova piu' tardi."
     }
 
     /// Conteggio G1 del turno (py:1914-1961). Segnali derivati dai punti unici
-    /// (regola L: non ricalcolati a mano). ADR 0018 fase 3: il fallback lessicale
-    /// (blacklist NARRAZIONE) e' stato rimosso — senza verdetto closure il segnale
-    /// e' il report STRUTTURALE di passi pendenti (stesse chiavi DB
-    /// agent.closure.pending_steps_*).
+    /// (regola L: non ricalcolati a mano). ADR 0018 fase 3 aveva gia' rimosso la
+    /// blacklist NARRAZIONE; il secondo residuo lessicale (`_PENDING_STEPS_LABELS`)
+    /// e' stato eliminato a sua volta — il presunto fallback `closure_verdict` non
+    /// ha mai avuto un produttore nel motore nativo (ADR 0034), quindi il ramo
+    /// lessicale era l'UNICO decisore reale del conteggio, non una difesa in
+    /// profondita'. Il segnale unfulfilled e' ora [`unfulfilled_signal_with`]:
+    /// `declared_outcome` (task_complete) se presente, altrimenti
+    /// `structural_unfulfilled_signal` ("ha smesso senza fare nulla").
     fn conteggio_g1(&self, state: &AgentState, iters_in: i64, messages: &[Message]) -> ConteggioG1 {
-        let unfulfilled_for_g1 = match closure_verdict_fulfilled(state) {
-            Some(fulfilled) => !fulfilled,
-            None => detect_pending_steps_report_with(
-                last_assistant_text(messages).as_deref(),
-                self.cfg.pending_steps_detection_enabled,
-                self.cfg.pending_steps_min_items,
-            ),
-        };
+        let has_pending = state
+            .pending_tool_uses
+            .as_ref()
+            .map(|p| !p.is_empty())
+            .unwrap_or(false);
+        let action_oriented = turn_action_oriented(state.action_oriented);
+        let had_tools = state
+            .tools_json
+            .as_ref()
+            .map(|t| !t.is_empty())
+            .unwrap_or(false);
+        let declared_outcome_present = crate::routing::declared_outcome_kind(state).is_some();
+        let unfulfilled_for_g1 = unfulfilled_signal_with(
+            declared_outcome_present,
+            had_tools,
+            !has_pending,
+            action_oriented,
+            iters_in,
+            self.cfg.tool_choice_forcing_max_iteration,
+        );
         let g1_recent_error = detect_recent_tool_error(messages, 4);
         let g1 = g1_accounting(&G1Signals {
             prev_stop_reason: state.stop_reason.map(stop_reason_str),
             iterations: iters_in,
-            has_pending: state
-                .pending_tool_uses
-                .as_ref()
-                .map(|p| !p.is_empty())
-                .unwrap_or(false),
-            action_oriented: turn_action_oriented(state.action_oriented),
+            has_pending,
+            action_oriented,
             unfulfilled: unfulfilled_for_g1,
             recent_error: g1_recent_error,
             // Errore "stale": persiste oltre il doppio del budget di nudge G1 ->
@@ -5135,7 +5154,7 @@ Riformula la richiesta, oppure riprova con un modello piu' capace di usare i too
         if turno_concluso(coda.stop_reason_enum, coda.pending_tool_uses, final_result) {
             self.applica_next_actions(ctx, final_result, assistant_msg)
                 .await;
-            self.applica_resoconto_onesto(state, messages, final_result, assistant_msg);
+            self.applica_resoconto_onesto(state, coda.iters_in, messages, final_result, assistant_msg);
         }
         None
     }
@@ -5222,24 +5241,44 @@ Riformula la richiesta, oppure riprova con un modello piu' capace di usare i too
 
     /// (2) unfulfilled-report: in modalita' NON autonoma con esito NON compiuto
     /// e turno NON action-oriented, SOSTITUISCE il result con il resoconto
-    /// onesto deterministico. Gate puro [`should_substitute_unfulfilled_report`];
-    /// il segnale e' il report STRUTTURALE di passi pendenti sul testo finale
-    /// (ADR 0018 fase 3: la detection lessicale della narrazione e' stata
-    /// rimossa; l'origine Python di questo ramo e' dismessa col brain). Il
-    /// closure_verdict resta deliberatamente NON consultato qui: potrebbe essere
-    /// stale del turno precedente.
+    /// onesto deterministico. Gate puro [`should_substitute_unfulfilled_report`].
+    ///
+    /// Il segnale "non compiuto" e' `declared_outcome == "partial"` (ADR 0034,
+    /// task_complete): l'unica dichiarazione onesta di lavoro incompleto che il
+    /// modello puo' emettere ("blocked"/"needs_input" hanno gia' il proprio
+    /// canale di chiusura — il loro `summary` non va sovrascritto da un
+    /// resoconto sintetico diverso). Il residuo lessicale
+    /// (`_PENDING_STEPS_LABELS`, 62 etichette in 5 lingue) e' stato eliminato:
+    /// il presunto fallback `closure_verdict` non ha mai avuto un produttore
+    /// nel motore nativo (ADR 0034, "resta una via complementare NON portata
+    /// al nativo"), quindi il ramo lessicale era l'UNICO decisore reale di
+    /// questa sostituzione, non una difesa in profondita' dietro un segnale
+    /// primario.
+    ///
+    /// FRESCHEZZA (`declared_outcome_iteration`): a differenza di
+    /// `route_after_executor` (dove lo stesso campo influenza solo
+    /// l'instradamento interno), qui `declared_outcome` riscrive il TESTO
+    /// VISIBILE all'utente — un rischio qualitativamente diverso. Un run puo'
+    /// proseguire per turni solo-testo dopo un `task_complete(partial)` (via
+    /// G1Continue, mai un altro ToolDispatch che la invaliderebbe): senza un
+    /// controllo di freschezza, una dichiarazione di N turni fa continuerebbe a
+    /// sovrascrivere un resoconto di chiusura genuino e magari gia' completo con
+    /// "...NON e' completato", fuorviando l'utente. Ci si fida SOLO se la
+    /// dichiarazione appartiene al turno IMMEDIATAMENTE successivo a quella in
+    /// cui e' stata emessa (uguaglianza esatta con `iters_in`) — vedi
+    /// `AgentState::declared_outcome_iteration`.
     fn applica_resoconto_onesto(
         &self,
         state: &AgentState,
+        iters_in: i64,
         messages: &[Message],
         final_result: &mut String,
         assistant_msg: &mut Message,
     ) {
-        let unfulfilled_post = detect_pending_steps_report_with(
-            Some(final_result.as_str()),
-            self.cfg.pending_steps_detection_enabled,
-            self.cfg.pending_steps_min_items,
-        );
+        let unfulfilled_post = matches!(
+            crate::routing::declared_outcome_kind(state).as_deref(),
+            Some("partial")
+        ) && state.declared_outcome_iteration == Some(iters_in);
         if !should_substitute_unfulfilled_report(
             state.automation_mode,
             unfulfilled_post,
@@ -8792,33 +8831,6 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
 // ──────────────────────────────────────────────────────────────────────────
 //  Helper puri (mapping messaggi, segnali derivati)
 // ──────────────────────────────────────────────────────────────────────────
-
-/// Estrae il bool `fulfilled` dal `closure_verdict` (replica `_unfulfilled_signal`
-/// e il ramo G1 del Python). PUNTO UNICO della lettura del verdetto: stesso campo
-/// letto da `routing::signals::unfulfilled_signal` (qui per il conteggio G1).
-fn closure_verdict_fulfilled(state: &AgentState) -> Option<bool> {
-    match &state.closure_verdict {
-        Some(Value::Object(map)) => match map.get("fulfilled") {
-            Some(Value::Bool(b)) => Some(*b),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// Ultimo testo dell'assistente (in reverse) con content testuale non vuoto
-/// (`_last_assistant_text`). `None` se nessuno. Usa `flatten_text` (regola L).
-fn last_assistant_text(messages: &[Message]) -> Option<String> {
-    for m in messages.iter().rev() {
-        if let Message::Ai { content, .. } = m {
-            let flat = content.flatten_text();
-            if !flat.trim().is_empty() {
-                return Some(flat);
-            }
-        }
-    }
-    None
-}
 
 /// Stringa snake_case dello `StopReason` (per il conteggio G1 che confronta
 /// `end_turn`/`stop`). Riusa la serde rename dell'enum (punto unico).

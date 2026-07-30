@@ -3,7 +3,7 @@
 //!
 //! Raccoglie in un solo struct i settings che in Python vengono letti da
 //! `orchestrator_config.get()` / `_load_g1_max_nudges()` /
-//! `_load_tool_choice_forcing_config()` / `_load_pending_steps_config()`.
+//! `_load_tool_choice_forcing_config()`.
 //! I [`Default`] replicano i `_SAFE_DEFAULTS` documentati del brain: valgono
 //! SOLO quando il DB non e' raggiungibile (stessa semantica del Python), mai
 //! come "magic fallback" dentro la logica decisionale.
@@ -21,7 +21,6 @@ use serde::{Deserialize, Serialize};
 ///   - `final_gate_max_cycles`    -> `agent.final_gate.max_cycles` (default 2)
 ///   - `final_gate_software_intents` -> `agent.final_gate.software_intents`
 ///   - `todo_isolation_enabled`   -> `agent.continuous.todo_isolation_enabled` (default false)
-///   - `pending_steps_*`          -> `agent.closure.pending_steps_*`
 ///   - `fs_mutator_tools`         -> `agent.tools.result_cache_mutators`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoutingConfig {
@@ -43,10 +42,6 @@ pub struct RoutingConfig {
     pub final_gate_software_intents: Vec<String>,
     /// Esecuzione todo come sub-run isolate abilitata (`todo_isolation_active`).
     pub todo_isolation_enabled: bool,
-    /// Rilevamento report con passi pendenti abilitato.
-    pub pending_steps_detection_enabled: bool,
-    /// Numero minimo di item per considerare un testo "report con TODO".
-    pub pending_steps_min_items: i64,
     /// Tool che MUTANO il filesystem/progetto (per `has_filesystem_mutation_in_history`).
     /// Punto unico dei DATI: setting `agent.tools.result_cache_mutators` (mig 0394).
     pub fs_mutator_tools: Vec<String>,
@@ -154,8 +149,6 @@ impl Default for RoutingConfig {
             .map(|s| s.to_string())
             .collect(),
             todo_isolation_enabled: false,
-            pending_steps_detection_enabled: true,
-            pending_steps_min_items: 2,
             fs_mutator_tools: _FS_MUTATORS_DEFAULT
                 .split(',')
                 .map(|s| s.trim().to_string())

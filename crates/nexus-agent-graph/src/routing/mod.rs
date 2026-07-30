@@ -23,7 +23,7 @@ mod golden_tests;
 pub use config::{effective_recursion_limit, GraphTopologyLimits, RoutingConfig};
 
 use crate::decisions::{structural_unfulfilled_signal, turn_action_oriented};
-use crate::state::{AgentState, AutomationMode, GateRouting, StopReason};
+use crate::state::{AgentState, GateRouting, StopReason};
 
 /// Nodo-bersaglio di una decisione di routing. Le label serializzate (snake_case)
 /// sono ESATTAMENTE i nomi-nodo che le `route_after_*` Python ritornano come
@@ -198,14 +198,27 @@ pub fn route_after_executor(state: &AgentState, cfg: &RoutingConfig) -> NodeTarg
                 // Resoconto finale legittimo (azioni produttive + non unfulfilled):
                 // niente G1, si cade ai gate finali.
             } else {
-                // Re-routing G1: structural || action_oriented || (unfulfilled && automatic/continuous).
+                // Re-routing G1: structural || action_oriented (ADR 0018 leva 1/c
+                // + richiesta d'azione esplicita).
+                //
+                // GAP ACCETTATO (non mascherato da codice morto): prima
+                // dell'eliminazione di `_PENDING_STEPS_LABELS`, un terzo ramo
+                // (`unfulfilled_triggers = unfulfilled_signal && automatic/
+                // continuous`) rimandava anche un turno NON action-oriented la
+                // cui PROSA soltanto ("prossimi passi:...") indicava lavoro non
+                // finito, in modalita' automatic/continuous. Quel ramo era gia'
+                // MATEMATICAMENTE assorbito da `is_action_req` per ogni caso in
+                // cui `unfulfilled_signal` puo' oggi essere vero (delega a
+                // structural_unfulfilled_signal, che richiede action_oriented=true
+                // per costruzione — X || (X && Y) = X): tenerlo avrebbe dato una
+                // falsa sensazione di copertura, non una copertura reale (regola
+                // O). Senza un segnale STRUTTURALE per "prosa non action-oriented
+                // che descrive lavoro incompleto, in automatic/continuous, senza
+                // declared_outcome", quel caso specifico non viene piu' rimandato
+                // e cade ai gate finali sotto: e' la conseguenza accettata di
+                // eliminare il vocabolario lessicale (regola M), non un difetto
+                // da mascherare con un'euristica sul testo.
                 let is_action_req = turn_action_oriented(state.action_oriented);
-                let is_unfulfilled = signals::unfulfilled_signal(state, cfg);
-                let automatic_or_continuous = matches!(
-                    state.automation_mode,
-                    Some(AutomationMode::Automatic) | Some(AutomationMode::Continuous)
-                );
-                let unfulfilled_triggers = is_unfulfilled && automatic_or_continuous;
                 let structural_unfulfilled = structural_unfulfilled_signal(
                     had_tools(state),
                     !pending,
@@ -213,7 +226,7 @@ pub fn route_after_executor(state: &AgentState, cfg: &RoutingConfig) -> NodeTarg
                     iters,
                     cfg.tool_choice_forcing_max_iteration,
                 );
-                if structural_unfulfilled || is_action_req || unfulfilled_triggers {
+                if structural_unfulfilled || is_action_req {
                     return NodeTarget::G1Continue;
                 }
             }
@@ -377,7 +390,7 @@ pub fn route_after_final_gate(state: &AgentState) -> NodeTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{ContentBlock, Message, MessageContent};
+    use crate::state::{AutomationMode, ContentBlock, Message, MessageContent};
     use serde_json::json;
 
     fn base() -> AgentState {

@@ -180,6 +180,13 @@ pub struct StateDelta {
         skip_serializing_if = "Option::is_none"
     )]
     pub declared_outcome: Option<Option<Value>>,
+    /// Vedi `AgentState::declared_outcome_iteration`.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub declared_outcome_iteration: Option<Option<i64>>,
     /// Vedi `AgentState::closure_verdict`.
     #[serde(
         default,
