@@ -35,6 +35,7 @@ use sqlx::PgPool;
 use tokio::time::sleep;
 
 use crate::agent_types::AgentStepEvent;
+use crate::nexus_gateway::transport_facts;
 use crate::orchestrator::Orchestrator;
 use crate::AgentChannels;
 
@@ -281,6 +282,20 @@ async fn attempt_recovery(_db: &PgPool, service: &str, probe: &ProbeResult) {
     }
 }
 
+/// Kind del probe da segnali STRUTTURATI (regola M): il Display di
+/// reqwest::Error e' sempre "error sending request for url (...)", non porta
+/// MAI "refused"/"timeout" (verificato — regola O). Punto unico condiviso da
+/// probe_gateway/probe_qdrant per lo stesso identico problema (regola L).
+fn probe_error_kind(facts: &nexus_types::error_presentation::TransportFacts) -> &'static str {
+    if facts.is_timeout {
+        "timeout"
+    } else if facts.io_kind.as_deref() == Some("ConnectionRefused") {
+        "connection_refused"
+    } else {
+        "connection_error"
+    }
+}
+
 /// Fix M48: probe HTTP del nexus-gateway su :4060/providers.
 async fn probe_gateway() -> ProbeResult {
     let port = std::env::var("NEXUS_GATEWAY_PORT").unwrap_or_else(|_| "4060".into());
@@ -314,14 +329,9 @@ async fn probe_gateway() -> ProbeResult {
             error_message: Some(format!("HTTP {}", r.status())),
         },
         Err(e) => {
+            let facts = transport_facts(&e, &url);
+            let kind = probe_error_kind(&facts);
             let msg = e.to_string();
-            let kind = if msg.contains("refused") || msg.contains("Connection refused") {
-                "connection_refused"
-            } else if msg.contains("timed out") || msg.contains("timeout") {
-                "timeout"
-            } else {
-                "connection_error"
-            };
             ProbeResult {
                 healthy: false,
                 latency_ms: Some(started.elapsed().as_millis() as i32),
@@ -463,14 +473,9 @@ async fn probe_qdrant(db: &PgPool) -> ProbeResult {
             }
         }
         Err(e) => {
+            let facts = transport_facts(&e, &health_url);
+            let kind = probe_error_kind(&facts);
             let msg = e.to_string();
-            let kind = if msg.contains("timed out") || msg.contains("timeout") {
-                "timeout"
-            } else if msg.contains("refused") {
-                "connection_refused"
-            } else {
-                "connection_error"
-            };
             ProbeResult {
                 healthy: false,
                 latency_ms: Some(started.elapsed().as_millis() as i32),

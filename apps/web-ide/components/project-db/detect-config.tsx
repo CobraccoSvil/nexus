@@ -227,13 +227,16 @@ export function DetectConfig({
         )}
 
         {/* Azioni suggerite quando il test della config rilevata fallisce.
-            La categorizzazione e' deterministica (parsing testo errore +
-            table_count) e le azioni sono context-aware: per "unreachable"
-            tentiamo automaticamente host alternativi sulla LAN; per
-            "no_database" generiamo un prompt agente per creare il DB;
-            per "tables_missing" suggeriamo di eseguire le migrazioni. */}
+            La categorizzazione preferisce `category` del backend (SQLSTATE per
+            postgres, regola M) e ricade su categorizeDbError (parsing testo)
+            solo per i motori che non la emettono ancora. Le azioni sono
+            context-aware: per "unreachable" tentiamo automaticamente host
+            alternativi sulla LAN; per "no_database" generiamo un prompt agente
+            per creare il DB; per "tables_missing" suggeriamo le migrazioni. */}
         {detectedTestResult && !detectedTestResult.ok && detectedConfig?.connection_string && (() => {
-          const category = categorizeDbError(detectedTestResult.error, detectedTestResult.table_count);
+          const category =
+            detectedTestResult.category ??
+            categorizeDbError(detectedTestResult.error, detectedTestResult.table_count);
           const parts = parseConnPartsForActions(detectedConfig.connection_string ?? "");
           const dbName = parts?.database || "<nome_db>";
           const altHosts = parts ? alternativeHostsFor(parts.host) : [];

@@ -57,8 +57,10 @@ export function retryHintForCategory(category: string | undefined, title: string
   if (cat === "dead_code" || titleLc.includes("dead code") || titleLc.includes("unused")) {
     return "Riprova: rimuovi codice/import/variabili non utilizzati, oppure sostituisci con `_` per quelli intenzionali.";
   }
-  // Documentation / comments
-  if (cat === "documentation" || cat === "commenti") {
+  // Documentation / comments — "docs"/"comments" sono i valori che i detector
+  // emettono davvero (crates/mcp-quality/src/lib.rs); "documentation"/"commenti"
+  // non sono mai stati prodotti da nessun produttore: ramo morto.
+  if (cat === "docs" || cat === "comments") {
     return "Riprova: aggiungi commento doc (TSDoc/JSDoc/Rust doc-comment) che spiega lo scopo della funzione, parametri principali e valore di ritorno.";
   }
   // Typing

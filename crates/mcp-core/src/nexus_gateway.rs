@@ -412,7 +412,12 @@ fn transport_error_detail(e: &reqwest::Error) -> String {
 /// diagnostica per i log, questo i FATTI da cui nasce la frase per l'utente. La
 /// stessa catena serve due canali diversi, e nessuno dei due deriva dall'altro
 /// leggendone il testo.
-fn transport_facts(e: &reqwest::Error, target: &str) -> TransportFacts {
+///
+/// `pub(crate)`: e' il punto unico dei fatti di trasporto reqwest per tutto
+/// mcp-core (regola L) — `task_watchdog::probe_qdrant`/`probe_gateway` lo
+/// riusano per classificare i probe invece di ricopiare la scansione di
+/// `source()`.
+pub(crate) fn transport_facts(e: &reqwest::Error, target: &str) -> TransportFacts {
     let mut io_kind = None;
     let mut os_error = None;
     let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);

@@ -9,7 +9,14 @@ export const statusColorMap: Record<string, string> = {
   overridden: "#8b5cf6",
 };
 
-/** Classifica l'errore di test-connection per proporre azioni mirate.
+/** FALLBACK testuale per i motori che non emettono ancora una `category`
+ *  strutturata lato backend (oggi solo postgres la emette, da SQLSTATE — vedi
+ *  `classify_pg_connection_error` in crates/mcp-core/src/project_db_routes/connection.rs).
+ *  Chiamare SOLO quando `ProjectDbTestResult.category` e' assente: il matching
+ *  testuale qui sotto e' intrinsecamente ambiguo (il prefisso fisso di sqlx,
+ *  "error returned from database: ...", contiene "database" per QUALSIASI
+ *  errore, non solo per un database inesistente) e resta cieco a un server
+ *  configurato con locale non inglese/italiano.
  *  - `unreachable`: host/porta non raggiungibili (connection refused, timeout, DNS).
  *  - `no_database` : il database non esiste sul server (es. "database X does not exist").
  *  - `auth_failed` : credenziali sbagliate (password authentication failed, role does not exist).
