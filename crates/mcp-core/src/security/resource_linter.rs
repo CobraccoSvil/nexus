@@ -19,6 +19,8 @@ use std::path::Path;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::agent_tools::port_scanner::PortOrigin;
+
 /// Directory escluse dal walk (generati, dipendenze, VCS).
 const LINT_EXCLUDED_DIRS: &[&str] = &[
     "node_modules",
@@ -76,6 +78,11 @@ pub struct ResourceLintFinding {
     pub value: String,
     pub kind: ResourceViolationKind,
     pub snippet: String,
+    /// Provenienza della porta, dal PRODUTTORE (`port_scanner`, regola L):
+    /// `None` per gli URL, che non hanno questa nozione. Sostituisce un
+    /// secondo giudizio testuale sullo snippet (vedi doc di
+    /// `violation_action_hint`).
+    pub port_origin: Option<PortOrigin>,
 }
 
 /// Lint di un singolo contenuto (funzione pura, testabile). Delega ai punti
@@ -105,6 +112,7 @@ pub fn lint_file_content(
             value: f.port.to_string(),
             kind: ResourceViolationKind::PortOutOfBucket,
             snippet: f.snippet.clone(),
+            port_origin: Some(f.origin),
         });
     }
     for f in crate::agent_tools::port_scanner::collect_bucket_ports(content) {
@@ -116,6 +124,7 @@ pub fn lint_file_content(
                 value: f.port.to_string(),
                 kind: ResourceViolationKind::PortBucketNotAllocated,
                 snippet: f.snippet.clone(),
+                port_origin: Some(f.origin),
             });
         }
     }
@@ -127,34 +136,11 @@ pub fn lint_file_content(
             value: f.url.clone(),
             kind: ResourceViolationKind::InternalUrlHardcoded,
             snippet: f.snippet.clone(),
+            port_origin: None,
         });
     }
 
     findings
-}
-
-/// True se lo snippet e' un fallback con porta letterale: lettura da env PIU' un
-/// operatore di default, es. `process.env.PORT || 21950`, `${PORT:-21950}`,
-/// `os.environ.get("PORT", 21950)`. Euristica usata SOLO per comporre il
-/// messaggio d'azione: la decisione di violazione resta strutturale a monte
-/// (`port_scanner`), qui si raffina solo il consiglio di fix.
-fn snippet_has_env_fallback(snippet: &str) -> bool {
-    let lower = snippet.to_lowercase();
-    let has_env_hint = [
-        "process.env",
-        "os.environ",
-        "env::var",
-        "getenv",
-        "import.meta.env",
-    ]
-    .iter()
-    .any(|h| lower.contains(h))
-        || lower.contains("${");
-    let has_fallback_op = snippet.contains("||")
-        || snippet.contains("??")
-        || snippet.contains(":-")
-        || lower.contains(".get(");
-    has_env_hint && has_fallback_op
 }
 
 /// Suffisso AZIONABILE per il `detail` di una violazione. Il pannello Problemi e
@@ -164,8 +150,16 @@ fn snippet_has_env_fallback(snippet: &str) -> bool {
 /// il fallback). Punto unico (regola L) del testo d'azione lato linter; distingue
 /// il fallback env hardcoded - dove il fix e' allocare e usare il valore OPPURE
 /// rimuovere il fallback - dal numero hardcoded puro.
-fn violation_action_hint(kind: &ResourceViolationKind, snippet: &str) -> &'static str {
-    let env_fallback = snippet_has_env_fallback(snippet);
+///
+/// `port_origin` arriva GIA' deciso dal produttore (`port_scanner`, che sa con
+/// certezza quale regex ha trovato la porta): prima questa funzione
+/// ri-giudicava la domanda da sola sul testo dello snippet (5 indizi in AND),
+/// e divergeva dal produttore reale su pattern come `env::var(...).unwrap_or(N)`
+/// (Rust) o `os.getenv(...) or N` (Python) — riconosciuti da
+/// `ENV_FALLBACK_PORT_REGEXES` ma non dall'euristica testuale, che consigliava
+/// "chiama request_port" invece di segnalare il fallback da correggere.
+fn violation_action_hint(kind: &ResourceViolationKind, port_origin: Option<PortOrigin>) -> &'static str {
+    let env_fallback = port_origin == Some(PortOrigin::EnvFallback);
     match kind {
         ResourceViolationKind::PortBucketNotAllocated if env_fallback => {
             "Azione: il fallback usa una porta nel range Nexus non allocata. Chiama \
@@ -412,7 +406,7 @@ async fn open_lint_finding(db: &PgPool, project_id: Uuid, f: &ResourceLintFindin
         kind,
         rule,
         f.snippet.chars().take(160).collect::<String>(),
-        violation_action_hint(&f.kind, &f.snippet),
+        violation_action_hint(&f.kind, f.port_origin),
     );
     let opened_id = crate::security::resource_governance::open_resource_violation(
         db,
@@ -858,19 +852,52 @@ mod tests {
         assert!(!should_lint_file(Path::new("logo.png")));
     }
 
+    /// Il difetto reale (30/07/2026): l'euristica testuale RIMOSSA
+    /// (`snippet_has_env_fallback`, 5 indizi in AND sullo snippet) riconosceva
+    /// `process.env.PORT || N` e `${VAR:-N}` ma NON `env::var(...).unwrap_or(N)`
+    /// (Rust) ne' `os.getenv(...) or N` (Python): "unwrap_or(" e la parola
+    /// "or" non comparivano fra i suoi 4 operatori di fallback (`||`, `??`,
+    /// `:-`, `.get(`). Il produttore (`port_scanner::ENV_FALLBACK_PORT_REGEXES`)
+    /// li riconosce da sempre. Ora il fatto arriva GIA' deciso da li' (campo
+    /// `port_origin`): non c'e' piu' un secondo giudizio che possa divergere.
     #[test]
-    fn env_fallback_riconosciuto_dallo_snippet() {
-        // Il caso che ha confuso i run: fallback env con porta letterale.
-        assert!(snippet_has_env_fallback(
-            "port: parseInt(process.env.PORT || '21950', 10),"
-        ));
-        assert!(snippet_has_env_fallback("PORT=${PORT_BACKEND:-21950}"));
-        assert!(snippet_has_env_fallback(
-            "port = os.environ.get(\"PORT\", 21950)"
-        ));
-        // Hardcode puro: nessun fallback env.
-        assert!(!snippet_has_env_fallback("PORT = 21970"));
-        assert!(!snippet_has_env_fallback("app.listen(21950)"));
+    fn port_origin_arriva_dal_produttore_reale() {
+        let allocated = HashSet::new();
+
+        // Pattern che l'euristica rimossa riconosceva gia' (baseline invariata).
+        let js = lint_file_content(
+            "server.js",
+            "port: parseInt(process.env.PORT || '3000', 10),",
+            &allocated,
+        );
+        assert_eq!(js.len(), 1);
+        assert_eq!(js[0].port_origin, Some(PortOrigin::EnvFallback));
+
+        // I due casi che l'euristica rimossa mancava.
+        let rust = lint_file_content(
+            "src/main.rs",
+            r#"let port = env::var("PORT").unwrap_or("3000".to_string());"#,
+            &allocated,
+        );
+        assert_eq!(rust.len(), 1);
+        assert_eq!(
+            rust[0].port_origin,
+            Some(PortOrigin::EnvFallback),
+            "env::var(...).unwrap_or(...) e' un fallback env, non un letterale puro"
+        );
+
+        let python = lint_file_content("app.py", "port = os.getenv(\"PORT\") or 3000", &allocated);
+        assert_eq!(python.len(), 1);
+        assert_eq!(
+            python[0].port_origin,
+            Some(PortOrigin::EnvFallback),
+            "os.getenv(...) or 3000 e' un fallback env, non un letterale puro"
+        );
+
+        // Contro-prova: letterale puro, nessuna lettura env sulla riga.
+        let plain = lint_file_content("config.js", "const PORT = 3000;", &allocated);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].port_origin, Some(PortOrigin::Literal));
     }
 
     #[test]
@@ -878,14 +905,14 @@ mod tests {
         // Fallback env -> il consiglio include la rimozione del fallback.
         let env = violation_action_hint(
             &ResourceViolationKind::PortBucketNotAllocated,
-            "process.env.PORT || '21950'",
+            Some(PortOrigin::EnvFallback),
         );
         assert!(env.contains("rimuovi il fallback"));
         assert!(env.contains("request_port"));
         // Hardcode puro -> consiglio di allocazione, senza "rimuovi il fallback".
         let pure = violation_action_hint(
             &ResourceViolationKind::PortBucketNotAllocated,
-            "PORT = 21950",
+            Some(PortOrigin::Literal),
         );
         assert!(pure.contains("request_port"));
         assert!(!pure.contains("rimuovi il fallback"));
@@ -895,7 +922,7 @@ mod tests {
             ResourceViolationKind::PortBucketNotAllocated,
             ResourceViolationKind::InternalUrlHardcoded,
         ] {
-            assert!(violation_action_hint(&kind, "x").contains("ADR 0010"));
+            assert!(violation_action_hint(&kind, None).contains("ADR 0010"));
         }
     }
 }
