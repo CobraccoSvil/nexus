@@ -329,40 +329,39 @@ impl PortRegistryCache {
         Ok(())
     }
 
-    /// Startup recovery: sincronizza il registro con i file .service esistenti.
+    /// Startup recovery: registra le porte dichiarate dai file `.service` su
+    /// disco e assenti dal registro. SOLO aggiunte: qui non si rilascia nulla.
     ///
-    /// 1. Per ogni allocazione con `service_unit`, verifica che il file esista.
-    ///    Se non esiste, rimuove dal DB.
-    /// 2. Scansiona i file .service in `~/.config/systemd/user/`, estrae le porte.
-    ///    Se una porta e' in un .service ma non nel DB, la registra come "auto".
+    /// Il rilascio di un'allocazione ha un punto unico (regola L),
+    /// `cleanup_orphaned_ports`, e un criterio osservabile (regola M): nessun
+    /// listener sulla porta, oltre la grace period, senza una riserva che la
+    /// giustifichi, e mai per una `manual`.
     ///
-    /// Richiede la lista dei progetti per associare le porte al progetto corretto.
+    /// Qui viveva un SECONDO criterio, che diceva il contrario: rilasciava ogni
+    /// allocazione il cui `service_unit` non avesse un file
+    /// `~/.config/systemd/user/<unit>`. Su Windows quel file non esiste per
+    /// costruzione — i servizi di progetto sono processi gestiti, non unit
+    /// systemd — quindi ogni riavvio di mcp-core svuotava il registro di TUTTE
+    /// le righe con `service_unit`: proprio quelle dei servizi gestiti, che
+    /// `web_service_port_env` annota via `link_allocation_to_service_unit` per
+    /// PROTEGGERLE dal GC. Protette a regime, distrutte all'avvio. E il rilascio
+    /// passava da `release`, che cancella per sola porta: nemmeno le `manual`
+    /// erano al riparo.
+    ///
+    /// Misurato il 31/07/2026 su bacheca-attivita: `nexus_port_allocations` vuota
+    /// per ogni progetto, backend in ascolto sulla 24826 dalle 22:21 del giorno
+    /// prima con lo stesso PID, e l'audit fermo alla riallocazione che precede il
+    /// riavvio dello stack. Senza allocazioni la readiness TCP non e' applicabile
+    /// (`service_observer::structural_reason` richiede `!ports.is_empty()`) e i
+    /// servizi vivi venivano giudicati dai soli PID vecchi, cioe' guasti.
+    ///
+    /// Un file unit non e' mai stato la domanda giusta: dice come il servizio
+    /// andrebbe avviato, non se qualcuno stia ascoltando adesso.
     pub async fn startup_recovery(&self) {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
         let svc_dir = format!("{}/.config/systemd/user", home);
 
-        // 1. Rimuovi allocazioni orfane (il file .service non esiste piu')
-        let registry = self.current().await;
-        for alloc in registry.by_port.values() {
-            if let Some(ref unit) = alloc.service_unit {
-                let path = format!("{}/{}", svc_dir, unit);
-                if !std::path::Path::new(&path).exists() {
-                    info!(
-                        "port_registry recovery: rimozione porta {} (unit {} non esiste)",
-                        alloc.port, unit
-                    );
-                    if let Err(e) = self.release(alloc.port).await {
-                        warn!(
-                            "port_registry recovery: rilascio porta {} fallito: {}",
-                            alloc.port, e
-                        );
-                    }
-                }
-            }
-        }
-        drop(registry);
-
-        // 2. Scansiona i .service, registra porte mancanti.
+        // Scansiona i .service, registra porte mancanti.
         // Mappa slug -> project_id per associare le porte ai progetti
         let project_map: HashMap<String, Uuid> = match sqlx::query_as::<_, (Uuid, String)>(
             "SELECT id, LOWER(REPLACE(REPLACE(name, ' ', '-'), '_', '-')) FROM projects",
@@ -1003,7 +1002,7 @@ fn extract_ports_from_unit_content(content: &str) -> Vec<u16> {
 mod tests {
     use super::{
         cleanup_orphaned_ports, dev_server_roots_to_kill, dev_server_signature,
-        extract_ports_from_unit_content, windows_unit_backed_by_label,
+        extract_ports_from_unit_content, windows_unit_backed_by_label, PortRegistryCache,
     };
 
     /// Il GC proteggeva l'artefatto proprio mentre faceva danno.
@@ -1091,6 +1090,95 @@ mod tests {
                 .any(|(p, m)| *p == manuale as i32 && m == "manual"),
             "una riserva decisa a mano non si tocca, dentro o fuori dal bucket. \
              Rimaste: {rimaste:?}"
+        );
+    }
+
+    /// L'avvio distruggeva le allocazioni che il GC tiene in piedi.
+    ///
+    /// `startup_recovery` aveva un SECONDO criterio di rilascio, e diceva il
+    /// contrario del primo: rilasciava ogni allocazione il cui `service_unit` non
+    /// avesse un file `~/.config/systemd/user/<unit>`. Su Windows quel file non
+    /// esiste per costruzione (i servizi di progetto sono processi gestiti, non
+    /// unit systemd), quindi ogni riavvio di mcp-core svuotava il registro di
+    /// tutte le righe con `service_unit` — cioe' proprio quelle dei servizi
+    /// gestiti, che `web_service_port_env` annota via
+    /// `link_allocation_to_service_unit` per PROTEGGERLE dal GC. Protette a
+    /// regime, distrutte all'avvio (regola L: la stessa domanda con due
+    /// risposte).
+    ///
+    /// Misurato il 31/07/2026 su bacheca-attivita: `nexus_port_allocations` vuota
+    /// per tutti i progetti, backend in ascolto sulla 24826 dalle 22:21 del
+    /// giorno prima con lo stesso PID (mai riavviato) e l'audit fermo alla
+    /// riallocazione che precede il riavvio dello stack.
+    ///
+    /// Il test tiene un listener VERO e passa dai produttori reali (`allocate` +
+    /// `link_allocation_to_service_unit`, poi una seconda `init` che rilegge dal
+    /// DB come fa il riavvio): il difetto stava nella giunzione fra chi scrive
+    /// `service_unit` e chi lo interpreta, e costruire la riga a mano l'avrebbe
+    /// saltata (regola O).
+    ///
+    /// Mutazione che rende rosso: rimettere in `startup_recovery` il rilascio
+    /// delle allocazioni il cui file unit non esiste.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn l_avvio_non_rilascia_l_allocazione_di_un_servizio_in_ascolto(pool: sqlx::PgPool) {
+        let (_user, project_id) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let (bucket_start, bucket_end) =
+            crate::project_workspace::services::project_bucket_range(&project_id);
+
+        // Porta del PROPRIO bucket su cui si possa davvero ascoltare: e' la
+        // condizione dell'incidente (servizio vivo), non un'ipotesi. Senza
+        // listener la riga sarebbe discutibile e il test non misurerebbe nulla.
+        let mut scelta = None;
+        for p in bucket_start..=bucket_end {
+            if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", p)) {
+                scelta = Some((p, l));
+                break;
+            }
+        }
+        let (porta, _listener) = scelta.expect("una porta libera nel bucket del progetto");
+
+        // Il run precedente: la porta viene allocata e legata all'unit del
+        // servizio, esattamente come a ogni avvio di un servizio gestito.
+        let prima = PortRegistryCache::init(pool.clone()).await;
+        prima
+            .allocate(project_id, porta, "backend", "dynamic", None, None)
+            .await
+            .expect("allocazione del run precedente");
+        let unit =
+            crate::project_workspace::services::project_service_unit(&pool, project_id, "backend")
+                .await
+                .expect("unit del servizio");
+        crate::project_workspace::allocate_port::link_allocation_to_service_unit(
+            &pool, project_id, "backend", &unit,
+        )
+        .await;
+        drop(prima);
+
+        // Il riavvio di mcp-core: la cache si ricarica dal DB (ed e' li' che il
+        // `service_unit` torna visibile) e parte il recovery.
+        let dopo = PortRegistryCache::init(pool.clone()).await;
+        dopo.startup_recovery().await;
+
+        let rimaste: Vec<(i32, Option<String>)> = sqlx::query_as(
+            "SELECT port::int, service_unit FROM nexus_port_allocations WHERE project_id = $1",
+        )
+        .bind(project_id)
+        .fetch_all(&pool)
+        .await
+        .expect("rilettura allocazioni");
+
+        assert_eq!(
+            rimaste.len(),
+            1,
+            "un'allocazione con un processo IN ASCOLTO non e' un residuo: il criterio e' il \
+             listener (regola M), non l'esistenza di un file unit systemd. Rimaste: {rimaste:?}"
+        );
+        assert_eq!(rimaste[0].0, porta as i32);
+        assert_eq!(
+            rimaste[0].1.as_deref(),
+            Some(unit.as_str()),
+            "il link all'unit deve sopravvivere al riavvio: e' cio' che preserva la porta \
+             quando il servizio e' fermo"
         );
     }
 
