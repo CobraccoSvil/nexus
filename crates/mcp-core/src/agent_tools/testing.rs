@@ -1046,6 +1046,8 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
         &live_progress,
         &artifacts,
         &command_str,
+        &stdout,
+        &stderr,
     )
     .await;
 
@@ -1065,14 +1067,133 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
     )
 }
 
-/// Costruisce il descrittore JSON dell'esito (label + message) da usare nel
-/// record `jobs` e negli eventi. Ritorna (status, label, message).
+/// Esito strutturato di un run Playwright (regola M): distingue un fallimento
+/// di SETUP (il webServer/le dipendenze non sono partiti, zero test eseguiti)
+/// da un fallimento di TEST (la suite e' partita, almeno un test e' rosso).
+/// La classificazione usa solo segnali strutturati -- exit code del processo e
+/// conteggio dei test effettivamente eseguiti -- mai il parsing della prosa
+/// dell'errore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaywrightOutcome {
+    Passed,
+    TestsFailed,
+    SetupFailed,
+}
+
+impl PlaywrightOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            PlaywrightOutcome::Passed => "passed",
+            PlaywrightOutcome::TestsFailed => "tests_failed",
+            PlaywrightOutcome::SetupFailed => "setup_failed",
+        }
+    }
+}
+
+/// Classifica l'esito da exit_code + conteggio test eseguiti
+/// (passed+failed+skipped). Exit code 0 => Passed. Exit code != 0 con ZERO
+/// test eseguiti => SetupFailed (il runner non e' arrivato alla fase di
+/// esecuzione: webServer non avviato, crash di configurazione, ecc.). Exit
+/// code != 0 con almeno un test eseguito => TestsFailed (la suite e' partita
+/// regolarmente, uno o piu' test sono rossi).
+fn classify_playwright_outcome(exit_code: i32, stats: &PlaywrightStats) -> PlaywrightOutcome {
+    if exit_code == 0 {
+        return PlaywrightOutcome::Passed;
+    }
+    let executed = stats.passed + stats.failed + stats.skipped;
+    if executed == 0 {
+        PlaywrightOutcome::SetupFailed
+    } else {
+        PlaywrightOutcome::TestsFailed
+    }
+}
+
+/// Estrae una causa breve per un fallimento di setup dall'ultima riga non
+/// vuota del segnale disponibile (stderr ha priorita', poi stdout): non e'
+/// parsing della prosa per DECIDERE l'esito (quello lo fa esclusivamente
+/// classify_playwright_outcome sui segnali strutturati), e' l'unico testo che
+/// il runner ha effettivamente prodotto sul perche', preso senza
+/// pattern-matching sul contenuto. Troncata a 300 char.
+fn extract_failure_cause(stdout: &str, stderr: &str) -> Option<String> {
+    let last_line_of = |text: &str| -> Option<String> {
+        text.lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(|l| l.chars().take(300).collect())
+    };
+    last_line_of(stderr).or_else(|| last_line_of(stdout))
+}
+
+/// Esito completo del run pronto per la persistenza: `status` resta il valore
+/// legacy ("passed"/"failed") per i consumer esistenti (query SQL, badge UI),
+/// `outcome` e' la classificazione strutturata a tre vie (regola M) e
+/// `failure_cause` e' valorizzato solo per SetupFailed.
+struct PlaywrightResultSummary {
+    status: &'static str,
+    outcome: &'static str,
+    label: String,
+    msg: String,
+    failure_cause: Option<String>,
+}
+
+/// Costruisce il descrittore dell'esito (label + message) da usare nel record
+/// `jobs` e negli eventi. Distingue "setup fallito, zero test eseguiti" da "N
+/// passati, M falliti": prima entrambi i casi producevano lo stesso "0
+/// passati, 0 falliti" fuorviante quando il webServer non partiva mai (regola
+/// M: lo stato viene dal segnale strutturato, non da un testo che finge un
+/// risultato di test che non e' mai iniziato).
 fn playwright_result_summary(
     exit_code: i32,
     stats: &PlaywrightStats,
-) -> (&'static str, String, String) {
-    let status = if exit_code == 0 { "passed" } else { "failed" };
-    let label = if exit_code == 0 {
+    stdout: &str,
+    stderr: &str,
+) -> PlaywrightResultSummary {
+    let outcome = classify_playwright_outcome(exit_code, stats);
+    let status = if outcome == PlaywrightOutcome::Passed {
+        "passed"
+    } else {
+        "failed"
+    };
+
+    if outcome == PlaywrightOutcome::SetupFailed {
+        setup_failed_summary(status, outcome, stdout, stderr)
+    } else {
+        tests_result_summary(status, outcome, stats)
+    }
+}
+
+/// Descrittore per un run che non ha eseguito nemmeno un test: la causa viene
+/// dall'ultima riga del runner (extract_failure_cause), mai da un conteggio
+/// di test che non e' mai iniziato.
+fn setup_failed_summary(
+    status: &'static str,
+    outcome: PlaywrightOutcome,
+    stdout: &str,
+    stderr: &str,
+) -> PlaywrightResultSummary {
+    let failure_cause = extract_failure_cause(stdout, stderr);
+    let label = "Setup fallito (nessun test eseguito)".to_string();
+    let msg = match &failure_cause {
+        Some(cause) => format!("Setup fallito, nessun test eseguito. Causa: {cause}"),
+        None => "Setup fallito, nessun test eseguito.".to_string(),
+    };
+    PlaywrightResultSummary {
+        status,
+        outcome: outcome.as_str(),
+        label,
+        msg,
+        failure_cause,
+    }
+}
+
+/// Descrittore per un run che ha eseguito almeno un test (Passed o TestsFailed).
+fn tests_result_summary(
+    status: &'static str,
+    outcome: PlaywrightOutcome,
+    stats: &PlaywrightStats,
+) -> PlaywrightResultSummary {
+    let label = if outcome == PlaywrightOutcome::Passed {
         format!("{} test passati", stats.passed)
     } else {
         format!("{} passati, {} falliti", stats.passed, stats.failed)
@@ -1096,7 +1217,13 @@ fn playwright_result_summary(
             String::new()
         }
     );
-    (status, label, msg)
+    PlaywrightResultSummary {
+        status,
+        outcome: outcome.as_str(),
+        label,
+        msg,
+        failure_cause: None,
+    }
 }
 
 /// Calcola il progress finale: privilegia le stats del parser completo, ma
@@ -1134,17 +1261,17 @@ async fn finalize_playwright_job(
     live_progress: &crate::playwright_live::PlaywrightProgress,
     artifacts: &[serde_json::Value],
     command_str: &str,
+    stdout: &str,
+    stderr: &str,
 ) {
-    let (status, label, msg) = playwright_result_summary(exit_code, stats);
+    let summary = playwright_result_summary(exit_code, stats, stdout, stderr);
     let final_progress = build_final_progress(stats, live_progress);
 
     update_playwright_job_record(
         proj_pool,
         ctx.project_id,
         job_id,
-        status,
-        &label,
-        &msg,
+        &summary,
         artifacts,
         command_str,
         exit_code,
@@ -1152,16 +1279,7 @@ async fn finalize_playwright_job(
     )
     .await;
 
-    emit_playwright_final_events(
-        ctx,
-        job_id,
-        status,
-        &label,
-        &msg,
-        artifacts,
-        exit_code,
-        final_progress,
-    );
+    emit_playwright_final_events(ctx, job_id, &summary, artifacts, exit_code, final_progress);
 }
 
 /// UPDATE del record `jobs` con esito finale (status, input, progress).
@@ -1171,22 +1289,22 @@ async fn update_playwright_job_record(
     proj_pool: &sqlx::PgPool,
     pid: Uuid,
     job_id: Uuid,
-    status: &str,
-    label: &str,
-    msg: &str,
+    summary: &PlaywrightResultSummary,
     artifacts: &[serde_json::Value],
     command_str: &str,
     exit_code: i32,
     final_progress: &crate::playwright_live::PlaywrightProgress,
 ) {
     match sqlx::query("UPDATE jobs SET status = $1, input = $2, progress = $3 WHERE id = $4")
-        .bind(status)
+        .bind(summary.status)
         .bind(serde_json::json!({
-            "label": label,
-            "message": msg,
+            "label": summary.label,
+            "message": summary.msg,
             "artifacts": artifacts,
             "command": command_str,
             "exit_code": exit_code,
+            "outcome": summary.outcome,
+            "failure_cause": summary.failure_cause,
         }))
         .bind(serde_json::to_value(final_progress).unwrap_or(serde_json::json!({})))
         .bind(job_id)
@@ -1194,7 +1312,7 @@ async fn update_playwright_job_record(
         .await
     {
         Ok(r) => {
-            tracing::info!(rows = r.rows_affected(), project_id = %pid, status = %status, artifacts = artifacts.len(), "playwright_test job aggiornato")
+            tracing::info!(rows = r.rows_affected(), project_id = %pid, status = %summary.status, outcome = %summary.outcome, artifacts = artifacts.len(), "playwright_test job aggiornato")
         }
         Err(e) => {
             tracing::error!(error = %e, project_id = %pid, "playwright_test job UPDATE fallito")
@@ -1204,13 +1322,10 @@ async fn update_playwright_job_record(
 
 /// Emette gli eventi di esito (dispatcher JobCreated + PlaywrightEvent::Final)
 /// e programma il cleanup deferito del channel SSE (30s).
-#[allow(clippy::too_many_arguments)]
 fn emit_playwright_final_events(
     ctx: &AgentToolContext,
     job_id: Uuid,
-    status: &str,
-    label: &str,
-    msg: &str,
+    summary: &PlaywrightResultSummary,
     artifacts: &[serde_json::Value],
     exit_code: i32,
     final_progress: crate::playwright_live::PlaywrightProgress,
@@ -1222,9 +1337,9 @@ fn emit_playwright_final_events(
         nexus_events::event::ProjectEvent::JobCreated {
             id: job_id,
             job_kind: "playwright_test".to_string(),
-            status: status.to_string(),
-            label: label.to_string(),
-            summary: Some(msg.to_string()),
+            status: summary.status.to_string(),
+            label: summary.label.clone(),
+            summary: Some(summary.msg.clone()),
             artifacts: serde_json::to_value(artifacts).unwrap_or(serde_json::Value::Null),
         },
     );
@@ -1234,7 +1349,7 @@ fn emit_playwright_final_events(
         &ctx.playwright_channels,
         crate::playwright_live::PlaywrightEvent::Final {
             job_id,
-            status: status.to_string(),
+            status: summary.status.to_string(),
             exit_code,
             progress: final_progress,
         },
@@ -1790,5 +1905,134 @@ fn truncate_output_tail(text: String, max_out: usize) -> String {
         format!("...(troncato)\n{}", &text[text.len() - max_out..])
     } else {
         text
+    }
+}
+
+#[cfg(test)]
+mod playwright_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn classify_passed_su_exit_code_zero() {
+        let stats = PlaywrightStats {
+            passed: 5,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_playwright_outcome(0, &stats),
+            PlaywrightOutcome::Passed
+        );
+    }
+
+    #[test]
+    fn classify_tests_failed_quando_almeno_un_test_e_eseguito() {
+        let stats = PlaywrightStats {
+            passed: 2,
+            failed: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_playwright_outcome(1, &stats),
+            PlaywrightOutcome::TestsFailed
+        );
+    }
+
+    #[test]
+    fn classify_setup_failed_quando_zero_test_eseguiti() {
+        // Caso reale (bacheca-attivita, 31/07/2026): webServer non parte,
+        // Playwright esce con errore prima di eseguire un solo test.
+        let stats = PlaywrightStats::default();
+        assert_eq!(
+            classify_playwright_outcome(1, &stats),
+            PlaywrightOutcome::SetupFailed
+        );
+    }
+
+    #[test]
+    fn classify_setup_failed_ignora_skipped_a_zero() {
+        // exit_code != 0 con SOLO skipped (nessun passed/failed) e' comunque
+        // "eseguito qualcosa": non deve essere classificato SetupFailed.
+        let stats = PlaywrightStats {
+            skipped: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_playwright_outcome(1, &stats),
+            PlaywrightOutcome::TestsFailed
+        );
+    }
+
+    #[test]
+    fn extract_cause_preferisce_ultima_riga_stderr() {
+        let stdout = "Running tests...\n";
+        let stderr = "Some warning\nError: Process from config.webServer was not able to start. Exit code: 1\n";
+        assert_eq!(
+            extract_failure_cause(stdout, stderr).as_deref(),
+            Some("Error: Process from config.webServer was not able to start. Exit code: 1")
+        );
+    }
+
+    #[test]
+    fn extract_cause_ripiega_su_stdout_se_stderr_vuoto() {
+        let stdout = "avvio...\nError: qualcosa e' andato storto\n";
+        assert_eq!(
+            extract_failure_cause(stdout, "").as_deref(),
+            Some("Error: qualcosa e' andato storto")
+        );
+    }
+
+    #[test]
+    fn extract_cause_none_se_entrambi_vuoti() {
+        assert_eq!(extract_failure_cause("", "   \n\n"), None);
+    }
+
+    #[test]
+    fn extract_cause_tronca_a_300_char() {
+        let long_line = "x".repeat(500);
+        let cause = extract_failure_cause("", &long_line).unwrap();
+        assert_eq!(cause.len(), 300);
+    }
+
+    #[test]
+    fn summary_setup_failed_non_dice_0_passati_0_falliti() {
+        let stats = PlaywrightStats::default();
+        let stderr = "Error: Process from config.webServer was not able to start. Exit code: 1\n";
+        let summary = playwright_result_summary(1, &stats, "", stderr);
+        assert_eq!(summary.status, "failed");
+        assert_eq!(summary.outcome, "setup_failed");
+        assert!(!summary.label.contains("0 passati"));
+        assert!(summary.msg.contains(
+            "Error: Process from config.webServer was not able to start. Exit code: 1"
+        ));
+        assert_eq!(
+            summary.failure_cause.as_deref(),
+            Some("Error: Process from config.webServer was not able to start. Exit code: 1")
+        );
+    }
+
+    #[test]
+    fn summary_tests_failed_riporta_conteggi() {
+        let stats = PlaywrightStats {
+            passed: 2,
+            failed: 1,
+            ..Default::default()
+        };
+        let summary = playwright_result_summary(1, &stats, "", "");
+        assert_eq!(summary.status, "failed");
+        assert_eq!(summary.outcome, "tests_failed");
+        assert_eq!(summary.label, "2 passati, 1 falliti");
+        assert_eq!(summary.failure_cause, None);
+    }
+
+    #[test]
+    fn summary_passed() {
+        let stats = PlaywrightStats {
+            passed: 3,
+            ..Default::default()
+        };
+        let summary = playwright_result_summary(0, &stats, "", "");
+        assert_eq!(summary.status, "passed");
+        assert_eq!(summary.outcome, "passed");
+        assert_eq!(summary.failure_cause, None);
     }
 }

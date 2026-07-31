@@ -1355,6 +1355,11 @@ fn playwright_run_to_json(row: sqlx::postgres::PgRow) -> Value {
         "label": input.get("label").and_then(Value::as_str).unwrap_or("Playwright run"),
         "status": row.get::<String, _>("status"),
         "summary": input.get("message").and_then(Value::as_str),
+        // Esito strutturato (regola M): "passed"|"tests_failed"|"setup_failed".
+        // Assente sui job pre-fix (input scritto prima di questo campo): il
+        // pannello ripiega sul rendering legacy quando manca.
+        "outcome": input.get("outcome").and_then(Value::as_str),
+        "failureCause": input.get("failure_cause").and_then(Value::as_str),
         "artifacts": input.get("artifacts").cloned().unwrap_or_else(|| json!([])),
         "command": input.get("command").and_then(Value::as_str),
         "exitCode": input.get("exit_code").and_then(Value::as_i64),
@@ -1429,6 +1434,9 @@ fn playwright_run_detail_to_json(row: sqlx::postgres::PgRow) -> Value {
         "label": input.get("label").and_then(Value::as_str).unwrap_or("Playwright run"),
         "command": input.get("command").and_then(Value::as_str),
         "summary": input.get("message").and_then(Value::as_str),
+        // Vedi playwright_run_to_json: stesso campo strutturato, stessa fonte.
+        "outcome": input.get("outcome").and_then(Value::as_str),
+        "failureCause": input.get("failure_cause").and_then(Value::as_str),
         "artifacts": input.get("artifacts").cloned().unwrap_or_else(|| json!([])),
         "exitCode": input.get("exit_code").and_then(Value::as_i64),
         "progress": progress,
