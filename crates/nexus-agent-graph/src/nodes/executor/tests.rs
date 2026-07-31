@@ -3024,6 +3024,52 @@ async fn rimando_review_a_vuoto_promuove_e_consuma_flag() {
 }
 
 #[tokio::test]
+async fn rimando_review_a_vuoto_rinnova_budget_iterazioni() {
+    // Il rimando in correzione ANDATO A VUOTO promuove il modello (test gemello
+    // sopra), ma con reset_iterations=false il promosso ereditava il conteggio
+    // iterazioni del mandato ORIGINALE: se il rimando cade vicino al cap assoluto
+    // (iteration_cap), il promosso riceve solo le iterazioni residue e chiude
+    // senza aver mai scritto un file. Misurato su bacheca-attivita (run
+    // 8757ac6d/c5d9b16d, 31/07/2026): task_complete dichiarato all'iterazione 57,
+    // rimando a vuoto, escalation scattata correttamente, run chiuso a 64
+    // iterazioni senza correzioni applicate -- l'escalation cambiava il MODELLO,
+    // non le iterazioni residue. Il rimando E' un nuovo mandato (i finding del
+    // panel), non la prosecuzione del mandato originale: merita un ciclo di
+    // iterazioni pieno, come gia' avviene per IterationCap (stesso punto unico
+    // maybe_escalate_nonconvergence, regola L).
+    //
+    // MUTAZIONE: tornando a reset_iterations=false in gate_rimando_review_a_vuoto,
+    // out.iterations torna a Some(61) (iters_in + 1) e questo assert rosseggia.
+    let rc = Arc::new(StubRunControlStore::default());
+    let esc = Arc::new(StubEscalationPort::with_chain_tier(
+        &["claude-piu-capace"],
+        "heavy",
+    ));
+    let (n, _meta, _s) = node_esc(cfg_resolved(), rc, esc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone());
+    let mut extra = serde_json::Map::new();
+    extra.insert(crate::nodes::REVIEW_GATE_ESCALATION_KEY.into(), json!(true));
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("crea x")],
+        stop_reason: Some(StopReason::ToolUse),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        iterations: Some(60),
+        extra,
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(
+        out.iterations,
+        Some(0),
+        "il modello promosso deve ripartire con un ciclo di iterazioni pieno, \
+         non ereditare il conteggio del mandato originale"
+    );
+}
+
+#[tokio::test]
 async fn rimando_review_a_vuoto_senza_candidato_prosegue() {
     // Flag review presente ma catena di escalation VUOTA: a differenza del
     // final_gate (che al cap ha esaurito i suoi tentativi e chiude), il rimando

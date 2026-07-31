@@ -3553,6 +3553,22 @@ oppure riprova piu' tardi."
     ///     esce dal cooldown durante QUESTO ciclo di correzione, la promozione
     ///     tardiva e' ancora pertinente (il rimando a vuoto e' ancora il rimando
     ///     corrente).
+    ///
+    /// `reset_iterations = true` (31/07/2026): il rimando in correzione E' un
+    /// nuovo mandato (i finding del panel), non la prosecuzione del mandato
+    /// originale, e il funnel di chiusura lo emette tipicamente TARDI nel run
+    /// (dopo un `task_complete` gia' dichiarato) — vicino al tetto assoluto
+    /// `iteration_cap`. Con `reset_iterations = false` il promosso ereditava
+    /// `iters_in` del run originale: misurato su bacheca-attivita (run
+    /// `8757ac6d`/`c5d9b16d`, 31/07/2026) task_complete dichiarato
+    /// all'iterazione 57, rimando a vuoto, escalation scattata correttamente,
+    /// ma il modello promosso riceveva solo le iterazioni residue (poche unita')
+    /// prima del cap assoluto e il run chiudeva `failed_diagnosed` senza una
+    /// sola scrittura di correzione. Stessa ragione gia' vale per
+    /// `SwitchReason::IterationCap` ("altrimenti rientrerebbe subito qui senza
+    /// mai lavorare"): qui il limite che sta per scattare non e' l'iteration_cap
+    /// in senso stretto, ma il rimando comunque compete per lo stesso budget
+    /// condiviso, quindi il promosso merita lo stesso ciclo pieno.
     async fn gate_rimando_review_a_vuoto(
         &self,
         state: &AgentState,
@@ -3568,7 +3584,7 @@ oppure riprova piu' tardi."
                 iters_in,
                 SwitchReason::ReviewCorrectionStalled,
                 ctx,
-                false,
+                true,
             )
             .await;
         if delta.is_none() {
@@ -7389,12 +7405,19 @@ una tool call, non descrivere.",
     /// STESSO paradigma del cap G1 (regola L), applicato ai trigger di non-convergenza
     /// (PUNTO UNICO di escalation-da-non-convergenza: 3 call site delegano qui).
     ///
-    /// `reset_iterations`: quando il limite che scatta E' il conteggio iterazioni
-    /// (ramo `iteration_cap`), azzera anche `iterations` cosi' il modello promosso
-    /// riparte con un ciclo pieno (simmetrico all'azzeramento del budget token);
-    /// altrimenti (`budget_token`/`final_gate_nonconvergence`, dove iterations NON e'
-    /// il limite) il conteggio prosegue (`iters_in + 1`). Il runaway resta bounded da
-    /// `auto_escalations` + hard-cap token/costo (mai resettati).
+    /// `reset_iterations`: azzera anche `iterations` cosi' il modello promosso
+    /// riparte con un ciclo pieno (simmetrico all'azzeramento del budget token),
+    /// per i trigger dove il turno residuo sul conteggio ESISTENTE sarebbe
+    /// insufficiente per il NUOVO mandato che la promozione avvia — non solo
+    /// `iteration_cap` (dove il limite che scatta e' il conteggio stesso) ma
+    /// anche `review_correction_stalled` (il rimando in correzione e' un
+    /// mandato nuovo — i finding del panel — emesso tipicamente tardi nel run,
+    /// vicino al tetto: promuovere senza azzerare lascerebbe al promosso solo le
+    /// iterazioni residue, misurato su bacheca-attivita 31/07/2026). Altrimenti
+    /// (`budget_token`/`final_gate_nonconvergence`, dove il promosso prosegue lo
+    /// STESSO turno del predecessore) il conteggio prosegue (`iters_in + 1`). Il
+    /// runaway resta bounded da `auto_escalations` + hard-cap token/costo (mai
+    /// resettati).
     async fn maybe_escalate_nonconvergence(
         &self,
         state: &AgentState,
