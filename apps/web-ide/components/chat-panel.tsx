@@ -29,6 +29,7 @@ import { extractLatestNextActions } from "./chat/agent-meta-step-card";
 import { InlineTracePanel } from "./chat/inline-trace-panel";
 import { Composer } from "./chat/composer";
 import { providerChoiceForSend } from "./chat/provider-choice-logic";
+import { planExternalInput } from "./chat/external-input-logic";
 import { MemoryPanel } from "./chat/memory-panel";
 import { TokenUsageBar } from "./chat/token-usage-bar";
 import {
@@ -289,6 +290,9 @@ export function ChatPanel({
   // azzerato i pending nel parent.
   const pendingAgentTypeHintRef = useRef<string | undefined>(undefined);
   const automationOnceRef = useRef<"study" | "confirm" | "automatic" | null>(null);
+  // Bozza utente messa da parte quando un prompt auto-send occupa il composer:
+  // torna nel campo dopo l'invio automatico (vedi external-input-logic.ts).
+  const draftToRestoreRef = useRef<string | null>(null);
   useEffect(() => {
     if (externalInput) {
       if (externalAutoSend) {
@@ -299,7 +303,19 @@ export function ChatPanel({
       if (externalAutomationOverride) {
         automationOnceRef.current = externalAutomationOverride;
       }
-      setInput(externalInput);
+      // Mai sostituire in silenzio una bozza non inviata: la decisione sta nel
+      // punto unico planExternalInput. Updater funzionale per leggere la bozza
+      // com'e' al momento del commit; la scrittura del ref dentro l'updater e'
+      // idempotente (StrictMode puo' invocarlo due volte con lo stesso input).
+      setInput((current) => {
+        const plan = planExternalInput({
+          currentDraft: current,
+          externalPrompt: externalInput,
+          autoSend: !!externalAutoSend,
+        });
+        draftToRestoreRef.current = plan.draftToRestore;
+        return plan.nextInput;
+      });
       onExternalInputConsumed?.();
     }
   // eslint-disable-next-line -- intentional: only re-run when externalInput changes
@@ -734,11 +750,20 @@ export function ChatPanel({
       const text = autoSendPendingRef.current;
       const hint = pendingProviderHintRef.current;
       const agentTypeHint = pendingAgentTypeHintRef.current;
+      const draft = draftToRestoreRef.current;
       autoSendPendingRef.current = null;
       pendingProviderHintRef.current = undefined;
       pendingAgentTypeHintRef.current = undefined;
+      draftToRestoreRef.current = null;
       // Piccolo delay per assicurare che lo stato React sia stabile
-      const timer = setTimeout(() => doSend(text, hint, agentTypeHint), 150);
+      const timer = setTimeout(() => {
+        // La bozza che il prompt auto-send aveva scalzato torna nel composer
+        // DOPO che doSend l'ha svuotato (clearComposer e' sincrono nel body,
+        // il then arriva sempre dopo).
+        void doSend(text, hint, agentTypeHint).then(() => {
+          if (draft) setInput(draft);
+        });
+      }, 150);
       return () => clearTimeout(timer);
     }
   // isAgentRunning e isLoading inclusi intenzionalmente: se bloccati l'effect riprova
