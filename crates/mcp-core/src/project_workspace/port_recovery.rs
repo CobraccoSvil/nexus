@@ -62,9 +62,10 @@ impl PortBind {
 
 /// PUNTO UNICO (regola L) della domanda «questa porta e' USABILE ora?»: il bind
 /// e' la domanda che il processo in avvio porra' al SO, e non coincide con
-/// `tcp_probe` (che chiede solo "qualcuno risponde?"). Una porta in TIME_WAIT o
-/// tenuta da un listener che non accetta connessioni non risponde al probe ma
-/// rifiuta il bind: iniettarla come `PORT` fa ripiegare il framework altrove.
+/// `port_listening` (che chiede solo "qualcuno risponde?"). Una porta in
+/// TIME_WAIT o tenuta da un listener che non accetta connessioni non risponde
+/// al probe ma rifiuta il bind: iniettarla come `PORT` fa ripiegare il
+/// framework altrove.
 pub async fn probe_bind(port: u16) -> PortBind {
     classifica_bind(tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await)
 }
@@ -130,17 +131,27 @@ where
     ultimo
 }
 
-/// True se la porta accetta una connessione TCP entro `timeout_ms`.
-pub async fn tcp_probe(port: u16, timeout_ms: u64) -> bool {
-    let addr = format!("127.0.0.1:{port}");
-    matches!(
-        tokio::time::timeout(
-            Duration::from_millis(timeout_ms),
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await,
-        Ok(Ok(_))
-    )
+/// PUNTO UNICO (regola L) della domanda «c'e' un listener su questa porta,
+/// ADESSO?». Delega a [`port_occupant`] (quindi a [`listening_ports`]: query
+/// diretta al SO — `GetExtendedTcpTable` su Windows, `ss`/`/proc/net/tcp{,6}`
+/// su Unix — non un TCP connect).
+///
+/// CAUSA RADICE (misurata 31/07/2026, progetto bacheca-attivita): la vecchia
+/// implementazione (`tcp_probe`, rimossa qui) apriva un TCP connect mirato al
+/// solo `127.0.0.1:{port}`. Un frontend Vite in LISTEN su `[::1]:24805`
+/// (dual-stack disattivato, bind IPv6-only) non rispondeva MAI a quel
+/// connect, e ognuno dei sette consumatori del vecchio probe lo dichiarava
+/// "muto": `cleanup_orphaned_ports` rilasciava l'allocazione di un servizio
+/// vivo, `find_or_allocate` ne riallocava una nuova, `service_observer` /
+/// `service_recovery` dichiaravano il servizio non pronto o non recuperato.
+/// `listening_ports` enumera GIA' entrambe le famiglie di indirizzi (vedi
+/// `process_util::windows_listening_sockets` e
+/// `services::proc_net_tcp_listen_inodes`, che legge sia `/proc/net/tcp` sia
+/// `/proc/net/tcp6`): la domanda "chi ascolta" ha gia' un punto unico
+/// indipendente dalla famiglia di indirizzo, e riaprire un connect mirato a
+/// UN indirizzo duplicava quella domanda in una forma piu' povera (regola L).
+pub async fn port_listening(port: u16) -> bool {
+    port_occupant(port).await.is_some()
 }
 
 /// Legge il process group id (PGID) di `pid` da /proc/{pid}/stat (campo `pgrp`,
@@ -497,14 +508,14 @@ pub async fn ensure_process_stopped(pid: Option<u32>, port: Option<u16>) -> bool
     let mut free_attempted = false;
     for attempt in 0..ATTEMPTS {
         let wrapper_alive = pid.map(crate::process_util::process_alive).unwrap_or(false);
-        let port_listening = match port {
-            Some(p) => Some(tcp_probe(p, 200).await),
+        let porta_in_ascolto = match port {
+            Some(p) => Some(port_listening(p).await),
             None => None,
         };
-        if process_fully_stopped(wrapper_alive, port_listening) {
+        if process_fully_stopped(wrapper_alive, porta_in_ascolto) {
             return true;
         }
-        if let (Some(true), Some(p)) = (port_listening, port) {
+        if let (Some(true), Some(p)) = (porta_in_ascolto, port) {
             if !free_attempted && attempt >= FREE_PORT_AFTER_ATTEMPT {
                 free_attempted = true;
                 tracing::warn!(
@@ -650,6 +661,58 @@ pub async fn kill_bucket_orphans(db: &PgPool, project_id: Uuid) -> Vec<u32> {
         killed.push(pid);
     }
     killed
+}
+
+#[cfg(test)]
+mod port_listening_tests {
+    /// REGRESSIONE (regola O, test di mutazione): un listener reale bindato
+    /// SOLO su `[::1]` (mai su `127.0.0.1`) deve risultare "in ascolto". E'
+    /// esattamente il caso misurato il 31/07/2026 su bacheca-attivita' (Vite
+    /// con dual-stack disattivato, in LISTEN solo su `[::1]:24805`): la
+    /// vecchia `tcp_probe`, che apriva un connect mirato al solo
+    /// `127.0.0.1:{port}`, l'avrebbe dichiarato muto — e con lui ogni
+    /// consumatore (cleanup_orphaned_ports, find_or_allocate,
+    /// service_observer, service_recovery). Se si reintroduce quel criterio
+    /// (o si sostituisce `port_listening` con un connect a un solo
+    /// indirizzo) questo test rosseggia sul difetto reale, non su un esito
+    /// fabbricato.
+    #[tokio::test]
+    async fn un_listener_ipv6_soltanto_e_visto_come_in_ascolto() {
+        let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
+            Ok(l) => l,
+            // Host senza stack IPv6: il test non ha oggetto, non si finge di
+            // aver verificato qualcosa.
+            Err(e) => {
+                eprintln!("IPv6 non disponibile su questo host, test saltato: {e}");
+                return;
+            }
+        };
+        let port = listener.local_addr().expect("local_addr").port();
+
+        assert!(
+            super::port_listening(port).await,
+            "listener reale su [::1]:{port} non riconosciuto: un probe cieco \
+             alla famiglia di indirizzo lo dichiarerebbe muto"
+        );
+
+        // Il listener e' vivo fino a qui: il fatto osservato sopra e' di
+        // questo test, nessun altro processo puo' averlo cambiato.
+        drop(listener);
+    }
+
+    /// Simmetrico sull'altra famiglia: un listener IPv4 resta visto (nessuna
+    /// regressione sul caso gia' coperto prima del fix).
+    #[tokio::test]
+    async fn un_listener_ipv4_e_visto_come_in_ascolto() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind di prova");
+        let port = listener.local_addr().expect("local_addr").port();
+
+        assert!(super::port_listening(port).await);
+
+        drop(listener);
+    }
 }
 
 #[cfg(test)]

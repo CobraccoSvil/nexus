@@ -107,7 +107,16 @@ pub async fn find_or_allocate(
     .await
     {
         let p = existing_port as u16;
-        if super::port_recovery::tcp_probe(p, 300).await {
+        // Un solo interrogo del SO (punto unico `port_occupant`, regola L):
+        // prima un `tcp_probe` a se' (connect al solo 127.0.0.1) decideva se
+        // "qualcuno ascolta" e SOLO in quel caso si chiedeva chi. Un servizio
+        // in LISTEN esclusivamente su `[::1]` risultava "muto" al gate e
+        // veniva riallocato mentre era vivo — stessa causa radice del
+        // frontend Vite di bacheca-attivita' (misurato 31/07/2026): non
+        // "occupata da chissi'" ma occupata per davvero, solo su una famiglia
+        // di indirizzo che il vecchio gate non sapeva interrogare.
+        let occupant = super::port_recovery::port_occupant(p).await;
+        if occupant.is_some() {
             // La porta risponde: qualcuno ascolta DAVVERO. Storicamente questo
             // ramo ritornava 'existing' senza chiedersi CHI: se l'occupante era
             // un processo non tracciato (orfano di uno stop non verificato,
@@ -117,7 +126,6 @@ pub async fn find_or_allocate(
             // dal progetto?", che rende legittimo anche l'occupante di un ALTRO
             // servizio. Ora la si pone stretta: "e' IL servizio richiesto?"
             // (punto unico `service_ownership`).
-            let occupant = super::port_recovery::port_occupant(p).await;
             let ownership = match &occupant {
                 Some((pid, _)) => {
                     service_ownership::ownership_of_occupant(db, project_id, *pid, label).await

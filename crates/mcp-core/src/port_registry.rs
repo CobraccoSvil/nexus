@@ -581,7 +581,7 @@ pub async fn cleanup_orphaned_ports(db: &PgPool, grace_secs: i64) -> u64 {
         // query. La chiusura alla fonte e' in `register_detected_port`.
         if nexus_tool_kit::ports::port_authorized_for_project(db, &project_id, p).await {
             // Se qualcuno ascolta sulla porta, e' in uso: non la tocchiamo.
-            if crate::project_workspace::port_recovery::tcp_probe(p, 200).await {
+            if crate::project_workspace::port_recovery::port_listening(p).await {
                 continue;
             }
             // Riserva di un servizio configurato ma FERMO -> non e' orfana, va

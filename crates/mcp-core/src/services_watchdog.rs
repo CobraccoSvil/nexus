@@ -41,10 +41,7 @@ use serde::Deserialize;
 use sqlx::PgPool;
 use tokio::time::sleep;
 
-use crate::project_workspace::port_recovery::tcp_probe;
-
-/// Timeout del TCP probe per ogni servizio.
-const PROBE_TIMEOUT_MS: u64 = 1_500;
+use crate::project_workspace::port_recovery::port_listening;
 
 /// Attesa iniziale prima del primo ciclo (lascia stabilizzare l'avvio).
 const STARTUP_DELAY_S: u64 = 20;
@@ -336,7 +333,7 @@ async fn run_cycle(db: &PgPool, cfg: &WatchdogConfig, states: &mut HashMap<Strin
             }
         };
 
-        let is_up = tcp_probe(port, PROBE_TIMEOUT_MS).await;
+        let is_up = port_listening(port).await;
         let st = states.entry(svc.name.clone()).or_default();
 
         if is_up {

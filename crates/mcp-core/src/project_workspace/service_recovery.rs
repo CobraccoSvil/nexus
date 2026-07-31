@@ -93,8 +93,6 @@ const OBSERVE_INTERVAL_MS: u64 = 2_000;
 /// tutti — un servizio web che risponde al secondo 2 e muore al secondo 8 non e'
 /// riparato piu' di un worker che fa lo stesso.
 const STABILITY_SECONDS: u64 = 15;
-/// Timeout della prova TCP (stesso ordine di `service_observer::any_port_listening`).
-const PROBE_TCP_TIMEOUT_MS: u64 = 400;
 /// Timeout della prova HTTP: piu' lungo del TCP perche' comprende la risposta.
 const PROBE_HTTP_TIMEOUT_MS: u64 = 2_000;
 /// Caratteri di log conservati nell'evidenza.
@@ -116,6 +114,14 @@ const FASE_RIAVVIO_CONFERMA: &str = "riavvio di conferma";
 /// come condizione: si chiude solo cio' che era davvero in verifica, e mai due
 /// volte.
 const STATO_DIAGNOSING: &str = "diagnosing";
+/// Diagnosi visibile e non presa in carico da nessuno: e' da qui che il presidio
+/// la preleva, ed e' qui che torna un tentativo fallito che ne ha ancora.
+const STATO_APERTA: &str = "open";
+/// Stato terminale: si e' tentato quanto era previsto e il servizio non risponde.
+/// Non e' `resolved` — il problema resta nel pannello, con l'evidenza.
+const STATO_FALLITA: &str = "failed_remediation";
+/// L'unico stato che timbra `resolved_at`.
+const STATO_RISOLTA: &str = "resolved";
 
 /// Cosa ha risposto una porta (segnale strutturato, regola M).
 ///
@@ -193,6 +199,24 @@ impl ServiceHealth {
     /// Il contratto: conforme, e per un tempo che non sia un istante.
     fn meets_contract(&self) -> bool {
         self.is_conforming() && self.stable
+    }
+
+    /// Riga di evidenza di cio' che si e' MISURATO, non di cio' che si conclude:
+    /// lo stato e cosa ha risposto su ciascuna porta allocata. E' quanto resta
+    /// scritto sulla diagnosi quando la si chiude senza aver riparato nulla, ed
+    /// e' la sola cosa che rende quella chiusura verificabile a posteriori.
+    pub(crate) fn describe(&self) -> String {
+        let stato = format!("stato {:?}", self.state);
+        if self.ports.is_empty() {
+            return format!("{stato}, nessuna porta allocata a questa unit");
+        }
+        let porte = self
+            .ports
+            .iter()
+            .map(|p| format!("{} -> {}", p.port, p.answer.describe()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!("{stato}, {porte}")
     }
 
     fn silent_ports(&self) -> Vec<u16> {
@@ -358,7 +382,7 @@ pub(crate) async fn probe_port(port: u16) -> PortAnswer {
             status: resp.status().as_u16(),
         };
     }
-    if super::port_recovery::tcp_probe(port, PROBE_TCP_TIMEOUT_MS).await {
+    if super::port_recovery::port_listening(port).await {
         return PortAnswer::Tcp;
     }
     PortAnswer::Silence
@@ -806,68 +830,616 @@ async fn readiness_window(state: &AppState) -> Duration {
 
 // ── Scrittura dell'esito ─────────────────────────────────────────────────────
 
-/// Applica il verdetto a una diagnosi in `diagnosing` e ritorna lo stato scritto.
+/// Come si e' concluso il presidio di una diagnosi. E' un vocabolario, non un
+/// booleano: le quattro conclusioni scrivono stati diversi perche' dicono cose
+/// diverse, e appiattirle rimetterebbe in circolo proprio la bugia che questo
+/// modulo esiste per togliere ("e' andata" / "non e' andata").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RepairOutcome {
+    /// Il contratto era gia' soddisfatto: NESSUN rimedio e' stato eseguito, e
+    /// non serviva. La rilevazione era superata.
+    NotNeeded,
+    /// Un rimedio e' stato eseguito e giudicato. `retry_left` distingue "non ha
+    /// funzionato, restano tentativi" da "non funziona, serve un umano": senza
+    /// quella distinzione il primo intoppo transitorio chiuderebbe per sempre la
+    /// riga, che e' la stessa forma di difetto — una decisione presa una volta —
+    /// che il presidio toglie a monte.
+    Judged {
+        verdict: RecoveryVerdict,
+        retry_left: bool,
+    },
+    /// I tentativi previsti sono finiti e non se ne fara' un altro. Nasce dal
+    /// gate, non da un rimedio: la riga e' ancora `open`.
+    Exhausted { attempts: i64 },
+}
+
+/// Applica l'esito a una diagnosi e ritorna lo stato scritto.
 ///
 /// PUNTO UNICO della scrittura dell'esito di una remediation di servizio: chi
 /// verifica e chi scrive sono la stessa catena, cosi' non puo' esistere un
-/// percorso che chiude senza aver verificato. Un verdetto negativo NON chiude:
-/// porta la diagnosi in `failed_remediation` (stato terminale gia' in uso dal
-/// gemello sulle violazioni risorse) e le allega l'evidenza — cosa non risponde,
-/// su quale porta — perche' il problema resti visibile e diagnosticabile nel
-/// pannello Problemi invece di sparire come risolto.
-pub(crate) async fn apply_recovery_verdict(
+/// percorso che chiude senza aver verificato. Un verdetto negativo definitivo
+/// NON chiude: porta la diagnosi in `failed_remediation` (stato terminale gia'
+/// in uso dal gemello sulle violazioni risorse) e le allega l'evidenza — cosa
+/// non risponde, su quale porta — perche' il problema resti visibile e
+/// diagnosticabile nel pannello Problemi invece di sparire come risolto.
+///
+/// Lo stato di PARTENZA lo sceglie l'esito, non il chiamante: `NotNeeded` e
+/// `Judged` chiudono un lease (`diagnosing`), `Exhausted` interviene su una riga
+/// ancora `open`. Se la riga non e' nello stato atteso non si scrive nulla e si
+/// ritorna `None`: qualcun altro l'ha gia' presa.
+pub(crate) async fn apply_repair_outcome(
     db: &sqlx::PgPool,
     diagnosis_id: Uuid,
-    verdict: &RecoveryVerdict,
+    outcome: &RepairOutcome,
     evidence: &str,
 ) -> Option<String> {
-    match verdict {
-        RecoveryVerdict::Recovered => sqlx::query_scalar::<_, String>(
-            "UPDATE service_diagnoses \
-                SET status = 'resolved', resolved_at = NOW(), updated_at = NOW() \
-              WHERE id = $1 AND status = $2 \
-              RETURNING status",
-        )
-        .bind(diagnosis_id)
-        .bind(STATO_DIAGNOSING)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten(),
-        RecoveryVerdict::NotRecovered(failure) => {
-            mark_failed_remediation(db, diagnosis_id, failure, evidence).await
+    match outcome {
+        RepairOutcome::NotNeeded => {
+            let detail = format!(
+                "NESSUN RIMEDIO NECESSARIO: il servizio soddisfa il contratto ({evidence}). \
+                 La rilevazione era superata."
+            );
+            close_diagnosis(db, diagnosis_id, &detail).await
+        }
+        RepairOutcome::Judged {
+            verdict: RecoveryVerdict::Recovered,
+            ..
+        } => {
+            let detail = format!("RIPARAZIONE VERIFICATA: {evidence}");
+            close_diagnosis(db, diagnosis_id, &detail).await
+        }
+        RepairOutcome::Judged {
+            verdict: RecoveryVerdict::NotRecovered(failure),
+            retry_left: true,
+        } => reopen_for_retry(db, diagnosis_id, failure).await,
+        RepairOutcome::Judged {
+            verdict: RecoveryVerdict::NotRecovered(failure),
+            retry_left: false,
+        } => {
+            let detail = format!(
+                "VERIFICA DEL RIMEDIO FALLITA: {}\n\n{evidence}",
+                failure.describe()
+            );
+            mark_terminal(db, diagnosis_id, STATO_DIAGNOSING, &detail).await
+        }
+        RepairOutcome::Exhausted { attempts } => {
+            let detail = format!(
+                "RIPARAZIONE AUTOMATICA ESAURITA dopo {attempts} tentativi: il servizio non \
+                 soddisfa il contratto (stato in esecuzione e almeno una porta allocata a lui \
+                 che risponde). Serve un intervento."
+            );
+            mark_terminal(db, diagnosis_id, STATO_APERTA, &detail).await
         }
     }
 }
 
-/// Stato terminale con l'evidenza in coda al `detail`: il problema resta nel
-/// pannello e porta con se' cosa non risponde e su quale porta. In coda e non al
-/// posto del testo esistente, perche' la diagnosi dell'AI e il log del guasto
-/// restano il contesto che serve a leggerlo.
-async fn mark_failed_remediation(
+/// Chiusura: `resolved` con la data, e in coda al `detail` il perche'. In coda e
+/// non al posto del testo esistente, perche' la diagnosi dell'AI e il log del
+/// guasto restano il contesto che serve a leggerlo.
+async fn close_diagnosis(db: &sqlx::PgPool, diagnosis_id: Uuid, detail: &str) -> Option<String> {
+    scrivi_esito(db, diagnosis_id, STATO_DIAGNOSING, STATO_RISOLTA, detail).await
+}
+
+/// Stato terminale (`failed_remediation`) con l'evidenza in coda: il problema
+/// resta nel pannello e porta con se' cosa non risponde e su quale porta.
+async fn mark_terminal(
+    db: &sqlx::PgPool,
+    diagnosis_id: Uuid,
+    from: &str,
+    detail: &str,
+) -> Option<String> {
+    scrivi_esito(db, diagnosis_id, from, STATO_FALLITA, detail).await
+}
+
+/// Il tentativo non ha riparato ma ce ne sono altri: la riga torna VISIBILE e
+/// disponibile (`open`), con scritto cosa non ha funzionato. Il `cooldown_until`
+/// scritto dal lease resta: il prossimo tentativo e' spaziato, non immediato.
+async fn reopen_for_retry(
     db: &sqlx::PgPool,
     diagnosis_id: Uuid,
     failure: &RecoveryFailure,
-    evidence: &str,
 ) -> Option<String> {
     let detail = format!(
-        "VERIFICA DEL RIMEDIO FALLITA: {}\n\n{evidence}",
+        "TENTATIVO DI RIPARAZIONE NON RIUSCITO: {}",
         failure.describe()
     );
+    scrivi_esito(db, diagnosis_id, STATO_DIAGNOSING, STATO_APERTA, &detail).await
+}
+
+/// L'unica UPDATE che scrive un esito su `service_diagnoses`.
+///
+/// Lo stato di partenza e' una CONDIZIONE, non un'informazione: si scrive solo
+/// cio' che era davvero in quello stato, e mai due volte. E la data di
+/// risoluzione la decide lo stato di arrivo qui dentro, in un punto solo: un
+/// chiamante che potesse timbrarla per conto proprio potrebbe timbrare una
+/// chiusura che non e' avvenuta.
+async fn scrivi_esito(
+    db: &sqlx::PgPool,
+    diagnosis_id: Uuid,
+    from: &str,
+    to: &str,
+    detail: &str,
+) -> Option<String> {
     sqlx::query_scalar::<_, String>(
         "UPDATE service_diagnoses \
-            SET status = 'failed_remediation', updated_at = NOW(), \
-                detail = COALESCE(detail, '') || E'\\n\\n' || $3 \
+            SET status = $3, \
+                resolved_at = CASE WHEN $3 = $5 THEN NOW() ELSE resolved_at END, \
+                updated_at = NOW(), \
+                detail = COALESCE(detail, '') || E'\\n\\n' || $4 \
           WHERE id = $1 AND status = $2 \
           RETURNING status",
     )
     .bind(diagnosis_id)
-    .bind(STATO_DIAGNOSING)
-    .bind(&detail)
+    .bind(from)
+    .bind(to)
+    .bind(detail)
+    .bind(STATO_RISOLTA)
     .fetch_optional(db)
     .await
     .ok()
     .flatten()
+}
+
+// ── Presa in carico: chi decide di riparare, e quando ────────────────────────
+//
+// IL DIFETTO CHE CHIUDE. Il contratto qui sopra esisteva, ma nessuno lo
+// interrogava se non DOPO un run dell'AI riuscito: [`restart_and_verify`] era
+// raggiungibile solo da `service_observer_remediation::spawn_verifica_esito`,
+// che nasce dallo spawn del Debugger. E quello spawn e' UN SOLO COLPO, deciso in
+// memoria: `service_observer::detect_structural_failure` registra il problema
+// una volta per (unit, marcatore d'avvio, reason) e non lo rivede finche' la
+// firma non cambia — cioe' finche' il servizio non riparte. Ogni guardia che
+// dice "non ora" (boot-grace, run gia' attivo sulla sessione, cap orario,
+// nessuna sessione chat) consumava quel colpo per SEMPRE: un rinvio diventava
+// una rinuncia, e nessuno se ne accorgeva perche' la riga restava li', aperta.
+//
+// MISURATO il 30-31/07/2026 su bacheca-attivita: tre diagnosi `crash` aperte
+// alle 20:51:53, ancora aperte sette ore dopo, con le anomalie gemelle riscritte
+// 1806 volte (una ogni 15s) e `triggered_run_id` NULL su tutte. Il log del
+// processo riavviato alle 04:17:40 mostra la meccanica per intero: cinque righe
+// "boot-grace attivo, skip auto-debug", tutte alle 04:18:08, e poi mai piu' una
+// sola interrogazione del trigger.
+//
+// Non era sfortuna. Il primo ciclo dell'observer e' a +25s dall'avvio
+// (`STARTUP_DELAY_S`) e la boot-grace dura 90s: per QUALUNQUE servizio gia' giu'
+// quando mcp-core riparte, l'unico colpo cade dentro la finestra in cui il
+// trigger e' per costruzione inerte. Zero riparazioni, garantite.
+//
+// Da qui la presa in carico non e' piu' una decisione presa una volta e tenuta a
+// mente: e' lo STATO DELLA RIGA (`status`, `triggered_run_id`, `ts`,
+// `remediation_attempts`, `cooldown_until`), riletto a ogni ciclo. Un rinvio
+// resta un rinvio, mai una rinuncia.
+//
+// PRIMA VERSIONE DI QUESTO FIX (scartata in review, mai committata): il
+// presidio riavviava direttamente via `restart_and_verify`, senza passare
+// dall'AI. Verificato che la corsa era REALE e SISTEMATICA, non solo sulle
+// diagnosi rimaste bloccate a lungo: `register_structural_problem` non attende
+// `service_log_diagnose::spawn_diagnosis` (un `tokio::spawn` non bloccante che
+// fa una chiamata LLM fino a 25s prima di interrogare
+// `maybe_trigger_debugger`), e il presidio girava nello STESSO ciclo
+// dell'observer subito dopo la registrazione — un semplice UPDATE Postgres
+// locale vince quasi sempre contro una chiamata HTTP con timeout di secondi.
+// Il guard "rimedio_in_corso" di `maybe_trigger_debugger` (`status =
+// 'diagnosing'`) non distingue un `diagnosing` scritto dal SUO trigger da uno
+// scritto dal lease del presidio, quindi il riavvio cieco arrivava per primo e
+// il Debugger — l'unico che puo' correggere una causa nel CODICE — non veniva
+// piu' invocato per (quasi) nessun crash nuovo. Avrebbe contraddetto il mandato
+// di questo stesso modulo: "la diagnosi e' delegata all'AI... non si aggiunge
+// un controllo sulla VARIANTE osservata".
+//
+// Il presidio quindi NON sostituisce l'AI: la RITENTA. Per ogni diagnosi
+// ancora aperta, se l'AI non ha mai avuto un run per lei (`triggered_run_id
+// IS NULL`) ed e' abbastanza recente, si richiama `maybe_trigger_debugger` —
+// stesso punto unico, stessi gate (cooldown per firma, boot-grace, cap orario,
+// sessione, run attivo), nessuna logica duplicata (regola L). Il riavvio
+// deterministico resta un RIPIEGO, per le sole diagnosi rimaste [`STUCK`] —
+// vecchie abbastanza da escludere qualunque gate transitorio, con l'AI mai
+// partita (o partita e interrotta da un riavvio di mcp-core, che riapre senza
+// azzerare `triggered_run_id`): la' un plain restart non correggera' un bug
+// reale, ma e' comunque meglio del silenzio di prima, e la sua eventuale
+// incapacita' di riparare si dichiara nel pannello (`failed_remediation`),
+// mai la si maschera.
+//
+// [`STUCK`]: vedi `RepairPolicy::ai_trigger_stuck_after_seconds`.
+
+/// Diagnosi prese in carico in un giro, per progetto. Ognuna, se ammissibile al
+/// ripiego deterministico, costa due riavvii e due finestre di osservazione: si
+/// lavora a poche per volta, le piu' vecchie prima, e le altre restano per il
+/// giro successivo.
+const MAX_CRASHES_PER_PASS: i64 = 3;
+/// Tentativi di riparazione DETERMINISTICA (ripiego, non AI) prima di
+/// dichiarare che serve un umano.
+const DEFAULT_MAX_ATTEMPTS: i64 = 3;
+/// Distanza minima fra due tentativi deterministici sulla stessa diagnosi.
+const DEFAULT_RETRY_COOLDOWN_S: i64 = 600;
+/// Quanto una diagnosi resta affidata SOLO ai ritentativi del trigger AI prima
+/// di diventare ammissibile al ripiego deterministico. Ampio apposta: deve
+/// escludere con margine qualunque gate transitorio di `maybe_trigger_debugger`
+/// (boot-grace, cap orario), cosi' il ripiego scatta solo su un blocco che i
+/// ritentativi non hanno superato, non su un gate che stava per sciogliersi.
+const DEFAULT_AI_TRIGGER_STUCK_AFTER_S: i64 = 1800;
+
+/// Parametri del presidio (regola G: dal DB, mai da env; i default valgono a
+/// chiave assente e sono identici ai valori della migrazione 0661).
+struct RepairPolicy {
+    enabled: bool,
+    max_attempts: i64,
+    retry_cooldown_seconds: i64,
+    ai_trigger_stuck_after_seconds: i64,
+}
+
+async fn repair_policy(db: &sqlx::PgPool) -> RepairPolicy {
+    async fn intero(db: &sqlx::PgPool, key: &str, default: i64) -> i64 {
+        crate::settings::get_setting(db, key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(default)
+    }
+    let enabled = crate::settings::get_setting(db, "agent.remediation.auto_restart_enabled")
+        .await
+        .ok()
+        .flatten()
+        .map(|v| {
+            !matches!(
+                v.trim().to_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true);
+    RepairPolicy {
+        enabled,
+        max_attempts: intero(db, "agent.remediation.max_restart_attempts", DEFAULT_MAX_ATTEMPTS)
+            .await
+            .max(1),
+        retry_cooldown_seconds: intero(
+            db,
+            "agent.remediation.retry_cooldown_seconds",
+            DEFAULT_RETRY_COOLDOWN_S,
+        )
+        .await
+        .max(0),
+        ai_trigger_stuck_after_seconds: intero(
+            db,
+            "agent.remediation.ai_trigger_stuck_after_seconds",
+            DEFAULT_AI_TRIGGER_STUCK_AFTER_S,
+        )
+        .await
+        .max(0),
+    }
+}
+
+/// Una diagnosi di crash che aspetta un presidio, con quanto e' gia' stato
+/// tentato su di lei e cio' che serve a decidere fra ritentare l'AI o ricadere
+/// sul ripiego deterministico.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingCrash {
+    pub(crate) id: Uuid,
+    pub(crate) unit: String,
+    pub(crate) attempts: i64,
+    /// Classificazione della diagnosi (colonna `metric`): passata a
+    /// `maybe_trigger_debugger` come `kind`, per rifare la stessa richiesta che
+    /// avrebbe fatto la registrazione originale.
+    pub(crate) metric: Option<String>,
+    /// Ultimo dettaglio noto (colonna `detail`): passato come `last_log`.
+    pub(crate) detail: Option<String>,
+    pub(crate) error_signature_hash: Option<String>,
+    /// `true` se questa diagnosi e' ammissibile al ripiego deterministico:
+    /// l'AI ha gia' avuto un run (`triggered_run_id` valorizzato, anche se poi
+    /// riaperta perche' interrotta da un riavvio di mcp-core) OPPURE e' aperta
+    /// da piu' di [`RepairPolicy::ai_trigger_stuck_after_seconds`] senza che
+    /// l'AI sia mai partita. Finche' e' `false` la diagnosi si affida SOLO ai
+    /// ritentativi del trigger esistente.
+    pub(crate) fallback_eligible: bool,
+}
+
+/// Le diagnosi di crash che aspettano: aperte, fuori dal cooldown dell'ultimo
+/// tentativo, le piu' vecchie prima.
+///
+/// SOLO `open` (regola L): `diagnosing` significa che un rimedio e' in volo —
+/// quello dell'AI o il lease di questo stesso presidio — e la sua chiusura
+/// appartiene a chi l'ha preso; `resolved` e `failed_remediation` sono terminali.
+/// Prenderne una in `diagnosing` significherebbe riavviare un servizio sotto i
+/// piedi di chi lo sta gia' verificando.
+pub(crate) async fn pending_service_crashes(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+    limit: i64,
+    ai_trigger_stuck_after_seconds: i64,
+) -> Vec<PendingCrash> {
+    sqlx::query_as::<_, (Uuid, String, i32, Option<String>, Option<String>, Option<String>, bool)>(
+        "SELECT id, unit, remediation_attempts, metric, detail, error_signature_hash, \
+                (triggered_run_id IS NOT NULL \
+                 OR ts < NOW() - make_interval(secs => $4)) AS fallback_eligible \
+           FROM service_diagnoses \
+          WHERE project_id = $1 AND signal_kind = 'crash' AND status = $2 \
+            AND (cooldown_until IS NULL OR cooldown_until < NOW()) \
+          ORDER BY ts ASC LIMIT $3",
+    )
+    .bind(project_id)
+    .bind(STATO_APERTA)
+    .bind(limit)
+    .bind(ai_trigger_stuck_after_seconds as f64)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(
+        |(id, unit, attempts, metric, detail, error_signature_hash, fallback_eligible)| {
+            PendingCrash {
+                id,
+                unit,
+                attempts: attempts as i64,
+                metric,
+                detail,
+                error_signature_hash,
+                fallback_eligible,
+            }
+        },
+    )
+    .collect()
+}
+
+/// Cosa fare di una diagnosi aperta. Puro e testabile: e' la regola, separata
+/// dall'orologio e dal database che la alimentano.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepairDecision {
+    /// Prendila in carico.
+    Attend,
+    /// Il presidio e' spento: la riga resta visibile, nessuno la tocca.
+    Disabled,
+    /// I tentativi previsti sono finiti: si smette di riavviare e lo si dichiara.
+    AttemptsExhausted,
+}
+
+pub(crate) fn repair_decision(enabled: bool, attempts: i64, max_attempts: i64) -> RepairDecision {
+    if !enabled {
+        return RepairDecision::Disabled;
+    }
+    if attempts >= max_attempts {
+        return RepairDecision::AttemptsExhausted;
+    }
+    RepairDecision::Attend
+}
+
+/// Prende in carico UNA diagnosi: `open` -> `diagnosing`, col cooldown del
+/// prossimo tentativo gia' scritto. Atomico e condizionato allo stato, perche'
+/// due cicli dell'observer che si accavallano — o il trigger dell'AI in corsa
+/// sulla stessa unit — non possano riavviare lo stesso servizio due volte.
+///
+/// `false` = la riga non era piu' `open`: qualcun altro l'ha presa, e questo
+/// giro non fa nulla.
+pub(crate) async fn lease_for_repair(
+    db: &sqlx::PgPool,
+    diagnosis_id: Uuid,
+    cooldown_seconds: i64,
+) -> bool {
+    sqlx::query_scalar::<_, Uuid>(
+        "UPDATE service_diagnoses \
+            SET status = $2, updated_at = NOW(), \
+                cooldown_until = NOW() + make_interval(secs => $3) \
+          WHERE id = $1 AND status = $4 \
+          RETURNING id",
+    )
+    .bind(diagnosis_id)
+    .bind(STATO_DIAGNOSING)
+    .bind(cooldown_seconds as f64)
+    .bind(STATO_APERTA)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .is_some()
+}
+
+/// Registra che un tentativo di riparazione e' stato ESEGUITO. Separato dal
+/// lease apposta: una diagnosi che si chiude perche' il servizio era gia' sano
+/// non ha consumato alcun tentativo, e contarla renderebbe il conteggio una
+/// misura di quante volte ci si e' guardati intorno.
+async fn note_attempt(db: &sqlx::PgPool, diagnosis_id: Uuid) {
+    let _ = sqlx::query(
+        "UPDATE service_diagnoses SET remediation_attempts = remediation_attempts + 1 \
+          WHERE id = $1",
+    )
+    .bind(diagnosis_id)
+    .execute(db)
+    .await;
+}
+
+/// Il contratto SENZA rimedio: questo servizio lo soddisfa GIA'?
+///
+/// Stessa misura del dopo-rimedio ([`await_contract`]: stesso stato, stesse
+/// prove sulle stesse porte, stessa durata) con la finestra di readiness a ZERO,
+/// perche' qui la domanda e' diversa: non si aspetta che un servizio DIVENTI
+/// sano — nessuno l'ha appena riavviato — si guarda se lo E'. Un secondo
+/// criterio di "servizio sano" farebbe dell'apertura e della chiusura due idee
+/// diverse della stessa cosa (regola L), e il ciclo oscillerebbe.
+pub(crate) async fn contract_without_repair(
+    state: &AppState,
+    project_id: Uuid,
+    unit: &str,
+) -> ServiceHealth {
+    let target = ServiceRef::resolve(state, project_id, unit).await;
+    await_contract(state, &target, Duration::ZERO).await
+}
+
+/// Presidia le diagnosi di crash aperte di un progetto: e' l'INGRESSO che
+/// mancava alla catena rileva -> ripara -> chiude.
+///
+/// Chiamata a ogni ciclo dell'observer con i parametri del trigger AI gia'
+/// caricati dal chiamante (`ObserverConfig`, un solo caricamento per ciclo):
+/// non li ricarica una seconda volta, e non ne duplica il significato.
+///
+/// Non trattiene il ciclo: ogni azione (ritentativo del trigger, o presidio
+/// deterministico) vive in un task a se'; il lease sul DB — o, per il
+/// ritentativo, i gate gia' dentro `maybe_trigger_debugger` — sono cio' che
+/// impedisce a due cicli di agire due volte sulla stessa riga.
+pub(crate) async fn process_open_service_crashes(
+    state: &AppState,
+    project_id: Uuid,
+    auto_diagnose_enabled: bool,
+    diagnose_cooldown_seconds: i64,
+    diagnose_max_per_hour: i64,
+) {
+    // Boot-grace: RINVIO, non consumo. Subito dopo un riavvio di mcp-core i
+    // servizi sono nel transitorio e "giu'" non distingue un guasto da una
+    // stabilizzazione. La riga resta `open` e il giro dopo si riprova — che e'
+    // esattamente cio' che prima non accadeva.
+    if super::service_observer_remediation::within_boot_grace(state).await {
+        return;
+    }
+    let policy = repair_policy(&state.db).await;
+    let crashes = pending_service_crashes(
+        &state.db,
+        project_id,
+        MAX_CRASHES_PER_PASS,
+        policy.ai_trigger_stuck_after_seconds,
+    )
+    .await;
+    for crash in crashes {
+        if !crash.fallback_eligible {
+            retry_ai_trigger(
+                state,
+                project_id,
+                crash,
+                auto_diagnose_enabled,
+                diagnose_cooldown_seconds,
+                diagnose_max_per_hour,
+            );
+            continue;
+        }
+        dispatch_repair_decision(state, project_id, &policy, crash).await;
+    }
+}
+
+/// Applica a UNA diagnosi la decisione di riparazione: esaurimento dichiarato
+/// (con refresh del pannello), presa in carico con lease e presidio in
+/// background, o nulla se la riparazione automatica e' spenta. Estratta dal
+/// ciclo di `process_open_service_crashes`, che resta la sola a decidere QUALI
+/// diagnosi entrano nel giro.
+async fn dispatch_repair_decision(
+    state: &AppState,
+    project_id: Uuid,
+    policy: &RepairPolicy,
+    crash: PendingCrash,
+) {
+    match repair_decision(policy.enabled, crash.attempts, policy.max_attempts) {
+        RepairDecision::Disabled => {}
+        RepairDecision::AttemptsExhausted => {
+            let esito = RepairOutcome::Exhausted {
+                attempts: crash.attempts,
+            };
+            if apply_repair_outcome(&state.db, crash.id, &esito, "").await.is_some() {
+                tracing::warn!(
+                    unit = %crash.unit, attempts = crash.attempts,
+                    "service_recovery: tentativi di riparazione esauriti, serve un intervento"
+                );
+                crate::project_workspace::logs::emit_problems_panel_refresh(
+                    project_id,
+                    vec![crash.id],
+                );
+            }
+        }
+        RepairDecision::Attend => {
+            if !lease_for_repair(&state.db, crash.id, policy.retry_cooldown_seconds).await {
+                return;
+            }
+            let ultimo = crash.attempts + 1 >= policy.max_attempts;
+            let state = state.clone();
+            tokio::spawn(async move { presidia(state, project_id, crash, ultimo).await });
+        }
+    }
+}
+
+/// Ritenta il trigger AI ESISTENTE (`maybe_trigger_debugger`, punto unico
+/// invariato) per una diagnosi non ancora ammissibile al ripiego. Nessuna
+/// scrittura nostra: se il trigger scatta, e' lui a portare la riga in
+/// `diagnosing` con `triggered_run_id`; se un gate lo respinge ancora (es.
+/// boot-grace non ancora scaduta altrove, cooldown per firma), la riga resta
+/// `open` e il ciclo successivo la ripresenta — che e' esattamente il
+/// comportamento che il difetto originale non aveva.
+///
+/// In un task a se': `maybe_trigger_debugger` fa diverse query e puo' spawnare
+/// un run: non deve trattenere il ciclo dell'observer, come gia' non lo
+/// trattiene quando parte da `service_log_diagnose::spawn_diagnosis`.
+fn retry_ai_trigger(
+    state: &AppState,
+    project_id: Uuid,
+    crash: PendingCrash,
+    auto_diagnose_enabled: bool,
+    diagnose_cooldown_seconds: i64,
+    diagnose_max_per_hour: i64,
+) {
+    let state = state.clone();
+    let PendingCrash {
+        id,
+        unit,
+        metric,
+        detail,
+        error_signature_hash,
+        ..
+    } = crash;
+    let kind = metric.unwrap_or_else(|| "unknown".to_string());
+    let last_log = detail.unwrap_or_default();
+    let sig = error_signature_hash.unwrap_or_default();
+    tokio::spawn(async move {
+        super::service_observer_remediation::maybe_trigger_debugger(
+            &state,
+            auto_diagnose_enabled,
+            diagnose_cooldown_seconds,
+            diagnose_max_per_hour,
+            project_id,
+            &unit,
+            &kind,
+            &last_log,
+            &sig,
+            Some(id),
+        )
+        .await;
+    });
+}
+
+/// Il presidio DETERMINISTICO di UNA diagnosi (ripiego, non AI), in
+/// background: prima guarda, e solo se serve ripara.
+///
+/// L'ordine non e' prudenza, e' il mandato: una rilevazione superata (il
+/// servizio risponde, la riga e' rimasta indietro) si chiude su un FATTO
+/// OSSERVATO — la porta che gli spetta risponde, e continua a farlo — non sul
+/// fatto che il ciclo sia passato di nuovo (regola M). E riavviare un servizio
+/// sano sarebbe il danno che la rilevazione sbagliata, da sola, non faceva.
+async fn presidia(
+    state: AppState,
+    project_id: Uuid,
+    crash: PendingCrash,
+    ultimo_tentativo: bool,
+) {
+    let salute = contract_without_repair(&state, project_id, &crash.unit).await;
+    if salute.meets_contract() {
+        let esito = RepairOutcome::NotNeeded;
+        let scritto =
+            apply_repair_outcome(&state.db, crash.id, &esito, &salute.describe()).await;
+        tracing::info!(
+            unit = %crash.unit, stato_diagnosi = ?scritto,
+            "service_recovery: diagnosi superata, il servizio soddisfa il contratto senza rimedi"
+        );
+        crate::project_workspace::logs::emit_problems_panel_refresh(project_id, vec![crash.id]);
+        return;
+    }
+
+    note_attempt(&state.db, crash.id).await;
+    let (verdict, facts) = restart_and_verify(&state, project_id, &crash.unit).await;
+    let esito = RepairOutcome::Judged {
+        verdict: verdict.clone(),
+        retry_left: !ultimo_tentativo,
+    };
+    let scritto = apply_repair_outcome(&state.db, crash.id, &esito, &facts.render()).await;
+    tracing::info!(
+        unit = %crash.unit, tentativo = crash.attempts + 1, verdetto = ?verdict,
+        stato_diagnosi = ?scritto,
+        "service_recovery: riparazione automatica tentata e verificata sul servizio"
+    );
+    announce_recovery(project_id, &crash.unit, &verdict, Some(crash.id));
 }
 
 /// Riporta a `open` le diagnosi di crash rimaste in `diagnosing` con il proprio
@@ -899,6 +1471,47 @@ pub(crate) async fn reap_interrupted_service_remediations(state: &AppState) {
     for (diag_id, project_id, run_id) in rows {
         reopen_if_remediation_dead(state, diag_id, project_id, run_id).await;
     }
+
+    // Il presidio deterministico non ha un run da interrogare: il suo lease e'
+    // tenuto da un task in memoria, e a un riavvio di mcp-core quel task muore
+    // come l'altro. Il criterio qui non e' un timeout scelto a occhio: e' l'AVVIO
+    // DI QUESTO PROCESSO. Un lease piu' vecchio non puo' appartenere a nessun
+    // task vivo, perche' i task vivi sono nati dopo.
+    let orfane = reopen_orphan_repair_leases(&state.db, state.boot_at.elapsed().as_secs() as i64)
+        .await;
+    if !orfane.is_empty() {
+        tracing::info!(
+            righe = orfane.len(),
+            "service_recovery: lease di riparazione orfani riaperti (mcp-core riavviato a rimedio in volo)"
+        );
+        crate::project_workspace::logs::emit_problems_panel_refresh_batch(&orfane);
+    }
+}
+
+/// Riapre le diagnosi leasate dal presidio deterministico (`diagnosing` SENZA
+/// run) il cui lease e' anteriore all'avvio di questo processo.
+///
+/// `open` e non `failed_remediation`, per la stessa ragione del gemello con run:
+/// il rimedio non ha fallito, e' stato INTERROTTO. E il tentativo non viene
+/// scontato — `remediation_attempts` era gia' stato incrementato solo se un
+/// riavvio era davvero partito.
+pub(crate) async fn reopen_orphan_repair_leases(
+    db: &sqlx::PgPool,
+    boot_elapsed_seconds: i64,
+) -> Vec<(Uuid, Uuid)> {
+    sqlx::query_as::<_, (Uuid, Uuid)>(
+        "UPDATE service_diagnoses SET status = $1, updated_at = NOW() \
+          WHERE signal_kind = 'crash' AND status = $2 \
+            AND triggered_run_id IS NULL \
+            AND updated_at < NOW() - make_interval(secs => $3) \
+          RETURNING project_id, id",
+    )
+    .bind(STATO_APERTA)
+    .bind(STATO_DIAGNOSING)
+    .bind(boot_elapsed_seconds as f64)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
 }
 
 /// Riapre UNA diagnosi se il run che la teneva in `diagnosing` non e' piu' vivo.
@@ -1024,7 +1637,7 @@ pub(crate) fn announce_recovery(
 // Cio' che invece si riusa davvero e' il principio (regola M): la decisione e'
 // lo STATUS, il corpo non entra mai nel giudizio. E il TCP di ripiego non e' un
 // secondo prober: e' il punto unico gia' esistente
-// `port_recovery::tcp_probe`, lo stesso che usa l'observer.
+// `port_recovery::port_listening`, lo stesso che usa l'observer.
 
 #[cfg(test)]
 mod tests {
@@ -1267,7 +1880,11 @@ mod tests {
             FASE_PRIMO_AVVIO,
             salute(ServiceState::Running, &[porta]).await,
         )]);
-        let scritto = apply_recovery_verdict(&pool, diagnosi, &verdetto, "evidenza dei fatti").await;
+        let esito = RepairOutcome::Judged {
+            verdict: verdetto,
+            retry_left: false,
+        };
+        let scritto = apply_repair_outcome(&pool, diagnosi, &esito, "evidenza dei fatti").await;
         assert_eq!(
             scritto.as_deref(),
             Some("failed_remediation"),
@@ -1317,8 +1934,14 @@ mod tests {
                 salute(ServiceState::Running, &[porta]).await,
             ),
         ]);
+        let esito = RepairOutcome::Judged {
+            verdict: verdetto,
+            retry_left: false,
+        };
         assert_eq!(
-            apply_recovery_verdict(&pool, diagnosi, &verdetto, "evidenza").await.as_deref(),
+            apply_repair_outcome(&pool, diagnosi, &esito, "evidenza")
+                .await
+                .as_deref(),
             Some("resolved")
         );
         let resolved_at: Option<chrono::DateTime<chrono::Utc>> =
@@ -1343,6 +1966,330 @@ mod tests {
         assert!(
             appena_nato.is_conforming() && !appena_nato.meets_contract(),
             "vivo nell'istante dello spawn e' esattamente cio' che NON basta"
+        );
+    }
+
+    // ── Presa in carico ──────────────────────────────────────────────────────
+
+    /// Semina una diagnosi di crash come la scrive l'observer.
+    async fn semina_crash(
+        pool: &sqlx::PgPool,
+        project: Uuid,
+        unit: &str,
+        status: &str,
+        attempts: i32,
+        cooldown_secs: Option<i64>,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO service_diagnoses \
+                (project_id, unit, signal_kind, metric, status, detail, \
+                 remediation_attempts, cooldown_until) \
+             VALUES ($1, $2, 'crash', 'service_failed', $3, 'servizio non operativo', $4, \
+                     CASE WHEN $5::bigint IS NULL THEN NULL \
+                          ELSE NOW() + make_interval(secs => $5::bigint) END) \
+             RETURNING id",
+        )
+        .bind(project)
+        .bind(unit)
+        .bind(status)
+        .bind(attempts)
+        .bind(cooldown_secs)
+        .fetch_one(pool)
+        .await
+        .expect("seed crash")
+    }
+
+    async fn stato_di(pool: &sqlx::PgPool, id: Uuid) -> (String, Option<String>, i32) {
+        sqlx::query_as("SELECT status, detail, remediation_attempts FROM service_diagnoses WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("rilettura diagnosi")
+    }
+
+    /// La regola, nuda: finiti i tentativi non si riavvia piu'. E' il freno che
+    /// impedisce al presidio di diventare un riavviatore perpetuo di un servizio
+    /// che non puo' partire.
+    ///
+    /// MUTAZIONE: togliendo il confronto sui tentativi (`repair_decision` che
+    /// ritorna sempre `Attend` a presidio acceso) rosseggia la terza asserzione,
+    /// col valore del difetto reale — un servizio riavviato all'infinito.
+    #[test]
+    fn il_presidio_smette_di_riavviare_quando_i_tentativi_sono_finiti() {
+        assert_eq!(repair_decision(false, 0, 3), RepairDecision::Disabled);
+        assert_eq!(repair_decision(true, 0, 3), RepairDecision::Attend);
+        assert_eq!(repair_decision(true, 2, 3), RepairDecision::Attend);
+        assert_eq!(
+            repair_decision(true, 3, 3),
+            RepairDecision::AttemptsExhausted
+        );
+    }
+
+    /// Cosa si prende in carico e cosa no. `diagnosing` in particolare NON si
+    /// tocca: e' una riga che qualcun altro sta gia' verificando, e prenderla
+    /// significherebbe riavviargli il servizio sotto i piedi.
+    ///
+    /// MUTAZIONE: allargando la selezione a `status IN ('open','diagnosing')` —
+    /// la forma che aveva `resolve_open_crashes` prima del fix del 28/07 —
+    /// rosseggia il conteggio, con due righe invece di una.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn si_prende_in_carico_solo_cio_che_e_aperto_e_fuori_cooldown(pool: sqlx::PgPool) {
+        let (_user, project) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let attesa = semina_crash(&pool, project, "app-backend.service", "open", 0, None).await;
+        semina_crash(&pool, project, "app-in-cooldown.service", "open", 1, Some(600)).await;
+        semina_crash(&pool, project, "app-in-corso.service", "diagnosing", 1, None).await;
+        semina_crash(&pool, project, "app-chiusa.service", "resolved", 0, None).await;
+        semina_crash(
+            &pool,
+            project,
+            "app-terminale.service",
+            "failed_remediation",
+            3,
+            None,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO service_diagnoses (project_id, unit, signal_kind, metric, status) \
+             VALUES ($1, 'app-backend.service', 'anomaly', 'down', 'open')",
+        )
+        .bind(project)
+        .execute(&pool)
+        .await
+        .expect("seed anomalia");
+
+        let pendenti = pending_service_crashes(&pool, project, 10, 1800).await;
+        assert_eq!(
+            pendenti.len(),
+            1,
+            "una sola riga e' presidiabile: {pendenti:?}"
+        );
+        assert_eq!(pendenti[0].id, attesa);
+        assert_eq!(pendenti[0].unit, "app-backend.service");
+        assert_eq!(pendenti[0].attempts, 0);
+    }
+
+    /// Il lease e' cio' che rende innocuo un ciclo che si accavalla con un
+    /// altro: la seconda presa in carico della stessa riga non avviene.
+    ///
+    /// MUTAZIONE: togliendo `AND status = 'open'` dalla UPDATE del lease,
+    /// entrambe le chiamate ritornano `true` e due task riavvierebbero lo stesso
+    /// servizio insieme — rosseggia la seconda asserzione.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn due_cicli_non_possono_prendere_la_stessa_diagnosi(pool: sqlx::PgPool) {
+        let (_user, project) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let id = semina_crash(&pool, project, "app-backend.service", "open", 0, None).await;
+
+        assert!(
+            lease_for_repair(&pool, id, 600).await,
+            "la prima presa in carico riesce"
+        );
+        assert!(
+            !lease_for_repair(&pool, id, 600).await,
+            "la seconda non trova piu' una riga aperta: qualcun altro l'ha presa"
+        );
+
+        let (status, _, attempts) = stato_di(&pool, id).await;
+        assert_eq!(status, "diagnosing");
+        assert_eq!(
+            attempts, 0,
+            "prendere in carico non e' tentare: il tentativo si conta quando si riavvia"
+        );
+        // Il cooldown del prossimo tentativo e' gia' scritto: la riga, tornando
+        // aperta, non viene ripresa dal ciclo successivo di quindici secondi.
+        assert!(
+            pending_service_crashes(&pool, project, 10, 1800)
+                .await
+                .is_empty(),
+            "in carico e in cooldown: nessuno la ripresenta"
+        );
+    }
+
+    /// Una diagnosi appena aperta NON e' ancora ammissibile al ripiego
+    /// deterministico: l'AI non ha ancora avuto la sua occasione, e finche' la
+    /// soglia non e' trascorsa il presidio deve limitarsi a ritentare il
+    /// trigger esistente (vedi retry_ai_trigger), mai riavviare da solo.
+    /// Trascorsa la soglia, senza che l'AI sia mai partita, diventa ammissibile.
+    ///
+    /// MUTAZIONE: togliendo il confronto sull'eta' (`fallback_eligible` sempre
+    /// `true`) rosseggia la prima asserzione — e il difetto sarebbe la corsa
+    /// gia' trovata in review: il riavvio deterministico precederebbe l'AI su
+    /// ogni crash nuovo.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn una_diagnosi_appena_aperta_attende_i_ritentativi_ai_prima_del_ripiego(
+        pool: sqlx::PgPool,
+    ) {
+        let (_user, project) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let id = semina_crash(&pool, project, "app-backend.service", "open", 0, None).await;
+
+        let pendenti = pending_service_crashes(&pool, project, 10, 1800).await;
+        assert_eq!(pendenti.len(), 1);
+        assert!(
+            !pendenti[0].fallback_eligible,
+            "appena aperta: l'AI non ha ancora avuto la sua occasione"
+        );
+
+        sqlx::query("UPDATE service_diagnoses SET ts = NOW() - INTERVAL '1 hour' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("invecchia la diagnosi");
+        let pendenti = pending_service_crashes(&pool, project, 10, 1800).await;
+        assert!(
+            pendenti[0].fallback_eligible,
+            "trascorsa la soglia senza che l'AI sia mai partita: ammissibile al ripiego"
+        );
+    }
+
+    /// Una diagnosi che l'AI ha GIA' preso in carico (`triggered_run_id`
+    /// valorizzato) e che poi torna `open` — l'unico modo e' un'interruzione
+    /// da riavvio di mcp-core, vedi `reopen_orphan_repair_leases` — e'
+    /// ammissibile al ripiego SUBITO, senza aspettare la soglia d'eta': l'AI
+    /// ha gia' avuto il suo turno, non ha senso ritentare lo stesso trigger
+    /// all'infinito su un run che non concludera' mai.
+    ///
+    /// MUTAZIONE: togliendo `triggered_run_id IS NOT NULL` dalla condizione SQL
+    /// rosseggia l'asserzione, con `fallback_eligible = false` nonostante l'AI
+    /// abbia gia' un run per questa diagnosi.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn una_diagnosi_gia_affidata_all_ai_e_poi_riaperta_e_subito_ammissibile(
+        pool: sqlx::PgPool,
+    ) {
+        let (_user, project) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let id = semina_crash(&pool, project, "app-backend.service", "open", 0, None).await;
+        sqlx::query("UPDATE service_diagnoses SET triggered_run_id = $2 WHERE id = $1")
+            .bind(id)
+            .bind(Uuid::new_v4())
+            .execute(&pool)
+            .await
+            .expect("simula un run AI interrotto e poi riaperto");
+
+        let pendenti = pending_service_crashes(&pool, project, 10, 1800).await;
+        assert_eq!(pendenti.len(), 1);
+        assert!(
+            pendenti[0].fallback_eligible,
+            "l'AI ha gia' avuto un run per questa diagnosi: si passa al ripiego, non si ritenta all'infinito"
+        );
+    }
+
+    /// Un tentativo che non ripara, quando ne restano altri, NON e' terminale:
+    /// la riga torna visibile e disponibile, con scritto cosa non ha funzionato.
+    ///
+    /// MUTAZIONE: facendo scrivere `failed_remediation` anche al ramo con
+    /// tentativi residui (cioe' ignorando `retry_left`) rosseggia la prima
+    /// asserzione — e il difetto sarebbe reale: un intoppo transitorio
+    /// chiuderebbe la riga per sempre al primo colpo, che e' la stessa forma di
+    /// difetto che questo lavoro toglie a monte.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn un_tentativo_fallito_con_altri_a_disposizione_torna_visibile(pool: sqlx::PgPool) {
+        let (_user, project) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let id = semina_crash(&pool, project, "app-backend.service", "open", 0, None).await;
+        assert!(lease_for_repair(&pool, id, 600).await);
+        note_attempt(&pool, id).await;
+
+        // Il servizio e' vivo ma la porta che il registro gli assegna e' muta:
+        // verdetto dal giudice vero, su una prova fatta dal produttore vero.
+        let porta = porta_muta().await;
+        let verdetto = judge_recovery(&[fase(
+            FASE_PRIMO_AVVIO,
+            salute(ServiceState::Running, &[porta]).await,
+        )]);
+        let esito = RepairOutcome::Judged {
+            verdict: verdetto,
+            retry_left: true,
+        };
+        assert_eq!(
+            apply_repair_outcome(&pool, id, &esito, "fatti").await.as_deref(),
+            Some("open"),
+            "restano tentativi: la diagnosi torna aperta, non chiusa in fallimento"
+        );
+
+        let (status, detail, attempts) = stato_di(&pool, id).await;
+        assert_eq!(status, "open");
+        assert_eq!(attempts, 1, "il tentativo eseguito e' contato");
+        let detail = detail.unwrap_or_default();
+        assert!(
+            detail.contains(&porta.to_string()),
+            "il tentativo lascia detto cosa non ha risposto: {detail}"
+        );
+
+        // Al giro dopo la riga NON viene ripresa subito: il cooldown scritto dal
+        // lease spazia i tentativi.
+        assert!(pending_service_crashes(&pool, project, 10, 1800)
+            .await
+            .is_empty());
+    }
+
+    /// IL FALSO POSITIVO del mandato: il servizio risponde, la diagnosi e'
+    /// rimasta indietro. Si chiude su cio' che si e' MISURATO — quale porta ha
+    /// risposto e come — e senza riavviare niente.
+    ///
+    /// MUTAZIONE: facendo chiudere la riga senza passare dal contratto (cioe'
+    /// scrivendo `resolved` perche' il ciclo e' passato di nuovo) il detail non
+    /// nomina piu' alcuna porta e rosseggia l'ultima asserzione: resterebbe una
+    /// chiusura non verificabile a posteriori, che e' esattamente il segnale
+    /// debole che mig 0654 ha tolto.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn una_diagnosi_superata_si_chiude_su_cio_che_ha_risposto(pool: sqlx::PgPool) {
+        let (_user, project) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let id = semina_crash(&pool, project, "app-backend.service", "open", 0, None).await;
+        assert!(lease_for_repair(&pool, id, 600).await);
+
+        // La salute viene dai produttori veri: stato + `probe_port` su un
+        // listener che risponde davvero, durata da `stable_enough`.
+        let porta = servizio_vivo_su_porta_effimera(STATUS_200).await;
+        let salute = salute(ServiceState::Running, &[porta]).await;
+        assert!(
+            salute.meets_contract(),
+            "premessa del caso: il servizio soddisfa il contratto"
+        );
+
+        let scritto = apply_repair_outcome(&pool, id, &RepairOutcome::NotNeeded, &salute.describe())
+            .await;
+        assert_eq!(scritto.as_deref(), Some("resolved"));
+
+        let (_, detail, attempts) = stato_di(&pool, id).await;
+        assert_eq!(
+            attempts, 0,
+            "non si e' riparato niente: nessun tentativo consumato"
+        );
+        let detail = detail.unwrap_or_default();
+        assert!(
+            detail.contains(&porta.to_string()) && detail.contains("200"),
+            "la chiusura porta con se' la prova che l'ha decisa: {detail}"
+        );
+    }
+
+    /// Il presidio vive in un task in memoria: a mcp-core riavviato, un lease
+    /// piu' vecchio dell'avvio non puo' appartenere a nessun task vivo e la
+    /// diagnosi va rimessa in circolo. Un lease piu' recente e' di questo
+    /// processo e non si tocca.
+    ///
+    /// MUTAZIONE: rimuovendo il confronto sull'avvio (riaprendo qualunque
+    /// `diagnosing` senza run) rosseggia la seconda asserzione, e il difetto
+    /// sarebbe una riga strappata a un rimedio in corso.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn un_lease_anteriore_all_avvio_del_processo_viene_riaperto(pool: sqlx::PgPool) {
+        let (_user, project) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let vecchia = semina_crash(&pool, project, "app-vecchia.service", "open", 1, None).await;
+        let recente = semina_crash(&pool, project, "app-recente.service", "open", 0, None).await;
+        assert!(lease_for_repair(&pool, vecchia, 600).await);
+        assert!(lease_for_repair(&pool, recente, 600).await);
+        // Il lease della prima e' anteriore all'avvio di questo processo.
+        sqlx::query("UPDATE service_diagnoses SET updated_at = NOW() - INTERVAL '10 minutes' WHERE id = $1")
+            .bind(vecchia)
+            .execute(&pool)
+            .await
+            .expect("invecchia il lease");
+
+        // Processo avviato 60 secondi fa: tutto cio' che e' stato leasato prima
+        // e' orfano per costruzione.
+        let riaperte = reopen_orphan_repair_leases(&pool, 60).await;
+        assert_eq!(riaperte, vec![(project, vecchia)]);
+        assert_eq!(stato_di(&pool, vecchia).await.0, "open");
+        assert_eq!(
+            stato_di(&pool, recente).await.0,
+            "diagnosing",
+            "il lease di questo processo ha ancora il suo task: non si tocca"
         );
     }
 

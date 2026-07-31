@@ -12,8 +12,9 @@
 //!
 //! Regole: G (tutte le soglie in settings, lette a ogni ciclo), E (solo unit
 //! `{slug}-` e PID del progetto), L (metriche via `process_util` cross-platform,
-//! readiness via `tcp_probe`, enumerazione Windows via `list_services_windows`;
-//! un solo loop per 3 capacita'), M (lo STATO del servizio si legge da segnali
+//! readiness via `port_recovery::listening_ports`, enumerazione Windows via
+//! `list_services_windows`; un solo loop per 3 capacita'), M (lo STATO del
+//! servizio si legge da segnali
 //! strutturati -- process_alive + exit_code/status di `agent_processes` su
 //! Windows, `is-active` su Linux -- mai dal parsing della prosa dei log: i log
 //! servono solo a error_rate e alla diagnosi).
@@ -1508,15 +1509,22 @@ async fn detect_structural_failure(
     register_structural_problem(ctx, unit, problem).await;
 }
 
-/// Vero se almeno una delle porte attese e' in ascolto (probe TCP con timeout
-/// breve). Estratto da `run_cycle` per early-return leggibile.
+/// Vero se almeno una delle porte attese e' in ascolto. Estratto da
+/// `run_cycle` per early-return leggibile.
+///
+/// Un solo interrogo del SO (`listening_ports`, punto unico regola L) per
+/// TUTTE le porte, invece di N connect mirati uno per porta: oltre a evitare
+/// N scansioni ridondanti della tabella TCP, copre entrambe le famiglie di
+/// indirizzo — un vecchio `tcp_probe` per porta (connect al solo
+/// `127.0.0.1`) dichiarava mute le porte in LISTEN solo su `[::1]`.
 async fn any_port_listening(ports: &[u16]) -> bool {
-    for p in ports {
-        if crate::project_workspace::port_recovery::tcp_probe(*p, 400).await {
-            return true;
-        }
+    if ports.is_empty() {
+        return false;
     }
-    false
+    let listening = crate::project_workspace::port_recovery::listening_ports().await;
+    ports
+        .iter()
+        .any(|p| listening.iter().any(|(lp, _, _)| lp == p))
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
@@ -1665,6 +1673,26 @@ async fn run_cycle(
         for sample in services {
             process_sample(&ctx, states, now_ts, sample).await;
         }
+
+        // ── PRESA IN CARICO delle diagnosi aperte (regola L: il criterio e la
+        // scrittura dell'esito vivono in `service_recovery`, qui c'e' solo il
+        // battito che le interroga, coi parametri del trigger AI gia'
+        // caricati sopra). Rilevare non ha mai riparato nulla: fino a qui
+        // l'unica strada verso un rimedio era lo spawn dell'AI, interrogato
+        // UNA volta al momento della rilevazione, e ogni rinvio lo consumava
+        // per sempre — tre diagnosi aperte per sette ore con zero tentativi
+        // (bacheca-attivita, 30-31/07/2026). Da qui la domanda si ripone a ogni
+        // ciclo: si ritenta lo STESSO trigger (nessuna logica duplicata), e
+        // solo una diagnosi rimasta bloccata a lungo senza che l'AI sia mai
+        // partita ricade su un riavvio deterministico di ripiego.
+        crate::project_workspace::service_recovery::process_open_service_crashes(
+            state,
+            project_id,
+            cfg.auto_diagnose_enabled,
+            cfg.diagnose_cooldown_seconds,
+            cfg.diagnose_max_per_hour,
+        )
+        .await;
 
         // ── Sweep: anomalie e crash di unit non piu' osservati (rinominati/
         // rimossi). Le richiude qui perche' il resolve per-unit non le

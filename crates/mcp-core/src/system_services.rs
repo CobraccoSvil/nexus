@@ -34,7 +34,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
-use crate::project_workspace::port_recovery::tcp_probe;
+use crate::project_workspace::port_recovery::port_listening;
 use crate::AppState;
 
 // Forma delle voci e lettura del catalogo: punto unico in `nexus-service-catalog`
@@ -45,9 +45,6 @@ pub(crate) use nexus_service_catalog::{resolve_port, CatalogEntry};
 
 /// Servizio che ospita questo processo: si controlla in modalita' detached.
 const SELF_SERVICE_NAME: &str = "mcp-core";
-
-/// Timeout del TCP probe per servizio (allineato al services_watchdog).
-const PROBE_TIMEOUT_MS: u64 = 1_500;
 
 /// Carica il catalogo delegando al punto unico, riportando l'esito come lista.
 ///
@@ -102,7 +99,7 @@ pub(crate) struct ServiceStatus {
 async fn probe_entry(db: &PgPool, entry: &CatalogEntry) -> ServiceStatus {
     let port = resolve_port(db, entry).await;
     let alive = match port {
-        Some(p) => tcp_probe(p, PROBE_TIMEOUT_MS).await,
+        Some(p) => port_listening(p).await,
         None => false,
     };
     let (state, sub_state) = derive_state(port, alive);

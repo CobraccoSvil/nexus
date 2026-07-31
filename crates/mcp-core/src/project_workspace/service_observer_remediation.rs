@@ -343,10 +343,18 @@ fn spawn_verifica_esito(
         .await;
         match diag_id {
             Some(id) => {
-                let scritto = crate::project_workspace::service_recovery::apply_recovery_verdict(
+                // `retry_left: false`: qui l'AI ha gia' lavorato sul problema e il
+                // contratto non e' soddisfatto lo stesso. Un altro giro identico
+                // non aggiunge niente — la riga va in stato terminale con
+                // l'evidenza, che e' cio' che un umano deve vedere.
+                let esito = crate::project_workspace::service_recovery::RepairOutcome::Judged {
+                    verdict: verdict.clone(),
+                    retry_left: false,
+                };
+                let scritto = crate::project_workspace::service_recovery::apply_repair_outcome(
                     &state.db,
                     id,
-                    &verdict,
+                    &esito,
                     &facts.render(),
                 )
                 .await;

@@ -264,7 +264,7 @@ const INTERVALLO_PROBE_MS: u64 = 400;
 async fn attende_ascolto(port: u16) -> bool {
     let scaduto_dopo = tokio::time::Instant::now() + std::time::Duration::from_millis(ATTESA_ASCOLTO_MS);
     loop {
-        if crate::project_workspace::port_recovery::tcp_probe(port, INTERVALLO_PROBE_MS).await {
+        if crate::project_workspace::port_recovery::port_listening(port).await {
             return true;
         }
         if tokio::time::Instant::now() >= scaduto_dopo {
