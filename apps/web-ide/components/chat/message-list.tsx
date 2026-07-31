@@ -19,6 +19,7 @@ import { ActivityCostFooter } from "./activity-cost-footer";
 import { ActivityHistoryRow } from "./activity-history-row";
 import { InlineTruncated, formatStepInput } from "./step-detail";
 import { usageBadgeView } from "./usage-badge-logic";
+import { runStatusBadgeSource } from "./run-status-display-logic";
 import { useResolvedRunSteps } from "../../lib/use-chat/use-run-steps";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
@@ -1463,15 +1464,19 @@ export function MessageList({
             {/* Badge di stato del turno (persistente, dal run canonico): rende
                 esplicito com'e' finito il run e demarca la fine del turno.
                 Per i turni STORICI compatti (flag ON, non l'ultimo run) lo stato
-                e' gia' nel badge della riga storica: lo nascondo per non
-                duplicarlo. Con flag OFF o sull'ultimo turno resta invariato. */}
+                e' gia' nella riga storica (ActivityHistoryRow, sotto): lo
+                nascondo qui per non duplicarlo. Con flag OFF o sull'ultimo
+                turno resta invariato. Decisione delegata al punto unico
+                runStatusBadgeSource (regola L): la stessa funzione decide se
+                la riga storica va resa, quindi le due sorgenti non possono
+                divergere (mai entrambe assenti, mai entrambe duplicate). */}
             {!isUser &&
               message.runStatus &&
-              !(
-                activityStreamEnabled &&
-                message.runId &&
-                message.id !== lastAssistantRunMessageId
-              ) && (
+              runStatusBadgeSource({
+                activityStreamEnabled,
+                hasRunId: Boolean(message.runId),
+                isLastAssistantRun: message.id === lastAssistantRunMessageId,
+              }) === "persistent-badge" && (
                 <div style={{ marginTop: 6 }}>
                   <RunStatusBadge status={message.runStatus} tc={tc} />
                 </div>
@@ -1542,9 +1547,20 @@ export function MessageList({
               const runSteps = agentStepsMap?.get(runId) ?? [];
               const runTraces = traces ? tracesForRun(traces, runId) : [];
               const hasRunData = runMeta.length > 0 || runSteps.length > 0 || runTraces.length > 0;
-              if (!hasRunData) return null;
               const isLastAssistantRun = message.id === lastAssistantRunMessageId;
-              if (isLastAssistantRun) {
+              // Stessa funzione, stesso punto unico, del badge persistente
+              // qui sopra: garantisce che le due decisioni non divergano mai.
+              const source = runStatusBadgeSource({
+                activityStreamEnabled,
+                hasRunId: true,
+                isLastAssistantRun,
+              });
+              if (source === "persistent-badge") {
+                // Il nastro ESPANSO vive di dati live/di sessione (meta/step/
+                // trace): senza, non c'e' nulla da narrare qui. Lo stato resta
+                // comunque visibile: per l'ultimo turno RunStatusBadge (sopra)
+                // non viene MAI soppresso.
+                if (!hasRunData) return null;
                 return (
                   <MessageActivityStream
                     runId={runId}
@@ -1556,6 +1572,25 @@ export function MessageList({
                   />
                 );
               }
+              // Turno storico (non ultimo): la riga compatta va resa SEMPRE,
+              // indipendentemente da hasRunData. Badge/trail/costo vengono dai
+              // campi PERSISTITI del messaggio (runStatus/totalTokens/
+              // totalCost, regola M), non dal nastro dettagliato -
+              // ActivityHistoryRow degrada da solo quando il nastro e' vuoto
+              // (nasconde solo l'espansione, non l'intestazione).
+              //
+              // PRIMA, un `hasRunData=false` (run chiuso un istante prima che
+              // ne partisse un altro: metaStepsMap/agentStepsMap non ancora
+              // popolate per QUESTO runId, o traces evitte dal cap di sessione)
+              // faceva sparire l'INTERO blocco qui sotto. Siccome per i turni
+              // non ultimi RunStatusBadge e' soppresso apposta (per non
+              // duplicare la riga storica), il turno restava SENZA alcun
+              // indicatore di stato: solo il pie' di costo (badge "usage",
+              // blocco indipendente piu' sotto, sempre reso da
+              // message.totalTokens) senza dire com'e' finito. Misurato
+              // 31/07/2026, progetto bacheca-attivita, run 51fe77ce
+              // (failed_diagnosed): badge di stato assente, footer costo
+              // presente.
               return (
                 <div style={{ marginTop: 6 }}>
                   <ActivityHistoryRow
