@@ -38,6 +38,36 @@
 # copre anche i gate che verranno aggiunti con altri glob.
 set -euo pipefail
 
+# Rete di sicurezza indipendente contro la trappola documentata di git
+# (git-worktree(1), ENVIRONMENT VARIABLES): "If GIT_DIR is set but GIT_WORK_TREE
+# is not, the current working directory is regarded as the top level of your
+# working tree." Per l'hook di un worktree collegato, git imposta SEMPRE GIT_DIR
+# prima di invocare l'hook; .lefthookrc (sourced prima che lefthook parta) fissa
+# SEMPRE GIT_WORK_TREE per chiudere quella trappola per l'intera catena a valle
+# (vedi commento li'). Se arriviamo qui con GIT_DIR presente e GIT_WORK_TREE
+# assente, quel fix e' stato bypassato o rotto: qualunque comando 'git' a valle
+# (compreso questo stesso script, un gate futuro, o un comando diagnostico)
+# rischia di mescolare l'indice di un albero coi file fisici di un altro.
+# Riprodotto e verificato (regola O): con questa combinazione uno script che fa
+# 'git -C <altro-albero> status' mostra centinaia di file fantasma e puo'
+# arrivare a scrivere nell'indice dell'altro repository.
+if [ -n "${GIT_DIR:-}" ] && [ -z "${GIT_WORK_TREE:-}" ]; then
+  echo "pre-commit: GIT_DIR e' nell'ambiente ma GIT_WORK_TREE no." >&2
+  echo "" >&2
+  echo "  GIT_DIR: $GIT_DIR" >&2
+  echo "" >&2
+  echo "Questa combinazione fa si' che qualunque comando 'git' con una CWD" >&2
+  echo "diversa dal worktree tratti quella CWD come work-tree, mescolando" >&2
+  echo "l'indice di un albero coi file fisici di un altro (git-worktree(1))." >&2
+  echo ".lefthookrc dovrebbe gia' fissare GIT_WORK_TREE prima di questo punto:" >&2
+  echo "verifica che non sia stato rimosso, bypassato, o che LEFTHOOK_BIN non" >&2
+  echo "provenga da un'invocazione che salta il source di .lefthookrc." >&2
+  echo "" >&2
+  echo "Operazione git RIFIUTATA." >&2
+  echo "Bypass volontario, solo emergenza: LEFTHOOK=0 git commit ..." >&2
+  exit 1
+fi
+
 # Normalizzatore unico: gli stessi due path scritti in due modi (separatori,
 # 8.3, case del drive) sarebbero una divergenza inventata. Una sola forma.
 _normalizza() {

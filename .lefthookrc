@@ -25,6 +25,35 @@
 # Bypass di emergenza: LEFTHOOK=0, valutato dall'hook prima di questo file. Resta esplicito
 # e volontario, quindi non e' un falso verde.
 
+# Blinda contro una trappola documentata di git (git-worktree(1), sezione ENVIRONMENT
+# VARIABLES): "If GIT_DIR is set but GIT_WORK_TREE is not, the current working directory
+# is regarded as the top level of your working tree." Per l'hook di un worktree collegato,
+# git imposta SEMPRE GIT_DIR (all'admin-dir del worktree, es. .git/worktrees/<nome>) prima
+# di invocare l'hook, ma NON imposta GIT_WORK_TREE. Se un qualunque comando 'git' piu' a
+# valle in questa catena (lefthook stesso, uno dei suoi comandi 'run: bash scripts/*.sh',
+# o uno script diagnostico aggiunto in futuro) viene eseguito con una CWD diversa dal
+# worktree -- '-C <altro-path>', un 'cd' interno, o una risoluzione di percorso sbagliata
+# -- quella CWD diventa il work-tree effettivo mentre GIT_DIR (ereditata) continua a
+# puntare all'indice/storia del worktree: un mix che legge/scrive file fisici nell'ALTRO
+# repository usando l'indice del worktree. Riprodotto e verificato (regola O): uno script
+# di misura che eredita GIT_DIR dal processo dell'hook ed esegue 'git -C /altro/path status'
+# mostra centinaia di file fantasma "modificati" e puo' arrivare a scrivere un file
+# nell'indice dell'altro repository -- lo stesso sintomo osservabile con qualunque comando
+# che cada nella stessa trappola. Fissare GIT_WORK_TREE qui, ESPLICITAMENTE e PRIMA di
+# 'call_lefthook', chiude la trappola per l'intera catena: con GIT_WORK_TREE gia' nota,
+# nessun comando puo' piu' dedurla dalla propria CWD, quale che sia. Nel repo principale
+# (non-worktree) il valore risolto coincide con quello che git userebbe comunque di
+# default, quindi il fix e' un no-op li' -- non introduce comportamento nuovo, chiude solo
+# il caso ambiguo.
+if [ -z "${GIT_WORK_TREE:-}" ]; then
+  _lh_toplevel="$(git rev-parse --show-toplevel 2>/dev/null)"
+  if [ -n "$_lh_toplevel" ]; then
+    GIT_WORK_TREE="$_lh_toplevel"
+    export GIT_WORK_TREE
+  fi
+  unset _lh_toplevel
+fi
+
 if [ -z "$LEFTHOOK_BIN" ]; then
   # uname in Git Bash restituisce 'mingw64_nt-10.0-26200', non 'windows': senza questa
   # normalizzazione il nome del pacchetto per-piattaforma non matcha mai su Windows.
