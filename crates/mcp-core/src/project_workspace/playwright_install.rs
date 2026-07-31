@@ -334,6 +334,11 @@ export default defineConfig({{
   projects: [
     {{ name: 'chromium', use: {{ ...devices['Desktop Chrome'] }} }},
   ],
+  // webServer assente per scelta: il servizio dev lo gestisce Nexus (pannello
+  // Servizi / nexus_port_allocations), non Playwright. Il pulsante chat
+  // "Abilita Playwright" (apps/web-ide/lib/chat-prompts.ts::promptEnablePlaywright)
+  // detta lo stesso config per il canale di installazione via agente: se questa
+  // filosofia cambia, allineare anche li'.
   webServer: undefined,
 }});
 "#,
