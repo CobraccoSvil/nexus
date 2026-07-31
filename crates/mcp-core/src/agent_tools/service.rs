@@ -190,7 +190,7 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
     if let Some(kind_hint) = derive_kind_hint(
         &command,
         &label,
-        scope_dir(&ctx.root_path, &work_dir).as_deref(),
+        scope_dir(&ctx.root_path, &work_dir, &command).as_deref(),
     ) {
         if let Some(refuse_msg) = refuse_if_same_scope_active(ctx, kind_hint).await {
             return refuse_msg;
@@ -463,10 +463,11 @@ fn resolve_service_label(
         return ServiceIdentity::NonServizio;
     }
 
-    if let Some(hint) = derive_kind_hint(command, "", scope_dir(root, work_dir).as_deref()) {
+    if let Some(hint) = derive_kind_hint(command, "", scope_dir(root, work_dir, command).as_deref())
+    {
         return ServiceIdentity::Ruolo(hint.to_string());
     }
-    if let Some(dal_percorso) = identita_dal_percorso(root, work_dir) {
+    if let Some(dal_percorso) = identita_dal_percorso(root, work_dir, command) {
         return ServiceIdentity::Ruolo(dal_percorso);
     }
     // Nessun segnale di ruolo. Il comando dice se un servizio c'e' comunque:
@@ -497,8 +498,12 @@ fn resolve_service_label(
 /// Il vaglio "porta una parola propria" e' `is_generic_service_label` (punto
 /// unico del vocabolario label, regola L): una cartella `app/` o `server/` non
 /// identifica niente piu' di quanto facesse "Service".
-fn identita_dal_percorso(root: &std::path::Path, work_dir: &std::path::Path) -> Option<String> {
-    let sotto_radice = scope_dir(root, work_dir);
+fn identita_dal_percorso(
+    root: &std::path::Path,
+    work_dir: &std::path::Path,
+    command: &str,
+) -> Option<String> {
+    let sotto_radice = scope_dir(root, work_dir, command);
     let mut candidati: Vec<String> = sotto_radice
         .iter()
         .flat_map(|rel| rel.components())
@@ -547,7 +552,7 @@ async fn dedup_and_cleanup_ports(
     if let Some(kind_hint) = derive_kind_hint(
         command,
         label,
-        scope_dir(&ctx.root_path, work_dir).as_deref(),
+        scope_dir(&ctx.root_path, work_dir, command).as_deref(),
     ) {
         free_listening_scope_port(ctx, kind_hint).await;
     }
@@ -853,6 +858,9 @@ fn format_started_message(
 ///
 /// `scope_dir` e' la working directory RELATIVA alla radice del progetto (vedi
 /// [`scope_dir`]): il nome della cartella di progetto non e' un segnale di ruolo.
+/// Quella working directory il comando puo' dichiararla lui stesso (`cd frontend
+/// && npm run dev`), ed e' [`scope_dir`] a saperlo: qui il segnale arriva gia'
+/// risolto, quindi le due scritture non possono dare due ruoli diversi.
 fn derive_kind_hint(
     command: &str,
     label: &str,
@@ -915,6 +923,25 @@ fn scope_from_work_dir(scope_dir: Option<&std::path::Path>) -> Option<&'static s
 /// progetto descrive il progetto intero, e dedurne lo scopo classificherebbe come
 /// "frontend" anche il backend di un progetto chiamato `shop-frontend`.
 ///
+/// La cartella da cui il servizio gira e' dichiarata in DUE posti, e sono lo
+/// stesso dato scritto in due modi: il parametro `working_dir` del tool, e il
+/// `cd` in testa al comando (`cd frontend && npm run dev`). Il secondo non e'
+/// un'euristica sul nome: il comando viene eseguito con `bash -c` a partire da
+/// `working_dir` (vedi `spawn_agent_process`), quindi quel `cd` sposta davvero la
+/// directory in cui il servizio gira — dice il ruolo con la stessa autorita' del
+/// parametro. Finche' nessuno lo leggeva, un progetto avviato dalla radice con
+/// `cd frontend &&` non aveva nessun segnale di ruolo e finiva sull'ancoraggio
+/// `service-<uuid>`: nel pannello Servizi compariva una terza voce accanto a
+/// backend e frontend, per un'app che ne ha due (misurato il 30/07/2026,
+/// progetto bacheca-attivita).
+///
+/// La dichiarazione nel comando vale SE E SOLO SE indica una cartella reale
+/// dentro la radice; in ogni altro caso (`cd` verso l'esterno, verso una cartella
+/// inesistente, argomento che non e' un percorso letterale) si ricade sulla sola
+/// `working_dir`, cioe' sul comportamento precedente. Un `cd` fuori dalla radice
+/// non e' uno scope di questo progetto (regola E), e non deve nemmeno cancellare
+/// il ruolo che la working dir dichiarava.
+///
 /// La radice viene canonicalizzata come fa `resolve_relative_path`, che e' il
 /// produttore di `work_dir`: senza, su Windows il prefisso verbatim (`\\?\D:\...`)
 /// impedirebbe lo strip e la working directory non parlerebbe mai (regola O: la
@@ -922,16 +949,150 @@ fn scope_from_work_dir(scope_dir: Option<&std::path::Path>) -> Option<&'static s
 fn scope_dir(
     root: &std::path::Path,
     work_dir: &std::path::Path,
+    command: &str,
+) -> Option<std::path::PathBuf> {
+    let effettiva = directory_effettiva(root, work_dir, command);
+    relativa_alla_radice(root, &effettiva).filter(|rel| rel.components().next().is_some())
+}
+
+/// La cartella da cui il servizio gira DAVVERO: la working dir, spostata dal `cd`
+/// in testa al comando quando questo indica una cartella reale dentro la radice.
+///
+/// Le due condizioni non sono due casi previsti, sono un vaglio unico. Deve
+/// esistere, perche' e' la stessa pretesa che `resolve_relative_path` ha gia' sul
+/// parametro `working_dir`: le due scritture dello stesso dato entrano alle stesse
+/// condizioni. E deve stare dentro la radice, perche' fuori non c'e' niente che
+/// appartenga a questo progetto (regola E). Insieme rendono inutile qualunque
+/// elenco di forme da rifiutare (`cd $DIR`, `cd /d D:\x`, una redirezione dopo il
+/// percorso): un argomento che non nomina una cartella vera del progetto non passa
+/// il vaglio, senza che nessuno l'abbia dovuto prevedere.
+///
+/// Quando la dichiarazione non passa, si ricade sulla sola working dir: cioe' sul
+/// comportamento precedente al fix. Un `cd` verso l'esterno non e' uno scope, ma
+/// non deve nemmeno cancellare il ruolo che la working dir dichiarava.
+fn directory_effettiva(
+    root: &std::path::Path,
+    work_dir: &std::path::Path,
+    command: &str,
+) -> std::path::PathBuf {
+    let Some(rel) = cd_dichiarato(command) else {
+        return work_dir.to_path_buf();
+    };
+    let dichiarata = normalizza_percorso(&work_dir.join(rel));
+    if dichiarata.is_dir() && relativa_alla_radice(root, &dichiarata).is_some() {
+        dichiarata
+    } else {
+        work_dir.to_path_buf()
+    }
+}
+
+/// Percorso di `dir` relativo alla radice del progetto: vuoto per la radice
+/// stessa, `None` se `dir` le sta fuori. Punto unico della misura "dove sta questa
+/// cartella rispetto al progetto": il confine di appartenenza e la parte che parla
+/// del ruolo sono la stessa domanda, e due implementazioni potrebbero rispondere
+/// in modo diverso sullo stesso percorso.
+fn relativa_alla_radice(
+    root: &std::path::Path,
+    dir: &std::path::Path,
 ) -> Option<std::path::PathBuf> {
     let root_canonico = root
         .canonicalize()
         .unwrap_or_else(|_| root.to_path_buf());
-    work_dir
-        .strip_prefix(&root_canonico)
-        .or_else(|_| work_dir.strip_prefix(root))
+    dir.strip_prefix(&root_canonico)
+        .or_else(|_| dir.strip_prefix(root))
         .ok()
-        .filter(|rel| rel.components().next().is_some())
         .map(std::path::Path::to_path_buf)
+}
+
+/// Risolve `.` e `..` senza toccare il filesystem. Necessario e non sostituibile
+/// da `canonicalize`: su Windows un percorso col prefisso verbatim (`\\?\D:\...`,
+/// quello che `resolve_relative_path` produce) NON viene normalizzato dal SO, e
+/// `..` resterebbe un componente letterale che nessuna cartella ha.
+fn normalizza_percorso(p: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            altro => out.push(altro.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Separatori fra due comandi di shell, dal piu' lungo al piu' corto: `&&` non va
+/// letto come `&`, ne' `||` come `|`.
+const SEPARATORI_COMANDO: &[&str] = &["&&", "||", ";", "|", "&"];
+
+/// Directory che il comando dichiara con uno o piu' `cd` in testa, relativa alla
+/// working dir da cui il comando parte (assoluta se il `cd` lo era: `join` la
+/// sostituisce, ed e' il caso che [`directory_effettiva`] scartera' perche' fuori
+/// dalla radice). `None` se il comando non comincia con un `cd`.
+///
+/// Si leggono solo i `cd` INIZIALI: al primo comando che non lo e' ci si ferma,
+/// perche' da li' in poi si sta descrivendo cio' che il servizio fa, non da dove.
+fn cd_dichiarato(command: &str) -> Option<std::path::PathBuf> {
+    let mut resto = command;
+    let mut dichiarata: Option<std::path::PathBuf> = None;
+    loop {
+        let (primo, dopo) = spezza_al_separatore(resto);
+        let Some(arg) = argomento_cd(primo) else {
+            break;
+        };
+        dichiarata = Some(dichiarata.unwrap_or_default().join(arg));
+        match dopo {
+            Some(r) => resto = r,
+            None => break,
+        }
+    }
+    dichiarata
+}
+
+/// Primo comando della riga e cio' che resta dopo il separatore.
+fn spezza_al_separatore(riga: &str) -> (&str, Option<&str>) {
+    let mut primo_taglio: Option<(usize, usize)> = None;
+    for sep in SEPARATORI_COMANDO {
+        if let Some(i) = riga.find(sep) {
+            if primo_taglio.is_none_or(|(j, _)| i < j) {
+                primo_taglio = Some((i, sep.len()));
+            }
+        }
+    }
+    match primo_taglio {
+        Some((i, len)) => (&riga[..i], Some(&riga[i + len..])),
+        None => (riga, None),
+    }
+}
+
+/// Argomento di un `cd`, se questo comando e' un `cd`. `None` per tutto il resto,
+/// incluso `cd` nudo (che porta alla home, non a uno scope del progetto) e i
+/// comandi che cominciano per "cd" senza esserlo (`cdk deploy`).
+fn argomento_cd(comando: &str) -> Option<&str> {
+    let comando = comando.trim();
+    if !comando.get(..2)?.eq_ignore_ascii_case("cd") {
+        return None;
+    }
+    let arg = comando[2..]
+        .strip_prefix(char::is_whitespace)?
+        .trim();
+    if arg.is_empty() {
+        return None;
+    }
+    Some(sfila_apici(arg))
+}
+
+/// Toglie una coppia di apici o virgolette che racchiuda l'intero argomento
+/// (`cd "mia cartella"`), lasciando intatto tutto il resto.
+fn sfila_apici(arg: &str) -> &str {
+    for q in ['"', '\''] {
+        if let Some(interno) = arg.strip_prefix(q).and_then(|a| a.strip_suffix(q)) {
+            return interno;
+        }
+    }
+    arg
 }
 
 /// Risolve il working directory di un servizio dal parametro `working_dir`,
@@ -1719,24 +1880,147 @@ mod tests {
     #[test]
     fn lo_scopo_viene_dalle_cartelle_sotto_la_radice() {
         let root = Path::new("/progetti/shop-frontend");
-        let rel = |p: &str| scope_dir(root, &root.join(p));
+        let rel = |cmd: &str, p: &str| scope_dir(root, &root.join(p), cmd);
 
         assert_eq!(
-            derive_kind_hint("pnpm serve", "", rel("apps/web").as_deref()),
+            derive_kind_hint("pnpm serve", "", rel("pnpm serve", "apps/web").as_deref()),
             Some("frontend")
         );
         assert_eq!(
-            derive_kind_hint("yarn start", "", rel("services/api").as_deref()),
+            derive_kind_hint("yarn start", "", rel("yarn start", "services/api").as_deref()),
             Some("backend")
         );
         // Working dir sulla radice: nessun ruolo, il nome del progetto non conta.
-        assert_eq!(scope_dir(root, root), None);
+        assert_eq!(scope_dir(root, root, "npm start"), None);
         assert_eq!(derive_kind_hint("npm start", "", None), None);
         // Il comando resta il segnale piu' specifico quando parla.
         assert_eq!(
-            derive_kind_hint("vite --host", "", rel("services/api").as_deref()),
+            derive_kind_hint("vite --host", "", rel("vite --host", "services/api").as_deref()),
             Some("frontend")
         );
+    }
+
+    /// REGRESSIONE (misurata il 30-31/07/2026, progetto bacheca-attivita): il
+    /// pannello Servizi mostrava TRE voci — backend, frontend e un
+    /// `service-66f4bf72` — per un'app che ne ha due. Nasceva dai due comandi
+    /// lanciati DALLA RADICE col `cd` dentro di se': `scope_dir` era vuoto, `npm
+    /// run dev`/`npm start` non nominano nessuna tecnologia, quindi nessun segnale
+    /// diceva il ruolo e l'identita' ripiegava sull'ancoraggio all'uuid — lo stesso
+    /// per entrambi, che e' il motivo per cui le due righe collassavano in una
+    /// terza voce sola.
+    ///
+    /// Il segnale c'era, scritto in un altro posto: `cd frontend &&` non e' un nome
+    /// da cui indovinare, e' la dichiarazione della cartella in cui il comando
+    /// gira — `spawn_agent_process` lo esegue con `bash -c` a partire dalla working
+    /// dir, quindi quel `cd` sposta davvero il servizio.
+    ///
+    /// Mutazione che rende rosso: far ritornare `None` a `cd_dichiarato` (cioe'
+    /// tornare a leggere la sola `working_dir`) -> entrambe le label tornano
+    /// `service-1a2b3c4d`, il valore reale del difetto, e l'unit torna a essere la
+    /// voce fantasma vista nel pannello.
+    #[test]
+    fn il_cd_in_testa_al_comando_dichiara_il_ruolo_come_la_working_dir() {
+        let (_tmp, root) = progetto("bacheca-attivita", &["frontend", "backend"]);
+
+        let input = json!({ "command": "cd frontend && npm run dev" });
+        let (label, unit, kind) = identita("bacheca-attivita", &root, &input, "service");
+        assert_eq!(label, "frontend", "il cd dichiara la cartella, la cartella il ruolo");
+        assert_eq!(unit, "bacheca-attivita-frontend.service");
+        assert_eq!(kind, "service");
+
+        let input = json!({ "command": "cd backend && npm start" });
+        let (label, unit, _) = identita("bacheca-attivita", &root, &input, "service");
+        assert_eq!(label, "backend");
+        assert_eq!(unit, "bacheca-attivita-backend.service");
+        // La conseguenza per cui il difetto era visibile: due comandi diversi non
+        // condividono piu' un'unica identita' di ripiego.
+        assert!(!is_generic_service_label(&label));
+    }
+
+    /// Le due scritture della stessa cosa devono dare la stessa identita': un
+    /// servizio non puo' chiamarsi in due modi a seconda di dove l'agente ha
+    /// scritto la sua cartella. Il `cd` si compone con la working dir, perche' e'
+    /// relativo a quella (`bash -c` parte da li').
+    #[test]
+    fn cd_nel_comando_e_working_dir_dicono_lo_stesso_scope() {
+        let (_tmp, root) = progetto("shop", &["apps/web"]);
+
+        let dal_parametro = json!({ "command": "npm run dev", "working_dir": "apps/web" });
+        let dal_comando = json!({ "command": "cd apps/web && npm run dev" });
+        let composto = json!({ "command": "cd web && npm run dev", "working_dir": "apps" });
+
+        let (atteso, _, _) = identita("shop", &root, &dal_parametro, "service");
+        assert_eq!(atteso, "frontend");
+        assert_eq!(identita("shop", &root, &dal_comando, "service").0, atteso);
+        assert_eq!(identita("shop", &root, &composto, "service").0, atteso);
+    }
+
+    /// Un `cd` verso l'esterno non e' uno scope di questo progetto (regola E), ma
+    /// non deve nemmeno cancellare cio' che la working dir gia' diceva: si ignora
+    /// la dichiarazione e resta il comportamento di prima. La cartella esiste
+    /// davvero, cosi' il test misura il CONFINE e non l'inesistenza del percorso.
+    ///
+    /// Questo e' l'unico dei test sul `cd` che resta verde disattivando la lettura
+    /// del comando, ed e' voluto: misura cio' che il fix NON deve cambiare. La
+    /// mutazione che lo rende rosso e' l'opposta — togliere da
+    /// `directory_effettiva` il vaglio `relativa_alla_radice(...).is_some()` ->
+    /// l'identita' diventa `altro-progetto`, cioe' il servizio prende il nome di
+    /// una cartella che non appartiene a questo progetto.
+    #[test]
+    fn un_cd_fuori_dalla_radice_non_cambia_l_identita() {
+        let (tmp, root) = progetto("bacheca-attivita", &["backend"]);
+        std::fs::create_dir_all(tmp.path().join("altro-progetto")).expect("cartella esterna");
+
+        let input = json!({
+            "command": "cd ../../altro-progetto && npm start",
+            "working_dir": "backend",
+        });
+        let (label, _, _) = identita("bacheca-attivita", &root, &input, "service");
+        assert_eq!(
+            label, "backend",
+            "fuori dalla radice non c'e' nessuno scope da leggere, e la working dir parla ancora"
+        );
+    }
+
+    /// Il `cd` puo' anche portare il servizio SULLA radice, e allora la risposta e'
+    /// che il ruolo non c'e': la stessa che si da' a chi parte dalla radice senza
+    /// muoversi. Il nome della cartella di progetto non e' un candidato, e non deve
+    /// rientrare dalla porta di servizio che questo fix apre.
+    #[test]
+    fn un_cd_verso_la_radice_non_produce_il_nome_del_progetto() {
+        let (_tmp, root) = progetto("bacheca-attivita", &["backend"]);
+        let input = json!({ "command": "cd .. && npm start", "working_dir": "backend" });
+
+        let (label, unit, kind) = identita("bacheca-attivita", &root, &input, "service");
+
+        assert_eq!(kind, "service", "resta un server, e gli servira' una porta");
+        assert_eq!(label, "service-1a2b3c4d", "nessun ruolo: ancoraggio all'uuid");
+        assert_ne!(unit, "bacheca-attivita-bacheca-attivita.service");
+    }
+
+    /// Cosa NON e' una dichiarazione di working directory. Nessuno di questi casi
+    /// e' un elenco di forme da rifiutare: passano tutti dallo stesso vaglio
+    /// (nomina una cartella reale dentro la radice?), e cio' che non lo supera
+    /// lascia il comportamento identico a prima del fix.
+    #[test]
+    fn solo_un_cd_verso_una_cartella_vera_sposta_lo_scope() {
+        let (_tmp, root) = progetto("shop", &["backend"]);
+        let scope = |cmd: &str| scope_dir(&root, &root, cmd);
+
+        assert_eq!(scope("cd backend && npm start").as_deref(), Some(Path::new("backend")));
+        // Cartella inesistente: non c'e' niente da leggere.
+        assert_eq!(scope("cd frontend && npm start"), None);
+        // Non e' un `cd`, per quanto cominci per "cd".
+        assert_eq!(scope("cdk deploy backend"), None);
+        // `cd` nudo porta alla home, che non e' uno scope del progetto.
+        assert_eq!(scope("cd && npm start"), None);
+        // Il `cd` va letto in TESTA: piu' avanti descrive cosa fa il servizio, non
+        // da dove parte.
+        assert_eq!(scope("npm start && cd backend"), None);
+        // Un percorso assoluto esterno resta escluso dal confine sulla radice.
+        assert_eq!(scope("cd /usr/lib && npm start"), None);
+        // Apici attorno all'intero argomento: il percorso e' quello che resta.
+        assert_eq!(scope("cd 'backend' && npm start").as_deref(), Some(Path::new("backend")));
     }
 
     fn uscita_processo(status: &str, stdout: &str, stderr: &str) -> crate::agent_processes::ProcessOutput {
