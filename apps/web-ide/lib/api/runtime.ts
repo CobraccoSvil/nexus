@@ -47,6 +47,11 @@ export interface PlaywrightRunSummary {
   label: string;
   status: string;
   summary?: string;
+  /** Esito strutturato (regola M): "passed" | "tests_failed" | "setup_failed".
+   *  Assente sui run precedenti al fix (nessun retrofit dello storico). */
+  outcome?: "passed" | "tests_failed" | "setup_failed" | string;
+  /** Ultima riga di errore del runner, valorizzata solo per outcome "setup_failed". */
+  failureCause?: string;
   createdAt: string;
   updatedAt?: string;
   artifacts?: PlaywrightArtifact[];

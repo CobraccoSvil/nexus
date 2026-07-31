@@ -628,6 +628,17 @@ export function BottomPanelManager({
                 (s.includes("installed") && !s.includes("test"));
               const category: "setup" | "test" = isSetup ? "setup" : "test";
               const badgeBg = category === "setup" ? "#6b7280" : "#3b82f6";
+              // Esito strutturato dal backend (regola M): un fallimento di
+              // SETUP (webServer/dipendenze mai partiti, zero test eseguiti)
+              // e' un problema diverso da test rossi, e va detto come tale
+              // invece di "0 passati, 0 falliti" (fuorviante: sembra una
+              // suite vuota andata bene). Assente sui run pre-fix: in quel
+              // caso il rendering resta quello legacy.
+              const isSetupFailed = run.outcome === "setup_failed";
+              const statusLabel = isSetupFailed ? "setup fallito" : run.status;
+              const statusColor = isSetupFailed
+                ? "#f59e0b"
+                : run.status === "passed" ? "#10b981" : run.status === "failed" ? tc.error : tc.textMuted;
               return (
               <div key={run.id} style={tileStyle(tc)}>
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
@@ -639,12 +650,26 @@ export function BottomPanelManager({
                     }}>{category}</span>
                     <span style={{ color: tc.text, fontWeight: 600 }}>{stripAnsi(run.label)}</span>
                   </div>
-                  <span style={{
-                    color: run.status === "passed" ? "#10b981" : run.status === "failed" ? tc.error : tc.textMuted,
-                    fontSize: 11, fontWeight: 600,
-                  }}>{run.status}</span>
+                  <span style={{ color: statusColor, fontSize: 11, fontWeight: 600 }}>{statusLabel}</span>
                 </div>
-                {run.summary && (
+                {isSetupFailed && run.failureCause ? (
+                  <div
+                    style={{
+                      color: tc.error,
+                      fontSize: 12,
+                      marginTop: 6,
+                      padding: "6px 8px",
+                      borderLeft: `3px solid ${tc.error}`,
+                      background: "rgba(239,68,68,0.08)",
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                      fontFamily: 'var(--font-mono)',
+                      lineHeight: 1.45,
+                    }}
+                  >
+                    I test non sono mai partiti — {stripAnsi(run.failureCause)}
+                  </div>
+                ) : run.summary && (
                   <div
                     style={{
                       color: tc.textSecondary,
@@ -659,7 +684,7 @@ export function BottomPanelManager({
                     {stripAnsi(run.summary)}
                   </div>
                 )}
-                {project && category === "test" && (
+                {project && category === "test" && !isSetupFailed && (
                   <PlaywrightLiveProgress run={run} projectId={project.id} tc={tc} />
                 )}
                 {run.artifacts && run.artifacts.length > 0 && project && (
