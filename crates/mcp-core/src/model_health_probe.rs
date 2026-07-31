@@ -456,6 +456,14 @@ async fn load_enabled_models(db: &PgPool) -> sqlx::Result<Vec<ProbeModel>> {
 /// massimo ogni ~30 min finche' non torna sano (poi e' riabilitato e basta).
 const REPROBE_BACKOFF_DEFAULT_MIN: i64 = 30;
 
+/// Reason scritto dal GATE DI ABILITAZIONE in DB (trigger
+/// `ai_price_catalog_enforce_probe_before_enable`, mig 0629) quando si tenta di
+/// abilitare un modello privo di `last_probe_healthy_at`. E' un marchio di
+/// "mai verificato", non un difetto del modello: il re-probe lo prende come
+/// candidato per dargli la prova d'inferenza che il gate pretende.
+/// La stringa e' fissata dal trigger SQL: qui la si rispecchia, non la si sceglie.
+pub const REASON_UNVERIFIED_NO_PROBE: &str = "unverified_no_probe";
+
 /// Riga candidata al RE-PROBE: modello disabilitato per un QUIRK GATEWAY
 /// ri-testabile (tool-probe fallito / malformed tool calls), da riprovare dopo
 /// il backoff per riabilitarlo quando il quirk e' stato corretto in produzione.
@@ -481,20 +489,58 @@ fn is_reprobe_candidate(is_enabled: bool, capability_source: &str, reason: Optio
     if is_enabled {
         return false;
     }
-    // Lock manuale: mai ri-probato in automatico (curatela admin).
-    if capability_source == "manual" {
-        return false;
-    }
     let Some(reason) = reason.map(str::trim).filter(|r| !r.is_empty()) else {
         return false;
     };
     if reason.starts_with("manual:") {
         return false;
     }
+    // Marchio del GATE DI ABILITAZIONE (mig 0629): l'admin ha tentato di
+    // abilitare un modello che non ha mai avuto una prova d'inferenza, e il
+    // trigger l'ha respinto. Senza questa apertura lo stato e' TERMINALE: il
+    // gate pretende `last_probe_healthy_at`, ma i due writer che lo scrivono
+    // scartano le righe gia' esistenti (discovery: solo modelli nuovi) e quelle
+    // manual (re-probe) — nessun percorso lo recupera. Misurato il 31/07/2026:
+    // i 4 modelli Groq bloccati cosi' dal 13/07 (seed opt-in mai abilitato
+    // prima del grandfather di 0629, quindi mai timbrato).
+    //
+    // Vale ANCHE per `capability_source='manual'`: il lock manuale esiste per
+    // non RI-CLASSIFICARE le capability curate dall'admin, non per vietare la
+    // verifica che il modello risponda — che e' esattamente cio' che il gate
+    // chiede. Il re-enable qui non tocca la curatela (vedi `reenable_candidate`).
+    if reason == REASON_UNVERIFIED_NO_PROBE {
+        return true;
+    }
+    // Lock manuale: mai ri-probato in automatico per i quirk di tool-capability
+    // (li' il re-probe RI-SCRIVE supports_tool_use, cioe' la curatela admin).
+    if capability_source == "manual" {
+        return false;
+    }
     // Reason di QUIRK GATEWAY ri-testabile: tool-probe fallito o malformed tool
     // calls dal runtime (lo stesso ciclo tool-capability, regola L).
     reason.starts_with(crate::tool_capability::REASON_TOOL_PROBE_PREFIX)
         || reason == crate::tool_capability::REASON_MALFORMED_TOOL_CALLS
+}
+
+/// Decide se il re-probe del candidato deve pretendere ANCHE il tool-probe.
+/// PURO/testabile. Per i quirk tool (`tool_probe_failed:*`, `malformed_tool_calls`)
+/// sempre: il quirk era proprio sul tool-forcing e deve dimostrarsi risolto. Per
+/// `unverified_no_probe` (gate 0629) la prova pretesa dal gate e' l'INFERENZA
+/// (e' il chat-probe a scrivere `last_probe_healthy_at`): il tool-probe si
+/// pretende solo da un modello dichiarato tool-capable — un chat-only fallirebbe
+/// quella prova a ogni giro e resterebbe nello stesso stato terminale che questo
+/// ramo esiste per chiudere, spendendo una chiamata provider ogni backoff.
+fn tool_step_required(reason: &str, supports_tool_use: bool) -> bool {
+    reason != REASON_UNVERIFIED_NO_PROBE || supports_tool_use
+}
+
+/// Decide se al re-enable va ripristinato `supports_tool_use=true`. PURO/
+/// testabile. Il ripristino risarcisce il DEGRADO inflitto dal quirk tool (che
+/// aveva azzerato il flag); per `unverified_no_probe` nessun degrado e' mai
+/// avvenuto e il flag (curatela admin o classificazione) non si tocca: scrivere
+/// true senza un tool-probe passato regalerebbe una capability mai dimostrata.
+fn restore_tool_flag(reason: &str, supports_tool_use: bool) -> bool {
+    !supports_tool_use && reason != REASON_UNVERIFIED_NO_PROBE
 }
 
 /// Decide se il candidato ha atteso abbastanza dal suo ultimo tentativo
@@ -512,23 +558,28 @@ fn reprobe_due(
 }
 
 /// Legge i candidati al re-probe dal catalog. Il filtro SQL replica
-/// `is_reprobe_candidate` (inclusi: reason che inizia con `tool_probe_failed:`
+/// `is_reprobe_candidate` (inclusi: reason `unverified_no_probe` — anche con
+/// capability_source='manual' — e reason che inizia con `tool_probe_failed:`
 /// oppure `malformed_tool_calls`; esclusi: is_enabled=true, capability_source=
-/// 'manual', reason `manual:%`, e implicitamente tutti gli altri reason del
-/// ciclo is_enabled — billing/quota cooldown, missing_from_api, %policy%,
-/// hollow_completion, not_chat_compatible — che NON vanno ri-probati cosi').
+/// 'manual' per i soli quirk tool, reason `manual:%`, e implicitamente tutti gli
+/// altri reason del ciclo is_enabled — billing/quota cooldown, missing_from_api,
+/// %policy%, hollow_completion, not_chat_compatible — che NON vanno ri-probati
+/// cosi').
 async fn load_reprobe_candidates(db: &PgPool) -> sqlx::Result<Vec<ReprobeCandidate>> {
     let predicate = crate::tool_capability::TOOL_REASON_PREDICATE_SQL;
+    // Replica di `is_reprobe_candidate` (regola L: stesso criterio, due rese).
+    // Il ramo `unverified_no_probe` (marchio del gate 0629) ignora il lock
+    // manual — vedi la motivazione sul predicato puro.
     let sql = format!(
         "SELECT provider, model, auto_disabled_reason, auto_disabled_at, \
                 COALESCE(capability_source, 'auto') AS capability_source, \
                 COALESCE(supports_tool_use, false) AS supports_tool_use \
            FROM ai_price_catalog \
           WHERE is_enabled = false \
-            AND COALESCE(capability_source, 'auto') <> 'manual' \
             AND auto_disabled_reason IS NOT NULL \
             AND auto_disabled_reason NOT LIKE 'manual:%' \
-            AND {predicate} \
+            AND ( auto_disabled_reason = '{REASON_UNVERIFIED_NO_PROBE}' \
+                  OR ( COALESCE(capability_source, 'auto') <> 'manual' AND {predicate} ) ) \
           ORDER BY provider, model"
     );
     let rows = sqlx::query(&sql).fetch_all(db).await?;
@@ -600,10 +651,14 @@ async fn reprobe_one_candidate(
         return early;
     }
 
-    // 2. Tool-probe (no side-effect). Deve passare anch'esso: il quirk era
-    //    proprio sul tool-forcing.
-    if let Some(early) = reprobe_tool_step(orchestrator, db, provider, model).await {
-        return early;
+    // 2. Tool-probe (no side-effect), solo se pertinente per questo candidato
+    //    (vedi `tool_step_required`): per i quirk tool deve passare — il quirk
+    //    era proprio sul tool-forcing; per unverified_no_probe si pretende solo
+    //    da un modello dichiarato tool-capable.
+    if tool_step_required(&cand.reason, cand.supports_tool_use) {
+        if let Some(early) = reprobe_tool_step(orchestrator, db, provider, model).await {
+            return early;
+        }
     }
 
     // 3. Entrambi OK: riabilita.
@@ -685,10 +740,16 @@ async fn reprobe_tool_step(
 
 /// Riabilita un candidato che ha superato chat-probe + tool-probe: is_enabled=true,
 /// reason/timestamp azzerati, contatori a 0, e ripristino di supports_tool_use se
-/// era stato degradato. Non tocca le righe manual (guard nella WHERE).
+/// era stato degradato.
+///
+/// Il lock manual resta in vigore per i quirk di tool-capability; cede solo per
+/// `unverified_no_probe` (marchio del gate 0629), dove il re-probe fornisce la
+/// prova d'inferenza mancante. In quel caso `supports_tool_use` NON viene
+/// toccato: la curatela admin decide la capability, il probe decide solo se il
+/// modello risponde.
 async fn reenable_candidate(db: &PgPool, cand: &ReprobeCandidate, provider: &str, model: &str) {
-    let restore_tool = !cand.supports_tool_use;
-    let _ = sqlx::query(
+    let restore_tool = restore_tool_flag(&cand.reason, cand.supports_tool_use);
+    let sql = format!(
         "UPDATE ai_price_catalog \
             SET is_enabled = true, \
                 last_probe_healthy_at = NOW(), \
@@ -697,12 +758,16 @@ async fn reenable_candidate(db: &PgPool, cand: &ReprobeCandidate, provider: &str
                 auto_disabled_reason = NULL, \
                 consecutive_failures = 0, \
                 consecutive_tool_failures = 0, \
-                supports_tool_use = CASE WHEN $3 THEN true ELSE supports_tool_use END, \
+                supports_tool_use = CASE \
+                    WHEN $3 AND COALESCE(capability_source, 'auto') <> 'manual' \
+                    THEN true ELSE supports_tool_use END, \
                 updated_at = NOW() \
           WHERE provider = $1 AND model = $2 \
             AND is_enabled = false \
-            AND COALESCE(capability_source, 'auto') <> 'manual'",
-    )
+            AND ( COALESCE(capability_source, 'auto') <> 'manual' \
+                  OR auto_disabled_reason = '{REASON_UNVERIFIED_NO_PROBE}' )"
+    );
+    let _ = sqlx::query(&sql)
     .bind(provider)
     .bind(model)
     .bind(restore_tool)
@@ -2103,6 +2168,57 @@ mod tests {
             "auto",
             Some("manual:non_chat_endpoint")
         ));
+    }
+
+    #[test]
+    fn reprobe_candidate_unverified_no_probe_incluso_anche_se_manual() {
+        // Il marchio del gate 0629 e' l'UNICO caso in cui il lock manual cede:
+        // altrimenti lo stato e' terminale (nessun writer scrive il timbro che
+        // il gate pretende). Caso reale: i 4 modelli Groq, seed manual mai
+        // abilitati prima del grandfather, bloccati dal 13/07 al 31/07/2026.
+        assert!(is_reprobe_candidate(
+            false,
+            "manual",
+            Some(REASON_UNVERIFIED_NO_PROBE)
+        ));
+        // Vale anche per le righe non curate (google/anthropic nello stesso stato).
+        assert!(is_reprobe_candidate(
+            false,
+            "auto",
+            Some(REASON_UNVERIFIED_NO_PROBE)
+        ));
+        // Ma un lock esplicito dell'admin (`manual:...`) resta intoccabile.
+        assert!(!is_reprobe_candidate(
+            false,
+            "manual",
+            Some("manual:non_chat_endpoint")
+        ));
+        // E un modello gia' abilitato non torna candidato per questa via.
+        assert!(!is_reprobe_candidate(
+            true,
+            "manual",
+            Some(REASON_UNVERIFIED_NO_PROBE)
+        ));
+    }
+
+    #[test]
+    fn prova_tool_pertinente_solo_fuori_da_unverified_no_probe() {
+        // Quirk tool: la prova tool e' il merito del re-probe — sempre pretesa,
+        // e il flag degradato dal quirk va risarcito al re-enable.
+        assert!(tool_step_required("tool_probe_failed:error", false));
+        assert!(restore_tool_flag("tool_probe_failed:error", false));
+        // unverified_no_probe (gate 0629): la prova pretesa e' l'inferenza.
+        // Il tool-step si pretende solo da un modello dichiarato tool-capable...
+        assert!(tool_step_required(REASON_UNVERIFIED_NO_PROBE, true));
+        // ...e un chat-only NON resta bloccato (ogni giro: chat OK, tool KO,
+        // StillBroken) su una prova che nessun consumatore gli chiedera'.
+        assert!(!tool_step_required(REASON_UNVERIFIED_NO_PROBE, false));
+        // Al re-enable il flag non si tocca mai: nessun degrado da risarcire,
+        // e true senza prova regalerebbe una capability mai dimostrata.
+        assert!(!restore_tool_flag(REASON_UNVERIFIED_NO_PROBE, false));
+        // Flag gia' true: niente da ripristinare in nessun caso.
+        assert!(!restore_tool_flag("tool_probe_failed:error", true));
+        assert!(!restore_tool_flag(REASON_UNVERIFIED_NO_PROBE, true));
     }
 
     #[test]
