@@ -68,17 +68,59 @@ pub async fn tool_nexus_search_semantic(ctx: &AgentToolContext, input: &Value) -
     )
     .await
     {
-        Ok(hits) => json!({
-            "query": query,
-            "count": hits.len(),
-            "hits": hits,
-        })
-        .to_string(),
+        Ok(report) => render_search_result(&query, report),
         Err(e) => {
             tracing::warn!("nexus_search_semantic: {}", e);
             search_failure(json!({"error": format!("rag search fallita: {e}"), "hits": []}))
         }
     }
+}
+
+/// Rende l'esito della ricerca per il MODELLO, distinguendo i tre casi che
+/// prima collassavano tutti su `count: 0` (regola M):
+/// - hit trovati: il risultato utile;
+/// - zero hit con collection fallite: NON e' "non trovato" — la fonte non ha
+///   potuto rispondere, e il campo `hint` dice di non ripetere la stessa query;
+/// - zero hit puliti: la risposta e' davvero "qui non c'e'", e l'hint indirizza
+///   verso gli strumenti che leggono i FILE (una query ripetuta su un indice
+///   che ha gia' risposto zero non produrra' un risultato diverso).
+///
+/// Misurato il 31/07/2026 (run 49fbc5d7): 8 ricerche identiche a zero risultati
+/// consecutive, chiusura per loop. Nessuna riga diceva al modello che
+/// l'insistere era strutturalmente inutile.
+fn render_search_result(query: &str, report: rag::SemanticSearchReport) -> String {
+    let mut out = serde_json::Map::new();
+    out.insert("query".into(), json!(query));
+    out.insert("count".into(), json!(report.hits.len()));
+    out.insert("hits".into(), json!(report.hits));
+    if !report.collections_fallite.is_empty() {
+        out.insert(
+            "collections_fallite".into(),
+            json!(report
+                .collections_fallite
+                .iter()
+                .map(|(k, e)| json!({"kind": k, "errore": e}))
+                .collect::<Vec<_>>()),
+        );
+        out.insert(
+            "hint".into(),
+            json!(
+                "una o piu' fonti non hanno potuto rispondere: questo NON e' un \
+                 'non trovato'. Non ripetere la stessa query; usa read_file / \
+                 search_in_files sui percorsi che gia' conosci."
+            ),
+        );
+    } else if report.hits.is_empty() {
+        out.insert(
+            "hint".into(),
+            json!(
+                "nessun risultato nell'indice semantico: ripetere la stessa query \
+                 dara' ancora zero. Per cercare nei sorgenti usa search_in_files \
+                 o leggi direttamente i file citati nel task."
+            ),
+        );
+    }
+    Value::Object(out).to_string()
 }
 
 #[cfg(test)]
@@ -97,5 +139,59 @@ mod tests {
         let parsed: Value =
             serde_json::from_str(after_marker).expect("payload dopo il marker e' JSON valido");
         assert_eq!(parsed["error"], "rag search fallita: qdrant down");
+    }
+
+    /// Zero hit con collection fallite: il risultato DISTINGUE il guasto dal
+    /// "non trovato" e l'hint vieta la ripetizione. Parte dal produttore reale
+    /// (`render_search_result`), non da un JSON scritto a mano (regola O).
+    #[test]
+    fn una_collection_fallita_non_e_un_non_trovato() {
+        let report = rag::SemanticSearchReport {
+            hits: Vec::new(),
+            collections_fallite: vec![("code".into(), "HTTP 404 collection assente".into())],
+        };
+        let out = render_search_result("frontend App counters", report);
+        let v: Value = serde_json::from_str(&out).expect("json valido");
+        assert_eq!(v["count"], 0);
+        assert_eq!(v["collections_fallite"][0]["kind"], "code");
+        let hint = v["hint"].as_str().expect("hint presente");
+        assert!(
+            hint.contains("NON e' un 'non trovato'"),
+            "l'hint deve dire che la fonte non ha risposto: {hint}"
+        );
+    }
+
+    /// Zero hit puliti: niente allarme, ma l'hint dice che insistere e' inutile.
+    /// E' il caso delle 8 ricerche identiche del run 49fbc5d7.
+    #[test]
+    fn zero_hit_puliti_scoraggiano_la_ripetizione() {
+        let out = render_search_result("query senza riscontri", rag::SemanticSearchReport::default());
+        let v: Value = serde_json::from_str(&out).expect("json valido");
+        assert_eq!(v["count"], 0);
+        assert!(v.get("collections_fallite").is_none());
+        let hint = v["hint"].as_str().expect("hint presente");
+        assert!(hint.contains("ripetere la stessa query"), "hint: {hint}");
+    }
+
+    /// Con risultati veri l'hint NON compare: un suggerimento appeso a un
+    /// esito riuscito diventerebbe rumore che il modello impara a ignorare.
+    #[test]
+    fn con_hit_nessun_hint() {
+        let report = rag::SemanticSearchReport {
+            hits: vec![rag::search::SearchHit {
+                source_kind: "code".into(),
+                source_id: "frontend/src/App.tsx".into(),
+                chunk_index: 0,
+                chunk_text: "export default function App()".into(),
+                score: 0.9,
+                metadata: Value::Null,
+            }],
+            collections_fallite: Vec::new(),
+        };
+        let v: Value = serde_json::from_str(&render_search_result("App", report)).unwrap();
+        assert_eq!(v["count"], 1);
+        assert!(v.get("hint").is_none());
+        // L'hit di codice porta il SUO file: senza, non e' azionabile.
+        assert_eq!(v["hits"][0]["source_id"], "frontend/src/App.tsx");
     }
 }

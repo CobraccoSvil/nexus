@@ -550,15 +550,28 @@ pub async fn project_context_collection_name(db: &PgPool) -> anyhow::Result<Stri
 
 // ── Code Index collection ────────────────────────────────────────────────────
 
+/// Punto unico (regola L) del NOME della collection dell'indice di codice.
+///
+/// Lo SCRITTORE (questo modulo) e il LETTORE (`rag::config`, canale
+/// `nexus_search_semantic`) devono risolvere lo stesso nome dalla stessa
+/// fonte: prima di questa funzione il lettore aveva inciso "code_embeddings",
+/// una collection MAI esistita, mentre lo scrittore indicizzava da sempre in
+/// `project_code_index` — misurato il 31/07/2026: 404 sulla prima, 111 punti
+/// nella seconda, e ogni ricerca semantica sul codice rispondeva zero PER
+/// COSTRUZIONE. Il correttore post-review di quella mattina e' morto in un
+/// loop di ricerche a vuoto proprio su questa faglia.
+pub(crate) async fn code_index_collection(db: &PgPool) -> String {
+    get_setting(db, "qdrant_code_index_collection")
+        .await
+        .ok()
+        .flatten()
+        .or_else(|| std::env::var("QDRANT_CODE_INDEX_COLLECTION").ok())
+        .unwrap_or_else(|| DEFAULT_CODE_INDEX_COLLECTION.to_string())
+}
+
 async fn qdrant_code_index_config(db: &PgPool) -> anyhow::Result<(String, String)> {
     let url = crate::settings::resolve_qdrant_url(db).await;
-
-    let collection = get_setting(db, "qdrant_code_index_collection")
-        .await?
-        .or_else(|| std::env::var("QDRANT_CODE_INDEX_COLLECTION").ok())
-        .unwrap_or_else(|| DEFAULT_CODE_INDEX_COLLECTION.to_string());
-
-    Ok((url, collection))
+    Ok((url, code_index_collection(db).await))
 }
 
 async fn ensure_code_index_collection(db: &PgPool) -> anyhow::Result<()> {

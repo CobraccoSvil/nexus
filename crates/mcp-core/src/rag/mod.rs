@@ -11,7 +11,7 @@ pub mod search;
 
 pub use config::current_config;
 pub use indexer::index_attachment;
-pub use search::search_semantic;
+pub use search::{search_semantic, SemanticSearchReport};
 
 use serde::{Deserialize, Serialize};
 

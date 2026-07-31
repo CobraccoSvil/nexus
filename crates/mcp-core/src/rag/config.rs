@@ -21,18 +21,23 @@ pub struct RagConfig {
     pub collection_kb: String,
     pub collection_chat_history: String,
     pub collection_tool_results: String,
+    /// Collection dell'indice di codice: risolta dal punto unico dello
+    /// SCRITTORE (`vector_memory::code_index_collection`, chiave
+    /// `qdrant_code_index_collection`), mai da un nome inciso qui. Il nome
+    /// inciso c'era — "code_embeddings" — ed era di una collection mai
+    /// esistita: ogni ricerca sul codice rispondeva zero per costruzione.
+    pub collection_code: String,
 }
 
 impl RagConfig {
     /// Ritorna il nome collection Qdrant per un dato `SourceKind`.
-    /// Code usa la collection legacy `code_embeddings` di EmbeddingService.
     pub fn collection_for(&self, kind: SourceKind) -> &str {
         match kind {
             SourceKind::Attachment => &self.collection_attachments,
             SourceKind::Kb => &self.collection_kb,
             SourceKind::ChatHistory => &self.collection_chat_history,
             SourceKind::ToolResult => &self.collection_tool_results,
-            SourceKind::Code => "code_embeddings",
+            SourceKind::Code => &self.collection_code,
             // Collection legacy (nomi fissi, come Code): popolate da
             // vector_memory.rs, payload eterogeneo gestito in search.rs.
             SourceKind::MetaDoc => "nexus_meta_docs",
@@ -59,7 +64,14 @@ pub async fn current_config(db: &PgPool) -> Result<Arc<RagConfig>, RagError> {
             }
         }
     }
+    load_uncached(db).await
+}
 
+/// Il caricamento vero, senza passare dalla cache globale. Separato perche' la
+/// cache non e' chiavata per DB: un test `#[sqlx::test]` che passasse da
+/// `current_config` leggerebbe (o avvelenerebbe) la config di un ALTRO pool —
+/// la stessa trappola dei sei test flaky gia' misurata su questo pattern.
+async fn load_uncached(db: &PgPool) -> Result<Arc<RagConfig>, RagError> {
     let rows = sqlx::query("SELECT key, value FROM settings WHERE key LIKE 'agent.rag.%'")
         .fetch_all(db)
         .await?;
@@ -97,10 +109,40 @@ pub async fn current_config(db: &PgPool) -> Result<Arc<RagConfig>, RagError> {
         collection_kb: get("agent.rag.collection_kb", "kb_chunks"),
         collection_chat_history: get("agent.rag.collection_chat_history", "chat_history_chunks"),
         collection_tool_results: get("agent.rag.collection_tool_results", "tool_results_chunks"),
+        // Dal punto unico dello scrittore, NON da una chiave agent.rag.*:
+        // lettore e scrittore devono divergere mai (regola L).
+        collection_code: crate::vector_memory::code_index_collection(db).await,
     };
 
     let arc = Arc::new(cfg);
     let mut g = CACHE.write().await;
     *g = Some((arc.clone(), Instant::now()));
     Ok(arc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// L'INVARIANTE del fix: il lettore (questa config) risolve il nome della
+    /// collection di codice dallo STESSO punto unico dello scrittore
+    /// (`vector_memory::code_index_collection`), sullo stesso DB migrato.
+    /// Prima il lettore aveva inciso "code_embeddings", collection mai
+    /// esistita: ogni ricerca sul codice rispondeva zero per costruzione, e
+    /// nessun test poteva accorgersene perche' nessuno confrontava i due lati.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_lettore_cerca_dove_lo_scrittore_scrive(pool: sqlx::PgPool) {
+        let dal_lettore = load_uncached(&pool).await.expect("config RAG dal DB migrato");
+        let dello_scrittore = crate::vector_memory::code_index_collection(&pool).await;
+        assert_eq!(
+            dal_lettore.collection_for(SourceKind::Code),
+            dello_scrittore,
+            "lettore e scrittore devono risolvere la stessa collection di codice"
+        );
+        assert_ne!(
+            dal_lettore.collection_for(SourceKind::Code),
+            "code_embeddings",
+            "il nome inciso della collection mai esistita non deve riapparire"
+        );
+    }
 }

@@ -30,8 +30,39 @@ async fn embed_query(query: &str) -> Result<Vec<f32>, RagError> {
         .map_err(|e| RagError::Embed(format!("embed_query spawn_blocking join: {e}")))
 }
 
+/// Esito della ricerca semantica: gli hit E le collection che non hanno
+/// potuto rispondere.
+///
+/// Una collection fallita non e' "zero risultati" (regola M): prima questo
+/// esito veniva inghiottito con un `warn!` e il chiamante — incluso il modello
+/// che decide la prossima mossa — vedeva `count: 0` identico a "cercato e non
+/// trovato". Misurato il 31/07/2026: il correttore post-review ha ripetuto 8
+/// ricerche sul codice contro una collection inesistente, leggendo ogni volta
+/// uno zero che sembrava una risposta, fino alla chiusura per loop.
+#[derive(Debug, Default)]
+pub struct SemanticSearchReport {
+    pub hits: Vec<SearchHit>,
+    /// `(kind, errore)` per ogni collection interrogata e fallita.
+    pub collections_fallite: Vec<(String, String)>,
+}
+
+/// I kind interrogati quando il chiamante non ne specifica: tutte le fonti
+/// per-progetto, INCLUSO il codice. Code ne era escluso quando la sua
+/// collection era un nome mai esistito ("code_embeddings"): tolta la faglia,
+/// escluderlo renderebbe la ricerca cieca proprio sui sorgenti — la domanda
+/// piu' frequente di un run di correzione.
+pub(crate) fn default_kinds() -> Vec<SourceKind> {
+    vec![
+        SourceKind::Attachment,
+        SourceKind::Kb,
+        SourceKind::ChatHistory,
+        SourceKind::ToolResult,
+        SourceKind::Code,
+    ]
+}
+
 /// Cerca i top-K chunk piu' rilevanti per `query` filtrati su:
-/// - `source_kinds`: lista di SourceKind ammessi (default: tutti tranne Code).
+/// - `source_kinds`: lista di SourceKind ammessi (default: [`default_kinds`]).
 /// - `project_id`: se Some, filtra payload.project_id.
 /// - `session_id`: se Some, filtra payload.session_id (rilevante per chat_history).
 /// - `extra_filters`: ulteriori filtri payload arbitrari (es. ("source_id", "<uuid>")).
@@ -43,22 +74,17 @@ pub async fn search_semantic(
     session_id: Option<Uuid>,
     top_k: Option<usize>,
     extra_filters: Vec<(String, Value)>,
-) -> Result<Vec<SearchHit>, RagError> {
+) -> Result<SemanticSearchReport, RagError> {
     let cfg = current_config(db).await?;
     if !cfg.enabled {
         return Err(RagError::Disabled);
     }
     if query.trim().is_empty() {
-        return Ok(Vec::new());
+        return Ok(SemanticSearchReport::default());
     }
     let top_k = top_k.unwrap_or(cfg.top_k_default).clamp(1, 100);
     let kinds = if source_kinds.is_empty() {
-        vec![
-            SourceKind::Attachment,
-            SourceKind::Kb,
-            SourceKind::ChatHistory,
-            SourceKind::ToolResult,
-        ]
+        default_kinds()
     } else {
         source_kinds
     };
@@ -70,6 +96,7 @@ pub async fn search_semantic(
     let query_vec = embed_query(query).await?;
 
     let mut all_hits: Vec<SearchHit> = Vec::new();
+    let mut collections_fallite: Vec<(String, String)> = Vec::new();
     for kind in kinds {
         let collection = cfg.collection_for(kind).to_string();
         let mut filters: Vec<(String, Value)> = Vec::new();
@@ -105,6 +132,10 @@ pub async fn search_semantic(
                     collection,
                     e
                 );
+                // Il fallimento viaggia col risultato, non solo nel log: per
+                // il chiamante "collection irraggiungibile" e "cercato e non
+                // trovato" sono esiti DIVERSI (regola M).
+                collections_fallite.push((kind.as_str().to_string(), e.to_string()));
                 continue;
             }
         };
@@ -130,6 +161,9 @@ pub async fn search_semantic(
                 .get("source_id")
                 .or_else(|| p.get("note_id"))
                 .or_else(|| p.get("doc_id"))
+                // project_code_index identifica i chunk col percorso del file:
+                // un hit di codice senza il SUO file non e' azionabile.
+                .or_else(|| p.get("file_path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -151,9 +185,28 @@ pub async fn search_semantic(
     });
     all_hits.truncate(top_k);
     tracing::info!(
-        "rag.search_semantic: query_len={} hits={}",
+        "rag.search_semantic: query_len={} hits={} collections_fallite={}",
         query.chars().count(),
-        all_hits.len()
+        all_hits.len(),
+        collections_fallite.len()
     );
-    Ok(all_hits)
+    Ok(SemanticSearchReport { hits: all_hits, collections_fallite })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Il default include il CODICE: e' la fonte che un run di correzione
+    /// interroga piu' spesso. Ne era escluso quando la sua collection era un
+    /// nome mai esistito; senza questo assert, l'esclusione potrebbe tornare
+    /// in silenzio e la ricerca risponderebbe di nuovo zero sui sorgenti.
+    #[test]
+    fn i_kind_di_default_includono_il_codice() {
+        let kinds = default_kinds();
+        assert!(
+            kinds.contains(&SourceKind::Code),
+            "default_kinds deve includere Code: {kinds:?}"
+        );
+    }
 }

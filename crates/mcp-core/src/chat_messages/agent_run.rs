@@ -1099,7 +1099,7 @@ pub(crate) async fn build_initial_msg_with_attachments(
     )
     .await
     {
-        Ok(h) => h,
+        Ok(report) => report.hits,
         Err(e) => {
             tracing::warn!("initial_msg RAG: search fallita ({e}), fallback metadata");
             return wrap(format!(
