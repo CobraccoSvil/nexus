@@ -56,6 +56,12 @@ export interface BottomPanelManagerProps {
   onSendToChat?: (message: string) => void;
   /** Problemi: nasconde la voce e invia il prompt dedicato (gestito da ide-shell). */
   onSendProblemToChat?: (item: ProblemItem) => void;
+  /**
+   * Problemi: ri-arma una riparazione fallita (diagnosi con
+   * `remediationRetryable`, segnale strutturato dal backend). Gestito da
+   * ide-shell, che chiama l'endpoint e rifetcha.
+   */
+  onRetryRemediation?: (item: ProblemItem) => void;
   onAutoSendToChat?: (message: string) => void;
   onKillPort?: (port: number) => void | Promise<void>;
   agentRunEndSignal?: number;
@@ -151,6 +157,7 @@ export function BottomPanelManager({
   onRefreshPanel,
   onSendToChat,
   onSendProblemToChat,
+  onRetryRemediation,
   onAutoSendToChat,
   onKillPort,
   agentRunEndSignal,
@@ -327,6 +334,31 @@ export function BottomPanelManager({
                     {item.source}{item.filePath ? ` • ${item.filePath}${item.line ? `:${item.line}` : ""}` : ""}
                   </div>
                 </button>
+                {onRetryRemediation && item.remediationRetryable ? (
+                  <button
+                    type="button"
+                    onClick={() => onRetryRemediation(item)}
+                    title="Ri-arma la riparazione automatica: la diagnosi torna in verifica e il presidio riavvia e controlla il servizio"
+                    style={{
+                      flexShrink: 0,
+                      marginLeft: 2,
+                      background: "rgba(59,130,246,0.85)",
+                      color: "#fff",
+                      border: "none",
+                      borderRadius: 3,
+                      padding: "0 6px",
+                      fontSize: 10,
+                      cursor: "pointer",
+                      verticalAlign: "middle",
+                      lineHeight: "16px",
+                      height: 16,
+                      fontWeight: 600,
+                    }}
+                    aria-label="Riprova riparazione"
+                  >
+                    ↻ riprova
+                  </button>
+                ) : null}
                 {onSendProblemToChat ? (
                   <button
                     type="button"

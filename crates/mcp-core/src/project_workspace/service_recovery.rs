@@ -72,9 +72,11 @@
 //! prosa dell'agente: i log entrano solo nell'EVIDENZA, per la diagnosi umana e
 //! per il prompt dell'AI.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use nexus_agent_graph::decisions::{path_in_scope, WriteFact};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -1289,6 +1291,10 @@ pub(crate) async fn process_open_service_crashes(
     if super::service_observer_remediation::within_boot_grace(state).await {
         return;
     }
+    // RI-ARMO prima della presa in carico: una diagnosi FALLITA la cui causa
+    // puo' essere cambiata (scrittura registrata su un file del servizio,
+    // posteriore al fallimento) torna `open` e rientra nel giro qui sotto.
+    rearm_failed_remediations(state, project_id).await;
     let policy = repair_policy(&state.db).await;
     let crashes = pending_service_crashes(
         &state.db,
@@ -1545,6 +1551,288 @@ async fn reopen_if_remediation_dead(
             "service_recovery: rimedio interrotto (run terminato senza verifica), diagnosi riaperta"
         );
         crate::project_workspace::logs::emit_problems_panel_refresh(project_id, vec![id]);
+    }
+}
+
+// ── Ri-armo: una diagnosi FALLITA torna ammissibile quando la causa cambia ──
+//
+// IL DIFETTO CHE CHIUDE. `failed_remediation` era TERMINALE in senso assoluto:
+// nessun percorso del codice la rileggeva. Corretta la causa nel codice — da un
+// run successivo o dall'utente — la diagnosi restava FALLITA, il servizio
+// spento, la porta allocata libera e inutilizzata, e il pannello Problemi
+// mostrava "Riparazione automatica FALLITA" su un difetto che non esisteva piu'.
+//
+// MISURATO il 31/07/2026 sera su bacheca-attivita: frontend in crash per
+// `css_syntax_error` (rilevazione corretta), riavvio ri-fallito (giusto: un
+// errore di sintassi non si guarisce riavviando), riga marcata
+// `failed_remediation` (onesto, per contratto). POI un run di correzione ha
+// sistemato il css — `npx vite build` pulito, 138 moduli — e la diagnosi e'
+// rimasta FALLITA, con la porta 24804 libera. Nel frattempo l'agente in chat,
+// non potendo far ripartire il servizio, ha aggirato: backend avviato come
+// processo nudo sulla porta 3001, FUORI dal bucket del progetto — esattamente
+// il workaround che la governance delle porte esiste per impedire.
+//
+// IL TRIGGER E' UN SEGNALE STRUTTURATO (regola M), mai un orologio: una
+// SCRITTURA registrata su un file del servizio (`file_mutations`, DB META, con
+// gli hash del contenuto prima/dopo) posteriore al fallimento, oppure la
+// richiesta ESPLICITA dal pannello Problemi. Un retry a tempo cieco sarebbe la
+// toppa (regola H): riavvierebbe per sempre un servizio la cui causa e' ancora
+// li', e trasformerebbe lo stato terminale in un eufemismo.
+//
+// Il ri-armo NON ripara niente: riporta la riga in `open`, e da li' il
+// presidio esistente (`process_open_service_crashes`) la riprende con il SUO
+// contratto invariato — Running, porta allocata che risponde, stabilita',
+// riavvio di conferma. Il criterio "questa scrittura conta?" delega ai punti
+// unici (regola L): [`WriteFact::cambia_il_contenuto`] (una riscrittura
+// identica non e' un cambiamento) e [`path_in_scope`] (la scrittura deve
+// cadere nell'area del servizio).
+
+/// Diagnosi FALLITE riesaminate per giro. Poche per costruzione: una riga
+/// entra qui solo dopo aver esaurito i tentativi del presidio.
+const MAX_REARM_PER_PASS: i64 = 10;
+/// Tetto di mutazioni lette per diagnosi, le piu' RECENTI prima: sono le
+/// candidate piu' probabili a essere la correzione, e le scritture nuove
+/// entrano nella finestra da sole al giro successivo.
+const MAX_REARM_FACTS: i64 = 500;
+
+/// Una diagnosi in stato terminale `failed_remediation`, col momento del
+/// fallimento (l'`updated_at` timbrato da [`scrivi_esito`]: dopo quella
+/// scrittura la riga non viene piu' toccata, quindi e' il watermark esatto
+/// oltre il quale una mutazione e' "posteriore al fallimento").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FailedDiagnosis {
+    pub(crate) id: Uuid,
+    pub(crate) unit: String,
+    pub(crate) failed_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Una scrittura registrata, coi suoi FATTI (regola M): il path e gli hash del
+/// contenuto prima/dopo, cosi' come `record_mutation` li ha calcolati.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MutationSeen {
+    pub(crate) file_path: String,
+    pub(crate) fact: WriteFact,
+    pub(crate) at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Le diagnosi di crash in stato terminale FALLITO di un progetto, le piu'
+/// vecchie prima. Solo `signal_kind = 'crash'`: il gemello sulle violazioni
+/// risorse ha il suo ciclo e la sua semantica.
+pub(crate) async fn failed_service_diagnoses(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+    limit: i64,
+) -> Vec<FailedDiagnosis> {
+    sqlx::query_as::<_, (Uuid, String, chrono::DateTime<chrono::Utc>)>(
+        "SELECT id, unit, updated_at FROM service_diagnoses \
+          WHERE project_id = $1 AND signal_kind = 'crash' AND status = $2 \
+          ORDER BY updated_at ASC LIMIT $3",
+    )
+    .bind(project_id)
+    .bind(STATO_FALLITA)
+    .bind(limit)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(id, unit, failed_at)| FailedDiagnosis {
+        id,
+        unit,
+        failed_at,
+    })
+    .collect()
+}
+
+/// Le scritture registrate DOPO un istante, per progetto, le piu' recenti
+/// prima. I fatti NON sono filtrati in SQL (stessa scelta, e stessa ragione,
+/// di `agent_graph_adapter::mutation_progress`): il criterio "cambia il
+/// contenuto?" vive nel punto unico [`WriteFact::cambia_il_contenuto`], e un
+/// `WHERE before_sha256 IS DISTINCT FROM after_sha256` ne farebbe una seconda
+/// copia in SQL (regola L).
+pub(crate) async fn mutations_since(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+    after: chrono::DateTime<chrono::Utc>,
+) -> Vec<MutationSeen> {
+    sqlx::query_as::<_, (String, Option<String>, Option<String>, chrono::DateTime<chrono::Utc>)>(
+        "SELECT file_path, before_sha256, after_sha256, created_at \
+           FROM file_mutations \
+          WHERE project_id = $1 AND created_at > $2 \
+          ORDER BY created_at DESC LIMIT $3",
+    )
+    .bind(project_id)
+    .bind(after)
+    .bind(MAX_REARM_FACTS)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(file_path, before_sha256, after_sha256, at)| MutationSeen {
+        file_path,
+        fact: WriteFact {
+            before_sha256,
+            after_sha256,
+        },
+        at,
+    })
+    .collect()
+}
+
+/// IL CRITERIO del ri-armo, puro e testabile: la prima mutazione che CAMBIA il
+/// contenuto ([`WriteFact::cambia_il_contenuto`]: una riscrittura identica non
+/// e' un segnale) e cade nell'AREA del servizio ([`path_in_scope`]). `None` =
+/// nessun segnale, la diagnosi resta terminale.
+pub(crate) fn rearm_evidence<'a>(
+    mutations: &'a [MutationSeen],
+    service_area: &[String],
+) -> Option<&'a MutationSeen> {
+    mutations
+        .iter()
+        .find(|m| m.fact.cambia_il_contenuto() && path_in_scope(&m.file_path, service_area))
+}
+
+/// L'AREA di un servizio come scope relativo alla root del progetto, per
+/// [`path_in_scope`] (che ri-normalizza: separatori, case, confine di
+/// segmento). La fonte e' la working dir REGISTRATA del processo
+/// (`agent_processes`, la stessa di [`process_facts`]), mai il nome del
+/// programma (lezione di `service_ownership`: `node` non dice quale servizio
+/// sia).
+///
+/// Working dir ignota, fuori root o uguale alla root -> `"."` (tutto il
+/// progetto): non sapendo QUALE area appartenga al servizio, qualunque
+/// scrittura del progetto e' un segnale ammissibile che la causa PUO' essere
+/// cambiata. Non e' lasco: il ri-armo non dichiara niente riparato, riapre il
+/// ciclo — ed e' il contratto a valle a verificare sul servizio vero.
+pub(crate) fn relative_service_area(working_dir: Option<&str>, project_root: &str) -> Vec<String> {
+    fn norm(p: &str) -> String {
+        p.trim()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    }
+    let tutto = vec![".".to_string()];
+    let Some(wd) = working_dir else {
+        return tutto;
+    };
+    let (wd, root) = (norm(wd), norm(project_root));
+    if root.is_empty() || wd == root {
+        return tutto;
+    }
+    match wd.strip_prefix(&format!("{root}/")) {
+        Some(rel) if !rel.is_empty() => vec![rel.to_string()],
+        _ => tutto,
+    }
+}
+
+/// Risolve l'area di un servizio dal suo processo registrato.
+async fn service_area(state: &AppState, project_id: Uuid, unit: &str) -> Vec<String> {
+    let target = ServiceRef::resolve(state, project_id, unit).await;
+    let (_, working_dir, _, _, _) = process_facts(state, project_id, &target.short).await;
+    relative_service_area(working_dir.as_deref(), &target.root.to_string_lossy())
+}
+
+/// PUNTO UNICO della scrittura di ri-armo: `failed_remediation` -> `open`, coi
+/// tentativi AZZERATI (la causa e' cambiata: il nuovo ciclo ha diritto ai
+/// suoi; la storia dei precedenti resta nel detail) e il cooldown rimosso (il
+/// segnale e' un fatto nuovo, non un retry dello stesso tentativo). Entrambi i
+/// trigger — la scrittura registrata e la richiesta esplicita dal pannello —
+/// delegano qui, col loro motivo.
+///
+/// Condizionata allo stato E al progetto: si ri-arma solo cio' che era davvero
+/// terminale-fallito, mai due volte, e mai una diagnosi di un altro progetto
+/// (il chiamante HTTP passa l'id dalla URL: senza questa condizione potrebbe
+/// ri-armare righe altrui).
+pub(crate) async fn rearm_diagnosis(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+    diagnosis_id: Uuid,
+    motivo: &str,
+) -> Option<Uuid> {
+    sqlx::query_scalar::<_, Uuid>(
+        "UPDATE service_diagnoses \
+            SET status = $4, remediation_attempts = 0, cooldown_until = NULL, \
+                updated_at = NOW(), \
+                detail = COALESCE(detail, '') || E'\\n\\n' || $3 \
+          WHERE id = $1 AND project_id = $2 AND signal_kind = 'crash' AND status = $5 \
+          RETURNING id",
+    )
+    .bind(diagnosis_id)
+    .bind(project_id)
+    .bind(motivo)
+    .bind(STATO_APERTA)
+    .bind(STATO_FALLITA)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Il motivo scritto sulla diagnosi al ri-armo esplicito dal pannello. Qui e
+/// non nel layer HTTP, perche' il vocabolario dei motivi stia accanto alla
+/// scrittura che li persiste.
+pub(crate) const REARM_EXPLICIT_REASON: &str =
+    "RIPARAZIONE RI-ARMATA su richiesta esplicita dal pannello: nuovo ciclo di verifica \
+     richiesto dall'utente.";
+
+/// Un giro di ri-armo sulle diagnosi FALLITE gia' selezionate, con le aree dei
+/// servizi gia' risolte. Ritorna gli id ri-armati. Separata dall'orchestratore
+/// con `AppState` perche' i test la attraversino sullo schema META reale
+/// (regola O) passando dai produttori veri (`apply_repair_outcome` per la
+/// diagnosi fallita, `record_mutation` per la scrittura).
+pub(crate) async fn rearm_pass(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+    failed: &[FailedDiagnosis],
+    aree: &HashMap<String, Vec<String>>,
+) -> Vec<Uuid> {
+    // Area assente dalla mappa = area non risolta: vale il ripiego dichiarato
+    // di `relative_service_area` (tutto il progetto), per la stessa ragione.
+    let tutto = vec![".".to_string()];
+    let mut riarmate = Vec::new();
+    for diag in failed {
+        let mutations = mutations_since(db, project_id, diag.failed_at).await;
+        if mutations.is_empty() {
+            continue;
+        }
+        let area = aree.get(&diag.unit).unwrap_or(&tutto);
+        let Some(seen) = rearm_evidence(&mutations, area) else {
+            continue;
+        };
+        let motivo = format!(
+            "RIPARAZIONE RI-ARMATA: scrittura registrata su {} alle {}, posteriore al \
+             fallimento: la causa puo' essere cambiata, il ciclo di verifica riparte da capo.",
+            seen.file_path,
+            seen.at.to_rfc3339()
+        );
+        if rearm_diagnosis(db, project_id, diag.id, &motivo).await.is_some() {
+            tracing::info!(
+                unit = %diag.unit, diagnosis_id = %diag.id, file = %seen.file_path,
+                "service_recovery: diagnosi fallita ri-armata da una scrittura sul servizio"
+            );
+            riarmate.push(diag.id);
+        }
+    }
+    riarmate
+}
+
+/// Ri-armo automatico di un progetto: interrogato a ogni ciclo dell'observer
+/// (da [`process_open_service_crashes`], PRIMA della presa in carico, cosi'
+/// una riga ri-armata rientra nel giro immediatamente successivo).
+pub(crate) async fn rearm_failed_remediations(state: &AppState, project_id: Uuid) {
+    let failed = failed_service_diagnoses(&state.db, project_id, MAX_REARM_PER_PASS).await;
+    if failed.is_empty() {
+        return;
+    }
+    let mut aree: HashMap<String, Vec<String>> = HashMap::new();
+    for diag in &failed {
+        if !aree.contains_key(&diag.unit) {
+            let area = service_area(state, project_id, &diag.unit).await;
+            aree.insert(diag.unit.clone(), area);
+        }
+    }
+    let riarmate = rearm_pass(&state.db, project_id, &failed, &aree).await;
+    if !riarmate.is_empty() {
+        crate::project_workspace::logs::emit_problems_panel_refresh(project_id, riarmate);
     }
 }
 
@@ -2291,6 +2579,286 @@ mod tests {
             "diagnosing",
             "il lease di questo processo ha ancora il suo task: non si tocca"
         );
+    }
+
+    // ── Ri-armo su cambiamento della causa ───────────────────────────────────
+
+    /// Produce una diagnosi FALLITA passando dal produttore vero (regola O): una
+    /// riga in verifica chiusa da [`apply_repair_outcome`] con verdetto negativo
+    /// e tentativi esauriti — la stessa strada di `spawn_verifica_esito` e del
+    /// presidio. Poi RETRODATA il fallimento di un minuto, perche' il confronto
+    /// "mutazione posteriore al fallimento" non dipenda dalla risoluzione del
+    /// clock del DB fra due statement consecutivi.
+    async fn diagnosi_fallita(pool: &sqlx::PgPool, project: Uuid, unit: &str) -> Uuid {
+        let id = semina_crash(pool, project, unit, "diagnosing", 3, None).await;
+        let esito = RepairOutcome::Judged {
+            verdict: RecoveryVerdict::NotRecovered(RecoveryFailure::NotStable {
+                phase: FASE_PRIMO_AVVIO,
+            }),
+            retry_left: false,
+        };
+        let scritto = apply_repair_outcome(pool, id, &esito, "evidenza del fallimento").await;
+        assert_eq!(
+            scritto.as_deref(),
+            Some(STATO_FALLITA),
+            "premessa: la diagnosi e' in stato terminale fallito"
+        );
+        sqlx::query(
+            "UPDATE service_diagnoses SET updated_at = updated_at - INTERVAL '1 minute' \
+              WHERE id = $1",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("retrodata il fallimento");
+        id
+    }
+
+    /// Scrive una mutazione col produttore vero (`record_mutation`, regola O):
+    /// gli hash che il criterio confronta sono quelli derivati dai contenuti.
+    async fn scrittura(
+        pool: &sqlx::PgPool,
+        project: Uuid,
+        user: Uuid,
+        path: &str,
+        before: Option<&str>,
+        after: Option<&str>,
+    ) {
+        crate::file_mutations::record_mutation(
+            pool,
+            project,
+            None,
+            Some(Uuid::new_v4()),
+            Some(user),
+            path,
+            "write_file",
+            before,
+            after,
+            crate::file_mutations::ScopeAudit::none(),
+        )
+        .await
+        .expect("mutazione registrata");
+    }
+
+    /// IL CASO DEL MANDATO (bacheca-attivita, 31/07/2026): il css viene corretto
+    /// da un run successivo, e la diagnosi FALLITA deve tornare ammissibile al
+    /// ciclo di verifica — `open`, tentativi azzerati, cooldown rimosso, motivo
+    /// scritto — e rientrare nella selezione del presidio.
+    ///
+    /// MUTAZIONE: rompendo il ri-armo — [`rearm_evidence`] che ignora
+    /// [`WriteFact::cambia_il_contenuto`] e ritorna `None`, oppure il watermark
+    /// invertito in [`mutations_since`] (`created_at < $2`) — questo test
+    /// rosseggia sulla prima asserzione, col valore del difetto reale: il
+    /// servizio resta spento con una diagnosi fallita stantia mentre il codice
+    /// e' sano.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn una_scrittura_sul_servizio_riarma_la_diagnosi_fallita(pool: sqlx::PgPool) {
+        let (user, project) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let unit = "bacheca-attivita-frontend.service";
+        let id = diagnosi_fallita(&pool, project, unit).await;
+
+        // La correzione: contenuto DIVERSO, dentro l'area del servizio.
+        scrittura(
+            &pool,
+            project,
+            user,
+            "frontend/src/style.css",
+            Some(".x{color:red;;}"),
+            Some(".x{color:red}"),
+        )
+        .await;
+
+        let failed = failed_service_diagnoses(&pool, project, MAX_REARM_PER_PASS).await;
+        assert_eq!(failed.len(), 1, "la diagnosi fallita e' candidata al ri-armo");
+        let aree = HashMap::from([(unit.to_string(), vec!["frontend".to_string()])]);
+        assert_eq!(
+            rearm_pass(&pool, project, &failed, &aree).await,
+            vec![id],
+            "una scrittura efficace nell'area del servizio ri-arma la diagnosi"
+        );
+
+        let (status, detail, attempts) = stato_di(&pool, id).await;
+        assert_eq!(status, "open");
+        assert_eq!(attempts, 0, "la causa e' cambiata: il nuovo ciclo ha i suoi tentativi");
+        let detail = detail.unwrap_or_default();
+        assert!(
+            detail.contains("RI-ARMATA") && detail.contains("frontend/src/style.css"),
+            "il motivo del ri-armo resta scritto sulla riga: {detail}"
+        );
+        let cooldown: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT cooldown_until FROM service_diagnoses WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("cooldown");
+        assert!(cooldown.is_none(), "il segnale e' un fatto nuovo, non un retry in attesa");
+
+        // Il cerchio si chiude: la riga rientra nella selezione del presidio.
+        let pending = pending_service_crashes(&pool, project, 10, 1800).await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id);
+    }
+
+    /// I due NON-segnali: una riscrittura a contenuto IDENTICO (l'attivita' che
+    /// non produce niente, il caso che `cambia_il_contenuto` esiste per vedere)
+    /// e una scrittura ANTERIORE al fallimento (il lavoro che il fallimento ha
+    /// gia' giudicato). Nessuno dei due deve riaprire il ciclo: un ri-armo su
+    /// questi sarebbe il retry cieco che la regola H vieta, solo travestito.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn riscritture_identiche_e_scritture_anteriori_non_riarmano(pool: sqlx::PgPool) {
+        let (user, project) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let unit = "app-frontend.service";
+
+        // Scrittura ANTERIORE (efficace, in area): registrata PRIMA che il
+        // fallimento venga timbrato, quindi gia' compresa nel giudizio.
+        scrittura(
+            &pool,
+            project,
+            user,
+            "frontend/vite.config.js",
+            Some("export default {}"),
+            Some("export default { server: {} }"),
+        )
+        .await;
+        // Il fallimento arriva DOPO quella scrittura; niente retrodatazione qui,
+        // il watermark deve restare successivo alla mutazione.
+        let id = semina_crash(&pool, project, unit, "diagnosing", 3, None).await;
+        let esito = RepairOutcome::Judged {
+            verdict: RecoveryVerdict::NotRecovered(RecoveryFailure::NotStable {
+                phase: FASE_PRIMO_AVVIO,
+            }),
+            retry_left: false,
+        };
+        assert_eq!(
+            apply_repair_outcome(&pool, id, &esito, "fallita dopo la scrittura")
+                .await
+                .as_deref(),
+            Some(STATO_FALLITA)
+        );
+
+        // Riscrittura POSTERIORE ma IDENTICA: il write c'e', il contenuto no.
+        scrittura(
+            &pool,
+            project,
+            user,
+            "frontend/src/style.css",
+            Some(".x{color:red}"),
+            Some(".x{color:red}"),
+        )
+        .await;
+
+        let failed = failed_service_diagnoses(&pool, project, MAX_REARM_PER_PASS).await;
+        let aree = HashMap::from([(unit.to_string(), vec!["frontend".to_string()])]);
+        assert!(
+            rearm_pass(&pool, project, &failed, &aree).await.is_empty(),
+            "ne' la scrittura anteriore ne' la riscrittura identica sono un segnale"
+        );
+        assert_eq!(stato_di(&pool, id).await.0, STATO_FALLITA);
+    }
+
+    /// L'AREA decide: la stessa scrittura efficace ri-arma il servizio la cui
+    /// area la contiene e NON quello di un'altra area. Con area ignota (`"."`)
+    /// qualunque scrittura del progetto e' ammissibile — dichiarato, non lasco:
+    /// il contratto a valle verifica comunque sul servizio vero.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn una_scrittura_fuori_dall_area_del_servizio_non_riarma(pool: sqlx::PgPool) {
+        let (user, project) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let unit = "app-frontend.service";
+        let id = diagnosi_fallita(&pool, project, unit).await;
+
+        scrittura(
+            &pool,
+            project,
+            user,
+            "backend/server.js",
+            Some("const p = 1;"),
+            Some("const p = 2;"),
+        )
+        .await;
+
+        let failed = failed_service_diagnoses(&pool, project, MAX_REARM_PER_PASS).await;
+        let stretta = HashMap::from([(unit.to_string(), vec!["frontend".to_string()])]);
+        assert!(
+            rearm_pass(&pool, project, &failed, &stretta).await.is_empty(),
+            "una scrittura sul backend non dice niente del frontend"
+        );
+        assert_eq!(stato_di(&pool, id).await.0, STATO_FALLITA);
+
+        // Stessa scrittura, area ignota: il segnale e' ammissibile.
+        let tutto = HashMap::from([(unit.to_string(), vec![".".to_string()])]);
+        assert_eq!(rearm_pass(&pool, project, &failed, &tutto).await, vec![id]);
+        assert_eq!(stato_di(&pool, id).await.0, "open");
+    }
+
+    /// Il ri-armo ESPLICITO dal pannello: la richiesta umana e' il segnale
+    /// strutturato, ma vale solo per una diagnosi davvero in stato terminale
+    /// fallito e davvero di quel progetto.
+    ///
+    /// MUTAZIONE: togliendo da [`rearm_diagnosis`] la condizione sullo stato
+    /// (`AND status = 'failed_remediation'`) rosseggia la prima asserzione — e
+    /// il difetto sarebbe un bottone capace di strappare una riga a un rimedio
+    /// in corso; togliendo quella sul progetto rosseggia l'ultima, e il difetto
+    /// sarebbe un endpoint che ri-arma diagnosi altrui.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_ritentativo_esplicito_riarma_solo_una_diagnosi_fallita(pool: sqlx::PgPool) {
+        let (_user, project) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let aperta = semina_crash(&pool, project, "app-aperta.service", "open", 0, None).await;
+        assert!(
+            rearm_diagnosis(&pool, project, aperta, REARM_EXPLICIT_REASON)
+                .await
+                .is_none(),
+            "una diagnosi non fallita non si ri-arma: non c'e' niente da riaprire"
+        );
+        assert_eq!(stato_di(&pool, aperta).await.0, "open");
+
+        let fallita = diagnosi_fallita(&pool, project, "app-rotta.service").await;
+        assert_eq!(
+            rearm_diagnosis(&pool, project, fallita, REARM_EXPLICIT_REASON).await,
+            Some(fallita)
+        );
+        let (status, detail, attempts) = stato_di(&pool, fallita).await;
+        assert_eq!(status, "open");
+        assert_eq!(attempts, 0);
+        assert!(detail.unwrap_or_default().contains("richiesta esplicita"));
+
+        // Progetto sbagliato: la riga non si tocca.
+        let altra = diagnosi_fallita(&pool, project, "app-altra.service").await;
+        assert!(
+            rearm_diagnosis(&pool, Uuid::new_v4(), altra, REARM_EXPLICIT_REASON)
+                .await
+                .is_none()
+        );
+        assert_eq!(stato_di(&pool, altra).await.0, STATO_FALLITA);
+    }
+
+    /// L'area del servizio dalla working dir registrata: relativa alla root,
+    /// robusta a separatori e case di Windows, col confine di SEGMENTO (una
+    /// root `d:/proj` non contiene `d:/proj-x`). Working dir ignota, uguale
+    /// alla root o fuori root -> `"."`, il ripiego dichiarato.
+    #[test]
+    fn l_area_del_servizio_e_relativa_alla_root() {
+        assert_eq!(
+            relative_service_area(Some(r"D:\proj\frontend"), r"D:\proj"),
+            vec!["frontend".to_string()]
+        );
+        assert_eq!(
+            relative_service_area(Some(r"d:\PROJ\Frontend\"), r"D:\proj"),
+            vec!["frontend".to_string()],
+            "il filesystem di Windows e' case-insensitive: l'area deve esserlo"
+        );
+        for (wd, root) in [
+            (None, r"D:\proj"),
+            (Some(r"D:\proj"), r"D:\proj"),
+            (Some(r"C:\altro\posto"), r"D:\proj"),
+            (Some(r"D:\proj-x\api"), r"D:\proj"),
+            (Some(r"D:\proj\x"), ""),
+        ] {
+            assert_eq!(
+                relative_service_area(wd, root),
+                vec![".".to_string()],
+                "area non determinabile ({wd:?}, {root:?}): tutto il progetto"
+            );
+        }
     }
 
     /// Il caso reale del mandato in forma pura: il servizio risponde e poi
