@@ -35,6 +35,16 @@ impl Classifier {
                         Some("Test Playwright falliti".into()),
                         Some(("playwright".into(), 1)),
                     ),
+                    // Instabile: i test falliti sono ripassati alla
+                    // riesecuzione mirata a codice invariato. Va detto, perche'
+                    // e' un debito di test reale, ma NON come un errore e senza
+                    // badge: il badge chiama a correggere, e qui non c'e' nulla
+                    // da correggere nell'applicazione.
+                    "flaky" => (
+                        Some("info".into()),
+                        Some("Test Playwright instabili (flaky)".into()),
+                        None,
+                    ),
                     _ => (None, None, None),
                 };
                 Some(UiHint {

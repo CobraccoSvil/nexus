@@ -1593,6 +1593,40 @@ else
   fail=1
 fi
 
+# L'esito di una suite di test nasce in UN punto (2026-08-01)
+#
+# La stessa suite veniva eseguita da TRE attori che non si riconoscevano
+# (final_gate come criterio, agente con run_playwright_tests, ciclo review dopo
+# ogni rimando): 53 esecuzioni in una serata sulla stessa app, 31 rosse e 21
+# verdi, perche' l'esito non era legato allo stato del codice e un rosso
+# instabile veniva letto come difetto reale. Il vocabolario dell'esito, la
+# classificazione e la chiave di stato devono restare in un posto solo: se
+# ricompaiono altrove, il prossimo consumatore torna a rispondersi da se'.
+assert_single "suite-outcome" 'enum SuiteOutcome' \
+  'crates/mcp-core/src/suite_verification/mod.rs' crates
+assert_single "suite-classifica-esito" 'fn classifica_esito' \
+  'crates/mcp-core/src/suite_verification/mod.rs' crates
+assert_single "suite-riconoscimento" 'fn e_suite_playwright' \
+  'crates/mcp-core/src/suite_verification/mod.rs' crates
+assert_single "suite-chiave-di-stato" 'fn digest_albero' \
+  'crates/mcp-core/src/suite_verification/state_key.rs' crates
+
+# Il guard che conta: gli artefatti del runner NON entrano nella chiave di
+# stato. Playwright riscrive `test-results/` e `playwright-report/` a ogni
+# esecuzione: contarli renderebbe la chiave diversa subito dopo ogni run, la
+# memoria non risponderebbe MAI e il presidio sarebbe inerte pur essendo tutto
+# scritto e testato — la forma di guasto che non si vede (regola O).
+for _dir in test-results playwright-report; do
+  if ! grep -q "\"$_dir\"" crates/mcp-core/src/suite_verification/state_key.rs; then
+    echo "!! chiave-di-stato: '$_dir' non e' fra le DIRECTORY_ESCLUSE." >&2
+    echo "   Il runner riscrive quella directory a ogni esecuzione: senza" >&2
+    echo "   l'esclusione la chiave cambia dopo ogni run e la memoria degli" >&2
+    echo "   esiti diventa inerte in silenzio." >&2
+    fail=1
+  fi
+done
+[[ "$fail" -eq 0 ]] && echo "OK chiave-di-stato: gli artefatti del runner restano fuori dalla chiave"
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

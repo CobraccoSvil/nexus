@@ -9,7 +9,7 @@ import { OptimizationPanel } from "./optimization-panel";
 import { MonitorPanel } from "./monitor-panel";
 import { RunPanel } from "./run-panel";
 import { SecurityPanel } from "./security-panel";
-import { promptFromPlaywrightRun, promptFromProblem, promptEnablePlaywright, promptRunPlaywrightTests } from "../../lib/chat-prompts";
+import { promptFromPlaywrightRun, promptFromFlakyPlaywrightRun, promptFromProblem, promptEnablePlaywright, promptRunPlaywrightTests } from "../../lib/chat-prompts";
 import type {
   AITraceEvent,
   OutputChannel,
@@ -667,10 +667,23 @@ export function BottomPanelManager({
               // suite vuota andata bene). Assente sui run pre-fix: in quel
               // caso il rendering resta quello legacy.
               const isSetupFailed = run.outcome === "setup_failed";
-              const statusLabel = isSetupFailed ? "setup fallito" : run.status;
+              // Un rosso NON riprodotto (i test falliti ripassano alla
+              // riesecuzione mirata, a codice invariato) e' un debito di TEST,
+              // non un difetto dell'app: ha un esito proprio e non deve
+              // apparire come fallimento — era il rosso che mandava il
+              // correttore a modificare codice sano.
+              const isFlaky = run.outcome === "flaky" || run.status === "flaky";
+              const flakyTests = Array.isArray(run.flakyTests) ? run.flakyTests : [];
+              const statusLabel = isSetupFailed
+                ? "setup fallito"
+                : isFlaky
+                  ? "instabile (flaky)"
+                  : run.status;
               const statusColor = isSetupFailed
                 ? "#f59e0b"
-                : run.status === "passed" ? "#10b981" : run.status === "failed" ? tc.error : tc.textMuted;
+                : isFlaky
+                  ? "#a855f7"
+                  : run.status === "passed" ? "#10b981" : run.status === "failed" ? tc.error : tc.textMuted;
               return (
               <div key={run.id} style={tileStyle(tc)}>
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
@@ -701,6 +714,31 @@ export function BottomPanelManager({
                   >
                     I test non sono mai partiti — {stripAnsi(run.failureCause)}
                   </div>
+                ) : isFlaky ? (
+                  <div
+                    style={{
+                      color: tc.textSecondary,
+                      fontSize: 12,
+                      marginTop: 6,
+                      padding: "6px 8px",
+                      borderLeft: "3px solid #a855f7",
+                      background: "rgba(168,85,247,0.08)",
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                      lineHeight: 1.45,
+                    }}
+                  >
+                    Test instabili: falliti alla prima esecuzione, ripassati alla riesecuzione
+                    mirata a codice invariato. E&apos; un debito di test, non un difetto
+                    dell&apos;applicazione.
+                    {flakyTests.length > 0 && (
+                      <div style={{ marginTop: 4, fontFamily: "var(--font-mono)", fontSize: 11 }}>
+                        {flakyTests.map((t) => (
+                          <div key={t}>· {stripAnsi(t)}</div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 ) : run.summary && (
                   <div
                     style={{
@@ -723,6 +761,31 @@ export function BottomPanelManager({
                   <PlaywrightArtifacts artifacts={run.artifacts} projectId={project.id} tc={tc} />
                 )}
                 <div style={{ color: tc.textMuted, fontSize: 11, marginTop: 6 }}>{new Date(run.createdAt).toLocaleString()}</div>
+                {onSendToChat && isFlaky && (
+                  <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
+                    <button
+                      onClick={() => {
+                        onSendToChat(promptFromFlakyPlaywrightRun(run));
+                      }}
+                      title="Chiedi a Nexus di stabilizzare i test instabili (senza toccare la logica dell'app)"
+                      style={{
+                        background: "rgba(168,85,247,0.85)",
+                        color: "#fff",
+                        border: "none",
+                        borderRadius: 3,
+                        padding: "0 6px",
+                        fontSize: 10,
+                        cursor: "pointer",
+                        verticalAlign: "middle",
+                        lineHeight: "16px",
+                        height: 16,
+                        fontWeight: 600,
+                      }}
+                    >
+                      ↗ stabilizza i test
+                    </button>
+                  </div>
+                )}
                 {onSendToChat && run.status === "failed" && (
                   <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
                     <button

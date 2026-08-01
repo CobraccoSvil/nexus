@@ -10,25 +10,26 @@
 //! 3. Se `base_url` è passato esplicitamente → usa quello (override).
 //! 4. Se non c'è nessuna porta allocata → usa la baseURL in playwright.config.ts
 //!    (o il default 3000).
-//! 5. Se la porta bersaglio e' legata a una unit di servizio del progetto,
-//!    attende che risponda STABILMENTE (contratto della remediation,
-//!    `service_recovery::await_port_ready`) entro
-//!    `agent.playwright.readiness_timeout_seconds`; scaduta la finestra:
-//!    setup_failed "servizio non pronto", la suite non parte mai a freddo.
-//! 6. Inietta `BASE_URL` come variabile d'ambiente e lancia `npx playwright test`.
-//! 7. Salva il risultato in `jobs` (kind = "playwright_test") per il pannello Playwright.
+//! 5. Inietta `BASE_URL` come variabile d'ambiente e lancia `npx playwright test`.
+//! 6. Salva il risultato in `jobs` (kind = "playwright_test") per il pannello Playwright.
 
 use super::*;
+use crate::suite_verification::{SuiteOutcome, SuiteStats};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
-const PLAYWRIGHT_DEFAULT_TIMEOUT: u64 = 600;
+/// Tetto di default di una esecuzione di suite: lo stesso numero che il punto
+/// unico impone come pavimento a chi delega da un contesto piu' stretto (il
+/// final gate). Due costanti separate sarebbero divergite alla prima modifica.
+const PLAYWRIGHT_DEFAULT_TIMEOUT: u64 = crate::suite_verification::TIMEOUT_SUITE_DEFAULT_S;
 const PLAYWRIGHT_MAX_TIMEOUT: u64 = 900;
 
 /// Finestra massima (secondi) in cui il runner attende che il servizio
 /// bersaglio della suite risponda stabilmente PRIMA di lanciare i test.
 /// Setting DB (regola G), default veicolato dalla migrazione 0662.
 const PLAYWRIGHT_READINESS_KEY: &str = "agent.playwright.readiness_timeout_seconds";
+/// Ripiego se il setting manca dal DB: la migrazione 0662 lo veicola, ma un DB
+/// non ancora migrato non deve trasformare il gate in un blocco infinito.
 const DEFAULT_TARGET_READINESS_SECONDS: u64 = 60;
 
 /// Pre-flight check: lancia `ldd` sul binary chromium-headless-shell di
@@ -925,6 +926,504 @@ async fn flush_playwright_log(
         .await;
 }
 
+/// Contesto minimo per ESEGUIRE una suite, costruibile sia dal ctx dei tool
+/// (percorso dell'agente) sia dall'adapter dei criteri del final gate.
+///
+/// E' cio' che ha reso possibile far convergere i tre esecutori su UN solo
+/// runner (regola L): prima il gate lanciava la suite dal tool `run_command`
+/// generico — senza `BASE_URL` dalle porte allocate, senza riga `jobs`, senza
+/// nulla che potesse riconoscere l'esecuzione dell'agente — e l'agente la
+/// lanciava da qui. Due esecuzioni della stessa suite che non si vedevano.
+#[derive(Clone)]
+pub(crate) struct SuiteEnv {
+    /// Pool META: porte allocate, settings, risoluzione del pool di progetto.
+    pub meta_db: sqlx::PgPool,
+    pub project_id: Uuid,
+    /// Radice su cui la suite gira: la playwright root per il tool, la radice
+    /// del run per il gate.
+    pub root: std::path::PathBuf,
+    /// Canali live: `None` fuori dal percorso dei tool (il gate non ha un
+    /// consumatore SSE agganciato). La riga `jobs` si scrive comunque — e' il
+    /// registro, non la diretta.
+    pub playwright_channels: Option<crate::playwright_live::PlaywrightChannels>,
+    pub project_channels: Option<nexus_events::ProjectChannels>,
+}
+
+impl SuiteEnv {
+    /// Dal contesto dei tool (percorso agente).
+    pub(crate) fn dal_ctx(ctx: &AgentToolContext, root: std::path::PathBuf) -> Self {
+        Self {
+            meta_db: (*ctx.db).clone(),
+            project_id: ctx.project_id,
+            root,
+            playwright_channels: Some(ctx.playwright_channels.clone()),
+            project_channels: Some(ctx.project_channels.clone()),
+        }
+    }
+}
+
+/// L'UNICO esecutore reale di una suite Playwright (impl di
+/// [`crate::suite_verification::SuiteExecutor`]).
+pub(crate) struct PlaywrightProcessExecutor {
+    env: SuiteEnv,
+}
+
+impl PlaywrightProcessExecutor {
+    pub(crate) fn new(env: SuiteEnv) -> Self {
+        Self { env }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::suite_verification::SuiteExecutor for PlaywrightProcessExecutor {
+    async fn esegui(
+        &self,
+        inv: &crate::suite_verification::SuiteInvocation,
+    ) -> Result<crate::suite_verification::SuiteRun, String> {
+        esegui_processo_suite(&self.env, inv).await
+    }
+}
+
+/// Annuncia ai pannelli l'esito FINALE quando la classificazione ha spostato
+/// cio' che il runner aveva misurato (l'unico caso reale: `flaky`). Senza,
+/// l'ultimo evento emesso resterebbe quello del runner — "test falliti" — e il
+/// pannello mostrerebbe rosso un run gia' riconosciuto instabile.
+struct AnnuncioAiPannelli {
+    env: SuiteEnv,
+}
+
+#[async_trait::async_trait]
+impl crate::suite_verification::EsitoAnnunciato for AnnuncioAiPannelli {
+    async fn annuncia(
+        &self,
+        job_id: Uuid,
+        outcome: crate::suite_verification::SuiteOutcome,
+        test_instabili: &[String],
+    ) {
+        let Some(pc) = &self.env.project_channels else {
+            return;
+        };
+        let label = if test_instabili.is_empty() {
+            "Test instabili (flaky)".to_string()
+        } else {
+            format!("{} test instabili (flaky)", test_instabili.len())
+        };
+        nexus_events::dispatcher::emit(
+            pc,
+            self.env.project_id,
+            nexus_events::event::ProjectEvent::JobCreated {
+                id: job_id,
+                job_kind: "playwright_test".to_string(),
+                status: outcome.job_status().to_string(),
+                label,
+                summary: Some(
+                    "Falliti alla prima esecuzione, ripassati alla riesecuzione mirata a \
+                     codice invariato: debito di test, non difetto dell'applicazione."
+                        .to_string(),
+                ),
+                artifacts: serde_json::Value::Null,
+            },
+        );
+    }
+}
+
+/// Costruisce le dipendenze della verifica (esecutore + memoria + chiave +
+/// policy). Punto unico della composizione: i chiamanti non scelgono quale
+/// memoria o quale chiave usare, le ricevono.
+///
+/// `root_chiave` e' distinta da `env.root` di proposito: si ESEGUE dove sta la
+/// configurazione Playwright (che puo' essere una sottodirectory), ma si
+/// CHIAVE sul codice che i test esercitano, cioe' la radice del run. Una chiave
+/// calcolata sulla sola `app/` riuserebbe l'esito dopo una modifica al backend
+/// che sta accanto.
+pub(crate) async fn suite_deps(
+    env: SuiteEnv,
+    root_chiave: std::path::PathBuf,
+) -> crate::suite_verification::SuiteDeps {
+    use crate::suite_verification::{state_key::ChiaveAlberoEServizi, SuiteDeps, SuitePolicy};
+
+    let policy = SuitePolicy::dal_db(&env.meta_db).await;
+    // La memoria vive nel DB del PROGETTO (tabella `jobs`): se non e'
+    // raggiungibile la verifica prosegue senza memoria — riesegue, che e' il
+    // comportamento sicuro — invece di fallire.
+    let memo: Option<std::sync::Arc<dyn crate::suite_verification::SuiteMemo>> =
+        match crate::project_db_routes::project_data_pool_from(&env.meta_db, env.project_id).await {
+            Ok(pool) => Some(std::sync::Arc::new(
+                crate::suite_verification::memo::PgSuiteMemo::new(pool, env.project_id),
+            )),
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %env.project_id,
+                    error = %e,
+                    "verifica suite: DB del progetto non disponibile, nessuna memoria degli esiti"
+                );
+                None
+            }
+        };
+    let chiave = std::sync::Arc::new(ChiaveAlberoEServizi::new(
+        root_chiave,
+        env.meta_db.clone(),
+        env.project_id,
+    ));
+    let annuncio: Option<std::sync::Arc<dyn crate::suite_verification::EsitoAnnunciato>> =
+        env.project_channels.as_ref().map(|_| {
+            std::sync::Arc::new(AnnuncioAiPannelli { env: env.clone() })
+                as std::sync::Arc<dyn crate::suite_verification::EsitoAnnunciato>
+        });
+    SuiteDeps {
+        executor: std::sync::Arc::new(PlaywrightProcessExecutor::new(env)),
+        memo,
+        chiave,
+        policy,
+        annuncio,
+    }
+}
+
+/// Ambiente della suite: porte allocate al progetto, BASE_URL del dev server e
+/// BACKEND_API_URL per il global-setup. E' la parte che il gate non aveva
+/// quando lanciava la suite dal tool `run_command` generico — e una suite E2E
+/// che non sa a quale porta bussare fallisce per ragioni proprie.
+async fn ambiente_della_suite(env: &SuiteEnv) -> AmbienteSuite {
+    let port_rows: Vec<(i32, String)> = sqlx::query_as(
+        "SELECT port, label FROM nexus_port_allocations WHERE project_id = $1 ORDER BY port ASC",
+    )
+    .bind(env.project_id)
+    .fetch_all(&env.meta_db)
+    .await
+    .unwrap_or_default();
+
+    let base_url = determine_base_url(None, &port_rows).await;
+    let backend_api_url = {
+        let dev_port = base_url.as_ref().and_then(|u| port_from_localhost_url(u));
+        pick_backend_port(&port_rows, dev_port).map(|p| format!("http://127.0.0.1:{}", p))
+    };
+    AmbienteSuite {
+        port_rows,
+        base_url,
+        backend_api_url,
+    }
+}
+
+/// Porte del progetto e URL iniettati alla suite.
+struct AmbienteSuite {
+    port_rows: Vec<(i32, String)>,
+    base_url: Option<String>,
+    backend_api_url: Option<String>,
+}
+
+/// Cio' che il processo ha prodotto, prima di ogni interpretazione.
+struct OutputProcesso {
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    live_progress: crate::playwright_live::PlaywrightProgress,
+}
+
+/// Apre la riga `jobs` dell'esecuzione e il canale live. La riesecuzione mirata
+/// ha una sua riga ed e' etichettata come tale: e' un'esecuzione reale e
+/// nasconderla renderebbe il pannello incoerente col numero di run avvenuti —
+/// ma non porta chiave, quindi la memoria non la puo' scambiare per l'esito di
+/// una suite.
+async fn apri_job_della_suite(
+    env: &SuiteEnv,
+    inv: &crate::suite_verification::SuiteInvocation,
+    proj_pool: &sqlx::PgPool,
+) -> (
+    Uuid,
+    crate::playwright_live::PlaywrightChannels,
+    tokio::sync::broadcast::Sender<crate::playwright_live::PlaywrightEvent>,
+) {
+    use crate::suite_verification::ScopoEsecuzione;
+
+    let job_id = Uuid::new_v4();
+    let (etichetta, scopo) = match inv.scopo {
+        ScopoEsecuzione::Suite => ("Run in corso...", "suite"),
+        ScopoEsecuzione::RiesecuzioneMirata => (
+            "Riesecuzione mirata (classificazione flaky)...",
+            "targeted_rerun",
+        ),
+    };
+    let _ = sqlx::query(
+        "INSERT INTO jobs (id, project_id, kind, status, input, progress, output_log) \
+         VALUES ($1, $2, 'playwright_test', 'running', $3, '{}'::jsonb, '')",
+    )
+    .bind(job_id)
+    .bind(env.project_id)
+    .bind(serde_json::json!({
+        "label": etichetta,
+        "command": inv.command,
+        "started_at": chrono::Utc::now().to_rfc3339(),
+        "scopo": scopo,
+    }))
+    .execute(proj_pool)
+    .await;
+
+    let channels = env
+        .playwright_channels
+        .clone()
+        .unwrap_or_else(crate::playwright_live::new_channels);
+    let live_tx = crate::playwright_live::register(&channels, job_id);
+    annuncia_job_avviato(env, job_id, etichetta);
+    (job_id, channels, live_tx)
+}
+
+/// Notifica al pannello che una esecuzione e' partita (la lista si aggiorna
+/// subito, senza attendere l'esito).
+fn annuncia_job_avviato(env: &SuiteEnv, job_id: Uuid, etichetta: &str) {
+    let Some(pc) = &env.project_channels else {
+        return;
+    };
+    nexus_events::dispatcher::emit(
+        pc,
+        env.project_id,
+        nexus_events::event::ProjectEvent::JobCreated {
+            id: job_id,
+            job_kind: "playwright_test".to_string(),
+            status: "running".to_string(),
+            label: etichetta.to_string(),
+            summary: None,
+            artifacts: serde_json::Value::Null,
+        },
+    );
+}
+
+/// Esegue UNA volta il processo della suite: ambiente (BASE_URL/BACKEND_API_URL
+/// dalle porte allocate), riga `jobs` con progresso live, parsing dei conteggi,
+/// artefatti. NON classifica e non consulta la memoria: quelle sono decisioni
+/// del punto unico [`crate::suite_verification`].
+async fn esegui_processo_suite(
+    env: &SuiteEnv,
+    inv: &crate::suite_verification::SuiteInvocation,
+) -> Result<crate::suite_verification::SuiteRun, String> {
+    use crate::suite_verification::SuiteRun;
+
+    let root = radice_di_esecuzione(env, inv)?;
+
+    // Separazione DB per-progetto: il pool va risolto PRIMA dello spawn (nessun
+    // child orfano non monitorato).
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&env.meta_db, env.project_id)
+            .await
+            .map_err(|e| format!("DB del progetto non disponibile: {e}"))?;
+
+    let amb = ambiente_della_suite(env).await;
+
+    // ── Readiness del servizio bersaglio ─────────────────────────────────────
+    // Una suite lanciata a t+0 da un riavvio trova una porta che risponde ma un
+    // servizio ancora freddo (Vite che ritrasforma le dipendenze): il giro e'
+    // destinato al rosso flaky, e i suoi rossi fabbricano cicli di correzione
+    // su codice sano. Se il bersaglio non risponde stabilmente entro la
+    // finestra, l'esito e' un setup_failed con la causa — la suite NON parte.
+    // La memoria della verifica non resta avvelenata dal servizio giu': la
+    // chiave di stato include la generazione dei servizi vivi, e il riavvio
+    // del servizio la invalida da se'.
+    if let Some(cause) =
+        await_target_service_ready(&env.meta_db, env.project_id, amb.base_url.as_deref()).await
+    {
+        return Ok(setup_failed_bersaglio_non_pronto(env, inv, &proj_pool, &cause).await);
+    }
+
+    corsa_del_processo(env, inv, &root, &amb, &proj_pool).await
+}
+
+/// La corsa vera e propria: spawn del processo, job registrato, attesa con
+/// monitoraggio live, statistiche, finalize e report. Separata
+/// dall'orchestrazione (pool, ambiente, gate di readiness) che sta in
+/// [`esegui_processo_suite`].
+async fn corsa_del_processo(
+    env: &SuiteEnv,
+    inv: &crate::suite_verification::SuiteInvocation,
+    root: &std::path::Path,
+    amb: &AmbienteSuite,
+    proj_pool: &sqlx::PgPool,
+) -> Result<crate::suite_verification::SuiteRun, String> {
+    use crate::suite_verification::SuiteRun;
+
+    tracing::info!(
+        command = %inv.command,
+        root = %root.display(),
+        scopo = ?inv.scopo,
+        "verifica suite: avvio comando"
+    );
+
+    let mut child = spawn_playwright_child(
+        &inv.command,
+        root,
+        amb.base_url.as_deref(),
+        amb.backend_api_url.as_deref(),
+    )
+    .map_err(|e| format!("errore avvio processo: {e}"))?;
+
+    let (job_id, channels, _live_tx) = apri_job_della_suite(env, inv, proj_pool).await;
+    let out =
+        attendi_processo_suite(&mut child, proj_pool, job_id, &channels, inv.timeout_s).await?;
+
+    let stats = parse_playwright_output_stats(&out.stdout, &out.stderr);
+    finalize_playwright_job(
+        env,
+        proj_pool,
+        job_id,
+        out.exit_code,
+        &stats,
+        &out.live_progress,
+        &collect_playwright_artifacts(root, &env.root),
+        &inv.command,
+        &out.stdout,
+        &out.stderr,
+    )
+    .await;
+
+    Ok(SuiteRun {
+        exit_code: out.exit_code,
+        testo: format_playwright_run_output(root, amb, &inv.command, out.exit_code, &stats, &out),
+        stats,
+        job_id: Some(job_id),
+    })
+}
+
+/// Chiude la corsa SENZA lanciare la suite quando il bersaglio non e' pronto:
+/// registra il job (punto unico [`apri_job_della_suite`]) e lo finalizza lungo
+/// la stessa catena dell'esito reale (regola O): exit -1 e zero test eseguiti
+/// => `classifica_esito` lo dice setup_failed, e la causa viaggia nel canale
+/// che `extract_failure_cause` legge.
+async fn setup_failed_bersaglio_non_pronto(
+    env: &SuiteEnv,
+    inv: &crate::suite_verification::SuiteInvocation,
+    proj_pool: &sqlx::PgPool,
+    cause: &str,
+) -> crate::suite_verification::SuiteRun {
+    let (job_id, _channels, _live_tx) = apri_job_della_suite(env, inv, proj_pool).await;
+    finalize_playwright_job(
+        env,
+        proj_pool,
+        job_id,
+        Some(-1),
+        &SuiteStats::default(),
+        &crate::playwright_live::PlaywrightProgress::default(),
+        &[],
+        &inv.command,
+        "",
+        cause,
+    )
+    .await;
+    crate::suite_verification::SuiteRun {
+        exit_code: Some(-1),
+        stats: SuiteStats::default(),
+        testo: format!(
+            "[run_playwright_tests] Setup fallito, suite NON lanciata: {cause}.\n\
+             Un giro di test partito ora produrrebbe rossi flaky su codice sano.\n\
+             Verifica il servizio dal pannello Servizi (o riavvialo con \
+             run_service), attendi che risponda e rilancia i test."
+        ),
+        job_id: Some(job_id),
+    }
+}
+
+/// Radice su cui l'invocazione gira: la `working_dir` risolta sotto la radice
+/// del run (il traversal e' bloccato da `resolve_relative_path`), o la radice
+/// stessa.
+fn radice_di_esecuzione(
+    env: &SuiteEnv,
+    inv: &crate::suite_verification::SuiteInvocation,
+) -> Result<std::path::PathBuf, String> {
+    match inv.working_dir.as_deref() {
+        Some(wd) if !wd.is_empty() => resolve_relative_path(&env.root, wd)
+            .map_err(|_| format!("working_dir '{wd}' fuori dalla radice del run")),
+        _ => Ok(env.root.clone()),
+    }
+}
+
+/// Attende il processo drenando stdout (parsing live + flush del log) e stderr
+/// IN PARALLELO a `child.wait()`: senza, la pipe si riempie (~64 KB) e l'attesa
+/// non ritorna mai. Ritorna `(exit_code, stdout, stderr, progresso live)`.
+///
+/// Un'attesa che non si conclude CHIUDE la riga `jobs`: prima restava `running`
+/// per sempre, e il pannello mostrava come suite ancora in corso un processo
+/// gia' ucciso.
+async fn attendi_processo_suite(
+    child: &mut tokio::process::Child,
+    proj_pool: &sqlx::PgPool,
+    job_id: Uuid,
+    channels: &crate::playwright_live::PlaywrightChannels,
+    timeout_s: u64,
+) -> Result<OutputProcesso, String> {
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+    let stdout_task = tokio::spawn(stream_playwright_stdout(
+        stdout_handle,
+        proj_pool.clone(),
+        channels.clone(),
+        job_id,
+    ));
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut err) = stderr_handle {
+            let _ = err.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+
+    let exit_code = esito_del_processo(child, proj_pool, job_id, timeout_s).await?;
+
+    let (stdout_bytes, live_progress) = stdout_task.await.unwrap_or_else(|_| {
+        (
+            Vec::new(),
+            crate::playwright_live::PlaywrightProgress::default(),
+        )
+    });
+    let stderr_bytes = stderr_task.await.unwrap_or_default();
+    Ok(OutputProcesso {
+        exit_code,
+        stdout: String::from_utf8_lossy(&stdout_bytes).to_string(),
+        stderr: String::from_utf8_lossy(&stderr_bytes).to_string(),
+        live_progress,
+    })
+}
+
+/// Attende la fine del processo entro il tetto. Un'attesa che non si conclude
+/// CHIUDE la riga `jobs` prima di propagare l'errore: prima restava `running`
+/// per sempre, e il pannello mostrava come suite in corso un processo ucciso.
+async fn esito_del_processo(
+    child: &mut tokio::process::Child,
+    proj_pool: &sqlx::PgPool,
+    job_id: Uuid,
+    timeout_s: u64,
+) -> Result<Option<i32>, String> {
+    match tokio::time::timeout(Duration::from_secs(timeout_s), child.wait()).await {
+        Ok(Ok(status)) => Ok(Some(status.code().unwrap_or(-1))),
+        Ok(Err(e)) => {
+            let motivo = format!("errore attesa processo: {e}");
+            chiudi_job_non_concluso(proj_pool, job_id, &motivo).await;
+            Err(motivo)
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let motivo = format!("timeout dopo {timeout_s}s: i test sono stati interrotti");
+            chiudi_job_non_concluso(proj_pool, job_id, &motivo).await;
+            Err(format!(
+                "Timeout dopo {timeout_s}s. I test sono stati interrotti. Considera di \
+                 aumentare il timeout o di filtrare i test."
+            ))
+        }
+    }
+}
+
+/// Chiude una riga `jobs` rimasta senza esito (timeout, errore di attesa).
+async fn chiudi_job_non_concluso(proj_pool: &sqlx::PgPool, job_id: Uuid, motivo: &str) {
+    let _ = sqlx::query(
+        "UPDATE jobs SET status = 'failed', \
+         input = jsonb_set( \
+           jsonb_set(input, '{label}', to_jsonb($1::text), true), \
+           '{message}', to_jsonb($2::text), true) \
+         WHERE id = $3",
+    )
+    .bind("Interrotto")
+    .bind(motivo)
+    .bind(job_id)
+    .execute(proj_pool)
+    .await;
+}
+
 pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Value) -> String {
     // ── 1. Parametri ─────────────────────────────────────────────────────────
     let params = parse_playwright_params(input);
@@ -971,7 +1470,8 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
         return format!(
             "[run_playwright_tests] Playwright non trovato nel progetto (cercato in {} e sottodirectory).\n\
              Installa con: run_command({{\"command\": \"pnpm add -D @playwright/test\", \"working_dir\": \"app\"}}).\n\
-             Poi inizializza: run_command({{\"command\": \"npx playwright install --with-deps chromium\", \"working_dir\": \"app\"}}).",
+             Poi inizializza: run_command({{\"command\": \
+             \"npx playwright install --with-deps chromium\", \"working_dir\": \"app\"}}).",
             ctx.root_path.display()
         );
     }
@@ -981,7 +1481,8 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
         return msg;
     }
 
-    // ── 3. Leggi porte allocate al progetto dal DB ────────────────────────────
+    // ── 3. Server raggiungibile? (pre-volo del tool: l'avvio automatico e'
+    //      una facolta' dell'agente, non della verifica) ─────────────────────
     let port_rows: Vec<(i32, String)> = sqlx::query_as(
         "SELECT port, label FROM nexus_port_allocations WHERE project_id = $1 ORDER BY port ASC",
     )
@@ -989,268 +1490,54 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
     .fetch_all(&*ctx.db)
     .await
     .unwrap_or_default();
+    let base_url_previsto = determine_base_url(explicit_base_url, &port_rows).await;
+    let server_status =
+        check_server_status(ctx, root, base_url_previsto.as_deref(), auto_start).await;
 
-    // ── 4. Determina BASE_URL e BACKEND_API_URL ──────────────────────────────
-    let base_url = determine_base_url(explicit_base_url, &port_rows).await;
-
-    // BACKEND_API_URL: porta del servizio backend per il global-setup.ts
-    // (seed utenti e health-check pre-test). Non override se già in env.
-    let backend_api_url: Option<String> = {
-        let dev_port = base_url.as_ref().and_then(|u| port_from_localhost_url(u));
-        pick_backend_port(&port_rows, dev_port).map(|p| format!("http://127.0.0.1:{}", p))
-    };
-
-    // ── 5. Verifica se il server è raggiungibile; suggerisci avvio se no ─────
-    let server_status = check_server_status(ctx, root, base_url.as_deref(), auto_start).await;
-
-    // ── 6. Costruisci il comando Playwright ───────────────────────────────────
+    // ── 4. Verifica a suite (punto unico): memoria + esecuzione + flaky ──────
     let command_str =
         build_playwright_command(test_timeout_ms, workers, &reporter, &project_arg, &filter);
-    tracing::info!(command = %command_str, root = %root.display(), "run_playwright_tests: avvio comando");
 
-    // ── 7. Esegui con env BASE_URL ────────────────────────────────────────────
-    // Separazione DB per-progetto: la tabella `jobs` e' migrata. Il pool del
-    // progetto va risolto PRIMA di spawnare il processo: se il DB progetto non
-    // e' disponibile il run non parte (nessun child orfano non monitorato).
-    // Riusato per INSERT, UPDATE live nel task stdout e UPDATE finale.
-    let proj_pool =
-        match crate::project_db_routes::project_data_pool_from(&ctx.db, ctx.project_id).await {
-            Ok(p) => p,
-            Err(e) => {
-                return format!("[run_playwright_tests] DB del progetto non disponibile: {e}")
-            }
-        };
-
-    // ── 7bis. Readiness del servizio bersaglio ────────────────────────────────
-    // Una suite lanciata a t+0 da un riavvio trova una porta che risponde ma un
-    // servizio ancora freddo (Vite che ritrasforma le dipendenze): il giro e'
-    // destinato al rosso flaky, e i suoi rossi fabbricano cicli di correzione
-    // su codice sano. Se il bersaglio non risponde stabilmente entro la
-    // finestra, l'esito e' un setup_failed con la causa — la suite NON parte.
-    if let Some(cause) = await_target_service_ready(&ctx.db, ctx.project_id, base_url.as_deref()).await
-    {
-        let job_id = Uuid::new_v4();
-        insert_playwright_job(&proj_pool, ctx.project_id, job_id, &command_str).await;
-        // Nessun channel live da registrare: questo job_id nasce e muore qui,
-        // nessun consumer SSE puo' conoscerlo (l'emit del Final e' documentato
-        // no-op senza channel). Il pannello lo vede dal record `jobs` e
-        // dall'evento JobCreated finale, che portano gia' l'esito.
-        // Stessa catena dell'esito reale (regola O: il record nasce dal
-        // produttore vero): exit_code -1 = nessun processo mai partito, zero
-        // test eseguiti => classify_playwright_outcome lo classifica
-        // setup_failed; la causa viaggia nel canale che extract_failure_cause
-        // legge (l'ultima riga prodotta dal runner sul perche').
-        finalize_playwright_job(
-            ctx,
-            &proj_pool,
-            job_id,
-            -1,
-            &PlaywrightStats::default(),
-            &crate::playwright_live::PlaywrightProgress::default(),
-            &[],
-            &command_str,
-            "",
-            &cause,
-        )
-        .await;
-        return format!(
-            "[run_playwright_tests] Setup fallito, suite NON lanciata: {cause}.\n\
-             Un giro di test partito ora produrrebbe rossi flaky su codice sano.\n\
-             Verifica il servizio dal pannello Servizi (o riavvialo con run_service), \
-             attendi che risponda e rilancia i test."
-        );
-    }
-    let mut child = match spawn_playwright_child(
-        &command_str,
-        root,
-        base_url.as_deref(),
-        backend_api_url.as_deref(),
-    ) {
-        Ok(c) => c,
-        Err(e) => return format!("[run_playwright_tests] Errore avvio processo: {e}"),
-    };
-
-    // ── Live monitoring: INSERT iniziale + broadcast channel ─────────────────
-    // (pool del progetto gia' risolto sopra, prima dello spawn)
-    let job_id = Uuid::new_v4();
-    insert_playwright_job(&proj_pool, ctx.project_id, job_id, &command_str).await;
-    let _live_tx = crate::playwright_live::register(&ctx.playwright_channels, job_id);
-    tracing::info!(job_id = %job_id, "run_playwright_tests: live job registrato");
-
-    // Dispatcher: notifica creazione job → pannello Playwright aggiorna la lista subito
-    nexus_events::dispatcher::emit(
-        &ctx.project_channels,
-        ctx.project_id,
-        nexus_events::event::ProjectEvent::JobCreated {
-            id: job_id,
-            job_kind: "playwright_test".to_string(),
-            status: "running".to_string(),
-            label: "Run in corso...".to_string(),
-            summary: None,
-            artifacts: serde_json::Value::Null,
-        },
-    );
-
-    // ── Raccoglie stdout/stderr IN PARALLELO con child.wait() ──────────────────
-    // Stdout: legge riga-per-riga per parsing live + UPDATE incrementale jobs.
-    // Stderr: legge a blocchi (per debug aggregato, no parsing live).
-    let stdout_handle = child.stdout.take();
-    let stderr_handle = child.stderr.take();
-
-    // Separazione DB per-progetto: il task di stdout aggiorna `jobs` (migrata),
-    // quindi cattura il pool del progetto gia' risolto, non il meta-pool.
-    let db_for_stdout = proj_pool.clone();
-    let channels_for_stdout = ctx.playwright_channels.clone();
-    let stdout_task = tokio::spawn(stream_playwright_stdout(
-        stdout_handle,
-        db_for_stdout,
-        channels_for_stdout,
-        job_id,
-    ));
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(mut err) = stderr_handle {
-            let _ = err.read_to_end(&mut buf).await;
-        }
-        buf
-    });
-
-    let timeout_result = tokio::time::timeout(Duration::from_secs(timeout), child.wait()).await;
-
-    let exit_code = match timeout_result {
-        Ok(Ok(status)) => {
-            let code = status.code().unwrap_or(-1);
-            tracing::info!(exit_code = code, "run_playwright_tests: processo terminato");
-            code
-        }
-        Ok(Err(e)) => {
-            tracing::error!(error = %e, "run_playwright_tests: errore attesa processo");
-            return format!("[run_playwright_tests] Errore attesa processo: {e}");
-        }
-        Err(_) => {
-            tracing::error!(timeout_secs = timeout, "run_playwright_tests: timeout");
-            // Tenta kill esplicito per liberare le pipe
-            let _ = child.start_kill();
-            return format!(
-                "[run_playwright_tests] Timeout dopo {}s. I test sono stati interrotti.\n\
-                 Considera di aumentare il timeout con timeout_secs o di filtrare i test con il parametro filter.",
-                timeout
-            );
-        }
-    };
-
-    // I task lettura terminano quando le pipe si chiudono (alla fine del processo).
-    let (stdout_bytes, live_progress) = stdout_task.await.unwrap_or_else(|_| {
-        (
-            Vec::new(),
-            crate::playwright_live::PlaywrightProgress::default(),
-        )
-    });
-    let stderr_bytes = stderr_task.await.unwrap_or_default();
-    let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
-    let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
-
-    // ── 8. Parsa statistiche ──────────────────────────────────────────────────
-    let stats = parse_playwright_output_stats(&stdout, &stderr);
-
-    // ── 8b. Raccogli artifact (screenshot, video, trace) ─────────────────────
-    let artifacts = collect_playwright_artifacts(root, &ctx.root_path);
-
-    // ── 9. Finalizza il record `jobs` (UPDATE, non nuova INSERT) ───────────────
-    finalize_playwright_job(
-        ctx,
-        &proj_pool,
-        job_id,
-        exit_code,
-        &stats,
-        &live_progress,
-        &artifacts,
-        &command_str,
-        &stdout,
-        &stderr,
+    // La directory si esprime RELATIVA alla radice del run, come fa il criterio
+    // del gate col `working_dir` dello step: e' l'altra meta' del
+    // riconoscimento reciproco (la prima e' la normalizzazione del comando in
+    // `suite_key`). Con la playwright root passata come radice, la stessa suite
+    // avrebbe avuto chiave "" per l'agente e "app" per il gate, e i due non si
+    // sarebbero riconosciuti mai.
+    let dir_relativa = playwright_root
+        .strip_prefix(&ctx.root_path)
+        .ok()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .filter(|s| !s.is_empty());
+    let deps = suite_deps(
+        SuiteEnv::dal_ctx(ctx, ctx.root_path.clone()),
+        ctx.root_path.clone(),
     )
     .await;
 
-    // ── 10. Output finale ─────────────────────────────────────────────────────
-    format_playwright_run_output(
-        root,
-        &cleanup_notes,
-        &port_rows,
-        base_url.as_deref(),
-        backend_api_url.as_deref(),
-        &server_status,
-        &command_str,
-        exit_code,
-        &stats,
-        &stdout,
-        &stderr,
-    )
-}
+    let inv =
+        crate::suite_verification::SuiteInvocation::suite(command_str, dir_relativa, timeout);
+    let verifica = match deps.verifica(&inv).await {
+        Ok(v) => v,
+        Err(e) => return format!("[run_playwright_tests] {e}"),
+    };
 
-/// INSERT del record `jobs` di un run Playwright (kind `playwright_test`,
-/// status iniziale `running`): un punto solo per i due rami che lo creano — il
-/// run vero, e il setup_failed pre-lancio per bersaglio non pronto.
-async fn insert_playwright_job(
-    proj_pool: &sqlx::PgPool,
-    project_id: Uuid,
-    job_id: Uuid,
-    command_str: &str,
-) {
-    let _ = sqlx::query(
-        "INSERT INTO jobs (id, project_id, kind, status, input, progress, output_log) \
-         VALUES ($1, $2, 'playwright_test', 'running', $3, '{}'::jsonb, '')",
-    )
-    .bind(job_id)
-    .bind(project_id)
-    .bind(serde_json::json!({
-        "label": "Run in corso...",
-        "command": command_str,
-        "started_at": chrono::Utc::now().to_rfc3339(),
-    }))
-    .execute(proj_pool)
-    .await;
-}
-
-/// Esito strutturato di un run Playwright (regola M): distingue un fallimento
-/// di SETUP (il webServer/le dipendenze non sono partiti, zero test eseguiti)
-/// da un fallimento di TEST (la suite e' partita, almeno un test e' rosso).
-/// La classificazione usa solo segnali strutturati -- exit code del processo e
-/// conteggio dei test effettivamente eseguiti -- mai il parsing della prosa
-/// dell'errore.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlaywrightOutcome {
-    Passed,
-    TestsFailed,
-    SetupFailed,
-}
-
-impl PlaywrightOutcome {
-    fn as_str(self) -> &'static str {
-        match self {
-            PlaywrightOutcome::Passed => "passed",
-            PlaywrightOutcome::TestsFailed => "tests_failed",
-            PlaywrightOutcome::SetupFailed => "setup_failed",
-        }
+    // ── 5. Output finale: note del pre-volo + esito dichiarato dal punto unico
+    let mut out = String::new();
+    if !cleanup_notes.is_empty() {
+        out.push_str(&format!("Cleanup:\n  {}\n", cleanup_notes.join("\n  ")));
     }
+    out.push_str(&format!("Server: {server_status}\n"));
+    out.push_str(&verifica.testo);
+    out
 }
 
-/// Classifica l'esito da exit_code + conteggio test eseguiti
-/// (passed+failed+skipped). Exit code 0 => Passed. Exit code != 0 con ZERO
-/// test eseguiti => SetupFailed (il runner non e' arrivato alla fase di
-/// esecuzione: webServer non avviato, crash di configurazione, ecc.). Exit
-/// code != 0 con almeno un test eseguito => TestsFailed (la suite e' partita
-/// regolarmente, uno o piu' test sono rossi).
-fn classify_playwright_outcome(exit_code: i32, stats: &PlaywrightStats) -> PlaywrightOutcome {
-    if exit_code == 0 {
-        return PlaywrightOutcome::Passed;
-    }
-    let executed = stats.passed + stats.failed + stats.skipped;
-    if executed == 0 {
-        PlaywrightOutcome::SetupFailed
-    } else {
-        PlaywrightOutcome::TestsFailed
-    }
-}
+// L'esito strutturato (regola M) vive nel punto unico
+// [`crate::suite_verification::SuiteOutcome`]: la stessa domanda se la ponevano
+// il tool, il gate e il ciclo review, e finche' il vocabolario e' stato qui la
+// risposta di questo modulo non era visibile agli altri due — in particolare
+// non lo era `flaky`, che nasce dalla riesecuzione mirata e non da una singola
+// esecuzione.
 
 /// Estrae una causa breve per un fallimento di setup dall'ultima riga non
 /// vuota del segnale disponibile (stderr ha priorita', poi stdout): non e'
@@ -1269,10 +1556,13 @@ fn extract_failure_cause(stdout: &str, stderr: &str) -> Option<String> {
     last_line_of(stderr).or_else(|| last_line_of(stdout))
 }
 
-/// Esito completo del run pronto per la persistenza: `status` resta il valore
-/// legacy ("passed"/"failed") per i consumer esistenti (query SQL, badge UI),
-/// `outcome` e' la classificazione strutturata a tre vie (regola M) e
-/// `failure_cause` e' valorizzato solo per SetupFailed.
+/// Esito del run pronto per la persistenza: `status` e' il valore della colonna
+/// `jobs.status`, `outcome` l'identificatore canonico (regola N) e
+/// `failure_cause` e' valorizzato solo per un setup fallito.
+///
+/// Qui l'esito e' quello di UNA esecuzione: `flaky` non puo' comparire, perche'
+/// nasce dal confronto con la riesecuzione mirata e lo scrive il punto unico
+/// ([`crate::suite_verification::memo`]) quando la classificazione e' fatta.
 struct PlaywrightResultSummary {
     status: &'static str,
     outcome: &'static str,
@@ -1288,19 +1578,15 @@ struct PlaywrightResultSummary {
 /// M: lo stato viene dal segnale strutturato, non da un testo che finge un
 /// risultato di test che non e' mai iniziato).
 fn playwright_result_summary(
-    exit_code: i32,
-    stats: &PlaywrightStats,
+    exit_code: Option<i32>,
+    stats: &SuiteStats,
     stdout: &str,
     stderr: &str,
 ) -> PlaywrightResultSummary {
-    let outcome = classify_playwright_outcome(exit_code, stats);
-    let status = if outcome == PlaywrightOutcome::Passed {
-        "passed"
-    } else {
-        "failed"
-    };
+    let outcome = crate::suite_verification::classifica_esito(exit_code, stats.eseguiti());
+    let status = outcome.job_status();
 
-    if outcome == PlaywrightOutcome::SetupFailed {
+    if outcome == SuiteOutcome::SetupFailed {
         setup_failed_summary(status, outcome, stdout, stderr)
     } else {
         tests_result_summary(status, outcome, stats)
@@ -1312,7 +1598,7 @@ fn playwright_result_summary(
 /// di test che non e' mai iniziato.
 fn setup_failed_summary(
     status: &'static str,
-    outcome: PlaywrightOutcome,
+    outcome: SuiteOutcome,
     stdout: &str,
     stderr: &str,
 ) -> PlaywrightResultSummary {
@@ -1334,10 +1620,10 @@ fn setup_failed_summary(
 /// Descrittore per un run che ha eseguito almeno un test (Passed o TestsFailed).
 fn tests_result_summary(
     status: &'static str,
-    outcome: PlaywrightOutcome,
-    stats: &PlaywrightStats,
+    outcome: SuiteOutcome,
+    stats: &SuiteStats,
 ) -> PlaywrightResultSummary {
-    let label = if outcome == PlaywrightOutcome::Passed {
+    let label = if outcome == SuiteOutcome::Passed {
         format!("{} test passati", stats.passed)
     } else {
         format!("{} passati, {} falliti", stats.passed, stats.failed)
@@ -1373,13 +1659,11 @@ fn tests_result_summary(
 /// Calcola il progress finale: privilegia le stats del parser completo, ma
 /// preserva flaky/failed_specs accumulati live se disponibili.
 fn build_final_progress(
-    stats: &PlaywrightStats,
+    stats: &SuiteStats,
     live_progress: &crate::playwright_live::PlaywrightProgress,
 ) -> crate::playwright_live::PlaywrightProgress {
     crate::playwright_live::PlaywrightProgress {
-        total: live_progress
-            .total
-            .or(Some((stats.passed + stats.failed + stats.skipped) as u32)),
+        total: live_progress.total.or(Some(stats.eseguiti() as u32)),
         passed: stats.passed as u32,
         failed: stats.failed as u32,
         skipped: stats.skipped as u32,
@@ -1397,11 +1681,11 @@ fn build_final_progress(
 /// e programma il cleanup deferito del channel SSE (30s).
 #[allow(clippy::too_many_arguments)]
 async fn finalize_playwright_job(
-    ctx: &AgentToolContext,
+    env: &SuiteEnv,
     proj_pool: &sqlx::PgPool,
     job_id: Uuid,
-    exit_code: i32,
-    stats: &PlaywrightStats,
+    exit_code: Option<i32>,
+    stats: &SuiteStats,
     live_progress: &crate::playwright_live::PlaywrightProgress,
     artifacts: &[serde_json::Value],
     command_str: &str,
@@ -1413,7 +1697,7 @@ async fn finalize_playwright_job(
 
     update_playwright_job_record(
         proj_pool,
-        ctx.project_id,
+        env.project_id,
         job_id,
         &summary,
         artifacts,
@@ -1423,7 +1707,7 @@ async fn finalize_playwright_job(
     )
     .await;
 
-    emit_playwright_final_events(ctx, job_id, &summary, artifacts, exit_code, final_progress);
+    emit_playwright_final_events(env, job_id, &summary, artifacts, exit_code, final_progress);
 }
 
 /// UPDATE del record `jobs` con esito finale (status, input, progress).
@@ -1436,7 +1720,7 @@ async fn update_playwright_job_record(
     summary: &PlaywrightResultSummary,
     artifacts: &[serde_json::Value],
     command_str: &str,
-    exit_code: i32,
+    exit_code: Option<i32>,
     final_progress: &crate::playwright_live::PlaywrightProgress,
 ) {
     match sqlx::query("UPDATE jobs SET status = $1, input = $2, progress = $3 WHERE id = $4")
@@ -1456,7 +1740,14 @@ async fn update_playwright_job_record(
         .await
     {
         Ok(r) => {
-            tracing::info!(rows = r.rows_affected(), project_id = %pid, status = %summary.status, outcome = %summary.outcome, artifacts = artifacts.len(), "playwright_test job aggiornato")
+            tracing::info!(
+                rows = r.rows_affected(),
+                project_id = %pid,
+                status = %summary.status,
+                outcome = %summary.outcome,
+                artifacts = artifacts.len(),
+                "playwright_test job aggiornato"
+            )
         }
         Err(e) => {
             tracing::error!(error = %e, project_id = %pid, "playwright_test job UPDATE fallito")
@@ -1467,44 +1758,48 @@ async fn update_playwright_job_record(
 /// Emette gli eventi di esito (dispatcher JobCreated + PlaywrightEvent::Final)
 /// e programma il cleanup deferito del channel SSE (30s).
 fn emit_playwright_final_events(
-    ctx: &AgentToolContext,
+    env: &SuiteEnv,
     job_id: Uuid,
     summary: &PlaywrightResultSummary,
     artifacts: &[serde_json::Value],
-    exit_code: i32,
+    exit_code: Option<i32>,
     final_progress: crate::playwright_live::PlaywrightProgress,
 ) {
     // Dispatcher: notifica esito finale → toast + highlight pannello Playwright
-    nexus_events::dispatcher::emit(
-        &ctx.project_channels,
-        ctx.project_id,
-        nexus_events::event::ProjectEvent::JobCreated {
-            id: job_id,
-            job_kind: "playwright_test".to_string(),
-            status: summary.status.to_string(),
-            label: summary.label.clone(),
-            summary: Some(summary.msg.clone()),
-            artifacts: serde_json::to_value(artifacts).unwrap_or(serde_json::Value::Null),
-        },
-    );
+    if let Some(pc) = &env.project_channels {
+        nexus_events::dispatcher::emit(
+            pc,
+            env.project_id,
+            nexus_events::event::ProjectEvent::JobCreated {
+                id: job_id,
+                job_kind: "playwright_test".to_string(),
+                status: summary.status.to_string(),
+                label: summary.label.clone(),
+                summary: Some(summary.msg.clone()),
+                artifacts: serde_json::to_value(artifacts).unwrap_or(serde_json::Value::Null),
+            },
+        );
+    }
 
+    let Some(channels) = env.playwright_channels.clone() else {
+        return;
+    };
     // Emette evento terminale agli SSE consumer + rimuove channel
     crate::playwright_live::emit(
-        &ctx.playwright_channels,
+        &channels,
         crate::playwright_live::PlaywrightEvent::Final {
             job_id,
             status: summary.status.to_string(),
-            exit_code,
+            exit_code: exit_code.unwrap_or(-1),
             progress: final_progress,
         },
     );
     // Lascia il channel attivo per qualche secondo: i consumer SSE che si
     // collegano DOPO il termine devono comunque ricevere il Final.
     // Cleanup deferito.
-    let channels_cleanup = ctx.playwright_channels.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(30)).await;
-        crate::playwright_live::unregister(&channels_cleanup, job_id);
+        crate::playwright_live::unregister(&channels, job_id);
     });
 }
 
@@ -1544,25 +1839,24 @@ fn format_port_info(port_rows: &[(i32, String)]) -> String {
         .join(", ")
 }
 
-/// Formatta il report testuale finale del run Playwright per il tool_result.
-#[allow(clippy::too_many_arguments)]
+/// Formatta il report testuale del run (tool_result e evidence del criterio).
 fn format_playwright_run_output(
     root: &Path,
-    cleanup_notes: &[String],
-    port_rows: &[(i32, String)],
-    base_url: Option<&str>,
-    backend_api_url: Option<&str>,
-    server_status: &str,
+    amb: &AmbienteSuite,
     command_str: &str,
-    exit_code: i32,
-    stats: &PlaywrightStats,
-    stdout: &str,
-    stderr: &str,
+    exit_code: Option<i32>,
+    stats: &SuiteStats,
+    out: &OutputProcesso,
 ) -> String {
-    let stdout_tail = last_n_lines(stdout, 60);
-    let stderr_excerpt = first_n_nonempty_lines(stderr, 20);
+    let (port_rows, base_url, backend_api_url) = (
+        amb.port_rows.as_slice(),
+        amb.base_url.as_deref(),
+        amb.backend_api_url.as_deref(),
+    );
+    let stdout_tail = last_n_lines(&out.stdout, 60);
+    let stderr_excerpt = first_n_nonempty_lines(&out.stderr, 20);
 
-    let status_label = if exit_code == 0 {
+    let status_label = if exit_code == Some(0) {
         "TUTTI I TEST PASSATI"
     } else {
         "TEST FALLITI"
@@ -1573,11 +1867,9 @@ fn format_playwright_run_output(
         "=== PLAYWRIGHT TEST ===\n\
          Stato: {status_label} (exit code: {exit_code})\n\
          Playwright root: {pw_root}\n\
-         {cleanup_section}\
          Porte progetto: {port_info}\n\
          BASE_URL: {base_url_display}\n\
          BACKEND_API_URL: {backend_api_url_display}\n\
-         Server: {server_status}\n\
          Comando: {command_str}\n\n\
          Risultati:\n\
            Passati:  {passed}\n\
@@ -1589,13 +1881,10 @@ fn format_playwright_run_output(
          {stdout_tail}\n\
          {stderr_section}",
         pw_root = root.display(),
-        cleanup_section = if cleanup_notes.is_empty() {
-            String::new()
-        } else {
-            format!("Cleanup:\n  {}\n", cleanup_notes.join("\n  "))
-        },
         status_label = status_label,
-        exit_code = exit_code,
+        exit_code = exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "n/d".to_string()),
         port_info = if port_info.is_empty() {
             "nessuna porta allocata".to_string()
         } else {
@@ -1604,12 +1893,11 @@ fn format_playwright_run_output(
         base_url_display = base_url.unwrap_or("(da playwright.config.ts)"),
         backend_api_url_display = backend_api_url
             .unwrap_or("(non trovata — verifica label 'backend-*' in nexus_port_allocations)"),
-        server_status = server_status,
         command_str = command_str,
         passed = stats.passed,
         failed = stats.failed,
         skipped = stats.skipped,
-        total = stats.passed + stats.failed + stats.skipped,
+        total = stats.eseguiti(),
         failed_list = if stats.failed_tests.is_empty() {
             String::new()
         } else {
@@ -1659,9 +1947,9 @@ fn detect_dev_server_command(root: &std::path::Path) -> Option<String> {
 }
 
 /// Parsa le statistiche dall'output testuale di `npx playwright test`.
-fn parse_playwright_output_stats(stdout: &str, stderr: &str) -> PlaywrightStats {
+fn parse_playwright_output_stats(stdout: &str, stderr: &str) -> SuiteStats {
     let combined = format!("{stdout}\n{stderr}");
-    let mut stats = PlaywrightStats::default();
+    let mut stats = SuiteStats::default();
 
     for line in combined.lines() {
         let t = line.trim();
@@ -1673,7 +1961,7 @@ fn parse_playwright_output_stats(stdout: &str, stderr: &str) -> PlaywrightStats 
                     "passed" => stats.passed += n,
                     "failed" => stats.failed += n,
                     "skipped" => stats.skipped += n,
-                    "flaky" => stats.flaky += n,
+                    "flaky" => stats.flaky_reported += n,
                     _ => {}
                 }
             }
@@ -1698,14 +1986,8 @@ fn extract_stat(line: &str, keyword: &str) -> Option<usize> {
         .ok()
 }
 
-#[derive(Default)]
-struct PlaywrightStats {
-    passed: usize,
-    failed: usize,
-    skipped: usize,
-    flaky: usize,
-    failed_tests: Vec<String>,
-}
+// I conteggi vivono nel punto unico: `SuiteStats`. La copia locale rendeva
+// impossibile passare l'esito di UNA esecuzione a chi doveva confrontarne DUE.
 
 // ── Tool Fase 3: test singolo, lint fix, format file ──────────────────
 
@@ -2058,26 +2340,26 @@ mod playwright_outcome_tests {
 
     #[test]
     fn classify_passed_su_exit_code_zero() {
-        let stats = PlaywrightStats {
+        let stats = SuiteStats {
             passed: 5,
             ..Default::default()
         };
         assert_eq!(
-            classify_playwright_outcome(0, &stats),
-            PlaywrightOutcome::Passed
+            crate::suite_verification::classifica_esito(Some(0), stats.eseguiti()),
+            SuiteOutcome::Passed
         );
     }
 
     #[test]
     fn classify_tests_failed_quando_almeno_un_test_e_eseguito() {
-        let stats = PlaywrightStats {
+        let stats = SuiteStats {
             passed: 2,
             failed: 1,
             ..Default::default()
         };
         assert_eq!(
-            classify_playwright_outcome(1, &stats),
-            PlaywrightOutcome::TestsFailed
+            crate::suite_verification::classifica_esito(Some(1), stats.eseguiti()),
+            SuiteOutcome::TestsFailed
         );
     }
 
@@ -2085,10 +2367,10 @@ mod playwright_outcome_tests {
     fn classify_setup_failed_quando_zero_test_eseguiti() {
         // Caso reale (bacheca-attivita, 31/07/2026): webServer non parte,
         // Playwright esce con errore prima di eseguire un solo test.
-        let stats = PlaywrightStats::default();
+        let stats = SuiteStats::default();
         assert_eq!(
-            classify_playwright_outcome(1, &stats),
-            PlaywrightOutcome::SetupFailed
+            crate::suite_verification::classifica_esito(Some(1), stats.eseguiti()),
+            SuiteOutcome::SetupFailed
         );
     }
 
@@ -2096,13 +2378,13 @@ mod playwright_outcome_tests {
     fn classify_setup_failed_ignora_skipped_a_zero() {
         // exit_code != 0 con SOLO skipped (nessun passed/failed) e' comunque
         // "eseguito qualcosa": non deve essere classificato SetupFailed.
-        let stats = PlaywrightStats {
+        let stats = SuiteStats {
             skipped: 3,
             ..Default::default()
         };
         assert_eq!(
-            classify_playwright_outcome(1, &stats),
-            PlaywrightOutcome::TestsFailed
+            crate::suite_verification::classifica_esito(Some(1), stats.eseguiti()),
+            SuiteOutcome::TestsFailed
         );
     }
 
@@ -2139,9 +2421,9 @@ mod playwright_outcome_tests {
 
     #[test]
     fn summary_setup_failed_non_dice_0_passati_0_falliti() {
-        let stats = PlaywrightStats::default();
+        let stats = SuiteStats::default();
         let stderr = "Error: Process from config.webServer was not able to start. Exit code: 1\n";
-        let summary = playwright_result_summary(1, &stats, "", stderr);
+        let summary = playwright_result_summary(Some(1), &stats, "", stderr);
         assert_eq!(summary.status, "failed");
         assert_eq!(summary.outcome, "setup_failed");
         assert!(!summary.label.contains("0 passati"));
@@ -2156,12 +2438,12 @@ mod playwright_outcome_tests {
 
     #[test]
     fn summary_tests_failed_riporta_conteggi() {
-        let stats = PlaywrightStats {
+        let stats = SuiteStats {
             passed: 2,
             failed: 1,
             ..Default::default()
         };
-        let summary = playwright_result_summary(1, &stats, "", "");
+        let summary = playwright_result_summary(Some(1), &stats, "", "");
         assert_eq!(summary.status, "failed");
         assert_eq!(summary.outcome, "tests_failed");
         assert_eq!(summary.label, "2 passati, 1 falliti");
@@ -2170,11 +2452,11 @@ mod playwright_outcome_tests {
 
     #[test]
     fn summary_passed() {
-        let stats = PlaywrightStats {
+        let stats = SuiteStats {
             passed: 3,
             ..Default::default()
         };
-        let summary = playwright_result_summary(0, &stats, "", "");
+        let summary = playwright_result_summary(Some(0), &stats, "", "");
         assert_eq!(summary.status, "passed");
         assert_eq!(summary.outcome, "passed");
         assert_eq!(summary.failure_cause, None);
@@ -2225,7 +2507,7 @@ mod target_readiness_tests {
         );
 
         let summary =
-            playwright_result_summary(-1, &PlaywrightStats::default(), "", &cause);
+            playwright_result_summary(Some(-1), &SuiteStats::default(), "", &cause);
         assert_eq!(summary.outcome, "setup_failed");
         assert_eq!(
             summary.failure_cause.as_deref(),

@@ -123,7 +123,10 @@ fn record_playwright_job(
     stderr: &str,
     exit_code: i32,
 ) {
-    if !command.contains("playwright") {
+    // Riconoscimento delegato al punto unico (regola L): `contains("playwright")`
+    // registrava come run di test anche `npx playwright install`, cioe' un
+    // esito di suite che nessuna suite aveva prodotto.
+    if !crate::suite_verification::e_suite_playwright(command) {
         return;
     }
     let summary = parse_playwright_summary(stdout, stderr, exit_code);

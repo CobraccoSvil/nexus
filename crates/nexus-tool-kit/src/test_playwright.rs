@@ -14,6 +14,17 @@
 //! Il tool usa sempre `--timeout 30000` per impedire test zombie e
 //! imposta la variabile d'ambiente `CI=true` per garantire headless anche
 //! su sistemi con display.
+//!
+//! NON e' l'esecutore del ciclo di chiusura. Quello e' il punto unico
+//! `mcp-core::suite_verification`, a cui delegano il final_gate, il tool
+//! agente `run_playwright_tests` e il ciclo review: li' l'esito e' legato allo
+//! stato del codice (memoria) e un fallimento non riprodotto viene classificato
+//! `flaky` invece di aprire una correzione. Questo tool e' una lettura
+//! ISOLATA, esposta nel catalogo MCP: esegue e riporta i conteggi, non
+//! memorizza nulla e non classifica. Usarlo per decidere se un lavoro e'
+//! finito rimetterebbe in piedi l'esecutore cieco che quel punto unico ha
+//! tolto (questo crate non puo' dipendere da mcp-core: la delega andrebbe
+//! fatta spostando il chiamante, non duplicando la politica).
 
 use super::exec::run_cmd;
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
