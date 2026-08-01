@@ -204,7 +204,7 @@ pub(crate) async fn maybe_trigger_debugger(
     // l'agente che non riesce a far ripartire il servizio AGGIRA. Misurato il
     // 31/07/2026 su bacheca-attivita: backend avviato come processo nudo sulla
     // porta 3001, FUORI dal bucket del progetto, mentre la porta allocata 24826
-    // restava libera — esattamente il workaround che la governance esiste per
+    // restava libera — esattamente il ripiego che la governance esiste per
     // impedire.
     let content = format!(
         "Crash rilevato automaticamente nel servizio `{unit}` (tipo: {kind}).\n\n\

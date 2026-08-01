@@ -150,7 +150,7 @@ impl PortAnswer {
         !matches!(self, PortAnswer::Silence)
     }
 
-    fn describe(self) -> String {
+    pub(crate) fn describe(self) -> String {
         match self {
             PortAnswer::Http { status } => format!("HTTP {status}"),
             PortAnswer::Tcp => "TCP aperta (nessuna risposta HTTP)".to_string(),
@@ -777,9 +777,45 @@ pub(crate) async fn restart_and_verify(
 /// Osserva ripetutamente finche' il contratto e' soddisfatto o si esaurisce il
 /// tempo, e ritorna la salute dell'ULTIMA osservazione.
 ///
+/// Il ciclo vero e' [`await_observed`]: qui c'e' solo l'osservazione (la salute
+/// dell'unit coi suoi allocati).
+async fn await_contract(
+    state: &AppState,
+    target: &ServiceRef,
+    readiness: Duration,
+) -> ServiceHealth {
+    await_observed(readiness, |conforming_for| {
+        Box::pin(observe_health(state, target, conforming_for))
+    })
+    .await
+}
+
+/// I due fatti su cui il ciclo dei due orologi decide, qualunque sia l'oggetto
+/// osservato (una unit coi suoi allocati, una singola porta). `stable` e' il
+/// fatto-durata gia' prodotto da [`stable_enough`], mai ricalcolato dal ciclo.
+trait ObservedContract {
+    /// Conforme ORA: quanto una singola osservazione puo' dire.
+    fn conforming(&self) -> bool;
+    /// Conforme da abbastanza: la finestra di stabilita' e' maturata.
+    fn stable(&self) -> bool;
+}
+
+impl ObservedContract for ServiceHealth {
+    fn conforming(&self) -> bool {
+        self.is_conforming()
+    }
+    fn stable(&self) -> bool {
+        self.stable
+    }
+}
+
+/// Il ciclo dei due orologi, parametrico sull'osservazione (punto unico: la
+/// stessa attesa serve la remediation, che osserva una unit, e il runner
+/// Playwright, che osserva la porta bersaglio della suite).
+///
 /// Due orologi distinti, che rispondono a due domande diverse:
 ///
-/// - `readiness` limita l'attesa che il servizio DIVENTI conforme (un avvio puo'
+/// - `readiness` limita l'attesa che l'osservato DIVENTI conforme (un avvio puo'
 ///   essere lento: build, migrazioni, warm-up);
 /// - [`STABILITY_SECONDS`] misura da quanto lo E' senza interruzioni. Ogni
 ///   caduta azzera il conteggio: la finestra va superata di fila, altrimenti un
@@ -789,33 +825,82 @@ pub(crate) async fn restart_and_verify(
 /// entra ed esce dalla conformita' non tenga occupato il verificatore per sempre:
 /// scaduto quello, l'ultima osservazione parla da se' e — non avendo maturato la
 /// stabilita' — non chiude.
-async fn await_contract(
-    state: &AppState,
-    target: &ServiceRef,
-    readiness: Duration,
-) -> ServiceHealth {
+///
+/// `observe` riceve da quanto l'osservato e' conforme senza interruzioni (`None`
+/// = non lo e', o ha appena smesso): e' l'input di [`stable_enough`], che
+/// l'osservazione usa per produrre il proprio fatto-durata. Il future e' boxed
+/// (`BoxFuture`, un'allocazione ogni [`OBSERVE_INTERVAL_MS`]: irrilevante) e
+/// NON per comodita': con `AsyncFnMut` il `Send` dei future resi non e'
+/// esprimibile, e ogni `tokio::spawn` a valle della catena smette di compilare.
+async fn await_observed<'a, T, F>(readiness: Duration, mut observe: F) -> T
+where
+    T: ObservedContract,
+    F: FnMut(Option<Duration>) -> futures::future::BoxFuture<'a, T>,
+{
     let start = Instant::now();
     let stability = Duration::from_secs(STABILITY_SECONDS);
     let mut conforming_since: Option<Instant> = None;
     loop {
         let conforming_for = conforming_since.map(|t| t.elapsed());
-        let health = observe_health(state, target, conforming_for).await;
-        if health.is_conforming() {
-            if health.stable {
-                return health;
+        let observed = observe(conforming_for).await;
+        if observed.conforming() {
+            if observed.stable() {
+                return observed;
             }
             conforming_since.get_or_insert_with(Instant::now);
         } else {
             conforming_since = None;
             if start.elapsed() >= readiness {
-                return health; // non e' mai diventato conforme entro la finestra
+                return observed; // non e' mai diventato conforme entro la finestra
             }
         }
         if start.elapsed() >= readiness + stability {
-            return health;
+            return observed;
         }
         tokio::time::sleep(Duration::from_millis(OBSERVE_INTERVAL_MS)).await;
     }
+}
+
+/// Esito dell'attesa di readiness su UNA porta: cosa ha risposto l'ultima
+/// osservazione, e se la risposta e' durata la finestra di stabilita'.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PortReadiness {
+    pub(crate) answer: PortAnswer,
+    pub(crate) stable: bool,
+}
+
+impl PortReadiness {
+    /// Pronta: risponde (HTTP o TCP), e da abbastanza da non essere un istante.
+    pub(crate) fn ready(&self) -> bool {
+        self.answer.answered() && self.stable
+    }
+}
+
+impl ObservedContract for PortReadiness {
+    fn conforming(&self) -> bool {
+        self.answer.answered()
+    }
+    fn stable(&self) -> bool {
+        self.stable
+    }
+}
+
+/// Attende che una porta RISPONDA stabilmente (il contratto della remediation,
+/// ridotto alla sola porta: niente stato dell'unit). E' il gate di readiness del
+/// runner Playwright: una suite lanciata a t+0 da un riavvio trova un servizio
+/// che risponde ma sta ancora scaldando (Vite che ritrasforma le dipendenze), e
+/// produce rossi flaky su codice sano. Criterio e durata sono i punti unici gia'
+/// esistenti ([`probe_port`], [`stable_enough`]); l'attesa e' [`await_observed`].
+pub(crate) async fn await_port_ready(port: u16, readiness: Duration) -> PortReadiness {
+    await_observed(readiness, move |conforming_for| {
+        Box::pin(async move {
+            PortReadiness {
+                answer: probe_port(port).await,
+                stable: stable_enough(conforming_for),
+            }
+        })
+    })
+    .await
 }
 
 /// Finestra di readiness dal DB (regola G): `agent.remediation.verify_readiness_seconds`.
@@ -1570,7 +1655,7 @@ async fn reopen_if_remediation_dead(
 // rimasta FALLITA, con la porta 24804 libera. Nel frattempo l'agente in chat,
 // non potendo far ripartire il servizio, ha aggirato: backend avviato come
 // processo nudo sulla porta 3001, FUORI dal bucket del progetto — esattamente
-// il workaround che la governance delle porte esiste per impedire.
+// il ripiego che la governance delle porte esiste per impedire.
 //
 // IL TRIGGER E' UN SEGNALE STRUTTURATO (regola M), mai un orologio: una
 // SCRITTURA registrata su un file del servizio (`file_mutations`, DB META, con
@@ -2034,6 +2119,152 @@ mod tests {
             health.meets_contract(),
             "un'API senza rotta di root risponde 404 e sta servendo la sua porta"
         );
+    }
+
+    /// Osservazione sintetica per esercitare il CICLO ([`await_observed`]) a
+    /// tempo virtuale (`start_paused`): la porta "risponde" dal giro
+    /// `risponde_dal` in poi, e il fatto-durata viene dal produttore vero
+    /// ([`stable_enough`]) — la closure sintetizza solo cio' che la rete
+    /// risponderebbe, mai il criterio (regola O). Niente I/O reale: con il clock
+    /// pausato l'auto-advance di tokio e l'I/O vero andrebbero in gara.
+    fn osservazione_a_scatti(
+        risponde_dal: usize,
+        giri: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl FnMut(Option<Duration>) -> futures::future::BoxFuture<'static, PortReadiness> {
+        move |conforming_for| {
+            let giri = giri.clone();
+            futures::future::FutureExt::boxed(async move {
+                let giro = giri.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let answer = if giro >= risponde_dal {
+                    PortAnswer::Http { status: 200 }
+                } else {
+                    PortAnswer::Silence
+                };
+                PortReadiness {
+                    answer,
+                    stable: stable_enough(conforming_for),
+                }
+            })
+        }
+    }
+
+    /// La risposta di UN istante non basta: il ciclo deve trattenere il
+    /// verdetto finche' la conformita' non ha retto l'intera finestra di
+    /// stabilita'. E' il caso del runner Playwright dopo un riavvio: la porta
+    /// risponde subito, ma la suite deve partire solo quando risponde DA
+    /// abbastanza.
+    ///
+    /// MUTAZIONE: facendo ritornare il ciclo alla prima osservazione conforme
+    /// (cioe' togliendo l'attesa della stabilita'), `stable` e' false e il
+    /// numero di giri e' 1: entrambe le asserzioni rosseggiano.
+    #[tokio::test(start_paused = true)]
+    async fn la_conformita_deve_durare_prima_che_il_ciclo_chiuda() {
+        let giri = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let esito = await_observed(
+            Duration::from_secs(60),
+            osservazione_a_scatti(0, giri.clone()),
+        )
+        .await;
+        assert!(esito.ready(), "risponde dal primo giro: deve maturare");
+        let osservazioni = giri.load(std::sync::atomic::Ordering::SeqCst);
+        let minimo = (STABILITY_SECONDS * 1000 / OBSERVE_INTERVAL_MS) as usize;
+        assert!(
+            osservazioni > minimo,
+            "la finestra di {STABILITY_SECONDS}s a passi di {OBSERVE_INTERVAL_MS}ms \
+             richiede piu' di {minimo} osservazioni, misurate {osservazioni}"
+        );
+    }
+
+    /// Il caso del runner a freddo: la porta e' muta per i primi giri (il
+    /// servizio sta ripartendo), poi risponde. Il ciclo deve attendere che
+    /// DIVENTI conforme e POI che la conformita' duri — mai chiudere sul
+    /// primo silenzio, mai sulla prima risposta.
+    #[tokio::test(start_paused = true)]
+    async fn una_porta_che_nasce_muta_e_poi_risponde_matura_la_finestra() {
+        let giri = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let muta_per = 5usize;
+        let esito = await_observed(
+            Duration::from_secs(60),
+            osservazione_a_scatti(muta_per, giri.clone()),
+        )
+        .await;
+        assert!(esito.ready(), "dopo il transitorio muto deve maturare");
+        let osservazioni = giri.load(std::sync::atomic::Ordering::SeqCst);
+        let minimo = muta_per + (STABILITY_SECONDS * 1000 / OBSERVE_INTERVAL_MS) as usize;
+        assert!(
+            osservazioni > minimo,
+            "il transitorio muto ({muta_per} giri) non conta nella finestra: \
+             servono piu' di {minimo} osservazioni, misurate {osservazioni}"
+        );
+    }
+
+    /// Scaduta la readiness senza che l'osservato sia MAI diventato conforme,
+    /// il ciclo ritorna l'ultima osservazione cosi' com'e': non pronta, e con
+    /// la risposta che spiega perche' (qui: muta).
+    ///
+    /// MUTAZIONE: se il ciclo ignorasse la finestra di readiness questo test
+    /// non terminerebbe (l'osservazione non diventa mai conforme).
+    #[tokio::test(start_paused = true)]
+    async fn scaduta_la_readiness_una_porta_sempre_muta_non_e_pronta() {
+        let giri = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let esito = await_observed(
+            Duration::from_secs(30),
+            osservazione_a_scatti(usize::MAX, giri.clone()),
+        )
+        .await;
+        assert!(!esito.ready(), "mai conforme: non puo' essere pronta");
+        assert_eq!(
+            esito.answer,
+            PortAnswer::Silence,
+            "l'ultima osservazione deve dire cosa (non) ha risposto"
+        );
+    }
+
+    /// Una caduta a meta' finestra azzera il conteggio: la stabilita' va
+    /// maturata DI FILA. Un servizio che oscilla non deve dichiararsi pronto
+    /// nel momento buono.
+    #[tokio::test(start_paused = true)]
+    async fn una_caduta_a_meta_finestra_azzera_il_conteggio() {
+        let giri = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let giri_visti = giri.clone();
+        // Conforme, MA con un buco al giro 3: risponde ai giri 0-2, tace al 3,
+        // risponde dal 4 in poi.
+        let osservazione = move |conforming_for: Option<Duration>| {
+            let giri = giri_visti.clone();
+            futures::future::FutureExt::boxed(async move {
+                let giro = giri.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let answer = if giro == 3 {
+                    PortAnswer::Silence
+                } else {
+                    PortAnswer::Http { status: 200 }
+                };
+                PortReadiness {
+                    answer,
+                    stable: stable_enough(conforming_for),
+                }
+            })
+        };
+        let esito = await_observed(Duration::from_secs(60), osservazione).await;
+        assert!(esito.ready(), "dopo la ricaduta la finestra rimatura");
+        let osservazioni = giri.load(std::sync::atomic::Ordering::SeqCst);
+        // 4 giri bruciati (3 conformi + la caduta) + una finestra INTERA dopo.
+        let minimo = 4 + (STABILITY_SECONDS * 1000 / OBSERVE_INTERVAL_MS) as usize;
+        assert!(
+            osservazioni > minimo,
+            "i giri prima della caduta non contano: servono piu' di {minimo} \
+             osservazioni, misurate {osservazioni}"
+        );
+    }
+
+    /// La composizione vera ([`await_port_ready`]: probe reale + ciclo) sul
+    /// caso immediato e deterministico: porta muta e readiness a zero. Il
+    /// primo giro osserva il silenzio e la finestra e' gia' scaduta: niente
+    /// attese, niente timer in gara con l'I/O.
+    #[tokio::test]
+    async fn await_port_ready_su_porta_muta_ritorna_subito_non_pronta() {
+        let esito = await_port_ready(porta_muta().await, Duration::ZERO).await;
+        assert!(!esito.ready(), "nessuno in ascolto: non e' pronta");
+        assert_eq!(esito.answer, PortAnswer::Silence);
     }
 
     /// IL CASO MINIMO del mandato: il servizio riparte (stato Running al primo

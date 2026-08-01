@@ -10,8 +10,13 @@
 //! 3. Se `base_url` è passato esplicitamente → usa quello (override).
 //! 4. Se non c'è nessuna porta allocata → usa la baseURL in playwright.config.ts
 //!    (o il default 3000).
-//! 5. Inietta `BASE_URL` come variabile d'ambiente e lancia `npx playwright test`.
-//! 6. Salva il risultato in `jobs` (kind = "playwright_test") per il pannello Playwright.
+//! 5. Se la porta bersaglio e' legata a una unit di servizio del progetto,
+//!    attende che risponda STABILMENTE (contratto della remediation,
+//!    `service_recovery::await_port_ready`) entro
+//!    `agent.playwright.readiness_timeout_seconds`; scaduta la finestra:
+//!    setup_failed "servizio non pronto", la suite non parte mai a freddo.
+//! 6. Inietta `BASE_URL` come variabile d'ambiente e lancia `npx playwright test`.
+//! 7. Salva il risultato in `jobs` (kind = "playwright_test") per il pannello Playwright.
 
 use super::*;
 use std::time::Duration;
@@ -19,6 +24,12 @@ use tokio::io::AsyncReadExt;
 
 const PLAYWRIGHT_DEFAULT_TIMEOUT: u64 = 600;
 const PLAYWRIGHT_MAX_TIMEOUT: u64 = 900;
+
+/// Finestra massima (secondi) in cui il runner attende che il servizio
+/// bersaglio della suite risponda stabilmente PRIMA di lanciare i test.
+/// Setting DB (regola G), default veicolato dalla migrazione 0662.
+const PLAYWRIGHT_READINESS_KEY: &str = "agent.playwright.readiness_timeout_seconds";
+const DEFAULT_TARGET_READINESS_SECONDS: u64 = 60;
 
 /// Pre-flight check: lancia `ldd` sul binary chromium-headless-shell di
 /// Playwright e raccoglie la lista delle librerie sistema marcate "not found".
@@ -641,6 +652,87 @@ async fn check_server_status(
     }
 }
 
+/// Gate di readiness del bersaglio della suite (regola L: delega al contratto
+/// della remediation — `service_recovery::await_port_ready`, cioe' `probe_port`
+/// + `stable_enough`): `Some(causa)` se la porta della BASE_URL appartiene a
+/// una unit di servizio del progetto e NON risponde stabilmente entro la
+/// finestra. `None` = pronta, oppure nessun contratto da attendere.
+///
+/// Il gate scatta SOLO se la porta e' legata a una unit
+/// (`nexus_port_allocations.service_unit`, lo stesso criterio con cui
+/// l'observer apre le diagnosi): senza unit non c'e' alcun servizio che DEBBA
+/// rispondere prima del lancio — e' il caso del `webServer` avviato dalla
+/// suite stessa, la cui porta risponde solo DOPO, e un'attesa qui lo
+/// bloccherebbe sempre.
+async fn await_target_service_ready(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+    base_url: Option<&str>,
+) -> Option<String> {
+    let port = base_url.and_then(port_from_localhost_url)?;
+    let unit = target_service_unit(db, project_id, port).await?;
+    let readiness = playwright_readiness_window(db).await;
+    let ready = crate::project_workspace::service_recovery::await_port_ready(
+        u16::try_from(port).ok()?,
+        readiness,
+    )
+    .await;
+    if ready.ready() {
+        tracing::info!(port, unit = %unit, "run_playwright_tests: bersaglio pronto (risposta stabile)");
+        return None;
+    }
+    Some(target_not_ready_cause(&ready, port, &unit, readiness))
+}
+
+/// La unit di servizio a cui il registro lega la porta bersaglio, se esiste.
+async fn target_service_unit(db: &sqlx::PgPool, project_id: Uuid, port: i32) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT service_unit FROM nexus_port_allocations WHERE project_id = $1 AND port = $2",
+    )
+    .bind(project_id)
+    .bind(port)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+}
+
+/// Finestra di readiness del bersaglio dal DB (regola G):
+/// `agent.playwright.readiness_timeout_seconds`. `parse::<u64>` rifiuta da se'
+/// i valori negativi; `0` riduce il gate alla sola finestra di stabilita'.
+async fn playwright_readiness_window(db: &sqlx::PgPool) -> Duration {
+    let secs = crate::settings::get_setting(db, PLAYWRIGHT_READINESS_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TARGET_READINESS_SECONDS);
+    Duration::from_secs(secs)
+}
+
+/// La causa del setup_failed per bersaglio non pronto: UNA riga (e' quella che
+/// `extract_failure_cause` raccogliera' come `failure_cause` del job, taglio a
+/// 300 char) con porta, unit, finestra attesa e cosa ha risposto l'ULTIMA
+/// osservazione.
+///
+/// Il numero e' dichiarato per cio' che e' — la finestra CONFIGURATA — non come
+/// durata dell'attesa: quella e' la finestra piu' la stabilita' pretesa dal
+/// contratto, e un numero senza la sua premessa e' un'opinione (regola O).
+fn target_not_ready_cause(
+    ready: &crate::project_workspace::service_recovery::PortReadiness,
+    port: i32,
+    unit: &str,
+    readiness: Duration,
+) -> String {
+    format!(
+        "Servizio non pronto: la porta {port} (unit {unit}) non risponde stabilmente \
+         entro la finestra configurata di {}s (ultima osservazione: {})",
+        readiness.as_secs(),
+        ready.answer.describe(),
+    )
+}
+
 /// Costruisce la riga di comando `npx playwright test ...` con timeout, workers,
 /// reporter e gli argomenti opzionali project/filter.
 fn build_playwright_command(
@@ -928,6 +1020,46 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
                 return format!("[run_playwright_tests] DB del progetto non disponibile: {e}")
             }
         };
+
+    // ── 7bis. Readiness del servizio bersaglio ────────────────────────────────
+    // Una suite lanciata a t+0 da un riavvio trova una porta che risponde ma un
+    // servizio ancora freddo (Vite che ritrasforma le dipendenze): il giro e'
+    // destinato al rosso flaky, e i suoi rossi fabbricano cicli di correzione
+    // su codice sano. Se il bersaglio non risponde stabilmente entro la
+    // finestra, l'esito e' un setup_failed con la causa — la suite NON parte.
+    if let Some(cause) = await_target_service_ready(&ctx.db, ctx.project_id, base_url.as_deref()).await
+    {
+        let job_id = Uuid::new_v4();
+        insert_playwright_job(&proj_pool, ctx.project_id, job_id, &command_str).await;
+        // Nessun channel live da registrare: questo job_id nasce e muore qui,
+        // nessun consumer SSE puo' conoscerlo (l'emit del Final e' documentato
+        // no-op senza channel). Il pannello lo vede dal record `jobs` e
+        // dall'evento JobCreated finale, che portano gia' l'esito.
+        // Stessa catena dell'esito reale (regola O: il record nasce dal
+        // produttore vero): exit_code -1 = nessun processo mai partito, zero
+        // test eseguiti => classify_playwright_outcome lo classifica
+        // setup_failed; la causa viaggia nel canale che extract_failure_cause
+        // legge (l'ultima riga prodotta dal runner sul perche').
+        finalize_playwright_job(
+            ctx,
+            &proj_pool,
+            job_id,
+            -1,
+            &PlaywrightStats::default(),
+            &crate::playwright_live::PlaywrightProgress::default(),
+            &[],
+            &command_str,
+            "",
+            &cause,
+        )
+        .await;
+        return format!(
+            "[run_playwright_tests] Setup fallito, suite NON lanciata: {cause}.\n\
+             Un giro di test partito ora produrrebbe rossi flaky su codice sano.\n\
+             Verifica il servizio dal pannello Servizi (o riavvialo con run_service), \
+             attendi che risponda e rilancia i test."
+        );
+    }
     let mut child = match spawn_playwright_child(
         &command_str,
         root,
@@ -941,19 +1073,7 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
     // ── Live monitoring: INSERT iniziale + broadcast channel ─────────────────
     // (pool del progetto gia' risolto sopra, prima dello spawn)
     let job_id = Uuid::new_v4();
-    let _ = sqlx::query(
-        "INSERT INTO jobs (id, project_id, kind, status, input, progress, output_log) \
-         VALUES ($1, $2, 'playwright_test', 'running', $3, '{}'::jsonb, '')",
-    )
-    .bind(job_id)
-    .bind(ctx.project_id)
-    .bind(serde_json::json!({
-        "label": "Run in corso...",
-        "command": command_str,
-        "started_at": chrono::Utc::now().to_rfc3339(),
-    }))
-    .execute(&proj_pool)
-    .await;
+    insert_playwright_job(&proj_pool, ctx.project_id, job_id, &command_str).await;
     let _live_tx = crate::playwright_live::register(&ctx.playwright_channels, job_id);
     tracing::info!(job_id = %job_id, "run_playwright_tests: live job registrato");
 
@@ -1065,6 +1185,30 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
         &stdout,
         &stderr,
     )
+}
+
+/// INSERT del record `jobs` di un run Playwright (kind `playwright_test`,
+/// status iniziale `running`): un punto solo per i due rami che lo creano — il
+/// run vero, e il setup_failed pre-lancio per bersaglio non pronto.
+async fn insert_playwright_job(
+    proj_pool: &sqlx::PgPool,
+    project_id: Uuid,
+    job_id: Uuid,
+    command_str: &str,
+) {
+    let _ = sqlx::query(
+        "INSERT INTO jobs (id, project_id, kind, status, input, progress, output_log) \
+         VALUES ($1, $2, 'playwright_test', 'running', $3, '{}'::jsonb, '')",
+    )
+    .bind(job_id)
+    .bind(project_id)
+    .bind(serde_json::json!({
+        "label": "Run in corso...",
+        "command": command_str,
+        "started_at": chrono::Utc::now().to_rfc3339(),
+    }))
+    .execute(proj_pool)
+    .await;
 }
 
 /// Esito strutturato di un run Playwright (regola M): distingue un fallimento
@@ -2034,5 +2178,162 @@ mod playwright_outcome_tests {
         assert_eq!(summary.status, "passed");
         assert_eq!(summary.outcome, "passed");
         assert_eq!(summary.failure_cause, None);
+    }
+}
+
+#[cfg(test)]
+mod target_readiness_tests {
+    use super::*;
+    use crate::project_workspace::service_recovery::{probe_port, PortReadiness};
+
+    /// Una porta su cui nessuno ascolta: porta effimera presa e rilasciata.
+    async fn porta_muta() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind effimero");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    }
+
+    /// La causa prodotta dal gate attraversa INTERA la catena del setup_failed
+    /// (fix fb5398c2): stessa strada del run vero (`playwright_result_summary`,
+    /// regola O), con la risposta della porta nata dal produttore
+    /// ([`probe_port`] su una porta muta reale), mai scritta a mano.
+    ///
+    /// MUTAZIONE: rendendo la causa multiriga, o piu' lunga del taglio dei 300
+    /// char di `extract_failure_cause`, `failure_cause` non e' piu' la causa
+    /// intera e l'ultima asserzione rosseggia.
+    #[tokio::test]
+    async fn la_causa_di_non_pronto_attraversa_la_catena_del_setup_failed() {
+        let port = porta_muta().await;
+        let ready = PortReadiness {
+            answer: probe_port(port).await,
+            stable: crate::project_workspace::service_recovery::stable_enough(None),
+        };
+        assert!(!ready.ready(), "porta muta: il gate non puo' dirla pronta");
+
+        let cause = target_not_ready_cause(
+            &ready,
+            i32::from(port),
+            "demo-frontend.service",
+            Duration::from_secs(60),
+        );
+        assert!(
+            cause.contains("Servizio non pronto") && cause.contains("MUTA"),
+            "la causa dice cosa manca e cosa ha risposto l'ultima osservazione: {cause}"
+        );
+
+        let summary =
+            playwright_result_summary(-1, &PlaywrightStats::default(), "", &cause);
+        assert_eq!(summary.outcome, "setup_failed");
+        assert_eq!(
+            summary.failure_cause.as_deref(),
+            Some(cause.as_str()),
+            "la causa deve arrivare INTERA nel failure_cause del job"
+        );
+    }
+
+    /// Semina il minimo per una allocazione di porta nel DB meta migrato
+    /// (FK: teams -> users -> projects) e ritorna il project_id.
+    async fn seed_project(pool: &sqlx::PgPool) -> Uuid {
+        let team = Uuid::new_v4();
+        let user = Uuid::new_v4();
+        let project = Uuid::new_v4();
+        sqlx::query("INSERT INTO teams (id, name, slug) VALUES ($1,'T',$2)")
+            .bind(team)
+            .bind(team.to_string())
+            .execute(pool)
+            .await
+            .expect("team");
+        sqlx::query("INSERT INTO users (id, email, display_name) VALUES ($1,$2,'U')")
+            .bind(user)
+            .bind(format!("{user}@t.local"))
+            .execute(pool)
+            .await
+            .expect("user");
+        sqlx::query(
+            "INSERT INTO projects (id, team_id, name, slug, owner_user_id) \
+             VALUES ($1,$2,'P',$3,$4)",
+        )
+        .bind(project)
+        .bind(team)
+        .bind(project.to_string())
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect("project");
+        project
+    }
+
+    async fn seed_allocation(
+        pool: &sqlx::PgPool,
+        project: Uuid,
+        port: u16,
+        service_unit: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO nexus_port_allocations (project_id, port, label, service_unit) \
+             VALUES ($1, $2, 'frontend', $3)",
+        )
+        .bind(project)
+        .bind(i32::from(port))
+        .bind(service_unit)
+        .execute(pool)
+        .await
+        .expect("allocazione");
+    }
+
+    /// IL CASO DEL MANDATO: la porta bersaglio appartiene a una unit di
+    /// servizio e nessuno la serve — il gate deve produrre la causa (e quindi
+    /// il setup_failed), MAI lasciar partire la suite. Attraversa la strada
+    /// intera della produzione (regola O): query dell'unit, finestra dal
+    /// setting in DB (la migrazione 0662 e' nel migrator embedded; qui
+    /// azzerata per non attendere 60 secondi veri), ciclo `await_port_ready`
+    /// su una porta muta reale.
+    ///
+    /// MUTAZIONE: rompendo l'attesa — un gate che ritorna `None` senza provare
+    /// la porta, com'era il runner prima del fix — questo test rosseggia.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_gate_su_porta_muta_di_una_unit_produce_la_causa(pool: sqlx::PgPool) {
+        let project = seed_project(&pool).await;
+        let port = porta_muta().await;
+        seed_allocation(&pool, project, port, Some("demo-frontend.service")).await;
+        sqlx::query("UPDATE settings SET value = '0' WHERE key = $1")
+            .bind(PLAYWRIGHT_READINESS_KEY)
+            .execute(&pool)
+            .await
+            .expect("azzera la finestra per il test");
+
+        let base_url = format!("http://localhost:{port}");
+        let cause = await_target_service_ready(&pool, project, Some(&base_url)).await;
+        let cause = cause.expect("porta muta di una unit: il gate deve fermare il lancio");
+        assert!(
+            cause.contains("Servizio non pronto") && cause.contains("demo-frontend.service"),
+            "la causa nomina la unit che non risponde: {cause}"
+        );
+    }
+
+    /// L'ANTI-REGRESSIONE del gate: una porta senza unit legata non ha alcun
+    /// contratto da attendere — e' il caso del `webServer` che la suite stessa
+    /// avvia, la cui porta risponde solo DOPO il lancio. Il gate deve lasciar
+    /// partire la suite subito, anche se la porta ora e' muta.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_gate_senza_unit_legata_non_attende(pool: sqlx::PgPool) {
+        let project = seed_project(&pool).await;
+        let port = porta_muta().await;
+        seed_allocation(&pool, project, port, None).await;
+
+        let base_url = format!("http://localhost:{port}");
+        assert_eq!(
+            await_target_service_ready(&pool, project, Some(&base_url)).await,
+            None,
+            "senza unit legata non c'e' contratto: la suite parte (webServer della config)"
+        );
+        assert_eq!(
+            await_target_service_ready(&pool, project, None).await,
+            None,
+            "senza BASE_URL non c'e' nemmeno una porta da provare"
+        );
     }
 }
