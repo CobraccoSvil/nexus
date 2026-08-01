@@ -16,6 +16,7 @@ pub use fs_browse::{
 pub mod admin_dto;
 pub mod build_info;
 pub mod code_files;
+pub mod db_error;
 pub mod documents_dto;
 pub mod error_presentation;
 pub mod gateway_client;

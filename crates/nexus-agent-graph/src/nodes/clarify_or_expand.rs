@@ -425,12 +425,19 @@ impl ClarifyOrExpandNode {
     /// e — se ne trova — wrappa nel blocco testuale. Stringa vuota se nessun
     /// marcatore o listing in errore (comportamento storico). L'I/O (la
     /// `list_files`) e' del chiamante (dietro `ctx.tools`).
-    pub fn build_project_context(listing: &str) -> String {
-        // Guard errori: un listing che DICHIARA un fallimento non descrive un
-        // progetto. Il criterio e' il contratto macchina (punto unico, regola L),
-        // non i prefissi testuali che qui erano ricopiati a mano: il tool che
-        // fallisce lo dichiara, e chi legge non deve conoscerne il vocabolario.
-        if listing.is_empty() || nexus_types::tool_outcome::is_tool_failure(listing) {
+    ///
+    /// `elenco_fallito` e' la DICHIARAZIONE d'esito di chi ha eseguito la
+    /// `list_files` (`ToolOutcome::is_error`), non una deduzione dal testo
+    /// (regola Q). Finche' la firma ammetteva il solo listing, questa funzione
+    /// DOVEVA ricavarsi l'esito da sola mentre il chiamante aveva in mano
+    /// l'esito strutturato e lo buttava via: un fallimento il cui marker non sta
+    /// in testa (una premessa anteposta basta a spostarlo) diventava qui un
+    /// progetto ESISTENTE, e il blocco vietava al nodo di chiedere all'utente la
+    /// natura dell'applicazione sulla base di un messaggio d'errore.
+    pub fn build_project_context(listing: &str, elenco_fallito: bool) -> String {
+        // Un elenco che il suo esecutore dichiara fallito non descrive un
+        // progetto: il criterio e' il campo, mai il vocabolario del messaggio.
+        if listing.is_empty() || elenco_fallito {
             return String::new();
         }
         let lower = listing.to_lowercase();
@@ -606,8 +613,10 @@ impl GraphNode<AgentState, AgentNodeCtx> for ClarifyOrExpandNode {
             };
             match ctx.tools.execute(call).await {
                 Ok(outcome) => {
+                    // L'esito viaggia nel campo: il listing e' testo per i
+                    // marcatori, `is_error` e' cio' su cui si decide.
                     let raw = Self::outcome_result_json(&outcome.content);
-                    Self::build_project_context(&raw)
+                    Self::build_project_context(&raw, outcome.is_error)
                 }
                 Err(err) => {
                     tracing::debug!(
@@ -1033,28 +1042,82 @@ mod tests {
     #[test]
     fn build_project_context_marcatori() {
         let listing = "package.json\nsrc/\nnode_modules/\nREADME.md";
-        let ctx = ClarifyOrExpandNode::build_project_context(listing);
+        let ctx = ClarifyOrExpandNode::build_project_context(listing, false);
         assert!(ctx.contains("CONTESTO PROGETTO"));
         assert!(ctx.contains("package.json"));
         assert!(ctx.contains("src/"));
-        // Listing in errore -> vuoto. La stringa e' quella che `tool_list_files`
-        // produce DAVVERO su un fallimento (col marker in testa, regola O): un
-        // fixture senza marker come "[Errore: dir non trovata]" (la vecchia
-        // forma) passerebbe questo assert per la ragione SBAGLIATA — cadrebbe
-        // nel ramo "nessun marcatore trovato" invece che nella guardia
-        // d'errore, e non proverebbe piu' nulla sulla guardia stessa. Qui il
-        // testo contiene ANCHE parole di dominio ("src", "readme") per
-        // dimostrare che e' la guardia a fermarlo, non l'assenza di marcatori.
-        assert_eq!(
-            ClarifyOrExpandNode::build_project_context(
-                "\u{274C} [Errore listing '.': src/ non elencabile, vedi README.md]"
-            ),
-            ""
-        );
         // nessun marcatore -> vuoto.
         assert_eq!(
-            ClarifyOrExpandNode::build_project_context("foo.txt\nbar.csv"),
+            ClarifyOrExpandNode::build_project_context("foo.txt\nbar.csv", false),
             ""
+        );
+    }
+
+    /// L'esito dell'elenco e' quello DICHIARATO da chi l'ha eseguito, non quello
+    /// indovinato dal testo. Il fixture e' un fallimento REALE il cui marker non
+    /// sta in testa: e' la forma che `prepend_preserving_failure` documenta
+    /// (una premessa anteposta sposta il marker) e che il criterio testuale
+    /// leggeva come successo. Il testo contiene ANCHE parole di dominio, cosi'
+    /// il vuoto atteso puo' venire SOLO dalla guardia, mai dall'assenza di
+    /// marcatori.
+    ///
+    /// PROVA DI MUTAZIONE: rimettendo il criterio testuale
+    /// (`nexus_types::tool_outcome::is_tool_failure(listing)`) al posto del
+    /// campo, questo caso ritorna il blocco "CONTESTO PROGETTO" costruito su un
+    /// messaggio d'errore e l'assert rosseggia.
+    #[test]
+    fn un_elenco_fallito_non_descrive_un_progetto() {
+        let elenco_fallito =
+            "Elenco parziale della radice.\n\u{274C} [Errore: 'src/' non leggibile, vedi README.md]";
+        assert_eq!(
+            ClarifyOrExpandNode::build_project_context(elenco_fallito, true),
+            "",
+            "l'esito e' nel campo: il posto del marker nel testo non c'entra"
+        );
+        // Contro-prova: lo STESSO testo dichiarato riuscito e' un elenco come un
+        // altro — il campo decide in entrambe le direzioni.
+        assert!(
+            ClarifyOrExpandNode::build_project_context(elenco_fallito, false)
+                .contains("CONTESTO PROGETTO")
+        );
+    }
+
+    /// Il nodo passa a `build_project_context` l'esito che la porta DICHIARA:
+    /// un `list_files` fallito non produce contesto progetto anche quando il suo
+    /// testo elenca marcatori. Attraversa il produttore vero (il nodo + la porta
+    /// `ToolExecutor`), non la sola funzione pura (regola O).
+    #[tokio::test]
+    async fn il_nodo_scarta_l_elenco_che_la_porta_dichiara_fallito() {
+        /// Porta che RIESCE a rispondere ma dichiara il fallimento del tool.
+        struct ElencoFallito;
+        #[async_trait]
+        impl ToolExecutor for ElencoFallito {
+            async fn execute(&self, call: ToolCall) -> Result<ToolOutcome, PortError> {
+                Ok(ToolOutcome {
+                    tool_call_id: call.id,
+                    content: Value::String(
+                        "Elenco parziale.\npackage.json src/ README.md non leggibili".to_string(),
+                    ),
+                    is_error: true,
+                    ..Default::default()
+                })
+            }
+        }
+
+        let node = ClarifyOrExpandNode::new(ClarifyConfig::default());
+        let llm = Arc::new(ScriptedLlm::with_decision(
+            json!({"mode": "skip"}),
+        ));
+        let ctx = ctx_with(llm.clone(), Arc::new(ElencoFallito));
+        let st = trigger_state();
+        node.run(&st, &ctx).await.expect("run ok");
+
+        let visto = llm.seen.lock().expect("lock");
+        let req = visto.first().expect("una richiesta LLM");
+        assert!(
+            !req.messages.iter().any(|m| m.role == "system"),
+            "nessun blocco CONTESTO PROGETTO da un elenco fallito: {:?}",
+            req.messages
         );
     }
 
@@ -1400,7 +1463,12 @@ mod golden {
                 }
                 "build_project_context" => {
                     let listing = c.input.get("listing").and_then(Value::as_str).unwrap_or("");
-                    Value::String(ClarifyOrExpandNode::build_project_context(listing))
+                    // Il golden Python conosce il solo TESTO (li' l'esito non
+                    // aveva un campo): l'esito si ricostruisce col ponte legacy,
+                    // esplicitamente e in un punto solo, per non far rientrare
+                    // il criterio testuale nella funzione.
+                    let fallito = nexus_types::tool_outcome::is_tool_failure(listing);
+                    Value::String(ClarifyOrExpandNode::build_project_context(listing, fallito))
                 }
                 "llm_decision" => {
                     let d = LlmDecision::from_tool_input(c.input.get("tool_input").expect("input"));

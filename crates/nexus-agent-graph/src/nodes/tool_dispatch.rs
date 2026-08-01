@@ -15,8 +15,9 @@
 //!
 //! ## Riuso (regola L, nessuna logica ri-implementata qui)
 //!
-//! - `decisions::predictive_cap`: [`predictive_cap_check`] + [`is_cap_exempt`] +
-//!   [`PREDICTIVE_CAP_SENTINEL`] (guard "blocked-da-cap" testuale).
+//! - `decisions::predictive_cap`: [`predictive_cap_check`] + [`is_cap_exempt`].
+//!   Il guard "blocked-da-cap" NON riconosce piu' il proprio messaggio: il gate
+//!   che rifiuta la chiamata lo DICHIARA in [`ToolResultBlock::motivo_blocco`].
 //! - `decisions::m16`: [`build_m16_allowed`]/[`is_tool_allowed`]/
 //!   [`parse_discovered_tools`]/[`merge_discovered_run`] (il parser usa gia' il
 //!   fix ensure_ascii, PR-G).
@@ -38,17 +39,19 @@
 //!     -> `awaiting_confirmation=true` + pending_actions in extra, NESSUN tool
 //!     eseguito (interrupt-resume prima dell'executor, parita' graph.py).
 //! 3. per ogni pending, NELL'ORDINE: predictive_cap_check (priorita') ->
-//!    SYNTHETIC-blocked col SENTINEL (NON eseguito); M16 `is_tool_allowed` ->
-//!    SYNTHETIC error (forza nexus_mcp_tool_search); budget allegati ->
-//!    SYNTHETIC error; altrimenti KEPT.
+//!    SYNTHETIC-blocked (NON eseguito); M16 `is_tool_allowed` -> SYNTHETIC error
+//!    (forza nexus_mcp_tool_search); budget allegati -> SYNTHETIC error;
+//!    altrimenti KEPT. Ogni synthetic porta il gate che l'ha prodotto in
+//!    [`ToolResultBlock::motivo_blocco`].
 //! 4. esecuzione: `join_all` dei KEPT via `ToolExecutor::execute`. Il nodo
 //!    PRESERVA l'ordine ORIGINALE dei pending nella ricomposizione (allineamento
 //!    per POSIZIONE, non per id): load-bearing.
 //! 5. exit_code: fluisce da `ToolOutcome::exit_code` al `ContentBlock::ToolResult`
 //!    INVARIATO (segnale anti-stallo).
 //! 6. aggiorna `attachment_read_bytes` dai tool_result attachment.
-//! 7. guard "blocked-da-cap": se task_complete outcome=blocked + un tool_result
-//!    col SENTINEL -> rifiuta la dichiarazione UNA volta.
+//! 7. guard "blocked-da-cap": se task_complete outcome=blocked + una chiamata
+//!    del turno rifiutata dal cap (campo, non testo) -> rifiuta la
+//!    dichiarazione UNA volta.
 //! 8. persist step via `AgentStepStore::persist_step`.
 //! 9. context-budget cap: se `ctx_chars + new_chars > max_context_chars`, tronca
 //!    ogni tool_result a `budget_per_tool` con offload best-effort
@@ -101,9 +104,7 @@ use crate::decisions::hitl::{
     HITL_PENDING_ACTIONS_EXTRA_KEY,
 };
 use crate::decisions::m16::DiscoveredTool;
-use crate::decisions::predictive_cap::{
-    is_cap_exempt, predictive_cap_check, PREDICTIVE_CAP_SENTINEL,
-};
+use crate::decisions::predictive_cap::{is_cap_exempt, predictive_cap_check};
 use crate::decisions::tool_dispatch::{
     append_reminder_block, apply_run_notes, current_context_token_estimate, estimate_context_chars,
     estimate_tool_result_size_bytes, extract_returned_bytes, normalize_advisory_verdict,
@@ -342,6 +343,29 @@ impl Default for ToolDispatchConfig {
     }
 }
 
+/// Quale GATE ha rifiutato una chiamata prima di eseguirla. Vocabolario chiuso
+/// (regola Q): il fatto lo conosce chi rifiuta, e lo DICHIARA qui invece di
+/// affidarlo a una sottostringa del messaggio destinato al modello.
+///
+/// Il guard blocked-da-cap decideva cercando [`PREDICTIVE_CAP_SENTINEL`] dentro
+/// il testo di un qualunque tool_result del turno: un `read_file` su questo
+/// sorgente, un grep, il resoconto di un sub-run che cita il cap bastavano ad
+/// ANNULLARE una dichiarazione `blocked` legittima del modello — cioe' a
+/// rimettere in moto un run che si era fermato per una ragione vera.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MotivoBlocco {
+    /// Predictive context cap: la proiezione del risultato sforava il budget
+    /// (blocco della SINGOLA chiamata, mai del task).
+    PredictiveCap,
+    /// M16: tool non in whitelist e non ancora scoperto in questo run.
+    ToolNonScoperto,
+    /// Budget di letture allegati della sessione esaurito.
+    BudgetAllegati,
+    /// La porta ha sollevato un errore invece di rispondere (guasto infra o
+    /// eccezione applicativa): la chiamata e' partita, non e' stata rifiutata.
+    PortaInErrore,
+}
+
 /// Esito di UNA tool_result, prima della ricomposizione nell'ordine dei pending.
 /// Mappa il dict `{type, tool_use_id, content, is_error, exit_code?, raw_content?}`
 /// del Python. `content` e' un `Value` (la stringa JSON del tool, gia' eventualmente
@@ -360,6 +384,12 @@ struct ToolResultBlock {
     /// il parser M16. Rimosso prima di costruire il blocco finale (non arriva al
     /// modello). `None` per ogni altro tool.
     raw_content: Option<String>,
+    /// Il gate che ha rifiutato la chiamata, quando non e' stata eseguita.
+    /// `None` = il tool ha girato (o e' brain-only). E' un campo INTERNO al
+    /// turno: nasce qui e muore qui, quindi non ha bisogno di attraversare il
+    /// `ContentBlock::ToolResult` ne' la persistenza — il suo unico consumatore,
+    /// [`should_reject_blocked_from_cap`], guarda i risultati di QUESTO turno.
+    motivo_blocco: Option<MotivoBlocco>,
 }
 
 #[derive(Debug, Clone)]
@@ -599,13 +629,22 @@ impl ToolDispatchNode {
     /// Costruisce un tool_result SYNTHETIC d'errore (non eseguito): il `content`
     /// e' una stringa JSON (per gli errori M16/budget) o gia' il messaggio col
     /// SENTINEL (predictive cap). Replica i dict `{type:tool_result,...}` Python.
-    fn synthetic_error(tool_use_id: &str, content: Value) -> ToolResultBlock {
+    ///
+    /// `motivo` e' obbligatorio: chi fabbrica un risultato al posto del tool sa
+    /// PERCHE' lo sta facendo, e dichiararlo qui e' cio' che evita a valle di
+    /// dover riconoscere il proprio stesso messaggio (regola Q).
+    fn synthetic_error(
+        tool_use_id: &str,
+        content: Value,
+        motivo: MotivoBlocco,
+    ) -> ToolResultBlock {
         ToolResultBlock {
             tool_use_id: tool_use_id.to_string(),
             content,
             is_error: true,
             exit_code: None,
             raw_content: None,
+            motivo_blocco: Some(motivo),
         }
     }
 
@@ -653,6 +692,8 @@ impl ToolDispatchNode {
                 is_error: !acknowledged,
                 exit_code: None,
                 raw_content: None,
+                // Brain-only: nessun gate ha rifiutato nulla.
+                motivo_blocco: None,
             };
         }
 
@@ -755,6 +796,8 @@ impl ToolDispatchNode {
                     is_error: outcome.is_error,
                     exit_code: outcome.exit_code,
                     raw_content,
+                    // Il tool ha girato: nessun gate lo ha rifiutato.
+                    motivo_blocco: None,
                 }
             }
             // try/except onnicomprensivo: QUALSIASI errore (infra incluso) ->
@@ -763,6 +806,7 @@ impl ToolDispatchNode {
             Err(exc) => Self::synthetic_error(
                 &tool_use_id,
                 Value::String(py_dumps(&json!({"error": exc.to_string()}))),
+                MotivoBlocco::PortaInErrore,
             ),
         }
     }
@@ -1161,7 +1205,11 @@ impl ToolDispatchNode {
             expected,
             gates.predictive_tokens,
         )?;
-        Some(Self::synthetic_error(tool_use_id, Value::String(msg)))
+        Some(Self::synthetic_error(
+            tool_use_id,
+            Value::String(msg),
+            MotivoBlocco::PredictiveCap,
+        ))
     }
 
     /// (3b) M16: tool non ammesso e non scoperto -> SYNTHETIC error che forza il
@@ -1192,6 +1240,7 @@ impl ToolDispatchNode {
         Some(Self::synthetic_error(
             tool_use_id,
             Value::String(py_dumps(&err)),
+            MotivoBlocco::ToolNonScoperto,
         ))
     }
 
@@ -1414,6 +1463,7 @@ fn attachment_budget_block(
     Some(ToolDispatchNode::synthetic_error(
         tool_use_id,
         Value::String(py_dumps(&err)),
+        MotivoBlocco::BudgetAllegati,
     ))
 }
 
@@ -1452,8 +1502,13 @@ fn added_attachment_bytes(pending: &[Value], results: &[ToolResultBlock]) -> i64
 }
 
 /// (7) Predicato del guard blocked-da-cap: l'ultima dichiarazione del turno e'
-/// `blocked`, non e' gia' stata rifiutata in questo run e almeno un tool_result
-/// porta il SENTINEL del predictive cap.
+/// `blocked`, non e' gia' stata rifiutata in questo run e almeno una chiamata di
+/// QUESTO turno e' stata rifiutata dal predictive cap.
+///
+/// Il criterio e' il campo [`ToolResultBlock::motivo_blocco`], che il gate
+/// compila quando rifiuta: annullare una dichiarazione d'esito del modello e'
+/// un'azione forte, e non puo' poggiare sul ritrovamento di una stringa dentro
+/// un testo che qualunque tool puo' aver RESTITUITO invece che SUBITO.
 fn should_reject_blocked_from_cap(
     declared_outcomes: &[Value],
     results: &[ToolResultBlock],
@@ -1463,10 +1518,10 @@ fn should_reject_blocked_from_cap(
         .last()
         .and_then(|d| d.get("outcome").and_then(Value::as_str))
         == Some("blocked");
-    let any_cap_sentinel = results
+    let qualcuno_bloccato_dal_cap = results
         .iter()
-        .any(|r| value_as_json_string(&r.content).contains(PREDICTIVE_CAP_SENTINEL));
-    !declared_outcomes.is_empty() && last_blocked && !already_rejected && any_cap_sentinel
+        .any(|r| r.motivo_blocco == Some(MotivoBlocco::PredictiveCap));
+    !declared_outcomes.is_empty() && last_blocked && !already_rejected && qualcuno_bloccato_dal_cap
 }
 
 /// (7) Guard blocked-da-cap (py:3924-3953): una dichiarazione `blocked` il cui
@@ -1732,6 +1787,9 @@ fn declarative_tool_result(
         is_error: decl.is_err(),
         exit_code: None,
         raw_content: None,
+        // Canale dichiarativo (brain-only): il rifiuto riguarda la
+        // DICHIARAZIONE, non una chiamata che un gate ha impedito.
+        motivo_blocco: None,
     }
 }
 
@@ -2103,6 +2161,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    // Prosa del messaggio al modello: i test la controllano perche' e' cio' che
+    // il modello legge, MAI perche' il programma la usi per decidere.
+    use crate::decisions::predictive_cap::PREDICTIVE_CAP_SENTINEL;
     use crate::routing::config::RoutingConfig;
     use crate::runtime::ports::{PortError, SseEvent, ToolOutcome};
     use crate::runtime::test_doubles::{
@@ -2182,6 +2243,7 @@ mod tests {
             is_error: false,
             exit_code: None,
             raw_content: None,
+            motivo_blocco: None,
         }];
 
         let enforcement = panel_enforcement_from_results(&pending, &results)
@@ -2212,6 +2274,7 @@ mod tests {
             is_error: false,
             exit_code: None,
             raw_content: None,
+            motivo_blocco: None,
         }];
 
         let enforcement = panel_enforcement_from_results(&pending, &results)
@@ -2243,6 +2306,7 @@ mod tests {
             is_error: false,
             exit_code: None,
             raw_content: None,
+            motivo_blocco: None,
         }];
 
         let enforcement = panel_enforcement_from_results(&pending, &results)
@@ -3013,6 +3077,68 @@ mod tests {
             .unwrap();
         assert!(tc["is_error"].as_bool().unwrap());
         assert!(tc["content"].as_str().unwrap().contains("RIFIUTATA"));
+    }
+
+    /// Un tool che RESTITUISCE il testo del cap non ha SUBITO il cap: la
+    /// dichiarazione `blocked` del modello resta in piedi.
+    ///
+    /// E' la trappola armata dal criterio testuale: il guard cercava
+    /// [`PREDICTIVE_CAP_SENTINEL`] in un qualunque tool_result del turno, e quel
+    /// testo puo' arrivare da un `read_file` su questo sorgente, da un grep, dal
+    /// resoconto di un sub-run che cita il cap. Chi lo restituiva vedeva
+    /// annullata la propria dichiarazione di blocco e il run ripartiva su un
+    /// blocco vero.
+    ///
+    /// La finestra qui e' ampia (nessuna chiamata viene rifiutata): l'unica
+    /// occorrenza della stringa e' nel CONTENUTO di un tool riuscito.
+    ///
+    /// PROVA DI MUTAZIONE: rimettendo in `should_reject_blocked_from_cap` il
+    /// criterio testuale (`results.iter().any(|r|
+    /// value_as_json_string(&r.content).contains(PREDICTIVE_CAP_SENTINEL))`) al
+    /// posto del campo, questo test rosseggia su `declared_outcome == None` e
+    /// `blocked_cap_rejected == Some(true)`.
+    #[tokio::test]
+    async fn un_tool_che_cita_il_cap_non_annulla_la_dichiarazione_di_blocco() {
+        let cfg = ToolDispatchConfig {
+            context_window: 10_000_000,
+            predictive_cap_ratio: 0.8,
+            ..Default::default()
+        };
+        // Il sorgente letto contiene la frase del cap: e' un CONTENUTO, non un
+        // rifiuto. Passa dal produttore vero (la porta `ToolExecutor`).
+        let tools = Arc::new(MapToolExecutor::new().with(
+            "read_file",
+            ToolOutcome {
+                tool_call_id: "r1".into(),
+                content: Value::String(format!(
+                    "pub const PREDICTIVE_CAP_SENTINEL: &str = \"{PREDICTIVE_CAP_SENTINEL}\";"
+                )),
+                is_error: false,
+                ..Default::default()
+            },
+        ));
+        let (n, _steps, _rc) = node(cfg, tools.clone());
+        let ctx = ctx_with(CancellationToken::new());
+        let st = state_with_pending(vec![
+            pending_tool("r1", "read_file", json!({"path": "predictive_cap.rs"})),
+            pending_tool(
+                "c2",
+                "task_complete",
+                json!({"outcome": "blocked", "summary": "manca la credenziale del provider"}),
+            ),
+        ]);
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+
+        assert_eq!(tools.seen.lock().expect("lock").len(), 1, "read_file eseguito");
+        assert_eq!(
+            out.declared_outcome
+                .as_ref()
+                .and_then(|v| v.get("outcome"))
+                .and_then(Value::as_str),
+            Some("blocked"),
+            "nessuna chiamata e' stata rifiutata dal cap: la dichiarazione vale"
+        );
+        assert_eq!(out.blocked_cap_rejected, None);
     }
 
     // ── (3b) M16: tool non scoperto -> synthetic error, forza search ─────────────

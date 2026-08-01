@@ -1590,8 +1590,41 @@ if [ -n "$esito_dal_testo" ]; then
   printf '%s' "$esito_dal_testo" >&2
   echo "   Usa risposta.esito.e_fallito() (regola Q)." >&2
   fail=1
+else
+  echo "OK risposta-tool-esito-dal-campo: l'esito si legge dal campo"
+fi
+
+# Un conflitto di unicita' si riconosce dal CODICE, mai dal messaggio (2026-08-02)
+#
+# Il Display di sqlx::Error dipende da `lc_messages` del server: MISURATO il
+# 01/08/2026 su questo Postgres, che risponde in italiano — «un valore chiave
+# duplicato viola il vincolo univoco "..."» — dove ne' "unique" ne' "duplicate"
+# compaiono. Ogni `contains` su quelle parole era gia' cieco, non a rischio di
+# diventarlo, e i difetti che ne nascevano erano opposti: un profilo con nome
+# gia' preso rispondeva 500 "errore interno", e una direttiva dava 409 anche
+# quando il DB era irraggiungibile.
+assert_single "conflitto-unicita-dal-codice" 'pub fn is_unique_violation\('   'crates/nexus-types/src/db_error.rs' crates
+
+# Il guard che conta: nessuno riconosce il conflitto dal testo dell'errore.
+# Escluse le righe di commento (dove la parola compare per SPIEGARE il difetto).
+conflitto_dal_testo=""
+for f in $(grep -rlE --include='*.rs' --exclude-dir=target     'to_string\(\)\.contains\("(unique|duplicate|uq_)' crates 2>/dev/null); do
+  hit="$(awk '
+    /^[[:space:]]*\/\// { next }
+    /to_string\(\)\.contains\("(unique|duplicate|uq_)/ { print NR ": " $0 }
+  ' "$f" || true)"
+  [[ -n "$hit" ]] && conflitto_dal_testo+="  $f"$'
+'"$hit"$'
+'
+done
+if [ -n "$conflitto_dal_testo" ]; then
+  echo "!! conflitto-unicita-dal-codice: il conflitto e' riconosciuto dal testo" >&2
+  echo "   dell'errore, che dipende dalla lingua del server:" >&2
+  printf '%s' "$conflitto_dal_testo" >&2
+  echo "   Usa nexus_types::db_error::is_unique_violation(&e) (SQLSTATE 23505)." >&2
+  fail=1
 else
-  echo "OK risposta-tool-esito-dal-campo: l'esito si legge dal campo"
+  echo "OK conflitto-unicita-dal-codice: nessun riconoscimento dal messaggio"
 fi
 
 # Il corpo che parte da un endpoint OpenAI-compat nasce in UN punto (2026-07-30)

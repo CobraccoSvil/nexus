@@ -101,6 +101,14 @@ fn find_redaction_map_placeholder(text: &str) -> Option<String> {
 /// (`nexus_agent_graph::routing::signals::REDACTION_REJECTED_CODE`); qui lo
 /// RI-ESPORTIAMO senza duplicarlo, cosi' fonte e consumatore condividono un
 /// solo valore versionato insieme.
+///
+/// LIMITE del canale, finche' il rifiuto e' una stringa: il codice apre il
+/// messaggio (subito dopo il marker d'errore) ma il consumatore lo cerca in un
+/// punto QUALUNQUE del testo dei tool_result recenti, e un tool puo' quel testo
+/// RESTITUIRLO invece che subirlo — un `read_file` su questo sorgente, un grep,
+/// il resoconto di un sub-run che cita il rifiuto. Un campo lo rende una
+/// domanda che non si pone: e' cio' che `nexus_types::tool_outcome::RispostaTool`
+/// fa per l'esito, dove comporre il testo non tocca la dichiarazione.
 pub use nexus_agent_graph::routing::signals::REDACTION_REJECTED_CODE;
 
 /// Messaggio di rifiuto per il modello: spiega cos'e' il placeholder e quale

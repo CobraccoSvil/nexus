@@ -53,6 +53,37 @@ pub struct UpdateDirectiveRequest {
 
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
+/// Errore sull'INSERT di una direttiva: una violazione di UNICITA' sulla chiave
+/// e' un CONFLITTO (409); qualunque altro guasto DB e' un 500.
+///
+/// Il segnale e' STRUTTURATO (SQLSTATE 23505 via
+/// `DatabaseError::is_unique_violation`, regola M): il Display di `sqlx::Error`
+/// e' testo per l'umano e cambia con driver, versione e `lc_messages` del
+/// server.
+///
+/// Il `contains("duplicate")` che stava qui non era una fragilita' teorica: era
+/// gia' cieco. MISURATO il 01/08/2026 sul Postgres di questo ambiente, che
+/// risponde in italiano — «un valore chiave duplicato viola il vincolo univoco
+/// "..."»: ne' "duplicate" ne' "unique" compaiono, quindi il ramo del conflitto
+/// non veniva scelto mai. Il difetto restava invisibile solo perche' il ramo
+/// "altro errore" rispondeva ugualmente 409, cioe' dava la risposta giusta per
+/// la ragione sbagliata — e con essa la dava anche a un Postgres
+/// irraggiungibile, che al client si presentava come "direttiva gia'
+/// esistente": l'unica risposta capace di far rinunciare chi chiama.
+fn insert_error(e: sqlx::Error, key: &str) -> (StatusCode, Json<Value>) {
+    if nexus_types::db_error::is_unique_violation(&e) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": format!("Direttiva '{}' gia' esistente", key) })),
+        );
+    }
+    tracing::error!(error = %e, key, "shared_directives: INSERT fallita");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": e.to_string() })),
+    )
+}
+
 /// SELECT per chiave con mapping 500/404 (punto unico, regola L):
 /// prima duplicato identico in `get_directive` e `update_directive`.
 async fn fetch_directive_or_404(
@@ -149,14 +180,7 @@ pub async fn create_directive(
     .bind(&body.description)
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        let msg = if e.to_string().contains("duplicate") || e.to_string().contains("unique") {
-            format!("Direttiva '{}' gia' esistente", key)
-        } else {
-            e.to_string()
-        };
-        (StatusCode::CONFLICT, Json(json!({ "error": msg })))
-    })?;
+    .map_err(|e| insert_error(e, &key))?;
 
     Ok(Json(json!(row)))
 }
@@ -267,4 +291,66 @@ pub async fn delete_directive(
     }
 
     Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// REGRESSIONE (violazione 19): la creazione di una direttiva riconosceva
+    /// il conflitto dal Display di `sqlx::Error` con `contains("duplicate")`, e
+    /// per giunta rispondeva 409 anche quando il DB era guasto — cioe' un
+    /// Postgres irraggiungibile diceva al client "esiste gia'", l'unica risposta
+    /// che lo convince a non riprovare.
+    ///
+    /// Il test attraversa il PRODUTTORE vero (regola O): l'errore nasce da un
+    /// vincolo UNIQUE violato da una INSERT reale, quindi il messaggio e'
+    /// quello che il SERVER produce davvero — non quello che ci si aspetta che
+    /// produca. E' la differenza che conta: su questo Postgres il messaggio e'
+    /// «un valore chiave duplicato viola il vincolo univoco
+    /// "pk_chiave_direttiva"», e nessuna delle due parole cercate compare.
+    /// Fabbricando l'errore a mano il test avrebbe scritto il messaggio inglese
+    /// e sarebbe stato verde sopra una produzione cieca.
+    ///
+    /// PROVA DI MUTAZIONE ESEGUITA: rimesso il `contains("duplicate")`, la
+    /// prima assert rosseggia con 500 al posto di 409.
+    #[sqlx::test]
+    async fn conflitto_e_guasto_non_sono_la_stessa_risposta(pool: sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE direttive_finte ( \
+               chiave TEXT NOT NULL, \
+               CONSTRAINT pk_chiave_direttiva UNIQUE (chiave) )",
+        )
+        .execute(&pool)
+        .await
+        .expect("tabella");
+        sqlx::query("INSERT INTO direttive_finte (chiave) VALUES ('gemella')")
+            .execute(&pool)
+            .await
+            .expect("prima riga");
+
+        let conflitto = sqlx::query("INSERT INTO direttive_finte (chiave) VALUES ('gemella')")
+            .execute(&pool)
+            .await
+            .expect_err("la seconda INSERT viola il vincolo");
+        let (status, _) = insert_error(conflitto, "gemella");
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "SQLSTATE 23505 e' il conflitto, qualunque cosa dica il messaggio"
+        );
+
+        // Il DB non c'e' piu': non e' un conflitto, e' un guasto.
+        pool.close().await;
+        let guasto = sqlx::query("INSERT INTO direttive_finte (chiave) VALUES ('altra')")
+            .execute(&pool)
+            .await
+            .expect_err("pool chiuso");
+        let (status, _) = insert_error(guasto, "altra");
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "un guasto DB non e' 'direttiva gia' esistente'"
+        );
+    }
 }

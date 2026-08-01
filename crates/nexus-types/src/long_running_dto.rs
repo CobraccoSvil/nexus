@@ -61,12 +61,19 @@ pub async fn create_pattern_core(db: &PgPool, body: CreatePatternRequest) -> Api
     .fetch_one(db)
     .await
     .map_err(|e| {
-        let msg = if e.to_string().contains("duplicate") {
-            format!("Pattern '{}' già esistente", pattern)
+        // Il conflitto lo dice il CODICE (punto unico crate::db_error), mai il
+        // messaggio: su un Postgres in italiano quella parola non compare, e il
+        // ramo era gia' cieco. E un errore che NON e' un conflitto non e' un
+        // 409: rispondere 409 a un guasto del DB manda l'utente a cambiare un
+        // nome che andava benissimo.
+        if crate::db_error::is_unique_violation(&e) {
+            api_error(
+                StatusCode::CONFLICT,
+                format!("Pattern '{pattern}' già esistente"),
+            )
         } else {
-            e.to_string()
-        };
-        api_error(StatusCode::CONFLICT, msg)
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
     })?;
 
     Ok(Json(json!(row)))

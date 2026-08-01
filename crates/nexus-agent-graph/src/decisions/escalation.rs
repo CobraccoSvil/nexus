@@ -6,7 +6,9 @@
 //! l'insieme dei candidati (catena intra-provider + candidati cross-provider, gia'
 //! filtrati per capability/cooldown e arricchiti di tier + telemetria) arriva gia'
 //! risolto dal chiamante via [`crate::runtime::ports::EscalationPort`] (nessun IO,
-//! nessuna lettura DB qui — regola G).
+//! nessuna lettura DB qui — regola G). Il criterio con cui i candidati
+//! cross-provider entrano nell'insieme e' [`cross_provider_shortlist`], anch'esso
+//! puro: la porta gli passa il pool eleggibile, non un ripiego singolo.
 //!
 //! ## Selezione AGENTICA (niente catena fissa)
 //!
@@ -27,6 +29,8 @@
 //!
 //! Il modello corrente (quello che sta fallendo) e' sempre ESCLUSO. La scelta e'
 //! DETERMINISTICA e replay-stabile (nessun LLM, solo il ranking puro sui segnali).
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -188,6 +192,62 @@ pub fn cap_candidates_one_step(
     } else {
         capped
     }
+}
+
+/// I candidati CROSS-PROVIDER ammissibili a un'escalation, scelti da un INSIEME
+/// invece che da un ripiego singolo. PURA.
+///
+/// Duale del criterio della catena intra-provider: quella ammette i modelli con
+/// `escalation_rank` SUPERIORE al corrente, cioe' non scende mai di capacita';
+/// qui l'equivalente esprimibile su fornitori diversi e' `tier_rank >=
+/// corrente`. Un candidato piu' debole non e' un'escalation, e' un ripiego — e
+/// per quello c'e' [`pick_failover_model`], che infatti tratta il tier come
+/// indicazione e non come pavimento.
+///
+/// `per_tier` limita quanti candidati tenere PER LIVELLO, non quanti in totale.
+/// Il pool arriva ordinato dal produttore per NON-thinking, poi costo crescente,
+/// poi featured (`AGENTIC_FAILOVER_ORDER` in mcp-core): un ordine pensato per
+/// scegliere un SOSTITUTO, dove il piu' economico che non impone round-trip di
+/// reasoning e' il candidato giusto. Qui la domanda e' l'opposta — il piu'
+/// CAPACE — e i modelli capaci stanno in fondo a quell'ordine perche' costano.
+/// Un tetto GLOBALE su quell'ordine escluderebbe
+/// sistematicamente proprio i livelli alti — e' il difetto gia' misurato sul
+/// backstop del pool di failover, dove un limite 64 su ~112 eleggibili tagliava
+/// tutti i frontier/heavy. Con un tetto per livello ogni banda di capacita'
+/// resta rappresentata, e [`cap_candidates_one_step`] a valle trova qualcosa da
+/// cui scegliere invece di una banda vuota. `0` = insieme disattivato: resta la
+/// sola preferenza dichiarata dal chiamante (comportamento storico).
+///
+/// L'ordine d'ingresso del pool e' preservato DENTRO ogni livello (e' il
+/// tie-breaker finale di [`pick_escalation_model`]); l'uscita e' ordinata per
+/// tier ASC, dal piu' vicino al corrente al piu' forte, come la catena intra.
+/// `current_tier` `None` = medium neutro (coerente con `tier_rank`).
+pub fn cross_provider_shortlist(
+    pool: Vec<CrossProviderCandidate>,
+    current_tier: Option<&str>,
+    per_tier: usize,
+) -> Vec<CrossProviderCandidate> {
+    if per_tier == 0 {
+        return Vec::new();
+    }
+    let floor = tier_rank(current_tier);
+    // `BTreeMap` sul rank: le chiavi escono ordinate, quindi il livello piu'
+    // vicino al corrente esce per primo senza un secondo sort.
+    let mut per_livello: BTreeMap<u8, Vec<CrossProviderCandidate>> = BTreeMap::new();
+    for c in pool {
+        if c.provider.trim().is_empty() || c.model.trim().is_empty() {
+            continue;
+        }
+        let rank = tier_rank(c.tier.as_deref());
+        if rank < floor {
+            continue;
+        }
+        let livello = per_livello.entry(rank).or_default();
+        if livello.len() < per_tier {
+            livello.push(c);
+        }
+    }
+    per_livello.into_values().flatten().collect()
 }
 
 /// PUNTO UNICO (regola L) della selezione AGENTICA del SOSTITUTO su provider
@@ -525,6 +585,104 @@ mod tests {
         let capped = cap_candidates_one_step(&cands, Some("medium"));
         assert_eq!(capped.len(), 1);
         assert_eq!(capped[0].model, "frontier");
+    }
+
+    // ---- cross_provider_shortlist (l'insieme, non il ripiego singolo) ----
+
+    fn cross(provider: &str, model: &str, tier: &str) -> CrossProviderCandidate {
+        CrossProviderCandidate {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            tier: Some(tier.to_string()),
+        }
+    }
+
+    /// IL CASO REALE (run cfb781ff, 01/08/2026): il corrente e' in cima alla
+    /// propria catena intra e l'unico ripiego dichiarato non qualifica; nel
+    /// catalogo, nello stesso istante, ci sono fornitori sani almeno altrettanto
+    /// capaci. Con un insieme la porta ha qualcosa da consegnare.
+    #[test]
+    fn shortlist_ammette_i_pari_e_i_piu_capaci() {
+        let pool = vec![
+            cross("openai", "gpt-frontier", "frontier"),
+            cross("anthropic", "claude-heavy", "heavy"),
+            cross("google", "gemini-high", "high"),
+        ];
+        let out = cross_provider_shortlist(pool, Some("heavy"), 3);
+        let modelli: Vec<&str> = out.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(
+            modelli,
+            vec!["claude-heavy", "gpt-frontier"],
+            "pari-tier prima (piu' vicino), poi il piu' forte; il high e' sotto il corrente"
+        );
+    }
+
+    /// MUTAZIONE del difetto: il tetto e' PER LIVELLO, non globale. Con un tetto
+    /// globale di 2 su un pool ordinato per costo crescente, il frontier — che e'
+    /// l'ultimo perche' e' il piu' caro — non entrerebbe mai, e a valle
+    /// `cap_candidates_one_step` troverebbe una banda vuota.
+    #[test]
+    fn shortlist_tiene_ogni_livello_non_solo_i_primi_del_pool() {
+        let pool = vec![
+            cross("a", "heavy-1", "heavy"),
+            cross("b", "heavy-2", "heavy"),
+            cross("c", "heavy-3", "heavy"),
+            cross("d", "frontier-caro", "frontier"),
+        ];
+        let out = cross_provider_shortlist(pool, Some("heavy"), 2);
+        let modelli: Vec<&str> = out.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(
+            modelli,
+            vec!["heavy-1", "heavy-2", "frontier-caro"],
+            "due per livello: il terzo heavy cade, il frontier NO"
+        );
+    }
+
+    /// Non si "escala" verso il basso: un candidato meno capace del corrente e'
+    /// un ripiego, non un'escalation.
+    #[test]
+    fn shortlist_scarta_chi_e_meno_capace_del_corrente() {
+        let pool = vec![
+            cross("a", "light", "light"),
+            cross("b", "medium", "medium"),
+            cross("c", "heavy", "heavy"),
+        ];
+        let out = cross_provider_shortlist(pool, Some("high"), 5);
+        let modelli: Vec<&str> = out.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(modelli, vec!["heavy"]);
+    }
+
+    /// Dentro il livello sopravvive l'ordine d'ingresso del pool (preferenza del
+    /// routing), che e' il tie-breaker finale di `pick_escalation_model`.
+    #[test]
+    fn shortlist_preserva_l_ordine_dentro_il_livello() {
+        let pool = vec![
+            cross("a", "primo", "heavy"),
+            cross("b", "secondo", "heavy"),
+        ];
+        let out = cross_provider_shortlist(pool, Some("heavy"), 5);
+        assert_eq!(out[0].model, "primo");
+    }
+
+    /// `0` disattiva l'insieme (resta la sola preferenza dichiarata dal
+    /// chiamante): la chiave di configurazione ha una via d'uscita esplicita.
+    #[test]
+    fn shortlist_per_tier_zero_e_insieme_vuoto() {
+        let pool = vec![cross("a", "heavy", "heavy")];
+        assert!(cross_provider_shortlist(pool, Some("heavy"), 0).is_empty());
+    }
+
+    /// Tier corrente ignoto = medium neutro, come ovunque nel vocabolario dei
+    /// tier: si scarta cio' che sta sotto medium, non tutto.
+    #[test]
+    fn shortlist_tier_corrente_assente_e_medium_neutro() {
+        let pool = vec![
+            cross("a", "light", "light"),
+            cross("b", "medium", "medium"),
+        ];
+        let out = cross_provider_shortlist(pool, None, 5);
+        let modelli: Vec<&str> = out.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(modelli, vec!["medium"]);
     }
 
     #[test]

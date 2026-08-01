@@ -1520,25 +1520,39 @@ async fn missing_model_should_be_preserved(
     // (model_health_probe) trova ancora il modello SANO, non spegnerlo solo
     // perche' "datato" / non piu' in lista. Disabilitiamo solo se anche
     // l'health reale lo conferma rotto.
-    if model_recently_healthy(db, provider, catalog_model).await {
-        // Annotazione diagnostica idempotente: il modello resta is_enabled=true
-        // (NON tocchiamo auto_disabled_*), ma l'audit_log registra la decisione
-        // cosi' e' rintracciabile perche' un modello "datato" e' rimasto attivo.
-        tracing::info!(
-            "catalog_sync[{}]: '{}' assente da upstream MA probe recente healthy -> NON disabilito (legacy, lascio is_enabled=true)",
-            provider, catalog_model,
-        );
-        audit_log(
-            db,
-            provider,
-            catalog_model,
-            "kept_enabled_legacy",
-            json!({"reason":"missing_from_api_but_recently_healthy"}),
-        )
-        .await;
-        return true;
+    match salute_modello_recente(db, provider, catalog_model).await {
+        SaluteModello::Sano => {
+            // Annotazione diagnostica idempotente: il modello resta
+            // is_enabled=true (NON tocchiamo auto_disabled_*), ma l'audit_log
+            // registra la decisione cosi' e' rintracciabile perche' un modello
+            // "datato" e' rimasto attivo.
+            tracing::info!(
+                "catalog_sync[{}]: '{}' assente da upstream MA probe recente healthy -> NON disabilito (legacy, lascio is_enabled=true)",
+                provider, catalog_model,
+            );
+            audit_log(
+                db,
+                provider,
+                catalog_model,
+                "kept_enabled_legacy",
+                json!({"reason":"missing_from_api_but_recently_healthy"}),
+            )
+            .await;
+            true
+        }
+        // Nessun verdetto: non si scrive. Non e' "sano" (niente audit che lo
+        // affermi), e' l'assenza del fatto su cui la disabilitazione si fonda.
+        // Il sync successivo ripone la domanda; un modello di troppo acceso per
+        // un giro non costa nulla, un parco spento da un DB muto si'.
+        SaluteModello::NonInterrogabile => {
+            tracing::warn!(
+                "catalog_sync[{}]: '{}' assente da upstream e salute NON interrogabile -> nessuna scrittura (rimando al prossimo sync)",
+                provider, catalog_model,
+            );
+            true
+        }
+        SaluteModello::NonSano => false,
     }
-    false
 }
 
 /// Disabilita un singolo modello assente dall'API (reason 'missing_from_api') +
@@ -2487,6 +2501,25 @@ async fn write_probe_healthy_flags(
     }
 }
 
+/// Verdetto sulla salute recente di un modello secondo l'ACCOUNT (regola Q:
+/// l'ignoto e' una variante, mai un valore comodo).
+///
+/// La terza variante non e' un dettaglio diagnostico: la conseguenza del
+/// verdetto e' una SCRITTURA (disabilitazione della riga di catalog), e
+/// collassare l'errore di interrogazione su `NonSano` significa che un DB che
+/// non risponde disabilita modelli sani. Su `NonInterrogabile` non si scrive:
+/// il prossimo giro del sync ripone la domanda.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaluteModello {
+    /// Un fatto dice che il modello risponde ancora per questo account.
+    Sano,
+    /// Un fatto dice il contrario: probe recente fallito, o fallimenti
+    /// consecutivi registrati nel catalog.
+    NonSano,
+    /// Nessun fatto: la domanda non ha potuto raggiungere il DB.
+    NonInterrogabile,
+}
+
 /// FIX 2: verifica se un modello e' "recentemente sano" secondo l'account,
 /// non secondo la lista upstream. Usato dal catalog_sync per NON disabilitare
 /// modelli assenti da upstream ma ancora funzionanti per l'account.
@@ -2495,14 +2528,11 @@ async fn write_probe_healthy_flags(
 ///         `agent.catalog_sync_health_window_hours` (default 24h), OPPURE
 ///        (b) il catalog riporta consecutive_failures=0 per il modello (mai
 ///         fallito un probe model-specific).
-///
-/// Conservativo: se la query fallisce, ritorna `false` (cioe' lascia procedere
-/// la disabilitazione come prima — niente nuovi falsi-positivi su DB down).
-async fn model_recently_healthy(db: &PgPool, provider: &str, model: &str) -> bool {
+async fn salute_modello_recente(db: &PgPool, provider: &str, model: &str) -> SaluteModello {
     let window_hours = load_health_window_hours(db).await;
 
     // (a) Ultimo health check recente healthy=true.
-    let recent_healthy: Option<bool> = sqlx::query_scalar(
+    let recent_healthy = sqlx::query_scalar::<_, bool>(
         "SELECT healthy
            FROM ai_model_health_history
           WHERE provider = $1 AND model = $2
@@ -2514,20 +2544,24 @@ async fn model_recently_healthy(db: &PgPool, provider: &str, model: &str) -> boo
     .bind(model)
     .bind(window_hours as i32)
     .fetch_optional(db)
-    .await
-    .ok()
-    .flatten();
-    if matches!(recent_healthy, Some(true)) {
-        return true;
-    }
+    .await;
 
-    // (b) Fallback: nessun probe recente, ma il catalog non registra fallimenti
-    // model-specific consecutivi -> consideriamo il modello ancora valido.
-    if recent_healthy.is_none() {
-        return model_has_no_consecutive_failures(db, provider, model).await;
+    match recent_healthy {
+        Err(e) => {
+            tracing::warn!(
+                provider,
+                model,
+                error = %e,
+                "catalog_sync: storico health non interrogabile (nessun verdetto di salute)"
+            );
+            SaluteModello::NonInterrogabile
+        }
+        Ok(Some(true)) => SaluteModello::Sano,
+        Ok(Some(false)) => SaluteModello::NonSano,
+        // (b) Fallback: nessun probe recente, ma il catalog non registra
+        // fallimenti model-specific consecutivi -> modello ancora valido.
+        Ok(None) => model_has_no_consecutive_failures(db, provider, model).await,
     }
-
-    false
 }
 
 /// Finestra di freschezza health DB-driven (setting
@@ -2543,22 +2577,39 @@ async fn load_health_window_hours(db: &PgPool) -> i64 {
         .unwrap_or(24)
 }
 
-/// Fallback (b) di `model_recently_healthy`: nessun probe recente, ma il catalog
-/// non registra fallimenti model-specific consecutivi (`consecutive_failures=0`,
-/// cioe' nessun probe l'ha trovato rotto) -> modello ancora valido. Estratta
-/// senza cambi di comportamento.
-async fn model_has_no_consecutive_failures(db: &PgPool, provider: &str, model: &str) -> bool {
-    let cf: Option<i32> = sqlx::query_scalar(
+/// Fallback (b) di [`salute_modello_recente`]: nessun probe recente, ma il
+/// catalog non registra fallimenti model-specific consecutivi
+/// (`consecutive_failures=0`, cioe' nessun probe l'ha trovato rotto) ->
+/// modello ancora valido.
+///
+/// Riga ASSENTE (`Ok(None)`) e' un fatto, non un ignoto: non esiste nulla da
+/// preservare, quindi `NonSano`. Solo l'errore di interrogazione e' ignoto.
+async fn model_has_no_consecutive_failures(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+) -> SaluteModello {
+    let cf = sqlx::query_scalar::<_, i32>(
         "SELECT consecutive_failures FROM ai_price_catalog
           WHERE provider = $1 AND model = $2",
     )
     .bind(provider)
     .bind(model)
     .fetch_optional(db)
-    .await
-    .ok()
-    .flatten();
-    matches!(cf, Some(0))
+    .await;
+    match cf {
+        Err(e) => {
+            tracing::warn!(
+                provider,
+                model,
+                error = %e,
+                "catalog_sync: consecutive_failures non interrogabile (nessun verdetto di salute)"
+            );
+            SaluteModello::NonInterrogabile
+        }
+        Ok(Some(0)) => SaluteModello::Sano,
+        Ok(_) => SaluteModello::NonSano,
+    }
 }
 
 async fn audit_log(db: &PgPool, provider: &str, model: &str, action: &str, details: Value) {
@@ -3518,6 +3569,82 @@ mod tests {
             (policy_curata.as_str(), tool_use_curato),
             ("none", false),
             "una riga 'manual' e' curata a mano: i flag classificati non la toccano"
+        );
+    }
+
+    /// REGRESSIONE (violazione 20): un DB che non risponde diventava un modello
+    /// DISABILITATO. `model_recently_healthy` collassava l'errore sqlx su
+    /// `false` con `.ok().flatten()` — cioe' sul verdetto "non e' sano" — e la
+    /// conseguenza di quel verdetto e' una SCRITTURA (`is_enabled=false`,
+    /// `auto_disabled_reason='missing_from_api'`).
+    ///
+    /// Il test attraversa il PRODUTTORE vero (regola O): l'errore non e'
+    /// fabbricato, nasce dal pool CHIUSO, cioe' dallo stesso `sqlx::Error` che
+    /// il sync incontrerebbe con Postgres irraggiungibile.
+    ///
+    /// PROVA DI MUTAZIONE ESEGUITA: fatto ritornare `NonSano` sul ramo `Err` di
+    /// `salute_modello_recente` (cioe' il vecchio `.ok().flatten()`), il test
+    /// rosseggia col valore del difetto reale — `left: NonSano`,
+    /// `right: NonInterrogabile` — e con esso cade il verdetto di preservazione,
+    /// cioe' il caller torna a scrivere.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn db_muto_non_e_un_modello_da_spegnere(pool: sqlx::PgPool) {
+        // Il DB c'e' e lo schema e' quello reale; poi sparisce sotto i piedi del
+        // sync, che e' esattamente il caso da coprire.
+        pool.close().await;
+
+        assert_eq!(
+            salute_modello_recente(&pool, "p", "m").await,
+            SaluteModello::NonInterrogabile,
+            "senza risposta dal DB non esiste alcun fatto sulla salute: \
+             l'ignoto e' una variante, non 'non e' sano'"
+        );
+
+        let api_models: Vec<String> = vec!["altro".to_string()];
+        let api_set: std::collections::HashSet<&str> = api_models
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            missing_model_should_be_preserved(&pool, "p", "m", &api_models, &api_set).await,
+            "modello assente da upstream + salute non interrogabile: si PRESERVA \
+             (nessuna disabilitazione), il prossimo sync ripone la domanda"
+        );
+    }
+
+    /// Il rovescio del test precedente: quando il fatto C'E', il verdetto resta
+    /// quello di prima. Senza questo, "non scrivo mai" passerebbe entrambi.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn fallimenti_consecutivi_registrati_restano_non_sano(pool: sqlx::PgPool) {
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+               (provider, model, input_cost_per_million_tokens, output_cost_per_million_tokens, \
+                consecutive_failures, currency) \
+             VALUES ('p', 'rotto', 1.0, 1.0, 3, 'USD'), \
+                    ('p', 'illeso', 1.0, 1.0, 0, 'USD')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        assert_eq!(
+            salute_modello_recente(&pool, "p", "rotto").await,
+            SaluteModello::NonSano,
+            "3 fallimenti consecutivi sono un FATTO: il modello si disabilita"
+        );
+        assert_eq!(
+            salute_modello_recente(&pool, "p", "illeso").await,
+            SaluteModello::Sano,
+            "nessun fallimento consecutivo: il modello resta acceso (FIX 2)"
+        );
+        assert_eq!(
+            salute_modello_recente(&pool, "p", "inesistente").await,
+            SaluteModello::NonSano,
+            "riga ASSENTE e' un fatto, non un ignoto: non c'e' nulla da preservare"
         );
     }
 }

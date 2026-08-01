@@ -6,20 +6,29 @@
 //! passato come parametri numerici. Qui vive solo la decisione di blocco e la
 //! costruzione del messaggio user-facing col SENTINEL.
 //!
-//! PUNTO UNICO (regola L) della sentinella [`PREDICTIVE_CAP_SENTINEL`]: il guard
-//! "blocked-da-cap" del tool_dispatch la matcha TESTUALMENTE (`if SENTINEL in content`)
-//! per rifiutare una dichiarazione `task_complete outcome=blocked` causata da un blocco
-//! di cap su singola chiamata. Una sola costante condivisa: se la stringa diverge fra il
-//! produttore (questa funzione) e il consumatore (il guard), la protezione si rompe in
-//! silenzio. Per questo e' esposta qui come unica fonte e va usata da entrambi i lati.
+//! [`PREDICTIVE_CAP_SENTINEL`] e' PROSA: apre il messaggio che il modello legge
+//! e nessun ramo del programma la estrae (regola Q). Il FATTO — "questa chiamata
+//! e' stata rifiutata dal cap" — lo conosce il gate che rifiuta, e viaggia in un
+//! campo del blocco di risultato (`nodes::tool_dispatch::ToolResultBlock::
+//! motivo_blocco`), che e' cio' su cui il guard "blocked-da-cap" decide se
+//! annullare una dichiarazione `task_complete outcome=blocked`.
+//!
+//! Finche' il canale era la sottostringa, quella decisione poteva nascere da un
+//! tool che la stringa l'aveva RESTITUITA invece che subita (un `read_file` su
+//! questo sorgente, un grep, il resoconto di un sub-run che cita il cap): la
+//! dichiarazione di blocco del modello veniva annullata e il run ripartiva.
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-/// Sentinella a convenzione chiusa: prefisso del tool_result quando il predictive
-/// context cap blocca una chiamata. VALORE ESATTO replicato 1:1 dal Python
-/// (`PREDICTIVE_CAP_SENTINEL`, helpers.py:3518). NON modificare senza aggiornare il
-/// guard testuale che la consuma (regola L).
+/// Apertura del messaggio che il modello riceve quando il predictive context cap
+/// rifiuta una chiamata. VALORE ESATTO replicato 1:1 dal Python
+/// (`PREDICTIVE_CAP_SENTINEL`, helpers.py:3518).
+///
+/// E' testo per chi legge, non un canale: chi deve SAPERE che una chiamata e'
+/// stata rifiutata dal cap guarda il campo `motivo_blocco` del risultato. Un
+/// consumatore nuovo che tornasse a cercare questa stringa dentro un contenuto
+/// riaprirebbe il difetto — un tool puo' restituirla senza averla subita.
 pub const PREDICTIVE_CAP_SENTINEL: &str = "[ERROR: chiamata bloccata da predictive context cap]";
 
 /// Tool di controllo/output-piccolo ESENTI dal cap (`_CAP_EXEMPT_TOOLS` Python, 1:1;

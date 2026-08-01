@@ -9,8 +9,12 @@
 //!      superiore al corrente, ordinati ASC;
 //!   2. stato cooldown del provider corrente dalla FONTE UNICA del gate (ADR 0020,
 //!      `crate::provider_cooldown::is_provider_in_cooldown`);
-//!   3. candidato cross-provider risolvendo il purpose `loop_fallback_default`
-//!      dalla routing matrix (regola G, `internal_routing::resolve_purpose_model_db`).
+//!   3. candidati cross-provider: la PREFERENZA dichiarata (purpose
+//!      `loop_fallback_default`, regola G, `internal_routing::resolve_purpose_model_db`)
+//!      piu' l'INSIEME eleggibile del catalog, scremato dal criterio puro
+//!      `cross_provider_shortlist`. Prima qui c'era il solo purpose, e un ripiego
+//!      singolo non e' un insieme: quando quell'unico non qualificava, la porta
+//!      consegnava zero candidati e l'esecutore chiudeva "catena esaurita".
 //!
 //! FILTRO PROVIDER REGISTRATI (nota verifica PR-J1): il signature-loop Python ha la
 //! guardia `_providers._providers.get(provider)` (`__init__.py:3200`): se la chain
@@ -29,10 +33,11 @@
 
 use async_trait::async_trait;
 use sqlx::PgPool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use nexus_agent_graph::decisions::escalation::{
-    pick_failover_model, ChainEntry, CrossProviderCandidate, EscalationCandidate,
+    cross_provider_shortlist, pick_failover_model, ChainEntry, CrossProviderCandidate,
+    EscalationCandidate,
 };
 use nexus_agent_graph::decisions::governance::ModelTelemetry;
 use nexus_agent_graph::runtime::ports::{
@@ -96,14 +101,15 @@ impl PgEscalationPort {
         self
     }
 
-    /// I candidati al RIPIEGO leciti per questo run: il pool del punto unico di
-    /// eleggibilita', meno quelli che il vincolo dell'utente esclude.
+    /// I candidati cross-provider leciti per questo run: il pool del punto unico
+    /// di eleggibilita', meno quelli che i vincoli del run escludono.
     ///
-    /// Esiste perche' il pool si legge DUE volte (la seconda allentando la
-    /// finestra, quando nessuno regge quella del caduto) e il vincolo va
-    /// applicato a entrambe le letture: scritto due volte, sarebbe bastato
-    /// aggiungere domani una terza lettura senza filtro per rimettere in gioco
-    /// proprio i fornitori che l'utente ha escluso. Senza vincolo e' l'identita'.
+    /// Esiste perche' il pool si legge PIU' volte — il ripiego lo legge due
+    /// (la seconda allentando la finestra, quando nessuno regge quella del
+    /// caduto) e l'escalation una terza ([`Self::cross_provider_set`]) — e il
+    /// vincolo va applicato a ognuna: scritto una volta per lettura, sarebbe
+    /// bastato aggiungerne un'altra senza filtro per rimettere in gioco proprio
+    /// i fornitori che il vincolo esclude. Senza vincolo e' l'identita'.
     async fn candidati_ammessi(
         &self,
         exclude: &[String],
@@ -127,7 +133,7 @@ impl PgEscalationPort {
                 // Il motivo VERO della chiusura che seguira': senza questa riga
                 // il log direbbe "nessun provider sano" e manderebbe la diagnosi
                 // a cercare un guasto dove c'e' solo la scelta dell'utente.
-                "failover_provider: run vincolato (pin dell'utente e/o veto del sistema), \
+                "candidati_ammessi: run vincolato (pin dell'utente e/o veto del sistema), \
                  candidati fuori dal vincolo scartati"
             );
         }
@@ -436,23 +442,24 @@ impl PgEscalationPort {
         .unwrap_or(0)
     }
 
-    /// Candidato cross-provider (`loop_fallback_default`) dal router. Eleggibile
-    /// SOLO la variante `Resolved` (tier-only, niente fallback hardcoded: ogni
-    /// altro esito — NotFound / NoCapableModel / MatrixUnavailable — NON e' un
-    /// candidato valido, regola G/H). `None` anche su sentinella o coppia vuota.
+    /// La PREFERENZA cross-provider dichiarata dall'amministratore (purpose
+    /// `loop_fallback_default`) dal router. Eleggibile SOLO la variante
+    /// `Resolved` (tier-only, niente fallback hardcoded: ogni altro esito —
+    /// NotFound / NoCapableModel / MatrixUnavailable — NON e' un candidato
+    /// valido, regola G/H). `None` anche su sentinella o coppia vuota.
     /// Best-effort: ogni esito non-risolto -> `None`.
     ///
-    /// FINESTRA-AWARE (NON-convergenza, regola H): se la coppia corrente e' nota e
-    /// ha una finestra nota (`current_window > 0`), il candidato cross-provider con
-    /// `context_window` STRETTAMENTE minore viene SCARTATO (evita il downgrade di
-    /// finestra che manda in overflow, come per la catena intra-provider). Se la
-    /// finestra del candidato e' ignota (`0`, non in catalog) il filtro e' inattivo
-    /// (fail-open: meglio offrire il cross-provider che restare bloccati).
-    async fn cross_provider(
-        &self,
-        current_provider: Option<&str>,
-        current_model: Option<&str>,
-    ) -> Option<CrossProviderCandidate> {
+    /// Non e' piu' l'UNICA possibilita' (vedi [`Self::cross_provider_set`]): e'
+    /// il candidato che entra per primo nell'insieme e vince i pari merito.
+    ///
+    /// FINESTRA-AWARE (NON-convergenza, regola H): se `current_window > 0`, il
+    /// candidato con `context_window` STRETTAMENTE minore viene SCARTATO (evita
+    /// il downgrade di finestra che manda in overflow, come per la catena
+    /// intra-provider). Se la finestra del candidato e' ignota (`0`, non in
+    /// catalog) il filtro e' inattivo (fail-open). Il guard scarta UN candidato:
+    /// che questo significasse chiudere il run era una conseguenza dell'insieme
+    /// di uno, non del guard.
+    async fn cross_provider(&self, current_window: i64) -> Option<CrossProviderCandidate> {
         let (provider, model) =
             match resolve_purpose_model_db(&self.db, "loop_fallback_default").await {
                 PurposeResolution::Resolved {
@@ -466,22 +473,19 @@ impl PgEscalationPort {
         if provider.trim().is_empty() || model.trim().is_empty() {
             return None;
         }
-        // Downgrade-finestra guard: scarta il cross-provider se ha finestra nota e
+        // Downgrade-finestra guard: scarta la preferenza se ha finestra nota e
         // STRETTAMENTE minore di quella corrente (entrambe note).
-        if let (Some(cp), Some(cm)) = (current_provider, current_model) {
-            let current_window = self.model_window(cp, cm).await;
-            if current_window > 0 {
-                let candidate_window = self.model_window(&provider, &model).await;
-                if candidate_window > 0 && candidate_window < current_window {
-                    tracing::info!(
-                        cross_provider = %provider,
-                        cross_model = %model,
-                        candidate_window,
-                        current_window,
-                        "escalation_port: cross-provider scartato (finestra piu' piccola della corrente)"
-                    );
-                    return None;
-                }
+        if current_window > 0 {
+            let candidate_window = self.model_window(&provider, &model).await;
+            if candidate_window > 0 && candidate_window < current_window {
+                tracing::info!(
+                    cross_provider = %provider,
+                    cross_model = %model,
+                    candidate_window,
+                    current_window,
+                    "escalation_port: preferenza cross-provider scartata (finestra piu' piccola della corrente)"
+                );
+                return None;
             }
         }
         // FIX-A (scale-controller): risolvi il tier del candidato dal catalog cosi'
@@ -493,6 +497,174 @@ impl PgEscalationPort {
             model,
             tier,
         })
+    }
+
+    /// Quanti candidati cross-provider tenere PER LIVELLO di capacita' (regola G,
+    /// chiave `agent.escalation.cross_provider_candidates_per_tier`, mig 0669).
+    ///
+    /// Il default dichiarato vale solo quando la chiave non c'e' (DB non ancora
+    /// migrato) o non e' un numero, ed e' la STESSA cifra che la migrazione
+    /// scrive: non una seconda configurazione nascosta, ma il valore con cui il
+    /// sistema si comporta come dichiarato mentre la migrazione non e' ancora
+    /// applicata. `0` disattiva l'insieme e lascia la sola preferenza.
+    async fn cross_provider_per_tier(&self) -> usize {
+        const CHIAVE: &str = "agent.escalation.cross_provider_candidates_per_tier";
+        const DEFAULT: usize = 3;
+        match nexus_auth::get_setting(&self.db, CHIAVE).await {
+            None => DEFAULT,
+            Some(raw) => raw.parse::<usize>().unwrap_or_else(|_| {
+                tracing::warn!(
+                    chiave = CHIAVE,
+                    valore = %raw,
+                    "escalation_port: valore non numerico, uso il default dichiarato"
+                );
+                DEFAULT
+            }),
+        }
+    }
+
+    /// I candidati CROSS-PROVIDER dell'escalation: la preferenza dichiarata piu'
+    /// l'INSIEME eleggibile risolto dal catalog.
+    ///
+    /// IL DIFETTO CHE CHIUDE. Il tier 2 era un ripiego SINGOLO — il solo purpose
+    /// `loop_fallback_default` — quindi quando quell'unico non qualificava (per
+    /// finestra, per cooldown, per qualunque motivo) l'insieme dei candidati
+    /// usciva VUOTO e l'esecutore concludeva "catena di escalation esaurita,
+    /// interrompo". E' la stessa forma dell'`unwrap_or` che nasconde un'assenza:
+    /// "non ho alternative" DEDOTTO da una lista di uno, invece di cercarne
+    /// un'altra. Misurato il 01/08/2026 (run cfb781ff): corrente
+    /// `deepseek/deepseek-v4-pro`, gia' in cima alla propria catena intra
+    /// (nessun `escalation_rank` superiore su quel fornitore), purpose risolto su
+    /// una finestra da 131k contro il milione del corrente e quindi scartato dal
+    /// guard; nello stesso istante il catalogo aveva sedici modelli abilitati con
+    /// finestra >= 1M su tre fornitori diversi, tutti con chiave configurata.
+    ///
+    /// L'insieme viene dal PUNTO UNICO dell'eleggibilita' agentica
+    /// ([`Self::candidati_ammessi`] -> `agentic_failover_candidates`, regola L),
+    /// che applica gia' cooldown, tool-use, thinking-policy, pavimento agentico,
+    /// vincoli del run e la soglia di finestra. Il criterio con cui l'insieme
+    /// viene scremato e' puro e vive nel modulo delle decisioni
+    /// (`cross_provider_shortlist`): qui resta solo l'I/O (confine regola L).
+    ///
+    /// La preferenza entra per PRIMA: a parita' di salute, tier e likelihood
+    /// `pick_escalation_model` conserva l'ordine d'ingresso, quindi il modello
+    /// dichiarato vince i pari merito senza essere l'unica possibilita'.
+    ///
+    /// La chiusura per catena esaurita resta possibile: se l'insieme eleggibile
+    /// e' davvero vuoto (nessun fornitore sano, o nessuno abbastanza capiente),
+    /// qui esce `Vec::new()` e il run chiude come prima — ma per un'assenza
+    /// MISURATA, non dedotta da una lista di uno.
+    /// Tiene i soli candidati il cui fornitore ha credenziali configurate.
+    ///
+    /// E' lo STESSO gate che la catena intra applica gia': escalare su un
+    /// fornitore senza chiave produce un fallimento certo al primo turno, e il
+    /// run avrebbe speso una delle poche promozioni che ha — chiudendo poi come
+    /// se non ci fossero alternative, cioe' il difetto che questo insieme esiste
+    /// per togliere. Una lettura per fornitore DISTINTO, non per modello.
+    async fn solo_fornitori_disponibili(
+        &self,
+        candidati: Vec<CrossProviderCandidate>,
+    ) -> Vec<CrossProviderCandidate> {
+        let mut disponibile: HashMap<String, bool> = HashMap::new();
+        let mut out: Vec<CrossProviderCandidate> = Vec::with_capacity(candidati.len());
+        for c in candidati {
+            let chiave = c.provider.trim().to_ascii_lowercase();
+            let ok = match disponibile.get(&chiave) {
+                Some(v) => *v,
+                None => {
+                    let v = self.provider_available(&c.provider).await;
+                    disponibile.insert(chiave, v);
+                    v
+                }
+            };
+            if ok {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// I modelli PIU' FORTI dello stesso fornitore, se il fornitore e'
+    /// disponibile runtime: escalare su un fornitore senza chiave sprecherebbe
+    /// una delle poche promozioni. Vuota se provider/model non sono valorizzati.
+    async fn catena_intra(
+        &self,
+        provider: Option<&str>,
+        model: Option<&str>,
+        turn_shape: TurnShape,
+    ) -> Vec<ChainEntry> {
+        let (Some(p), Some(m)) = (provider, model) else {
+            return Vec::new();
+        };
+        if p.trim().is_empty() || m.trim().is_empty() {
+            return Vec::new();
+        }
+        if !self.provider_available(p).await {
+            tracing::info!(
+                provider = %p,
+                "escalation_port: provider corrente non disponibile runtime,                  catena intra saltata (si usera' il cross-provider)"
+            );
+            return Vec::new();
+        }
+        self.chain_for(p, m, turn_shape).await
+    }
+
+    /// I candidati eleggibili degli ALTRI fornitori, gia' filtrati dal punto
+    /// unico dell'eleggibilita' agentica (cooldown, tool-use, thinking-policy,
+    /// pavimento, vincoli del run, soglia di finestra).
+    ///
+    /// Il fornitore corrente e' escluso: i suoi modelli PIU' capaci sono gia' la
+    /// catena intra, con un criterio piu' fine (`escalation_rank`, che ordina
+    /// anche a parita' di tier), e ripescarli qui rimetterebbe in gioco pure
+    /// quelli SOTTO al corrente.
+    async fn pool_altri_fornitori(
+        &self,
+        current_provider: Option<&str>,
+        current_window: i64,
+    ) -> Vec<CrossProviderCandidate> {
+        let exclude: Vec<String> = current_provider
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| vec![p.to_string()])
+            .unwrap_or_default();
+        self.candidati_ammessi(&exclude, current_window)
+            .await
+            .into_iter()
+            .map(|(provider, model, tier)| CrossProviderCandidate {
+                provider,
+                model,
+                tier,
+            })
+            .collect()
+    }
+
+    async fn cross_provider_set(
+        &self,
+        current_provider: Option<&str>,
+        current_window: i64,
+        current_tier: Option<&str>,
+    ) -> Vec<CrossProviderCandidate> {
+        let preferita = self.cross_provider(current_window).await;
+        let per_tier = self.cross_provider_per_tier().await;
+        let pool = self.pool_altri_fornitori(current_provider, current_window).await;
+        let insieme = cross_provider_shortlist(pool, current_tier, per_tier);
+
+        let mut visti: HashSet<(String, String)> = HashSet::new();
+        let candidati: Vec<CrossProviderCandidate> = preferita
+            .into_iter()
+            .chain(insieme)
+            .filter(|c| visti.insert((c.provider.trim().to_ascii_lowercase(), c.model.clone())))
+            .collect();
+        let out = self.solo_fornitori_disponibili(candidati).await;
+        tracing::info!(
+            target: "nexus_mcp_core::escalation_port",
+            candidati = out.len(),
+            per_tier,
+            current_window,
+            current_tier = current_tier.unwrap_or("?"),
+            "escalation_port: candidati cross-provider dall'insieme eleggibile"
+        );
+        out
     }
 
     /// PUNTO UNICO (regola L) dell'arricchimento candidati: triple
@@ -553,27 +725,21 @@ impl EscalationPort for PgEscalationPort {
         model: Option<&str>,
         turn_shape: TurnShape,
     ) -> Result<EscalationInputs, PortError> {
-        // Candidato cross-provider (loop_fallback_default), sempre risolto.
-        let cross = self.cross_provider(provider, model).await;
-
-        // Catena intra-provider (modelli piu' forti dello stesso provider): solo se
-        // provider+model valorizzati E il provider e' disponibile runtime (API key):
-        // escalare su un provider senza chiave sprecherebbe un turno.
-        let intra: Vec<ChainEntry> = match (provider, model) {
+        // Finestra e tier del modello che non converge: servono entrambi ai
+        // candidati cross-provider (guard finestra + pavimento di capacita') e si
+        // leggono una volta sola, dai punti unici gia' presenti qui.
+        let (cur_window, cur_tier) = match (provider, model) {
             (Some(p), Some(m)) if !p.trim().is_empty() && !m.trim().is_empty() => {
-                if self.provider_available(p).await {
-                    self.chain_for(p, m, turn_shape).await
-                } else {
-                    tracing::info!(
-                        provider = %p,
-                        "escalation_port: provider corrente non disponibile runtime, \
-                         catena intra saltata (si usera' il cross-provider)"
-                    );
-                    Vec::new()
-                }
+                (self.model_window(p, m).await, self.model_tier(p, m).await)
             }
-            _ => Vec::new(),
+            _ => (0, None),
         };
+        // Candidati cross-provider: preferenza dichiarata + insieme eleggibile.
+        let cross = self
+            .cross_provider_set(provider, cur_window, cur_tier.as_deref())
+            .await;
+
+        let intra = self.catena_intra(provider, model, turn_shape).await;
 
         // Insieme UNIFICATO (provider, model, tier): intra (provider corrente) + cross.
         // Niente split Tier1/Tier2 ne' indice posizionale: la SELEZIONE agentica
@@ -583,11 +749,9 @@ impl EscalationPort for PgEscalationPort {
             .into_iter()
             .map(|e| (cur_provider.clone(), e.escalation_model, e.tier))
             .collect();
-        if let Some(c) = &cross {
-            pmt.push((c.provider.clone(), c.model.clone(), c.tier.clone()));
-        }
-        // VINCOLO DEL RUN. Un solo filtro sull'insieme unificato: cade il
-        // candidato cross-provider, resta la catena intra (i modelli PIU' FORTI
+        pmt.extend(cross.into_iter().map(|c| (c.provider, c.model, c.tier)));
+        // VINCOLO DEL RUN. Un solo filtro sull'insieme unificato: cadono i
+        // candidati cross-provider, resta la catena intra (i modelli PIU' FORTI
         // dello stesso fornitore). E' la parte che tiene in piedi i run lunghi
         // anche col pin — il vincolo e' sul FORNITORE, non sul modello: se
         // l'utente ha scelto un fornitore, salire di modello dentro quel
@@ -1074,6 +1238,212 @@ mod tests {
             .await
             .expect("fail-open");
         assert!(inputs.candidates.is_empty());
+    }
+
+    /// La scena del run cfb781ff (01/08/2026), quella in cui il run chiudeva con
+    /// "catena di escalation esaurita" avendo sei alternative a portata di query:
+    ///   - corrente `deepseek/deepseek-v4-pro`, heavy, finestra 1M, ed e' il
+    ///     modello con `escalation_rank` piu' alto del suo fornitore -> catena
+    ///     intra VUOTA (l'altro deepseek e' sotto di lui);
+    ///   - `loop_fallback_default` risolve per tier col criterio del costo, e il
+    ///     piu' economico e' un heavy con finestra 131k -> scartato dal guard
+    ///     downgrade-finestra, correttamente;
+    ///   - nel catalogo, sano e abilitato, un fornitore terzo abbastanza capiente.
+    async fn scena_catena_intra_al_massimo(pool: &PgPool) {
+        create_schema(pool).await;
+        set_api_key(pool, "deepseek", "sk-live").await;
+        // Anche il candidato ha la sua chiave: l'insieme cross-provider passa
+        // dallo STESSO gate di disponibilita' della catena intra, perche'
+        // escalare su un fornitore senza credenziali spende una delle poche
+        // promozioni disponibili per un fallimento certo al primo turno.
+        set_api_key(pool, "openai", "sk-live").await;
+        seed_catalog_window(
+            pool,
+            &[
+                ("deepseek", "deepseek-v4-flash", "heavy", 0.5, true, true, 1_000_000),
+                ("deepseek", "deepseek-v4-pro", "heavy", 2.0, true, true, 1_000_000),
+                // Il piu' economico del tier: e' lui che il purpose risolve, ed e'
+                // lui che il guard finestra scarta.
+                ("mistral", "mistral-small-latest", "heavy", 0.05, true, true, 131_072),
+                // L'alternativa che c'era e che nessuno guardava.
+                ("openai", "gpt-forte", "frontier", 9.0, true, true, 1_050_000),
+            ],
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, requires_tool_use) \
+             VALUES ('loop_fallback_default', 'mistral', 'mistral-small-latest', 'heavy', true)",
+        )
+        .execute(pool)
+        .await
+        .expect("purpose loop_fallback_default");
+    }
+
+    /// PREMESSA del test seguente, e non un doppione: la scena e' davvero quella
+    /// del run reale, cioe' il ripiego SINGOLO non qualifica e la catena intra e'
+    /// vuota. Senza questa misura, il test del fix potrebbe passare per una via
+    /// diversa da quella che intende provare.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_preferenza_e_la_catena_intra_non_offrono_nulla(pool: PgPool) {
+        scena_catena_intra_al_massimo(&pool).await;
+        let port = PgEscalationPort::new(pool.clone());
+        // Catena intra: il corrente e' in cima al proprio fornitore.
+        assert!(
+            port.chain_for("deepseek", "deepseek-v4-pro", TurnShape::default())
+                .await
+                .is_empty(),
+            "nessun modello deepseek ha escalation_rank superiore al corrente"
+        );
+        // Preferenza dichiarata: risolta, ma con finestra piu' piccola -> scartata.
+        assert!(
+            port.cross_provider(1_000_000).await.is_none(),
+            "il guard downgrade-finestra scarta la preferenza (131k < 1M)"
+        );
+    }
+
+    /// L'insieme cross-provider passa dallo STESSO gate di disponibilita' della
+    /// catena intra: un fornitore senza chiave configurata non e' un candidato.
+    ///
+    /// Non e' pignoleria: le promozioni sono poche (`max_escalations`), e
+    /// spenderne una su un fornitore che fallira' al primo turno significa
+    /// chiudere il run come se non ci fossero alternative — cioe' il difetto che
+    /// questo lotto sta togliendo, riprodotto un gradino piu' in la'.
+    ///
+    /// MUTAZIONE: togliendo il filtro `provider_available` da
+    /// `cross_provider_set`, "openai/gpt-forte" rientra fra i candidati e questo
+    /// test rosseggia.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn un_fornitore_senza_chiave_non_entra_nell_insieme(pool: PgPool) {
+        scena_catena_intra_al_massimo(&pool).await;
+        // La produzione ce l'ha; qui la si toglie per misurare il gate.
+        sqlx::query("DELETE FROM settings WHERE key = 'openai_api_key'")
+            .execute(&pool)
+            .await
+            .expect("delete chiave");
+
+        let port = PgEscalationPort::new(pool.clone());
+        let inputs = port
+            .escalation_inputs(
+                None,
+                Some("deepseek"),
+                Some("deepseek-v4-pro"),
+                TurnShape::default(),
+            )
+            .await
+            .expect("fail-open");
+        let coppie: Vec<(&str, &str)> = inputs
+            .candidates
+            .iter()
+            .map(|c| (c.provider.as_str(), c.model.as_str()))
+            .collect();
+        assert!(
+            !coppie.contains(&("openai", "gpt-forte")),
+            "un fornitore senza credenziali non e' un'alternativa: {coppie:?}"
+        );
+    }
+
+    /// IL DIFETTO CHE QUESTO CHIUDE: con la catena intra vuota e la preferenza
+    /// scartata, l'insieme dei candidati usciva VUOTO e l'esecutore chiudeva il
+    /// run con "catena di escalation esaurita. Interrompo" — mentre nel catalogo
+    /// c'erano fornitori sani e abbastanza capienti. Il guard resta: scarta un
+    /// candidato, non chiude tutto.
+    ///
+    /// MUTAZIONE: rimettendo il candidato cross-provider SINGOLO (in
+    /// `cross_provider_set`, sostituire il corpo con `self.cross_provider(
+    /// current_window).await.into_iter().collect()`) l'insieme torna vuoto e
+    /// questa asserzione cade con il valore del difetto reale: zero candidati.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn l_insieme_offre_un_candidato_dove_il_ripiego_singolo_non_ne_aveva(pool: PgPool) {
+        scena_catena_intra_al_massimo(&pool).await;
+        let port = PgEscalationPort::new(pool.clone());
+        let inputs = port
+            .escalation_inputs(
+                None,
+                Some("deepseek"),
+                Some("deepseek-v4-pro"),
+                TurnShape::default(),
+            )
+            .await
+            .expect("fail-open");
+        let coppie: Vec<(&str, &str)> = inputs
+            .candidates
+            .iter()
+            .map(|c| (c.provider.as_str(), c.model.as_str()))
+            .collect();
+        assert!(
+            coppie.contains(&("openai", "gpt-forte")),
+            "l'alternativa capiente del catalogo deve entrare nell'insieme: {coppie:?}"
+        );
+        assert!(
+            !coppie.contains(&("mistral", "mistral-small-latest")),
+            "il guard downgrade-finestra resta: la 131k non rientra dalla finestra: {coppie:?}"
+        );
+    }
+
+    /// L'insieme non e' una porta aperta a chiunque: un fornitore MENO capace del
+    /// corrente non e' un'escalation. Se qui entrasse, la "promozione" sarebbe
+    /// una retrocessione mascherata — e il criterio duale della catena intra
+    /// (`escalation_rank > corrente`) sarebbe stato perso proprio nel passaggio
+    /// da uno a molti.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn l_insieme_non_ammette_chi_e_meno_capace_del_corrente(pool: PgPool) {
+        create_schema(&pool).await;
+        set_api_key(&pool, "deepseek", "sk-live").await;
+        seed_catalog_window(
+            &pool,
+            &[
+                ("deepseek", "deepseek-v4-pro", "heavy", 2.0, true, true, 1_000_000),
+                ("openai", "gpt-debole", "medium", 0.1, true, true, 1_050_000),
+            ],
+        )
+        .await;
+        let port = PgEscalationPort::new(pool.clone());
+        let inputs = port
+            .escalation_inputs(
+                None,
+                Some("deepseek"),
+                Some("deepseek-v4-pro"),
+                TurnShape::default(),
+            )
+            .await
+            .expect("fail-open");
+        assert!(
+            inputs.candidates.is_empty(),
+            "nessun candidato almeno capace quanto il corrente -> chiusura, ma MISURATA: {:?}",
+            inputs.candidates
+        );
+    }
+
+    /// La chiusura per catena esaurita resta possibile, ed e' il controllo che il
+    /// fix non abbia trasformato "nessuna alternativa" in "una qualsiasi": con
+    /// l'insieme disattivato dalla configurazione (regola G) il comportamento
+    /// torna esattamente quello precedente.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn per_tier_zero_riporta_al_solo_ripiego_dichiarato(pool: PgPool) {
+        scena_catena_intra_al_massimo(&pool).await;
+        sqlx::query(
+            "INSERT INTO settings (key, value, category) \
+             VALUES ('agent.escalation.cross_provider_candidates_per_tier', '0', 'agent') \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .execute(&pool)
+        .await
+        .expect("spegni l'insieme");
+        let port = PgEscalationPort::new(pool.clone());
+        let inputs = port
+            .escalation_inputs(
+                None,
+                Some("deepseek"),
+                Some("deepseek-v4-pro"),
+                TurnShape::default(),
+            )
+            .await
+            .expect("fail-open");
+        assert!(
+            inputs.candidates.is_empty(),
+            "insieme spento: resta la sola preferenza, che il guard scarta: {:?}",
+            inputs.candidates
+        );
     }
 
     // ---- failover_provider: selezione agentica del sostituto ----

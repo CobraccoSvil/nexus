@@ -128,12 +128,32 @@ impl<'a> ProfileInsertBinds<'a> {
 /// Mappa errore sqlx unique-violation -> 409 CONFLICT con messaggio
 /// personalizzato; altri errori -> 500. Punto unico per i blocchi
 /// `if e.to_string().contains("unique") ...` ripetuti nei create profile.
+///
+/// Il segnale e' STRUTTURATO (regola M): il driver espone SQLSTATE 23505 via
+/// `DatabaseError::is_unique_violation`, e quello e' il codice macchina che
+/// Postgres garantisce. Il Display di `sqlx::Error` e' testo per l'umano e
+/// dipende da `lc_messages` del server.
+///
+/// Il `contains("unique")` non era fragile in teoria: era gia' cieco.
+/// MISURATO il 01/08/2026 sul Postgres di questo ambiente, che risponde in
+/// italiano — «un valore chiave duplicato viola il vincolo univoco "..."»:
+/// nessuna delle due parole cercate compare. Qui, a differenza delle direttive
+/// condivise, non c'era nemmeno un ramo che desse per sbaglio la risposta
+/// giusta: OGNI nome di profilo gia' preso rispondeva 500 «errore interno» con
+/// dentro il messaggio crudo del DB, invece del 409 che dice all'utente di
+/// scegliere un altro nome.
 fn map_profile_insert_error(e: sqlx::Error, conflict_msg: &'static str) -> ApiError {
-    if e.to_string().contains("unique") || e.to_string().contains("duplicate") {
+    if is_unique_violation(&e) {
         api_error(StatusCode::CONFLICT, conflict_msg)
     } else {
         api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     }
+}
+
+/// Un conflitto di unicita' Postgres si riconosce dal codice SQLSTATE, mai dal
+/// messaggio (regola M). Delega al driver, che il codice ce l'ha tipizzato.
+pub(crate) fn is_unique_violation(e: &sqlx::Error) -> bool {
+    nexus_types::db_error::is_unique_violation(e)
 }
 
 impl<'a> ProfileUpdateBinds<'a> {
@@ -461,13 +481,7 @@ pub async fn fork_profile(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        if e.to_string().contains("unique") || e.to_string().contains("duplicate") {
-            api_error(StatusCode::CONFLICT, "Hai gia' una copia di questo profilo")
-        } else {
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        }
-    })?;
+    .map_err(|e| map_profile_insert_error(e, "Hai gia' una copia di questo profilo"))?;
 
     Ok(Json(row_to_json(&row)))
 }
@@ -858,4 +872,80 @@ pub async fn admin_list_global_mcp_servers(
     let servers: Vec<Value> = rows.iter().map(mcp_server_row_to_json).collect();
 
     Ok(Json(json!({ "servers": servers })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// REGRESSIONE (violazione 19): il conflitto di unicita' era riconosciuto
+    /// dal Display di `sqlx::Error` con `contains("unique")`.
+    ///
+    /// Il test attraversa il PRODUTTORE vero (regola O): l'errore non e'
+    /// costruito a mano, nasce da un vincolo UNIQUE di Postgres violato da una
+    /// INSERT reale — cioe' e' lo stesso `sqlx::Error` che arriva a
+    /// `create_profile`. Costruirlo a mano avrebbe fissato l'assunto da
+    /// verificare (che il messaggio contenga "unique").
+    ///
+    /// La tabella e' minimale di proposito: cio' che si misura e' la
+    /// classificazione del SEGNALE, non lo schema dei profili. Il vincolo
+    /// `UNIQUE` e' la sola parte che deve essere reale, ed e' Postgres a
+    /// emettere lo SQLSTATE.
+    ///
+    /// Il messaggio che il server produce davvero, misurato qui, e' «un valore
+    /// chiave duplicato viola il vincolo univoco "pk_nome_profilo"»: nessuna
+    /// delle due parole cercate dal `contains`. Fabbricando l'errore a mano il
+    /// test avrebbe scritto la frase inglese attesa e sarebbe rimasto verde
+    /// sopra una produzione cieca.
+    ///
+    /// PROVA DI MUTAZIONE ESEGUITA (sul gemello in `admin-service`, stesso
+    /// segnale e stesso produttore): rimesso
+    /// `e.to_string().contains("unique") || e.to_string().contains("duplicate")`
+    /// al posto di [`is_unique_violation`], l'assert sullo status rosseggia con
+    /// 500 invece di 409.
+    #[sqlx::test]
+    async fn il_conflitto_di_unicita_si_riconosce_dallo_sqlstate(pool: sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE profili_finti ( \
+               nome TEXT NOT NULL, \
+               CONSTRAINT pk_nome_profilo UNIQUE (nome) )",
+        )
+        .execute(&pool)
+        .await
+        .expect("tabella");
+        sqlx::query("INSERT INTO profili_finti (nome) VALUES ('gemello')")
+            .execute(&pool)
+            .await
+            .expect("prima riga");
+
+        let conflitto = sqlx::query("INSERT INTO profili_finti (nome) VALUES ('gemello')")
+            .execute(&pool)
+            .await
+            .expect_err("la seconda INSERT viola il vincolo");
+        assert!(
+            is_unique_violation(&conflitto),
+            "SQLSTATE 23505 e' il segnale strutturato del conflitto, \
+             qualunque cosa dica il messaggio (qui il vincolo si chiama \
+             'pk_nome_profilo': nessun 'unique', nessun 'duplicate')"
+        );
+        let (status, _) = map_profile_insert_error(conflitto, "esiste gia'");
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "un conflitto e' 409, non un guasto"
+        );
+
+        // Il rovescio: un guasto NON e' un conflitto. Senza questa meta',
+        // «ritorna sempre 409» passerebbe il test.
+        let guasto = sqlx::query("SELECT colonna_inesistente FROM profili_finti")
+            .execute(&pool)
+            .await
+            .expect_err("colonna inesistente");
+        assert!(
+            !is_unique_violation(&guasto),
+            "SQLSTATE 42703 (colonna inesistente) non e' un conflitto di unicita'"
+        );
+        let (status, _) = map_profile_insert_error(guasto, "esiste gia'");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

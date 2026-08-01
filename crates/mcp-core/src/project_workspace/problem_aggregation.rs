@@ -56,14 +56,6 @@ fn source_priority_for_dedup(source: &str) -> i32 {
     }
 }
 
-static POLICY_RULE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)violazione risorse \[([^\]]+)\]").unwrap()
-});
-
-static SERVICE_UNIT_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)servizio ([^:\n]+):").unwrap()
-});
-
 static UUID_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
@@ -94,25 +86,29 @@ fn normalize_semantic_message(message: &str) -> String {
         .collect()
 }
 
-/// Estrae la regola policy da messaggi tipo
-/// `Violazione risorse [port/require_allocation]: ...`.
-fn extract_policy_rule(message: &str) -> Option<String> {
-    POLICY_RULE_RE
-        .captures(message)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_ascii_lowercase())
-}
-
-/// Estrae l'unita' servizio da messaggi tipo `Servizio foo.service: crash`.
-fn extract_service_unit(message: &str) -> Option<String> {
-    SERVICE_UNIT_RE
-        .captures(message)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().trim().to_ascii_lowercase())
+/// Legge un campo TIPIZZATO dell'item, se la fonte lo espone (regola Q). Il
+/// vuoto vale come assente: un campo presente ma senza contenuto non e' una
+/// classe di errore, e' un ignoto — e l'ignoto qui e' una variante (il ripiego
+/// semantico esplicito qui sotto), mai un valore comodo su cui raggruppare.
+fn campo(item: &Value, chiave: &str) -> Option<String> {
+    item.get(chiave)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
 }
 
 /// Punto unico (regola L) dell'identita' di gruppo per errori ripetitivi.
 /// Ignora token variabili quando la classe di errore e' la stessa.
+///
+/// La classe di errore si LEGGE dai campi che la fonte espone, non si riestrae
+/// dalla prosa: `metric` ('kind/rule') per le violazioni risorse, `unit` per le
+/// diagnosi di servizio. Prima due regex le ricostruivano dal messaggio che
+/// `logs::diagnosis_source_message` aveva composto a partire da quegli stessi
+/// campi — un giro completo tipizzato -> prosa -> tipizzato, dove bastava
+/// cambiare una parola del testo italiano per far collassare il raggruppamento
+/// senza che nulla fallisse. Il ripiego semantico resta per gli item che quei
+/// campi non li hanno.
 pub fn problem_group_key(item: &Value) -> String {
     let source = item
         .get("source")
@@ -124,7 +120,7 @@ pub fn problem_group_key(item: &Value) -> String {
         .unwrap_or("");
 
     if source.starts_with("policy:") {
-        if let Some(rule) = extract_policy_rule(message) {
+        if let Some(rule) = campo(item, "metric") {
             return format!("policy:{rule}");
         }
         return format!("{source}:{}", normalize_semantic_message(message));
@@ -132,7 +128,7 @@ pub fn problem_group_key(item: &Value) -> String {
 
     if source.starts_with("service_observer:") {
         let kind = source.strip_prefix("service_observer:").unwrap_or(source);
-        if let Some(unit) = extract_service_unit(message) {
+        if let Some(unit) = campo(item, "unit") {
             return format!("service_observer:{kind}:{unit}");
         }
         return format!("service_observer:{kind}:{}", normalize_semantic_message(message));
@@ -400,6 +396,10 @@ mod tests {
         assert_eq!(items.len(), 2);
     }
 
+    /// Nota: gli item veri li produce `logs::DiagnosisProblem::to_problem`, e i
+    /// test che attraversano quel produttore stanno accanto ad esso (regola O).
+    /// Qui si verifica il solo criterio: la classe viene dal campo `metric`,
+    /// mai dalla prosa — infatti questi messaggi la prosa non ce l'hanno.
     #[test]
     fn policy_port_violations_group_by_rule_not_port() {
         let mut items = vec![
@@ -407,7 +407,9 @@ mod tests {
                 "id": "a",
                 "severity": "error",
                 "source": "policy:port",
-                "message": "Violazione risorse [port/require_allocation]: vite.config.ts:12 21950 (port/require_allocation) | vite --port 21950",
+                "metric": "port/require_allocation",
+                "unit": "svc-a.service",
+                "message": "vite --port 21950",
                 "filePath": "vite.config.ts",
                 "line": 12,
                 "createdAt": "2026-01-01T00:00:00Z",
@@ -416,7 +418,9 @@ mod tests {
                 "id": "b",
                 "severity": "error",
                 "source": "policy:port",
-                "message": "Violazione risorse [port/require_allocation]: docker-compose.yml:5 21951 (port/require_allocation) | ports: 21951:3000",
+                "metric": "port/require_allocation",
+                "unit": "svc-b.service",
+                "message": "ports: 21951:3000",
                 "filePath": "docker-compose.yml",
                 "line": 5,
                 "createdAt": "2026-01-01T00:00:01Z",
@@ -435,6 +439,30 @@ mod tests {
         assert_eq!(related.len(), 2);
     }
 
+    /// Campo `metric` assente: si ripiega sul messaggio semantico, e due
+    /// messaggi diversi restano due problemi. L'ignoto non raggruppa.
+    #[test]
+    fn policy_senza_campo_metric_non_raggruppa() {
+        let mut items = vec![
+            json!({
+                "id": "a",
+                "severity": "error",
+                "source": "policy:port",
+                "message": "vite --port 21950 senza allocazione",
+                "createdAt": "2026-01-01T00:00:00Z",
+            }),
+            json!({
+                "id": "b",
+                "severity": "error",
+                "source": "policy:port",
+                "message": "listen hardcoded in server.js",
+                "createdAt": "2026-01-01T00:00:01Z",
+            }),
+        ];
+        aggregate_repetitive(&mut items);
+        assert_eq!(items.len(), 2);
+    }
+
     #[test]
     fn service_observer_groups_same_unit() {
         let mut items = vec![
@@ -442,14 +470,18 @@ mod tests {
                 "id": "1",
                 "severity": "error",
                 "source": "service_observer:crash",
-                "message": "Servizio demo-api.service: crash — restarts=5 (soglia 3.0)",
+                "unit": "demo-api.service",
+                "signalKind": "crash",
+                "message": "restarts=5 (soglia 3.0)",
                 "createdAt": "2026-01-01T00:00:00Z",
             }),
             json!({
                 "id": "2",
                 "severity": "error",
                 "source": "service_observer:crash",
-                "message": "Servizio demo-api.service: crash — restarts=7 (soglia 3.0)",
+                "unit": "demo-api.service",
+                "signalKind": "crash",
+                "message": "restarts=7 (soglia 3.0)",
                 "createdAt": "2026-01-01T00:00:02Z",
             }),
         ];
@@ -459,6 +491,32 @@ mod tests {
             items[0].get("occurrenceCount").and_then(Value::as_u64),
             Some(2)
         );
+    }
+
+    /// Unit diverse non raggruppano, anche a prosa identica: e' il campo a
+    /// decidere. Prova di mutazione del criterio.
+    #[test]
+    fn service_observer_unit_diverse_non_raggruppano() {
+        let mut items = vec![
+            json!({
+                "id": "1",
+                "severity": "error",
+                "source": "service_observer:crash",
+                "unit": "demo-api.service",
+                "message": "restarts=5 (soglia 3.0)",
+                "createdAt": "2026-01-01T00:00:00Z",
+            }),
+            json!({
+                "id": "2",
+                "severity": "error",
+                "source": "service_observer:crash",
+                "unit": "demo-web.service",
+                "message": "restarts=5 (soglia 3.0)",
+                "createdAt": "2026-01-01T00:00:02Z",
+            }),
+        ];
+        aggregate_repetitive(&mut items);
+        assert_eq!(items.len(), 2);
     }
 
     #[test]
@@ -494,6 +552,7 @@ mod tests {
                 "id": "a",
                 "severity": "error",
                 "source": "policy:port",
+                "metric": "port/enforce_hardcode",
                 "message": "Violazione risorse [port/enforce_hardcode]: server.js:1 5000 (port/enforce_hardcode) | listen(5000)",
                 "filePath": "server.js",
                 "line": 1,
@@ -503,6 +562,7 @@ mod tests {
                 "id": "b",
                 "severity": "error",
                 "source": "policy:port",
+                "metric": "port/enforce_hardcode",
                 "message": "Violazione risorse [port/enforce_hardcode]: app.js:3 5173 (port/enforce_hardcode) | listen(5173)",
                 "filePath": "app.js",
                 "line": 3,

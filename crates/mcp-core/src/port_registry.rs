@@ -258,7 +258,10 @@ impl PortRegistryCache {
         .execute(&self.db)
         .await
         .map_err(|e| {
-            if e.to_string().contains("uq_port") || e.to_string().contains("unique") {
+            // SQLSTATE 23505 (punto unico nexus_types::db_error): il nome del
+            // vincolo e la parola "unique" vivono nel messaggio, che su un
+            // Postgres non inglese non li contiene affatto.
+            if nexus_types::db_error::is_unique_violation(&e) {
                 format!("Porta {} gia' allocata a un altro progetto", port)
             } else {
                 format!("Errore DB durante allocazione porta {}: {}", port, e)

@@ -238,48 +238,93 @@ async fn collect_service_diagnosis_problems(
     Ok(rows.into_iter().map(diagnosis_row_to_problem).collect())
 }
 
+/// I campi TIPIZZATI di una riga `service_diagnoses` che il pannello Problemi
+/// consuma. Esistono come struct perche' [`DiagnosisProblem::to_problem`] e' il
+/// PRODUTTORE dell'item di problema: separarlo dalla lettura della `PgRow` e'
+/// cio' che permette al test del raggruppamento di passare di qui invece di
+/// ricopiare a mano un JSON gia' prodotto altrove (regola O).
+struct DiagnosisProblem {
+    id: Uuid,
+    unit: String,
+    signal_kind: String,
+    metric: Option<String>,
+    value: Option<f64>,
+    threshold: Option<f64>,
+    detail: Option<String>,
+    status: String,
+    file_path: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl DiagnosisProblem {
+    fn from_row(row: &sqlx::postgres::PgRow) -> Self {
+        Self {
+            id: row.get("id"),
+            unit: row.get("unit"),
+            signal_kind: row.get("signal_kind"),
+            metric: row.try_get("metric").ok().flatten(),
+            value: row.try_get("value").ok().flatten(),
+            threshold: row.try_get("threshold").ok().flatten(),
+            detail: row.try_get("detail").ok().flatten(),
+            status: row.try_get("status").unwrap_or_else(|_| "open".to_string()),
+            file_path: row.try_get("file_path").ok().flatten(),
+            created_at: row.get("created_at"),
+        }
+    }
+
+    /// Item del pannello Problemi. Il testo si compone DOPO, dai campi: la
+    /// prosa e' per l'umano, i campi tipizzati sono per chi a valle deve
+    /// decidere (regola Q). Prima `signal_kind`, `unit`, `metric` e `status`
+    /// arrivavano al pannello SOLO appiattiti nel messaggio, e l'aggregatore
+    /// era costretto a riestrarli a regex da un testo composto qui accanto.
+    fn to_problem(&self) -> Value {
+        // signal_kind = "crash" e' grave; "policy_violation" e' SEMPRE error
+        // (violazione di governance risorse); "anomaly" e' warning.
+        let severity = if self.signal_kind == "crash" || self.signal_kind == "policy_violation" {
+            "error"
+        } else {
+            "warning"
+        };
+        let (source, message) = diagnosis_source_message(
+            &self.signal_kind,
+            &self.unit,
+            &self.status,
+            &self.metric,
+            self.value,
+            self.threshold,
+            &self.detail,
+        );
+        // Segnale STRUTTURATO per la UI (regola M): il bottone "riprova
+        // riparazione" decide su questo campo, mai sul prefisso testuale del
+        // messaggio. Vale per le sole diagnosi di crash in stato terminale
+        // fallito: e' l'unico stato che il ri-armo esplicito
+        // (`service_recovery::rearm_diagnosis`) accetta.
+        let remediation_retryable =
+            self.signal_kind == "crash" && self.status == "failed_remediation";
+        json!({
+            "id": self.id.to_string(),
+            "severity": severity,
+            "source": source,
+            "message": message,
+            // Classe dell'errore e servizio, come CAMPI. Per una
+            // `policy_violation` la classe e' `metric` = 'kind/rule' (es.
+            // 'port/require_allocation'): e' cio' su cui il pannello raggruppa.
+            "signalKind": self.signal_kind.clone(),
+            "unit": self.unit.clone(),
+            "metric": self.metric.clone().map(Value::from).unwrap_or(Value::Null),
+            "status": self.status.clone(),
+            "filePath": self.file_path.clone().map(Value::from).unwrap_or(Value::Null),
+            "line": Value::Null,
+            "column": Value::Null,
+            "createdAt": self.created_at.to_rfc3339(),
+            "remediationRetryable": remediation_retryable,
+        })
+    }
+}
+
 /// Mappa una riga `service_diagnoses` sul formato problema unificato.
 fn diagnosis_row_to_problem(row: sqlx::postgres::PgRow) -> Value {
-    let unit: String = row.get("unit");
-    let signal_kind: String = row.get("signal_kind");
-    let metric: Option<String> = row.try_get("metric").ok().flatten();
-    let value: Option<f64> = row.try_get("value").ok().flatten();
-    let threshold: Option<f64> = row.try_get("threshold").ok().flatten();
-    let detail: Option<String> = row.try_get("detail").ok().flatten();
-    let status: String = row.try_get("status").unwrap_or_else(|_| "open".to_string());
-    let file_path: Option<String> = row.try_get("file_path").ok().flatten();
-    // signal_kind = "crash" e' grave; "policy_violation" e' SEMPRE error
-    // (violazione di governance risorse); "anomaly" e' warning.
-    let severity = if signal_kind == "crash" || signal_kind == "policy_violation" {
-        "error"
-    } else {
-        "warning"
-    };
-    let (source, message) = diagnosis_source_message(
-        &signal_kind,
-        &unit,
-        &status,
-        &metric,
-        value,
-        threshold,
-        &detail,
-    );
-    // Segnale STRUTTURATO per la UI (regola M): il bottone "riprova riparazione"
-    // decide su questo campo, mai sul prefisso testuale del messaggio. Vale per
-    // le sole diagnosi di crash in stato terminale fallito: e' l'unico stato che
-    // il ri-armo esplicito (`service_recovery::rearm_diagnosis`) accetta.
-    let remediation_retryable = signal_kind == "crash" && status == "failed_remediation";
-    json!({
-        "id": row.get::<Uuid, _>("id").to_string(),
-        "severity": severity,
-        "source": source,
-        "message": message,
-        "filePath": file_path.clone().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
-        "line": serde_json::Value::Null,
-        "column": serde_json::Value::Null,
-        "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
-        "remediationRetryable": remediation_retryable,
-    })
+    DiagnosisProblem::from_row(&row).to_problem()
 }
 
 /// Ri-armo ESPLICITO di una riparazione fallita, dal pannello Problemi.
@@ -342,8 +387,12 @@ fn diagnosis_status_prefix(status: &str) -> &'static str {
     }
 }
 
-/// Costruisce (source, message) per una diagnosi service_observer. Le violazioni
-/// di policy vengono troncate a 600 char.
+/// Tetto del messaggio di una violazione risorse, in CARATTERI.
+const MESSAGGIO_DIAGNOSI_MAX_CHARS: usize = 600;
+
+/// Costruisce (source, message) per una diagnosi service_observer: prosa per
+/// l'umano. Non e' piu' il canale dell'informazione tecnica — quella viaggia
+/// nei campi tipizzati di [`DiagnosisProblem::to_problem`] (regola Q).
 #[allow(clippy::too_many_arguments)]
 fn diagnosis_source_message(
     signal_kind: &str,
@@ -363,10 +412,20 @@ fn diagnosis_source_message(
             .clone()
             .filter(|d| !d.is_empty())
             .unwrap_or_else(|| format!("violazione {rule} ({unit})"));
-        let mut message = format!("{prefix}Violazione risorse [{rule}]: {base}");
-        if message.len() > 600 {
-            message.truncate(600);
-        }
+        let message = format!("{prefix}Violazione risorse [{rule}]: {base}");
+        // Taglio per CARATTERI, non per byte: `String::truncate` panica se
+        // l'indice non e' un confine di carattere, e questo messaggio contiene
+        // per costruzione un em-dash (il prefisso di stato) piu' il `detail`
+        // della diagnosi, che e' testo italiano accentato. Un endpoint del
+        // pannello Problemi non puo' morire sulla lunghezza di una prosa.
+        let message = if message.chars().count() > MESSAGGIO_DIAGNOSI_MAX_CHARS {
+            message
+                .chars()
+                .take(MESSAGGIO_DIAGNOSI_MAX_CHARS)
+                .collect()
+        } else {
+            message
+        };
         (format!("policy:{kind_label}"), message)
     } else {
         let metric_part = match (metric.as_deref(), value, threshold) {
@@ -514,28 +573,168 @@ pub(super) fn severity_rank(value: &str) -> i32 {
 
 #[cfg(test)]
 mod problems_tests {
+    use super::{DiagnosisProblem, MESSAGGIO_DIAGNOSI_MAX_CHARS};
     use crate::project_workspace::problem_aggregation;
-    use serde_json::json;
+    use serde_json::{json, Value};
+    use uuid::Uuid;
+
+    fn diagnosi(
+        signal_kind: &str,
+        unit: &str,
+        metric: Option<&str>,
+        detail: &str,
+        status: &str,
+    ) -> DiagnosisProblem {
+        DiagnosisProblem {
+            id: Uuid::new_v4(),
+            unit: unit.to_string(),
+            signal_kind: signal_kind.to_string(),
+            metric: metric.map(str::to_string),
+            value: None,
+            threshold: None,
+            detail: Some(detail.to_string()),
+            status: status.to_string(),
+            file_path: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Il messaggio di una violazione contiene per costruzione un em-dash (il
+    /// prefisso di stato) e testo italiano accentato: tagliarlo a un indice di
+    /// BYTE faceva panicare l'endpoint del pannello Problemi.
+    #[test]
+    fn messaggio_diagnosi_non_panica_su_accenti_ed_em_dash() {
+        // Accentate a DUE byte: il testo utile parte a byte 81 (prefisso di
+        // stato con em-dash + "Violazione risorse [regola]: "), quindi il byte
+        // 600 cade in mezzo a una lettera. E' li' che `String::truncate`
+        // panicava.
+        let detail = "\u{e0}".repeat(700);
+        let item = diagnosi(
+            "policy_violation",
+            "demo-api.service",
+            Some("port/require_allocation"),
+            &detail,
+            "failed_remediation",
+        )
+        .to_problem();
+        let message = item.get("message").and_then(Value::as_str).unwrap();
+        assert!(message.starts_with("Riparazione automatica FALLITA \u{2014} "));
+        assert_eq!(message.chars().count(), MESSAGGIO_DIAGNOSI_MAX_CHARS);
+    }
+
+    /// La classe di errore e' un CAMPO che la fonte espone (regola Q): riscrivere
+    /// la prosa non deve spostare l'item di gruppo. Con la riestrazione a regex
+    /// dal messaggio, questo confronto falliva.
+    #[test]
+    fn la_classe_di_gruppo_non_dipende_dalla_prosa() {
+        let item = diagnosi(
+            "policy_violation",
+            "demo-api.service",
+            Some("port/require_allocation"),
+            "vite.config.ts:12 21950 | vite --port 21950",
+            "open",
+        )
+        .to_problem();
+        assert_eq!(
+            item.get("metric").and_then(Value::as_str),
+            Some("port/require_allocation")
+        );
+        let atteso = problem_aggregation::problem_group_key(&item);
+        assert_eq!(atteso, "policy:port/require_allocation");
+
+        let mut riscritto = item.clone();
+        riscritto["message"] = json!("Testo per l'umano, cambiato");
+        assert_eq!(problem_aggregation::problem_group_key(&riscritto), atteso);
+    }
+
+    /// Stessa cosa per il servizio: l'unit viaggia come campo, non dentro
+    /// `Servizio X: crash`.
+    #[test]
+    fn unita_di_servizio_dal_campo_non_dal_messaggio() {
+        let item = diagnosi("crash", "Demo-API.service", None, "restart loop", "open").to_problem();
+        assert_eq!(
+            item.get("unit").and_then(Value::as_str),
+            Some("Demo-API.service")
+        );
+        assert_eq!(item.get("signalKind").and_then(Value::as_str), Some("crash"));
+        let atteso = problem_aggregation::problem_group_key(&item);
+        assert_eq!(atteso, "service_observer:crash:demo-api.service");
+
+        let mut riscritto = item.clone();
+        riscritto["message"] = json!("Il servizio non riparte");
+        assert_eq!(problem_aggregation::problem_group_key(&riscritto), atteso);
+    }
+
+    /// Due violazioni della stessa regola su porte diverse restano una riga sola.
+    #[test]
+    fn violazioni_stessa_regola_raggruppano() {
+        let mut items = vec![
+            diagnosi(
+                "policy_violation",
+                "svc-a.service",
+                Some("port/require_allocation"),
+                "vite.config.ts:12 21950",
+                "open",
+            )
+            .to_problem(),
+            diagnosi(
+                "policy_violation",
+                "svc-b.service",
+                Some("port/require_allocation"),
+                "docker-compose.yml:5 21951",
+                "open",
+            )
+            .to_problem(),
+        ];
+        problem_aggregation::aggregate_problems(&mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].get("occurrenceCount").and_then(Value::as_u64),
+            Some(2)
+        );
+    }
 
     #[test]
-    fn problem_aggregation_delegates_to_module() {
+    fn regole_diverse_non_raggruppano() {
+        let mut items = vec![
+            diagnosi(
+                "policy_violation",
+                "svc-a.service",
+                Some("port/require_allocation"),
+                "vite.config.ts:12 21950",
+                "open",
+            )
+            .to_problem(),
+            diagnosi(
+                "policy_violation",
+                "svc-a.service",
+                Some("port/enforce_hardcode"),
+                "vite.config.ts:12 21950",
+                "open",
+            )
+            .to_problem(),
+        ];
+        problem_aggregation::aggregate_problems(&mut items);
+        assert_eq!(items.len(), 2);
+    }
+
+    /// Il ripiego semantico resta per le fonti che campi non ne espongono:
+    /// l'ignoto e' una variante dichiarata, non un valore comodo.
+    #[test]
+    fn fonte_senza_campi_ripiega_sul_messaggio_semantico() {
         let mut items = vec![
             json!({
                 "id": "a",
                 "severity": "error",
-                "source": "policy:port",
-                "message": "Violazione risorse [port/require_allocation]: a.ts:1 21950 (port/require_allocation) | x",
-                "filePath": "a.ts",
-                "line": 1,
+                "source": "runtime:run_command",
+                "message": "EADDRINUSE: porta 21950 gia' occupata",
                 "createdAt": "2026-01-01T00:00:00Z",
             }),
             json!({
                 "id": "b",
                 "severity": "error",
-                "source": "policy:port",
-                "message": "Violazione risorse [port/require_allocation]: b.ts:2 21951 (port/require_allocation) | y",
-                "filePath": "b.ts",
-                "line": 2,
+                "source": "runtime:run_command",
+                "message": "EADDRINUSE: porta 21951 gia' occupata",
                 "createdAt": "2026-01-01T00:00:01Z",
             }),
         ];
