@@ -756,6 +756,15 @@ struct ProviderHealthRow {
     healthy: bool,
     latency_ms: Option<i32>,
     error_kind: Option<String>,
+    // Messaggio diagnostico completo (regola M: la CAUSA, non solo la
+    // categoria). Colonna presente in `nexus_provider_health_history` fin
+    // dalla mig 0097 e sempre scritta dai due writer (probe periodico
+    // mcp-core, errori su richiesta reale nexus-gateway), ma prima di
+    // questo fix nessuna query la leggeva: un `healthy=false` restava senza
+    // causa diagnosticabile appena il provider usciva dalla cooldown_map
+    // in-process (vedi `providers_status_internal`, che copriva l'assenza
+    // solo mentre il cooldown mcp-core era attivo).
+    error_message: Option<String>,
     checked_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -767,7 +776,7 @@ async fn fetch_provider_health_map(
 ) -> std::collections::HashMap<String, ProviderHealthRow> {
     let rows: Vec<ProviderHealthRow> = sqlx::query_as::<_, ProviderHealthRow>(
         r#"SELECT DISTINCT ON (provider)
-                  provider, healthy, latency_ms, error_kind, checked_at
+                  provider, healthy, latency_ms, error_kind, error_message, checked_at
            FROM nexus_provider_health_history
            ORDER BY provider, checked_at DESC"#,
     )
@@ -933,6 +942,91 @@ mod provider_names_tests {
         let ordine: Vec<&str> = out.iter().map(|v| v["provider"].as_str().unwrap()).collect();
         assert_eq!(ordine, vec!["a", "b", "c"]);
     }
+
+    fn health_row(healthy: bool, error_kind: Option<&str>, error_message: Option<&str>) -> ProviderHealthRow {
+        ProviderHealthRow {
+            provider: "deepseek".to_string(),
+            healthy,
+            latency_ms: None,
+            error_kind: error_kind.map(str::to_string),
+            error_message: error_message.map(str::to_string),
+            checked_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Il difetto misurato il 31/07/2026: un `healthy=false` senza
+    /// cooldown mcp-core attivo (cooldown_map vuota — es. scaduto, o
+    /// l'errore osservato solo dal gateway) arrivava a `/health` senza
+    /// alcuna causa. Rompendo il fix (rimuovendo la copia di
+    /// `error_message` in `build_provider_status_entry`), questo test
+    /// rosseggia.
+    #[test]
+    fn unhealthy_senza_cooldown_espone_comunque_la_causa() {
+        let mut health_map = std::collections::HashMap::new();
+        health_map.insert(
+            "deepseek".to_string(),
+            health_row(false, Some("timeout"), Some("nessuna risposta in 30s")),
+        );
+        let cooldown_map = std::collections::HashMap::new(); // cooldown scaduto/mai applicato
+        let api_keys = std::collections::HashMap::new();
+
+        let entry = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys);
+
+        assert_eq!(entry["healthy"], json!(false));
+        assert_eq!(entry["error_kind"], json!("timeout"));
+        assert_eq!(entry["error"], json!("nessuna risposta in 30s"));
+    }
+
+    /// Se il cooldown mcp-core E' attivo, la sua reason resta prioritaria
+    /// (piu' recente/specifica del messaggio del probe) — comportamento
+    /// preesistente, non deve regredire con l'aggiunta del fallback.
+    #[test]
+    fn unhealthy_con_cooldown_attivo_usa_la_reason_del_cooldown() {
+        let mut health_map = std::collections::HashMap::new();
+        health_map.insert(
+            "deepseek".to_string(),
+            health_row(false, Some("timeout"), Some("messaggio del probe, piu' vecchio")),
+        );
+        let mut cooldown_map = std::collections::HashMap::new();
+        cooldown_map.insert(
+            "deepseek".to_string(),
+            (42u64, Some("rate limit raggiunto ora".to_string())),
+        );
+        let api_keys = std::collections::HashMap::new();
+
+        let entry = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys);
+
+        assert_eq!(entry["error"], json!("rate limit raggiunto ora"));
+        assert_eq!(entry["cooldown_seconds_remaining"], json!(42));
+    }
+
+    /// healthy=true non deve mai portare un campo "error" fantasma.
+    #[test]
+    fn healthy_non_espone_errore() {
+        let mut health_map = std::collections::HashMap::new();
+        health_map.insert("deepseek".to_string(), health_row(true, None, None));
+        let cooldown_map = std::collections::HashMap::new();
+        let api_keys = std::collections::HashMap::new();
+
+        let entry = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys);
+
+        assert_eq!(entry["healthy"], json!(true));
+        assert!(entry.get("error").is_none());
+    }
+}
+
+/// Applica a `p["error"]` la causa diagnosticabile di un provider unhealthy
+/// (regola M: il messaggio pieno persistito con l'ultimo probe, non solo la
+/// categoria). No-op se il provider e' sano o non c'e' un messaggio. Punto
+/// unico (regola L) riusato dai tre costruttori di payload provider
+/// (`build_provider_status_entry`, `build_providers_fallback`,
+/// `apply_health_probe`): prima duplicato identico in ciascuno.
+fn apply_health_error(p: &mut Value, h: &ProviderHealthRow) {
+    if !h.healthy {
+        if let Some(msg) = &h.error_message {
+            p["error"] = json!(msg);
+        }
+    }
 }
 
 /// Snapshot dei provider in cooldown come mappa `provider -> (secondi, motivo)`.
@@ -971,6 +1065,7 @@ fn build_providers_fallback(
                 if let Some(kind) = &h.error_kind {
                     p["last_known_error_kind"] = json!(kind);
                 }
+                apply_health_error(&mut p, h);
             }
             if let Some((secs, reason)) = cooldown_map.get(name) {
                 p["healthy"] = json!(false);
@@ -1017,6 +1112,10 @@ fn apply_health_probe(p: &mut serde_json::Value, h: &ProviderHealthRow) {
         }
     } else if !h.healthy {
         p["healthy"] = json!(false);
+        // Regola M: causa diagnosticabile di default; `apply_cooldown_or_billing`
+        // (chiamato dopo, in `patch_gateway_provider`) la sovrascrive se c'e'
+        // un cooldown attivo con una reason piu' specifica.
+        apply_health_error(p, h);
     }
 }
 
@@ -1421,6 +1520,9 @@ pub async fn embeddings_apply_handler(
 ///   - `last_check`: ISO timestamp dell'ultimo probe
 ///   - `latency_ms`: latency del probe (se disponibile)
 ///   - `error_kind`: tipo errore se unhealthy (quota_exceeded, billing_required, ecc.)
+///   - `error`: messaggio diagnostico se unhealthy (regola M: mai un
+///     `healthy=false` senza causa leggibile) — dal probe se non c'e' un
+///     cooldown mcp-core attivo, altrimenti dalla reason del cooldown.
 ///   - `cooldown_seconds_remaining`: se in cooldown attivo
 ///   - `configured`: se la API key è presente in `settings`
 ///
@@ -1441,35 +1543,50 @@ pub async fn providers_status_internal(
 
     let providers: Vec<Value> = provider_names
         .iter()
-        .map(|name| {
-            let name = name.as_str();
-            let mut p = json!({
-                "name": name,
-                "configured": api_key_configured.get(name).copied().unwrap_or(false),
-                "healthy": serde_json::Value::Null,
-            });
-            if let Some(h) = health_map.get(name) {
-                p["healthy"] = json!(h.healthy);
-                p["last_check"] = json!(h.checked_at.to_rfc3339());
-                if let Some(lat) = h.latency_ms {
-                    p["latency_ms"] = json!(lat);
-                }
-                if let Some(kind) = &h.error_kind {
-                    p["error_kind"] = json!(kind);
-                }
-            }
-            if let Some((secs, reason)) = cooldown_map.get(name) {
-                p["healthy"] = json!(false);
-                p["cooldown_seconds_remaining"] = json!(secs);
-                if let Some(r) = reason {
-                    p["error"] = json!(r);
-                }
-            }
-            p
-        })
+        .map(|name| build_provider_status_entry(name, &health_map, &cooldown_map, &api_key_configured))
         .collect();
 
     Json(json!({ "providers": providers }))
+}
+
+/// Costruisce l'entry JSON di un singolo provider per `/api/internal/providers/status`.
+/// Punto unico (regola L), estratto per essere testabile senza DB/AppState
+/// (regola O: la funzione pura e' la stessa che serve la route, non una sua
+/// imitazione nel test).
+fn build_provider_status_entry(
+    name: &str,
+    health_map: &std::collections::HashMap<String, ProviderHealthRow>,
+    cooldown_map: &std::collections::HashMap<String, (u64, Option<String>)>,
+    api_key_configured: &std::collections::HashMap<String, bool>,
+) -> Value {
+    let mut p = json!({
+        "name": name,
+        "configured": api_key_configured.get(name).copied().unwrap_or(false),
+        "healthy": serde_json::Value::Null,
+    });
+    if let Some(h) = health_map.get(name) {
+        p["healthy"] = json!(h.healthy);
+        p["last_check"] = json!(h.checked_at.to_rfc3339());
+        if let Some(lat) = h.latency_ms {
+            p["latency_ms"] = json!(lat);
+        }
+        if let Some(kind) = &h.error_kind {
+            p["error_kind"] = json!(kind);
+        }
+        // Regola M: un healthy=false senza causa non e' diagnosticabile.
+        // Il messaggio pieno (gia' persistito, mig 0097) e' il default;
+        // il cooldown_map sotto lo sovrascrive con la reason attiva se
+        // piu' recente/specifica.
+        apply_health_error(&mut p, h);
+    }
+    if let Some((secs, reason)) = cooldown_map.get(name) {
+        p["healthy"] = json!(false);
+        p["cooldown_seconds_remaining"] = json!(secs);
+        if let Some(r) = reason {
+            p["error"] = json!(r);
+        }
+    }
+    p
 }
 
 /// POST /api/admin/routing-matrix/auto-promote-now

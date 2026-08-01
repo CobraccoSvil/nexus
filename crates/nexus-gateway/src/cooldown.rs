@@ -283,23 +283,34 @@ impl CooldownManager {
     /// ricostruibile da nessuna parte (incidente run a5db0985, 2026-07-06).
     ///
     /// Fire-and-forget: nessun errore DB blocca la pipeline di routing. No-op
-    /// se il pool non e' collegato (test unit) o fuori da un runtime tokio.
+    /// se il pool non e' collegato (test unit) o fuori da un runtime tokio
+    /// (delegato a [`Self::spawn_persist`], punto unico regola L).
     fn persist_last_error(&self, provider: &str, reason: CooldownReason, last_error: Option<&str>) {
+        // Regola F: e' il messaggio d'errore del provider (status+codice), mai
+        // prompt/response. Troncato a 500 char come la history del probe.
+        let message = truncate_chars(last_error.unwrap_or(""), 500);
+        let provider = provider.to_lowercase();
+        let kind = reason.as_str();
+        self.spawn_persist(move |pool| persist_provider_error(pool, provider, kind, message));
+    }
+
+    /// Punto unico (regola L) del fire-and-forget "collega pool + runtime,
+    /// spawna". `persist_last_error` e `persist_recovery` differiscono solo
+    /// nella query da eseguire; questo evita di ripetere la stessa sequenza
+    /// `db.get().cloned()` + `Handle::try_current()` in entrambi (il gate
+    /// qualita' la segnalava come blocco duplicato).
+    fn spawn_persist<F, Fut>(&self, make_future: F)
+    where
+        F: FnOnce(PgPool) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         let Some(pool) = self.db.get().cloned() else {
             return;
         };
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        // Regola F: e' il messaggio d'errore del provider (status+codice), mai
-        // prompt/response. Troncato a 500 char come la history del probe.
-        let message = truncate_chars(last_error.unwrap_or(""), 500);
-        handle.spawn(persist_provider_error(
-            pool,
-            provider.to_lowercase(),
-            reason.as_str(),
-            message,
-        ));
+        handle.spawn(make_future(pool));
     }
 
     /// `true` se il provider e' in cooldown rispetto all'istante corrente.
@@ -339,11 +350,30 @@ impl CooldownManager {
         }
     }
 
-    /// Rimuove il cooldown di un provider (usato dal re-probe al ripristino).
+    /// Rimuove il cooldown di un provider (usato dal re-probe al ripristino e
+    /// dal path di richiesta reale su un 200 dopo cooldown). Se il provider
+    /// era EFFETTIVAMENTE in cooldown, persiste una riga `healthy=true` in
+    /// `nexus_provider_health_history` (fix bug "re-probe cieco": prima il
+    /// ripristino restava SOLO in-memory, quindi `checked_at` in DB restava
+    /// fermo all'ultimo fallimento anche dopo un recovery reale confermato
+    /// da questo stesso processo — la riga piu' recente vista da
+    /// `fetch_provider_health_map` (mcp-core) e' quella che decide lo stato
+    /// esposto da `/health`, e senza questa scrittura un provider tornato
+    /// sano restava marcato down fino al prossimo giro del probe periodico
+    /// separato di mcp-core, con cadenza propria non sincronizzata).
     pub fn clear(&self, provider: &str) {
         if self.states.remove(provider).is_some() {
             tracing::info!(provider, "gateway: provider ripristinato (cooldown rimosso)");
+            self.persist_recovery(provider);
         }
+    }
+
+    /// Persiste il ripristino: INSERT `healthy=true` in
+    /// `nexus_provider_health_history` con `source='gateway'`, via
+    /// [`Self::spawn_persist`] (stesso punto unico di `persist_last_error`).
+    fn persist_recovery(&self, provider: &str) {
+        let provider = provider.to_lowercase();
+        self.spawn_persist(move |pool| persist_provider_recovery(pool, provider));
     }
 
     /// Snapshot dello stato di tutti i provider in cooldown, come
@@ -496,6 +526,31 @@ async fn persist_provider_error(pool: PgPool, provider: String, kind: &'static s
         if let Err(e) = res {
             tracing::warn!(provider, error = %e, "gateway-cooldown: {} fallito", what);
         }
+    }
+}
+
+/// Scrittura DB del ripristino (vedi [`CooldownManager::persist_recovery`]):
+/// riga append-only `healthy=true` con source='gateway'. Non tocca
+/// `nexus_provider_health` (quella tabella e' lo snapshot dell'ULTIMO
+/// errore, non ha bisogno di un "ultimo successo"): il consumatore
+/// (`fetch_provider_health_map` in mcp-core) legge solo
+/// `nexus_provider_health_history` per `healthy`/`checked_at`.
+async fn persist_provider_recovery(pool: PgPool, provider: String) {
+    let res = sqlx::query(
+        "INSERT INTO nexus_provider_health_history \
+           (provider, healthy, error_kind, error_message, source) \
+         VALUES ($1, true, NULL, NULL, $2)",
+    )
+    .bind(&provider)
+    .bind(LAST_ERROR_SOURCE)
+    .execute(&pool)
+    .await;
+    if let Err(e) = res {
+        tracing::warn!(
+            provider,
+            error = %e,
+            "gateway-cooldown: INSERT ripristino in nexus_provider_health_history fallito"
+        );
     }
 }
 
@@ -697,6 +752,92 @@ mod tests {
         assert_eq!(truncate_chars("ciao mondo", 4), "ciao…");
         // Multibyte: slicing per byte panicherebbe, per char no.
         assert_eq!(truncate_chars("èèèèè", 3), "èèè…");
+    }
+
+    /// Il fix del bug misurato il 31/07/2026 (deepseek healthy=false per 8+
+    /// minuti dopo un riavvio, mai ri-verificato): `clear()` deve persistere
+    /// il ripristino, non solo rimuovere lo stato in-memory. Attraversa il
+    /// PRODUTTORE reale (`clear`), non ricostruisce l'INSERT a mano (regola
+    /// O). Poll breve perche' la persistenza e' fire-and-forget
+    /// (`tokio::spawn` non atteso dal chiamante, per non rallentare il path
+    /// di richiesta/re-probe).
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn clear_su_provider_in_cooldown_persiste_il_ripristino(pool: PgPool) {
+        let m = CooldownManager::new();
+        m.attach_db(pool.clone());
+        m.mark_at(
+            "deepseek",
+            CooldownReason::Transient,
+            Some("timeout".to_string()),
+            Utc::now(),
+            30,
+        );
+        // Attende che la riga d'errore sia REALMENTE scritta prima di
+        // procedere: entrambe le persistenze (mark_at e clear) sono
+        // fire-and-forget su `tokio::spawn`, quindi chiamarle in sequenza
+        // ravvicinata senza questa attesa metterebbe i due INSERT in race
+        // fra loro (ordine di `checked_at` non garantito). In produzione
+        // questa race non esiste: fra un errore osservato e il recovery
+        // passano minuti (il `reprobe_interval_seconds`), qui la
+        // riproduciamo nel test rispettando l'ordine causale reale.
+        attendi_riga_healthy(&pool, "deepseek", false).await;
+
+        m.clear("deepseek");
+
+        let source = attendi_riga_healthy(&pool, "deepseek", true).await;
+        assert_eq!(source, "gateway");
+    }
+
+    /// Mutazione di controllo: se il provider NON era in cooldown, `clear()`
+    /// non deve scrivere nulla (altrimenti ogni richiesta riuscita su un
+    /// provider gia' sano genererebbe rumore append-only senza fine).
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn clear_su_provider_non_in_cooldown_non_scrive_nulla(pool: PgPool) {
+        let m = CooldownManager::new();
+        m.attach_db(pool.clone());
+
+        m.clear("mistral");
+        // Nessuna attesa di poll: verifichiamo l'assenza dopo un breve margine,
+        // sufficiente perche' una scrittura errata abbia il tempo di comparire.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM nexus_provider_health_history WHERE provider = $1",
+        )
+        .bind("mistral")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// Poll fino a 2s per una riga con l'esatto `healthy` atteso (non
+    /// semplicemente "l'ultima riga"): la scrittura e' un `tokio::spawn`
+    /// fire-and-forget, non c'e' un handle da attendere dal lato del test
+    /// senza cambiare la firma di produzione per farne uno strumento di test
+    /// (regola O: non piegare il produttore alla misura). Cercare per
+    /// `healthy` invece che per "ultima per checked_at" evita di dipendere
+    /// dall'ordine di completamento relativo di due INSERT asincroni.
+    async fn attendi_riga_healthy(pool: &PgPool, provider: &str, atteso: bool) -> String {
+        for _ in 0..20 {
+            if let Some(source) = sqlx::query_scalar::<_, String>(
+                "SELECT source FROM nexus_provider_health_history \
+                 WHERE provider = $1 AND healthy = $2 ORDER BY checked_at DESC LIMIT 1",
+            )
+            .bind(provider)
+            .bind(atteso)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+            {
+                return source;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!(
+            "nessuna riga con healthy={atteso} per '{provider}' in \
+             nexus_provider_health_history entro 2s"
+        );
     }
 
     #[tokio::test]
