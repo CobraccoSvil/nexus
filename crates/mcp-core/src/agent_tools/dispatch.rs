@@ -304,45 +304,12 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use uuid::Uuid;
 
-    /// Contesto minimale senza infrastruttura: pool DB lazy mai contattato,
-    /// brain non connesso. Sufficiente per i path di dispatch che non
-    /// toccano rete ne' DB.
+    /// Contesto minimale senza infrastruttura (punto unico in `test_support`:
+    /// lo condividono i test dei tool che vogliono attraversare il dispatcher
+    /// per la strada della produzione).
     fn ctx_for_dispatch_tests(root: std::path::PathBuf) -> AgentToolContext {
-        let db =
-            sqlx::PgPool::connect_lazy("postgres://test:test@127.0.0.1:1/test").expect("pool lazy");
-        AgentToolContext {
-            core: nexus_agent_tools::ToolContextCore {
-                root_path: root,
-                user_id: Uuid::nil(),
-                is_git_repo: false,
-                can_write: true,
-                project_id: Uuid::nil(),
-                session_id: None,
-                db: Arc::new(db.clone()),
-                run_db: Arc::new(db.clone()),
-                parent_run_id: None,
-                run_id: None,
-                long_running_patterns: Vec::new(),
-                user_role: "admin".to_string(),
-                is_nexus_operator: true,
-                project_channels: Arc::new(dashmap::DashMap::new()),
-                monitor_registry: Arc::new(parking_lot::RwLock::new(
-                    std::collections::HashMap::new(),
-                )),
-                hooks: Arc::new(nexus_agent_tools::context_core::NoopMutationHooks),
-                embedder: Arc::new(nexus_agent_tools::context_core::NoopEmbedder),
-                isolated_subrun: false,
-                write_scope: Vec::new(),
-            },
-            playwright_channels: crate::playwright_live::new_channels(),
-            neural: crate::orchestrator::NeuralCoreClient::disconnected_for_tests(),
-            dependency_status: Arc::new(crate::task_watchdog::DependencyStatus::new()),
-            port_registry: crate::port_registry::PortRegistryCache::empty_for_tests(db),
-            parent_narration: None,
-        }
+        crate::test_support::ctx_di_tool_test(root)
     }
 
     /// Regressione: `run_tests` e' esposto al modello (tool_schema, prompt

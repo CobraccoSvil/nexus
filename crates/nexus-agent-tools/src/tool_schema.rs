@@ -626,7 +626,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "run_command",
-    "description": "Usa questo tool per eseguire comandi nella root del progetto (build, test, lint, format, etc.). Default sincrono con timeout 120s. Imposta background=true per server/watcher/processi interattivi. Non usare per lunghe operazioni: usa run_service per quelle.",
+    "description": "Usa questo tool per eseguire comandi nella root del progetto (build, test, lint, format, etc.). Default sincrono con timeout 120s. Imposta background=true per server/watcher/processi interattivi. Non usare per lunghe operazioni: usa run_service per quelle. Per la suite Playwright usa run_playwright_tests: 'npx playwright test' scritto qui viene comunque eseguito da quel tool, che imposta BASE_URL sulle porte del progetto e attende che il servizio bersaglio sia pronto.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -650,7 +650,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "run_tests",
-    "description": "Usa questo tool per eseguire test del progetto con timeout esteso (120s). Auto-rileva il comando test (package.json, Cargo.toml, pyproject.toml, etc.) o accetta comando esplicito. Esegui i test con parsimonia: preferisci 'filter' per sottoinsiemi mirati invece di rieseguire l'intera suite. Non usare run_command per test: questo tool è specializzato.",
+    "description": "Usa questo tool per eseguire test del progetto con timeout esteso (120s). Auto-rileva il comando test (package.json, Cargo.toml, pyproject.toml, etc.) o accetta comando esplicito. Esegui i test con parsimonia: preferisci 'filter' per sottoinsiemi mirati invece di rieseguire l'intera suite. Non usare run_command per test: questo tool è specializzato. Eccezione: i test end-to-end Playwright si lanciano con run_playwright_tests, che è anche chi li esegue se scrivi 'npx playwright test' qui.",
     "input_schema": {
       "type": "object",
       "properties": {

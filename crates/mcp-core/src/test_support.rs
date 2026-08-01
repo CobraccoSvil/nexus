@@ -42,6 +42,53 @@ use uuid::Uuid;
 /// difetto misurato che l'ha resa necessaria.
 pub(crate) use nexus_migrations_embedded::PROJECT_MIGRATOR;
 
+/// Contesto tool minimale, senza infrastruttura: pool DB lazy mai contattato,
+/// brain non connesso, root sul path passato.
+///
+/// Punto unico (regola L) del contesto usato dai test dei tool: prima viveva
+/// dentro il `mod tests` di `agent_tools::dispatch`, quindi ogni altro modulo
+/// che volesse esercitare un tool per la strada della produzione doveva
+/// ricopiarne i quindici campi — e una copia che diverge sul campo sbagliato
+/// (`can_write`, `write_scope`, `isolated_subrun`) non fallisce: prova un'altra
+/// cosa restando verde.
+///
+/// ATTENZIONE al costo di una lettura DB su questo pool: `connect_lazy` verso
+/// una porta chiusa non fallisce subito, consuma l'`acquire_timeout` (30s). Un
+/// test che attraversa un percorso con letture di settings paga 30s ciascuna:
+/// vanno scelti percorsi che decidono PRIMA di interrogare il DB.
+pub(crate) fn ctx_di_tool_test(root: std::path::PathBuf) -> crate::agent_tools::AgentToolContext {
+    use std::sync::Arc;
+    let db = sqlx::PgPool::connect_lazy("postgres://test:test@127.0.0.1:1/test").expect("pool lazy");
+    crate::agent_tools::AgentToolContext {
+        core: nexus_agent_tools::ToolContextCore {
+            root_path: root,
+            user_id: Uuid::nil(),
+            is_git_repo: false,
+            can_write: true,
+            project_id: Uuid::nil(),
+            session_id: None,
+            db: Arc::new(db.clone()),
+            run_db: Arc::new(db.clone()),
+            parent_run_id: None,
+            run_id: None,
+            long_running_patterns: Vec::new(),
+            user_role: "admin".to_string(),
+            is_nexus_operator: true,
+            project_channels: Arc::new(dashmap::DashMap::new()),
+            monitor_registry: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            hooks: Arc::new(nexus_agent_tools::context_core::NoopMutationHooks),
+            embedder: Arc::new(nexus_agent_tools::context_core::NoopEmbedder),
+            isolated_subrun: false,
+            write_scope: Vec::new(),
+        },
+        playwright_channels: crate::playwright_live::new_channels(),
+        neural: crate::orchestrator::NeuralCoreClient::disconnected_for_tests(),
+        dependency_status: Arc::new(crate::task_watchdog::DependencyStatus::new()),
+        port_registry: crate::port_registry::PortRegistryCache::empty_for_tests(db),
+        parent_narration: None,
+    }
+}
+
 /// Semina una sessione chat (`chat_sessions`, mig project 0001) e ne ritorna l'id.
 ///
 /// Serve perche' lo schema reale VINCOLA `agent_runs.session_id` con una FK verso
