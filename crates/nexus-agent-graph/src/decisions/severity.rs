@@ -79,6 +79,34 @@ pub fn any_high(items: &[Value]) -> bool {
     items.iter().any(is_high)
 }
 
+/// `true` se ALMENO un elemento raggiunge la gravita' `minima`: e' il test di
+/// SOSTEGNO di un verdetto che chiede lavoro.
+///
+/// Un revisore dichiara due cose nello stesso oggetto — il verdetto e l'evidenza
+/// che lo sostiene — e le due possono non reggersi a vicenda. Misurato il
+/// 01/08/2026 su bacheca-attivita (run 397c0824): due revisori, uno vota `pass`
+/// con zero finding, l'altro `needs_changes` con UN finding di gravita' `bassa`
+/// il cui testo dice "Not a blocker" e "Codice accettabile" su uno scenario che
+/// il revisore stesso dichiara impossibile ("SELECT COUNT(*) never returns
+/// NULL"). Il panel ha prodotto NeedsChanges, il ciclo di correzione e' girato a
+/// vuoto due volte e il run e' chiuso `failed_diagnosed` — con l'applicazione
+/// funzionante.
+///
+/// E' il corollario della regola Q: una struttura non rende vera l'affermazione
+/// che contiene. Il campo `verdict` e' una DICHIARAZIONE; i `findings` sono cio'
+/// che il revisore porta a sostegno, ed e' l'unica parte che qualcun altro puo'
+/// pesare. Quando il sostegno manca, a valere e' l'evidenza — non perche' il
+/// revisore menta, ma perche' un verdetto non sostenuto non e' distinguibile da
+/// un'abitudine a chiedere sempre una modifica in piu'.
+///
+/// Gravita' IGNOTA (`None`) non sostiene: se cosi' non fosse, un `severity`
+/// scritto male varrebbe piu' di uno scritto `bassa`.
+pub fn any_at_least(items: &[Value], minima: Severity) -> bool {
+    items
+        .iter()
+        .any(|i| severity_of(i).is_some_and(|s| s <= minima))
+}
+
 /// Rank per l'ordinamento dei rischi/finding: piu' basso = piu' grave, cosi' un
 /// sort ASCENDENTE (stabile) porta le `alta` in cima e lascia le gravita' ignote
 /// in fondo senza perderle.

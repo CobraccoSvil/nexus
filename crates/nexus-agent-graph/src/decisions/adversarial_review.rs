@@ -90,6 +90,11 @@ pub struct QuorumPolicy {
     /// un `fail` conta come voto ordinario e serve comunque la presenza di
     /// almeno un fail per il verdetto Fail.
     pub fail_on_high_severity: bool,
+    /// Gravita' MINIMA che un finding deve raggiungere perche' un voto
+    /// `needs_changes` valga come rimando in correzione. Un voto che chiede
+    /// lavoro senza portare evidenza che lo giustifichi conta come approvazione
+    /// (i finding restano annotati): vedi `severity::any_at_least`.
+    pub min_severity_per_rimando: super::severity::Severity,
 }
 
 impl Default for QuorumPolicy {
@@ -100,6 +105,10 @@ impl Default for QuorumPolicy {
         Self {
             min_valid_verdicts: 1,
             fail_on_high_severity: true,
+            // `Medium`: una `bassa` non giustifica da sola un giro di correzione
+            // (il revisore che la trova scrive tipicamente "not a blocker"), una
+            // `media` si'.
+            min_severity_per_rimando: super::severity::Severity::Medium,
         }
     }
 }
@@ -114,6 +123,11 @@ pub struct PanelOutcome {
     pub pass: usize,
     pub fail: usize,
     pub needs_changes: usize,
+    /// Voti `needs_changes` che NON portavano evidenza sufficiente e sono stati
+    /// contati come approvazione. Non e' un dettaglio interno: senza, un
+    /// dissenso declassato sparirebbe in silenzio, ed e' esattamente la forma di
+    /// perdita che questo modulo esiste per impedire.
+    pub needs_changes_non_sostenuti: usize,
     /// I revisori validi NON concordano (piu' di un verdetto distinto).
     pub dissent: bool,
     /// Findings aggregati di TUTTI i voti validi (uniti, non deduplicati: la
@@ -152,7 +166,12 @@ impl PanelOutcome {
             "approved": self.verdict.is_approved(),
             "valid": self.valid,
             "total_reviews": self.total_reviews,
-            "tally": { "pass": self.pass, "fail": self.fail, "needs_changes": self.needs_changes },
+            "tally": {
+                "pass": self.pass,
+                "fail": self.fail,
+                "needs_changes": self.needs_changes,
+                "needs_changes_non_sostenuti": self.needs_changes_non_sostenuti,
+            },
             "dissent": self.dissent,
             "findings": self.findings,
             "reviewers": self.reviewers_json(),
@@ -239,6 +258,58 @@ fn extract_vote(outcome: &Value) -> Option<Vote> {
 /// `Inconclusive` se ci sono review ma i voti validi sono sotto la soglia.
 ///
 /// Determinismo: l'ordine dei findings segue l'ordine degli `outcomes` (stabile).
+/// Lo spoglio dei voti validi: quanti per verdetto, se c'e' evidenza grave a
+/// sostegno di un veto, e i finding di tutti.
+struct Spoglio {
+    pass: usize,
+    fail: usize,
+    needs_changes: usize,
+    non_sostenuti: usize,
+    any_high_severity_fail: bool,
+    findings: Vec<Value>,
+}
+
+/// Conta i voti applicando il test di SOSTEGNO ai rimandi.
+///
+/// Un rimando in correzione COSTA: un ciclo di gate, un turno del coordinatore
+/// e, se non produce scritture, un'escalation di modello. Vale quando c'e'
+/// qualcosa da correggere, e cio' che il revisore porta a sostegno e' l'unica
+/// parte che qualcun altro puo' pesare — corollario della regola Q: la struttura
+/// non rende vera l'affermazione che contiene. Senza sostegno il voto conta come
+/// approvazione, i finding restano annotati e il declassamento e' DICHIARATO in
+/// `non_sostenuti`, cosi' un dissenso non sparisce in silenzio.
+fn spoglia_i_voti(votes: &[Vote], policy: &QuorumPolicy) -> Spoglio {
+    let mut s = Spoglio {
+        pass: 0,
+        fail: 0,
+        needs_changes: 0,
+        non_sostenuti: 0,
+        any_high_severity_fail: false,
+        findings: Vec::new(),
+    };
+    for v in votes {
+        match v.verdict {
+            ReviewVerdict::Pass => s.pass += 1,
+            ReviewVerdict::Fail => {
+                s.fail += 1;
+                if v.has_high_severity {
+                    s.any_high_severity_fail = true;
+                }
+            }
+            ReviewVerdict::NeedsChanges => {
+                if super::severity::any_at_least(&v.findings, policy.min_severity_per_rimando) {
+                    s.needs_changes += 1;
+                } else {
+                    s.pass += 1;
+                    s.non_sostenuti += 1;
+                }
+            }
+        }
+        s.findings.extend(v.findings.iter().cloned());
+    }
+    s
+}
+
 pub fn compose_panel_verdict(outcomes: &[Value], policy: &QuorumPolicy) -> Option<PanelOutcome> {
     // Un batch e' un "panel di review" se almeno un outcome ha il campo review
     // (anche solo dichiarato): distingue un panel da un batch di soli worker.
@@ -251,24 +322,14 @@ pub fn compose_panel_verdict(outcomes: &[Value], policy: &QuorumPolicy) -> Optio
     }
 
     let votes: Vec<Vote> = outcomes.iter().filter_map(extract_vote).collect();
-    let mut pass = 0;
-    let mut fail = 0;
-    let mut needs_changes = 0;
-    let mut any_high_severity_fail = false;
-    let mut findings: Vec<Value> = Vec::new();
-    for v in &votes {
-        match v.verdict {
-            ReviewVerdict::Pass => pass += 1,
-            ReviewVerdict::Fail => {
-                fail += 1;
-                if v.has_high_severity {
-                    any_high_severity_fail = true;
-                }
-            }
-            ReviewVerdict::NeedsChanges => needs_changes += 1,
-        }
-        findings.extend(v.findings.iter().cloned());
-    }
+    let Spoglio {
+        pass,
+        fail,
+        needs_changes,
+        non_sostenuti,
+        any_high_severity_fail,
+        findings,
+    } = spoglia_i_voti(&votes, policy);
     let valid = votes.len();
     let distinct = usize::from(pass > 0) + usize::from(fail > 0) + usize::from(needs_changes > 0);
     let verdict = classify_panel_verdict(
@@ -288,6 +349,7 @@ pub fn compose_panel_verdict(outcomes: &[Value], policy: &QuorumPolicy) -> Optio
         pass,
         fail,
         needs_changes,
+        needs_changes_non_sostenuti: non_sostenuti,
         dissent: distinct > 1,
         findings,
         // Chi ha votato lo sa il convocatore, non gli outcome: lo compila lui
@@ -396,6 +458,7 @@ mod tests {
             &QuorumPolicy {
                 min_valid_verdicts: 1,
                 fail_on_high_severity: true,
+                min_severity_per_rimando: crate::decisions::severity::Severity::Medium,
             },
         )
         .unwrap();
@@ -410,6 +473,7 @@ mod tests {
             &QuorumPolicy {
                 min_valid_verdicts: 1,
                 fail_on_high_severity: false,
+                min_severity_per_rimando: crate::decisions::severity::Severity::Medium,
             },
         )
         .unwrap();
@@ -417,17 +481,73 @@ mod tests {
     }
 
     #[test]
-    fn needs_changes_senza_fail() {
+    fn needs_changes_sostenuto_da_evidenza_rimanda() {
         let out = compose_panel_verdict(
             &[
                 reviewer("pass", json!([])),
-                reviewer("needs_changes", json!([])),
+                reviewer("needs_changes", json!([{"severity": "media", "file": "a.rs"}])),
             ],
             &QuorumPolicy::default(),
         )
         .unwrap();
         assert_eq!(out.verdict, PanelVerdict::NeedsChanges);
         assert!(out.dissent);
+    }
+
+    /// Un voto che chiede lavoro senza portarne la ragione non fa girare il
+    /// ciclo di correzione: i finding restano nel resoconto, il verdetto no.
+    ///
+    /// Misurato il 01/08/2026 (run 397c0824, bacheca-attivita): un revisore
+    /// vota `pass` con zero finding, l'altro `needs_changes` con UN finding
+    /// `bassa` il cui testo dice "Not a blocker" e "Codice accettabile". Il
+    /// panel produsse NeedsChanges, il ciclo di correzione giro' a vuoto due
+    /// volte (`progress: no_writes`) e il run chiuse `failed_diagnosed` — con
+    /// l'applicazione funzionante. Il caso a zero finding e' lo stesso difetto
+    /// nella sua forma estrema: chiede una modifica senza dire quale.
+    ///
+    /// MUTAZIONE: togliendo il test di sostegno da `compose_panel_verdict`
+    /// (`needs_changes += 1` incondizionato) entrambi i casi tornano
+    /// `NeedsChanges` e questo test rosseggia.
+    #[test]
+    fn needs_changes_non_sostenuto_vale_approvazione() {
+        for findings in [json!([]), json!([{"severity": "bassa", "file": "a.rs"}])] {
+            let out = compose_panel_verdict(
+                &[reviewer("pass", json!([])), reviewer("needs_changes", findings.clone())],
+                &QuorumPolicy::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                out.verdict,
+                PanelVerdict::Pass,
+                "un rimando senza evidenza che lo giustifichi non fa girare il \
+                 ciclo di correzione: {findings}"
+            );
+        }
+    }
+
+    /// La soglia e' policy, non una costante: alzandola a `alta`, un rimando
+    /// sostenuto da una `media` smette di valere. Serve a provare che il campo
+    /// e' davvero letto (regola G) e non un ornamento.
+    #[test]
+    fn la_soglia_del_sostegno_viene_dalla_policy() {
+        let voti = [
+            reviewer("pass", json!([])),
+            reviewer("needs_changes", json!([{"severity": "media", "file": "a.rs"}])),
+        ];
+        let severa = QuorumPolicy {
+            min_severity_per_rimando: crate::decisions::severity::Severity::High,
+            ..QuorumPolicy::default()
+        };
+        assert_eq!(
+            compose_panel_verdict(&voti, &severa).unwrap().verdict,
+            PanelVerdict::Pass
+        );
+        assert_eq!(
+            compose_panel_verdict(&voti, &QuorumPolicy::default())
+                .unwrap()
+                .verdict,
+            PanelVerdict::NeedsChanges
+        );
     }
 
     #[test]
@@ -440,6 +560,7 @@ mod tests {
             &QuorumPolicy {
                 min_valid_verdicts: 2,
                 fail_on_high_severity: true,
+                min_severity_per_rimando: crate::decisions::severity::Severity::Medium,
             },
         )
         .unwrap();

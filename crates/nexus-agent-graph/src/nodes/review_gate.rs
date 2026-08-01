@@ -916,6 +916,7 @@ mod tests {
             &QuorumPolicy {
                 min_valid_verdicts: 1,
                 fail_on_high_severity: true,
+                min_severity_per_rimando: crate::decisions::severity::Severity::Medium,
             },
         )
         .expect("panel di review valido")
@@ -931,6 +932,7 @@ mod tests {
             &QuorumPolicy {
                 min_valid_verdicts: 1,
                 fail_on_high_severity: true,
+                min_severity_per_rimando: crate::decisions::severity::Severity::Medium,
             },
         )
         .expect("panel valido")

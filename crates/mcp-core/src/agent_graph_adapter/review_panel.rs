@@ -125,6 +125,34 @@ impl ReviewPanelAdapter {
             .ok()
             .flatten()
             .unwrap_or(true),
+            min_severity_per_rimando: Self::soglia_rimando(&self.db).await,
+        }
+    }
+
+    /// Gravita' minima perche' un `needs_changes` valga come rimando in
+    /// correzione (`orchestrator.review_min_severity_per_rimando`, mig 0668).
+    ///
+    /// Una gravita' non riconosciuta NON diventa il default in silenzio: il
+    /// vocabolario e' chiuso (`alta|media|bassa`) e un valore fuori vocabolario
+    /// e' un errore di configurazione da vedere nei log, non una soglia che
+    /// qualcuno crede di aver impostato.
+    async fn soglia_rimando(db: &sqlx::PgPool) -> nexus_agent_graph::decisions::severity::Severity {
+        use nexus_agent_graph::decisions::severity::Severity;
+        const CHIAVE: &str = "orchestrator.review_min_severity_per_rimando";
+        let default = Severity::Medium;
+        let Some(raw) = nexus_auth::get_setting(db, CHIAVE).await else {
+            return default;
+        };
+        match Severity::try_parse(&raw) {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    chiave = CHIAVE,
+                    valore = %raw,
+                    "gravita' fuori vocabolario (alta|media|bassa): uso il default"
+                );
+                default
+            }
         }
     }
 
