@@ -7,10 +7,11 @@
 //! si esegue la stessa funzione di dispatch del server gRPC, in processo. I tool
 //! sono REALI (side-effect possibili sul progetto).
 //!
-//! ESITO STRUTTURATO (regola L): `is_error` e `exit_code` sono derivati dal testo
-//! del risultato col PUNTO UNICO di mcp-core ([`crate::tool_runner_server::
-//! tool_result_is_error`] / [`crate::tool_runner_server::extract_exit_code`]),
-//! gli stessi usati dal path gRPC. L'`exit_code` fluisce INVARIATO nel
+//! ESITO STRUTTURATO (regola Q): `is_error` e `exit_code` arrivano dai CAMPI
+//! della [`nexus_types::tool_outcome::RispostaTool`] che il dispatch restituisce
+//! — il testo non viene riletto per sapere com'e' andata. Per i tool non ancora
+//! migrati quei campi li ricostruisce il ponte `da_testo_legacy`, all'ingresso
+//! del dispatch e in un punto solo. L'`exit_code` fluisce INVARIATO nel
 //! [`ToolOutcome`] (alimenta `routing::signals::tool_result_outcome_after`).
 //!
 //! GUASTO INFRA vs ERRORE APPLICATIVO (caso "gRPC-down -> degrada a executor",
@@ -34,9 +35,7 @@ use nexus_agent_graph::runtime::ports::{PortError, ToolCall, ToolExecutor, ToolO
 use nexus_types::error_presentation::RenderedError;
 
 use crate::agent_tools::execute_agent_tool;
-use crate::tool_runner_server::{
-    extract_exit_code, tool_result_is_error, ToolRunnerDeps, ToolRunnerService,
-};
+use crate::tool_runner_server::{ToolRunnerDeps, ToolRunnerService};
 
 /// Adapter [`ToolExecutor`] -> dispatch tool IN-PROCESS.
 pub struct ToolRunnerExecutorAdapter {
@@ -158,20 +157,23 @@ fn rendered_from_status(status: &tonic::Status) -> RenderedError {
 /// Mappa il risultato testuale di un tool (output di `execute_agent_tool`) nel
 /// [`ToolOutcome`] strutturato.
 ///
-/// `is_error`/`exit_code` derivano dal PUNTO UNICO di mcp-core (stesso codice del
-/// path gRPC). `content` resta il testo grezzo (i nodi lo trattano come opaco).
-/// `is_infrastructure=false`: un errore applicativo del tool (marker `\u{274C}`)
-/// NON e' un guasto infra (il ToolRunner ha risposto). L'infra-error e' segnalato
-/// a monte (build_ctx fallita -> `PortError::Tool`, mappato dal chiamante).
-pub(crate) fn map_result_to_outcome(tool_call_id: &str, result: String) -> ToolOutcome {
-    let is_error = tool_result_is_error(&result);
-    let exit_code = extract_exit_code(&result).map(|c| c as i64);
+/// `is_error`/`exit_code` arrivano dai CAMPI della risposta (regola Q): non si
+/// rilegge il testo per sapere com'e' andata. Per i tool ancora legacy quei campi
+/// li ha ricostruiti il ponte all'ingresso del dispatch, in un punto solo.
+/// `content` resta il testo grezzo (i nodi lo trattano come opaco).
+/// `is_infrastructure=false`: un errore APPLICATIVO del tool non e' un guasto
+/// infra (il ToolRunner ha risposto). L'infra-error e' segnalato a monte
+/// (build_ctx fallita -> `PortError::Tool`, mappato dal chiamante).
+pub(crate) fn map_result_to_outcome(
+    tool_call_id: &str,
+    risposta: nexus_types::tool_outcome::RispostaTool,
+) -> ToolOutcome {
+    let is_error = risposta.esito.e_fallito();
     ToolOutcome {
         tool_call_id: tool_call_id.to_string(),
-        content: Value::String(result),
+        content: Value::String(risposta.testo),
         is_error,
-        exit_code,
-        // Errore applicativo, non infrastrutturale: il tool ha prodotto un esito.
+        exit_code: risposta.exit_code.map(i64::from),
         is_infrastructure: false,
         error_class: if is_error {
             Some("tool_error".to_string())
@@ -184,6 +186,54 @@ pub(crate) fn map_result_to_outcome(tool_call_id: &str, result: String) -> ToolO
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nexus_types::tool_outcome::RispostaTool;
+
+    /// IL test del refactor: `is_error` viene dal CAMPO, non dal testo.
+    ///
+    /// Un tool MIGRATO dichiara il fallimento in `esito` e non scrive alcun
+    /// marker — il suo testo e' testo. Se il consumatore tornasse a leggere la
+    /// stringa (com'era prima), quel fallimento diventerebbe un successo: e' la
+    /// stessa perdita che due composizioni del repo producevano anteponendo
+    /// prosa al risultato, ma qui non serve nemmeno una composizione per
+    /// perderlo, basta la firma sbagliata.
+    ///
+    /// Il ponte legacy NON puo' catturare questo caso, perche' li' testo e campo
+    /// coincidono per costruzione: e' il motivo per cui questo test esiste
+    /// accanto agli altri e non al posto loro.
+    ///
+    /// MUTAZIONE: `let is_error = is_tool_failure(&risposta.testo)` in
+    /// `map_result_to_outcome` -> questo test rosseggia con `is_error == false`.
+    #[test]
+    fn l_esito_viene_dal_campo_non_dal_testo() {
+        let migrato = RispostaTool::fallito("nessun ascolto sulla porta 24806");
+        assert!(
+            !nexus_types::tool_outcome::is_tool_failure(&migrato.testo),
+            "premessa del test: un tool migrato NON scrive il marker"
+        );
+
+        let out = map_result_to_outcome("c", migrato);
+        assert!(
+            out.is_error,
+            "il fallimento e' dichiarato nel campo: leggere il testo lo perde"
+        );
+        assert_eq!(out.error_class.as_deref(), Some("tool_error"));
+    }
+
+    /// Il duale: un tool riuscito il cui TESTO contiene il marker (perche' sta
+    /// RIPORTANDO il fallimento di qualcun altro — un elenco di esiti, un
+    /// riepilogo) non diventa fallito.
+    #[test]
+    fn un_riuscito_che_riporta_un_fallimento_altrui_resta_riuscito() {
+        let riepilogo = RispostaTool::riuscito(format!(
+            "3 servizi controllati, 1 giu': {} porta 24806 muta",
+            nexus_types::tool_outcome::TOOL_FAILURE_PREFIX
+        ));
+        let out = map_result_to_outcome("c", riepilogo);
+        assert!(
+            !out.is_error,
+            "chi RIPORTA un fallimento non lo sta DICHIARANDO come proprio"
+        );
+    }
 
     // ── map_result_to_outcome (punto unico esito) ─────────────────────────────
 
@@ -191,7 +241,9 @@ mod tests {
     fn esito_successo_con_exit_code_zero() {
         let out = map_result_to_outcome(
             "call_1",
-            "hints\nEXIT CODE: 0\nSTDOUT:\nok\nSTDERR:\n".to_string(),
+            RispostaTool::da_testo_legacy(
+                "hints\nEXIT CODE: 0\nSTDOUT:\nok\nSTDERR:\n".to_string(),
+            ),
         );
         assert_eq!(out.tool_call_id, "call_1");
         assert!(!out.is_error);
@@ -203,7 +255,10 @@ mod tests {
 
     #[test]
     fn esito_comando_fallito_exit_code_non_zero() {
-        let out = map_result_to_outcome("c", "EXIT CODE: 1\nSTDERR:\nboom".to_string());
+        let out = map_result_to_outcome(
+            "c",
+            RispostaTool::da_testo_legacy("EXIT CODE: 1\nSTDERR:\nboom".to_string()),
+        );
         // exit_code != 0: errore di comando, propagato strutturato.
         assert_eq!(out.exit_code, Some(1));
         // NB: un exit_code != 0 NON marca is_error (quello e' il marker U+274C):
@@ -213,7 +268,10 @@ mod tests {
 
     #[test]
     fn esito_errore_applicativo_marker() {
-        let out = map_result_to_outcome("c", "\u{274C} Tool 'pippo' non esiste".to_string());
+        let out = map_result_to_outcome(
+            "c",
+            RispostaTool::da_testo_legacy("\u{274C} Tool 'pippo' non esiste".to_string()),
+        );
         assert!(out.is_error, "marker U+274C -> is_error");
         // tool non-comando: nessun exit_code.
         assert_eq!(out.exit_code, None);
@@ -224,7 +282,10 @@ mod tests {
 
     #[test]
     fn esito_tool_non_comando_nessun_exit_code() {
-        let out = map_result_to_outcome("c", "contenuto del file letto".to_string());
+        let out = map_result_to_outcome(
+            "c",
+            RispostaTool::da_testo_legacy("contenuto del file letto".to_string()),
+        );
         assert!(!out.is_error);
         assert_eq!(out.exit_code, None, "tool non-comando -> exit_code None");
     }

@@ -1550,8 +1550,48 @@ if [[ -n "$contratto_ricopiato" ]]; then
   printf '%s' "$contratto_ricopiato" >&2
   echo "   Chiama nexus_types::tool_outcome::is_tool_failure(risultato)." >&2
   fail=1
+else
+  echo "OK contratto-fallimento-tool: nessun call site ricopia la condizione del marker"
+fi
+
+# L'esito di un tool sta in un CAMPO, non nel testo (2026-08-01, regola Q)
+#
+# `RispostaTool` porta `esito`/`exit_code` accanto al testo, e il ponte
+# `da_testo_legacy` e' l'UNICO punto autorizzato a ricostruirli dalla stringa —
+# finche' i tool non sono tutti migrati. Il marker in testa a una stringa e' un
+# campo travestito da prosa: `is_tool_failure` guarda la testa, e due
+# composizioni legittime del repo vi anteponevano prosa di successo, lasciando
+# l'apparato anti-loop della firma "servizio non in ascolto" irraggiungibile per
+# costruzione. Nessun test poteva accorgersene, perche' il contratto non era un
+# tipo.
+assert_single "risposta-tool-ponte-legacy" 'fn da_testo_legacy\('   'crates/nexus-types/src/tool_outcome.rs' crates
+
+# Il guard che conta: nessun CONSUMATORE decide l'esito rileggendo il testo di
+# una RispostaTool. Il campo c'e': leggerlo dalla stringa e' tornare al difetto
+# con il tipo giusto in mano. Esclusi commenti e test (dove costruire il caso
+# legacy e' la fixture legittima).
+# Le sole righe di CODICE fino a `#[cfg(test)]`: in un test asserire che un
+# tool migrato NON scriva il marker e' la fixture che PROVA il contratto, non
+# una violazione (stessa forma del guard sopra).
+esito_dal_testo=""
+for f in $(grep -rlE --include='*.rs' --exclude-dir=target     'is_tool_failure\(&?[a-z_]+\.testo' crates 2>/dev/null); do
+  hit="$(awk '
+    /^#\[cfg\(test\)\]/ { exit }
+    /^[[:space:]]*\/\// { next }
+    /is_tool_failure\(&?[a-z_]+\.testo/ { print NR ": " $0 }
+  ' "$f" || true)"
+  [[ -n "$hit" ]] && esito_dal_testo+="  $f"$'
+'"$hit"$'
+'
+done
+if [ -n "$esito_dal_testo" ]; then
+  echo "!! risposta-tool-esito-dal-campo: un consumatore rilegge il testo per" >&2
+  echo "   sapere com'e' andata, avendo il campo a disposizione:" >&2
+  printf '%s' "$esito_dal_testo" >&2
+  echo "   Usa risposta.esito.e_fallito() (regola Q)." >&2
+  fail=1
 else
-  echo "OK contratto-fallimento-tool: nessun call site ricopia la condizione del marker"
+  echo "OK risposta-tool-esito-dal-campo: l'esito si legge dal campo"
 fi
 
 # Il corpo che parte da un endpoint OpenAI-compat nasce in UN punto (2026-07-30)

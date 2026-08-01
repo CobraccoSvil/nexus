@@ -21,7 +21,24 @@ use super::{
 
 /// Esegue un tool per conto dell'agente.
 /// Ritorna sempre una stringa: il risultato in caso di successo, o un messaggio d'errore.
-pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Value) -> String {
+/// Esegue un tool agente e ne restituisce la risposta con l'esito in un CAMPO
+/// (regola Q): il testo e' testo, `esito` ed `exit_code` sono dati.
+///
+/// I tool non ancora migrati ritornano `String` e passano dal ponte
+/// [`RispostaTool::da_testo_legacy`], che ricostruisce l'esito dal marker: e'
+/// l'UNICO punto autorizzato a farlo, ed e' debito dichiarato. Un tool migrato
+/// costruisce la propria `RispostaTool` e non passa di li'.
+pub async fn execute_agent_tool(
+    ctx: &AgentToolContext,
+    name: &str,
+    input: &Value,
+) -> nexus_types::tool_outcome::RispostaTool {
+    esegui_tool_legacy(ctx, name, input).await.into()
+}
+
+/// Il dispatch dei tool che ancora ritornano `String`. Sparisce quando l'ultimo
+/// tool e' migrato; finche' esiste, e' la superficie che il ponte deve coprire.
+async fn esegui_tool_legacy(ctx: &AgentToolContext, name: &str, input: &Value) -> String {
     match name {
         "read_file" => files::tool_read_file(ctx, input).await,
         "read_file_lines" => files::tool_read_file_lines(ctx, input).await,
@@ -257,7 +274,11 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
-                return Box::pin(execute_agent_tool(ctx, inner_tool, &inner_args)).await;
+                // Ricorsione DENTRO il dispatch legacy: qui si resta nel mondo
+                // testuale, il ponte lo applica una volta sola l'ingresso
+                // pubblico. Passare da `execute_agent_tool` significherebbe
+                // ricostruire l'esito e poi buttarlo via.
+                return Box::pin(esegui_tool_legacy(ctx, inner_tool, &inner_args)).await;
             }
             crate::nexus_builtin::execute_with_neural(
                 &ctx.db,
@@ -324,12 +345,14 @@ mod tests {
         let ctx = ctx_for_dispatch_tests(dir.path().to_path_buf());
         let out = execute_agent_tool(&ctx, "run_tests", &serde_json::json!({})).await;
         assert!(
-            !out.contains("non esiste"),
-            "run_tests caduto nel fallback del dispatcher: {out}"
+            !out.testo.contains("non esiste"),
+            "run_tests caduto nel fallback del dispatcher: {}",
+            out.testo
         );
         assert!(
-            out.contains("impossibile rilevare il comando test"),
-            "output inatteso da tool_run_tests: {out}"
+            out.testo.contains("impossibile rilevare il comando test"),
+            "output inatteso da tool_run_tests: {}",
+            out.testo
         );
     }
 
@@ -378,8 +401,9 @@ mod tests {
         // dispatcher la risposta sarebbe "Tool ... non esiste" col marker di
         // errore, e questa asserzione fallirebbe.
         assert!(
-            out.contains("target_dir 'cartella_che_non_esiste' non esiste nel progetto"),
-            "atteso l'errore del tool sul target_dir, non il fallback del dispatcher: {out}"
+            out.testo.contains("target_dir 'cartella_che_non_esiste' non esiste nel progetto"),
+            "atteso l'errore del tool sul target_dir, non il fallback del dispatcher: {}",
+            out.testo
         );
     }
 
@@ -395,16 +419,19 @@ mod tests {
         let ctx = ctx_for_dispatch_tests(dir.path().to_path_buf());
         let out = execute_agent_tool(&ctx, "tool_che_non_esiste", &serde_json::json!({})).await;
         assert!(
-            out.contains("non esiste"),
-            "fallback atteso, ottenuto: {out}"
+            out.testo.contains("non esiste"),
+            "fallback atteso, ottenuto: {}",
+            out.testo
         );
         assert!(
-            out.trim_start().starts_with('\u{274C}'),
-            "GAP1: l'errore tool-not-found deve iniziare col marker U+274C: {out}"
+            out.esito.e_fallito(),
+            "GAP1: un tool inesistente e' un FALLIMENTO dichiarato nel campo: {}",
+            out.testo
         );
         assert!(
-            out.contains("nexus_mcp_tool_search"),
-            "GAP3: nudge a tool_search sempre presente: {out}"
+            out.testo.contains("nexus_mcp_tool_search"),
+            "GAP3: nudge a tool_search sempre presente: {}",
+            out.testo
         );
     }
 
@@ -423,12 +450,14 @@ mod tests {
         )
         .await;
         assert!(
-            out.trim_start().starts_with('\u{274C}'),
-            "GAP1: nexus_* inesistente deve produrre is_error path (marker U+274C): {out}"
+            out.esito.e_fallito(),
+            "GAP1: un nexus_* inesistente e' un fallimento dichiarato nel campo: {}",
+            out.testo
         );
         assert!(
-            !out.contains("non riconosciuto"),
-            "il vecchio messaggio senza marker non deve piu' comparire: {out}"
+            !out.testo.contains("non riconosciuto"),
+            "il vecchio messaggio senza marker non deve piu' comparire: {}",
+            out.testo
         );
     }
 
@@ -440,12 +469,14 @@ mod tests {
         let ctx = ctx_for_dispatch_tests(dir.path().to_path_buf());
         let out = execute_agent_tool(&ctx, "read_fil", &serde_json::json!({})).await;
         assert!(
-            out.trim_start().starts_with('\u{274C}'),
-            "marker atteso: {out}"
+            out.esito.e_fallito(),
+            "fallimento atteso nel campo esito: {}",
+            out.testo
         );
         assert!(
-            out.contains("read_file"),
-            "GAP2: 'read_fil' deve suggerire read_file: {out}"
+            out.testo.contains("read_file"),
+            "GAP2: 'read_fil' deve suggerire read_file: {}",
+            out.testo
         );
     }
 }

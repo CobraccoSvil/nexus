@@ -1456,7 +1456,8 @@ mod tests {
             // strutturati (non piu' il testo) misurerebbero un doppio che non
             // si comporta come l'originale.
             Ok(crate::agent_graph_adapter::tool_executor::map_result_to_outcome(
-                &call.id, content,
+                &call.id,
+                nexus_types::tool_outcome::RispostaTool::da_testo_legacy(content),
             ))
         }
     }

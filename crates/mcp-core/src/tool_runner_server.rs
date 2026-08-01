@@ -386,10 +386,10 @@ impl ToolRunner for ToolRunnerService {
 
         let result = execute_agent_tool(&ctx, &req.tool_name, &input).await;
 
-        // execute_agent_tool codifica l'errore come stringa che inizia
-        // con il carattere '❌'. Lo mappiamo su is_error=true (punto unico
-        // `tool_result_is_error`, riusato dall'adapter ToolExecutor del grafo).
-        let is_error = tool_result_is_error(&result);
+        // L'esito arriva dal CAMPO della risposta (regola Q): il testo non
+        // viene riletto per sapere com'e' andata. Per i tool ancora legacy il
+        // campo l'ha ricostruito il ponte all'ingresso del dispatch.
+        let is_error = result.esito.e_fallito();
         let duration_ms = started.elapsed().as_millis() as u64;
 
         // Coerenza cache dopo mutazione (incidente Beauty-Book 2026-06-11): un
@@ -418,7 +418,7 @@ impl ToolRunner for ToolRunnerService {
             let db = self.deps.db.clone();
             let tool_name = req.tool_name.clone();
             let args_for_cache = input.clone();
-            let payload = result.clone();
+            let payload = result.testo.clone();
             let ttl = cache_cfg.ttl_seconds;
             tokio::spawn(async move {
                 if let Err(e) = crate::agent_tool_result_cache::store(
@@ -435,10 +435,10 @@ impl ToolRunner for ToolRunnerService {
             });
         }
 
-        let exit_code = extract_exit_code(&result);
+        let exit_code = result.exit_code;
         Ok(Response::new(ExecuteToolResponse {
             tool_use_id: req.tool_use_id,
-            tool_result_json: result,
+            tool_result_json: result.testo,
             is_error,
             duration_ms,
             has_exit_code: exit_code.is_some(),
@@ -479,7 +479,7 @@ impl ToolRunner for ToolRunnerService {
                 .send(Ok(ToolChunk {
                     tool_use_id: tool_use_id.clone(),
                     kind: "final".to_string(),
-                    data: result,
+                    data: result.testo,
                     ts_ms,
                 }))
                 .await;
