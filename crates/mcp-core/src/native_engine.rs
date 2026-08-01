@@ -2429,11 +2429,18 @@ async fn build_native_engine(
         // finge una radice.
         Err(_) => None,
     };
-    let criteria_adapter = Arc::new(FinalGateCriteriaRunnerAdapter::new(
-        tools.clone(),
-        run_db.clone(),
-        criteria_root,
-    ));
+    // Il progetto della sessione arriva fin qui perche' il criterio
+    // `run_command` possa DELEGARE una suite di test al punto unico della
+    // verifica (memoria per stato del codice + classificazione del rosso non
+    // riprodotto). Senza, il gate resterebbe il terzo esecutore cieco.
+    let criteria_adapter = {
+        let adapter =
+            FinalGateCriteriaRunnerAdapter::new(tools.clone(), run_db.clone(), criteria_root);
+        Arc::new(match session_project.as_ref() {
+            Some((pid, _)) => adapter.con_progetto(db.clone(), *pid),
+            None => adapter,
+        })
+    };
     let criteria: Arc<dyn CriteriaRunner> = criteria_adapter.clone();
 
     // Misura del progresso fra un rimando in correzione e il successivo. Senza,

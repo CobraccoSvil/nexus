@@ -137,6 +137,29 @@ export function promptFromPlaywrightRun(run: PlaywrightRunSummary): string {
     .join("\n");
 }
 
+/** Prompt per un run classificato `flaky`: i test falliti sono ripassati alla
+ *  riesecuzione mirata a codice invariato, quindi il difetto sta nel TEST (o
+ *  nelle sue attese sull'ambiente), non nell'applicazione. Il prompt lo dice
+ *  esplicitamente perche' e' esattamente l'errore misurato: un rosso instabile
+ *  letto come difetto reale mandava il correttore a modificare codice sano. */
+export function promptFromFlakyPlaywrightRun(run: PlaywrightRunSummary): string {
+  const instabili = Array.isArray(run.flakyTests) ? run.flakyTests : [];
+  return [
+    operativePreamble(),
+    header("warn", "Test Playwright instabili (flaky)"),
+    "",
+    `- Run: ${run.label}`,
+    run.createdAt ? `- Quando: ${new Date(run.createdAt).toLocaleString()}` : undefined,
+    instabili.length > 0 ? `- Test instabili: ${instabili.join(", ")}` : undefined,
+    "",
+    "Questi test sono falliti alla prima esecuzione e sono RIPASSATI alla riesecuzione mirata, con lo stesso identico stato del codice e dei servizi: e' instabilita' del test, non un difetto dell'applicazione.",
+    "",
+    "Richiesta: rendi stabili questi test intervenendo sui test stessi e sulle loro attese (attese esplicite sullo stato della pagina invece di timeout fissi, setup/teardown, dipendenze dall'ordine di esecuzione, prontezza del servizio prima del primo passo). NON modificare la logica dell'applicazione per farli passare: la resa dell'app e' gia' corretta su questo stato del codice.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
 /** Fix M17: porta dev preferita per Playwright/UI runner.
  * Allineamento con pick_dev_port di crates/mcp-core/src/nexus_tools/test_playwright.rs:25.
  * - Cerca label che CONTIENE uno dei keyword dev (non solo equals)

@@ -47,11 +47,16 @@ export interface PlaywrightRunSummary {
   label: string;
   status: string;
   summary?: string;
-  /** Esito strutturato (regola M): "passed" | "tests_failed" | "setup_failed".
-   *  Assente sui run precedenti al fix (nessun retrofit dello storico). */
-  outcome?: "passed" | "tests_failed" | "setup_failed" | string;
+  /** Esito strutturato (regola M/N): "passed" | "flaky" | "tests_failed" |
+   *  "setup_failed". Assente sui run precedenti al fix (nessun retrofit dello
+   *  storico). `flaky` = fallito alla prima esecuzione e ripassato alla
+   *  riesecuzione mirata a codice invariato: debito di TEST, non difetto
+   *  dell'app. */
+  outcome?: "passed" | "flaky" | "tests_failed" | "setup_failed" | string;
   /** Ultima riga di errore del runner, valorizzata solo per outcome "setup_failed". */
   failureCause?: string;
+  /** Nomi dei test instabili, valorizzati solo per outcome "flaky". */
+  flakyTests?: string[];
   createdAt: string;
   updatedAt?: string;
   artifacts?: PlaywrightArtifact[];

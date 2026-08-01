@@ -81,6 +81,13 @@ pub struct FinalGateCriteriaRunnerAdapter {
     /// `file_exists` non puo' guardare, e lo DICHIARA
     /// ([`EsistenzaFile::NonInterrogabile`]) invece di rispondere "non esiste".
     run_root: Option<PathBuf>,
+    /// Pool META + progetto della sessione: servono al PUNTO UNICO della
+    /// verifica a suite ([`crate::suite_verification`]), a cui il criterio
+    /// `run_command` delega quando il comando dello step e' una suite
+    /// Playwright. `None` = sessione senza progetto: il criterio esegue come un
+    /// comando qualunque (nessuna memoria, nessuna classificazione), che e' il
+    /// comportamento storico.
+    progetto: Option<(PgPool, Uuid)>,
 }
 
 impl FinalGateCriteriaRunnerAdapter {
@@ -97,7 +104,123 @@ impl FinalGateCriteriaRunnerAdapter {
             db,
             http_client: reqwest::Client::new(),
             run_root,
+            progetto: None,
         }
+    }
+
+    /// Aggancia il progetto della sessione: e' cio' che permette al criterio
+    /// `run_command` di DELEGARE una suite di test al punto unico della
+    /// verifica invece di eseguirla per conto proprio. Senza, il gate resta il
+    /// terzo esecutore cieco agli altri due.
+    pub fn con_progetto(mut self, meta_db: PgPool, project_id: Uuid) -> Self {
+        self.progetto = Some((meta_db, project_id));
+        self
+    }
+
+    /// Se il comando dello step e' una suite di test, la verifica passa dal
+    /// punto unico: memoria degli esiti per stato del codice e classificazione
+    /// del rosso non riprodotto.
+    ///
+    /// `None` = non e' una suite, o manca cio' che serve per delegare
+    /// (progetto, radice del run): il criterio esegue come prima. `Some(Err)` =
+    /// delegata e NON riuscita: il criterio fallisce dichiarandolo, senza
+    /// rilanciare la suite per conto proprio — un ripiego che rieseguisse
+    /// rimetterebbe in piedi il terzo esecutore, e dopo un timeout
+    /// raddoppierebbe anche l'attesa.
+    async fn verifica_suite_delegata(
+        &self,
+        cmd: &str,
+        working_dir: Option<&str>,
+        timeout_s: f64,
+    ) -> Option<Result<crate::suite_verification::SuiteVerification, String>> {
+        if !crate::suite_verification::e_suite_playwright(cmd) {
+            return None;
+        }
+        let (meta_db, project_id) = self.progetto.clone()?;
+        let run_root = self.run_root.clone()?;
+
+        let env = crate::agent_tools::testing::SuiteEnv {
+            meta_db: meta_db.clone(),
+            project_id,
+            root: run_root.clone(),
+            // Il gate non ha un consumatore SSE agganciato: la riga `jobs` si
+            // scrive comunque, ed e' quella a rendere l'esecuzione del gate
+            // visibile nel pannello (prima non lo era affatto).
+            playwright_channels: None,
+            project_channels: None,
+        };
+        let deps = crate::agent_tools::testing::suite_deps(env, run_root).await;
+        let inv = crate::suite_verification::SuiteInvocation::suite(
+            cmd,
+            working_dir.map(str::to_string),
+            // I criteri comando del gate portano il timeout dei BUILD (180s di
+            // default): per una suite E2E e' un'interruzione, non una verifica.
+            // Si prende il piu' largo fra i due (punto unico del tetto).
+            (timeout_s.max(1.0) as u64).max(crate::suite_verification::TIMEOUT_SUITE_DEFAULT_S),
+        );
+        Some(deps.verifica(&inv).await)
+    }
+
+    /// Traduce l'esito della verifica a suite nel verdetto del criterio.
+    ///
+    /// `flaky` PASSA: e' la decisione centrale del presidio — un rosso non
+    /// riprodotto a codice invariato non e' un difetto dell'app, e bocciare il
+    /// gate per quello e' cio' che mandava il correttore a modificare codice
+    /// sano. Passa DICHIARANDOLO: l'evidence porta l'esito canonico e i nomi
+    /// dei test instabili, cosi' il debito resta visibile invece di sparire in
+    /// un verde.
+    fn evidenza_suite(
+        cmd: &str,
+        esito: Result<crate::suite_verification::SuiteVerification, String>,
+        baseline_exit: Option<i64>,
+    ) -> (bool, Value) {
+        let v = match esito {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    false,
+                    json!({
+                        "command": cmd,
+                        "error": format!("verifica a suite non riuscita: {e}"),
+                        "verdict": format!("La suite non ha prodotto un esito: {e}"),
+                    }),
+                )
+            }
+        };
+        // Delta-aware sui criteri (invariato dal ramo generico): una suite che
+        // falliva GIA' con lo stesso exit code sull'albero pre-lavoro e' debito
+        // del progetto, non una regressione di questo run. Senza questo ramo la
+        // delega avrebbe introdotto proprio la bocciatura che il gate
+        // delta-aware esiste per evitare.
+        let preesistente = v.outcome.blocca_la_chiusura()
+            && baseline_exit.is_some_and(|b| b != 0 && v.exit_code.map(i64::from) == Some(b));
+        let passed = !v.outcome.blocca_la_chiusura() || preesistente;
+        // L'output di una suite e' lungo: il gate ne espone quanto ne espone di
+        // un build fallito (`build_output_max_chars`), non i 600 caratteri del
+        // criterio generico, altrimenti l'agente vedrebbe la sola coda.
+        const MAX_OUTPUT_SUITE: usize = 4000;
+        let excerpt = truncate_chars(&v.testo, MAX_OUTPUT_SUITE);
+        (
+            passed,
+            json!({
+                "command": cmd,
+                "exit_code": v.exit_code,
+                "suite_outcome": v.outcome.as_str(),
+                "suite_origine": match &v.origine {
+                    crate::suite_verification::OrigineEsito::Eseguita => "eseguita",
+                    crate::suite_verification::OrigineEsito::Memoria { .. } => "memoria",
+                },
+                "flaky_tests": v.test_instabili,
+                "passed_tests": v.stats.passed,
+                "failed_tests": v.stats.failed,
+                "output_excerpt": excerpt,
+                "output_total_chars": v.testo.chars().count(),
+                "output_truncated": v.testo.chars().count() > MAX_OUTPUT_SUITE,
+                "baseline_exit_code": baseline_exit,
+                "preexisting_bootstrap": preesistente,
+                "verdict": verdetto_suite(&v, preesistente),
+            }),
+        )
     }
 
     /// Esegue un tool via il PUNTO UNICO [`ToolExecutor`] e ritorna il suo esito
@@ -320,8 +443,22 @@ task_complete (outcome + summary)"
         if cmd.is_empty() {
             return (false, json!({ "error": "spec.command obbligatorio" }));
         }
+        let working_dir = spec.get("working_dir").and_then(Value::as_str);
+
+        // Una suite di test NON e' un comando qualunque: il suo esito vale per
+        // lo stato del codice su cui e' girata, e un rosso non riprodotto non e'
+        // un difetto. Delega al punto unico (regola L) — il gate era il terzo
+        // esecutore, e non riconosceva l'esito degli altri due.
+        if let Some(esito) = self
+            .verifica_suite_delegata(cmd, working_dir, _timeout_s)
+            .await
+        {
+            let baseline = spec.get("baseline_exit_code").and_then(Value::as_i64);
+            return Self::evidenza_suite(cmd, esito, baseline);
+        }
+
         let mut tool_input = json!({ "command": cmd });
-        if let Some(wd) = spec.get("working_dir").and_then(Value::as_str) {
+        if let Some(wd) = working_dir {
             tool_input["working_dir"] = json!(wd);
         }
         // Delega al ToolExecutor. Un guasto di porta -> evidence.error (parita'
@@ -895,6 +1032,21 @@ enum EsistenzaFile {
     NonInterrogabile { motivo: String },
 }
 
+/// Verdetto testuale del criterio-suite: la dichiarazione del punto unico, piu'
+/// la nota sul fallimento pre-esistente quando e' quello a farlo passare (senza,
+/// l'evidence direbbe "fallita" accanto a un criterio superato).
+fn verdetto_suite(v: &crate::suite_verification::SuiteVerification, preesistente: bool) -> String {
+    if preesistente {
+        format!(
+            "{} La suite falliva GIA' con lo stesso exit code sull'albero pre-lavoro: \
+             debito del progetto, non una regressione di questo run.",
+            v.dichiarazione()
+        )
+    } else {
+        v.dichiarazione()
+    }
+}
+
 /// Interroga il FILESYSTEM sull'esistenza di `path`, relativo alla radice del run.
 ///
 /// Il percorso si risolve con [`nexus_types::workspace_paths::resolve_workspace_target`]
@@ -935,6 +1087,100 @@ async fn interroga_esistenza(run_root: Option<&Path>, path: &str) -> EsistenzaFi
         Err(e) => EsistenzaFile::NonInterrogabile {
             motivo: format!("filesystem non interrogabile: {e}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod verdetto_suite_tests {
+    use super::*;
+    use crate::suite_verification::{
+        OrigineEsito, SuiteOutcome, SuiteStats, SuiteVerification,
+    };
+
+    fn verifica(outcome: SuiteOutcome, exit: Option<i32>) -> SuiteVerification {
+        SuiteVerification {
+            outcome,
+            origine: OrigineEsito::Eseguita,
+            stats: SuiteStats {
+                passed: 19,
+                failed: 2,
+                ..Default::default()
+            },
+            test_instabili: vec!["e2e/home.spec.ts:5:3".to_string()],
+            motivo_non_classificato: None,
+            exit_code: exit,
+            testo: "output".to_string(),
+            job_id: None,
+            state_key: Some("stato-A".to_string()),
+            suite_key: "app|playwright test".to_string(),
+        }
+    }
+
+    /// `flaky` PASSA il criterio: e' la decisione centrale del presidio. Se
+    /// bocciasse, il ciclo di correzione ripartirebbe su codice sano — il
+    /// difetto misurato il 31/07/2026.
+    #[test]
+    fn flaky_non_boccia_il_criterio_e_lo_dichiara() {
+        let (passed, ev) = FinalGateCriteriaRunnerAdapter::evidenza_suite(
+            "npx playwright test",
+            Ok(verifica(SuiteOutcome::Flaky, Some(1))),
+            None,
+        );
+        assert!(passed);
+        assert_eq!(ev["suite_outcome"], json!("flaky"));
+        assert_eq!(ev["flaky_tests"][0], json!("e2e/home.spec.ts:5:3"));
+    }
+
+    /// Un fallimento riprodotto boccia, come prima.
+    #[test]
+    fn tests_failed_boccia_il_criterio() {
+        let (passed, ev) = FinalGateCriteriaRunnerAdapter::evidenza_suite(
+            "npx playwright test",
+            Ok(verifica(SuiteOutcome::TestsFailed, Some(1))),
+            None,
+        );
+        assert!(!passed);
+        assert_eq!(ev["suite_outcome"], json!("tests_failed"));
+    }
+
+    /// Delta-aware: una suite che falliva GIA' con lo stesso exit code
+    /// sull'albero pre-lavoro e' debito del progetto, non una regressione di
+    /// questo run. Senza questo ramo la delega al punto unico avrebbe
+    /// introdotto proprio la bocciatura che il gate delta-aware evita.
+    #[test]
+    fn fallimento_identico_alla_baseline_non_boccia() {
+        let (passed, ev) = FinalGateCriteriaRunnerAdapter::evidenza_suite(
+            "npx playwright test",
+            Ok(verifica(SuiteOutcome::TestsFailed, Some(1))),
+            Some(1),
+        );
+        assert!(passed);
+        assert_eq!(ev["preexisting_bootstrap"], json!(true));
+        assert!(ev["verdict"].as_str().unwrap().contains("pre-lavoro"));
+    }
+
+    /// Baseline VERDE: il run ha rotto la suite, e va bocciato.
+    #[test]
+    fn baseline_verde_e_suite_rossa_boccia() {
+        let (passed, _) = FinalGateCriteriaRunnerAdapter::evidenza_suite(
+            "npx playwright test",
+            Ok(verifica(SuiteOutcome::TestsFailed, Some(1))),
+            Some(0),
+        );
+        assert!(!passed);
+    }
+
+    /// Una verifica che non ha prodotto esito (timeout, runner morto) fallisce
+    /// il criterio dichiarandolo: non si ripiega su una seconda esecuzione.
+    #[test]
+    fn verifica_non_riuscita_boccia_dichiarando() {
+        let (passed, ev) = FinalGateCriteriaRunnerAdapter::evidenza_suite(
+            "npx playwright test",
+            Err("Timeout dopo 600s".to_string()),
+            None,
+        );
+        assert!(!passed);
+        assert!(ev["error"].as_str().unwrap().contains("Timeout"));
     }
 }
 

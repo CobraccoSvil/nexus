@@ -114,6 +114,9 @@ mod settings;
 mod static_preview;
 mod sudo_manager;
 mod sudo_routes;
+/// Punto unico della verifica a suite: memoria degli esiti per stato del
+/// codice + classificazione del rosso non riprodotto.
+mod suite_verification;
 mod system_services;
 mod task_watchdog;
 #[cfg(test)]
