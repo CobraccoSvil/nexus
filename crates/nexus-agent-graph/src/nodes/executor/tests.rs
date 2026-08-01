@@ -2881,6 +2881,55 @@ async fn final_gate_nonconvergence_promuove_e_consuma_flag() {
 }
 
 #[tokio::test]
+async fn final_gate_nonconvergence_promuove_con_iterazioni_piene() {
+    // Il gate esaurisce `max_cycles` TARDI nel run per costruzione (ogni ciclo
+    // costa una batteria di criteri piu' il turno di correzione): promuovere a un
+    // modello piu' capace lasciandogli le sole iterazioni residue e' una
+    // promozione sulla carta. Misurato su bacheca-attivita (16 escalation da
+    // non-convergenza): le 4 scattate con >= 43 iterazioni gia' spese hanno
+    // prodotto ZERO scritture dopo la promozione, una di queste con zero
+    // iterazioni residue (run 431c9a3b, 60/60).
+    //
+    // MUTAZIONE: tornando a reset_iterations=false in
+    // gate_nonconvergenza_final_gate, out.iterations torna a Some(59)
+    // (iters_in + 1) e questo assert rosseggia.
+    let rc = Arc::new(StubRunControlStore::default());
+    let esc = Arc::new(StubEscalationPort::with_chain_tier(
+        &["claude-piu-capace"],
+        "heavy",
+    ));
+    let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone());
+    let mut extra = serde_json::Map::new();
+    extra.insert(crate::nodes::FINAL_GATE_ESCALATION_KEY.into(), json!(true));
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("crea x")],
+        stop_reason: Some(StopReason::ToolUse),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        iterations: Some(58),
+        extra,
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(
+        out.iterations,
+        Some(0),
+        "cicli di gate freschi senza iterazioni in cui spenderli sono una \
+         promozione sulla carta: il promosso riparte con un mandato pieno"
+    );
+    // La promozione e' comunque avvenuta: l'azzeramento non e' un ramo diverso.
+    assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
+    assert_eq!(
+        out.extra.get("auto_escalations").and_then(Value::as_i64),
+        Some(1),
+        "il backstop resta il NUMERO di promozioni, non il numero di iterazioni"
+    );
+}
+
+#[tokio::test]
 async fn escalation_nonconvergenza_payload_porta_from_model() {
     // REGRESSIONE (card "Mistral / ?"): il ramo di escalation per non-convergenza
     // del final_gate (maybe_escalate_nonconvergence) era il 4o emettitore di card

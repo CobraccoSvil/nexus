@@ -3487,6 +3487,25 @@ impl ExecutorNode {
     ///   - Some -> delta di promozione (sticky + reset contatori + budget del turno
     ///     azzerato + flag CONSUMATO dentro maybe_escalate_nonconvergence); il
     ///     modello promosso riparte con cicli di gate freschi.
+    ///
+    /// `reset_iterations = true` (01/08/2026): cicli di GATE freschi senza
+    /// ITERAZIONI in cui spenderli sono una promozione sulla carta. Il gate
+    /// esaurisce `max_cycles` TARDI nel run per costruzione — ogni ciclo costa
+    /// una batteria di criteri piu' il turno di correzione — quindi il promosso
+    /// ereditava `iters_in` gia' quasi al tetto. Misurato sul DB progetto
+    /// (bacheca-attivita, 16 escalation da non-convergenza): le 4 scattate con
+    /// >= 43 iterazioni gia' spese hanno prodotto ZERO scritture
+    /// (`edit_file`/`write_file`/`apply_patch`) dopo la promozione — una con
+    /// zero iterazioni residue (run `431c9a3b`, 60/60) — contro le 11 e le 2
+    /// scritture delle due scattate a iterazione 4. E' lo stesso difetto gia'
+    /// corretto per il gemello `gate_rimando_review_a_vuoto` (dd2f234e,
+    /// 31/07/2026) e per `SwitchReason::IterationCap`: la promozione e' un
+    /// NUOVO mandato (i criteri oggettivi falliti che il gate ha nominato), non
+    /// la prosecuzione di quello originale, e un mandato senza budget non e' un
+    /// mandato. Il backstop resta `max_escalations` (il numero di promozioni,
+    /// non il numero di iterazioni), quindi azzerare qui non apre alcun ciclo
+    /// infinito: dopo l'ultima promozione disponibile la catena e' esaurita e
+    /// questo stesso nodo chiude via [`Self::close_runaway`].
     ///   - None -> catena esaurita / tutti in cooldown (raro: il gate ha gia'
     ///     verificato auto_escalations < max, ma un cooldown puo' sopraggiungere):
     ///     chiusura FailedDiagnosed via il PUNTO UNICO [`Self::close_runaway`]
@@ -3507,7 +3526,7 @@ impl ExecutorNode {
                 iters_in,
                 SwitchReason::FinalGateNonconvergence,
                 ctx,
-                false,
+                true,
             )
             .await
         {
