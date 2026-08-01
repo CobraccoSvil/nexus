@@ -305,6 +305,49 @@ impl AgentRunStatus {
     }
 }
 
+/// Causa di un completamento "hollow" (l'agente dichiara di aver finito senza
+/// aver prodotto nulla di verificabile). Sono cause CUMULABILI: un turno puo'
+/// averle entrambe, e l'ordine di `BTreeSet` segue la dichiarazione qui sotto.
+///
+/// Identificatori canonici inglesi sul wire (regola N); il vocabolario STORICO
+/// della colonna `nexus_provider_empty_responses.kind` (mig 0291) resta invece
+/// maiuscolo ed e' composto da [`hollow_kind_for_db`]: la colonna ha righe
+/// scritte da anni, e cambiarne il vocabolario renderebbe incomparabili le vecchie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HollowCause {
+    /// Nessun corpo di risposta: il turno ha chiuso muto.
+    EmptyAnswer,
+    /// Nessun tool invocato, pur avendone di disponibili.
+    NoTools,
+}
+
+impl HollowCause {
+    /// Vocabolario della colonna `nexus_provider_empty_responses.kind`.
+    pub fn as_db_kind(self) -> &'static str {
+        match self {
+            Self::EmptyAnswer => "EMPTY_ANSWER",
+            Self::NoTools => "NO_TOOLS",
+        }
+    }
+}
+
+/// Testo del `kind` per la colonna storica `nexus_provider_empty_responses.kind`
+/// (mig 0291), COMPOSTO dalle cause tipizzate: `"EMPTY_ANSWER+NO_TOOLS"` per due
+/// cause, `"UNKNOWN"` per l'insieme vuoto. E' l'unico punto in cui quelle cause
+/// tornano a essere testo, e solo perche' la colonna e' un registro diagnostico
+/// gia' popolato: nessun consumatore decide su questa stringa.
+pub fn hollow_kind_for_db(causes: &std::collections::BTreeSet<HollowCause>) -> String {
+    if causes.is_empty() {
+        return "UNKNOWN".to_string();
+    }
+    causes
+        .iter()
+        .map(|c| c.as_db_kind())
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRunResult {
@@ -381,15 +424,20 @@ pub struct AgentRunResult {
     /// senza disabilitarlo globalmente, lasciandolo disponibile per i task chat.
     #[serde(default)]
     pub hollow_no_tools: bool,
-    /// Sottotipo specifico dell'hollow_completion per la diagnostica QW2:
-    /// "EMPTY_ANSWER" | "NO_TOOLS" | "EMPTY_ANSWER+NO_TOOLS" | "".
-    /// Vuoto se hollow_completion=false. Propagato dal caller (agent_turn_setup)
-    /// al persistente (chat_messages/agent_run) per il log in
-    /// `nexus_provider_empty_responses` (mig 0291). Il kind lessicale "RESIGNED"
-    /// e' stato rimosso (ADR 0018 fase 3): la rinuncia e' dichiarata dal modello
-    /// via task_complete (refusal/blocked, ADR 0034).
+    /// Cause STRUTTURATE del completamento hollow (vedi [`HollowCause`]). Vuoto
+    /// se `hollow_completion=false`, o se l'hollow non ha una causa dichiarata —
+    /// il non-saputo e' l'insieme vuoto, non una causa arbitraria.
+    ///
+    /// Era una `String` che impacchettava piu' cause concatenate con un `+`
+    /// ("EMPTY_ANSWER+NO_TOOLS"), e a valle il declassamento dello status del run
+    /// si decideva con un `contains("EMPTY_ANSWER")` su quella stringa: un
+    /// insieme travestito da testo, che costringeva ogni consumatore a ri-parsare
+    /// cio' che il produttore sapeva gia' in forma discreta. Il testo si compone
+    /// ora DAI campi, e solo dove serve davvero: la colonna storica
+    /// `nexus_provider_empty_responses.kind` (mig 0291) la scrive
+    /// [`hollow_kind_for_db`].
     #[serde(default)]
-    pub hollow_completion_kind: String,
+    pub hollow_causes: std::collections::BTreeSet<HollowCause>,
     /// Ragionamento (thinking) accumulato del run: concatenazione di tutti i
     /// `thinking_delta` emessi durante l'esecuzione. LIVE viaggia come evento SSE
     /// `agent_thinking` (volatile, perso al refresh); qui lo accumuliamo per

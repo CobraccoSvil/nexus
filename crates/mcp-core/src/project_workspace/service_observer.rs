@@ -1452,7 +1452,7 @@ async fn structural_reason(
     ports: &[u16],
 ) -> Option<&'static str> {
     let readiness_failed =
-        grace_ok && active == "active" && !ports.is_empty() && !any_port_listening(ports).await;
+        readiness_fallita(grace_ok, active, ports, any_port_listening(ports).await);
     if active == "failed" {
         Some("service_failed")
     } else if readiness_failed {
@@ -1509,22 +1509,37 @@ async fn detect_structural_failure(
     register_structural_problem(ctx, unit, problem).await;
 }
 
-/// Vero se almeno una delle porte attese e' in ascolto. Estratto da
-/// `run_cycle` per early-return leggibile.
+/// Predicato PURO della readiness TCP: il servizio e' giu' SOLO se si e'
+/// potuto osservare che nessuna delle porte attese e' in ascolto.
 ///
-/// Un solo interrogo del SO (`listening_ports`, punto unico regola L) per
+/// `ascolto == None` significa che il SO non ha risposto: da li' non si apre una
+/// diagnosi di crash. Il difetto era `!any_port_listening(..)`, che faceva del
+/// silenzio del SO una prova a carico — reason `port_not_listening`, diagnosi
+/// aperta, remediation innescata, tutto su un servizio sano.
+fn readiness_fallita(grace_ok: bool, active: &str, ports: &[u16], ascolto: Option<bool>) -> bool {
+    grace_ok && active == "active" && !ports.is_empty() && ascolto == Some(false)
+}
+
+/// Almeno una delle porte attese e' in ascolto? `None` = non si e' potuto
+/// chiedere (vedi [`ListenerScan`]). Estratto da `run_cycle` per early-return
+/// leggibile.
+///
+/// Un solo interrogo del SO (`scan_listening_ports`, punto unico regola L) per
 /// TUTTE le porte, invece di N connect mirati uno per porta: oltre a evitare
 /// N scansioni ridondanti della tabella TCP, copre entrambe le famiglie di
 /// indirizzo — un vecchio `tcp_probe` per porta (connect al solo
 /// `127.0.0.1`) dichiarava mute le porte in LISTEN solo su `[::1]`.
-async fn any_port_listening(ports: &[u16]) -> bool {
+///
+/// [`ListenerScan`]: crate::project_workspace::port_recovery::ListenerScan
+async fn any_port_listening(ports: &[u16]) -> Option<bool> {
+    // Nessuna porta attesa: niente da osservare, e nessun motivo di interrogare
+    // il SO. La risposta e' certa.
     if ports.is_empty() {
-        return false;
+        return Some(false);
     }
-    let listening = crate::project_workspace::port_recovery::listening_ports().await;
-    ports
-        .iter()
-        .any(|p| listening.iter().any(|(lp, _, _)| lp == p))
+    crate::project_workspace::port_recovery::scan_listening_ports()
+        .await
+        .qualcuno_ascolta(ports)
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
@@ -1737,6 +1752,36 @@ mod tests {
             readiness_grace_seconds: 12,
             anomaly_stale_resolve_seconds: 300,
         }
+    }
+
+    /// IL DIFETTO: una tabella dei listener non leggibile (`None`) apriva una
+    /// diagnosi di crash `port_not_listening` e innescava la remediation su un
+    /// servizio sano. Solo l'assenza OSSERVATA di listener e' un servizio giu'.
+    #[test]
+    fn senza_risposta_dal_so_il_servizio_non_e_dichiarato_giu() {
+        assert!(
+            !readiness_fallita(true, "active", &[24805], None),
+            "il silenzio del SO non e' la prova che nessuno ascolti"
+        );
+        assert!(
+            readiness_fallita(true, "active", &[24805], Some(false)),
+            "nessun listener OSSERVATO: il servizio e' giu'"
+        );
+        assert!(!readiness_fallita(true, "active", &[24805], Some(true)));
+    }
+
+    /// Le altre condizioni restano necessarie: prima del grace, con un servizio
+    /// non attivo o senza porte attese, non si parla di readiness.
+    #[test]
+    fn la_readiness_richiede_grace_servizio_attivo_e_porte() {
+        assert!(!readiness_fallita(false, "active", &[24805], Some(false)));
+        assert!(!readiness_fallita(
+            true,
+            "activating",
+            &[24805],
+            Some(false)
+        ));
+        assert!(!readiness_fallita(true, "active", &[], Some(false)));
     }
 
     #[test]

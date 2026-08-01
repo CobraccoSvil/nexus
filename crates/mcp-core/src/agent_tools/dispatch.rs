@@ -33,13 +33,40 @@ pub async fn execute_agent_tool(
     name: &str,
     input: &Value,
 ) -> nexus_types::tool_outcome::RispostaTool {
-    esegui_tool_legacy(ctx, name, input).await.into()
+    if let Some(risposta) = esegui_tool_migrato(ctx, name, input).await {
+        return risposta;
+    }
+    esegui_tool_legacy(ctx, name, input).await
+}
+
+/// I tool MIGRATI alla regola Q: costruiscono la propria [`RispostaTool`] e non
+/// passano dal ponte, perche' non c'e' nulla da ricostruire — l'esito e' gia' un
+/// campo. `None` = il nome non e' fra questi, decide il dispatch legacy.
+///
+/// E' un elenco che CRESCE di un nome a ogni tool migrato: quando copre tutto,
+/// spariscono insieme il dispatch legacy, il ponte e il marker.
+async fn esegui_tool_migrato(
+    ctx: &AgentToolContext,
+    name: &str,
+    input: &Value,
+) -> Option<nexus_types::tool_outcome::RispostaTool> {
+    match name {
+        // Lo stato d'uscita di un comando e' il dato su cui decidono il
+        // final_gate e la catena di verifica: viaggia nel campo `exit_code`,
+        // non nel testo "EXIT CODE: N" (che resta per il modello).
+        "run_command" => Some(command::tool_run_command(ctx, input).await),
+        _ => None,
+    }
 }
 
 /// Il dispatch dei tool che ancora ritornano `String`. Sparisce quando l'ultimo
 /// tool e' migrato; finche' esiste, e' la superficie che il ponte deve coprire.
-async fn esegui_tool_legacy(ctx: &AgentToolContext, name: &str, input: &Value) -> String {
-    match name {
+async fn esegui_tool_legacy(
+    ctx: &AgentToolContext,
+    name: &str,
+    input: &Value,
+) -> nexus_types::tool_outcome::RispostaTool {
+    let testo = match name {
         "read_file" => files::tool_read_file(ctx, input).await,
         "read_file_lines" => files::tool_read_file_lines(ctx, input).await,
         "write_file" => files::tool_write_file(ctx, input).await,
@@ -85,7 +112,6 @@ async fn esegui_tool_legacy(ctx: &AgentToolContext, name: &str, input: &Value) -
         "delete_file" => files::tool_delete_file(ctx, input).await,
         "rename_file" => files::tool_rename_file(ctx, input).await,
         "edit_file" => files::tool_edit_file(ctx, input).await,
-        "run_command" => command::tool_run_command(ctx, input).await,
         // Catena di verifica post-modifica (ADR 0019 L3): typecheck -> build ->
         // lint -> test con fail-fast e VerifyReport strutturato.
         "nexus_verify_change" => verify::tool_nexus_verify_change(ctx, input).await,
@@ -259,26 +285,32 @@ async fn esegui_tool_legacy(ctx: &AgentToolContext, name: &str, input: &Value) -
                     .unwrap_or("")
                     .trim();
                 if inner_tool.is_empty() {
-                    return serde_json::json!({
-                        "error": "tool_name richiesto per nexus_mcp_tool_call con server_id=builtin"
-                    })
-                    .to_string();
+                    return nexus_types::tool_outcome::RispostaTool::da_testo_legacy(
+                        serde_json::json!({
+                            "error": "tool_name richiesto per nexus_mcp_tool_call con server_id=builtin"
+                        })
+                        .to_string(),
+                    );
                 }
                 if inner_tool == "nexus_mcp_tool_call" {
-                    return serde_json::json!({
-                        "error": "ricorsione builtin -> builtin non permessa"
-                    })
-                    .to_string();
+                    return nexus_types::tool_outcome::RispostaTool::da_testo_legacy(
+                        serde_json::json!({
+                            "error": "ricorsione builtin -> builtin non permessa"
+                        })
+                        .to_string(),
+                    );
                 }
                 let inner_args = input
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
-                // Ricorsione DENTRO il dispatch legacy: qui si resta nel mondo
-                // testuale, il ponte lo applica una volta sola l'ingresso
-                // pubblico. Passare da `execute_agent_tool` significherebbe
-                // ricostruire l'esito e poi buttarlo via.
-                return Box::pin(esegui_tool_legacy(ctx, inner_tool, &inner_args)).await;
+                // Ricorsione dall'INGRESSO, non dal solo mondo legacy: per questa
+                // via il modello puo' invocare qualunque builtin, e un tool
+                // migrato deve arrivarci col proprio esito nei campi. Ripartire
+                // da `esegui_tool_legacy` lo lascerebbe fuori dal dispatch (il
+                // suo braccio non e' piu' li') e lo farebbe cadere nel fallback
+                // "tool non esiste".
+                return Box::pin(execute_agent_tool(ctx, inner_tool, &inner_args)).await;
             }
             crate::nexus_builtin::execute_with_neural(
                 &ctx.db,
@@ -319,7 +351,10 @@ async fn esegui_tool_legacy(ctx: &AgentToolContext, name: &str, input: &Value) -
             )
             .await
         }
-    }
+    };
+    // Il ponte, in un punto solo: l'esito di un tool legacy si legge dal marker
+    // che ha scritto nel proprio testo, perche' altro canale non ne ha.
+    nexus_types::tool_outcome::RispostaTool::da_testo_legacy(testo)
 }
 
 #[cfg(test)]
@@ -352,6 +387,41 @@ mod tests {
         assert!(
             out.testo.contains("impossibile rilevare il comando test"),
             "output inatteso da tool_run_tests: {}",
+            out.testo
+        );
+    }
+
+    /// La ricorsione di `nexus_mcp_tool_call` riparte dall'INGRESSO, non dal solo
+    /// mondo legacy.
+    ///
+    /// Il braccio di un tool MIGRATO non vive piu' dentro `esegui_tool_legacy`:
+    /// ripartire da li' lo lascerebbe fuori dal dispatch e lo farebbe cadere nel
+    /// fallback "tool non esiste" — cioe' il modello, chiamando un builtin per
+    /// questa via, riceverebbe un errore inventato invece dell'esito del tool.
+    /// E' il difetto gia' accaduto due volte in questa catena, qui in una terza
+    /// forma: non un braccio dimenticato, ma un braccio irraggiungibile da una
+    /// sola porta d'ingresso.
+    ///
+    /// MUTAZIONE: rimettendo `esegui_tool_legacy` al posto di
+    /// `execute_agent_tool` nella ricorsione, questo test rosseggia con
+    /// "Tool 'run_command' non esiste".
+    #[tokio::test]
+    async fn la_ricorsione_del_mcp_tool_call_raggiunge_i_tool_migrati() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = ctx_for_dispatch_tests(dir.path().to_path_buf());
+        let out = execute_agent_tool(
+            &ctx,
+            "nexus_mcp_tool_call",
+            &serde_json::json!({
+                "server_id": "builtin",
+                "tool_name": "run_command",
+                "arguments": { "command": "" },
+            }),
+        )
+        .await;
+        assert!(
+            !out.testo.contains("non esiste"),
+            "un tool migrato non e' raggiungibile dalla ricorsione: {}",
             out.testo
         );
     }

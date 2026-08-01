@@ -7,8 +7,9 @@
 //! profilo non e' disponibile il tool lo dichiara con esito strutturato,
 //! senza comandi generici di ripiego.
 //!
-//! Esito STRUTTURATO (regola M): ogni step riporta `exit_code` (punto unico
-//! `tool_runner_server::extract_exit_code`) + `build_errors` (punto unico
+//! Esito STRUTTURATO (regole M e Q): ogni step riporta `exit_code` — il CAMPO
+//! della `RispostaTool` che `run_command` restituisce, non un numero ri-estratto
+//! dal suo testo — piu' `build_errors` (punto unico
 //! `nexus_agent_graph::count_build_errors`, stessa coppia dei criteri del
 //! final_gate); il consumatore legge `passed`/`first_failure`, mai la prosa.
 //!
@@ -190,13 +191,13 @@ pub(super) async fn tool_nexus_verify_change(ctx: &AgentToolContext, input: &Val
             .timeout_s
             .map(|t| t.max(1.0) as u64)
             .unwrap_or(step_timeout_s);
-        let raw = match tokio::time::timeout(
+        let risposta = match tokio::time::timeout(
             std::time::Duration::from_secs(effective_timeout_s),
             super::command::tool_run_command(ctx, &tool_input),
         )
         .await
         {
-            Ok(s) => s,
+            Ok(r) => r,
             Err(_) => {
                 passed = false;
                 first_failure = Some(step);
@@ -215,9 +216,18 @@ pub(super) async fn tool_nexus_verify_change(ctx: &AgentToolContext, input: &Val
         };
         let duration_ms = started.elapsed().as_millis() as u64;
 
-        // Esito STRUTTURATO: exit_code dal punto unico + rete build_errors
-        // (exit 0 bugiardo di certi bundler, stessa coppia del final_gate).
-        let exit_code = crate::tool_runner_server::extract_exit_code(&raw);
+        // Esito STRUTTURATO: exit_code dal CAMPO della risposta (regola Q) +
+        // rete build_errors (exit 0 bugiardo di certi bundler, stessa coppia del
+        // final_gate). Ri-estrarlo dal testo, com'era, faceva dipendere l'esito
+        // dello step dal primo "EXIT CODE:" che comparisse nella stringa —
+        // compreso quello di un hint scritto in `nexus_command_hints`.
+        let exit_code = risposta.exit_code;
+        // Il tool ha DICHIARATO di non aver potuto eseguire (comando rifiutato,
+        // probe scaduto, spawn fallito): non c'e' exit code perche' non c'e'
+        // stata esecuzione, ed e' un'informazione diversa da "eseguito senza
+        // stato d'uscita". Il report la espone invece di appiattirla su un null.
+        let invocation_failed = risposta.esito.e_fallito();
+        let raw = risposta.testo;
         let build_errors = nexus_agent_graph::count_build_errors(&raw);
         let step_ok = exit_code == Some(0) && build_errors == 0;
         if !step_ok {
@@ -231,6 +241,7 @@ pub(super) async fn tool_nexus_verify_change(ctx: &AgentToolContext, input: &Val
             "command_source": resolved.source,
             "passed": step_ok,
             "exit_code": exit_code,
+            "invocation_failed": invocation_failed,
             "build_errors": build_errors,
             "duration_ms": duration_ms,
             "output_excerpt": excerpt,

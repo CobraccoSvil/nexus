@@ -150,7 +150,7 @@ pub async fn tool_ui_layout_patterns(db: &PgPool, input: &Value) -> String {
 
     let patterns = match load_patterns(db, app_type).await {
         Ok(p) => p,
-        Err(e) => return json!({ "error": e.to_string() }).to_string(),
+        Err(e) => return crate::errore_json(e.to_string()),
     };
 
     if patterns.is_empty() {

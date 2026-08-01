@@ -174,7 +174,7 @@ pub fn is_provider_in_cooldown(provider: &str) -> bool {
 /// chiamate esclusivamente dai rami billing/auth/budget (Long) e dai rami
 /// transient (Short) — chi chiama sa gia' quale dei due sta invocando.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CooldownSeverity {
+pub enum CooldownSeverity {
     /// Persistente (billing/quota/credito/auth/budget): il recovery e' del
     /// loop dedicato, mai del probe periodico generico.
     Long,
@@ -614,9 +614,34 @@ pub fn put_provider_in_short_cooldown(provider: &str, reason: &str, duration_sec
 /// Esposto al frontend via `cooldown_snapshot()` → reason mostrato nel LED tooltip.
 static PROVIDER_COOLDOWN_REASONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
-/// Snapshot di tutti i provider attualmente in cooldown.
-/// Returns: vec di (provider_name, remaining_seconds, reason)
-pub fn cooldown_snapshot() -> Vec<(String, u64, Option<String>)> {
+/// Una riga dello snapshot dei cooldown attivi.
+///
+/// La `reason` e' testo per l'umano (display, log, tooltip): non e' un criterio.
+/// Cio' su cui si DECIDE e' [`CooldownEntry::severity`], la severita' REGISTRATA
+/// da chi il cooldown lo ha messo. Prima lo snapshot portava solo la terna
+/// `(provider, secondi, reason)` e ogni consumatore che avesse bisogno di sapere
+/// "e' un cooldown di credito?" era COSTRETTO a ri-classificare quel testo con le
+/// stesse 4 sottostringhe inglesi (`credit`/`quota`/`billing`/`balance`) che
+/// questo modulo aveva gia' sostituito con un registro tipizzato: la
+/// classificazione esisteva, ma non usciva dalla porta.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CooldownEntry {
+    pub provider: String,
+    pub remaining_seconds: u64,
+    /// Motivo per l'umano. Riempito liberamente dai produttori, anche in
+    /// italiano: mai un segnale su cui decidere (regola M/Q).
+    pub reason: Option<String>,
+    /// `None` = severita' NON registrata. E' una variante, non un ripiego
+    /// comodo: significa che il cooldown esiste ma nessuna delle funzioni che
+    /// lo classificano lo ha creato, e chi legge deve trattarlo come ignoto,
+    /// non come transiente.
+    pub severity: Option<CooldownSeverity>,
+}
+
+/// Snapshot di tutti i provider attualmente in cooldown, con la severita'
+/// REGISTRATA. Lettore autoritativo dei tre registri (scadenze, motivi,
+/// severita'): [`cooldown_snapshot`] ne e' la proiezione a tre campi.
+pub fn cooldown_snapshot_entries() -> Vec<CooldownEntry> {
     let store = match PROVIDER_COOLDOWN.get() {
         Some(s) => s,
         None => return Vec::new(),
@@ -626,16 +651,32 @@ pub fn cooldown_snapshot() -> Vec<(String, u64, Option<String>)> {
         Err(_) => return Vec::new(),
     };
     let reasons = PROVIDER_COOLDOWN_REASONS.get().and_then(|s| s.lock().ok());
+    let severities = PROVIDER_COOLDOWN_SEVERITY.get().and_then(|s| s.lock().ok());
     let now = std::time::Instant::now();
     let mut out = Vec::new();
     for (name, &until) in map.iter() {
         if until > now {
-            let secs = (until - now).as_secs().max(1);
-            let reason = reasons.as_ref().and_then(|r| r.get(name).cloned());
-            out.push((name.clone(), secs, reason));
+            out.push(CooldownEntry {
+                provider: name.clone(),
+                remaining_seconds: (until - now).as_secs().max(1),
+                reason: reasons.as_ref().and_then(|r| r.get(name).cloned()),
+                severity: severities.as_ref().and_then(|s| s.get(name).copied()),
+            });
         }
     }
     out
+}
+
+/// Proiezione a tre campi di [`cooldown_snapshot_entries`], per i consumatori
+/// che della severita' non hanno bisogno (elenchi, LED, esclusioni per nome).
+/// Chi deve DECIDERE in base alla natura del cooldown usa la forma completa: qui
+/// il campo che porta il criterio e' assente per costruzione, quindi nessuno puo'
+/// essere tentato di ricavarlo dalla `reason`.
+pub fn cooldown_snapshot() -> Vec<(String, u64, Option<String>)> {
+    cooldown_snapshot_entries()
+        .into_iter()
+        .map(|e| (e.provider, e.remaining_seconds, e.reason))
+        .collect()
 }
 
 /// Ripristina un cooldown (billing) da un timestamp letto da Redis dopo riavvio.

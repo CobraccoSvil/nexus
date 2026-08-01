@@ -65,19 +65,19 @@ pub async fn tool_nexus_extract_pdf_text(ctx: &ToolContextCore, input: &Value) -
         .and_then(|s| Uuid::parse_str(s).ok())
     {
         Some(id) => id,
-        None => return json!({ "error": "Parametro 'attachment_id' obbligatorio." }).to_string(),
+        None => return crate::errore_json("Parametro 'attachment_id' obbligatorio."),
     };
     let page_start = input.get("page_start").and_then(Value::as_u64);
     let page_end = input.get("page_end").and_then(Value::as_u64);
 
     let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
         Ok(r) => r,
-        Err(e) => return json!({ "error": e }).to_string(),
+        Err(e) => return crate::errore_json(e),
     };
 
     let bytes = match tokio::fs::read(&record.file_path).await {
         Ok(b) => b,
-        Err(e) => return json!({ "error": format!("read fallita: {e}") }).to_string(),
+        Err(e) => return crate::errore_json(format!("read fallita: {e}")),
     };
 
     let result =
@@ -85,8 +85,8 @@ pub async fn tool_nexus_extract_pdf_text(ctx: &ToolContextCore, input: &Value) -
 
     match result {
         Ok(Ok(v)) => v.to_string(),
-        Ok(Err(e)) => json!({ "error": e }).to_string(),
-        Err(e) => json!({ "error": format!("spawn_blocking fallita: {e}") }).to_string(),
+        Ok(Err(e)) => crate::errore_json(e),
+        Err(e) => crate::errore_json(format!("spawn_blocking fallita: {e}")),
     }
 }
 
@@ -154,24 +154,24 @@ pub async fn tool_nexus_extract_docx_text(ctx: &ToolContextCore, input: &Value) 
         .and_then(|s| Uuid::parse_str(s).ok())
     {
         Some(id) => id,
-        None => return json!({ "error": "Parametro 'attachment_id' obbligatorio." }).to_string(),
+        None => return crate::errore_json("Parametro 'attachment_id' obbligatorio."),
     };
 
     let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
         Ok(r) => r,
-        Err(e) => return json!({ "error": e }).to_string(),
+        Err(e) => return crate::errore_json(e),
     };
 
     let bytes = match tokio::fs::read(&record.file_path).await {
         Ok(b) => b,
-        Err(e) => return json!({ "error": format!("read fallita: {e}") }).to_string(),
+        Err(e) => return crate::errore_json(format!("read fallita: {e}")),
     };
 
     let result = tokio::task::spawn_blocking(move || extract_docx(&bytes)).await;
     match result {
         Ok(Ok(v)) => v.to_string(),
-        Ok(Err(e)) => json!({ "error": e }).to_string(),
-        Err(e) => json!({ "error": format!("spawn_blocking fallita: {e}") }).to_string(),
+        Ok(Err(e)) => crate::errore_json(e),
+        Err(e) => crate::errore_json(format!("spawn_blocking fallita: {e}")),
     }
 }
 
@@ -244,7 +244,7 @@ pub async fn tool_nexus_extract_xlsx_data(ctx: &ToolContextCore, input: &Value) 
         .and_then(|s| Uuid::parse_str(s).ok())
     {
         Some(id) => id,
-        None => return json!({ "error": "Parametro 'attachment_id' obbligatorio." }).to_string(),
+        None => return crate::errore_json("Parametro 'attachment_id' obbligatorio."),
     };
     let sheet_name = input
         .get("sheet_name")
@@ -253,18 +253,18 @@ pub async fn tool_nexus_extract_xlsx_data(ctx: &ToolContextCore, input: &Value) 
 
     let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
         Ok(r) => r,
-        Err(e) => return json!({ "error": e }).to_string(),
+        Err(e) => return crate::errore_json(e),
     };
 
     let bytes = match tokio::fs::read(&record.file_path).await {
         Ok(b) => b,
-        Err(e) => return json!({ "error": format!("read fallita: {e}") }).to_string(),
+        Err(e) => return crate::errore_json(format!("read fallita: {e}")),
     };
     let result = tokio::task::spawn_blocking(move || extract_xlsx(&bytes, sheet_name)).await;
     match result {
         Ok(Ok(v)) => v.to_string(),
-        Ok(Err(e)) => json!({ "error": e }).to_string(),
-        Err(e) => json!({ "error": format!("spawn_blocking fallita: {e}") }).to_string(),
+        Ok(Err(e)) => crate::errore_json(e),
+        Err(e) => crate::errore_json(format!("spawn_blocking fallita: {e}")),
     }
 }
 

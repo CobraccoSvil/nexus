@@ -972,15 +972,10 @@ pub async fn tool_ui_styling_audit(ctx: &ToolContextCore, input: &Value) -> Stri
         .unwrap_or(".");
     let root = match nexus_types::workspace_paths::normalize_into_root(&ctx.root_path, target_rel) {
         Ok(clean) => ctx.root_path.join(&clean),
-        Err(e) => {
-            return json!({ "error": format!("target_dir non valido: {}", e.message()) }).to_string()
-        }
+        Err(e) => return crate::errore_json(format!("target_dir non valido: {}", e.message())),
     };
     if !root.is_dir() {
-        return json!({
-            "error": format!("target_dir '{target_rel}' non esiste nel progetto")
-        })
-        .to_string();
+        return crate::errore_json(format!("target_dir '{target_rel}' non esiste nel progetto"));
     }
 
     let voc = load_vocabulary(&ctx.db).await;

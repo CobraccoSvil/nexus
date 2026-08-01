@@ -105,7 +105,7 @@ struct SearchParams {
 fn parse_search_params(input: &Value) -> Result<SearchParams, String> {
     let query = match input.get("query").and_then(|v| v.as_str()) {
         Some(q) if !q.trim().is_empty() => q.trim().to_string(),
-        _ => return Err(json!({"error": "query mancante o vuota"}).to_string()),
+        _ => return Err(crate::errore_json("query mancante o vuota")),
     };
     let top_k = input
         .get("top_k")
@@ -188,7 +188,7 @@ async fn knowledge_search_summary(ctx: &ToolContextCore, top_k: usize) -> String
     .await;
     let rows = match rows {
         Ok(r) => r,
-        Err(e) => return json!({"error": format!("DB cluster query: {e}")}).to_string(),
+        Err(e) => return crate::errore_json(format!("DB cluster query: {e}")),
     };
     let (clusters, total) = cluster_rows_to_json(&rows);
     json!({
@@ -208,7 +208,7 @@ async fn knowledge_search_hits(
 ) -> Result<Vec<(Uuid, f32)>, String> {
     let vector = match ctx.embedder.embed_text("", embed_slice(&p.query)).await {
         Ok(v) => v,
-        Err(e) => return Err(json!({"error": format!("embed fallito: {e}")}).to_string()),
+        Err(e) => return Err(crate::errore_json(format!("embed fallito: {e}"))),
     };
     let hits = match nexus_wiki::content_points::search_wiki_content_points_filtered(
         &ctx.db,
@@ -220,7 +220,7 @@ async fn knowledge_search_hits(
     .await
     {
         Ok(h) => h,
-        Err(e) => return Err(json!({"error": format!("search Qdrant fallita: {e}")}).to_string()),
+        Err(e) => return Err(crate::errore_json(format!("search Qdrant fallita: {e}"))),
     };
     Ok(hits
         .iter()
@@ -274,7 +274,7 @@ async fn knowledge_search_render(
     .await
     {
         Ok(r) => r,
-        Err(e) => return Err(json!({"error": format!("DB query: {e}")}).to_string()),
+        Err(e) => return Err(crate::errore_json(format!("DB query: {e}"))),
     };
 
     let mut by_id: std::collections::HashMap<Uuid, Value> = std::collections::HashMap::new();
@@ -338,7 +338,7 @@ pub async fn tool_knowledge_search(ctx: &ToolContextCore, input: &Value) -> Stri
 pub async fn tool_code_doc(ctx: &ToolContextCore, input: &Value) -> String {
     let file_path = match input.get("file_path").and_then(|v| v.as_str()) {
         Some(p) if !p.trim().is_empty() => p.trim(),
-        _ => return json!({"error": "file_path mancante o vuoto"}).to_string(),
+        _ => return crate::errore_json("file_path mancante o vuoto"),
     };
 
     let row = sqlx::query(
@@ -369,7 +369,7 @@ pub async fn tool_code_doc(ctx: &ToolContextCore, input: &Value) -> String {
             "message": "Nessuna documentazione (code_doc) per questo file. Prova knowledge_search per contesto correlato."
         })
         .to_string(),
-        Err(e) => json!({ "error": format!("query fallita: {e}") }).to_string(),
+        Err(e) => crate::errore_json(format!("query fallita: {e}")),
     }
 }
 
@@ -415,7 +415,7 @@ pub async fn tool_knowledge_get_note(ctx: &ToolContextCore, input: &Value) -> St
         .and_then(|s| Uuid::parse_str(s).ok())
     {
         Some(id) => id,
-        None => return json!({"error": "note_id mancante o non UUID valido"}).to_string(),
+        None => return crate::errore_json("note_id mancante o non UUID valido"),
     };
 
     let row = match sqlx::query(
@@ -432,8 +432,8 @@ pub async fn tool_knowledge_get_note(ctx: &ToolContextCore, input: &Value) -> St
     .await
     {
         Ok(Some(r)) => r,
-        Ok(None) => return json!({"error": "nota non trovata o non accessibile"}).to_string(),
-        Err(e) => return json!({"error": format!("DB: {e}")}).to_string(),
+        Ok(None) => return crate::errore_json("nota non trovata o non accessibile"),
+        Err(e) => return crate::errore_json(format!("DB: {e}")),
     };
 
     knowledge_note_json(note_id, &row).to_string()
@@ -462,7 +462,7 @@ fn parse_create_note_params(input: &Value) -> Result<CreateNoteParams, String> {
         .filter(|s| !s.is_empty() && s.len() <= 200)
     {
         Some(t) => t.to_string(),
-        None => return Err(json!({"error": "title mancante o invalido (1-200 char)"}).to_string()),
+        None => return Err(crate::errore_json("title mancante o invalido (1-200 char)")),
     };
     let body_md = match input
         .get("body_md")
@@ -471,7 +471,7 @@ fn parse_create_note_params(input: &Value) -> Result<CreateNoteParams, String> {
         .filter(|s| !s.is_empty())
     {
         Some(b) => b.to_string(),
-        None => return Err(json!({"error": "body_md mancante"}).to_string()),
+        None => return Err(crate::errore_json("body_md mancante")),
     };
     let intent = input
         .get("intent")
@@ -547,7 +547,7 @@ async fn insert_note_doc(
     .bind(&p.tags)
     .fetch_one(&*ctx.db)
     .await;
-    doc_row.map_err(|e| json!({"error": format!("scrittura wiki_docs fallita: {e}")}).to_string())
+    doc_row.map_err(|e| crate::errore_json(format!("scrittura wiki_docs fallita: {e}")))
 }
 
 /// Embedding + upsert Qdrant del doc (best-effort). Ritorna `true` se il punto
@@ -599,7 +599,7 @@ pub async fn tool_knowledge_create_note(ctx: &ToolContextCore, input: &Value) ->
     // Slug derivato dal title (slugify minimal: lowercase + replace).
     let slug = nexus_wiki::vault::slugify(&params.title);
     if slug.is_empty() {
-        return json!({"error": "title non genera slug valido"}).to_string();
+        return crate::errore_json("title non genera slug valido");
     }
     let body_hash = nexus_wiki::vault::sha256_hex(&params.body_md);
 
@@ -715,11 +715,11 @@ pub async fn tool_knowledge_get_links(ctx: &ToolContextCore, input: &Value) -> S
         .and_then(|s| Uuid::parse_str(s).ok())
     {
         Some(id) => id,
-        None => return json!({"error": "note_id mancante o non UUID valido"}).to_string(),
+        None => return crate::errore_json("note_id mancante o non UUID valido"),
     };
 
     if !note_in_project(ctx, note_id).await {
-        return json!({"error": "nota non trovata nel progetto corrente"}).to_string();
+        return crate::errore_json("nota non trovata nel progetto corrente");
     }
 
     let out = links_to_json(&load_directional_links(ctx, note_id, true).await);
@@ -797,7 +797,7 @@ async fn resolve_subgraph_seed(
     {
         let vector = match ctx.embedder.embed_text("", embed_slice(q)).await {
             Ok(v) => v,
-            Err(e) => return Err(json!({"error": format!("embed fallito: {e}")}).to_string()),
+            Err(e) => return Err(crate::errore_json(format!("embed fallito: {e}"))),
         };
         let hits = nexus_wiki::content_points::search_wiki_content_points_filtered(
             &ctx.db,
@@ -823,7 +823,7 @@ async fn resolve_subgraph_seed(
         nodes.push(id);
     } else {
         return Err(
-            json!({"error": "serve 'query' (testo) oppure 'note_id' (UUID) come seed"}).to_string(),
+            crate::errore_json("serve 'query' (testo) oppure 'note_id' (UUID) come seed"),
         );
     }
     Ok(nodes)
@@ -992,7 +992,7 @@ fn parse_create_link_params(input: &Value) -> Result<CreateLinkParams, String> {
         .and_then(|s| Uuid::parse_str(s).ok())
     {
         Some(id) => id,
-        None => return Err(json!({"error": "from_note_id mancante o non UUID valido"}).to_string()),
+        None => return Err(crate::errore_json("from_note_id mancante o non UUID valido")),
     };
     let to = match input
         .get("to_note_id")
@@ -1000,18 +1000,19 @@ fn parse_create_link_params(input: &Value) -> Result<CreateLinkParams, String> {
         .and_then(|s| Uuid::parse_str(s).ok())
     {
         Some(id) => id,
-        None => return Err(json!({"error": "to_note_id mancante o non UUID valido"}).to_string()),
+        None => return Err(crate::errore_json("to_note_id mancante o non UUID valido")),
     };
     if from == to {
-        return Err(json!({"error": "self-link non ammesso (from == to)"}).to_string());
+        return Err(crate::errore_json("self-link non ammesso (from == to)"));
     }
     let rel_input = match input.get("rel_type").and_then(|v| v.as_str()) {
         Some(r) if KNOWLEDGE_REL_TYPES.contains(&r) => r.to_string(),
         Some(r) => {
-            return Err(json!({"error": format!("rel_type '{r}' non valido; ammessi: {KNOWLEDGE_REL_TYPES:?}")})
-                .to_string())
+            return Err(crate::errore_json(format!(
+                "rel_type '{r}' non valido; ammessi: {KNOWLEDGE_REL_TYPES:?}"
+            )))
         }
-        None => return Err(json!({"error": "rel_type mancante"}).to_string()),
+        None => return Err(crate::errore_json("rel_type mancante")),
     };
     let rel_wiki = map_rel_to_wiki(&rel_input);
     let confidence = input
@@ -1053,8 +1054,7 @@ pub async fn tool_knowledge_create_link(ctx: &ToolContextCore, input: &Value) ->
     };
 
     if !both_docs_accessible(ctx, p.from, p.to).await {
-        return json!({"error": "una o entrambe le note non esistono nel progetto corrente"})
-            .to_string();
+        return crate::errore_json("una o entrambe le note non esistono nel progetto corrente");
     }
 
     // wiki_links: PK = (from_doc_id, to_doc_id, rel_type). ON CONFLICT update
@@ -1086,7 +1086,7 @@ pub async fn tool_knowledge_create_link(ctx: &ToolContextCore, input: &Value) ->
         // "INSERT" qui e' il prefisso di un messaggio d'errore diagnostico, non
         // una query costruita per interpolazione: la INSERT sopra e' interamente
         // parametrizzata via .bind(). Il messaggio evita la keyword SQL letterale.
-        Err(e) => json!({"error": format!("creazione link fallita: {e}")}).to_string(),
+        Err(e) => crate::errore_json(format!("creazione link fallita: {e}")),
     }
 }
 
@@ -1104,11 +1104,11 @@ pub async fn tool_knowledge_set_relevance(ctx: &ToolContextCore, input: &Value) 
         .and_then(|s| Uuid::parse_str(s).ok())
     {
         Some(id) => id,
-        None => return json!({"error": "note_id mancante o non UUID valido"}).to_string(),
+        None => return crate::errore_json("note_id mancante o non UUID valido"),
     };
     let off_topic = match input.get("off_topic").and_then(|v| v.as_bool()) {
         Some(b) => b,
-        None => return json!({"error": "off_topic (bool) mancante"}).to_string(),
+        None => return crate::errore_json("off_topic (bool) mancante"),
     };
     let new_lock = if off_topic { "frozen" } else { "none" };
 
@@ -1132,11 +1132,11 @@ pub async fn tool_knowledge_set_relevance(ctx: &ToolContextCore, input: &Value) 
             "off_topic": off_topic,
         })
         .to_string(),
-        Ok(_) => json!({"error": "nota non trovata nel progetto corrente"}).to_string(),
+        Ok(_) => crate::errore_json("nota non trovata nel progetto corrente"),
         // "UPDATE" qui e' il prefisso di un messaggio d'errore diagnostico, non
         // una query costruita per interpolazione: la UPDATE sopra e' interamente
         // parametrizzata via .bind(). Il messaggio evita la keyword SQL letterale.
-        Err(e) => json!({"error": format!("aggiornamento rilevanza fallito: {e}")}).to_string(),
+        Err(e) => crate::errore_json(format!("aggiornamento rilevanza fallito: {e}")),
     }
 }
 
@@ -1335,14 +1335,13 @@ fn parse_import_graph_input(input: &Value) -> Result<ImportGraphInput, String> {
         Some(f) if !f.trim().is_empty() => f.trim().to_lowercase(),
         _ => {
             return Err(
-                json!({"error": "parametro 'format' obbligatorio (json | mermaid | dot)"})
-                    .to_string(),
+                crate::errore_json("parametro 'format' obbligatorio (json | mermaid | dot)"),
             )
         }
     };
     let content = match input.get("content").and_then(|v| v.as_str()) {
         Some(c) if !c.trim().is_empty() => c.to_string(),
-        _ => return Err(json!({"error": "parametro 'content' obbligatorio"}).to_string()),
+        _ => return Err(crate::errore_json("parametro 'content' obbligatorio")),
     };
     let source_id = input
         .get("source_id")
@@ -1393,7 +1392,7 @@ fn parse_graph_payload(
 ) -> Result<(Vec<Value>, Vec<Value>), String> {
     let payload: Value = match serde_json::from_str(content) {
         Ok(v) => v,
-        Err(e) => return Err(json!({"error": format!("JSON invalido: {e}")}).to_string()),
+        Err(e) => return Err(crate::errore_json(format!("JSON invalido: {e}"))),
     };
     let nodes_in = payload
         .get("nodes")
@@ -1406,12 +1405,11 @@ fn parse_graph_payload(
         .cloned()
         .unwrap_or_default();
     if nodes_in.is_empty() {
-        return Err(json!({"error": "nessun nodo trovato nel grafo"}).to_string());
+        return Err(crate::errore_json("nessun nodo trovato nel grafo"));
     }
     if nodes_in.len() > max_nodes {
         return Err(
-            json!({"error": format!("troppi nodi: {} > max {}", nodes_in.len(), max_nodes)})
-                .to_string(),
+            crate::errore_json(format!("troppi nodi: {} > max {}", nodes_in.len(), max_nodes)),
         );
     }
     Ok((nodes_in, edges_in))
@@ -1425,18 +1423,16 @@ pub async fn tool_knowledge_import_graph(ctx: &ToolContextCore, input: &Value) -
 
     let cfg = load_graph_import_config(ctx).await;
     if !cfg.enabled {
-        return json!({"error": "import grafi disabilitato (knowledge.graph_import_enabled=false)"})
-            .to_string();
+        return crate::errore_json(
+            "import grafi disabilitato (knowledge.graph_import_enabled=false)",
+        );
     }
     if args.format != "json" {
-        return json!({
-            "error": format!(
+        return crate::errore_json(format!(
                 "formato '{}' non supportato in questa versione (solo 'json' node-link). \
                  Mermaid/DOT richiedono il parser legacy `knowledge::graph_import` non ancora portato.",
                 args.format
-            )
-        })
-        .to_string();
+            ));
     }
 
     // Parsing JSON node-link minimo.

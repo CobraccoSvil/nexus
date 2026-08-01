@@ -57,10 +57,7 @@ pub async fn tool_nexus_describe_image_attachment(
     {
         Some(id) => id,
         None => {
-            return json!({
-                "error": "Parametro 'attachment_id' obbligatorio (UUID valido)."
-            })
-            .to_string();
+            return crate::errore_json("Parametro 'attachment_id' obbligatorio (UUID valido).");
         }
     };
     let question = input
@@ -72,44 +69,42 @@ pub async fn tool_nexus_describe_image_attachment(
     // 1) Lookup allegato (scoped al project_id corrente).
     let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
         Ok(r) => r,
-        Err(e) => return json!({ "error": e }).to_string(),
+        Err(e) => return crate::errore_json(e),
     };
 
     // 2) Inspect: deve essere image_*.
     let header = match read_header(&record.file_path).await {
         Ok(h) => h,
-        Err(e) => return json!({ "error": e }).to_string(),
+        Err(e) => return crate::errore_json(e),
     };
     let (kind, mime_reale, _ext) = detect_kind(&header, &record.file_name, &record.mime_type);
     if !is_image_kind(&kind) {
-        return json!({
+        return crate::errore_json_con_dettagli(json!({
             "error": format!(
                 "L'allegato non e' un'immagine (kind rilevato: '{}'). Usa il tool di estrazione corretto per quel kind.",
                 kind
             ),
             "kind": kind,
-        })
-        .to_string();
+        }));
     }
 
     // 3) Limite size dal DB (no fallback nascosto: default safe documentato).
     let max_bytes = image_max_bytes(&ctx.db).await;
     if record.size_bytes < 0 || (record.size_bytes as usize) > max_bytes {
-        return json!({
+        return crate::errore_json_con_dettagli(json!({
             "error": format!(
                 "Immagine troppo grande ({} byte, limite {} byte). Configura 'agent.attachment.image_max_bytes' in settings se devi alzare il limite.",
                 record.size_bytes, max_bytes
             ),
             "size_bytes": record.size_bytes,
             "max_bytes": max_bytes,
-        })
-        .to_string();
+        }));
     }
 
     // 4) Leggi e costruisci il data URI base64 (formato image_url del gateway).
     let bytes = match tokio::fs::read(&record.file_path).await {
         Ok(b) => b,
-        Err(e) => return json!({ "error": format!("read fallita: {e}") }).to_string(),
+        Err(e) => return crate::errore_json(format!("read fallita: {e}")),
     };
     let data_uri = format!("data:{};base64,{}", mime_reale, B64.encode(&bytes));
 
@@ -119,13 +114,10 @@ pub async fn tool_nexus_describe_image_attachment(
     let (provider, model) = match resolve_purpose_via_http(&ctx.db, VISION_PURPOSE).await {
         Ok(pm) => pm,
         Err(e) => {
-            return json!({
-                "error": format!(
+            return crate::errore_json(format!(
                     "modello vision non risolvibile (purpose '{VISION_PURPOSE}'): {e}. \
                      Verifica nexus_purpose_model.vision_describe (mig 0194)."
-                )
-            })
-            .to_string();
+                ));
         }
     };
 
@@ -150,10 +142,7 @@ pub async fn tool_nexus_describe_image_attachment(
     {
         Ok(r) => r,
         Err(e) => {
-            return json!({
-                "error": format!("chiamata vision via gateway fallita: {e}")
-            })
-            .to_string();
+            return crate::errore_json(format!("chiamata vision via gateway fallita: {e}"));
         }
     };
 

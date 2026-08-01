@@ -387,10 +387,9 @@ pub async fn tool_nexus_inspect_attachment(ctx: &ToolContextCore, input: &Value)
     let raw_id = match input.get("attachment_id").and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => s.trim(),
         _ => {
-            return json!({
-                "error": "Parametro 'attachment_id' obbligatorio (UUID valido o nome file)."
-            })
-            .to_string();
+            return crate::errore_json(
+                "Parametro 'attachment_id' obbligatorio (UUID valido o nome file).",
+            );
         }
     };
 
@@ -400,25 +399,23 @@ pub async fn tool_nexus_inspect_attachment(ctx: &ToolContextCore, input: &Value)
         match resolve_attachment_id_by_name(&ctx.db, raw_id, ctx.project_id, ctx.session_id).await {
             Ok(uuid) => uuid,
             Err(e) => {
-                return json!({
-                    "error": format!(
-                        "Impossibile risolvere attachment '{raw_id}': {e}. Passa l'UUID dell'allegato \
-                         (visibile nel blocco <allegati>) oppure il nome esatto del file."
-                    )
-                })
-                .to_string();
+                return crate::errore_json(format!(
+                    "Impossibile risolvere attachment '{raw_id}': {e}. Passa l'UUID \
+                     dell'allegato (visibile nel blocco <allegati>) oppure il nome esatto \
+                     del file."
+                ));
             }
         }
     };
 
     let record = match load_attachment(&ctx.db, resolved_id, ctx.project_id).await {
         Ok(r) => r,
-        Err(e) => return json!({ "error": e }).to_string(),
+        Err(e) => return crate::errore_json(e),
     };
 
     let header = match read_header(&record.file_path).await {
         Ok(h) => h,
-        Err(e) => return json!({ "error": e }).to_string(),
+        Err(e) => return crate::errore_json(e),
     };
 
     let (kind, mime_reale, ext_reale) = detect_kind(&header, &record.file_name, &record.mime_type);

@@ -552,8 +552,71 @@ async fn windows_service_unit_still_exists(db: &PgPool, project_id: Uuid, unit: 
 ///
 /// Le `manual` (riserve esplicite dell'utente) restano sempre. Ritorna il numero
 /// rilasciate.
+/// Vero se questa allocazione NON va rilasciata dal GC.
+///
+/// Le protezioni (listener vivo, riserva di un servizio fermo) dicono "questa
+/// allocazione e' viva, non toccarla": hanno senso solo per una riga che il
+/// progetto ha DIRITTO di avere, perche' applicarle a un artefatto significa
+/// proteggerlo proprio mentre fa danno. Il criterio era il range GLOBALE
+/// (20000-39999) e prendeva dentro il bucket di un ALTRO progetto: ora e'
+/// l'AUTORIZZAZIONE (punto unico, regola L) — nel proprio bucket, oppure allocata
+/// a mano. Le `manual` non arrivano nemmeno qui, escluse dalla query.
+async fn allocazione_da_preservare(
+    db: &PgPool,
+    project_id: Uuid,
+    porta: u16,
+    service_unit: Option<&str>,
+    scan: &crate::project_workspace::port_recovery::ListenerScan,
+) -> bool {
+    if !nexus_tool_kit::ports::port_authorized_for_project(db, &project_id, porta).await {
+        return false;
+    }
+    // Se qualcuno ascolta, e' in uso. La risposta viene dalla fotografia presa a
+    // inizio giro; `None` qui e' irraggiungibile (la guardia del chiamante ha
+    // gia' fermato tutto), ma resta trattato come "non toccare": e' il difetto
+    // che questo ramo evita.
+    if scan.ascolta(porta) != Some(false) {
+        return true;
+    }
+    // Riserva di un servizio configurato ma FERMO -> non e' orfana. Criterio
+    // platform-specifico:
+    //  - POSIX: il file unit esiste ancora e dichiara ANCORA questa porta.
+    //  - Windows: NON esiste alcun file unit. Segnale strutturato onesto (regola
+    //    M): esiste ancora una riga agent_processes (servizio installato) che
+    //    ricostruisce quell'unit? uninstall / clear-finished cancellano quelle
+    //    righe -> assenza = servizio rimosso = allocazione ORFANA da rilasciare.
+    //    Su errore DB TRANSITORIO si PRESERVA (fail-closed).
+    let Some(unit) = service_unit else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        windows_service_unit_still_exists(db, project_id, unit).await
+    }
+    #[cfg(not(windows))]
+    {
+        service_unit_reserves_port(unit, porta).await
+    }
+}
+
 pub async fn cleanup_orphaned_ports(db: &PgPool, grace_secs: i64) -> u64 {
     let grace = grace_secs.max(60);
+    // Una sola interrogazione del SO per l'intero giro (invece di una per riga):
+    // e' anche una fotografia COERENTE, cosi' due allocazioni non vengono
+    // giudicate su stati del sistema diversi.
+    //
+    // Se la tabella non si e' lasciata leggere non si cancella NIENTE: "nessuno
+    // ascolta" e "non ho potuto chiedere" portavano entrambi al DELETE, e il
+    // secondo rilascia le porte di servizi vivi. Un giro saltato costa al
+    // massimo qualche minuto di ritardo sul GC.
+    let scan = crate::project_workspace::port_recovery::scan_listening_ports().await;
+    if !scan.osservazione_avvenuta() {
+        tracing::warn!(
+            esito = %scan.descrizione(),
+            "port_gc: nessuna allocazione rilasciata in questo giro"
+        );
+        return 0;
+    }
     let rows: Vec<(Uuid, i32, Option<String>)> = sqlx::query_as(
         "SELECT project_id, port, service_unit FROM nexus_port_allocations \
          WHERE allocation_mode <> 'manual' AND created_at < NOW() - make_interval(secs => $1)",
@@ -566,47 +629,8 @@ pub async fn cleanup_orphaned_ports(db: &PgPool, grace_secs: i64) -> u64 {
     let mut released = 0u64;
     for (project_id, port, service_unit) in rows {
         let p = port as u16;
-        // Le protezioni qui sotto (listener vivo, riserva di un servizio fermo)
-        // dicono "questa allocazione e' viva, non toccarla". Hanno senso solo per
-        // una riga che il progetto ha DIRITTO di avere: applicarle a un artefatto
-        // significa proteggerlo proprio mentre fa danno.
-        //
-        // Il criterio era il range GLOBALE (20000-39999), e prendeva dentro anche
-        // le porte del bucket di un ALTRO progetto: una 5434 (Postgres, dove il
-        // servizio si CONNETTE) cadeva subito, ma una 20001 registrata al progetto
-        // sbagliato restava protetta finche' qualcuno ci ascoltava. Ora il criterio
-        // e' l'AUTORIZZAZIONE (punto unico, regola L): nel proprio bucket, oppure
-        // allocata a mano. Le `manual` non arrivano nemmeno qui, escluse dalla
-        // query. La chiusura alla fonte e' in `register_detected_port`.
-        if nexus_tool_kit::ports::port_authorized_for_project(db, &project_id, p).await {
-            // Se qualcuno ascolta sulla porta, e' in uso: non la tocchiamo.
-            if crate::project_workspace::port_recovery::port_listening(p).await {
-                continue;
-            }
-            // Riserva di un servizio configurato ma FERMO -> non e' orfana, va
-            // preservata (come le `manual`). Criterio platform-specifico:
-            //  - POSIX: il file unit esiste ancora e dichiara ANCORA questa porta.
-            //  - Windows: NON esiste alcun file unit. Segnale strutturato onesto
-            //    (regola M): esiste ancora una riga agent_processes (servizio
-            //    installato) che ricostruisce quell'unit? uninstall / clear-finished
-            //    cancellano quelle righe -> assenza = servizio rimosso = allocazione
-            //    ORFANA da rilasciare. Su errore DB TRANSITORIO si PRESERVA
-            //    (windows_service_unit_still_exists e' fail-closed).
-            if let Some(ref unit) = service_unit {
-                let reserved = {
-                    #[cfg(windows)]
-                    {
-                        windows_service_unit_still_exists(db, project_id, unit).await
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        service_unit_reserves_port(unit, p).await
-                    }
-                };
-                if reserved {
-                    continue;
-                }
-            }
+        if allocazione_da_preservare(db, project_id, p, service_unit.as_deref(), &scan).await {
+            continue;
         }
         let n = sqlx::query(
             "DELETE FROM nexus_port_allocations \

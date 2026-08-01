@@ -47,18 +47,18 @@ pub async fn tool_nexus_list_archive_entries(
     {
         Some(id) => id,
         None => {
-            return json!({ "error": "Parametro 'attachment_id' obbligatorio (UUID)." }).to_string()
+            return crate::errore_json("Parametro 'attachment_id' obbligatorio (UUID).")
         }
     };
 
     let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
         Ok(r) => r,
-        Err(e) => return json!({ "error": e }).to_string(),
+        Err(e) => return crate::errore_json(e),
     };
 
     let bytes = match tokio::fs::read(&record.file_path).await {
         Ok(b) => b,
-        Err(e) => return json!({ "error": format!("read fallita: {e}") }).to_string(),
+        Err(e) => return crate::errore_json(format!("read fallita: {e}")),
     };
 
     // Politica "mai troncare-e-buttare": elenca SEMPRE tutte le entry, nessun cap.
@@ -76,8 +76,8 @@ pub async fn tool_nexus_list_archive_entries(
 
     match result {
         Ok(Ok(v)) => v.to_string(),
-        Ok(Err(e)) => json!({ "error": e }).to_string(),
-        Err(e) => json!({ "error": format!("spawn_blocking fallita: {e}") }).to_string(),
+        Ok(Err(e)) => crate::errore_json(e),
+        Err(e) => crate::errore_json(format!("spawn_blocking fallita: {e}")),
     }
 }
 
@@ -152,11 +152,11 @@ pub async fn tool_nexus_read_archive_entry(ctx: &ToolContextCore, input: &Value)
         .and_then(|s| Uuid::parse_str(s).ok())
     {
         Some(id) => id,
-        None => return json!({ "error": "Parametro 'attachment_id' obbligatorio." }).to_string(),
+        None => return crate::errore_json("Parametro 'attachment_id' obbligatorio."),
     };
     let entry_path = match input.get("entry_path").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
-        _ => return json!({ "error": "Parametro 'entry_path' obbligatorio." }).to_string(),
+        _ => return crate::errore_json("Parametro 'entry_path' obbligatorio."),
     };
     let encoding_req = input
         .get("encoding")
@@ -164,17 +164,17 @@ pub async fn tool_nexus_read_archive_entry(ctx: &ToolContextCore, input: &Value)
         .unwrap_or("auto")
         .to_lowercase();
     if !matches!(encoding_req.as_str(), "auto" | "text" | "base64") {
-        return json!({ "error": "encoding deve essere uno di: auto|text|base64" }).to_string();
+        return crate::errore_json("encoding deve essere uno di: auto|text|base64");
     }
 
     let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
         Ok(r) => r,
-        Err(e) => return json!({ "error": e }).to_string(),
+        Err(e) => return crate::errore_json(e),
     };
 
     let bytes = match tokio::fs::read(&record.file_path).await {
         Ok(b) => b,
-        Err(e) => return json!({ "error": format!("read fallita: {e}") }).to_string(),
+        Err(e) => return crate::errore_json(format!("read fallita: {e}")),
     };
     // Politica "mai troncare-e-buttare": leggiamo l'INTERA entry, nessun cap.
     // FIX 2 (ADR 0012): deduplica via read_cache. La chiave usa una lunghezza
@@ -204,9 +204,9 @@ pub async fn tool_nexus_read_archive_entry(ctx: &ToolContextCore, input: &Value)
 
         let (payload, total_size) = match result {
             Ok(Ok(v)) => v,
-            Ok(Err(e)) => return json!({ "error": e }).to_string(),
+            Ok(Err(e)) => return crate::errore_json(e),
             Err(e) => {
-                return json!({ "error": format!("spawn_blocking fallita: {e}") }).to_string()
+                return crate::errore_json(format!("spawn_blocking fallita: {e}"))
             }
         };
 

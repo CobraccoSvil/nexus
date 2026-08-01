@@ -41,21 +41,19 @@ const OUTPUT_EXT: &str = "png";
 pub async fn tool_nexus_generate_image(ctx: &ToolContextCore, input: &Value) -> String {
     // 1) Permesso di scrittura obbligatorio: il tool PRODUCE un file su disco.
     if !ctx.can_write {
-        return json!({
-            "error": "Permesso di scrittura non concesso: impossibile salvare l'immagine \
-                      generata su disco. Esegui in una modalita' che consente la scrittura file."
-        })
-        .to_string();
+        return crate::errore_json(
+            "Permesso di scrittura non concesso: impossibile salvare l'immagine \
+             generata su disco. Esegui in una modalita' che consente la scrittura file.",
+        );
     }
 
     // 2) Prompt obbligatorio + parametri opzionali.
     let prompt = match input.get("prompt").and_then(Value::as_str).map(str::trim) {
         Some(p) if !p.is_empty() => p.to_string(),
         _ => {
-            return json!({
-                "error": "Parametro 'prompt' obbligatorio (descrizione testuale dell'immagine da generare)."
-            })
-            .to_string();
+            return crate::errore_json(
+                "Parametro 'prompt' obbligatorio (descrizione testuale dell'immagine da generare).",
+            );
         }
     };
     let size = input
@@ -76,14 +74,11 @@ pub async fn tool_nexus_generate_image(ctx: &ToolContextCore, input: &Value) -> 
     let (provider, model) = match resolve_purpose_via_http(&ctx.db, IMAGE_PURPOSE).await {
         Ok(pm) => pm,
         Err(e) => {
-            return json!({
-                "error": format!(
-                    "modello image-gen non risolvibile (purpose '{IMAGE_PURPOSE}'): {e}. \
-                     Verifica nexus_purpose_model.generate_image (mig 0478) e che un modello \
-                     image-gen sia abilitato nel catalog (mig 0479)."
-                )
-            })
-            .to_string();
+            return crate::errore_json(format!(
+                "modello image-gen non risolvibile (purpose '{IMAGE_PURPOSE}'): {e}. \
+                 Verifica nexus_purpose_model.generate_image (mig 0478) e che un modello \
+                 image-gen sia abilitato nel catalog (mig 0479)."
+            ));
         }
     };
 
@@ -109,10 +104,7 @@ pub async fn tool_nexus_generate_image(ctx: &ToolContextCore, input: &Value) -> 
     {
         Ok(r) => r,
         Err(e) => {
-            return json!({
-                "error": format!("generazione immagine via gateway fallita: {e}")
-            })
-            .to_string();
+            return crate::errore_json(format!("generazione immagine via gateway fallita: {e}"));
         }
     };
 
@@ -120,26 +112,24 @@ pub async fn tool_nexus_generate_image(ctx: &ToolContextCore, input: &Value) -> 
     //    URL temporanea, non possiamo salvare path-safe: errore esplicito (regola
     //    H: niente fetch nascosto di una URL esterna).
     let Some(b64) = result.b64_json.as_deref() else {
-        return json!({
+        return crate::errore_json_con_dettagli(json!({
             "error": "il provider ha restituito solo una URL temporanea, non l'immagine inline: \
                       impossibile salvarla nel progetto.",
             "image_url": result.url.unwrap_or_default(),
             "model_used": result.model_used,
-        })
-        .to_string();
+        }));
     };
     let bytes = match B64.decode(b64) {
         Ok(b) => b,
         Err(e) => {
-            return json!({ "error": format!("decodifica immagine base64 fallita: {e}") })
-                .to_string();
+            return crate::errore_json(format!("decodifica immagine base64 fallita: {e}"));
         }
     };
 
     // 6) Salva path-safe sotto la project_root.
     let (image_path, provider_used) = match save_image(&ctx.root_path, &bytes, filename).await {
         Ok(p) => (p, provider),
-        Err(e) => return json!({ "error": format!("salvataggio immagine fallito: {e}") }).to_string(),
+        Err(e) => return crate::errore_json(format!("salvataggio immagine fallito: {e}")),
     };
 
     json!({

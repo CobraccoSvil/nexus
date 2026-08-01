@@ -47,21 +47,19 @@ const OUTPUT_EXT: &str = "mp4";
 pub async fn tool_nexus_generate_video(ctx: &ToolContextCore, input: &Value) -> String {
     // 1) Permesso di scrittura obbligatorio: il tool PRODUCE un file su disco.
     if !ctx.can_write {
-        return json!({
-            "error": "Permesso di scrittura non concesso: impossibile salvare il video \
-                      generato su disco. Esegui in una modalita' che consente la scrittura file."
-        })
-        .to_string();
+        return crate::errore_json(
+            "Permesso di scrittura non concesso: impossibile salvare il video \
+             generato su disco. Esegui in una modalita' che consente la scrittura file.",
+        );
     }
 
     // 2) Prompt obbligatorio + parametri opzionali.
     let prompt = match input.get("prompt").and_then(Value::as_str).map(str::trim) {
         Some(p) if !p.is_empty() => p.to_string(),
         _ => {
-            return json!({
-                "error": "Parametro 'prompt' obbligatorio (descrizione testuale del video da generare)."
-            })
-            .to_string();
+            return crate::errore_json(
+                "Parametro 'prompt' obbligatorio (descrizione testuale del video da generare).",
+            );
         }
     };
     let duration_seconds = input
@@ -80,14 +78,11 @@ pub async fn tool_nexus_generate_video(ctx: &ToolContextCore, input: &Value) -> 
     let (provider, model) = match resolve_purpose_via_http(&ctx.db, VIDEO_PURPOSE).await {
         Ok(pm) => pm,
         Err(e) => {
-            return json!({
-                "error": format!(
+            return crate::errore_json(format!(
                     "modello video-gen non risolvibile (purpose '{VIDEO_PURPOSE}'): {e}. \
                      Verifica nexus_purpose_model.generate_video (mig 0482) e che un modello \
                      video-gen sia abilitato nel catalog (mig 0482)."
-                )
-            })
-            .to_string();
+                ));
         }
     };
 
@@ -110,10 +105,7 @@ pub async fn tool_nexus_generate_video(ctx: &ToolContextCore, input: &Value) -> 
     {
         Ok(r) => r,
         Err(e) => {
-            return json!({
-                "error": format!("generazione video via gateway fallita: {e}")
-            })
-            .to_string();
+            return crate::errore_json(format!("generazione video via gateway fallita: {e}"));
         }
     };
 
@@ -132,15 +124,14 @@ pub async fn tool_nexus_generate_video(ctx: &ToolContextCore, input: &Value) -> 
     let bytes = match B64.decode(b64) {
         Ok(b) => b,
         Err(e) => {
-            return json!({ "error": format!("decodifica video base64 fallita: {e}") })
-                .to_string();
+            return crate::errore_json(format!("decodifica video base64 fallita: {e}"));
         }
     };
 
     // 6) Salva path-safe sotto la project_root.
     let (video_path, provider_used) = match save_video(&ctx.root_path, &bytes, filename).await {
         Ok(p) => (p, provider),
-        Err(e) => return json!({ "error": format!("salvataggio video fallito: {e}") }).to_string(),
+        Err(e) => return crate::errore_json(format!("salvataggio video fallito: {e}")),
     };
 
     json!({

@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use super::services::project_bucket_range;
 #[cfg(not(windows))]
-use super::services::{read_listening_ports_proc, read_listening_ports_ss};
+use super::services::{read_listening_ports_ss, scan_listening_ports_proc};
 
 /// Esito della domanda «posso legarmi a questa porta ORA?». Tre risposte, non
 /// due, perche' un bind fallito non prova che la porta sia di qualcuno.
@@ -412,39 +412,155 @@ pub(crate) async fn kill_process_tree(pid: u32) {
         .await;
 }
 
-/// Lista (port, pid, program) in ascolto. PUNTO UNICO cross-platform (regola L):
-/// Unix usa `ss` con fallback /proc; Windows delega a `windows_listening_ports`
-/// (Get-NetTCPConnection). Prima del dispatch #[cfg(windows)] questa funzione
-/// ritornava SEMPRE vuoto su Windows: try_free_port non risolveva mai il PID
-/// occupante, scan_bucket_orphans era cieco e la guardia RefuseActive mai
-/// attiva (incidente Beaty-Book 2026-07-02: 6 node orfani, EADDRINUSE ricorrente).
-pub async fn listening_ports() -> Vec<(u16, u32, String)> {
+/// Esito della domanda «CHI e' in ascolto, adesso?». Due risposte, non una
+/// lista: una lista vuota diceva insieme «nessuno ascolta» e «non ho potuto
+/// chiedere», e i consumatori distruttivi agivano sulla seconda credendo la
+/// prima. Gemello di [`PortBind`], che separa allo stesso modo «la porta e' di
+/// qualcuno» da «il sistema non ha risposto sull'occupazione».
+///
+/// E' l'incidente del 31/07/2026 (probe cieco al solo `127.0.0.1`) preso dal
+/// lato opposto: li' il probe rispondeva "muto" su un servizio vivo, qui e' la
+/// tabella del SO a non farsi leggere. Gli effetti sono gli stessi e sono tutti
+/// distruttivi: `cleanup_orphaned_ports` rilascia l'allocazione di un servizio
+/// vivo, `service_observer` apre una diagnosi di crash falsa e innesca la
+/// remediation, `services_watchdog` riavvia un servizio sano.
+///
+/// UNA LISTA PARZIALE E' `NonInterrogabile`, non `Osservati`: e' il caso
+/// peggiore, non quello lieve. Una lista mezza piena non fa scattare nessuna
+/// guardia sul vuoto, quindi passa per completa e le porte della famiglia non
+/// letta risultano tutte mute (misurato: su questa macchina 6 porte, fra cui la
+/// 3000 e la 32987 del bucket progetti, sono in ascolto SOLO su IPv6). La
+/// distinzione si prende alla fonte, dove si sa quale famiglia non ha risposto:
+/// vedi `process_util::windows_listening_sockets`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListenerScan {
+    /// La tabella dei listener e' stata letta per INTERO: la lista e' completa,
+    /// e se e' vuota significa davvero che nessuno ascolta.
+    Osservati(Vec<(u16, u32, String)>),
+    /// La domanda non ha avuto risposta (syscall fallita, famiglia di indirizzi
+    /// non leggibile, lettura interrotta). Non e' la prova che nessuno ascolti:
+    /// chi agirebbe in modo distruttivo si ferma e lo dichiara.
+    NonInterrogabile { motivo: String },
+}
+
+impl ListenerScan {
+    /// Come si racconta questo esito in un log.
+    pub fn descrizione(&self) -> String {
+        match self {
+            ListenerScan::Osservati(v) => format!("{} listener osservati", v.len()),
+            ListenerScan::NonInterrogabile { motivo } => {
+                format!("tabella dei listener non interrogabile ({motivo})")
+            }
+        }
+    }
+
+    /// Vero solo se l'osservazione e' AVVENUTA. Chi sta per compiere un'azione
+    /// distruttiva su un intero insieme (rilasciare allocazioni, contare servizi
+    /// giu') si ferma qui: non conosce lo stato, quindi non ne deduce nulla.
+    pub fn osservazione_avvenuta(&self) -> bool {
+        matches!(self, ListenerScan::Osservati(_))
+    }
+
+    /// «C'e' un listener su questa porta?». `None` = non si e' potuto chiedere:
+    /// e' una VARIANTE, mai un `false` comodo (regola Q).
+    pub fn ascolta(&self, porta: u16) -> Option<bool> {
+        match self {
+            ListenerScan::Osservati(v) => Some(v.iter().any(|(p, _, _)| *p == porta)),
+            ListenerScan::NonInterrogabile { .. } => None,
+        }
+    }
+
+    /// «Almeno una di queste porte e' in ascolto?». Un insieme vuoto di porte e'
+    /// una risposta certa (`Some(false)`): non c'e' niente da osservare.
+    pub fn qualcuno_ascolta(&self, porte: &[u16]) -> Option<bool> {
+        if porte.is_empty() {
+            return Some(false);
+        }
+        match self {
+            ListenerScan::Osservati(v) => {
+                Some(porte.iter().any(|p| v.iter().any(|(lp, _, _)| lp == p)))
+            }
+            ListenerScan::NonInterrogabile { .. } => None,
+        }
+    }
+
+    /// Appiattisce l'ignoto a lista vuota. Esiste per i call site che NON
+    /// decidono niente di distruttivo sul vuoto (diagnostica, elenchi mostrati
+    /// all'utente, risalita all'occupante di una porta gia' nota): li' una lista
+    /// mancante produce al piu' un'informazione assente. Non usarla per decidere
+    /// se cancellare, diagnosticare o riavviare.
+    pub fn osservati_o_vuoto(self) -> Vec<(u16, u32, String)> {
+        match self {
+            ListenerScan::Osservati(v) => v,
+            ListenerScan::NonInterrogabile { .. } => Vec::new(),
+        }
+    }
+}
+
+/// PUNTO UNICO cross-platform (regola L) della domanda «chi ascolta ORA»:
+/// Windows delega a `windows_scan_listening_ports` (GetExtendedTcpTable sulle
+/// due famiglie), Unix a `ss` con ripiego su `/proc`. E' l'unico produttore:
+/// [`listening_ports`] ne e' l'adattatore che perde l'ignoto.
+pub async fn scan_listening_ports() -> ListenerScan {
     #[cfg(windows)]
     {
-        super::services::windows_listening_ports().await
+        super::services::windows_scan_listening_ports().await
     }
     #[cfg(not(windows))]
     {
+        // `ss` che risponde con una lista piena e' una risposta completa. Vuota
+        // o assente non lo e': il comando puo' mancare del tutto, e in quel caso
+        // la risposta la deve dare `/proc`.
         if let Ok(v) = read_listening_ports_ss().await {
             if !v.is_empty() {
-                return v;
+                return ListenerScan::Osservati(v);
             }
         }
-        tokio::task::spawn_blocking(read_listening_ports_proc)
-            .await
-            .unwrap_or_default()
+        match tokio::task::spawn_blocking(scan_listening_ports_proc).await {
+            Ok(Ok(v)) => ListenerScan::Osservati(v),
+            Ok(Err(motivo)) => ListenerScan::NonInterrogabile { motivo },
+            Err(e) => ListenerScan::NonInterrogabile {
+                motivo: format!("lettura dei listener interrotta: {e}"),
+            },
+        }
     }
+}
+
+/// Lista (port, pid, program) in ascolto, con l'ignoto appiattito a vuoto.
+/// ADATTATORE di [`scan_listening_ports`]: chi decide se cancellare, aprire una
+/// diagnosi o riavviare deve usare quella e trattare `NonInterrogabile` come
+/// "non agire" — qui i due casi tornano indistinguibili.
+///
+/// Prima del dispatch #[cfg(windows)] questa funzione ritornava SEMPRE vuoto su
+/// Windows: try_free_port non risolveva mai il PID occupante, scan_bucket_orphans
+/// era cieco e la guardia RefuseActive mai attiva (incidente Beaty-Book
+/// 2026-07-02: 6 node orfani, EADDRINUSE ricorrente).
+pub async fn listening_ports() -> Vec<(u16, u32, String)> {
+    scan_listening_ports().await.osservati_o_vuoto()
 }
 
 /// `(pid, program)` del processo in LISTEN su `port`, se risolvibile. Delega a
 /// `listening_ports` (punto unico): nessun call site deve ri-implementare la
 /// domanda "chi occupa questa porta".
 pub async fn port_occupant(port: u16) -> Option<(u32, String)> {
-    listening_ports()
-        .await
-        .into_iter()
-        .find(|(p, _, _)| *p == port)
-        .map(|(_, pid, program)| (pid, program))
+    occupante_osservato(port).await.unwrap_or(None)
+}
+
+/// L'occupante di una porta, DISTINGUENDO "nessuno" da "non ho potuto chiedere".
+///
+/// `None` esterno = la tabella dei listener non era interrogabile; `Some(None)` =
+/// osservata e nessuno ascolta. Serve a chi COMPIE un'azione irreversibile sulla
+/// base della risposta: [`port_occupant`] appiattisce i due casi ed e' giusto
+/// solo per chi cerca un occupante da nominare, non per chi deduce un'assenza.
+pub async fn occupante_osservato(port: u16) -> Option<Option<(u32, String)>> {
+    match scan_listening_ports().await {
+        ListenerScan::Osservati(v) => Some(
+            v.into_iter()
+                .find(|(p, _, _)| *p == port)
+                .map(|(_, pid, program)| (pid, program)),
+        ),
+        ListenerScan::NonInterrogabile { .. } => None,
+    }
 }
 
 /// True se `pid` e' un processo GOVERNATO dal progetto: presente in
@@ -508,13 +624,28 @@ pub async fn ensure_process_stopped(pid: Option<u32>, port: Option<u16>) -> bool
     let mut free_attempted = false;
     for attempt in 0..ATTEMPTS {
         let wrapper_alive = pid.map(crate::process_util::process_alive).unwrap_or(false);
-        let porta_in_ascolto = match port {
-            Some(p) => Some(port_listening(p).await),
+        // `true` qui e' l'unica autorizzazione a scrivere `status='stopped'`: una
+        // porta NON INTERROGABILE non e' una porta libera, e concluderlo
+        // dichiarerebbe fermo un processo che tiene ancora il listener — lo
+        // stesso incidente Beaty-Book che questa funzione esiste per impedire,
+        // con una causa diversa. Sul ramo ignoto si RITENTA entro il timeout.
+        let osservazione = match port {
+            Some(p) => match occupante_osservato(p).await {
+                Some(occ) => Some(occ.is_some()),
+                None => {
+                    tracing::warn!(
+                        port = p,
+                        "ensure_process_stopped: tabella dei listener non                          interrogabile, lo stop non e' verificato: ritento"
+                    );
+                    continue;
+                }
+            },
             None => None,
         };
-        if process_fully_stopped(wrapper_alive, porta_in_ascolto) {
+        if process_fully_stopped(wrapper_alive, osservazione) {
             return true;
         }
+        let porta_in_ascolto = osservazione;
         if let (Some(true), Some(p)) = (porta_in_ascolto, port) {
             if !free_attempted && attempt >= FREE_PORT_AFTER_ATTEMPT {
                 free_attempted = true;
@@ -712,6 +843,76 @@ mod port_listening_tests {
         assert!(super::port_listening(port).await);
 
         drop(listener);
+    }
+}
+
+#[cfg(test)]
+mod listener_scan_tests {
+    use super::ListenerScan;
+
+    /// Il produttore VERO, su questa macchina: la tabella si legge, quindi
+    /// l'esito e' `Osservati` e contiene il listener appena aperto. Se il
+    /// dispatch per piattaforma o la lettura si rompessero, qui uscirebbe
+    /// `NonInterrogabile` — che e' esattamente cio' che i consumatori devono
+    /// vedere invece di una lista vuota.
+    #[tokio::test]
+    async fn lo_scan_reale_dichiara_di_aver_osservato() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind di prova");
+        let porta = listener.local_addr().expect("local_addr").port();
+
+        let scan = super::scan_listening_ports().await;
+        assert!(
+            scan.osservazione_avvenuta(),
+            "scan non riuscito su una macchina viva: {}",
+            scan.descrizione()
+        );
+        assert_eq!(scan.ascolta(porta), Some(true));
+        assert_eq!(scan.qualcuno_ascolta(&[porta]), Some(true));
+
+        drop(listener);
+    }
+
+    /// IL DIFETTO: `NonInterrogabile` non risponde `false` a nessuna domanda.
+    /// Un `false` qui e' cio' che faceva rilasciare l'allocazione di un servizio
+    /// vivo, aprire una diagnosi di crash falsa e riavviare un servizio sano.
+    #[test]
+    fn l_ignoto_non_risponde_mai_nessuno_ascolta() {
+        let scan = ListenerScan::NonInterrogabile {
+            motivo: "tabella IPv6 non letta: GetExtendedTcpTable(af=23) codice 87".to_string(),
+        };
+        assert_eq!(scan.ascolta(3000), None);
+        assert_eq!(scan.qualcuno_ascolta(&[3000, 24805]), None);
+        assert!(!scan.osservazione_avvenuta());
+        assert!(
+            scan.descrizione().contains("codice 87"),
+            "il motivo deve arrivare nel log: {}",
+            scan.descrizione()
+        );
+    }
+
+    /// Un'osservazione RIUSCITA che non trova nessuno e' invece una risposta
+    /// piena: e' il caso in cui il GC deve poter cancellare.
+    #[test]
+    fn il_vuoto_osservato_resta_una_risposta() {
+        let scan = ListenerScan::Osservati(Vec::new());
+        assert_eq!(scan.ascolta(3000), Some(false));
+        assert_eq!(scan.qualcuno_ascolta(&[3000]), Some(false));
+        assert!(scan.osservazione_avvenuta());
+    }
+
+    /// Nessuna porta attesa: risposta certa, e senza interrogare il SO. Il
+    /// servizio senza porte (worker) non deve poter cadere nel ramo dell'ignoto.
+    #[test]
+    fn senza_porte_attese_la_risposta_e_certa() {
+        assert_eq!(
+            ListenerScan::NonInterrogabile {
+                motivo: "x".to_string()
+            }
+            .qualcuno_ascolta(&[]),
+            Some(false)
+        );
     }
 }
 

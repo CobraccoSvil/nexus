@@ -112,12 +112,12 @@ pub async fn tool_ui_reference_search(ctx: &ToolContextCore, input: &Value) -> S
         None => String::new(),
     };
     if query.is_empty() {
-        return json!({ "error": "parametro 'query' obbligatorio e non vuoto" }).to_string();
+        return crate::errore_json("parametro 'query' obbligatorio e non vuoto");
     }
 
     let (provider, model) = match provider_di_ricerca(&ctx.db).await {
         Ok(pm) => pm,
-        Err(e) => return json!({ "error": e }).to_string(),
+        Err(e) => return crate::errore_json(e),
     };
 
     match nexus_types::gateway_client::gateway_text_complete(
@@ -142,7 +142,7 @@ pub async fn tool_ui_reference_search(ctx: &ToolContextCore, input: &Value) -> S
             "model_used": model,
         })
         .to_string(),
-        Err(e) => json!({ "error": format!("ricerca fallita: {e}") }).to_string(),
+        Err(e) => crate::errore_json(format!("ricerca fallita: {e}")),
     }
 }
 

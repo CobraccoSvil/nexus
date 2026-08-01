@@ -97,16 +97,15 @@ pub async fn tool_nexus_install_shadcn_components(
         match nexus_types::workspace_paths::normalize_into_root(project_root, target_rel) {
             Ok(clean) => project_root.join(&clean),
             Err(e) => {
-                return json!({"error": format!("target_dir non valido: {}", e.message())})
-                    .to_string()
+                return crate::errore_json(format!("target_dir non valido: {}", e.message()))
             }
         };
 
     if let Err(e) = fs::create_dir_all(&target_dir).await {
-        return json!({
-            "error": format!("creazione directory '{}' fallita: {e}", target_dir.display())
-        })
-        .to_string();
+        return crate::errore_json(format!(
+            "creazione directory '{}' fallita: {e}",
+            target_dir.display()
+        ));
     }
 
     let mut written: Vec<String> = Vec::new();

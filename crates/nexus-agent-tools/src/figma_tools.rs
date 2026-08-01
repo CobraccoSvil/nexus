@@ -47,25 +47,25 @@ pub async fn tool_nexus_extract_figma_structure(
         .and_then(|s| Uuid::parse_str(s).ok())
     {
         Some(id) => id,
-        None => return json!({ "error": "Parametro 'attachment_id' obbligatorio." }).to_string(),
+        None => return crate::errore_json("Parametro 'attachment_id' obbligatorio."),
     };
 
     let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
         Ok(r) => r,
-        Err(e) => return json!({ "error": e }).to_string(),
+        Err(e) => return crate::errore_json(e),
     };
     let limits = attachment_settings::current(&ctx.db).await;
 
     let bytes = match tokio::fs::read(&record.file_path).await {
         Ok(b) => b,
-        Err(e) => return json!({ "error": format!("read fallita: {e}") }).to_string(),
+        Err(e) => return crate::errore_json(format!("read fallita: {e}")),
     };
 
     let result = tokio::task::spawn_blocking(move || extract_figma(&bytes, limits)).await;
     match result {
         Ok(Ok(v)) => v.to_string(),
-        Ok(Err(e)) => json!({ "error": e }).to_string(),
-        Err(e) => json!({ "error": format!("spawn_blocking fallita: {e}") }).to_string(),
+        Ok(Err(e)) => crate::errore_json(e),
+        Err(e) => crate::errore_json(format!("spawn_blocking fallita: {e}")),
     }
 }
 
@@ -80,11 +80,10 @@ const DEFAULT_FIGMA_EXPORT_SUBDIR: &str = "figma_export";
 /// metadati: niente contenuto file, per non saturare il contesto del modello.
 pub async fn tool_nexus_extract_figma_code(ctx: &ToolContextCore, input: &Value) -> String {
     if !ctx.can_write {
-        return json!({
-            "error": "Permesso di scrittura non concesso su questo progetto: \
-                      impossibile estrarre il code-snapshot Figma su disco."
-        })
-        .to_string();
+        return crate::errore_json(
+            "Permesso di scrittura non concesso su questo progetto: \
+             impossibile estrarre il code-snapshot Figma su disco.",
+        );
     }
 
     let attachment_id = match input
@@ -93,7 +92,7 @@ pub async fn tool_nexus_extract_figma_code(ctx: &ToolContextCore, input: &Value)
         .and_then(|s| Uuid::parse_str(s).ok())
     {
         Some(id) => id,
-        None => return json!({ "error": "Parametro 'attachment_id' obbligatorio." }).to_string(),
+        None => return crate::errore_json("Parametro 'attachment_id' obbligatorio."),
     };
 
     let target_subdir = input
@@ -107,13 +106,13 @@ pub async fn tool_nexus_extract_figma_code(ctx: &ToolContextCore, input: &Value)
 
     let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
         Ok(r) => r,
-        Err(e) => return json!({ "error": e }).to_string(),
+        Err(e) => return crate::errore_json(e),
     };
     let limits = attachment_settings::current(&ctx.db).await;
 
     let bytes = match tokio::fs::read(&record.file_path).await {
         Ok(b) => b,
-        Err(e) => return json!({ "error": format!("read fallita: {e}") }).to_string(),
+        Err(e) => return crate::errore_json(format!("read fallita: {e}")),
     };
 
     // Parsing pesante in spawn_blocking: produce la mappa path->content.
@@ -121,8 +120,8 @@ pub async fn tool_nexus_extract_figma_code(ctx: &ToolContextCore, input: &Value)
         .await
     {
         Ok(Ok(s)) => s,
-        Ok(Err(e)) => return json!({ "error": e }).to_string(),
-        Err(e) => return json!({ "error": format!("spawn_blocking fallita: {e}") }).to_string(),
+        Ok(Err(e)) => return crate::errore_json(e),
+        Err(e) => return crate::errore_json(format!("spawn_blocking fallita: {e}")),
     };
 
     if snapshot.files.is_empty() {
@@ -192,18 +191,15 @@ pub async fn tool_nexus_extract_figma_code(ctx: &ToolContextCore, input: &Value)
 
         if let Some(parent) = abs_target.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                return json!({
-                    "error": format!("creazione directory '{}' fallita: {e}", parent.display())
-                })
-                .to_string();
+                return crate::errore_json(format!(
+                    "creazione directory '{}' fallita: {e}",
+                    parent.display()
+                ));
             }
         }
 
         if let Err(e) = tokio::fs::write(&abs_target, content).await {
-            return json!({
-                "error": format!("scrittura '{clean_rel}' fallita: {e}")
-            })
-            .to_string();
+            return crate::errore_json(format!("scrittura '{clean_rel}' fallita: {e}"));
         }
 
         nexus_events::dispatcher::emit(

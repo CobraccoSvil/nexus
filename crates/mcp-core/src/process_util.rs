@@ -473,30 +473,39 @@ fn exe_name_senza_estensione(raw: &[u16]) -> String {
 /// porte risultano in ascolto SOLO su IPv6 — fra cui la 3000 (web-ide) e la
 /// 32987, che sta dentro il bucket dei progetti. Enumerare il solo IPv4
 /// renderebbe il `port_enforcer` cieco proprio sulla classe di processi che
-/// deve sorvegliare, e in modo peggiore della cecita' totale: la sua guardia
-/// fail-closed scatta solo su lista VUOTA, quindi con una lista parziale lo
-/// sweep girerebbe comunque e `resolve_stale_runtime_port_violations`
-/// chiuderebbe come "rientrate" violazioni ancora vive.
+/// deve sorvegliare, e in modo peggiore della cecita' totale: la guardia
+/// fail-closed di `port_enforcer::scan_and_enforce` scatta solo su lista
+/// VUOTA, quindi su una lista mezza piena non scatta e lo sweep girerebbe
+/// comunque e `resolve_stale_runtime_port_violations` chiuderebbe come
+/// "rientrate" violazioni ancora vive.
+///
+/// E' la ragione per cui l'esito e' un `Result` e non una lista: la lettura
+/// PARZIALE (una famiglia letta, l'altra no) e' un fallimento, perche' a valle
+/// e' indistinguibile da una completa. `Err` porta il motivo per il log; la
+/// decisione la prende `ListenerScan::NonInterrogabile`, che nessun consumatore
+/// puo' confondere con "nessuno ascolta".
 ///
 /// `TCP_TABLE_OWNER_PID_LISTENER` fa filtrare i soli listener al kernel: non
 /// c'e' uno stato da riconoscere a valle. Chiamata sincrona nell'ordine dei
 /// millisecondi: i chiamanti async la avvolgono in `spawn_blocking`.
 #[cfg(windows)]
-pub(crate) fn windows_listening_sockets() -> Vec<(u16, u32)> {
+pub(crate) fn windows_listening_sockets() -> Result<Vec<(u16, u32)>, String> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         MIB_TCP6TABLE_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
     };
     use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
     let mut out: Vec<(u16, u32)> = Vec::new();
-    raccogli_listener::<MIB_TCPTABLE_OWNER_PID>(AF_INET as u32, &mut out);
-    raccogli_listener::<MIB_TCP6TABLE_OWNER_PID>(AF_INET6 as u32, &mut out);
+    raccogli_listener::<MIB_TCPTABLE_OWNER_PID>(AF_INET as u32, &mut out)
+        .map_err(|e| format!("tabella IPv4 non letta: {e}"))?;
+    raccogli_listener::<MIB_TCP6TABLE_OWNER_PID>(AF_INET6 as u32, &mut out)
+        .map_err(|e| format!("tabella IPv6 non letta: {e}"))?;
 
     // Un processo in ascolto su `::` con dual-stack compare in entrambe le
     // tabelle: la stessa coppia (porta, pid) non e' due binding distinti.
     out.sort_unstable();
     out.dedup();
-    out
+    Ok(out)
 }
 
 /// Le due MIB dei listener (IPv4 e IPv6) hanno campi omonimi ma tipi distinti,
@@ -548,12 +557,34 @@ impl_mib_listener!(
 /// Legge la tabella dei listener della famiglia `af` e accoda le coppie
 /// `(porta, pid)` valide. Una sola implementazione per entrambe le famiglie:
 /// il filtro delle righe prive di senso non puo' divergere fra IPv4 e IPv6.
+///
+/// `Err` = questa famiglia non ha risposto, quindi l'intera enumerazione e'
+/// parziale e non va usata. Una famiglia che il SO dichiara NON SUPPORTATA e'
+/// invece una risposta piena: su uno stack senza IPv6 nessuno puo' ascoltare in
+/// IPv6, e trattarlo come fallimento renderebbe quella macchina cieca per
+/// sempre — cioe' il difetto opposto, con gli stessi consumatori paralizzati.
 #[cfg(windows)]
-fn raccogli_listener<T: MibListener>(af: u32, out: &mut Vec<(u16, u32)>) {
-    let Some(buffer) = tabella_listener::<T>(af) else {
-        return;
+fn raccogli_listener<T: MibListener>(af: u32, out: &mut Vec<(u16, u32)>) -> Result<(), String> {
+    accoda_listener(tabella_listener::<T>(af), af, out)
+}
+
+/// La conseguenza dell'esito, separata da chi interroga il SO: e' la parte che
+/// decide se una famiglia mancante ferma tutto o vale zero righe, e il kernel
+/// non si sa costringere a rispondere `NonSupportata` a comando (regola O).
+#[cfg(windows)]
+fn accoda_listener<T: MibListener>(
+    esito: EsitoTabella<T>,
+    af: u32,
+    out: &mut Vec<(u16, u32)>,
+) -> Result<(), String> {
+    let buffer = match esito {
+        EsitoTabella::Letta(b) => b,
+        EsitoTabella::NonSupportata => return Ok(()),
+        EsitoTabella::Fallita { codice } => {
+            return Err(format!("GetExtendedTcpTable(af={af}) codice {codice}"))
+        }
     };
-    // SAFETY: `tabella_listener` ritorna Some solo dopo una chiamata riuscita,
+    // SAFETY: `tabella_listener` ritorna `Letta` solo dopo una chiamata riuscita,
     // quindi l'header e' inizializzato e `dwNumEntries` righe lo seguono
     // contigue (layout documentato della MIB).
     unsafe {
@@ -566,6 +597,22 @@ fn raccogli_listener<T: MibListener>(af: u32, out: &mut Vec<(u16, u32)>) {
             }
         }
     }
+    Ok(())
+}
+
+/// Esito della lettura di UNA tabella MIB. Tre risposte, non due: `Option` fa
+/// di «il SO non sa rispondere» e «questa famiglia non esiste su questa
+/// macchina» lo stesso `None`, e le due conseguenze sono opposte — la prima
+/// deve fermare i consumatori distruttivi, la seconda no.
+#[cfg(windows)]
+enum EsitoTabella<T> {
+    /// Tabella letta per intero.
+    Letta(Vec<T>),
+    /// Il SO dichiara la famiglia di indirizzi non supportata: nessuno puo'
+    /// ascoltare li' sopra, quindi zero righe e' la risposta VERA.
+    NonSupportata,
+    /// La chiamata e' fallita: non sappiamo chi ascolta in questa famiglia.
+    Fallita { codice: u32 },
 }
 
 /// Alloca e riempie la tabella dei listener per la famiglia `af`, col protocollo
@@ -575,7 +622,7 @@ fn raccogli_listener<T: MibListener>(af: u32, out: &mut Vec<(u16, u32)>) {
 /// Il buffer e' un `Vec<T>` e non un `Vec<u8>` per ottenere l'allineamento che
 /// la struct richiede.
 #[cfg(windows)]
-fn tabella_listener<T>(af: u32) -> Option<Vec<T>> {
+fn tabella_listener<T>(af: u32) -> EsitoTabella<T> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GetExtendedTcpTable, TCP_TABLE_OWNER_PID_LISTENER,
     };
@@ -595,6 +642,10 @@ const NO_ERROR_U32: u32 = 0;
 /// `ERROR_INSUFFICIENT_BUFFER`: il buffer non basta, `size` dice quanto serve.
 #[cfg(windows)]
 const ERROR_INSUFFICIENT_BUFFER_U32: u32 = 122;
+/// `ERROR_NOT_SUPPORTED`: la famiglia di indirizzi non esiste su questa
+/// macchina. E' una risposta, non un guasto: nessuno puo' ascoltare li' sopra.
+#[cfg(windows)]
+const ERROR_NOT_SUPPORTED_U32: u32 = 50;
 /// Quanti giri di riallocazione concedere prima di arrendersi. La tabella puo'
 /// crescere fra il dimensionamento e la lettura, ma non all'infinito: tre giri
 /// coprono qualunque burst realistico senza trasformare un difetto in un ciclo.
@@ -612,30 +663,43 @@ const MAX_TENTATIVI_TABELLA: usize = 3;
 /// porte di quella famiglia per quell'iterazione. Il danno sarebbe quello gia'
 /// visto con l'enumerazione IPv4-only: la lista non e' vuota (l'altra famiglia
 /// l'ha riempita), quindi la guardia fail-closed di `scan_and_enforce` non
-/// scatta, lo sweep gira su dati parziali e `resolve_stale_runtime_port_violations`
-/// chiude come "rientrate" violazioni ancora vive.
+/// scatta, lo sweep gira su
+/// dati parziali e `resolve_stale_runtime_port_violations` chiude come
+/// "rientrate" violazioni ancora vive. Arrendersi resta possibile — dopo
+/// `MAX_TENTATIVI_TABELLA` giri — ma e' `Fallita`, non una lista corta.
 #[cfg(windows)]
-fn tabella_listener_con<T, F>(mut chiama: F) -> Option<Vec<T>>
+fn tabella_listener_con<T, F>(mut chiama: F) -> EsitoTabella<T>
 where
     F: FnMut(*mut std::ffi::c_void, &mut u32) -> u32,
 {
     let mut size: u32 = 0;
-    if chiama(std::ptr::null_mut(), &mut size) != ERROR_INSUFFICIENT_BUFFER_U32 || size == 0 {
-        return None;
+    let dimensionamento = chiama(std::ptr::null_mut(), &mut size);
+    if dimensionamento == ERROR_NOT_SUPPORTED_U32 {
+        return EsitoTabella::NonSupportata;
+    }
+    // Anche una tabella VUOTA occupa l'header con `dwNumEntries`, quindi il
+    // dimensionamento chiede sempre spazio: qualunque altra risposta e' un
+    // fallimento, non una tabella senza righe.
+    if dimensionamento != ERROR_INSUFFICIENT_BUFFER_U32 || size == 0 {
+        return EsitoTabella::Fallita {
+            codice: dimensionamento,
+        };
     }
 
+    let mut ultimo = ERROR_INSUFFICIENT_BUFFER_U32;
     for _ in 0..MAX_TENTATIVI_TABELLA {
         let elementi = (size as usize).div_ceil(std::mem::size_of::<T>());
         let mut buffer: Vec<T> = Vec::with_capacity(elementi.max(1));
-        match chiama(buffer.as_mut_ptr().cast(), &mut size) {
-            NO_ERROR_U32 => return Some(buffer),
+        ultimo = chiama(buffer.as_mut_ptr().cast(), &mut size);
+        match ultimo {
+            NO_ERROR_U32 => return EsitoTabella::Letta(buffer),
             // La tabella e' cresciuta fra le due chiamate: `size` porta gia' il
             // nuovo fabbisogno, si rialloca e si rilegge.
             ERROR_INSUFFICIENT_BUFFER_U32 => continue,
-            _ => return None,
+            codice => return EsitoTabella::Fallita { codice },
         }
     }
-    None
+    EsitoTabella::Fallita { codice: ultimo }
 }
 
 /// La MIB tiene la porta nei due byte bassi del DWORD, in ordine di rete.
@@ -673,7 +737,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn le_porte_in_ascolto_non_escono_mai_vuote() {
-        let porte = windows_listening_sockets();
+        let porte = windows_listening_sockets().expect("tabella dei listener non letta");
         assert!(!porte.is_empty(), "nessuna porta in ascolto: probe cieco");
         assert!(
             porte.iter().all(|(porta, pid)| *porta > 0 && *pid > 0),
@@ -688,13 +752,12 @@ mod tests {
     /// produzione usa: cambia solo chi risponde al posto del kernel, perche' la
     /// race vera (un socket che si apre fra due chiamate) non e' provocabile a
     /// comando. Arrendersi qui costerebbe tutte le porte di una famiglia per
-    /// quell'iterazione, con la lista che resta piena a meta' e la guardia
-    /// fail-closed che percio' non scatta.
+    /// quell'iterazione, con la lista che resta piena a meta'.
     #[cfg(windows)]
     #[test]
     fn la_tabella_cresciuta_fra_le_due_chiamate_viene_riletta() {
         let mut chiamate = 0usize;
-        let esito: Option<Vec<u8>> = tabella_listener_con(|ptr, size| {
+        let esito: EsitoTabella<u8> = tabella_listener_con(|ptr, size| {
             chiamate += 1;
             match chiamate {
                 // Dimensionamento: servono 100 byte.
@@ -713,27 +776,76 @@ mod tests {
             }
         });
         assert!(
-            esito.is_some(),
+            matches!(esito, EsitoTabella::Letta(_)),
             "tabella persa: il buffer non e' stato riallocato dopo la crescita"
         );
         assert_eq!(chiamate, 3, "giri di riallocazione inattesi: {chiamate}");
     }
 
     /// Una tabella che cresce a ogni giro non deve diventare un ciclo: dopo i
-    /// tentativi previsti si rinuncia a quella famiglia (lista incompleta ma
-    /// nessun blocco dello scan).
+    /// tentativi previsti si rinuncia a quella famiglia — e la rinuncia e'
+    /// `Fallita`, non una tabella vuota. E' la differenza che tiene fermi i
+    /// consumatori distruttivi (GC delle allocazioni, diagnosi di crash,
+    /// riavvio) invece di farli agire su una lista che non abbiamo letto.
     #[cfg(windows)]
     #[test]
     fn la_riallocazione_non_gira_all_infinito() {
         let mut chiamate = 0usize;
-        let esito: Option<Vec<u8>> = tabella_listener_con(|_ptr, size| {
+        let esito: EsitoTabella<u8> = tabella_listener_con(|_ptr, size| {
             chiamate += 1;
             *size = 100 * chiamate as u32;
             ERROR_INSUFFICIENT_BUFFER_U32
         });
-        assert!(esito.is_none(), "nessun buffer valido, doveva rinunciare");
+        assert!(
+            matches!(
+                esito,
+                EsitoTabella::Fallita {
+                    codice: ERROR_INSUFFICIENT_BUFFER_U32
+                }
+            ),
+            "nessun buffer valido: doveva dichiarare il fallimento, non una tabella"
+        );
         // 1 dimensionamento + MAX_TENTATIVI_TABELLA letture.
         assert_eq!(chiamate, 1 + MAX_TENTATIVI_TABELLA);
+    }
+
+    /// Una famiglia di indirizzi che il SO dichiara NON SUPPORTATA e' una
+    /// risposta piena (zero listener possibili), non un guasto: trattarla come
+    /// fallimento renderebbe cieca per sempre una macchina senza stack IPv6.
+    #[cfg(windows)]
+    #[test]
+    fn una_famiglia_non_supportata_non_e_un_fallimento() {
+        use windows_sys::Win32::NetworkManagement::IpHelper::MIB_TCP6TABLE_OWNER_PID;
+
+        let esito: EsitoTabella<MIB_TCP6TABLE_OWNER_PID> =
+            tabella_listener_con(|_ptr, _size| ERROR_NOT_SUPPORTED_U32);
+        assert!(matches!(esito, EsitoTabella::NonSupportata));
+
+        // E la conseguenza e' "nessuna riga", non un errore che ferma lo scan.
+        let mut out = Vec::new();
+        assert!(accoda_listener(esito, 23, &mut out).is_ok());
+        assert!(out.is_empty());
+    }
+
+    /// Una famiglia che NON risponde ferma l'intera enumerazione: e' il caso
+    /// peggiore, non quello lieve. Con l'altra famiglia gia' letta la lista
+    /// resterebbe piena a meta' e passerebbe per completa, e ogni porta della
+    /// famiglia persa risulterebbe muta — la stessa cecita' misurata il
+    /// 31/07/2026, con GC delle allocazioni, diagnosi di crash e riavvii che
+    /// scattano su servizi vivi.
+    #[cfg(windows)]
+    #[test]
+    fn una_famiglia_che_fallisce_non_diventa_zero_righe() {
+        use windows_sys::Win32::NetworkManagement::IpHelper::MIB_TCP6TABLE_OWNER_PID;
+
+        let esito: EsitoTabella<MIB_TCP6TABLE_OWNER_PID> = tabella_listener_con(|_ptr, _size| 87);
+        let mut out = vec![(3000u16, 1234u32)];
+        let errore = accoda_listener(esito, 23, &mut out)
+            .expect_err("una tabella non letta deve dichiararsi, non valere zero righe");
+        assert!(
+            errore.contains("87"),
+            "motivo senza il codice del SO: {errore}"
+        );
     }
 
     /// Un errore diverso da "buffer insufficiente" non e' ritentabile.
@@ -741,7 +853,7 @@ mod tests {
     #[test]
     fn un_errore_non_ritentabile_ferma_subito() {
         let mut chiamate = 0usize;
-        let esito: Option<Vec<u8>> = tabella_listener_con(|_ptr, size| {
+        let esito: EsitoTabella<u8> = tabella_listener_con(|_ptr, size| {
             chiamate += 1;
             if chiamate == 1 {
                 *size = 100;
@@ -750,7 +862,10 @@ mod tests {
                 87 // ERROR_INVALID_PARAMETER
             }
         });
-        assert!(esito.is_none());
+        assert!(
+            matches!(esito, EsitoTabella::Fallita { codice: 87 }),
+            "l'errore del SO deve arrivare a valle col suo codice"
+        );
         assert_eq!(chiamate, 2, "un errore non ritentabile non va ritentato");
     }
 
@@ -777,7 +892,7 @@ mod tests {
         };
         let porta = listener.local_addr().expect("indirizzo locale").port();
         let mio_pid = std::process::id();
-        let visti = windows_listening_sockets();
+        let visti = windows_listening_sockets().expect("tabella dei listener non letta");
         assert!(
             visti.contains(&(porta, mio_pid)),
             "listener IPv6 su [::1]:{porta} (pid {mio_pid}) invisibile al probe: \

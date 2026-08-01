@@ -199,30 +199,27 @@ pub async fn tool_nexus_dev_server_diagnose(
             match nexus_types::workspace_paths::normalize_into_root(&ctx.root_path, lp) {
                 Ok(clean) => ctx.root_path.join(&clean),
                 Err(e) => {
-                    return json!({
+                    return crate::errore_json_con_dettagli(json!({
                         "error": format!("log_path non valido: {}", e.message()),
                         "hint": "Passa log_path assoluto o relativo a project root, oppure passa 'log' (stringa inline)."
-                    })
-                    .to_string();
+                    }));
                 }
             }
         };
         match read_log_tail(&resolved).await {
             Ok(s) => s,
             Err(e) => {
-                return json!({
+                return crate::errore_json_con_dettagli(json!({
                     "error": format!("lettura log fallita: {e}"),
                     "hint": "Passa log_path assoluto o relativo a project root, oppure passa 'log' (stringa inline)."
-                })
-                .to_string();
+                }));
             }
         }
     } else {
-        return json!({
+        return crate::errore_json_con_dettagli(json!({
             "error": "Specifica almeno uno tra 'log_path' (file) o 'log' (stringa inline).",
             "hint": "Tipico uso: dopo run_service salva l'output in /tmp/<label>.log e passa log_path=/tmp/<label>.log"
-        })
-        .to_string();
+        }));
     };
 
     let diagnostics = get_diagnostics(&ctx.db).await;

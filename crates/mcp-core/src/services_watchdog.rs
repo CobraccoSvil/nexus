@@ -41,8 +41,6 @@ use serde::Deserialize;
 use sqlx::PgPool;
 use tokio::time::sleep;
 
-use crate::project_workspace::port_recovery::port_listening;
-
 /// Attesa iniziale prima del primo ciclo (lascia stabilizzare l'avvio).
 const STARTUP_DELAY_S: u64 = 20;
 
@@ -320,6 +318,21 @@ pub fn spawn_services_watchdog(db: PgPool) {
 async fn run_cycle(db: &PgPool, cfg: &WatchdogConfig, states: &mut HashMap<String, ServiceState>) {
     let now_ts = chrono::Utc::now().timestamp();
 
+    // Una sola interrogazione del SO per tutti i servizi del ciclo, e una sola
+    // guardia: se la tabella dei listener non si e' lasciata leggere, il ciclo
+    // NON gira. Prima "nessuno ascolta" e "non ho potuto chiedere" davano lo
+    // stesso `is_up = false`, quindi una syscall fallita faceva avanzare
+    // `consecutive_down` di ogni servizio e, a soglia, ne riavviava di sani.
+    // Saltare un ciclo ritarda al piu' di `interval_s` un riavvio legittimo.
+    let scan = crate::project_workspace::port_recovery::scan_listening_ports().await;
+    if !scan.osservazione_avvenuta() {
+        tracing::warn!(
+            esito = %scan.descrizione(),
+            "services_watchdog: ciclo saltato, nessun servizio contato giu'"
+        );
+        return;
+    }
+
     for svc in &cfg.services {
         let port = match resolve_port(db, &svc.port_setting_key).await {
             Some(p) => p,
@@ -333,7 +346,11 @@ async fn run_cycle(db: &PgPool, cfg: &WatchdogConfig, states: &mut HashMap<Strin
             }
         };
 
-        let is_up = port_listening(port).await;
+        // `None` e' irraggiungibile qui (la guardia a inizio ciclo ha gia'
+        // fermato tutto): resta trattato come "non contare", mai come "giu'".
+        let Some(is_up) = scan.ascolta(port) else {
+            continue;
+        };
         let st = states.entry(svc.name.clone()).or_default();
 
         if is_up {

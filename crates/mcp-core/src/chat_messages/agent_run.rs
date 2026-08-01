@@ -389,8 +389,10 @@ fn is_report_hollow(result: &crate::agent_types::AgentRunResult) -> bool {
 /// rimossa, ADR 0018 fase 3).
 pub(crate) fn canonical_run_status(result: &crate::agent_types::AgentRunResult) -> AgentRunStatus {
     if is_report_hollow(result) {
-        let no_work =
-            result.steps.is_empty() && result.hollow_completion_kind.contains("EMPTY_ANSWER");
+        let no_work = result.steps.is_empty()
+            && result
+                .hollow_causes
+                .contains(&crate::agent_types::HollowCause::EmptyAnswer);
         if no_work {
             return AgentRunStatus::FailedDiagnosed;
         }
@@ -423,7 +425,10 @@ pub(crate) fn canonical_run_status(result: &crate::agent_types::AgentRunResult) 
 /// openai/anthropic solo perche' quei due erano in cooldown billing per motivi
 /// propri, mostrando "ricarica i crediti" e nominando i provider sbagliati.
 fn cooldown_exhaustion_note(result: &crate::agent_types::AgentRunResult) -> Option<String> {
-    cooldown_note_for_turn(&crate::provider_cooldown::cooldown_snapshot(), result)
+    cooldown_note_for_turn(
+        &crate::provider_cooldown::cooldown_snapshot_entries(),
+        result,
+    )
 }
 
 /// True se la classe errore STRUTTURATA del turno indica che il provider coinvolto
@@ -460,7 +465,7 @@ fn error_class_indicates_cooldown(error_class: Option<&str>) -> bool {
 ///     in cooldown per motivi propri): `None`, vale il placeholder a valle che
 ///     nomina il `result.provider` reale.
 fn cooldown_note_for_turn(
-    snap: &[(String, u64, Option<String>)],
+    snap: &[crate::provider_cooldown::CooldownEntry],
     result: &crate::agent_types::AgentRunResult,
 ) -> Option<String> {
     // Caso 1: il turno e' fallito perche' NESSUN provider era disponibile.
@@ -478,9 +483,9 @@ fn cooldown_note_for_turn(
         return None;
     }
     let involved = result.provider.to_lowercase();
-    let filtered: Vec<(String, u64, Option<String>)> = snap
+    let filtered: Vec<crate::provider_cooldown::CooldownEntry> = snap
         .iter()
-        .filter(|(name, _, _)| name.to_lowercase() == involved)
+        .filter(|e| e.provider.to_lowercase() == involved)
         .cloned()
         .collect();
     cooldown_note_from_snapshot(&filtered)
@@ -488,27 +493,35 @@ fn cooldown_note_for_turn(
 
 /// Logica pura (testabile, regola F): compone la nota dato lo snapshot dei
 /// cooldown. Separata dalla fonte globale per non dipendere da stato condiviso.
-fn cooldown_note_from_snapshot(snap: &[(String, u64, Option<String>)]) -> Option<String> {
+///
+/// La distinzione "credito esaurito" / "indisponibilita' passeggera" la porta il
+/// campo TIPIZZATO `severity`, registrato da chi ha messo il provider in cooldown
+/// (`put_provider_in_long_cooldown` vs `put_provider_in_short_cooldown`). Prima
+/// veniva ri-dedotta QUI cercando `credit`/`quota`/`billing`/`balance` nella
+/// `reason`: le stesse 4 sottostringhe inglesi che `provider_cooldown` aveva gia'
+/// abbandonato perche' i produttori scrivono anche `budget_exhausted` o `API key
+/// non valida`, e su quelle il turno diceva "attendi qualche istante" a un utente
+/// che invece doveva ricaricare o correggere le credenziali. La `reason` resta
+/// SOLO nell'elenco mostrato, che e' il suo unico mestiere.
+fn cooldown_note_from_snapshot(
+    snap: &[crate::provider_cooldown::CooldownEntry],
+) -> Option<String> {
+    use crate::provider_cooldown::CooldownSeverity;
     if snap.is_empty() {
         return None;
     }
     let mut parts: Vec<String> = Vec::new();
     let mut any_billing = false;
-    for (name, secs, reason) in snap {
-        let r = reason.as_deref().unwrap_or("");
-        let rl = r.to_lowercase();
-        if rl.contains("credit")
-            || rl.contains("quota")
-            || rl.contains("billing")
-            || rl.contains("balance")
-        {
+    for e in snap {
+        if matches!(e.severity, Some(CooldownSeverity::Long)) {
             any_billing = true;
         }
+        let r = e.reason.as_deref().unwrap_or("");
         if r.is_empty() {
-            let mins = secs.div_ceil(60);
-            parts.push(format!("{} (~{} min)", name, mins));
+            let mins = e.remaining_seconds.div_ceil(60);
+            parts.push(format!("{} (~{} min)", e.provider, mins));
         } else {
-            parts.push(format!("{} ({})", name, r));
+            parts.push(format!("{} ({})", e.provider, r));
         }
     }
     let list = parts.join(", ");
@@ -570,10 +583,19 @@ fn looks_like_textual_tool_call(s: &str) -> bool {
 }
 
 /// True se il testo e' composto SOLO da blocchi `[Error: ...]` concatenati
-/// (formato fisso nostro: i provider impacchettano cosi' gli errori). Incidente
-/// run 2c6e41fb: final_answer = "[Error: An assistant message with][Error:
-/// Unexpected tool call id ...]..." — gli errori della cascade erano diventati
-/// la "risposta" di un run completed. Strutturale, zero semantica.
+/// (formato fisso nostro: `error_completion_value` /
+/// `error_agent_turn_value_inner` in `orchestrator::neural_client` impacchettano
+/// cosi' ogni errore del gateway). Incidente run 2c6e41fb: final_answer =
+/// "[Error: An assistant message with][Error: Unexpected tool call id ...]..." —
+/// gli errori della cascade erano diventati la "risposta" di un run completed.
+///
+/// RIPIEGO DICHIARATO, non il criterio: e' un ramo di
+/// [`is_provider_error_answer`], che a sua volta si applica solo dopo il campo
+/// tipizzato `provider_error_close` (vedi [`answer_is_provider_error_residue`]).
+/// Copre i run STORICI, chiusi prima che quel campo esistesse, e la
+/// concatenazione della cascade, che nasce fuori dall'executor e quindi non
+/// passa da quel campo. Riconoscimento di FORMA (il wrapper e' nostro, a
+/// delimitatori fissi), mai semantica del messaggio.
 fn is_only_provider_errors(s: &str) -> bool {
     let mut rest = s.trim();
     if !rest.starts_with("[Error:") {
@@ -596,7 +618,7 @@ pub(crate) fn compose_turn_answer(result: &crate::agent_types::AgentRunResult) -
     match result.final_answer.as_deref() {
         // Tool call colata nel testo o soli errori provider come "risposta":
         // non e' una risposta. Recap deterministico (o nota cooldown/placeholder).
-        Some(s) if looks_like_textual_tool_call(s) || is_only_provider_errors(s) => {
+        Some(s) if looks_like_textual_tool_call(s) || answer_is_provider_error_residue(result, s) => {
             build_action_recap(&result.steps)
                 .or_else(|| cooldown_exhaustion_note(result))
                 .or_else(|| {
@@ -1780,10 +1802,17 @@ pub(crate) async fn native_outcome_to_run_result(
         nexus_task_type: outcome.user_intent,
         hollow_completion,
         hollow_no_tools: false,
-        hollow_completion_kind: if hollow_completion {
-            "EMPTY_ANSWER+NO_TOOLS".to_string()
+        // L'hollow del grafo nativo e' per costruzione entrambe le cose: nessun
+        // corpo di risposta E nessuno step eseguito (vedi il calcolo qui sopra).
+        hollow_causes: if hollow_completion {
+            [
+                crate::agent_types::HollowCause::EmptyAnswer,
+                crate::agent_types::HollowCause::NoTools,
+            ]
+            .into_iter()
+            .collect()
         } else {
-            String::new()
+            Default::default()
         },
         // FIX D4: reasoning accumulato dal grafo nativo (reasoning_acc dello stato).
         reasoning: outcome.reasoning,
@@ -1848,8 +1877,33 @@ fn compose_unconfirmed_report(
 /// ancora il testo. Un run nuovo che passasse SOLO da questa funzione (segnale
 /// strutturato assente/false) e testo comunque marcato sarebbe un difetto nel
 /// produttore (`executor::gestisci_errore_gateway`), non un caso da coprire qui.
+///
+/// I wrapper riconosciuti sono DUE, entrambi nostri e a delimitatore fisso:
+/// `[Errore provider ...]` (sintesi dell'executor) e la concatenazione di
+/// `[Error: ...]` della cascade ([`is_only_provider_errors`]). Stavano in due
+/// funzioni scollegate, con la conseguenza che il gemello STRUTTURATO
+/// [`is_provider_error_completion`] conosceva solo il primo: un run chiuso
+/// `completed` la cui unica risposta era la pila di errori della cascade restava
+/// "completato con successo".
 fn is_provider_error_answer(answer: &str) -> bool {
-    answer.trim_start().starts_with("[Errore provider")
+    answer.trim_start().starts_with("[Errore provider") || is_only_provider_errors(answer)
+}
+
+/// True se la `final_answer` non e' una risposta ma il residuo degli errori del
+/// gateway. Punto unico (regola L) della domanda "questo testo va sostituito dal
+/// recap deterministico?", posta dal finalizzatore dello spawn e dal resume.
+///
+/// Ordine dei criteri (regola M/Q): PRIMA il campo tipizzato
+/// `provider_error_close`, che l'executor scrive alla FONTE nel turno in cui il
+/// gateway e' caduto; POI, e solo come ripiego DICHIARATO, il riconoscimento del
+/// wrapper testuale. Prima l'unica prova era il wrapper: un contratto tenuto per
+/// copia fra due crate dentro un campo di DISPLAY, che una riformulazione del
+/// messaggio avrebbe rotto in silenzio.
+fn answer_is_provider_error_residue(
+    result: &crate::agent_types::AgentRunResult,
+    answer: &str,
+) -> bool {
+    result.provider_error_close || is_provider_error_answer(answer)
 }
 
 /// True se il run, pur risultando `Completed`, e' in realta' un fallimento per
@@ -1870,11 +1924,11 @@ fn is_provider_error_answer(answer: &str) -> bool {
 pub(crate) fn is_provider_error_completion(result: &crate::agent_types::AgentRunResult) -> bool {
     matches!(result.status, crate::agent_types::AgentRunStatus::Completed)
         && result.completion_tokens == 0
-        && (result.provider_error_close
-            || result
-                .final_answer
-                .as_deref()
-                .is_some_and(is_provider_error_answer))
+        // La disgiunzione "segnale strutturato OPPURE fallback sul testo" vive in
+        // UN posto solo (regola L): ricopiarla qui significherebbe che aggiungere
+        // un segnale nuovo lo farebbe leggere a un chiamante e non all'altro,
+        // ed e' precisamente il modo in cui i due erano gia' divergibili.
+        && answer_is_provider_error_residue(result, result.final_answer.as_deref().unwrap_or(""))
 }
 
 /// Totali aggregati dal ledger di billing (`ai_usage_ledger`) per un singolo
@@ -2085,7 +2139,7 @@ pub(crate) fn native_engine_failure_result(
         stop_reason: Some("error".to_string()),
         hollow_completion: false,
         hollow_no_tools: false,
-        hollow_completion_kind: String::new(),
+        hollow_causes: Default::default(),
         // Fallimento del motore nativo: nessun reasoning utile (FIX D4).
         reasoning: None,
         // Fallimento prima di produrre una conversazione: nessun messages_json.
@@ -3366,19 +3420,25 @@ fn empty_response_excerpt(raw: &str, max_bytes: usize) -> String {
     }
 }
 
-/// Causa sospetta del completamento vuoto, dedotta dal `kind` STRUTTURATO
-/// dell'esito (regola M) e non dal testo della risposta.
-fn suspected_empty_cause(kind: &str, raw: &str) -> &'static str {
-    match kind {
-        "EMPTY_ANSWER" | "EMPTY_ANSWER+NO_TOOLS" => {
-            if raw.trim().is_empty() {
-                "empty_completion_unknown"
-            } else {
-                "empty_after_text"
-            }
+/// Causa sospetta del completamento vuoto, dalle cause STRUTTURATE dell'esito
+/// (regola M) e non dal testo della risposta. Prima interrogava la stringa
+/// concatenata elencandone le combinazioni ammesse (`"EMPTY_ANSWER"` |
+/// `"EMPTY_ANSWER+NO_TOOLS"`): una terza causa avrebbe raddoppiato quei rami.
+fn suspected_empty_cause(
+    causes: &std::collections::BTreeSet<crate::agent_types::HollowCause>,
+    raw: &str,
+) -> &'static str {
+    use crate::agent_types::HollowCause;
+    if causes.contains(&HollowCause::EmptyAnswer) {
+        if raw.trim().is_empty() {
+            "empty_completion_unknown"
+        } else {
+            "empty_after_text"
         }
-        "NO_TOOLS" => "no_tool_calls",
-        _ => "unknown",
+    } else if causes.contains(&HollowCause::NoTools) {
+        "no_tool_calls"
+    } else {
+        "unknown"
     }
 }
 
@@ -3423,7 +3483,10 @@ async fn log_empty_response_diagnostics(
     };
     let raw = result.final_answer.as_deref().unwrap_or("");
     let excerpt = empty_response_excerpt(raw, max_bytes);
-    let suspected = suspected_empty_cause(&result.hollow_completion_kind, raw);
+    let suspected = suspected_empty_cause(&result.hollow_causes, raw);
+    // Unico punto in cui le cause tornano a essere testo: il vocabolario storico
+    // della colonna (mig 0291), composto DAI campi.
+    let kind = crate::agent_types::hollow_kind_for_db(&result.hollow_causes);
     let _ = sqlx::query(
         r#"
         INSERT INTO nexus_provider_empty_responses
@@ -3440,11 +3503,7 @@ async fn log_empty_response_diagnostics(
     .bind(&result.provider)
     .bind(&result.model)
     .bind(intent)
-    .bind(if result.hollow_completion_kind.is_empty() {
-        "UNKNOWN"
-    } else {
-        result.hollow_completion_kind.as_ref()
-    })
+    .bind(&kind)
     .bind(result.iteration_count as i32)
     .bind(result.steps.len() as i32)
     .bind(raw.len() as i32)
@@ -3696,14 +3755,16 @@ fn spawn_canonical_run_status(
 ) -> crate::agent_types::AgentRunStatus {
     let hollow_no_work = report_hollow
         && result.steps.is_empty()
-        && result.hollow_completion_kind.contains("EMPTY_ANSWER");
+        && result
+            .hollow_causes
+            .contains(&crate::agent_types::HollowCause::EmptyAnswer);
     let provider_error_close = is_provider_error_completion(result);
     if hollow_no_work {
         tracing::warn!(
             "agent_run {}: hollow senza lavoro ({}) — status declassato \
              completed -> failed_diagnosed (esito certo)",
             run_id,
-            result.hollow_completion_kind
+            crate::agent_types::hollow_kind_for_db(&result.hollow_causes)
         );
         crate::agent_types::AgentRunStatus::FailedDiagnosed
     } else if provider_error_close {
@@ -6433,10 +6494,54 @@ pub(crate) fn is_code_file(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Unico tool capace di EMETTERE un verdetto aggregato di panel: il batch
+/// `dispatch_subagents` lo compone col punto unico `compose_panel_verdict` dagli
+/// esiti strutturati dei sub-run. Il dispatch singolare non lo produce mai.
+const REVIEW_PANEL_TOOL: &str = "dispatch_subagents";
+
+/// True se QUESTO step e' l'emissione di un panel di review.
+///
+/// La domanda "il run e' gia' passato dalla review?" ha due segnali strutturati:
+/// il NOME del tool (colonna gia' letta dalla query) e la CHIAVE `panel_verdict`
+/// nel JSON che quel tool ha restituito. Prima bastava che la sequenza di
+/// caratteri `panel_verdict` comparisse in un tool_result QUALUNQUE: un
+/// `read_file` o un `run_command` su un sorgente che nomina il campo (questo
+/// stesso file, o `subagent_native.rs`) marcava il run come gia' revisionato, e
+/// il gate saltava la review con `ReviewSkipReason::AlreadyReviewed`.
+///
+/// Forma del dato persistito: `{"content": "<json del tool>", "status": ...}`.
+/// L'involucro lo costruisce `persist_turn_steps` con serde DOPO il troncamento,
+/// quindi e' sempre JSON valido; il `content` invece puo' essere stato troncato
+/// testa+coda. Se il content non e' piu' JSON, il ripiego DICHIARATO e' la
+/// presenza della chiave `"panel_verdict"` nella coda preservata — dentro
+/// l'output di quel SOLO tool, mai in un testo qualunque.
+pub(crate) fn step_emits_review_panel(tool_name: &str, tool_result: Option<&str>) -> bool {
+    if tool_name != REVIEW_PANEL_TOOL {
+        return false;
+    }
+    let Some(raw) = tool_result else {
+        return false;
+    };
+    let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let content = match wrapper.get("content") {
+        Some(serde_json::Value::String(s)) => s.as_str(),
+        // Forma gia' strutturata (nessun involucro-stringa): chiave letta diretta.
+        Some(v) => return v.get("panel_verdict").is_some(),
+        None => return false,
+    };
+    match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(v) => v.get("panel_verdict").is_some(),
+        Err(_) => content.contains("\"panel_verdict\""),
+    }
+}
+
 /// Segnali strutturati dagli step del run (regola M, MAI dalla prosa): file di
 /// CODICE modificati + se un panel di review e' GIA' stato prodotto. Il tool reale
 /// e' annidato in `agent_steps.tool_input` (`{tool_name, tool_input:{path}}`); la
-/// presenza di un panel si legge dal `panel_verdict` nel tool_result del fan-in.
+/// presenza di un panel la decide [`step_emits_review_panel`] dal nome del tool
+/// e dalla chiave strutturata del suo risultato.
 pub(crate) async fn review_gate_signals(pool: &PgPool, run_id: Uuid) -> (Vec<String>, bool) {
     use sqlx::Row;
     const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "create_file", "patch_file"];
@@ -6462,11 +6567,11 @@ pub(crate) async fn review_gate_signals(pool: &PgPool, run_id: Uuid) -> (Vec<Str
             }
         }
         if !reviewed {
-            if let Some(res) = r.try_get::<Option<String>, _>("tool_result").ok().flatten() {
-                if res.contains("panel_verdict") {
-                    reviewed = true;
-                }
-            }
+            let res = r
+                .try_get::<Option<String>, _>("tool_result")
+                .ok()
+                .flatten();
+            reviewed = step_emits_review_panel(&tname, res.as_deref());
         }
     }
     (modified, reviewed)
@@ -7129,6 +7234,75 @@ mod tests_review_gate {
             assert!(!is_code_file(no), "atteso NON codice: {no}");
         }
     }
+
+    /// Il tool_result di `dispatch_subagents` COME LO PERSISTE la produzione:
+    /// il contenuto e' `out.to_string()` del tool, l'involucro e' quello che
+    /// `tool_dispatch::persist_turn_steps` costruisce con serde
+    /// (`{content, status}`). Il `panel_verdict` nasce dal PRODUTTORE vero
+    /// (`compose_panel_verdict` + `PanelOutcome::to_value`), non da un letterale
+    /// scritto a mano: se il campo cambiasse nome, il test lo seguirebbe.
+    fn step_di_panel() -> String {
+        use nexus_agent_graph::decisions::{compose_panel_verdict, QuorumPolicy};
+        let outcomes = vec![json!({
+            "review": { "verdict": "pass", "findings": [] }
+        })];
+        let panel = compose_panel_verdict(&outcomes, &QuorumPolicy::default())
+            .expect("un outcome con `review` e' un panel");
+        let mut out = json!({ "count": 1, "ok": 1, "failed": 0, "results": [] });
+        out["panel_verdict"] = panel.to_value();
+        involucro_step(&out.to_string())
+    }
+
+    /// Involucro del tool_result come lo scrive `persist_turn_steps`.
+    fn involucro_step(content: &str) -> String {
+        json!({ "content": content, "status": "completed" }).to_string()
+    }
+
+    #[test]
+    fn panel_riconosciuto_solo_dal_tool_che_lo_emette() {
+        let step = step_di_panel();
+        assert!(
+            super::step_emits_review_panel("dispatch_subagents", Some(&step)),
+            "il batch che ha composto il verdetto E' la review gia' avvenuta"
+        );
+        // Stesso payload, tool diverso: non e' quel tool ad averlo emesso.
+        assert!(!super::step_emits_review_panel("read_file", Some(&step)));
+        assert!(!super::step_emits_review_panel("dispatch_subagent", Some(&step)));
+    }
+
+    #[test]
+    fn lettura_di_un_sorgente_che_nomina_il_campo_non_e_una_review() {
+        // Il difetto reale: `read_file` su un file di questo repo che contiene la
+        // parola `panel_verdict` marcava il run come gia' revisionato e il gate
+        // saltava la review.
+        let lettura = involucro_step(
+            "if let Some(panel) = compose_panel_verdict(&outcomes, &policy) {\n\
+             out[\"panel_verdict\"] = panel.to_value();\n}",
+        );
+        assert!(!super::step_emits_review_panel("read_file", Some(&lettura)));
+        assert!(!super::step_emits_review_panel("run_command", Some(&lettura)));
+    }
+
+    #[test]
+    fn batch_di_soli_worker_non_e_una_review() {
+        // `compose_panel_verdict` non aggiunge nulla se nessun sub-run ha
+        // dichiarato un `review`: lo stesso tool, senza panel, non e' una review.
+        let out = json!({ "count": 2, "ok": 2, "failed": 0, "results": [] });
+        let step = involucro_step(&out.to_string());
+        assert!(!super::step_emits_review_panel("dispatch_subagents", Some(&step)));
+        assert!(!super::step_emits_review_panel("dispatch_subagents", None));
+    }
+
+    #[test]
+    fn content_troncato_resta_riconosciuto_dal_ripiego_dichiarato() {
+        // Il troncamento testa+coda avviene PRIMA della persistenza: il content
+        // non e' piu' JSON, ma la coda conserva la chiave. L'involucro invece e'
+        // sempre JSON valido (lo scrive serde dopo il troncamento).
+        let step = involucro_step(
+            "{\"count\":1,\n[...troncato: 90000 char totali...]\n\"panel_verdict\":{\"verdict\":\"fail\"}}",
+        );
+        assert!(super::step_emits_review_panel("dispatch_subagents", Some(&step)));
+    }
 }
 
 
@@ -7198,7 +7372,7 @@ mod tests_finalize_turn {
         steps: Vec<AgentStep>,
         final_answer: Option<&str>,
         hollow_completion: bool,
-        hollow_kind: &str,
+        hollow_causes: &[crate::agent_types::HollowCause],
         task_type: Option<&str>,
     ) -> AgentRunResult {
         AgentRunResult {
@@ -7225,7 +7399,7 @@ mod tests_finalize_turn {
             nexus_task_type: task_type.map(str::to_string),
             hollow_completion,
             hollow_no_tools: false,
-            hollow_completion_kind: hollow_kind.into(),
+            hollow_causes: hollow_causes.iter().copied().collect(),
             reasoning: None,
             messages_json: None,
         }
@@ -7277,7 +7451,7 @@ mod tests_finalize_turn {
             vec![],
             None,
             true,
-            "EMPTY_ANSWER",
+            &[crate::agent_types::HollowCause::EmptyAnswer],
             Some("fix"),
         );
         assert_eq!(canonical_run_status(&r), AgentRunStatus::FailedDiagnosed);
@@ -7289,7 +7463,65 @@ mod tests_finalize_turn {
             vec![],
             Some("non posso"),
             true,
-            "",
+            &[],
+            Some("fix"),
+        );
+        assert_eq!(canonical_run_status(&r2), AgentRunStatus::Completed);
+    }
+
+    #[test]
+    fn cause_hollow_sono_un_insieme_non_una_stringa_concatenata() {
+        use crate::agent_types::{hollow_kind_for_db, HollowCause};
+        use std::collections::BTreeSet;
+        // L'ordine con cui il produttore le dichiara non e' un dato: l'insieme e'
+        // normalizzato, quindi due consumatori non possono divergere per come le
+        // cause erano state concatenate.
+        let a: BTreeSet<_> = [HollowCause::NoTools, HollowCause::EmptyAnswer]
+            .into_iter()
+            .collect();
+        let b: BTreeSet<_> = [HollowCause::EmptyAnswer, HollowCause::NoTools]
+            .into_iter()
+            .collect();
+        assert_eq!(a, b);
+        // Il testo si compone DAI campi, e solo per la colonna storica.
+        assert_eq!(hollow_kind_for_db(&a), "EMPTY_ANSWER+NO_TOOLS");
+        assert_eq!(hollow_kind_for_db(&BTreeSet::new()), "UNKNOWN");
+        // Prima i due consumatori dello stesso campo si ponevano la domanda in
+        // due modi incompatibili: `suspected_empty_cause` faceva match sulle
+        // combinazioni ESATTE della stringa, `canonical_run_status` cercava una
+        // SOTTOSTRINGA. Sullo stesso insieme di cause scritto in ordine inverso
+        // ("NO_TOOLS+EMPTY_ANSWER") il primo cadeva su "unknown" e il secondo
+        // declassava comunque: una diagnosi persa per l'ordine di una join.
+        assert_eq!(
+            super::suspected_empty_cause(&a, ""),
+            "empty_completion_unknown"
+        );
+        assert_eq!(super::suspected_empty_cause(&a, "testo"), "empty_after_text");
+        let solo_tool: BTreeSet<_> = [HollowCause::NoTools].into_iter().collect();
+        assert_eq!(super::suspected_empty_cause(&solo_tool, ""), "no_tool_calls");
+        assert_eq!(super::suspected_empty_cause(&BTreeSet::new(), ""), "unknown");
+    }
+
+    #[test]
+    fn status_declassato_dalla_causa_non_dall_ordine_di_dichiarazione() {
+        use crate::agent_types::HollowCause;
+        // Cause dichiarate nell'ordine "sbagliato": lo status non se ne accorge.
+        let r = mk_result(
+            AgentRunStatus::Completed,
+            vec![],
+            None,
+            true,
+            &[HollowCause::NoTools, HollowCause::EmptyAnswer],
+            Some("fix"),
+        );
+        assert_eq!(canonical_run_status(&r), AgentRunStatus::FailedDiagnosed);
+        // Solo NoTools, con una risposta: non e' il "run muto senza lavoro".
+        let r2 = mk_result(
+            AgentRunStatus::Completed,
+            vec![],
+            Some("ecco cosa ho trovato"),
+            true,
+            &[HollowCause::NoTools],
             Some("fix"),
         );
         assert_eq!(canonical_run_status(&r2), AgentRunStatus::Completed);
@@ -7303,7 +7535,7 @@ mod tests_finalize_turn {
             vec![write_step()],
             None,
             true,
-            "EMPTY_ANSWER",
+            &[crate::agent_types::HollowCause::EmptyAnswer],
             Some("fix"),
         );
         assert_eq!(canonical_run_status(&r), AgentRunStatus::Completed);
@@ -7333,7 +7565,7 @@ mod tests_finalize_turn {
                  Interrotto dopo 10 iterazioni. Lavoro svolto finora: 15 azioni.",
             ),
             false,
-            "",
+            &[],
             Some("agentic_default"),
         );
         assert!(is_provider_error_completion(&r));
@@ -7352,7 +7584,7 @@ mod tests_finalize_turn {
             vec![write_step()],
             Some("Fornitore momentaneamente non disponibile, riprova piu' tardi."),
             false,
-            "",
+            &[],
             Some("agentic_default"),
         );
         r.provider_error_close = true;
@@ -7371,7 +7603,7 @@ mod tests_finalize_turn {
             vec![write_step()],
             Some("Ho completato il task con successo."),
             false,
-            "",
+            &[],
             Some("agentic_default"),
         );
         r.provider_error_close = false;
@@ -7388,7 +7620,7 @@ mod tests_finalize_turn {
             vec![write_step()],
             Some("[Errore provider x: transiente, ma poi ho risposto]"),
             false,
-            "",
+            &[],
             Some("agentic_default"),
         );
         r.completion_tokens = 10;
@@ -7403,7 +7635,7 @@ mod tests_finalize_turn {
             vec![write_step()],
             Some("Ho completato il task con successo."),
             false,
-            "",
+            &[],
             Some("agentic_default"),
         );
         r.completion_tokens = 42;
@@ -7419,7 +7651,7 @@ mod tests_finalize_turn {
             vec![],
             None,
             true,
-            "EMPTY_ANSWER",
+            &[crate::agent_types::HollowCause::EmptyAnswer],
             Some("chat"),
         );
         assert_eq!(canonical_run_status(&r), AgentRunStatus::Completed);
@@ -7433,7 +7665,7 @@ mod tests_finalize_turn {
             vec![write_step()],
             None,
             true,
-            "EMPTY_ANSWER",
+            &[crate::agent_types::HollowCause::EmptyAnswer],
             Some("fix"),
         );
         let msg = compose_turn_answer(&r).expect("recap atteso");
@@ -7447,7 +7679,7 @@ mod tests_finalize_turn {
             vec![],
             None,
             true,
-            "EMPTY_ANSWER",
+            &[crate::agent_types::HollowCause::EmptyAnswer],
             Some("fix"),
         );
         let msg2 = compose_turn_answer(&r2).expect("placeholder atteso");
@@ -7461,7 +7693,7 @@ mod tests_finalize_turn {
             vec![],
             Some("Ecco il risultato."),
             false,
-            "",
+            &[],
             Some("fix"),
         );
         assert_eq!(compose_turn_answer(&r).unwrap(), "Ecco il risultato.");
@@ -7476,7 +7708,7 @@ mod tests_finalize_turn {
             vec![],
             None,
             false,
-            "",
+            &[],
             Some("chat"),
         );
         assert!(compose_turn_answer(&r).is_none());
@@ -7495,7 +7727,7 @@ mod tests_finalize_turn {
             vec![write_step()],
             None,
             false,
-            "",
+            &[],
             Some("fix"),
         );
         let msg = compose_turn_answer(&r).expect("recap atteso anche se non-hollow");
@@ -7527,7 +7759,7 @@ mod tests_finalize_turn {
             vec![write_step()],
             Some(raw),
             false,
-            "",
+            &[],
             Some("fix"),
         );
         let msg = compose_turn_answer(&r).expect("recap atteso");
@@ -7541,11 +7773,34 @@ mod tests_finalize_turn {
         );
     }
 
+    /// I blocchi `[Error: ...]` come li scrive il PRODUTTORE vero
+    /// (`neural_client::error_agent_turn_value`, il turno d'errore del gateway),
+    /// concatenati come nella cascade del run 2c6e41fb. Comporre la stringa a
+    /// mano fisserebbe proprio la forma del wrapper che si vuole verificare
+    /// (regola O): se il produttore cambiasse delimitatore, il test lo seguirebbe.
+    fn errori_di_cascade_concatenati(errori: &[&str]) -> String {
+        errori
+            .iter()
+            .map(|e| {
+                crate::orchestrator::neural_client::error_agent_turn_value("mistral", "large", e)
+                    ["content"]
+                    .as_str()
+                    .expect("il turno d'errore porta il content testuale")
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
     #[test]
     fn soli_errori_provider_rilevati_e_sostituiti() {
         // Caso reale run 2c6e41fb: final_answer = concatenazione di 422 Mistral.
-        let raw = "[Error: An assistant message with][Error: Unexpected tool call id FbW0bLZsv in tool results][Error: An assistant message with]";
-        assert!(super::is_only_provider_errors(raw));
+        let raw = errori_di_cascade_concatenati(&[
+            "An assistant message with",
+            "Unexpected tool call id FbW0bLZsv in tool results",
+            "An assistant message with",
+        ]);
+        assert!(super::is_only_provider_errors(&raw));
         // Risposte legittime (anche se citano errori) NON matchano.
         assert!(!super::is_only_provider_errors(
             "Il build fallisce con [Error: x]"
@@ -7556,14 +7811,74 @@ mod tests_finalize_turn {
         let r = mk_result(
             AgentRunStatus::Completed,
             vec![write_step()],
-            Some(raw),
+            Some(raw.as_str()),
             false,
-            "",
+            &[],
             Some("fix"),
         );
         let msg = compose_turn_answer(&r).expect("recap atteso");
         assert!(msg.contains("a.ts"), "recap deterministico atteso: {msg}");
         assert!(!msg.contains("FbW0bLZsv"), "niente errori grezzi: {msg}");
+    }
+
+    #[test]
+    fn pila_di_errori_come_risposta_declassa_il_run_a_failed() {
+        // L'estensione del gemello STRUTTURATO: `is_provider_error_completion`
+        // conosceva solo il marker `[Errore provider` dell'executor, quindi un run
+        // chiuso `completed` la cui unica risposta era la pila di errori della
+        // cascade (0 completion_tokens) restava un successo. Ora i due wrapper
+        // stanno nello stesso ripiego dichiarato e il verdetto e' uno solo.
+        let raw = errori_di_cascade_concatenati(&[
+            "An assistant message with",
+            "Unexpected tool call id FbW0bLZsv in tool results",
+        ]);
+        let r = mk_result(
+            AgentRunStatus::Completed,
+            vec![write_step()],
+            Some(raw.as_str()),
+            false,
+            &[],
+            Some("agentic_default"),
+        );
+        assert_eq!(r.completion_tokens, 0, "premessa: nessun output prodotto");
+        assert!(is_provider_error_completion(&r));
+        assert_eq!(canonical_run_status(&r), AgentRunStatus::Failed);
+    }
+
+    #[test]
+    fn residuo_di_errori_riconosciuto_dal_campo_tipizzato_senza_wrapper() {
+        // Criterio PRIMARIO: il campo che l'executor scrive alla fonte. Il testo
+        // qui NON porta alcun wrapper nostro (una riformulazione del messaggio, o
+        // un produttore che non lo impacchetta): senza il campo, quella risposta
+        // finirebbe in chat come se fosse il risultato del lavoro.
+        let mut r = mk_result(
+            AgentRunStatus::Completed,
+            vec![write_step()],
+            Some("Fornitore momentaneamente non disponibile, riprova piu' tardi."),
+            false,
+            &[],
+            Some("fix"),
+        );
+        r.provider_error_close = true;
+        let msg = compose_turn_answer(&r).expect("recap atteso");
+        assert!(msg.contains("a.ts"), "recap deterministico atteso: {msg}");
+        assert!(
+            !msg.contains("momentaneamente"),
+            "il residuo d'errore non va mostrato come risposta: {msg}"
+        );
+    }
+
+    /// Snapshot REALE limitato ai provider di un singolo test. Le entry nascono
+    /// dai PRODUTTORI veri (`put_provider_in_long_cooldown` /
+    /// `put_provider_in_short_cooldown`), non da tuple scritte a mano: la
+    /// `severity` e' quella che il registro ha davvero memorizzato, quindi il
+    /// test misura la catena produttore -> snapshot -> nota. Lo stato del modulo
+    /// e' globale: ogni test usa nomi provider propri (prefisso `__test_`).
+    fn snapshot_di(providers: &[&str]) -> Vec<crate::provider_cooldown::CooldownEntry> {
+        crate::provider_cooldown::cooldown_snapshot_entries()
+            .into_iter()
+            .filter(|e| providers.contains(&e.provider.as_str()))
+            .collect()
     }
 
     #[test]
@@ -7576,19 +7891,14 @@ mod tests_finalize_turn {
     fn cooldown_note_billing_dice_ricarica() {
         // Provider buoni in cooldown per credito/quota -> messaggio ONESTO che
         // indica la causa reale e l'azione, non "completamento vuoto".
-        let snap = vec![
-            (
-                "anthropic".to_string(),
-                300u64,
-                Some("credit balance too low".to_string()),
-            ),
-            (
-                "openai".to_string(),
-                250u64,
-                Some("you exceeded your current quota".to_string()),
-            ),
-        ];
-        let msg = super::cooldown_note_from_snapshot(&snap).expect("nota attesa");
+        let a = "__test_nota_billing_alfa";
+        let b = "__test_nota_billing_beta";
+        crate::provider_cooldown::put_provider_in_long_cooldown(a, "credit balance too low");
+        crate::provider_cooldown::put_provider_in_long_cooldown(
+            b,
+            "you exceeded your current quota",
+        );
+        let msg = super::cooldown_note_from_snapshot(&snapshot_di(&[a, b])).expect("nota attesa");
         assert!(
             msg.contains("quota/credito esaurito"),
             "deve indicare la causa billing: {msg}"
@@ -7598,16 +7908,19 @@ mod tests_finalize_turn {
             "deve suggerire la ricarica: {msg}"
         );
         assert!(
-            msg.contains("anthropic") && msg.contains("openai"),
+            msg.contains(a) && msg.contains(b),
             "deve elencare i provider: {msg}"
         );
+        crate::provider_cooldown::remove_cooldown(a);
+        crate::provider_cooldown::remove_cooldown(b);
     }
 
     #[test]
     fn cooldown_note_non_billing_dice_attendi() {
         // Cooldown transitorio (rate-limit) -> "attendi", NON "ricarica".
-        let snap = vec![("mistral".to_string(), 60u64, Some("rate limit".to_string()))];
-        let msg = super::cooldown_note_from_snapshot(&snap).expect("nota attesa");
+        let p = "__test_nota_transiente";
+        crate::provider_cooldown::put_provider_in_short_cooldown(p, "rate limit", 60);
+        let msg = super::cooldown_note_from_snapshot(&snapshot_di(&[p])).expect("nota attesa");
         assert!(
             msg.contains("temporaneamente non disponibili"),
             "non-billing -> attendi: {msg}"
@@ -7616,6 +7929,48 @@ mod tests_finalize_turn {
             !msg.contains("Ricarica"),
             "non deve dire ricarica per rate-limit: {msg}"
         );
+        crate::provider_cooldown::remove_cooldown(p);
+    }
+
+    #[test]
+    fn cooldown_note_billing_riconosciuto_su_reason_senza_parole_inglesi() {
+        // Il difetto: la nota ri-classificava il cooldown cercando
+        // credit/quota/billing/balance nella `reason`. Nessuna delle due reason
+        // qui sotto contiene una di quelle parole — sono le stesse che il modulo
+        // provider_cooldown ha gia' misurato come reali (budget mensile esaurito
+        // e auth_error in italiano) — eppure entrambe vengono da
+        // put_provider_in_long_cooldown, quindi il credito NON torna da solo e
+        // "attendi qualche istante" sarebbe un consiglio falso.
+        let a = "__test_nota_budget_esaurito";
+        let b = "__test_nota_chiave_non_valida";
+        crate::provider_cooldown::put_provider_in_long_cooldown(a, "budget_exhausted");
+        crate::provider_cooldown::put_provider_in_long_cooldown(b, "API key non valida");
+        let msg = super::cooldown_note_from_snapshot(&snapshot_di(&[a, b])).expect("nota attesa");
+        assert!(
+            msg.contains("Ricarica"),
+            "severita' REGISTRATA Long -> nota di credito, qualunque sia il testo: {msg}"
+        );
+        crate::provider_cooldown::remove_cooldown(a);
+        crate::provider_cooldown::remove_cooldown(b);
+    }
+
+    #[test]
+    fn cooldown_note_transiente_non_diventa_billing_per_una_parola_nel_testo() {
+        // Direzione opposta: la reason di un cooldown BREVE nomina la quota, ma
+        // il provider rientra da solo in 60s. Decidere dal testo direbbe
+        // "ricarica i crediti" per un rate-limit passeggero.
+        let p = "__test_nota_transiente_che_nomina_quota";
+        crate::provider_cooldown::put_provider_in_short_cooldown(
+            p,
+            "rate limit: quota della finestra da 1 minuto",
+            60,
+        );
+        let msg = super::cooldown_note_from_snapshot(&snapshot_di(&[p])).expect("nota attesa");
+        assert!(
+            !msg.contains("Ricarica"),
+            "severita' REGISTRATA Short -> attesa, non ricarica: {msg}"
+        );
+        crate::provider_cooldown::remove_cooldown(p);
     }
 
     #[test]
@@ -7631,29 +7986,26 @@ mod tests_finalize_turn {
             vec![],
             None,
             true,
-            "EMPTY_ANSWER",
+            &[crate::agent_types::HollowCause::EmptyAnswer],
             Some("fix"),
         );
         r.provider = "google".into();
         r.model = "gemini-2.5-flash".into();
         r.error_class = None; // 200 vuoto: nessuna classe errore strutturata
-        let snap = vec![
-            (
-                "openai".to_string(),
-                250u64,
-                Some("you exceeded your current quota".to_string()),
-            ),
-            (
-                "anthropic".to_string(),
-                300u64,
-                Some("credit balance too low".to_string()),
-            ),
-        ];
-        assert!(
-            super::cooldown_note_for_turn(&snap, &r).is_none(),
-            "il turno fallito per empty_completion di google NON deve produrre la \
-             nota cooldown che incolpa openai/anthropic"
+        let a = "__test_gate_ortogonale_alfa";
+        let b = "__test_gate_ortogonale_beta";
+        crate::provider_cooldown::put_provider_in_long_cooldown(
+            a,
+            "you exceeded your current quota",
         );
+        crate::provider_cooldown::put_provider_in_long_cooldown(b, "credit balance too low");
+        assert!(
+            super::cooldown_note_for_turn(&snapshot_di(&[a, b]), &r).is_none(),
+            "il turno fallito per empty_completion di google NON deve produrre la \
+             nota cooldown che incolpa provider ortogonali"
+        );
+        crate::provider_cooldown::remove_cooldown(a);
+        crate::provider_cooldown::remove_cooldown(b);
     }
 
     #[test]
@@ -7666,27 +8018,25 @@ mod tests_finalize_turn {
             vec![],
             None,
             false,
-            "",
+            &[],
             None,
         );
-        let snap = vec![
-            (
-                "openai".to_string(),
-                250u64,
-                Some("you exceeded your current quota".to_string()),
-            ),
-            (
-                "anthropic".to_string(),
-                300u64,
-                Some("credit balance too low".to_string()),
-            ),
-        ];
-        let msg = super::cooldown_note_for_turn(&snap, &r).expect("nota attesa su ProviderUnavailable");
+        let a = "__test_gate_unavailable_alfa";
+        let b = "__test_gate_unavailable_beta";
+        crate::provider_cooldown::put_provider_in_long_cooldown(
+            a,
+            "you exceeded your current quota",
+        );
+        crate::provider_cooldown::put_provider_in_long_cooldown(b, "credit balance too low");
+        let msg = super::cooldown_note_for_turn(&snapshot_di(&[a, b]), &r)
+            .expect("nota attesa su ProviderUnavailable");
         assert!(msg.contains("Ricarica"), "billing -> ricarica: {msg}");
         assert!(
-            msg.contains("openai") && msg.contains("anthropic"),
+            msg.contains(a) && msg.contains(b),
             "deve elencare tutti i provider indisponibili: {msg}"
         );
+        crate::provider_cooldown::remove_cooldown(a);
+        crate::provider_cooldown::remove_cooldown(b);
     }
 
     #[test]
@@ -7694,27 +8044,31 @@ mod tests_finalize_turn {
         // Il provider DEL TURNO (openai) ha colpito un billing_error strutturato:
         // la nota e' pertinente ma va FILTRATA a openai, non deve trascinare
         // anthropic (in cooldown per motivi propri, ortogonali).
-        let mut r = mk_result(AgentRunStatus::Failed, vec![], None, false, "", None);
-        r.provider = "openai".into();
+        let coinvolto = "__test_gate_filtro_coinvolto";
+        let estraneo = "__test_gate_filtro_estraneo";
+        let mut r = mk_result(AgentRunStatus::Failed, vec![], None, false, &[], None);
+        r.provider = coinvolto.into();
         r.error_class = Some("billing_error".into());
-        let snap = vec![
-            (
-                "openai".to_string(),
-                250u64,
-                Some("you exceeded your current quota".to_string()),
-            ),
-            (
-                "anthropic".to_string(),
-                300u64,
-                Some("credit balance too low".to_string()),
-            ),
-        ];
-        let msg = super::cooldown_note_for_turn(&snap, &r).expect("nota attesa per billing del turno");
-        assert!(msg.contains("openai"), "deve nominare il provider del turno: {msg}");
+        crate::provider_cooldown::put_provider_in_long_cooldown(
+            coinvolto,
+            "you exceeded your current quota",
+        );
+        crate::provider_cooldown::put_provider_in_long_cooldown(
+            estraneo,
+            "credit balance too low",
+        );
+        let msg = super::cooldown_note_for_turn(&snapshot_di(&[coinvolto, estraneo]), &r)
+            .expect("nota attesa per billing del turno");
         assert!(
-            !msg.contains("anthropic"),
+            msg.contains(coinvolto),
+            "deve nominare il provider del turno: {msg}"
+        );
+        assert!(
+            !msg.contains(estraneo),
             "NON deve nominare provider ortogonali al turno: {msg}"
         );
+        crate::provider_cooldown::remove_cooldown(coinvolto);
+        crate::provider_cooldown::remove_cooldown(estraneo);
     }
 
     #[test]
@@ -7728,7 +8082,7 @@ mod tests_finalize_turn {
             vec![write_step()],
             Some("fatto"),
             false,
-            "",
+            &[],
             Some("fix"),
         );
         assert_eq!(r.total_cost, 0.0);
@@ -7766,7 +8120,7 @@ mod tests_finalize_turn {
             vec![write_step()],
             Some("fatto"),
             false,
-            "",
+            &[],
             Some("fix"),
         );
         r.total_cost = 0.033842; // costo del solo ultimo turno
@@ -7802,7 +8156,7 @@ mod tests_finalize_turn {
             vec![write_step()],
             Some("fatto"),
             false,
-            "",
+            &[],
             Some("fix"),
         );
         r.total_cost = 0.02;
@@ -7829,7 +8183,7 @@ mod tests_finalize_turn {
             vec![write_step()],
             Some("fatto"),
             false,
-            "",
+            &[],
             Some("fix"),
         );
         r.prompt_tokens = 500;
@@ -7868,7 +8222,7 @@ mod tests_finalize_turn {
             vec![write_step()],
             Some("fatto"),
             false,
-            "",
+            &[],
             Some("fix"),
         );
         r.last_prompt_tokens = Some(42_000);
@@ -7904,7 +8258,7 @@ mod tests_finalize_turn {
             vec![write_step()],
             Some("fatto"),
             false,
-            "",
+            &[],
             Some("fix"),
         );
         let ledger = super::LedgerTotals {
@@ -8284,7 +8638,7 @@ mod tests_native_mapping {
             "un piano concluso con lavoro non e' hollow: il declassamento a \
              failed_diagnosed marcherebbe 'fallito' un run che ha fatto tutto"
         );
-        assert!(r.hollow_completion_kind.is_empty());
+        assert!(r.hollow_causes.is_empty());
         // Recap dai dati: il run non resta muto in chat.
         let ans = r.final_answer.expect("recap del dispatcher");
         assert!(ans.contains("Piano completato"), "recap inatteso: {ans}");
@@ -8321,7 +8675,9 @@ mod tests_native_mapping {
 
         let r = native_outcome_to_run_result(&pool, run, outcome).await;
         assert!(r.hollow_completion, "run senza piano: detection invariata");
-        assert!(r.hollow_completion_kind.contains("EMPTY_ANSWER"));
+        assert!(r
+            .hollow_causes
+            .contains(&crate::agent_types::HollowCause::EmptyAnswer));
     }
 
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
@@ -8810,7 +9166,19 @@ mod tests_native_mapping {
         let r = native_outcome_to_run_result(&pool, run, o).await;
         assert!(r.final_answer.is_none());
         assert!(r.hollow_completion, "risposta vuota + 0 step -> hollow");
-        assert_eq!(r.hollow_completion_kind, "EMPTY_ANSWER+NO_TOOLS");
+        // Le due cause insieme; il testo storico della colonna diagnostica si
+        // compone DA loro, non e' piu' il dato.
+        assert_eq!(
+            r.hollow_causes.iter().copied().collect::<Vec<_>>(),
+            vec![
+                crate::agent_types::HollowCause::EmptyAnswer,
+                crate::agent_types::HollowCause::NoTools
+            ]
+        );
+        assert_eq!(
+            crate::agent_types::hollow_kind_for_db(&r.hollow_causes),
+            "EMPTY_ANSWER+NO_TOOLS"
+        );
         assert_eq!(
             canonical_run_status(&r),
             AgentRunStatus::FailedDiagnosed,
@@ -8830,7 +9198,7 @@ mod tests_native_mapping {
         // Risposta presente -> non hollow.
         let r = native_outcome_to_run_result(&pool, run, outcome_base()).await;
         assert!(!r.hollow_completion);
-        assert_eq!(r.hollow_completion_kind, "");
+        assert!(r.hollow_causes.is_empty());
         assert_eq!(canonical_run_status(&r), AgentRunStatus::Completed);
         // Interrupt HITL (final_answer assente ma run NON concluso) -> non hollow.
         let mut o = outcome_base();

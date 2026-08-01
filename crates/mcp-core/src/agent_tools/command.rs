@@ -3,6 +3,7 @@
 use super::*;
 // Punto unico (regola L) di derivazione nome DB progetto e settings cluster app.
 use crate::project_db_routes::load_app_db_setting;
+use nexus_types::tool_outcome::RispostaTool;
 
 /// Durata del "probe" per rilevare comandi long-running non noti.
 /// Se il processo non termina entro questo tempo, viene killato e ri-lanciato nel terminale.
@@ -258,9 +259,13 @@ async fn maybe_route_to_service(
     // ── Livello 1: parametro background esplicito dall'AI ──
     if explicit_bg {
         let routed = service::tool_run_service(ctx, input, "service").await;
-        return Some(format!(
-            "[Background] Comando avviato come servizio server-side (background=true).\n{}",
-            routed
+        // La premessa NON deve coprire l'esito del tool inoltrato: `run_service`
+        // dichiara ancora il fallimento col marker in TESTA, e una concatenazione
+        // nuda lo spingerebbe in mezzo al testo rendendo un avvio fallito
+        // indistinguibile da uno riuscito (punto unico regola L).
+        return Some(nexus_types::tool_outcome::prepend_preserving_failure(
+            "[Background] Comando avviato come servizio server-side (background=true).",
+            &routed,
         ));
     }
 
@@ -274,10 +279,10 @@ async fn maybe_route_to_service(
         || service::looks_like_web_service(command)
     {
         let routed = service::tool_run_service(ctx, input, "service").await;
-        return Some(format!(
+        return Some(nexus_types::tool_outcome::prepend_preserving_failure(
             "[Auto-routing] Comando long-running/web-service rilevato: avviato come servizio \
-             server-side (PORT allocata nel bucket del progetto).\n{}",
-            routed
+             server-side (PORT allocata nel bucket del progetto).",
+            &routed,
         ));
     }
     None
@@ -308,17 +313,40 @@ fn resolve_work_dir(ctx: &AgentToolContext, input: &Value) -> Result<PathBuf, St
     }
 }
 
-pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> String {
+/// Ricostruisce l'esito di un ramo che INOLTRA il risultato di un tool ancora
+/// legacy (routing a run_service, comandi privilegiati, guardie di sicurezza):
+/// il loro unico canale d'esito e' il marker nel testo, quindi qui il ponte e'
+/// l'unica lettura onesta di cio' che hanno dichiarato. Sparisce quando quei
+/// tool porteranno il proprio esito in un campo.
+fn inoltro_legacy(testo: String) -> RispostaTool {
+    RispostaTool::da_testo_legacy(testo)
+}
+
+/// Compone il testo del ramo di rifiuto anteponendo gli hint DB-driven, se ce
+/// ne sono. Il testo e' testo (regola Q): l'esito lo dichiara il campo di
+/// [`RispostaTool`], quindi comporre qui non puo' nascondere nulla — che e'
+/// esattamente cio' che accadeva quando il fallimento viveva in testa alla
+/// stringa.
+fn con_hint(hints_prefix: &str, testo: String) -> String {
+    let hint = hints_prefix.trim_end();
+    if hint.is_empty() {
+        testo
+    } else {
+        format!("{hint}\n{testo}")
+    }
+}
+
+pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> RispostaTool {
     let command = match input.get("command").and_then(Value::as_str) {
         Some(s) => s.to_string(),
-        None => return "\u{274C} [Errore: parametro 'command' mancante]".to_string(),
+        None => return RispostaTool::fallito("[Errore: parametro 'command' mancante]"),
     };
     if command.trim().is_empty() {
-        return "\u{274C} [Errore: comando vuoto]".to_string();
+        return RispostaTool::fallito("[Errore: comando vuoto]");
     }
 
     if let Some(msg) = command_security_gate(ctx, &command).await {
-        return msg;
+        return inoltro_legacy(msg);
     }
 
     // Hints DB-driven + guardie di routing pre-esecuzione (privilegiato,
@@ -326,7 +354,7 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
     // Ok = prefisso hint da prependare al risultato finale.
     let hints_prefix = match command_hints_and_routing(ctx, input, &command).await {
         Ok(prefix) => prefix,
-        Err(msg) => return msg,
+        Err(risposta) => return risposta,
     };
 
     // Blocca la duplicazione working_dir + path nel comando PRIMA dell'esecuzione
@@ -335,26 +363,25 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
     // comando ripete quel segmento ('cd frontend', 'frontend/...') i path si
     // sommano e rm/install/build operano sulla dir sbagliata. Rifiutare qui evita
     // il danno silenzioso; il messaggio dice all'agente come correggere.
-    // Il rifiuto E' un fallimento del tool e deve dirlo col marker (regola M):
+    // Il rifiuto E' un fallimento del tool e lo dichiara nel CAMPO (regola Q):
     // il comando NON e' stato eseguito, quindi non esiste alcun exit code, e un
     // consumatore che vedesse solo l'assenza di exit code non potrebbe
     // distinguere "invocazione rifiutata" da "eseguito senza stato d'uscita".
     // Il final_gate fa esattamente quella domanda per decidere se un criterio e'
-    // fallito o non misurabile: senza marker, un criterio la cui invocazione e'
-    // stata rifiutata verrebbe ASSOLTO invece che rieseguito corretto.
+    // fallito o non misurabile: senza dichiarazione, un criterio la cui
+    // invocazione e' stata rifiutata verrebbe ASSOLTO invece che rieseguito
+    // corretto.
     if let Some(wd) = working_dir_param(input) {
         if let Some(msg) = super::helpers::detect_workdir_path_duplication(wd, &command) {
-            return nexus_types::tool_outcome::prepend_preserving_failure(
-                hints_prefix.trim_end(),
-                &nexus_types::tool_outcome::tool_failure(msg),
-            );
+            return RispostaTool::fallito(con_hint(&hints_prefix, msg));
         }
     }
 
     // ── Livello 3: probe timeout — esegui, se non finisce in 10s ri-lancia nel terminale ──
     let work_dir = match resolve_work_dir(ctx, input) {
         Ok(p) => p,
-        Err(msg) => return msg,
+        // Percorso invalido: il comando non parte, quindi nessun exit code.
+        Err(msg) => return RispostaTool::fallito(msg),
     };
 
     // Sezione critica dei package manager: due install concorrenti sulla stessa
@@ -362,12 +389,17 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
     // termine della funzione, quindi copre spawn + attesa.
     let _pkg_guard = match acquire_pkg_manager_slot(ctx.project_id, &command).await {
         Ok(g) => g,
-        Err(msg) => return format!("{hints_prefix}{msg}"),
+        // Attesa scaduta: il comando NON e' stato eseguito. E' lo stesso caso
+        // dell'invocazione rifiutata — fallimento dichiarato, nessun exit code
+        // — e prima non dichiarava nulla, cioe' passava per un comando la cui
+        // esecuzione non era misurabile.
+        Err(msg) => return RispostaTool::fallito(con_hint(&hints_prefix, msg)),
     };
 
     let child = match spawn_command_child(ctx, &command, &work_dir).await {
         Ok(c) => c,
-        Err(msg) => return msg,
+        // Il processo non e' nemmeno partito: nessuno stato d'uscita esiste.
+        Err(msg) => return RispostaTool::fallito(msg),
     };
 
     run_command_probe(ctx, input, &command, child, &hints_prefix).await
@@ -375,15 +407,19 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
 
 /// Calcola il prefisso hint DB-driven e applica le guardie di routing
 /// pre-esecuzione (comandi privilegiati → Sudo Manager, policy migration-only,
-/// background/long-running → run_service). Ritorna `Err(messaggio)` se il
+/// background/long-running → run_service). Ritorna `Err(risposta)` se il
 /// comando va instradato/bloccato (ritorno anticipato del chiamante), `Ok(prefix)`
-/// col prefisso hint se l'esecuzione in-line puo' proseguire. Estratto da
-/// `tool_run_command` (behavior-preserving).
+/// col prefisso hint se l'esecuzione in-line puo' proseguire.
+///
+/// L'`Err` porta gia' la [`RispostaTool`] e non il solo testo: ogni ramo sa se
+/// sta INOLTRANDO l'esito di un tool legacy (che va letto dal suo marker) o se
+/// sta RIFIUTANDO l'esecuzione in proprio (fallimento senza exit code). Con una
+/// stringa sola le due cose erano indistinguibili a valle.
 async fn command_hints_and_routing(
     ctx: &AgentToolContext,
     input: &Value,
     command: &str,
-) -> Result<String, String> {
+) -> Result<String, RispostaTool> {
     // ── Suite Playwright: ha un solo esecutore (punto unico regola L,
     // playwright_cli) ──────────────────────────────────────────────────────
     // Prima di ogni altra guardia di QUESTA funzione, che decidono COME
@@ -395,7 +431,7 @@ async fn command_hints_and_routing(
         super::playwright_cli::intercetta_suite(ctx, NOME_TOOL, command, working_dir_param(input))
             .await
     {
-        return Err(out);
+        return Err(inoltro_legacy(out));
     }
 
     // ── Command hints (migration 0230) ──────────────────────────────────────
@@ -414,17 +450,28 @@ async fn command_hints_and_routing(
     // arbitrario), lo instradiamo al gestore privilegiato controllato. Il sudo
     // arbitrario riceve un messaggio guida. Punto unico: privileged.rs (regola L).
     if let Some(routed) = super::privileged::try_route_privileged_command(ctx, command).await {
-        return Err(format!("{}{}", hints_prefix, routed));
+        // L'esito si legge PRIMA di comporre: `privileged` e' ancora legacy e
+        // dichiara il proprio fallimento col marker in testa, che una premessa
+        // anteposta annullerebbe. Composta la premessa nel campo `testo`,
+        // l'esito e' un dato e non si puo' piu' perdere.
+        let r = inoltro_legacy(routed);
+        return Err(RispostaTool {
+            testo: con_hint(&hints_prefix, r.testo),
+            ..r
+        });
     }
 
+    // Policy migration-only: l'esecuzione e' NEGATA qui, non altrove. E' un
+    // rifiuto del tool — fallimento dichiarato, nessun exit code — e non un
+    // comando andato bene senza stato d'uscita, che e' come il gate lo leggeva.
     if let Some(msg) = migration_only_block(ctx, command).await {
-        return Err(msg);
+        return Err(RispostaTool::fallito(msg));
     }
 
     // ── Livelli 1-2: routing a run_service (background esplicito o comando noto
     // long-running/web-service). Se instradato ritorna il messaggio; None = prosegue. ──
     if let Some(msg) = maybe_route_to_service(ctx, input, command).await {
-        return Err(msg);
+        return Err(inoltro_legacy(msg));
     }
 
     Ok(hints_prefix)
@@ -442,7 +489,7 @@ async fn run_command_probe(
     command: &str,
     mut child: tokio::process::Child,
     hints_prefix: &str,
-) -> String {
+) -> RispostaTool {
     // Drain stdout/stderr IN PARALLELO con child.wait() (evita deadlock pipe ~64KB).
     let (stdout_task, stderr_task) = spawn_output_drainers(&mut child);
 
@@ -468,7 +515,9 @@ async fn run_command_probe(
             format_command_completed(ctx, command, exit_code, &stdout, &stderr, hints_prefix).await
         }
         Ok(Err(e)) => {
-            format!("\u{274C} [Errore attesa comando '{}': {}]", command, e)
+            // L'attesa del processo e' fallita: nessuno stato d'uscita e'
+            // osservabile, e il tool lo dichiara invece di tacere.
+            RispostaTool::fallito(format!("[Errore attesa comando '{}': {}]", command, e))
         }
         Err(_) => {
             // Probe timeout.
@@ -515,9 +564,10 @@ async fn spawn_command_child(
         .map_err(|e| format!("\u{274C} [Errore avvio comando '{}': {}]", command, e))
 }
 
-/// Compone l'output finale di `run_command` per un comando terminato entro il
-/// probe: hint semantico + registrazione Playwright + troncamento testa+coda
-/// DB-driven. Estratto da `tool_run_command` (behavior-preserving).
+/// Compone l'esito finale di `run_command` per un comando terminato entro il
+/// probe. L'unico I/O e' il cap di troncamento (DB-driven, regola G): la
+/// composizione vera e' pura e vive in [`componi_esito_comando`], cosi' e'
+/// interrogabile senza montare un DB.
 async fn format_command_completed(
     ctx: &AgentToolContext,
     command: &str,
@@ -525,7 +575,32 @@ async fn format_command_completed(
     stdout: &str,
     stderr: &str,
     hints_prefix: &str,
-) -> String {
+) -> RispostaTool {
+    let max_chars = load_run_command_max_chars(&ctx.db).await;
+    componi_esito_comando(command, exit_code, stdout, stderr, hints_prefix, max_chars)
+}
+
+/// L'esito di un comando ESEGUITO: lo stato d'uscita nel CAMPO, il resto nel
+/// testo.
+///
+/// Il testo RIPETE `EXIT CODE: N` perche' e' informazione utile al modello che
+/// legge il tool_result, non perche' qualcuno debba ri-estrarla: chi decide
+/// legge `RispostaTool::exit_code`. La differenza non e' estetica — il prefisso
+/// hint viene da `nexus_command_hints`, testo scritto dall'admin, e un hint che
+/// citi "EXIT CODE: 0" precede il valore vero nella stringa: qualunque lettura
+/// posizionale del testo (il `find` del ponte legacy) prenderebbe il primo, cioe'
+/// quello dell'hint.
+///
+/// L'esito resta `Riuscito` anche con `exit_code != 0`: il tool ha fatto il suo
+/// lavoro, il comando no, e sono due assi distinti (vedi `RispostaTool::comando`).
+fn componi_esito_comando(
+    command: &str,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+    hints_prefix: &str,
+    max_chars: usize,
+) -> RispostaTool {
     // Con `pipefail` (vedi helpers::shell_line) una pipeline riporta il primo
     // stadio fallito. Se il consumatore a valle chiude presto (`... | head -N`)
     // il produttore muore di SIGPIPE e la pipeline riporterebbe 141: non e' un
@@ -549,13 +624,14 @@ async fn format_command_completed(
     // perdere la coda con gli ultimi errori + il totale, inducendo l'agente a
     // ri-eseguire il build per "vedere gli altri errori" (loop razionale).
     // Cap DB-driven (regola G), default 16000 >= cap brain cosi' mcp-core non e'
-    // mai il collo di bottiglia che decapita la coda prima del brain.
-    let max_chars = load_run_command_max_chars(&ctx.db).await;
-    if combined.chars().count() > max_chars {
+    // mai il collo di bottiglia che decapita la coda prima del brain. Tagliare
+    // il testo non puo' toccare l'esito, che vive in un campo a parte.
+    let testo = if combined.chars().count() > max_chars {
         smart_truncate_test_output(&combined, max_chars)
     } else {
         combined
-    }
+    };
+    RispostaTool::comando(testo, exit_code)
 }
 
 /// Costruisce l'hint semantico da appendere all'output di `run_command` in base
@@ -585,8 +661,22 @@ fn command_result_hint(exit_code: i32, stdout: &str, stderr: &str, command: &str
 
 /// Gestisce il timeout del probe di `run_command`: gli one-shot (install/build)
 /// segnalano il timeout perche' NON sono server long-running; gli altri vengono
-/// re-instradati a run_service. Estratto da `tool_run_command`
-/// (behavior-preserving).
+/// re-instradati a run_service.
+///
+/// Nessuno dei due rami ha un exit code da riportare — il processo e' stato
+/// UCCISO, uno stato d'uscita non e' mai esistito — e la differenza fra loro sta
+/// nell'esito, non nel testo:
+///
+/// - il timeout di un one-shot e' un FALLIMENTO dichiarato: il build/install non
+///   e' arrivato in fondo, e il gate deve poterlo bocciare. Finche' questo ramo
+///   non dichiarava nulla, un criterio di verifica che sforava il probe risultava
+///   "non misurato", cioe' ASSOLVEVA un build mai terminato;
+/// - il re-instradamento a servizio e' invece riuscito se il servizio e' partito:
+///   il comando non ha un esito perche' non doveva averne uno, e un criterio
+///   costruito su un dev-server resta onestamente NON misurato. Se pero'
+///   `run_service` fallisce, quel fallimento e' del tool e deve arrivare a valle
+///   — prima la premessa "[Auto-probe] ..." lo spingeva fuori dalla testa della
+///   stringa e nessuno lo vedeva piu'.
 async fn command_probe_timeout_result(
     ctx: &AgentToolContext,
     input: &Value,
@@ -594,27 +684,32 @@ async fn command_probe_timeout_result(
     is_oneshot: bool,
     probe_secs: u64,
     hints_prefix: &str,
-) -> String {
+) -> RispostaTool {
     if is_oneshot {
         // One-shot (install/build) che non finisce nemmeno in probe_secs:
         // NON è un server long-running -> NON instradare a run_service
         // (semantica errata + su Windows il wizard setsid/nohup è rotto).
         // Segnala il timeout così l'agente può spezzare il comando.
-        format!(
-            "{}[Timeout] Il comando '{}' non è terminato in {}s ed è stato interrotto. \
-             Se è un build/install legittimo molto lungo, eseguilo per passi.",
+        RispostaTool::fallito(con_hint(
             hints_prefix,
-            command.chars().take(120).collect::<String>(),
-            probe_secs
-        )
+            format!(
+                "[Timeout] Il comando '{}' non è terminato in {}s ed è stato interrotto. \
+                 Se è un build/install legittimo molto lungo, eseguilo per passi.",
+                command.chars().take(120).collect::<String>(),
+                probe_secs
+            ),
+        ))
     } else {
         // Long-running non-one-shot (dev server, watcher) → run_service.
         let routed = service::tool_run_service(ctx, input, "service").await;
-        format!(
-            "[Auto-probe] Il comando non è terminato in {}s — rilevato come long-running.\n\
-             Processo server-side terminato e ri-lanciato come servizio.\n{}",
-            probe_secs, routed
-        )
+        inoltro_legacy(nexus_types::tool_outcome::prepend_preserving_failure(
+            format!(
+                "[Auto-probe] Il comando non è terminato in {}s — rilevato come long-running.\n\
+                 Processo server-side terminato e ri-lanciato come servizio.",
+                probe_secs
+            ),
+            &routed,
+        ))
     }
 }
 
@@ -1184,12 +1279,18 @@ mod tests {
         let ctx = crate::test_support::ctx_di_tool_test(dir.path().to_path_buf());
         let out = tool_run_command(&ctx, &serde_json::json!({"command": "npx playwright test"})).await;
         assert!(
-            out.contains(MARCA_ESECUTORE),
-            "la suite deve passare dall'esecutore unico, output: {out}"
+            out.testo.contains(MARCA_ESECUTORE),
+            "la suite deve passare dall'esecutore unico, output: {}",
+            out.testo
         );
         assert!(
-            !out.contains("EXIT CODE:"),
-            "run_command non deve aver eseguito la riga in proprio: {out}"
+            !out.testo.contains("EXIT CODE:"),
+            "run_command non deve aver eseguito la riga in proprio: {}",
+            out.testo
+        );
+        assert_eq!(
+            out.exit_code, None,
+            "nessun comando eseguito qui -> nessuno stato d'uscita da riportare"
         );
     }
 
@@ -1226,14 +1327,20 @@ mod tests {
             &serde_json::json!({"command": "npm ci && npx playwright test"}),
         )
         .await;
-        assert!(out.starts_with('\u{274C}'), "deve essere un errore: {out}");
         assert!(
-            out.contains("run_playwright_tests"),
-            "il rifiuto deve indirizzare all'esecutore unico: {out}"
+            out.esito.e_fallito(),
+            "deve essere un errore dichiarato nel campo: {}",
+            out.testo
         );
         assert!(
-            !out.contains("EXIT CODE:") && !out.contains(MARCA_ESECUTORE),
-            "ne' eseguita qui ne' delegata a meta': {out}"
+            out.testo.contains("run_playwright_tests"),
+            "il rifiuto deve indirizzare all'esecutore unico: {}",
+            out.testo
+        );
+        assert!(
+            !out.testo.contains("EXIT CODE:") && !out.testo.contains(MARCA_ESECUTORE),
+            "ne' eseguita qui ne' delegata a meta': {}",
+            out.testo
         );
     }
 
@@ -1263,6 +1370,97 @@ mod tests {
                 "non e' una suite e non va deviato al runner: {riga}"
             );
         }
+    }
+
+    /// Il probe che scade su un one-shot DICHIARA il fallimento e NON inventa
+    /// uno stato d'uscita.
+    ///
+    /// E' il caso che assolveva un build mai terminato: il ramo non scriveva
+    /// ne' `EXIT CODE:` ne' alcuna dichiarazione, quindi a valle
+    /// `exit_code = None` e `is_error = false`, e il final_gate calcola
+    /// `esito_misurato = exit_code.is_some() || is_error` — falso, cioe'
+    /// "criterio NON misurato", che nel gate non boccia nulla.
+    ///
+    /// Si passa dal PRODUTTORE del ramo (`command_probe_timeout_result`, quello
+    /// che `run_command_probe` chiama allo scadere) e dall'adapter REALE che
+    /// alimenta il gate (`map_result_to_outcome`): un timeout vero costerebbe
+    /// `LONG_ONESHOT_PROBE_SECS` secondi di attesa, e ricostruire a mano la
+    /// risposta fisserebbe proprio l'assunto da verificare.
+    ///
+    /// MUTAZIONE: si riporta il ramo a `RispostaTool::riuscito(...)` (cioe' a non
+    /// dichiarare nulla, com'era) -> il test rosseggia su `esito_misurato` falso.
+    #[tokio::test]
+    async fn timeout_del_probe_e_un_fallimento_misurato_senza_exit_code() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = crate::test_support::ctx_di_tool_test(dir.path().to_path_buf());
+        let risposta = command_probe_timeout_result(
+            &ctx,
+            &serde_json::json!({"command": "npm install"}),
+            "npm install",
+            true,
+            LONG_ONESHOT_PROBE_SECS,
+            "",
+        )
+        .await;
+
+        assert_eq!(
+            risposta.exit_code, None,
+            "il processo e' stato ucciso: uno stato d'uscita non e' mai esistito"
+        );
+        let outcome =
+            crate::agent_graph_adapter::tool_executor::map_result_to_outcome("c", risposta);
+        // La coppia esatta che `criteria_runner::check_run_command` legge.
+        let esito_misurato = outcome.exit_code.is_some() || outcome.is_error;
+        assert!(
+            esito_misurato,
+            "un build interrotto dal probe deve risultare MISURATO (e fallito), \
+             non 'non misurato': content={:?}",
+            outcome.content
+        );
+        assert!(
+            outcome
+                .content
+                .as_str()
+                .is_some_and(|t| t.contains("[Timeout]")),
+            "il testo resta la guida per l'agente: {:?}",
+            outcome.content
+        );
+    }
+
+    /// Lo stato d'uscita sta nel CAMPO, e il testo non puo' contraddirlo.
+    ///
+    /// Il prefisso hint viene da `nexus_command_hints` (testo scritto
+    /// dall'admin) e PRECEDE l'output del comando: una lettura posizionale del
+    /// testo — `find("EXIT CODE: ")`, cioe' il ponte legacy — prende quella
+    /// dell'hint. Il test lo dimostra chiedendo la stessa cosa nei due modi e
+    /// mostrando che danno risposte diverse.
+    ///
+    /// Si passa dal compositore REALE (`componi_esito_comando`, quello che
+    /// `format_command_completed` chiama dopo aver letto il cap dal DB).
+    ///
+    /// MUTAZIONE: si costruisce la risposta con `RispostaTool::da_testo_legacy`
+    /// invece che con `comando(testo, exit_code)` -> il test rosseggia con
+    /// `Some(0)` al posto di `Some(1)`, cioe' col valore del difetto reale.
+    #[test]
+    fn l_exit_code_viene_dal_campo_non_dal_testo_dell_hint() {
+        let hint = "[HINT — ERROR] (pattern: `tsc`)\nSe vedi EXIT CODE: 0 ma il build \
+                    fallisce, controlla il bundler.\n\n---\n";
+        let risposta = componi_esito_comando("pnpm build", 1, "", "error TS2322", hint, 16000);
+
+        assert_eq!(
+            risposta.exit_code,
+            Some(1),
+            "l'exit code e' quello del processo, non quello citato dall'hint"
+        );
+        assert_eq!(
+            nexus_types::tool_outcome::RispostaTool::da_testo_legacy(risposta.testo.clone())
+                .exit_code,
+            Some(0),
+            "premessa del test: leggendo il TESTO si ottiene il numero dell'hint, \
+             ed e' la ragione per cui l'esito non puo' viaggiare li'"
+        );
+        // Il comando e' fallito, il tool no: due assi distinti.
+        assert!(!risposta.esito.e_fallito());
     }
 
     /// Genera un output di build sintetico con N errori in ordine e il totale

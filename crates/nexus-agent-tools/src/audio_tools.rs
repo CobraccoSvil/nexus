@@ -63,10 +63,7 @@ pub async fn tool_nexus_transcribe_audio(ctx: &ToolContextCore, input: &Value) -
     {
         Some(id) => id,
         None => {
-            return json!({
-                "error": "Parametro 'attachment_id' obbligatorio (UUID valido)."
-            })
-            .to_string();
+            return crate::errore_json("Parametro 'attachment_id' obbligatorio (UUID valido).");
         }
     };
     let language = input
@@ -78,44 +75,42 @@ pub async fn tool_nexus_transcribe_audio(ctx: &ToolContextCore, input: &Value) -
     // 1) Lookup allegato (scoped al project_id corrente, regola E).
     let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
         Ok(r) => r,
-        Err(e) => return json!({ "error": e }).to_string(),
+        Err(e) => return crate::errore_json(e),
     };
 
     // 2) Inspect: deve essere audio_*.
     let header = match read_header(&record.file_path).await {
         Ok(h) => h,
-        Err(e) => return json!({ "error": e }).to_string(),
+        Err(e) => return crate::errore_json(e),
     };
     let (kind, mime_reale, _ext) = detect_kind(&header, &record.file_name, &record.mime_type);
     if !is_audio_kind(&kind) {
-        return json!({
+        return crate::errore_json_con_dettagli(json!({
             "error": format!(
                 "L'allegato non e' un audio (kind rilevato: '{}'). Usa il tool di estrazione corretto per quel kind.",
                 kind
             ),
             "kind": kind,
-        })
-        .to_string();
+        }));
     }
 
     // 3) Limite size dal DB (no fallback nascosto: default safe documentato).
     let max_bytes = audio_max_bytes(&ctx.db).await;
     if record.size_bytes < 0 || (record.size_bytes as usize) > max_bytes {
-        return json!({
+        return crate::errore_json_con_dettagli(json!({
             "error": format!(
                 "Audio troppo grande ({} byte, limite {} byte). Configura 'agent.attachment.audio_max_bytes' in settings se devi alzare il limite.",
                 record.size_bytes, max_bytes
             ),
             "size_bytes": record.size_bytes,
             "max_bytes": max_bytes,
-        })
-        .to_string();
+        }));
     }
 
     // 4) Leggi e codifica base64 (il gateway invia il binario come multipart).
     let bytes = match tokio::fs::read(&record.file_path).await {
         Ok(b) => b,
-        Err(e) => return json!({ "error": format!("read fallita: {e}") }).to_string(),
+        Err(e) => return crate::errore_json(format!("read fallita: {e}")),
     };
     let audio_base64 = B64.encode(&bytes);
 
@@ -125,14 +120,11 @@ pub async fn tool_nexus_transcribe_audio(ctx: &ToolContextCore, input: &Value) -
     let (provider, model) = match resolve_purpose_via_http(&ctx.db, AUDIO_PURPOSE).await {
         Ok(pm) => pm,
         Err(e) => {
-            return json!({
-                "error": format!(
-                    "modello audio-in non risolvibile (purpose '{AUDIO_PURPOSE}'): {e}. \
-                     Verifica nexus_purpose_model.transcribe_audio (mig 0480) e che un modello \
-                     audio-in sia abilitato nel catalog."
-                )
-            })
-            .to_string();
+            return crate::errore_json(format!(
+                "modello audio-in non risolvibile (purpose '{AUDIO_PURPOSE}'): {e}. \
+                 Verifica nexus_purpose_model.transcribe_audio (mig 0480) e che un modello \
+                 audio-in sia abilitato nel catalog."
+            ));
         }
     };
 
@@ -157,10 +149,7 @@ pub async fn tool_nexus_transcribe_audio(ctx: &ToolContextCore, input: &Value) -
     {
         Ok(r) => r,
         Err(e) => {
-            return json!({
-                "error": format!("trascrizione audio via gateway fallita: {e}")
-            })
-            .to_string();
+            return crate::errore_json(format!("trascrizione audio via gateway fallita: {e}"));
         }
     };
 
@@ -221,21 +210,19 @@ async fn audio_max_bytes(db: &sqlx::PgPool) -> usize {
 pub async fn tool_nexus_text_to_speech(ctx: &ToolContextCore, input: &Value) -> String {
     // 1) Permesso di scrittura obbligatorio: il tool PRODUCE un file su disco.
     if !ctx.can_write {
-        return json!({
-            "error": "Permesso di scrittura non concesso: impossibile salvare l'audio \
-                      generato su disco. Esegui in una modalita' che consente la scrittura file."
-        })
-        .to_string();
+        return crate::errore_json(
+            "Permesso di scrittura non concesso: impossibile salvare l'audio \
+             generato su disco. Esegui in una modalita' che consente la scrittura file.",
+        );
     }
 
     // 2) Testo obbligatorio + parametri opzionali.
     let text = match input.get("text").and_then(Value::as_str).map(str::trim) {
         Some(t) if !t.is_empty() => t.to_string(),
         _ => {
-            return json!({
-                "error": "Parametro 'text' obbligatorio (testo da convertire in audio)."
-            })
-            .to_string();
+            return crate::errore_json(
+                "Parametro 'text' obbligatorio (testo da convertire in audio).",
+            );
         }
     };
     let voice = input
@@ -254,14 +241,11 @@ pub async fn tool_nexus_text_to_speech(ctx: &ToolContextCore, input: &Value) -> 
     let (provider, model) = match resolve_purpose_via_http(&ctx.db, TTS_PURPOSE).await {
         Ok(pm) => pm,
         Err(e) => {
-            return json!({
-                "error": format!(
+            return crate::errore_json(format!(
                     "modello audio-out non risolvibile (purpose '{TTS_PURPOSE}'): {e}. \
                      Verifica nexus_purpose_model.text_to_speech (mig 0481) e che un modello \
                      audio-out sia abilitato nel catalog."
-                )
-            })
-            .to_string();
+                ));
         }
     };
 
@@ -290,10 +274,7 @@ pub async fn tool_nexus_text_to_speech(ctx: &ToolContextCore, input: &Value) -> 
     {
         Ok(r) => r,
         Err(e) => {
-            return json!({
-                "error": format!("sintesi vocale via gateway fallita: {e}")
-            })
-            .to_string();
+            return crate::errore_json(format!("sintesi vocale via gateway fallita: {e}"));
         }
     };
 
@@ -301,15 +282,14 @@ pub async fn tool_nexus_text_to_speech(ctx: &ToolContextCore, input: &Value) -> 
     let bytes = match B64.decode(result.audio_base64.trim()) {
         Ok(b) => b,
         Err(e) => {
-            return json!({ "error": format!("decodifica audio base64 fallita: {e}") }).to_string();
+            return crate::errore_json(format!("decodifica audio base64 fallita: {e}"));
         }
     };
     if bytes.is_empty() {
-        return json!({
+        return crate::errore_json_con_dettagli(json!({
             "error": "il gateway ha restituito un audio vuoto.",
             "model_used": result.model_used,
-        })
-        .to_string();
+        }));
     }
 
     // 6) Estensione coerente col MIME reale (fallback al formato richiesto).
@@ -318,7 +298,7 @@ pub async fn tool_nexus_text_to_speech(ctx: &ToolContextCore, input: &Value) -> 
     // 7) Salva path-safe sotto la project_root.
     let audio_path = match save_audio(&ctx.root_path, &bytes, filename, ext).await {
         Ok(p) => p,
-        Err(e) => return json!({ "error": format!("salvataggio audio fallito: {e}") }).to_string(),
+        Err(e) => return crate::errore_json(format!("salvataggio audio fallito: {e}")),
     };
 
     json!({

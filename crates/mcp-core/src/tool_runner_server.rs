@@ -294,18 +294,16 @@ pub(crate) fn resolve_ctx_root(session_root: PathBuf, override_root: Option<&Pat
     }
 }
 
-/// Estrae l'exit code dal testo "EXIT CODE: N" emesso da run_command &c.
-/// (formato CONTROLLATO da noi in agent_tools/command.rs — questo e' un parser
-/// del nostro stesso output, non un'euristica sul testo del modello). Punto
-/// unico Rust della traduzione testo->strutturato: prima ogni consumer Python
-/// ri-parsava la stringa con regex (`EXIT CODE: N`); ora il valore viaggia
-/// strutturato nel proto (contratto dati A, censimento 2026-06-10).
+/// Estrae l'exit code dal testo "EXIT CODE: N" emesso dai tool comando.
 ///
-/// `pub(crate)`: riusato dall'adapter `ToolExecutor` del grafo Rust
-/// (`agent_graph_adapter::tool_executor`) per estrarre lo stesso `exit_code`
-/// strutturato sia in Real (dal risultato di `execute_agent_tool`) sia in Replay
-/// (dal `tool_result` riletto da `agent_steps`). Un solo parser (regola L).
-pub(crate) fn extract_exit_code(result: &str) -> Option<i32> {
+/// RESIDUO, e solo per il payload CACHEATO: li' l'unica cosa conservata e' il
+/// testo di un risultato passato, e l'exit code non ha altro posto da cui essere
+/// letto. Chi esegue davvero un comando non passa piu' di qui — `run_command`
+/// porta lo stato d'uscita nel campo `RispostaTool::exit_code` (regola Q), e
+/// leggerlo dal testo era fragile in un modo misurabile: `find` restituisce la
+/// PRIMA occorrenza, e il prefisso hint (testo di `nexus_command_hints`,
+/// editabile dall'admin) precede il valore vero.
+fn extract_exit_code(result: &str) -> Option<i32> {
     let marker = "EXIT CODE: ";
     let start = result.find(marker)? + marker.len();
     let rest = &result[start..];

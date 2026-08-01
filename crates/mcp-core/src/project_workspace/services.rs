@@ -2246,38 +2246,64 @@ fn resolve_service_ancestor(
     None
 }
 
-/// Socket TCP in ascolto via `Get-NetTCPConnection` → (porta, pid, programma).
+/// Socket TCP in ascolto via `GetExtendedTcpTable` → (porta, pid, programma),
+/// con l'esito DICHIARATO: letto per intero, oppure non interrogabile.
 ///
 /// PUNTO UNICO Windows (regola L) per "chi ascolta su quale porta": usato sia
-/// dal pannello Servizi sia da `port_recovery::listening_ports` (che prima del
-/// dispatch #[cfg(windows)] ritornava SEMPRE vuoto su Windows, lasciando ciechi
-/// try_free_port / scan_bucket_orphans / guardia RefuseActive — incidente
-/// Beaty-Book 2026-07-02, node orfani + EADDRINUSE ricorrente). Il nome
-/// programma (Get-Process, una sola enumerazione) serve alle euristiche
+/// dal pannello Servizi sia da `port_recovery::scan_listening_ports` (che prima
+/// del dispatch #[cfg(windows)] ritornava SEMPRE vuoto su Windows, lasciando
+/// ciechi try_free_port / scan_bucket_orphans / guardia RefuseActive —
+/// incidente Beaty-Book 2026-07-02, node orfani + EADDRINUSE ricorrente). Il
+/// nome programma (una sola fotografia Toolhelp32) serve alle euristiche
 /// `looks_like_server_process` per adozione/cleanup orfani.
+///
+/// La fotografia dei processi NON e' un motivo di fallimento: senza di essa i
+/// nomi restano vuoti, ma le coppie (porta, pid) — l'unica cosa su cui si
+/// decide qualcosa di distruttivo — sono state osservate lo stesso.
 #[cfg(windows)]
-pub(crate) async fn windows_listening_ports() -> Vec<(u16, u32, String)> {
+pub(crate) async fn windows_scan_listening_ports(
+) -> crate::project_workspace::port_recovery::ListenerScan {
+    use crate::project_workspace::port_recovery::ListenerScan;
+
     // Syscall (GetExtendedTcpTable + Toolhelp32) invece di due interpreti
     // PowerShell: misurati 6.7s per `Get-NetTCPConnection`+`Get-Process`, contro
     // millisecondi qui. Il costo non era un dettaglio di efficienza: il
     // `port_enforcer` scandisce ogni 5s con timeout 10s, e quei probe da soli
     // (9.9s in due) mandavano in timeout OGNI iterazione -- l'enforcement delle
     // porte non e' mai girato (33 "iterazione abortita" nei log del 26/07).
-    tokio::task::spawn_blocking(|| {
+    let letta = tokio::task::spawn_blocking(|| {
+        let socket = crate::process_util::windows_listening_sockets()?;
         let processi = crate::process_util::windows_process_snapshot();
-        crate::process_util::windows_listening_sockets()
-            .into_iter()
-            .map(|(porta, pid)| {
-                let nome = processi
-                    .get(&pid)
-                    .map(|p| p.name.clone())
-                    .unwrap_or_default();
-                (porta, pid, nome)
-            })
-            .collect()
+        Ok::<Vec<(u16, u32, String)>, String>(
+            socket
+                .into_iter()
+                .map(|(porta, pid)| {
+                    let nome = processi
+                        .get(&pid)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_default();
+                    (porta, pid, nome)
+                })
+                .collect(),
+        )
     })
-    .await
-    .unwrap_or_default()
+    .await;
+
+    match letta {
+        Ok(Ok(v)) => ListenerScan::Osservati(v),
+        Ok(Err(motivo)) => ListenerScan::NonInterrogabile { motivo },
+        Err(e) => ListenerScan::NonInterrogabile {
+            motivo: format!("lettura della tabella TCP interrotta: {e}"),
+        },
+    }
+}
+
+/// Come [`windows_scan_listening_ports`], con l'ignoto appiattito a lista
+/// vuota. Solo per i call site che non decidono niente di distruttivo sul
+/// vuoto: chi cancella, diagnostica o riavvia usa lo scan.
+#[cfg(windows)]
+pub(crate) async fn windows_listening_ports() -> Vec<(u16, u32, String)> {
+    windows_scan_listening_ports().await.osservati_o_vuoto()
 }
 
 /// Mappa figlio->genitore di tutti i processi, proiettata dalla fotografia
@@ -2408,22 +2434,33 @@ fn proc_listening_ports_of_pid(
     }
 }
 
-pub fn read_listening_ports_proc() -> Vec<(u16, u32, String)> {
+/// Porte in ascolto lette da `/proc`, con l'esito DICHIARATO: `Err` significa
+/// che `/proc` non si e' lasciato enumerare, non che nessuno ascolti. E' la
+/// stessa distinzione che su Windows fa `windows_listening_sockets`: chi
+/// cancella un'allocazione, apre una diagnosi di crash o riavvia un servizio
+/// deve poter distinguere le due cose (vedi `ListenerScan`).
+pub fn scan_listening_ports_proc() -> Result<Vec<(u16, u32, String)>, String> {
     let inode_to_port = proc_net_tcp_listen_inodes();
 
     // Mappa inode → pid via /proc/{pid}/fd/*
     let mut result = Vec::new();
-    if let Ok(proc_entries) = std::fs::read_dir("/proc") {
-        for entry in proc_entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            let Ok(pid) = name_str.parse::<u32>() else {
-                continue;
-            };
-            proc_listening_ports_of_pid(pid, &inode_to_port, &mut result);
-        }
+    let proc_entries =
+        std::fs::read_dir("/proc").map_err(|e| format!("/proc non enumerabile: {e}"))?;
+    for entry in proc_entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let Ok(pid) = name_str.parse::<u32>() else {
+            continue;
+        };
+        proc_listening_ports_of_pid(pid, &inode_to_port, &mut result);
     }
-    result
+    Ok(result)
+}
+
+/// Adattatore di [`scan_listening_ports_proc`] che appiattisce l'ignoto a lista
+/// vuota, per i call site che non decidono niente di distruttivo sul vuoto.
+pub fn read_listening_ports_proc() -> Vec<(u16, u32, String)> {
+    scan_listening_ports_proc().unwrap_or_default()
 }
 
 // Punto unico bucket/porte riservate: vive in nexus-tool-kit::ports
@@ -3347,28 +3384,22 @@ pub async fn detect_all_port_bindings(db: &sqlx::PgPool) -> Result<Vec<PortBindi
 /// il pid in ascolto (node/vite) al pid del servizio noto (npm/pnpm) e quindi al
 /// progetto. Stessa strategia di `detect_project_ports_windows`.
 #[cfg(windows)]
-async fn detect_all_port_bindings_windows(db: &sqlx::PgPool) -> Result<Vec<PortBinding>, String> {
+/// Mappa pid -> progetto dei processi VIVI e CONFERMATI, aggregando i DB di
+/// progetto. Un DB irraggiungibile degrada senza azzerare gli altri.
+/// VALIDAZIONE IDENTITA' del PID (anti-riciclo, punto unico regola L
+/// `process_util::pid_identity_confirmed`, lo stesso dell'observer): Windows
+/// ricicla i PID in modo aggressivo e le righe 'running' possono essere
+/// stantie (crash non ancora sanato, restart di Nexus). Senza il confronto
+/// creation-time vs started_at, un PID riciclato su un processo ESTRANEO
+/// veniva attribuito al progetto e — tramite la risalita dell'albero processi
+/// qui sotto — le sue porte (49664-49671 dei servizi di sistema, 5434 del
+/// cluster DB dell'infrastruttura) finivano flaggate e killate come
+/// "violazioni porta" del progetto: falsi positivi eterni nel pannello
+/// Problemi con detail "processo 'lsass'/'svchost'/'postgres' terminato".
+async fn pid_progetto_confermati(
+    db: &sqlx::PgPool,
+) -> std::collections::HashMap<u32, uuid::Uuid> {
     use std::collections::HashMap;
-
-    let listening = windows_listening_ports().await;
-    if listening.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // pid -> project_id da agent_processes (la tabella e' migrata: aggreghiamo i
-    // DB progetto, come fa il ramo Unix). Un DB progetto irraggiungibile degrada
-    // senza azzerare gli altri.
-    //
-    // VALIDAZIONE IDENTITA' del PID (anti-riciclo, punto unico regola L
-    // `process_util::pid_identity_confirmed`, lo stesso dell'observer): Windows
-    // ricicla i PID in modo aggressivo e le righe 'running' possono essere
-    // stantie (crash non ancora sanato, restart di Nexus). Senza il confronto
-    // creation-time vs started_at, un PID riciclato su un processo ESTRANEO
-    // veniva attribuito al progetto e — tramite la risalita dell'albero processi
-    // qui sotto — le sue porte (49664-49671 dei servizi di sistema, 5434 del
-    // cluster DB dell'infrastruttura) finivano flaggate e killate come
-    // "violazioni porta" del progetto: falsi positivi eterni nel pannello
-    // Problemi con detail "processo 'lsass'/'svchost'/'postgres' terminato".
     let mut pid_to_project: HashMap<u32, uuid::Uuid> = HashMap::new();
     for proj in crate::project_db_routes::list_all_project_ids(db).await {
         let Some(pool) = crate::project_db_routes::project_data_pool_or_warn(
@@ -3400,6 +3431,24 @@ async fn detect_all_port_bindings_windows(db: &sqlx::PgPool) -> Result<Vec<PortB
             pid_to_project.insert(pid, proj_id);
         }
     }
+    pid_to_project
+}
+
+async fn detect_all_port_bindings_windows(db: &sqlx::PgPool) -> Result<Vec<PortBinding>, String> {
+    // Fail-closed (regola M): una tabella non letta NON e' "nessuno ascolta".
+    // `Err` fa abortire l'iterazione del `port_enforcer` — che altrimenti
+    // girerebbe su zero binding e chiuderebbe come "rientrate" violazioni ancora
+    // vive — mentre una lista vuota OSSERVATA resta una risposta legittima.
+    use crate::project_workspace::port_recovery::ListenerScan;
+    let listening = match windows_scan_listening_ports().await {
+        ListenerScan::Osservati(v) => v,
+        scan @ ListenerScan::NonInterrogabile { .. } => return Err(scan.descrizione()),
+    };
+    if listening.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let pid_to_project = pid_progetto_confermati(db).await;
 
     // Albero processi (figlio -> genitore) per risalire dal listener al servizio.
     let child_to_parent = windows_process_parents().await;

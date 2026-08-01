@@ -86,17 +86,15 @@ fn resolve_target_dir(root_path: &Path, target_rel: &str) -> Result<PathBuf, Str
     let clean = match nexus_types::workspace_paths::normalize_into_root(root_path, target_rel) {
         Ok(clean) => clean,
         Err(e) => {
-            return Err(
-                json!({"error": format!("target_dir non valido: {}", e.message())}).to_string(),
-            )
+            return Err(crate::errore_json(format!(
+                "target_dir non valido: {}",
+                e.message()
+            )))
         }
     };
     let target = root_path.join(&clean);
     if !target.exists() {
-        return Err(json!({
-            "error": format!("target_dir '{}' non esiste", target.display())
-        })
-        .to_string());
+        return Err(crate::errore_json(format!("target_dir '{}' non esiste", target.display())));
     }
     Ok(target)
 }
