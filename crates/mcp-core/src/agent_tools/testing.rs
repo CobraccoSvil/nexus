@@ -332,6 +332,12 @@ struct PlaywrightRunParams {
     auto_start: bool,
     config_path_override: Option<String>,
     cleanup_stale: bool,
+    /// Argomenti della riga di comando quando la suite arriva qui delegata da
+    /// un tool generico (vedi [`esegui_suite_delegata`]). NON e' esposto nel
+    /// catalogo dei tool: e' il canale con cui `run_command`/`run_tests`
+    /// consegnano all'esecutore unico cio' che l'agente aveva scritto, senza
+    /// che nulla vada perso per strada.
+    extra_args: Vec<String>,
 }
 
 /// Estrae e normalizza i parametri dal JSON di input, applicando default e
@@ -381,7 +387,23 @@ fn parse_playwright_params(input: &Value) -> PlaywrightRunParams {
             .get("cleanup_stale_configs")
             .and_then(Value::as_bool)
             .unwrap_or(true),
+        extra_args: extra_args_da_input(input),
     }
+}
+
+/// Argomenti passati dalla delega di un tool generico: lista di stringhe, gli
+/// altri tipi ignorati (il canale e' interno, ma un `null` in mezzo non deve
+/// diventare un argomento vuoto sulla riga di comando).
+fn extra_args_da_input(input: &Value) -> Vec<String> {
+    input
+        .get("extra_args")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Risolve la playwright root e la lista di config wrapper stale. Se
@@ -736,32 +758,71 @@ fn target_not_ready_cause(
 
 /// Costruisce la riga di comando `npx playwright test ...` con timeout, workers,
 /// reporter e gli argomenti opzionali project/filter.
+///
+/// `extra_args` sono gli argomenti scritti dall'agente quando la suite arriva
+/// delegata da un tool generico: vengono appesi COSI' COME SONO (ri-quotati),
+/// e i default omologhi non vengono aggiunti — passare `--workers 4` e trovarsi
+/// `--workers 1 --workers 4` significherebbe che il valore vincente dipende
+/// dall'ordine, cioe' da un dettaglio che nessun chiamante controlla.
 fn build_playwright_command(
     test_timeout_ms: u64,
     workers: u64,
     reporter: &str,
     project_arg: &Option<String>,
     filter: &Option<String>,
+    extra_args: &[String],
 ) -> String {
     let mut cmd_parts = vec![
         "npx".to_string(),
         "playwright".to_string(),
         "test".to_string(),
-        "--timeout".to_string(),
-        test_timeout_ms.to_string(),
-        "--workers".to_string(),
-        workers.to_string(),
-        "--reporter".to_string(),
-        reporter.to_string(),
     ];
+    if !flag_presente(extra_args, "--timeout") {
+        cmd_parts.push("--timeout".to_string());
+        cmd_parts.push(test_timeout_ms.to_string());
+    }
+    const FLAG_WORKERS: &str = "--workers";
+    const FLAG_REPORTER: &str = "--reporter";
+    if !flag_presente(extra_args, FLAG_WORKERS) && !flag_presente(extra_args, "-j") {
+        cmd_parts.push(FLAG_WORKERS.to_string());
+        cmd_parts.push(workers.to_string());
+    }
+    if !flag_presente(extra_args, FLAG_REPORTER) {
+        cmd_parts.push(FLAG_REPORTER.to_string());
+        cmd_parts.push(reporter.to_string());
+    }
     if let Some(p) = project_arg {
-        cmd_parts.push("--project".to_string());
-        cmd_parts.push(p.clone());
+        if !flag_presente(extra_args, "--project") {
+            cmd_parts.push("--project".to_string());
+            cmd_parts.push(p.clone());
+        }
     }
     if let Some(f) = filter {
         cmd_parts.push(f.clone());
     }
+    cmd_parts.extend(extra_args.iter().map(|a| quota_argomento(a)));
     cmd_parts.join(" ")
+}
+
+/// `flag` presente fra gli argomenti, sia staccato (`--workers 4`) sia
+/// attaccato (`--workers=4`).
+fn flag_presente(args: &[String], flag: &str) -> bool {
+    args.iter()
+        .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
+}
+
+/// Ri-quota un argomento per la shell: la riga costruita qui torna a essere
+/// UNA stringa passata a `sh -c`, quindi un argomento che conteneva spazi
+/// (`--grep "login utente"`) si spezzerebbe in due senza questo passaggio.
+fn quota_argomento(arg: &str) -> String {
+    let sicuro = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_=./:@,+".contains(c));
+    if sicuro {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', r"'\''"))
 }
 
 /// Calcola il valore di `LD_LIBRARY_PATH` per Chromium: prepende la dir delle
@@ -1422,6 +1483,129 @@ async fn chiudi_job_non_concluso(proj_pool: &sqlx::PgPool, job_id: Uuid, motivo:
     .await;
 }
 
+/// Esegue attraverso l'esecutore unico una suite che un tool generico
+/// (`run_command`, `run_tests`) ha ricevuto come riga di comando.
+///
+/// Chiamata solo da `playwright_cli::intercetta_suite`, che ha gia' stabilito
+/// che la riga chiede la suite e che non porta altri comandi. Qui si traduce
+/// la riga nei parametri del runner: gli argomenti passano interi
+/// (`extra_args`), la BASE_URL dichiarata inline diventa il parametro
+/// omonimo, la directory viene da `cd`/`working_dir`. Cio' che non e'
+/// traducibile viene DICHIARATO nella nota, mai applicato a meta': un'env var
+/// silenziosamente caduta e' un test che fallisce per una ragione che non si
+/// legge da nessuna parte.
+///
+/// Il `timeout_secs` del tool generico non viene propagato: e' il tempo che quel
+/// tool aspetta, e vale al massimo 300s contro i 600 del runner. Propagarlo
+/// accorcerebbe la finestra di una suite E2E fino a troncarla a meta', che e'
+/// il modo di ottenere un job appeso invece di un esito.
+pub(super) async fn esegui_suite_delegata(
+    ctx: &AgentToolContext,
+    tool: &str,
+    inv: &super::playwright_cli::InvocazioneSuite,
+    working_dir_param: Option<&str>,
+    riga: &str,
+) -> String {
+    let input = input_per_runner(inv, working_dir_param, riga);
+    let coda = avvertenze_di_traduzione(inv);
+    let out = tool_run_playwright_tests(ctx, &input).await;
+    format!(
+        "[{tool} -> run_playwright_tests] La suite Playwright ha un solo esecutore: BASE_URL dalle \
+         porte allocate al progetto, preflight Chromium, attesa del servizio bersaglio e \
+         registrazione nel pannello Playwright. La riga e' stata eseguita da li' con i suoi \
+         argomenti.{coda}\n{out}"
+    )
+}
+
+/// Le due variabili con cui una riga dichiara l'URL del bersaglio: sono le
+/// stesse che `spawn_playwright_child` inietta, quindi tradurle nel parametro
+/// `base_url` le fa arrivare esattamente dove sarebbero arrivate.
+const ENV_BASE_URL: [&str; 2] = ["BASE_URL", "PLAYWRIGHT_BASE_URL"];
+
+/// Traduce la riga nei parametri del runner (vedi [`esegui_suite_delegata`]).
+fn input_per_runner(
+    inv: &super::playwright_cli::InvocazioneSuite,
+    working_dir_param: Option<&str>,
+    riga: &str,
+) -> Value {
+    let mut input = serde_json::json!({
+        "extra_args": inv.args,
+        // Il cleanup delle config wrapper CANCELLA file dal progetto: e'
+        // un'azione che chi ha scritto `npx playwright test` non ha chiesto.
+        // Resta disponibile a chi invoca il tool dedicato di proposito.
+        "cleanup_stale_configs": false,
+    });
+    if let Some(dir) = directory_della_suite(inv, working_dir_param, riga) {
+        input["config_path"] = serde_json::json!(dir);
+    }
+    if let Some((_, url)) = inv
+        .env_inline
+        .iter()
+        .find(|(n, _)| ENV_BASE_URL.contains(&n.as_str()))
+    {
+        input["base_url"] = serde_json::json!(url);
+    }
+    input
+}
+
+/// Cio' che la riga chiedeva e la traduzione non porta con se', dichiarato in
+/// coda all'output. Vuoto se non c'e' niente da dichiarare.
+fn avvertenze_di_traduzione(inv: &super::playwright_cli::InvocazioneSuite) -> String {
+    let mut avvertenze: Vec<String> = Vec::new();
+    let env_cadute: Vec<&str> = inv
+        .env_inline
+        .iter()
+        .filter(|(n, _)| !ENV_BASE_URL.contains(&n.as_str()))
+        .map(|(n, _)| n.as_str())
+        .collect();
+    if !env_cadute.is_empty() {
+        avvertenze.push(format!(
+            "variabili inline NON applicate ({}): il runner isola l'ambiente del processo. \
+             Se servono ai test, mettile nella config Playwright.",
+            env_cadute.join(", ")
+        ));
+    }
+    if inv.redirezioni {
+        avvertenze.push(
+            "redirezioni di output ignorate: l'output della suite torna qui per intero.".to_string(),
+        );
+    }
+    if avvertenze.is_empty() {
+        String::new()
+    } else {
+        format!("\nAvvertenze: {}", avvertenze.join(" | "))
+    }
+}
+
+/// Directory in cui cercare la config Playwright, relativa alla root del
+/// progetto: `working_dir` del tool e `cd` della riga si sommano, salvo quando
+/// il secondo ripete il primo — caso che riconosce gia'
+/// `helpers::detect_workdir_path_duplication` (punto unico, regola L: e' la
+/// stessa domanda che `run_command` pone prima di eseguire).
+fn directory_della_suite(
+    inv: &super::playwright_cli::InvocazioneSuite,
+    working_dir_param: Option<&str>,
+    riga: &str,
+) -> Option<String> {
+    let wd = working_dir_param.filter(|s| !s.trim().is_empty());
+    match (wd, inv.cd.as_deref()) {
+        (None, None) => None,
+        (Some(w), None) => Some(w.to_string()),
+        (None, Some(c)) => Some(c.to_string()),
+        (Some(w), Some(c)) => {
+            if super::helpers::detect_workdir_path_duplication(w, riga).is_some() {
+                Some(w.to_string())
+            } else {
+                Some(format!(
+                    "{}/{}",
+                    w.trim_end_matches('/'),
+                    c.trim_start_matches("./")
+                ))
+            }
+        }
+    }
+}
+
 pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Value) -> String {
     // ── 1. Parametri ─────────────────────────────────────────────────────────
     let params = parse_playwright_params(input);
@@ -1436,6 +1620,7 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
         auto_start,
         config_path_override,
         cleanup_stale,
+        extra_args,
     } = params;
 
     // ── 2. Controllo presenza Playwright ─────────────────────────────────────
@@ -1493,8 +1678,14 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
         check_server_status(ctx, root, base_url_previsto.as_deref(), auto_start).await;
 
     // ── 4. Verifica a suite (punto unico): memoria + esecuzione + flaky ──────
-    let command_str =
-        build_playwright_command(test_timeout_ms, workers, &reporter, &project_arg, &filter);
+    let command_str = build_playwright_command(
+        test_timeout_ms,
+        workers,
+        &reporter,
+        &project_arg,
+        &filter,
+        &extra_args,
+    );
 
     // La directory si esprime RELATIVA alla radice del run, come fa il criterio
     // del gate col `working_dir` dello step: e' l'altra meta' del
@@ -2329,6 +2520,83 @@ fn truncate_output_tail(text: String, max_out: usize) -> String {
         format!("...(troncato)\n{}", &text[text.len() - max_out..])
     } else {
         text
+    }
+}
+
+#[cfg(test)]
+mod comando_delegato_tests {
+    use super::*;
+
+    /// Gli argomenti NON si costruiscono a mano: si prendono da dove nascono in
+    /// produzione, cioe' dalla riga scritta dall'agente passata per
+    /// `invocazione_suite` (regola O).
+    fn args_dalla_riga(riga: &str) -> Vec<String> {
+        super::super::playwright_cli::invocazione_suite(riga)
+            .expect("la riga deve essere riconosciuta come suite")
+            .args
+    }
+
+    #[test]
+    fn gli_argomenti_dell_agente_arrivano_nella_riga_eseguita() {
+        let args = args_dalla_riga("npx playwright test e2e/auth.spec.ts --headed");
+        let cmd = build_playwright_command(10_000, 1, "list", &None, &None, &args);
+        assert!(cmd.contains("e2e/auth.spec.ts"), "riga costruita: {cmd}");
+        assert!(cmd.contains("--headed"), "riga costruita: {cmd}");
+    }
+
+    /// Un default omologo a quello che l'agente ha scritto non va aggiunto: due
+    /// `--workers` sulla stessa riga rendono il valore vincente un fatto
+    /// dell'ordine, che nessun chiamante controlla.
+    #[test]
+    fn il_default_non_si_somma_al_flag_dell_agente() {
+        let args = args_dalla_riga("npx playwright test --workers 4");
+        let cmd = build_playwright_command(10_000, 1, "list", &None, &None, &args);
+        assert_eq!(
+            cmd.matches("--workers").count(),
+            1,
+            "un solo --workers, riga costruita: {cmd}"
+        );
+        assert!(cmd.contains("--workers 4"), "riga costruita: {cmd}");
+        // La forma attaccata deve valere quanto quella staccata.
+        let args_eq = args_dalla_riga("npx playwright test --reporter=html");
+        let cmd_eq = build_playwright_command(10_000, 1, "list", &None, &None, &args_eq);
+        assert_eq!(
+            cmd_eq.matches("--reporter").count(),
+            1,
+            "un solo --reporter, riga costruita: {cmd_eq}"
+        );
+    }
+
+    /// La riga costruita torna a essere UNA stringa per `sh -c`: un argomento
+    /// con spazi, che l'agente aveva quotato, si spezzerebbe in due.
+    #[test]
+    fn un_argomento_con_spazi_resta_un_argomento() {
+        let args = args_dalla_riga("npx playwright test --grep \"login utente\"");
+        assert_eq!(args, vec!["--grep".to_string(), "login utente".to_string()]);
+        let cmd = build_playwright_command(10_000, 1, "list", &None, &None, &args);
+        assert!(
+            cmd.contains("'login utente'"),
+            "l'argomento va ri-quotato, riga costruita: {cmd}"
+        );
+    }
+
+    /// `cd` e `working_dir` insieme non si sommano quando il secondo ripete il
+    /// primo: e' la stessa domanda che `run_command` pone prima di eseguire, e
+    /// si delega al suo punto unico.
+    #[test]
+    fn directory_non_raddoppia_quando_il_cd_ripete_il_working_dir() {
+        let inv = super::super::playwright_cli::invocazione_suite("cd app && npx playwright test")
+            .expect("suite riconosciuta");
+        assert_eq!(
+            directory_della_suite(&inv, Some("app"), "cd app && npx playwright test").as_deref(),
+            Some("app")
+        );
+        assert_eq!(
+            directory_della_suite(&inv, Some("packages"), "cd app && npx playwright test")
+                .as_deref(),
+            Some("packages/app"),
+            "senza ripetizione le due parti si sommano"
+        );
     }
 }
 

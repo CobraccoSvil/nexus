@@ -16,6 +16,10 @@ const LONG_ONESHOT_PROBE_SECS: u64 = 300;
 const RUN_TESTS_DEFAULT_TIMEOUT: u64 = 120;
 const RUN_TESTS_MAX_TIMEOUT: u64 = 300;
 
+/// Nome con cui questo tool e' esposto al modello: identita' per il gate di
+/// redazione, l'audit di sicurezza e la guardia della suite Playwright.
+const NOME_TOOL: &str = "run_command";
+
 /// Attesa massima per entrare nella sezione critica dei package manager.
 /// Deliberatamente MAGGIORE di `LONG_ONESHOT_PROBE_SECS`: chi tiene il lock e' un
 /// install, e il probe lo uccide comunque entro 300s. Aspettare piu' a lungo del
@@ -113,53 +117,15 @@ fn spawn_output_drainers(
     (stdout_task, stderr_task)
 }
 
-/// Registra l'esito di una run Playwright nella tabella `jobs` (fire-and-forget).
-/// No-op se `command` non e' una run Playwright. Punto unico (regola L): usato da
-/// `tool_run_command` e `tool_run_tests`.
-fn record_playwright_job(
-    ctx: &AgentToolContext,
-    command: &str,
-    stdout: &str,
-    stderr: &str,
-    exit_code: i32,
-) {
-    // Riconoscimento delegato al punto unico (regola L): `contains("playwright")`
-    // registrava come run di test anche `npx playwright install`, cioe' un
-    // esito di suite che nessuna suite aveva prodotto.
-    if !crate::suite_verification::e_suite_playwright(command) {
-        return;
-    }
-    let summary = parse_playwright_summary(stdout, stderr, exit_code);
-    let db = ctx.db.clone();
-    let pid = ctx.project_id;
-    tokio::spawn(async move {
-        // Separazione DB per-progetto: `jobs` e' tabella migrata, instrada il
-        // write sul pool del progetto. Fire-and-forget: DB non disponibile ->
-        // registrazione saltata con WARN, mai fallback al meta.
-        let proj_pool = match crate::project_db_routes::project_data_pool_from(&db, pid).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(
-                    project_id = %pid,
-                    error = %e,
-                    "record_playwright_job: DB progetto non disponibile, salto"
-                );
-                return;
-            }
-        };
-        let _ = sqlx::query(
-            "INSERT INTO jobs (project_id, kind, status, input) VALUES ($1, 'playwright_test', $2, $3)",
-        )
-        .bind(pid)
-        .bind(if exit_code == 0 { "passed" } else { "failed" })
-        .bind(serde_json::json!({
-            "label": summary.label,
-            "message": summary.message,
-        }))
-        .execute(&proj_pool)
-        .await;
-    });
-}
+// `record_playwright_job` viveva qui: registrava un job `kind='playwright_test'`
+// A POSTERIORI per qualunque comando che CONTENESSE "playwright", eseguito in
+// proprio da questi tool generici. Rimossa con la guardia `playwright_cli`
+// (regola L, esecutore unico): la suite non passa piu' di qui, quindi qui non
+// c'e' piu' alcun esito di suite da registrare — lo scrive il runner, che e'
+// anche l'unico a sapere quali test sono partiti. Cio' che resta e' cio' che
+// non era mai stato un test: `playwright install`, `show-report`, `codegen`,
+// perfino `cat playwright.config.ts`, che quel `contains` registrava come
+// esecuzioni della suite nel pannello.
 
 /// Progetto con DB registrato e `allow_ddl_override = false` (default): schema change solo via migration.
 async fn strict_migration_only_project(ctx: &AgentToolContext) -> bool {
@@ -217,7 +183,7 @@ async fn command_security_gate(ctx: &AgentToolContext, command: &str) -> Option<
     // errori a runtime. Punto unico: security::redaction_guard (regola L).
     if let Some(msg) = crate::security::redaction_guard::enforce_no_redacted_placeholder(
         ctx,
-        "run_command",
+        NOME_TOOL,
         "command",
         command,
     )
@@ -317,12 +283,19 @@ async fn maybe_route_to_service(
     None
 }
 
+/// Legge il parametro `working_dir` grezzo dall'input JSON di un tool. Punto
+/// unico del nome del campo: usato ovunque questi tool leggono `working_dir`
+/// PRIMA di risolverlo in path (la risoluzione resta a [`resolve_work_dir`]).
+fn working_dir_param(input: &Value) -> Option<&str> {
+    input.get("working_dir").and_then(Value::as_str)
+}
+
 /// Risolve la working directory dal parametro `working_dir` (relativo alla root
 /// di progetto) o ricade sulla root. Ritorna `Err(messaggio)` se il path e'
 /// invalido. Punto unico (regola L): usato da `tool_run_command` e
 /// `tool_run_tests`.
 fn resolve_work_dir(ctx: &AgentToolContext, input: &Value) -> Result<PathBuf, String> {
-    if let Some(sub) = input.get("working_dir").and_then(Value::as_str) {
+    if let Some(sub) = working_dir_param(input) {
         match resolve_relative_path(&ctx.root_path, sub) {
             Ok(p) => Ok(p),
             Err(e) => Err(format!(
@@ -362,7 +335,7 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
     // comando ripete quel segmento ('cd frontend', 'frontend/...') i path si
     // sommano e rm/install/build operano sulla dir sbagliata. Rifiutare qui evita
     // il danno silenzioso; il messaggio dice all'agente come correggere.
-    if let Some(wd) = input.get("working_dir").and_then(Value::as_str) {
+    if let Some(wd) = working_dir_param(input) {
         if let Some(msg) = super::helpers::detect_workdir_path_duplication(wd, &command) {
             return format!("{hints_prefix}{msg}");
         }
@@ -401,6 +374,20 @@ async fn command_hints_and_routing(
     input: &Value,
     command: &str,
 ) -> Result<String, String> {
+    // ── Suite Playwright: ha un solo esecutore (punto unico regola L,
+    // playwright_cli) ──────────────────────────────────────────────────────
+    // Prima di ogni altra guardia di QUESTA funzione, che decidono COME
+    // instradare: questa decide SE la riga si esegue qui. Vive in questa
+    // funzione — gia' un `Result` di routing pre-esecuzione — cosi'
+    // `tool_run_command` non guadagna un ramo proprio per lei: la stessa
+    // domanda ("questa riga va instradata altrove?") ha gia' un posto solo.
+    if let Some(out) =
+        super::playwright_cli::intercetta_suite(ctx, NOME_TOOL, command, working_dir_param(input))
+            .await
+    {
+        return Err(out);
+    }
+
     // ── Command hints (migration 0230) ──────────────────────────────────────
     // Lookup pattern noti in nexus_command_hints (cache 60s). Se match, l'hint
     // viene prependato al risultato finale del comando — guida il modello
@@ -541,8 +528,6 @@ async fn format_command_completed(
         exit_code
     };
     let hint = command_result_hint(exit_code, stdout, stderr, command);
-    // Registra risultati Playwright nella tabella jobs (fire-and-forget)
-    record_playwright_job(ctx, command, stdout, stderr, exit_code);
 
     let combined = format!(
         "{}EXIT CODE: {}\nSTDOUT:\n{}\nSTDERR:\n{}{}",
@@ -643,6 +628,16 @@ pub(crate) async fn tool_run_tests(ctx: &AgentToolContext, input: &Value) -> Str
             .to_string();
     }
 
+    // Stessa guardia di `run_command` e per la stessa ragione: questo tool
+    // riceve un comando arbitrario dall'agente, e `npx playwright test` scritto
+    // qui lancerebbe la suite fuori dal suo unico esecutore.
+    if let Some(out) =
+        super::playwright_cli::intercetta_suite(ctx, "run_tests", &command, working_dir_param(input))
+            .await
+    {
+        return out;
+    }
+
     // 2. Working directory (punto unico resolve_work_dir, regola L)
     let work_dir = match resolve_work_dir(ctx, input) {
         Ok(p) => p,
@@ -657,19 +652,14 @@ pub(crate) async fn tool_run_tests(ctx: &AgentToolContext, input: &Value) -> Str
         .min(RUN_TESTS_MAX_TIMEOUT);
 
     // 4. Esecuzione sincrona — NESSUN auto-routing a background
-    run_tests_execution(ctx, &command, &work_dir, timeout).await
+    run_tests_execution(&command, &work_dir, timeout).await
 }
 
 /// Esecuzione sincrona dei test (nessun auto-routing a background): spawn nella
 /// shell isolata, drain parallelo stdout/stderr, attesa con timeout e
 /// formattazione dell'esito (o messaggio di timeout con kill). Estratto da
 /// `tool_run_tests` (behavior-preserving).
-async fn run_tests_execution(
-    ctx: &AgentToolContext,
-    command: &str,
-    work_dir: &Path,
-    timeout: u64,
-) -> String {
+async fn run_tests_execution(command: &str, work_dir: &Path, timeout: u64) -> String {
     let child = crate::sandbox::isolated_command(&crate::sandbox::agent_shell())
         .arg("-c")
         .arg(super::helpers::shell_line(command))
@@ -695,7 +685,7 @@ async fn run_tests_execution(
             let stderr_bytes = stderr_task.await.unwrap_or_default();
             let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
             let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
-            format_run_tests_output(ctx, command, exit_code, &stdout, &stderr)
+            format_run_tests_output(command, exit_code, &stdout, &stderr)
         }
         Ok(Err(e)) => format!("\u{274C} [Errore attesa test '{}': {}]", command, e),
         Err(_) => {
@@ -729,21 +719,12 @@ fn resolve_test_command(ctx: &AgentToolContext, input: &Value) -> String {
 }
 
 /// Compone il blocco `=== RUN TEST ===` per un'esecuzione test terminata:
-/// troncamento intelligente stdout/stderr + registrazione Playwright + label di
-/// stato. Estratto da `tool_run_tests` (behavior-preserving).
-fn format_run_tests_output(
-    ctx: &AgentToolContext,
-    command: &str,
-    exit_code: i32,
-    stdout: &str,
-    stderr: &str,
-) -> String {
+/// troncamento intelligente stdout/stderr + label di stato. Estratto da
+/// `tool_run_tests` (behavior-preserving).
+fn format_run_tests_output(command: &str, exit_code: i32, stdout: &str, stderr: &str) -> String {
     // Troncamento intelligente: preserva errori (in fondo)
     let truncated_stdout = smart_truncate_test_output(stdout, 6000);
     let truncated_stderr = smart_truncate_test_output(stderr, 2000);
-
-    // Registra risultati Playwright nella tabella jobs
-    record_playwright_job(ctx, command, stdout, stderr, exit_code);
 
     let status_label = if exit_code == 0 {
         "TUTTI I TEST PASSATI"
@@ -900,66 +881,12 @@ fn smart_truncate_test_output(output: &str, max_chars: usize) -> String {
     )
 }
 
-struct PlaywrightSummary {
-    label: String,
-    message: String,
-}
-
-fn parse_playwright_summary(stdout: &str, stderr: &str, exit_code: i32) -> PlaywrightSummary {
-    let output = if stdout.is_empty() { stderr } else { stdout };
-    let mut passed = 0u32;
-    let mut failed = 0u32;
-    let mut skipped = 0u32;
-    for line in output.lines() {
-        let lower = line.to_lowercase();
-        if lower.contains("passed") {
-            if let Some(n) = extract_test_count(&lower, "passed") {
-                passed = n;
-            }
-        }
-        if lower.contains("failed") {
-            if let Some(n) = extract_test_count(&lower, "failed") {
-                failed = n;
-            }
-        }
-        if lower.contains("skipped") {
-            if let Some(n) = extract_test_count(&lower, "skipped") {
-                skipped = n;
-            }
-        }
-    }
-    let total = passed + failed + skipped;
-    let label = if total > 0 {
-        format!(
-            "Playwright: {} test ({} ok, {} ko, {} skip)",
-            total, passed, failed, skipped
-        )
-    } else if exit_code == 0 {
-        "Playwright: test completati".to_string()
-    } else {
-        "Playwright: esecuzione fallita".to_string()
-    };
-    let message = output
-        .lines()
-        .rev()
-        .take(5)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n");
-    PlaywrightSummary { label, message }
-}
-
-fn extract_test_count(line: &str, keyword: &str) -> Option<u32> {
-    let pos = line.find(keyword)?;
-    let before = &line[..pos];
-    before
-        .rsplit(|c: char| !c.is_ascii_digit())
-        .next()?
-        .parse()
-        .ok()
-}
+// `PlaywrightSummary` / `parse_playwright_summary` / `extract_test_count`
+// vivevano qui: leggevano i contatori di Playwright dal TESTO dell'output per
+// riempire il job registrato a posteriori. Rimossi con quel job: i contatori
+// veri li produce il runner leggendo il proprio stdout riga per riga
+// (`parse_playwright_output_stats` in testing.rs), che e' anche l'unico punto
+// che sa quale suite ha lanciato.
 
 /// Persiste l'evento di blocco su `nexus_security_audit` (mig 0154).
 /// Best-effort: se la tabella non esiste o il DB e' down, log warn e prosegue.
@@ -976,7 +903,7 @@ async fn persist_security_audit(
     .bind(ctx.project_id)
     .bind(ctx.user_id)
     .bind(ctx.session_id)
-    .bind("run_command")
+    .bind(NOME_TOOL)
     .bind(command.chars().take(2000).collect::<String>())
     .bind(reason.category)
     .bind(reason.message)
@@ -1229,6 +1156,104 @@ async fn load_run_command_max_chars(db: &sqlx::PgPool) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Prova che la riga NON e' stata eseguita da questi tool ma consegnata
+    /// all'esecutore unico: su una root vuota il runner si ferma da solo al suo
+    /// primo controllo, e quel messaggio lo puo' produrre solo lui.
+    ///
+    /// Regola O: si asserisce la CONSEGUENZA (chi ha eseguito), non la stringa
+    /// del riconoscimento; e l'input e' la riga come la scrive l'agente, non un
+    /// `InvocazioneSuite` costruito a mano. Mutazione verificata: rimossa la
+    /// guardia da `tool_run_command`, l'output torna a essere "EXIT CODE:" del
+    /// comando eseguito in proprio e il test rosseggia.
+    const MARCA_ESECUTORE: &str = "[run_playwright_tests] Playwright non trovato nel progetto";
+
+    #[tokio::test]
+    async fn run_command_non_esegue_la_suite_playwright_in_proprio() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = crate::test_support::ctx_di_tool_test(dir.path().to_path_buf());
+        let out = tool_run_command(&ctx, &serde_json::json!({"command": "npx playwright test"})).await;
+        assert!(
+            out.contains(MARCA_ESECUTORE),
+            "la suite deve passare dall'esecutore unico, output: {out}"
+        );
+        assert!(
+            !out.contains("EXIT CODE:"),
+            "run_command non deve aver eseguito la riga in proprio: {out}"
+        );
+    }
+
+    /// Gemello per `run_tests`: e' l'altro tool che riceve un comando arbitrario
+    /// dall'agente, ed era l'altro call site della registrazione a posteriori.
+    #[tokio::test]
+    async fn run_tests_non_esegue_la_suite_playwright_in_proprio() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = crate::test_support::ctx_di_tool_test(dir.path().to_path_buf());
+        let out = tool_run_tests(
+            &ctx,
+            &serde_json::json!({"command": "npx playwright test --grep smoke"}),
+        )
+        .await;
+        assert!(
+            out.contains(MARCA_ESECUTORE),
+            "la suite deve passare dall'esecutore unico, output: {out}"
+        );
+        assert!(
+            !out.contains("=== RUN TEST ==="),
+            "run_tests non deve aver eseguito la riga in proprio: {out}"
+        );
+    }
+
+    /// La riga che chiede la suite INSIEME ad altri comandi non si delega (il
+    /// runner eseguirebbe la sola suite e `npm ci` sparirebbe in silenzio) e non
+    /// si esegue qui: si rifiuta dicendo come spezzarla.
+    #[tokio::test]
+    async fn riga_composita_con_suite_playwright_e_rifiutata_con_guida() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = crate::test_support::ctx_di_tool_test(dir.path().to_path_buf());
+        let out = tool_run_command(
+            &ctx,
+            &serde_json::json!({"command": "npm ci && npx playwright test"}),
+        )
+        .await;
+        assert!(out.starts_with('\u{274C}'), "deve essere un errore: {out}");
+        assert!(
+            out.contains("run_playwright_tests"),
+            "il rifiuto deve indirizzare all'esecutore unico: {out}"
+        );
+        assert!(
+            !out.contains("EXIT CODE:") && !out.contains(MARCA_ESECUTORE),
+            "ne' eseguita qui ne' delegata a meta': {out}"
+        );
+    }
+
+    /// Contro-prova: un comando che NOMINA playwright senza lanciare la suite
+    /// resta di competenza di questi tool. E' il caso che il vecchio
+    /// `contains("playwright")` registrava come esecuzione di test.
+    ///
+    /// Si ferma alla guardia invece di attraversare tutto `tool_run_command`
+    /// perche' il seguito della pipeline legge il DB (hint, policy migration,
+    /// routing a servizio) e su un pool lazy ogni lettura costa il proprio
+    /// `acquire_timeout`: il costo del test sarebbe minuti, non millisecondi.
+    /// Che `run_command` interroghi la guardia lo provano i test qui sopra.
+    #[tokio::test]
+    async fn altri_usi_del_cli_playwright_restano_a_run_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = crate::test_support::ctx_di_tool_test(dir.path().to_path_buf());
+        for riga in [
+            "npx playwright show-report",
+            "npx playwright install --with-deps chromium",
+            "cat playwright.config.ts",
+        ] {
+            let deviato =
+                super::super::playwright_cli::intercetta_suite(&ctx, "run_command", riga, None)
+                    .await;
+            assert!(
+                deviato.is_none(),
+                "non e' una suite e non va deviato al runner: {riga}"
+            );
+        }
+    }
 
     /// Genera un output di build sintetico con N errori in ordine e il totale
     /// "Found N errors" in FONDO (come fa tsc/npm build).

@@ -165,9 +165,51 @@ fn existing_service_action(listening: bool) -> ExistingServiceAction {
     }
 }
 
+/// Nome del tool con cui l'agente ha invocato [`tool_run_service`]: i due
+/// bracci del dispatcher condividono l'implementazione ma non il nome, e un
+/// messaggio che nomina l'altro manda a cercare la riga sbagliata.
+fn nome_del_tool(kind: &str) -> &'static str {
+    if kind == "task" {
+        "run_in_terminal"
+    } else {
+        "run_service"
+    }
+}
+
+/// Suite Playwright arrivata a questo tool: la consegna all'esecutore unico
+/// (punto unico `playwright_cli`, regola L). Terzo percorso della guardia, e
+/// non un caso di scuola: `helpers::is_long_oneshot` nomina gia'
+/// `playwright test` proprio perche' di qui passava.
+///
+/// La posizione nel chiamante e' fra due vincoli. DOPO la validazione del
+/// comando, perche' il gate sui placeholder di redazione vale per qualunque
+/// riga a prescindere da chi la esegue, e delegare prima lo scavalcherebbe.
+/// PRIMA di tutto cio' che segue, perche' ha effetti: `dedup_and_cleanup_ports`
+/// ferma processi e libera porte, e farlo per una suite che da qui non doveva
+/// partire costerebbe un servizio vivo.
+async fn suite_playwright_altrove(
+    ctx: &AgentToolContext,
+    tool: &str,
+    command: &str,
+    input: &Value,
+) -> Option<String> {
+    super::playwright_cli::intercetta_suite(
+        ctx,
+        tool,
+        command,
+        input.get("working_dir").and_then(Value::as_str),
+    )
+    .await
+}
+
 /// Avvia un servizio/processo long-running direttamente sul server.
 /// L'output viene catturato nel DB e mostrato nel pannello Output dell'IDE.
 pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind: &str) -> String {
+    // Nome del tool come l'ha invocato l'agente, preso PRIMA che `kind` venga
+    // ridefinito dal declassamento one-shot: un messaggio che nomina un tool
+    // diverso da quello chiamato manda a cercare la riga sbagliata.
+    let tool_invocante = nome_del_tool(kind);
+
     // Fase 1: validazione + label/work_dir (senza refuse: la dedup deve girare prima).
     let launch = match resolve_service_launch(ctx, input, kind).await {
         Ok(l) => l,
@@ -180,30 +222,12 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         work_dir,
     } = launch;
 
-    // ── Deduplicazione PRIMA del refuse (regola L, fix strutturale) ─────────
-    // stop_similar + cleanup porte, poi liberazione LISTEN orfano/zombie sullo
-    // stesso scopo. Solo DOPO si valuta refuse_if_same_scope_active: cosi' un
-    // riavvio non resta bloccato da PID 12812/child ancora in ascolto mentre il
-    // check refuse girava prima della dedup (incidente Vite 31754).
-    dedup_and_cleanup_ports(ctx, &label, &command, &work_dir).await;
-
-    if let Some(kind_hint) = derive_kind_hint(
-        &command,
-        &label,
-        scope_dir(&ctx.root_path, &work_dir, &command).as_deref(),
-    ) {
-        if let Some(refuse_msg) = refuse_if_same_scope_active(ctx, kind_hint).await {
-            return refuse_msg;
-        }
+    if let Some(out) = suite_playwright_altrove(ctx, tool_invocante, &command, input).await {
+        return out;
     }
 
-    // ── Quota container (PR hardening) ────────────────────────────────────
-    // Solo per kind="service": i tool agente short-lived non contano contro
-    // la quota container del progetto.
-    if kind == "service" {
-        if let Some(quota_msg) = check_container_quotas(ctx, &label, &command).await {
-            return quota_msg;
-        }
+    if let Some(rifiuto) = gate_pre_avvio(ctx, &kind, &label, &command, &work_dir).await {
+        return rifiuto;
     }
 
     // ── Strato 1 hardening: auto-inject PORT per servizi web ────────────────
@@ -242,6 +266,38 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         }
     };
     report_started_service(ctx, &label, process_id, ascolto).await
+}
+
+/// Gate pre-avvio di `tool_run_service`: dedup+cleanup porte, poi refuse per
+/// scopo gia' attivo, poi quota container. `Some(messaggio)` = rifiuto,
+/// ritorno anticipato del chiamante; `None` = via libera all'avvio.
+///
+/// L'ordine e' il fix strutturale (regola L): dedup PRIMA del refuse, cosi' un
+/// riavvio non resta bloccato da un PID/child ancora in ascolto mentre il
+/// check refuse girava prima della dedup (incidente Vite 31754).
+async fn gate_pre_avvio(
+    ctx: &AgentToolContext,
+    kind: &str,
+    label: &str,
+    command: &str,
+    work_dir: &Path,
+) -> Option<String> {
+    dedup_and_cleanup_ports(ctx, label, command, work_dir).await;
+
+    if let Some(kind_hint) = kind_hint_for(ctx, label, command, work_dir) {
+        if let Some(refuse_msg) = refuse_if_same_scope_active(ctx, kind_hint).await {
+            return Some(refuse_msg);
+        }
+    }
+
+    // Solo per kind="service": i tool agente short-lived non contano contro la
+    // quota container del progetto.
+    if kind == "service" {
+        if let Some(quota_msg) = check_container_quotas(ctx, label, command).await {
+            return Some(quota_msg);
+        }
+    }
+    None
 }
 
 /// Finestra entro cui un servizio web deve mettersi in ascolto sulla sua porta.
@@ -549,13 +605,30 @@ async fn dedup_and_cleanup_ports(
     if let Ok(existing) = crate::agent_processes::list_processes(&ctx.db, ctx.project_id).await {
         cleanup_dead_process_ports(&ctx.db, ctx.project_id, &existing, label).await;
     }
-    if let Some(kind_hint) = derive_kind_hint(
+    if let Some(kind_hint) = kind_hint_for(ctx, label, command, work_dir) {
+        free_listening_scope_port(ctx, kind_hint).await;
+    }
+}
+
+/// `derive_kind_hint` sullo scope del comando corrente: punto unico della
+/// composizione (regola L), condivisa da [`dedup_and_cleanup_ports`] e
+/// [`gate_pre_avvio`]. Le due chiamate erano testualmente identiche gia' prima
+/// di questo helper — la duplicazione non era nuova, era solo invisibile al
+/// detector finche' una viveva inline in `tool_run_service` con variabili
+/// possedute (`&command`, `&label`); estraendola in una funzione a parametri
+/// presi in prestito il testo e' tornato IDENTICO a questo, e il detector lo
+/// vede correttamente per quello che e'.
+fn kind_hint_for(
+    ctx: &AgentToolContext,
+    label: &str,
+    command: &str,
+    work_dir: &std::path::Path,
+) -> Option<&'static str> {
+    derive_kind_hint(
         command,
         label,
         scope_dir(&ctx.root_path, work_dir, command).as_deref(),
-    ) {
-        free_listening_scope_port(ctx, kind_hint).await;
-    }
+    )
 }
 
 /// Dopo stop_similar: se lo stesso scopo e' ancora in LISTEN (child orfano,
@@ -1689,7 +1762,7 @@ mod tests {
     use super::{
         derive_kind_hint, detect_port_from_output, existing_service_action, format_started_message,
         looks_like_web_service, resolve_service_label, resolve_service_work_dir, scope_dir,
-        ExistingServiceAction, PortaRilevata, Uuid,
+        tool_run_service, ExistingServiceAction, PortaRilevata, Uuid,
     };
     use crate::agent_processes::{is_generic_service_label, similar_service_labels};
     use crate::project_workspace::services::{project_service_slug, service_unit_name};
@@ -2246,6 +2319,30 @@ mod tests {
         assert_eq!(
             existing_service_action(false),
             ExistingServiceAction::AdoptStale
+        );
+    }
+
+    /// Il terzo tool che riceve un comando arbitrario non deve avviare la suite
+    /// come se fosse un servizio: la consegna all'esecutore unico, che su una
+    /// root vuota si ferma da solo con un messaggio che solo lui produce.
+    ///
+    /// Regola O: si attraversa `tool_run_service` per intero, come fa il
+    /// dispatcher. Se la guardia venisse rimossa, il flusso proseguirebbe verso
+    /// dedup e allocazione porte — che leggono il DB — e questo test lo
+    /// segnalerebbe restando appeso invece di passare in millisecondi.
+    #[tokio::test]
+    async fn run_service_non_avvia_la_suite_playwright_come_servizio() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = crate::test_support::ctx_di_tool_test(dir.path().to_path_buf());
+        let out = tool_run_service(
+            &ctx,
+            &serde_json::json!({"command": "npx playwright test", "label": "e2e"}),
+            "task",
+        )
+        .await;
+        assert!(
+            out.contains("[run_playwright_tests] Playwright non trovato nel progetto"),
+            "la suite deve passare dall'esecutore unico, output: {out}"
         );
     }
 }

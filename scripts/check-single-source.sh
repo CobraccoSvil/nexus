@@ -1626,6 +1626,29 @@ for _dir in test-results playwright-report; do
   fi
 done
 [[ "$fail" -eq 0 ]] && echo "OK chiave-di-stato: gli artefatti del runner restano fuori dalla chiave"
+# Esecutore unico della suite Playwright (2026-08-01). Il riconoscimento della
+# riga vive in playwright_cli.rs; la riga `npx playwright test ...` la costruisce
+# solo build_playwright_command, dentro il runner. Due esecutori significano due
+# contratti per la stessa suite: il secondo (run_command/run_tests, che la
+# lanciavano in proprio e ne registravano il job a posteriori) partiva senza
+# BASE_URL derivata dalle porte, senza preflight e senza attendere che il
+# servizio bersaglio fosse pronto, e nel pannello il suo esito era
+# indistinguibile da quello vero.
+assert_single "esecutore-suite-playwright" 'fn invocazione_suite' \
+  'crates/mcp-core/src/agent_tools/playwright_cli.rs' crates
+
+# Regressione diretta: la registrazione a posteriori non deve tornare. Cerca la
+# DEFINIZIONE, non il nome: il commento che ne spiega la rimozione lo cita.
+if grep -rEln --include='*.rs' --exclude-dir=target 'fn record_playwright_job' crates >/dev/null 2>&1; then
+  echo "!! esecutore-suite-playwright: e' ricomparsa una registrazione del job" >&2
+  echo "   Playwright fuori dal runner. Il job lo scrive chi ha eseguito la suite," >&2
+  echo "   che e' l'unico a sapere quali test sono partiti; registrarlo a valle di" >&2
+  echo "   un comando generico produce nel pannello esiti indistinguibili da quelli" >&2
+  echo "   veri, e per giunta su comandi che test non sono (install, show-report)." >&2
+  fail=1
+else
+  echo "OK esecutore-suite-playwright: nessuna registrazione job fuori dal runner"
+fi
 
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
