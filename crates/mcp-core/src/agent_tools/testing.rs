@@ -1195,8 +1195,6 @@ async fn esegui_processo_suite(
     env: &SuiteEnv,
     inv: &crate::suite_verification::SuiteInvocation,
 ) -> Result<crate::suite_verification::SuiteRun, String> {
-    use crate::suite_verification::SuiteRun;
-
     let root = radice_di_esecuzione(env, inv)?;
 
     // Separazione DB per-progetto: il pool va risolto PRIMA dello spawn (nessun
