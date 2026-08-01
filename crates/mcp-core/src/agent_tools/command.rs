@@ -335,9 +335,19 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
     // comando ripete quel segmento ('cd frontend', 'frontend/...') i path si
     // sommano e rm/install/build operano sulla dir sbagliata. Rifiutare qui evita
     // il danno silenzioso; il messaggio dice all'agente come correggere.
+    // Il rifiuto E' un fallimento del tool e deve dirlo col marker (regola M):
+    // il comando NON e' stato eseguito, quindi non esiste alcun exit code, e un
+    // consumatore che vedesse solo l'assenza di exit code non potrebbe
+    // distinguere "invocazione rifiutata" da "eseguito senza stato d'uscita".
+    // Il final_gate fa esattamente quella domanda per decidere se un criterio e'
+    // fallito o non misurabile: senza marker, un criterio la cui invocazione e'
+    // stata rifiutata verrebbe ASSOLTO invece che rieseguito corretto.
     if let Some(wd) = working_dir_param(input) {
         if let Some(msg) = super::helpers::detect_workdir_path_duplication(wd, &command) {
-            return format!("{hints_prefix}{msg}");
+            return nexus_types::tool_outcome::prepend_preserving_failure(
+                hints_prefix.trim_end(),
+                &nexus_types::tool_outcome::tool_failure(msg),
+            );
         }
     }
 

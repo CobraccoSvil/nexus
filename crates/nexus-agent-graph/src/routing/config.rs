@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 ///   - `final_gate_software_intents` -> `agent.final_gate.software_intents`
 ///   - `todo_isolation_enabled`   -> `agent.continuous.todo_isolation_enabled` (default false)
 ///   - `fs_mutator_tools`         -> `agent.tools.result_cache_mutators`
+///   - `iteration_cap`            -> `agent.executor.iteration_cap` (default 60)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoutingConfig {
     /// Numero massimo di re-routing G1 verso executor per run (`g1_max_nudges`).
@@ -45,6 +46,29 @@ pub struct RoutingConfig {
     /// Tool che MUTANO il filesystem/progetto (per `has_filesystem_mutation_in_history`).
     /// Punto unico dei DATI: setting `agent.tools.result_cache_mutators` (mig 0394).
     pub fs_mutator_tools: Vec<String>,
+    /// Cap di ITERAZIONI agentiche del run: oltre la soglia `route_after_*` non
+    /// rilancia piu' l'executor e instrada alla chiusura (passando prima dalla
+    /// verifica oggettiva, vedi `route_after_executor`). NON e' il cap di
+    /// superstep del grafo, che e' [`RoutingConfig::recursion_limit`].
+    ///
+    /// Fonte: setting `agent.executor.iteration_cap`, lo STESSO che governa la
+    /// chiusura d'autorita' DENTRO l'executor (`ExecutorConfig::iteration_cap`):
+    /// una sola domanda, un solo valore. Prima il routing lo teneva in una
+    /// costante di compile-time e il setting non lo governava, quindi i due lati
+    /// della stessa soglia potevano divergere (in produzione: 60 contro 100).
+    ///
+    /// `serde(default)` perche' i casi golden serializzati non portano il campo:
+    /// il valore di ripiego e' quello DICHIARATO da [`Default`], non un valore
+    /// diverso deciso qui.
+    ///
+    /// INNESTO del wiring DB: `mcp-core::native_engine::load_routing_config`
+    /// legge GIA' `agent.executor.iteration_cap` nella variabile locale
+    /// `iteration_cap` (le serve per `effective_recursion_limit`) e costruisce
+    /// la struct chiudendo con `..RoutingConfig::default()`. Finche' quel
+    /// letterale non elenca anche `iteration_cap,`, il routing resta al default
+    /// dichiarato qui e il valore DB non lo governa.
+    #[serde(default = "default_iteration_cap")]
+    pub iteration_cap: i64,
     /// Cap effettivo di superstep del motore di grafo (`GraphEngine`): anti-loop
     /// infinito del grafo (NON delle iterazioni agentiche, che hanno il loro
     /// `iter_cap`). Valorizzato a runtime da
@@ -122,6 +146,19 @@ pub fn effective_recursion_limit(limits: &GraphTopologyLimits) -> u32 {
     limits.db_floor.max(topology.max(0) as u32)
 }
 
+/// Cap iterazioni quando il wiring non ha passato il valore DB (safe-default
+/// DB-down, come gli altri campi di [`RoutingConfig::default`]). Identico a
+/// `ExecutorConfig::default().iteration_cap`: le due config rispondono alla
+/// STESSA domanda e non devono divergere nemmeno a DB spento — invariante
+/// coperta dal test `iteration_cap_default_allineato_all_executor`.
+const ITERATION_CAP_DEFAULT: i64 = 60;
+
+/// Ripiego di serde per [`RoutingConfig::iteration_cap`]: rimanda al default
+/// dichiarato, mai a un valore proprio.
+fn default_iteration_cap() -> i64 {
+    ITERATION_CAP_DEFAULT
+}
+
 impl Default for RoutingConfig {
     fn default() -> Self {
         // Default IDENTICI ai `_SAFE_DEFAULTS` del brain (orchestrator_config.py),
@@ -157,6 +194,7 @@ impl Default for RoutingConfig {
             // Pavimento safe-DB-down: a runtime `effective_recursion_limit` lo
             // scala sulla topologia (iteration_cap + stall/G1/final_gate).
             recursion_limit: 150,
+            iteration_cap: ITERATION_CAP_DEFAULT,
         }
     }
 }
@@ -180,6 +218,20 @@ mod tests {
             g1_max_nudges: 3,
             final_gate_max_cycles: 2,
         }
+    }
+
+    /// Le due config che rispondono a "quante iterazioni puo' fare questo run"
+    /// (il ROUTING che smette di rilanciare l'executor, e l'EXECUTOR che chiude
+    /// d'autorita') leggono lo stesso setting: i loro safe-default non possono
+    /// divergere, o a DB spento il grafo e il nodo si fermerebbero a soglie
+    /// diverse. Il confronto attraversa i due PRODUTTORI veri (regola O), non
+    /// due letterali ricopiati.
+    #[test]
+    fn iteration_cap_default_allineato_all_executor() {
+        assert_eq!(
+            RoutingConfig::default().iteration_cap,
+            crate::nodes::ExecutorConfig::default().iteration_cap
+        );
     }
 
     #[test]

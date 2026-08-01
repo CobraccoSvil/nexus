@@ -919,6 +919,13 @@ async fn setting_f64(db: &PgPool, key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+/// Come [`setting_i64`] per una misura che non puo' essere negativa (byte,
+/// caratteri): un valore negativo in tabella vale zero, che per queste soglie
+/// significa "nessun limite" ed e' una scelta esplicita dell'operatore.
+async fn setting_usize(db: &PgPool, key: &str, default: usize) -> usize {
+    setting_i64(db, key, default as i64).await.max(0) as usize
+}
+
 /// Legge un setting CSV dal DB col fallback al `default` (lista) se assente/vuoto.
 async fn setting_csv(db: &PgPool, key: &str, default: Vec<String>) -> Vec<String> {
     match nexus_auth::get_setting(db, key).await {
@@ -1384,6 +1391,12 @@ async fn load_routing_config(db: &PgPool) -> RoutingConfig {
     }
     RoutingConfig {
         recursion_limit,
+        // Lo STESSO valore che dimensiona il recursion_limit governa anche il
+        // cap del routing: erano due numeri diversi per la stessa soglia (100
+        // dal DB qui, la costante 60 dentro il routing), quindi la chiusura
+        // d'autorita' dell'executor e la chiusura del grafo rispondevano a due
+        // domande che si credevano la stessa.
+        iteration_cap,
         g1_max_nudges,
         final_gate_max_cycles,
         todo_isolation_enabled: setting_bool(
@@ -2055,6 +2068,301 @@ async fn load_todo_runner_config(db: &PgPool) -> TodoRunnerConfig {
     }
 }
 
+/// Cap del singolo tool_result (char) del modello del turno, dalla vista
+/// capability `v_model_capabilities` (mig 0318, PUNTO UNICO della capability —
+/// regola L): e' la fonte che la [`ToolDispatchConfig`] dichiara per questo
+/// campo. Colonna assente/NULL o vista irraggiungibile -> `default` (il
+/// safe-default del nodo), come per `resolve_context_window`: un cap inventato
+/// taglierebbe i risultati a una misura che nessuno ha scelto.
+async fn resolve_tool_result_max_chars(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    default: usize,
+) -> usize {
+    let row: Option<(Option<i32>,)> = sqlx::query_as(
+        "SELECT tool_result_max_chars FROM v_model_capabilities \
+         WHERE provider = $1 AND model = $2 LIMIT 1",
+    )
+    .bind(provider)
+    .bind(model)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    match row.and_then(|(v,)| v) {
+        Some(v) if v > 0 => v as usize,
+        _ => default,
+    }
+}
+
+/// Costruisce la [`ToolDispatchConfig`] DB-driven (regola G).
+///
+/// NESSUN `..Default::default()`: tutti i campi sono elencati. E' la parte
+/// strutturale del fix — con la chiusura per default un campo nuovo (o un campo
+/// mai cablato) entra in silenzio col valore hardcoded del `Default` e nessuna
+/// compilazione se ne accorge. Cosi' `agent.context.predictive_cap_ratio` (0.40
+/// nel DB) e' rimasto senza lettori mentre il cap girava con lo 0.8 cablato:
+/// il setting c'era, l'operatore lo aveva abbassato, e il sistema usava un altro
+/// numero. Elencandoli tutti, il prossimo campo aggiunto alla struct rompe la
+/// build QUI e obbliga a dichiarare da dove viene.
+///
+/// `fs_mutator_tools` arriva dalla `RoutingConfig` gia' letta dal chiamante
+/// (`agent.tools.result_cache_mutators`): una seconda lettura sarebbe un secondo
+/// punto di verita' per la stessa domanda (regola L).
+/// Frazione della finestra di contesto oltre la quale il cap predittivo rifiuta
+/// una chiamata. Chiave REALE: `agent.context.predictive_cap_ratio` — il doc del
+/// tipo cita `agent.predictive_cap_ratio`, che nel DB non esiste: leggerla
+/// darebbe una chiave fantasma, cioe' il difetto della config inerte con l'aria
+/// di essere risolto.
+///
+/// Il dominio e' `(0.0, 1.0]` e viene VALIDATO qui, perche' rendere leggibile un
+/// valore lo rende anche sbagliabile: la migrazione 0429 descrive questa soglia a
+/// parole come "40% invece di 50%", e chi scrivesse `40` invece di `0.40`
+/// spegnerebbe in silenzio la protezione (un cap al 4000% della finestra non
+/// scatta mai). Un valore fuori dominio non e' un'opinione da rispettare: torna
+/// al default DICHIARATO e lo dice nei log, come gia' fa `advisory_gate_timeout`.
+async fn load_predictive_cap_ratio(db: &PgPool, default: f64) -> f64 {
+    const CHIAVE: &str = "agent.context.predictive_cap_ratio";
+    ratio_nel_dominio(setting_f64(db, CHIAVE, default).await, default, CHIAVE)
+}
+
+/// La guardia di dominio, pura: separata dalla lettura perche' la lettura passa
+/// da una cache di settings che non e' chiavata per DB, e un test che cambiasse
+/// il valore piu' volte misurerebbe la cache invece della regola.
+fn ratio_nel_dominio(letto: f64, default: f64, chiave: &str) -> f64 {
+    if letto > 0.0 && letto <= 1.0 {
+        return letto;
+    }
+    tracing::warn!(
+        chiave,
+        valore = letto,
+        default,
+        "predictive_cap_ratio fuori dal dominio (0.0, 1.0]: uso il default. \
+         E' una frazione, non una percentuale: 0.40, non 40"
+    );
+    default
+}
+
+async fn load_tool_dispatch_config(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    context_window: i64,
+    fs_mutator_tools: Vec<String>,
+) -> ToolDispatchConfig {
+    let d = ToolDispatchConfig::default();
+    ToolDispatchConfig {
+        predictive_cap_ratio: load_predictive_cap_ratio(db, d.predictive_cap_ratio).await,
+        // Gia' risolto a monte dal catalog (`resolve_context_window`).
+        context_window,
+        tool_result_max_chars: resolve_tool_result_max_chars(
+            db,
+            provider,
+            model,
+            d.tool_result_max_chars,
+        )
+        .await,
+        attachment_budget_bytes: setting_i64(
+            db,
+            "agent.attachment.session_read_budget_bytes",
+            d.attachment_budget_bytes,
+        )
+        .await,
+        // NON cablato su `agent.tools.discovery_first_enabled` (true in DB), e la
+        // costante e' una DECISIONE dichiarata, non un default ereditato.
+        //
+        // Quel setting governa il punto in cui discovery-first e' davvero
+        // applicato: `agent_turn_setup::build_tools_json_for_agent`, che FILTRA
+        // il catalogo esposto al modello. Questo campo governa un SECONDO gate,
+        // a valle, che rifiuta una chiamata gia' emessa — e i due non rispondono
+        // alla stessa domanda: il gate ammette la whitelist piu' i tool scoperti
+        // nel turno PRECEDENTE (durata 1 turno), mentre l'executor continua a
+        // esporre i tool scoperti nell'INTERO run (`discovered_tools_run`).
+        //
+        // Soprattutto: un SUB-RUN non passa da `build_tools_json_for_agent` — il
+        // suo catalogo nasce da `nexus_subagent_definitions.tool_whitelist`, che
+        // e' la fonte unica di cio' che quella figura puo' chiamare. Misurato sul
+        // DB meta il 01/08/2026: 11 tool concessi da definizioni ATTIVE stanno
+        // fuori dall'insieme ammesso da M16 (`run_tests`, `run_playwright_tests`,
+        // `nexus_todo_write`, `nexus_search_semantic`, `ui_styling_audit`, ...).
+        // Accendere il gate qui li rifiuterebbe tutti con un invito a usare
+        // `nexus_mcp_tool_search`, che quelle figure spesso non hanno.
+        //
+        // Il cablaggio va fatto quando il gate sapra' rispondere alla domanda
+        // giusta (tool ammessi = catalogo REALE del run): vive in
+        // `nexus-agent-graph`, fuori da questo file.
+        discovery_first_enabled: false,
+        discovery_first_whitelist: setting_csv(
+            db,
+            "agent.tools.discovery_first_whitelist",
+            d.discovery_first_whitelist,
+        )
+        .await,
+        // Vuoto DICHIARATO: in Rust non esiste un registry di "profilo" che
+        // pubblichi tool always-on. L'insieme ammesso ha gia' la sua fonte unica
+        // (whitelist DB + meta-tool + tool brain-only); una seconda lista
+        // inventata qui sarebbe un secondo punto di verita' (regola L).
+        always_on_tools: Vec::new(),
+        // Usato a ogni turno (parsing dei tool scoperti), indipendente dal gate.
+        discovery_schema_max_bytes: setting_usize(
+            db,
+            "agent.tools.discovery_schema_max_bytes",
+            d.discovery_schema_max_bytes,
+        )
+        .await,
+        todo_reminder_every_n_steps: setting_i64(
+            db,
+            "orchestrator.todo_reminder_every_n_steps",
+            d.todo_reminder_every_n_steps,
+        )
+        .await,
+        // `agent.context.max_chars` (400000 in DB) non aveva lettori: il budget
+        // del contesto girava sulla costante del nodo. Un valore <= 0 nel DB
+        // significa "nessun budget", cioe' compressione di ogni tool_result: e'
+        // una scelta esplicita dell'operatore, non un caso da salvare.
+        max_context_chars: setting_usize(db, "agent.context.max_chars", d.max_context_chars)
+            .await,
+        fs_mutator_tools,
+        // Barriera advisory (mig 0606): attesa massima della prima scrittura.
+        // CLAMP alla deadline residua del run (fase 3): una barriera che attende
+        // oltre la deadline produrrebbe un `time_budget` mascherato da gate.
+        advisory_gate_timeout_s: advisory_gate_timeout(db).await,
+    }
+}
+
+/// Costruisce la [`ClarifyConfig`] DB-driven (regola G, prefisso `clarify.`).
+///
+/// Il nodo era costruito con `ClarifyConfig::default()` puro: i sei setting del
+/// prefisso erano INERTI. Il caso che si vedeva sul campo e'
+/// `clarify.confirm_irreversible_in_auto`, `true` nel DB e `false` nel codice —
+/// cioe' in modalita' automatica il gate delle decisioni IRREVERSIBILI non e'
+/// mai stato attivo, benche' un amministratore lo avesse acceso.
+async fn load_clarify_config(db: &PgPool) -> ClarifyConfig {
+    let d = ClarifyConfig::default();
+    ClarifyConfig {
+        // Il namespace di questa config e' MISTO per ragioni storiche: tre
+        // chiavi nascono con prefisso `orchestrator.` (mig 0169) e tre col
+        // prefisso nudo (migg 0386, 0339, 0209). Va verificata ogni singola
+        // chiave contro la migrazione che la semina, mai dedotto il prefisso
+        // dalle vicine: dedurlo produce una chiave fantasma, cioe' lo stesso
+        // difetto della config inerte con l'aria di essere risolto.
+        enabled: setting_bool(db, "orchestrator.clarify.enabled", d.enabled).await,
+        confidence_threshold: setting_f64(
+            db,
+            "orchestrator.clarify.confidence_threshold",
+            d.confidence_threshold,
+        )
+        .await,
+        max_attempts: setting_i64(db, "clarify.max_attempts", d.max_attempts).await,
+        max_question_chars: setting_i64(
+            db,
+            "orchestrator.clarify.max_question_chars",
+            d.max_question_chars,
+        )
+        .await,
+        smalltalk_agentic_score_max: setting_f64(
+            db,
+            "clarify.smalltalk_agentic_score_max",
+            d.smalltalk_agentic_score_max,
+        )
+        .await,
+        confirm_irreversible_in_auto: setting_bool(
+            db,
+            "clarify.confirm_irreversible_in_auto",
+            d.confirm_irreversible_in_auto,
+        )
+        .await,
+    }
+}
+
+/// Costruisce la [`UnderstandingConfig`] DB-driven per l'unico campo che ha una
+/// chiave, `orchestrator.subagents_enabled` (la STESSA che governa il tool
+/// `dispatch_subagent`: fonte unica, regola L).
+///
+/// Gli altri campi vengono dalle chiavi `orchestrator.understanding_*` seminate
+/// dalla migrazione 0207. Il prefisso e' `orchestrator.`, non `understanding.`:
+/// cercarle col nome sbagliato le fa sembrare inesistenti, ed e' cosi' che sono
+/// rimaste inerti — la migrazione 0564 le ha portate a `true` elencandole fra i
+/// flag "VERIFICATI letti dal codice Rust attuale", mentre nessuno le leggeva.
+/// La 0667 le riporta a `false` con la motivazione: l'accensione del nodo
+/// (pre-planner piu' fan-out di sub-agent explore) e' un cambio di comportamento
+/// che va valutato a se', ma il valore deve arrivare dal DB perche' quella
+/// valutazione si possa concludere con un UPDATE invece che con un deploy.
+async fn load_understanding_config(db: &PgPool) -> UnderstandingConfig {
+    let d = UnderstandingConfig::default();
+    UnderstandingConfig {
+        enabled: setting_bool(db, "orchestrator.understanding_enabled", d.enabled).await,
+        fanout_enabled: setting_bool(
+            db,
+            "orchestrator.understanding_fanout_enabled",
+            d.fanout_enabled,
+        )
+        .await,
+        synthesize_enabled: setting_bool(
+            db,
+            "orchestrator.understanding_synthesize_enabled",
+            d.synthesize_enabled,
+        )
+        .await,
+        topk: setting_i64(db, "orchestrator.understanding_topk", d.topk).await,
+        min_token_budget: setting_i64(
+            db,
+            "orchestrator.understanding_min_token_budget",
+            d.min_token_budget,
+        )
+        .await,
+        max_explore: setting_i64(db, "orchestrator.understanding_max_explore", d.max_explore)
+            .await,
+        subagents_enabled: setting_bool(
+            db,
+            "orchestrator.subagents_enabled",
+            d.subagents_enabled,
+        )
+        .await,
+    }
+}
+
+/// Costruisce la [`ReflectionConfig`] DB-driven (regola G). `provider`/`model`
+/// sono RISOLTI A MONTE (il nodo non li sceglie) e arrivano come parametri.
+///
+/// Prima solo `enabled` veniva letto e la chiusura `..Default::default()`
+/// seppelliva il resto: `reflection_sample_rate`, `reflection_timeout_s`,
+/// `reflection_reward_weight` e `reflection_reasoning_bank_min_score` esistono
+/// nel DB dalla stessa migrazione che li documenta, e i due template redazionali
+/// (`system.reflection_rubric` / `system.reflection_user_template`, mig 0448)
+/// erano stati ESTRATTI in `nexus_prompt_templates` proprio per non vivere nel
+/// codice — ma la config continuava a prendere le costanti, quindi modificarli
+/// in DB non aveva alcun effetto. Template assente/vuoto -> costante del nodo
+/// (safe-default: la reflection non si spegne per un template mancante).
+async fn load_reflection_config(
+    db: &PgPool,
+    provider: String,
+    model: String,
+) -> ReflectionConfig {
+    let d = ReflectionConfig::default();
+    ReflectionConfig {
+        enabled: setting_bool(db, "reflection_enabled", d.enabled).await,
+        sample_rate: setting_f64(db, "reflection_sample_rate", d.sample_rate).await,
+        timeout_s: setting_f64(db, "reflection_timeout_s", d.timeout_s).await,
+        provider,
+        model,
+        reward_weight: setting_f64(db, "reflection_reward_weight", d.reward_weight).await,
+        reasoning_bank_min_score: setting_f64(
+            db,
+            "reflection_reasoning_bank_min_score",
+            d.reasoning_bank_min_score,
+        )
+        .await,
+        system_template: resolve_prompt_template(db, "system.reflection_rubric")
+            .await
+            .unwrap_or(d.system_template),
+        user_template: resolve_prompt_template(db, "system.reflection_user_template")
+            .await
+            .unwrap_or(d.user_template),
+    }
+}
+
 /// Modalita' di ingresso del motore nativo (punto unico, regola L): distingue
 /// l'avvio nuovo dal resume HITL. Estrae la decisione "init Some/None +
 /// resume_delta" da `run_engine` in un solo enum, cosi' i due call site
@@ -2537,27 +2845,17 @@ async fn build_native_engine(
     exec_cfg.run_time_budget_s =
         effective_run_time_budget_s(exec_cfg.run_time_budget_s, input.run_time_budget_s);
 
-    let tool_dispatch_cfg = ToolDispatchConfig {
+    let tool_dispatch_cfg = load_tool_dispatch_config(
+        &db,
+        &input.provider,
+        &input.model,
         context_window,
-        fs_mutator_tools: routing_cfg.fs_mutator_tools.clone(),
-        // Barriera advisory (mig 0606): attesa massima della prima scrittura.
-        // CLAMP alla deadline residua del run (fase 3): una barriera che attende
-        // oltre la deadline produrrebbe un `time_budget` mascherato da gate.
-        advisory_gate_timeout_s: advisory_gate_timeout(&db).await,
-        ..ToolDispatchConfig::default()
-    };
+        routing_cfg.fs_mutator_tools.clone(),
+    )
+    .await;
 
-    let reflection_cfg = ReflectionConfig {
-        enabled: setting_bool(
-            &db,
-            "reflection_enabled",
-            ReflectionConfig::default().enabled,
-        )
-        .await,
-        provider: reflection_provider,
-        model: reflection_model,
-        ..ReflectionConfig::default()
-    };
+    let reflection_cfg =
+        load_reflection_config(&db, reflection_provider, reflection_model).await;
 
     // ── Meta-reasoner LLM CONDIVISO (regola L: UNA istanza, iniettata sia nel
     // gate orchestrazione del planner sia nel nodo recovery StallRecovery). Impl
@@ -2576,8 +2874,8 @@ async fn build_native_engine(
     // ── 11 nodi (porte iniettate nei costruttori reali) ──────────────────────
     let nodes = AgentGraphNodes {
         router: Arc::new(RouterNode),
-        clarify_or_expand: Arc::new(ClarifyOrExpandNode::new(ClarifyConfig::default())),
-        understanding: Arc::new(UnderstandingNode::new(UnderstandingConfig::default())),
+        clarify_or_expand: Arc::new(ClarifyOrExpandNode::new(load_clarify_config(&db).await)),
+        understanding: Arc::new(UnderstandingNode::new(load_understanding_config(&db).await)),
         planner: Arc::new(PlannerNode::new(
             planner_cfg.clone(),
             planner_provider,
@@ -4583,6 +4881,260 @@ mod tests {
         // token_brake dal DB (0.55 < 0.70 default).
         assert!((cfg.token_brake.max_context_ratio - 0.55).abs() < 1e-9);
         assert!((cfg.forced_rag_ratio - 0.30).abs() < 1e-9);
+    }
+
+    /// Scrive un setting sullo schema REALE (le migrazioni seminano gia' molte
+    /// chiavi: un INSERT nudo andrebbe in conflitto).
+    async fn upsert_setting(pool: &sqlx::PgPool, key: &str, value: &str) {
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ($1, $2) \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(pool)
+        .await
+        .expect("upsert setting");
+    }
+
+    /// Il BLOCCO di config del tool_dispatch arriva dal DB (regola G). Prima
+    /// `run_engine` ne risolveva 3 campi su 12 e chiudeva con
+    /// `..ToolDispatchConfig::default()`: tutto il resto era inerte. Il caso di
+    /// riferimento e' `agent.context.predictive_cap_ratio`, che le migrazioni
+    /// 0199+0429 portano a 0.40 mentre il cap girava sullo 0.8 cablato.
+    ///
+    /// Schema E SEED reali (regola O): la chiave 0.40 non e' scritta dal test,
+    /// e' quella che il DB di produzione riceve dalle migrazioni.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn tool_dispatch_config_legge_il_blocco_dal_db(pool: sqlx::PgPool) {
+        // Valori DISCRIMINANTI (diversi dai safe-default del nodo): un valore
+        // atteso uguale al default non proverebbe la lettura.
+        for (k, v) in [
+            ("agent.attachment.session_read_budget_bytes", "123456"),
+            ("agent.context.max_chars", "77777"),
+            ("agent.tools.discovery_schema_max_bytes", "4096"),
+            ("orchestrator.todo_reminder_every_n_steps", "9"),
+            ("agent.tools.discovery_first_enabled", "true"),
+        ] {
+            upsert_setting(&pool, k, v).await;
+        }
+
+        let cfg = load_tool_dispatch_config(
+            &pool,
+            "anthropic",
+            "modello-fuori-catalogo",
+            200_000,
+            vec!["write_file".to_string()],
+        )
+        .await;
+
+        let d = ToolDispatchConfig::default();
+        assert!(
+            (cfg.predictive_cap_ratio - 0.40).abs() < 1e-9,
+            "il cap predittivo deve venire dal seed delle migrazioni (0.40), non \
+             dal {} cablato nel Default: letto {}",
+            d.predictive_cap_ratio,
+            cfg.predictive_cap_ratio
+        );
+        assert_eq!(cfg.attachment_budget_bytes, 123_456);
+        assert_eq!(cfg.max_context_chars, 77_777);
+        assert_eq!(cfg.discovery_schema_max_bytes, 4096);
+        assert_eq!(cfg.todo_reminder_every_n_steps, 9);
+
+        // Whitelist dal DB (seed 0257/0335/0417): contiene il dominio file, non
+        // le due sole voci di discovery del Default.
+        assert!(
+            cfg.discovery_first_whitelist.iter().any(|t| t == "read_file"),
+            "whitelist dal DB: {:?}",
+            cfg.discovery_first_whitelist
+        );
+        // Il gate M16 del NODO resta spento anche col setting a true: e' la
+        // decisione DICHIARATA nel loader (un sub-run non passa dal filtro a
+        // monte, il suo catalogo nasce da nexus_subagent_definitions).
+        assert!(!cfg.discovery_first_enabled);
+        // Risolti a monte dal chiamante, non riletti qui.
+        assert_eq!(cfg.context_window, 200_000);
+        assert_eq!(cfg.fs_mutator_tools, vec!["write_file".to_string()]);
+        // Modello assente da nexus_provider_capabilities -> safe-default del nodo.
+        assert_eq!(cfg.tool_result_max_chars, d.tool_result_max_chars);
+    }
+
+    /// Rendere leggibile un valore lo rende anche sbagliabile: finche' il cap
+    /// predittivo girava sulla costante, nessun valore in tabella poteva
+    /// spegnerlo. La mig 0429 lo descrive a parole come "40% invece di 50%", e
+    /// una percentuale scritta al posto della frazione (40 invece di 0.40) non
+    /// alza la soglia: la porta al 4000% della finestra, cioe' disattiva in
+    /// silenzio la protezione.
+    ///
+    /// Che la CHIAVE giusta venga letta lo prova
+    /// `tool_dispatch_config_legge_il_blocco_dal_db` attraversando il loader; qui
+    /// si prova la REGOLA, sulla funzione pura, perche' la lettura passa da una
+    /// cache di settings non chiavata per DB: tre upsert nello stesso test
+    /// misurerebbero la cache, non il dominio (difetto noto, non introdotto qui).
+    ///
+    /// MUTAZIONE: togliendo la guardia (`ratio_nel_dominio` che ritorna `letto`)
+    /// il primo caso vale 40.0 e rosseggia.
+    #[test]
+    fn predictive_cap_ratio_fuori_dominio_torna_al_default() {
+        let d = ToolDispatchConfig::default().predictive_cap_ratio;
+        const K: &str = "agent.context.predictive_cap_ratio";
+
+        assert!(
+            (ratio_nel_dominio(40.0, d, K) - d).abs() < 1e-9,
+            "una percentuale al posto della frazione porterebbe il cap al 4000% \
+             della finestra, cioe' lo spegnerebbe in silenzio"
+        );
+        assert!(
+            (ratio_nel_dominio(0.0, d, K) - d).abs() < 1e-9,
+            "zero rifiuterebbe QUALUNQUE chiamata: fuori dominio anche in basso"
+        );
+        assert!(
+            (ratio_nel_dominio(-0.5, d, K) - d).abs() < 1e-9,
+            "un negativo non e' una frazione"
+        );
+        assert!(
+            (ratio_nel_dominio(0.55, d, K) - 0.55).abs() < 1e-9,
+            "un valore NEL dominio deve passare: la guardia non e' un tetto"
+        );
+        assert!(
+            (ratio_nel_dominio(1.0, d, K) - 1.0).abs() < 1e-9,
+            "l'estremo alto e' incluso: cap all'intera finestra"
+        );
+    }
+
+    /// `tool_result_max_chars` viene dalla capability del modello del TURNO
+    /// (vista `v_model_capabilities`, mig 0318), che e' la fonte dichiarata dal
+    /// tipo: prima restava alla costante del nodo per ogni modello.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn tool_result_max_chars_dalla_capability_del_modello(pool: sqlx::PgPool) {
+        sqlx::query(
+            "INSERT INTO nexus_provider_capabilities (provider, model, tool_result_max_chars) \
+             VALUES ('anthropic', 'claude-cap-test', 1234)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert capability");
+
+        let cfg = load_tool_dispatch_config(
+            &pool,
+            "anthropic",
+            "claude-cap-test",
+            0,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            cfg.tool_result_max_chars, 1234,
+            "cap del tool_result dalla vista capability"
+        );
+    }
+
+    /// I sei setting della `ClarifyConfig` erano inerti (`Default` puro). Il caso
+    /// vivo e' `clarify.confirm_irreversible_in_auto`: `true` nel DB di
+    /// produzione, `false` nel codice — il gate delle decisioni irreversibili in
+    /// modalita' automatica non si e' mai acceso.
+    ///
+    /// Il namespace e' MISTO (tre chiavi `orchestrator.clarify.*` dalla mig 0169,
+    /// tre col prefisso nudo dalle migg 0386/0339/0209) e dedurre il prefisso
+    /// dalle vicine produce una chiave fantasma: configurazione che sembra
+    /// esistere, che nessuna migrazione semina, e che nessun lettore trovera'
+    /// mai. E' il difetto che questo test deve vedere.
+    ///
+    /// Non basta leggere il SEME (regola O): per queste chiavi il valore
+    /// seminato dalla 0169 COINCIDE col `Default` del tipo (0.6, 280, true),
+    /// quindi un test che asserisse il seme passerebbe identico anche col nome
+    /// sbagliato, cadendo sul Default. Il valore scritto qui e' scelto DIVERSO
+    /// da entrambi: solo la lettura della chiave giusta puo' produrlo. Cio' che
+    /// il test fissa e' il valore, non il nome della chiave — che e' l'assunto
+    /// sotto esame.
+    ///
+    /// MUTAZIONE: rimettendo il prefisso nudo su `confidence_threshold`
+    /// (`clarify.confidence_threshold`, che nessuna migrazione semina) il valore
+    /// letto ricade sul Default 0.6 e l'assert su 0.42 rosseggia.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn clarify_config_legge_le_chiavi_del_namespace_giusto(pool: sqlx::PgPool) {
+        upsert_setting(&pool, "clarify.confirm_irreversible_in_auto", "true").await;
+        upsert_setting(&pool, "orchestrator.clarify.confidence_threshold", "0.42").await;
+        upsert_setting(&pool, "orchestrator.clarify.max_question_chars", "137").await;
+
+        let cfg = load_clarify_config(&pool).await;
+        assert!(
+            cfg.confirm_irreversible_in_auto,
+            "il gate irreversibili in automatico deve venire dal DB, non dal \
+             false del Default"
+        );
+        assert!(
+            (cfg.confidence_threshold - 0.42).abs() < 1e-9,
+            "soglia dalla chiave `orchestrator.clarify.*` (mig 0169): letto {}",
+            cfg.confidence_threshold
+        );
+        assert_eq!(
+            cfg.max_question_chars, 137,
+            "anche questa nasce col prefisso orchestrator."
+        );
+    }
+
+    /// I flag `orchestrator.understanding_*` (mig 0207, accesi dalla 0564 su una
+    /// premessa falsa) erano cercati col prefisso `understanding.` e quindi mai
+    /// trovati: il nodo restava spento mentre la configurazione lo dichiarava
+    /// acceso. La 0667 li riporta a `false` DICHIARANDO il motivo; qui conta che
+    /// il valore arrivi dal DB, non quale sia.
+    ///
+    /// MUTAZIONE: tornando ai safe-default cablati (`enabled: d.enabled`) questo
+    /// test rosseggia, perche' `true` nel DB darebbe comunque `false`.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn understanding_config_viene_dal_db(pool: sqlx::PgPool) {
+        upsert_setting(&pool, "orchestrator.understanding_enabled", "true").await;
+        upsert_setting(&pool, "orchestrator.understanding_fanout_enabled", "true").await;
+
+        let cfg = load_understanding_config(&pool).await;
+        assert!(
+            cfg.enabled && cfg.fanout_enabled,
+            "gli interruttori del nodo devono venire dal DB: un flag acceso in \
+             tabella e spento nel binario e' una configurazione che mente"
+        );
+        assert_eq!(cfg.topk, 8, "parametro dal seme della mig 0207");
+        assert_eq!(cfg.min_token_budget, 3000);
+    }
+
+    /// Soglie e TEMPLATE della reflection dal DB: la mig 0448 aveva estratto le
+    /// due rubriche in `nexus_prompt_templates` proprio per non tenerle nel
+    /// codice, ma la config prendeva le costanti (`..Default::default()`).
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn reflection_config_legge_soglie_e_template_dal_db(pool: sqlx::PgPool) {
+        upsert_setting(&pool, "reflection_sample_rate", "0.77").await;
+        // La riga esiste per SEED (mig 0448): la si aggiorna, e il numero di
+        // righe toccate e' esso stesso il controllo che quel seed ci sia.
+        let toccate = sqlx::query(
+            "UPDATE nexus_prompt_templates SET content = 'RUBRICA-DAL-DB', is_active = TRUE \
+             WHERE key = 'system.reflection_rubric'",
+        )
+        .execute(&pool)
+        .await
+        .expect("update template rubrica")
+        .rows_affected();
+        assert_eq!(toccate, 1, "il seed 0448 deve esserci");
+
+        let cfg =
+            load_reflection_config(&pool, "anthropic".to_string(), "claude-x".to_string()).await;
+        assert!((cfg.sample_rate - 0.77).abs() < 1e-9);
+        assert_eq!(cfg.system_template, "RUBRICA-DAL-DB");
+        // Provider/model restano quelli risolti a monte (il nodo non li sceglie).
+        assert_eq!(cfg.provider, "anthropic");
+        assert_eq!(cfg.model, "claude-x");
+    }
+
+    /// `orchestrator.subagents_enabled` e' l'unico campo di UnderstandingConfig
+    /// con una chiave nel DB (la STESSA che governa `dispatch_subagent`): prima
+    /// il nodo nasceva da `UnderstandingConfig::default()` e non la vedeva.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn understanding_config_legge_subagents_enabled(pool: sqlx::PgPool) {
+        upsert_setting(&pool, "orchestrator.subagents_enabled", "false").await;
+        let cfg = load_understanding_config(&pool).await;
+        assert!(
+            !cfg.subagents_enabled,
+            "false dal DB deve vincere sul true del Default"
+        );
     }
 
     /// FIX-A (scale-controller): il tier del modello iniziale e' letto dal catalog e

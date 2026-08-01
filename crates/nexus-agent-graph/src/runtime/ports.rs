@@ -507,6 +507,70 @@ pub struct CriterionSpec {
     pub timeout_s: Option<f64>,
 }
 
+/// Esito di UN criterio di verifica: passato, fallito, oppure NON MISURABILE.
+///
+/// Tre casi e non un `bool` perche' "non ho potuto misurare" non e' ne' una
+/// prova di difetto ne' una prova di correttezza. Schiacciato su un booleano
+/// l'ignoto degrada per forza in una delle due direzioni, e nello stesso nodo
+/// degradava in ENTRAMBE: un criterio non portato (`no_orphan_imported`) o un
+/// file non interrogabile diventava `true` e il gate chiudeva "verifica
+/// superata" senza che nessuno avesse misurato; un exit code ASSENTE
+/// (processo mai partito) diventava `false` come un exit code SBAGLIATO, e il
+/// gate bocciava il codice per un guasto dell'esecuzione.
+///
+/// La variante vive nel TIPO e non come flag dentro `evidence`: un flag in un
+/// JSON opaco e' invisibile al compilatore, quindi ogni consumatore decide da
+/// se' se guardarlo — ed e' esattamente cosi' che i due nodi gemelli
+/// (`verifier` e `final_gate`) sono arrivati a due idee diverse dello stesso
+/// esito.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CriterionOutcome {
+    /// Misurato: il criterio e' soddisfatto.
+    Passed,
+    /// Misurato: il criterio NON e' soddisfatto (prova di difetto).
+    Failed,
+    /// Non misurabile: la prova non e' stata eseguita o non ha prodotto un
+    /// segnale interpretabile. NON e' un verdetto sul codice.
+    Inconclusive,
+}
+
+impl CriterionOutcome {
+    /// Esito di una misura EFFETTUATA. Da usare solo dove il criterio ha
+    /// davvero prodotto un segnale: costruirlo da un booleano che gia' porta
+    /// dentro di se' un caso "non so" riporta il difetto al punto di partenza.
+    pub fn measured(passed: bool) -> Self {
+        if passed {
+            Self::Passed
+        } else {
+            Self::Failed
+        }
+    }
+
+    /// Misurato e soddisfatto.
+    pub fn is_passed(self) -> bool {
+        matches!(self, Self::Passed)
+    }
+
+    /// Misurato e non soddisfatto: l'unico caso che prova un difetto.
+    pub fn is_failed(self) -> bool {
+        matches!(self, Self::Failed)
+    }
+
+    /// Non misurabile.
+    pub fn is_inconclusive(self) -> bool {
+        matches!(self, Self::Inconclusive)
+    }
+
+    /// Identificatore canonico (regola N) per persistenza/render/telemetria.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Inconclusive => "inconclusive",
+        }
+    }
+}
+
 /// Esito dell'esecuzione di UN criterio. `evidence` e' JSON arbitrario: per il
 /// criterio build contiene `output_excerpt`/`exit_code`/`output_total_chars`/
 /// `output_truncated`, per gli altri `verdict`/`error`.
@@ -514,10 +578,27 @@ pub struct CriterionSpec {
 pub struct CriterionResult {
     /// Tipo del criterio (eco dello spec).
     pub criterion_type: String,
-    /// `true` se il criterio e' passato.
-    pub passed: bool,
+    /// Esito a tre stati (vedi [`CriterionOutcome`]).
+    pub outcome: CriterionOutcome,
     /// Evidenza diagnostica (JSON opaco al nodo).
     pub evidence: Value,
+}
+
+impl CriterionResult {
+    /// Misurato e soddisfatto.
+    pub fn passed(&self) -> bool {
+        self.outcome.is_passed()
+    }
+
+    /// Misurato e non soddisfatto: l'unico caso che boccia.
+    pub fn failed(&self) -> bool {
+        self.outcome.is_failed()
+    }
+
+    /// Non misurabile: non boccia e non assolve.
+    pub fn inconclusive(&self) -> bool {
+        self.outcome.is_inconclusive()
+    }
 }
 
 /// Astrazione del motore di verifica dei criteri generali del final gate.
@@ -530,9 +611,11 @@ pub struct CriterionResult {
 pub trait CriteriaRunner: Send + Sync {
     /// Esegue i criteri nell'ordine dato; un fallimento di un
     /// criterio NON deve propagare un errore: il concreto lo mappa su un
-    /// [`CriterionResult`] con `passed=false` + `evidence.error` (parita' col
-    /// try/except del Python, `final_gate.py:381-385`). L'errore di porta resta
-    /// per un guasto infrastrutturale del runner stesso.
+    /// [`CriterionResult`] con [`CriterionOutcome::Failed`] + `evidence.error`
+    /// (parita' col try/except del Python, `final_gate.py:381-385`). Una prova
+    /// che non si e' potuta ESEGUIRE e' invece
+    /// [`CriterionOutcome::Inconclusive`]. L'errore di porta resta per un
+    /// guasto infrastrutturale del runner stesso.
     async fn run(
         &self,
         criteria: Vec<CriterionSpec>,

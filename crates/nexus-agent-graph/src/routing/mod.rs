@@ -54,25 +54,29 @@ pub enum NodeTarget {
     ScaleControl,
 }
 
-/// `MAX_AGENT_ITERATIONS` Python: cap conservativo di fallback quando lo state
-/// non porta un `iteration_budget` adattivo. Vedi `helpers.MAX_AGENT_ITERATIONS`.
-const MAX_AGENT_ITERATIONS: i64 = 60;
-
-/// Cap iterazioni effettivo: `iteration_budget` adattivo se >0, altrimenti il
-/// fallback `MAX_AGENT_ITERATIONS`. Replica
-/// `int(state.get("iteration_budget") or 0) or MAX_AGENT_ITERATIONS`.
-/// Il campo `iteration_budget` non e' promosso a campo nativo: vive in `extra`.
-fn iter_cap(state: &AgentState) -> i64 {
-    let budget = state
-        .extra
-        .get("iteration_budget")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    if budget != 0 {
-        budget
-    } else {
-        MAX_AGENT_ITERATIONS
-    }
+/// Cap iterazioni del run per il ROUTING: viene dalla CONFIG (regola G), la
+/// stessa che governa la chiusura d'autorita' dentro l'executor e che dimensiona
+/// il `recursion_limit`.
+///
+/// NON e' ancora l'unica risposta nel workspace: `decisions::reward` conserva la
+/// propria `MAX_AGENT_ITERATIONS = 60` come floor del reward euristico quando
+/// `iteration_budget` e' 0 — cioe' sempre, visto che quel campo non lo scrive
+/// nessuno. E' lo stesso doppio decisore appena tolto da qui, sopravvissuto in un
+/// consumatore diverso: finche' resta, un cap DB a 100 produce un reward calcolato
+/// su 60, e la stessa soglia ha due valori a seconda di chi la chiede (residuo
+/// dichiarato, regola L).
+///
+/// Qui vivevano DUE decisori: `extra["iteration_budget"]` se != 0, altrimenti
+/// la costante `MAX_AGENT_ITERATIONS = 60`. Il campo adattivo lo scriveva il
+/// `router_node` PYTHON; nel motore nativo non lo scrive nessuno (misurato sul
+/// DB di progetto: 14199 checkpoint, `state->'extra'->>'iteration_budget'`
+/// NULL su tutti), quindi il ramo adattivo era morto e il cap effettivo era la
+/// costante — mentre il setting `agent.executor.iteration_cap` (100 in
+/// produzione) non governava questo punto. Un valore configurabile non torna in
+/// una costante: se un budget per-run servira', lo portera' la config, non un
+/// campo di stato che nessun produttore popola (regola O).
+fn iter_cap(cfg: &RoutingConfig) -> i64 {
+    cfg.iteration_cap
 }
 
 /// Numero di iterazioni gia' eseguite (`int(state.get("iterations") or 0)`).
@@ -100,14 +104,21 @@ fn had_tools(state: &AgentState) -> bool {
 
 /// Decide se iterare, verificare o chiudere dopo l'executor.
 ///
-/// Porting 1:1 di `route_after_executor` (routing.py:101-291). I 9 branch-path
-/// sono valutati nello STESSO ordine del Python (l'ordine e' load-bearing: il
-/// primo che matcha vince).
+/// Porting di `route_after_executor` (routing.py:101-291): i branch-path sono
+/// valutati nello STESSO ordine del Python (l'ordine e' load-bearing: il primo
+/// che matcha vince).
+///
+/// DIVERGENZA VOLUTA dal Python (regola H, non una toppa): al cap il Python
+/// ritornava sempre `learner`. Qui il cap concede PRIMA una verifica oggettiva,
+/// una sola volta per run — vedi il branch (4). In Python quel `learner` andava
+/// al nodo di riflessione; nel grafo nativo passa dal ReviewGate, cioe' da un
+/// panel di modelli, e chiudere di li' senza aver mai eseguito build/typecheck
+/// non e' una chiusura verificata.
 pub fn route_after_executor(state: &AgentState, cfg: &RoutingConfig) -> NodeTarget {
     let stop_reason = state.stop_reason;
     let pending = has_pending(state);
     let iters = iterations(state);
-    let cap = iter_cap(state);
+    let cap = iter_cap(cfg);
 
     // (1) Cancellazione cooperativa: run superato -> chiusura immediata.
     if stop_reason == Some(StopReason::Superseded) {
@@ -154,13 +165,38 @@ pub fn route_after_executor(state: &AgentState, cfg: &RoutingConfig) -> NodeTarg
         }
         return NodeTarget::Learner;
     }
-    // (4) Cap iterazioni adattivo -> learner. ECCEZIONE (ADR 0034): una
-    // dichiarazione task_complete PENDENTE viene sempre dispatchata (e' la
-    // CHIUSURA strutturata del run, un giro di dispatch senza chiamate LLM):
-    // altrimenti il turno dichiarativo emesso a ridosso del cap perdeva la
-    // dichiarazione (tool_use senza tool_result) e l'esito ricadeva sulle
-    // euristiche.
+    // (4) Cap iterazioni -> chiusura. ECCEZIONE (ADR 0034): una dichiarazione
+    // task_complete PENDENTE viene sempre dispatchata (e' la CHIUSURA
+    // strutturata del run, un giro di dispatch senza chiamate LLM): altrimenti
+    // il turno dichiarativo emesso a ridosso del cap perdeva la dichiarazione
+    // (tool_use senza tool_result) e l'esito ricadeva sulle euristiche.
     if iters >= cap && !pending_is_task_complete(state) {
+        // UNA verifica oggettiva prima di chiudere, e una sola.
+        //
+        // Il cap era valutato PRIMA dell'eleggibilita' del final_gate, e
+        // `Learner` e' rimappato su ReviewGate (graph.rs): un run che esauriva
+        // le iterazioni chiudeva giudicato da un panel di MODELLI senza che
+        // build/typecheck/endpoint fossero mai stati eseguiti. Misurato sui
+        // checkpoint di bacheca-attivita: 97 transizioni executor->review_gate a
+        // `iterations >= cap` contro ZERO executor->final_gate, e 43 di quelle
+        // transizioni appartengono a run in cui il gate non e' MAI entrato.
+        //
+        // La condizione include "il gate non e' mai entrato in questo run"
+        // (`final_gate_verdict == None`, il segnale STRUTTURATO che il gate
+        // scrive su OGNI suo ramo, regola M) e non il solo `final_gate_eligible`:
+        // il gate che boccia DICHIARA `RimandaInCorrezione` e l'edge lo rispedisce
+        // all'executor, che al giro successivo e' di nuovo al cap. Senza il
+        // marcatore sarebbe un ciclo executor->final_gate->executor fermato solo
+        // dal `recursion_limit`; con il marcatore la verifica al cap e' UNICA e
+        // non ripetibile, perche' il verdetto e' monotono (nessun nodo lo riporta
+        // a `None`) e il turno di correzione concesso dal gate e' l'ultimo: al
+        // rientro l'executor trova il verdetto scritto e chiude.
+        //
+        // Un run gia' verificato (verdetto presente, qualunque esso sia) non
+        // ripete la verifica: la sua ha gia' avuto luogo ed e' registrata.
+        if state.final_gate_verdict.is_none() && signals::final_gate_eligible(state, cfg) {
+            return NodeTarget::FinalGate;
+        }
         return NodeTarget::Learner;
     }
     // (5) tool_use + pending -> tool_dispatch.
@@ -310,8 +346,8 @@ pub(crate) fn declared_role_channel(state: &AgentState) -> Option<&'static str> 
 
 /// Decide post-verifier: re-iterare (executor) o chiudere (learner).
 /// Porting 1:1 di `route_after_verifier` (routing.py:294-311).
-pub fn route_after_verifier(state: &AgentState, _cfg: &RoutingConfig) -> NodeTarget {
-    if iterations(state) >= iter_cap(state) {
+pub fn route_after_verifier(state: &AgentState, cfg: &RoutingConfig) -> NodeTarget {
+    if iterations(state) >= iter_cap(cfg) {
         return NodeTarget::Learner;
     }
     if state.stop_reason == Some(StopReason::ToolUse) {
@@ -336,7 +372,7 @@ pub fn route_after_planner(state: &AgentState, cfg: &RoutingConfig) -> NodeTarge
 /// Dopo todo_runner: re-entry, chiusura via final_gate/learner, o fallback executor.
 /// Porting 1:1 di `route_after_todo_runner` (routing.py:339-385).
 pub fn route_after_todo_runner(state: &AgentState, cfg: &RoutingConfig) -> NodeTarget {
-    if iterations(state) >= iter_cap(state) {
+    if iterations(state) >= iter_cap(cfg) {
         return NodeTarget::Learner;
     }
     let stop_reason = state.stop_reason;
@@ -514,6 +550,91 @@ mod tests {
             route_after_executor(&s, &RoutingConfig::default()),
             NodeTarget::Learner
         );
+    }
+
+    /// Al cap, un run ELEGGIBILE alla verifica oggettiva ci passa PRIMA di
+    /// chiudere: `Learner` e' rimappato su ReviewGate (un panel di modelli),
+    /// quindi chiudere di li' significa non aver mai eseguito build/typecheck.
+    #[test]
+    fn cap_iterazioni_passa_dalla_verifica_oggettiva() {
+        let cfg = RoutingConfig::default();
+        let mut s = base();
+        s.iterations = Some(cfg.iteration_cap);
+        s.stop_reason = Some(StopReason::EndTurn);
+        s.user_intent = Some("code".into()); // task software -> gate eleggibile.
+        assert_eq!(route_after_executor(&s, &cfg), NodeTarget::FinalGate);
+        // Un run NON software resta com'era: nessun criterio da eseguire.
+        s.user_intent = Some("chat".into());
+        assert_eq!(route_after_executor(&s, &cfg), NodeTarget::Learner);
+    }
+
+    /// La verifica al cap e' UNA SOLA: il gate che boccia rimanda all'executor,
+    /// che al giro dopo e' di nuovo al cap. Il verdetto gia' scritto (segnale
+    /// strutturato del gate) impedisce il ciclo executor->final_gate->executor.
+    #[test]
+    fn verifica_al_cap_non_si_ripete() {
+        let cfg = RoutingConfig::default();
+        let mut s = base();
+        s.iterations = Some(cfg.iteration_cap);
+        s.stop_reason = Some(StopReason::EndTurn);
+        s.user_intent = Some("code".into());
+        // Il gate e' gia' entrato in questo run (qualunque verdetto): chiude.
+        for verdetto in [
+            crate::state::FinalGateVerdict::FailedPendingCorrection,
+            crate::state::FinalGateVerdict::Passed,
+            crate::state::FinalGateVerdict::EscalationHandoff,
+        ] {
+            s.final_gate_verdict = Some(verdetto);
+            assert_eq!(
+                route_after_executor(&s, &cfg),
+                NodeTarget::Learner,
+                "verdetto {verdetto:?}: la verifica al cap non si ripete"
+            );
+        }
+    }
+
+    /// Il cap viene dalla CONFIG, non da una costante: con `iteration_cap = 100`
+    /// un run a 60 iterazioni PROSEGUE (con la costante storica chiudeva).
+    #[test]
+    fn cap_iterazioni_dalla_config() {
+        let cfg = RoutingConfig {
+            iteration_cap: 100,
+            ..RoutingConfig::default()
+        };
+        let mut s = base();
+        s.iterations = Some(60);
+        s.stop_reason = Some(StopReason::ToolUse);
+        s.pending_tool_uses = Some(vec![json!({"name": "read_file"})]);
+        assert_eq!(route_after_executor(&s, &cfg), NodeTarget::ToolDispatch);
+        // Stesso stato con cap piu' basso della config -> chiusura.
+        let cfg_basso = RoutingConfig {
+            iteration_cap: 10,
+            ..RoutingConfig::default()
+        };
+        assert_eq!(route_after_executor(&s, &cfg_basso), NodeTarget::Learner);
+        // Le altre due route leggono lo STESSO cap dalla config.
+        s.stop_reason = Some(StopReason::ToolUse);
+        assert_eq!(route_after_verifier(&s, &cfg), NodeTarget::Executor);
+        assert_eq!(route_after_verifier(&s, &cfg_basso), NodeTarget::Learner);
+        assert_eq!(route_after_todo_runner(&s, &cfg), NodeTarget::TodoRunner);
+        assert_eq!(route_after_todo_runner(&s, &cfg_basso), NodeTarget::Learner);
+    }
+
+    /// Il budget adattivo in `extra` non e' piu' una fonte: nessun produttore lo
+    /// scrive nel motore nativo (misurato: NULL su 14199 checkpoint), e un campo
+    /// che nessuno popola non puo' scavalcare la configurazione (regola G/O).
+    #[test]
+    fn iteration_budget_in_extra_non_governa_il_cap() {
+        let cfg = RoutingConfig {
+            iteration_cap: 10,
+            ..RoutingConfig::default()
+        };
+        let mut s = base();
+        s.iterations = Some(20);
+        s.stop_reason = Some(StopReason::ToolUse);
+        s.pending_tool_uses = Some(vec![json!({"name": "read_file"})]);
+        s.extra.insert("iteration_budget".into(), json!(500));
+        assert_eq!(route_after_executor(&s, &cfg), NodeTarget::Learner);
     }
 
     #[test]

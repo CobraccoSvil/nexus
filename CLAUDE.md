@@ -564,6 +564,77 @@ staging, file nuovo e file cancellato:
 Non esiste una forma di `git diff` che li copra tutti: usare `-Save` + `-Restore`,
 che parte dall'indice reale e fa `add -A`.
 
+## Q. Una risposta agentica dichiara l'esito in un CAMPO, non nel testo
+
+Regola autoritativa, duale della M e con lo stesso peso: **cio' che un tool, un
+agente, un nodo o un servizio interno RESTITUISCE deve portare il proprio esito in
+campi tipizzati; il testo libero resta per l'umano e non trasporta mai
+informazione che qualcuno a valle debba estrarre.**
+
+La M vieta di LEGGERE lo stato tecnico dal testo. Ma finche' il produttore
+consegna solo testo, il consumatore non ha alternative: e' costretto a parsare, e
+la M diventa inapplicabile per costruzione. Le due regole sono la stessa regola
+vista dai due lati del confine, e il lato del produttore e' quello che decide se
+l'altro puo' rispettarla.
+
+### Cosa e' vietato
+
+- **Firme che non hanno spazio per l'esito**: `async fn tool_x(...) -> String`. Il
+  tipo di ritorno E' il contratto: se non ha un campo per il verdetto, il verdetto
+  finira' nel testo, sempre, per necessita'.
+- **Marker dentro la stringa** (`"ERRORE: ..."`, un carattere in testa, un prefisso
+  convenzionale) come canale dell'esito. Anche quando il marker e' costante,
+  documentato e prodotto da un punto unico, resta un campo travestito da prosa:
+  chiunque componga quella stringa lo puo' spostare, seppellire o perdere, e non
+  c'e' tipo che lo impedisca. Misurato in questo repo: il marker di fallimento dei
+  tool viveva in testa alla stringa e `is_tool_failure` lo cercava li', mentre due
+  composizioni legittime gli anteponevano prosa di successo — l'apparato anti-loop
+  dedicato a quella firma era irraggiungibile per costruzione, e nessun test poteva
+  accorgersene perche' il contratto non era un tipo.
+- **Numeri e stati incorporati nel testo** perche' il chiamante li rilegga
+  (`"EXIT CODE: 0"`, `"3 file modificati"`, `"status: ok"`). Chi li scrive sta
+  serializzando a mano in un formato senza schema.
+- **Un `Display` usato come protocollo**: se un `to_string()` viene poi analizzato
+  da codice, quel tipo aveva bisogno di un campo, non di una `impl Display`.
+
+### Cosa e' richiesto
+
+1. **Il tipo di ritorno porta l'esito.** Minimo: cosa e' successo (enum chiuso, mai
+   `bool` quando i casi sono tre — l'ignoto e' un caso), i dati misurati, e il testo
+   per l'umano come UN campo fra gli altri. Il vocabolario e' in inglese e canonico
+   (regola N).
+2. **L'ignoto e' una variante, non un valore comodo.** `NonMisurabile` /
+   `Inconclusive` / `Unknown` esistono perche' "non ho potuto guardare" non degradi
+   ne' a "va bene" ne' a "e' rotto". Un `Option` che collassa due cause diverse in
+   un `None` e' lo stesso difetto in forma piu' educata.
+3. **Il testo si compone DOPO, dai campi.** Mai il contrario. Un renderer che
+   traduce la struttura in prosa e' legittimo e va bene ovunque; un parser che
+   ricostruisce la struttura dalla prosa e' il difetto.
+4. **Verso il modello, lo schema e' il contratto.** Quando la risposta la produce
+   un LLM, si usano structured output / tool a schema strict con enum ed evidenza
+   obbligatoria, mai il pattern-matching sulla prosa (ADR 0034). Cio' che il modello
+   DICHIARA resta una dichiarazione: non diventa stato tecnico persistito senza che
+   qualcuno l'abbia osservata (vedi corollario in fondo).
+5. **Migrazione incrementale ammessa, marker nuovi no.** Dove le firme legacy
+   ritornano testo, il ponte esistente resta finche' non e' migrato — ma un
+   intervento NUOVO non introduce un altro marker: introduce il campo. Se il campo
+   non c'e', il lavoro e' aggiungerlo, non aggirarlo.
+
+### Il corollario che vale per tutti
+
+Una struttura non rende vera l'affermazione che contiene. Un modello che compila
+`{"outcome": "done"}` sta dichiarando, non accertando: la forma strutturata elimina
+il parsing, non il bisogno di misurare. Il campo va bene come DICHIARAZIONE; per
+diventare stato tecnico (`passed`, `resolved`, `status='closed'`) serve
+un'osservazione del codice.
+
+### Conseguenza pratica
+
+Prima di scrivere `-> String` su qualunque cosa che un altro pezzo di sistema
+dovra' interpretare, FERMATI: quel valore ha un esito, e l'esito vuole un campo.
+Un PR che aggiunge un marker testuale nuovo, o una firma che costringe il
+chiamante a parsare, e' rifiutato come una toppa (regola H).
+
 ## Esecuzione locale canonica
 
 - Ambiente di sviluppo locale: **Windows nativo**, repo Git in `D:\IDEAI`. Shell:

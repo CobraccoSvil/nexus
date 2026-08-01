@@ -39,7 +39,9 @@
 //!   excerpt per criterio, ramo speciale build (max_output_chars,
 //!   output_truncated, header), direttive fail-closed, prefisso `<autonomy_hint>`
 //!   se behavior_mode autonomo. Stringhe deterministiche 1:1.
-//! - **`all_passed`** (`final_gate.py:392`): `all(r.passed)` sui risultati.
+//! - **`all_passed`** (`final_gate.py:392`): `all(passed)` sui soli risultati
+//!   MISURABILI; i non misurabili non bocciano ma tolgono alla chiusura il
+//!   titolo di "verificata" (vedi [`CriterionOutcome`]).
 //!
 //! ## Cosa NON porta (sotto-sistema delegato dietro porta + TODO espliciti)
 //!
@@ -285,6 +287,20 @@ impl Default for FinalGateConfig {
 /// vuota; una stringa vuota `""` (falsy in Python) o un tipo diverso/assente
 /// ritornano `None`, cosi' il chiamante cade sul campo successivo della catena.
 /// Senza questo, `Some("")` interromperebbe il fallback (divergenza dal Python).
+/// Il titolo del meta-step quando il gate chiude col PASS: dichiara quanti
+/// criteri non si sono potuti misurare, invece di tacerli.
+///
+/// "Verifica superata" davanti a criteri non misurati e' precisamente la frase
+/// che il caso `Inconclusive` esiste per non far dire piu': il numero, nel
+/// titolo, e' cio' che distingue una verifica CONCLUSA da una verifica in cui
+/// una parte non e' stata guardata.
+fn titolo_verifica_superata(inconclusive: usize) -> String {
+    if inconclusive == 0 {
+        return "Verifica superata".to_string();
+    }
+    format!("Verifica superata sui criteri misurabili ({inconclusive} non misurabili)")
+}
+
 fn str_truthy(v: Option<&Value>) -> Option<&str> {
     match v.and_then(Value::as_str) {
         Some(s) if !s.is_empty() => Some(s),
@@ -670,9 +686,28 @@ impl FinalGateNode {
         criteria
     }
 
-    /// `all_passed` reduce (`final_gate.py:392`): tutti i criteri passati?
+    /// `all_passed` reduce (`final_gate.py:392`): tutti i criteri MISURABILI
+    /// sono passati?
+    ///
+    /// Converge col gemello [`crate::nodes::verifier`], che gia' escludeva gli
+    /// inconcludenti dal conteggio: un criterio non misurabile non e' una prova
+    /// di difetto, quindi non boccia. Non e' nemmeno una prova di correttezza —
+    /// quella meta' della risposta la porta [`Self::any_inconclusive`], e il
+    /// chiamante la usa per NON dichiarare verificata la chiusura.
+    ///
+    /// Lista vuota (o tutti inconcludenti) -> vero per vacuita': e' il
+    /// comportamento storico del reduce, e non e' un'assoluzione perche' in quel
+    /// caso `any_inconclusive` degrada comunque la chiusura.
     pub fn all_passed(results: &[CriterionResult]) -> bool {
-        results.iter().all(|r| r.passed)
+        results.iter().filter(|r| !r.inconclusive()).all(|r| r.passed())
+    }
+
+    /// Almeno un criterio NON e' stato misurabile: la verifica ha dei buchi.
+    /// Non boccia (nessuna prova di difetto) ma toglie alla chiusura il titolo
+    /// di "verificata" — stessa conseguenza gia' scelta per il profilo di
+    /// verifica assente e per le prove funzionali mai eseguite.
+    pub fn any_inconclusive(results: &[CriterionResult]) -> bool {
+        results.iter().any(|r| r.inconclusive())
     }
 
     /// True se l'UNICO tipo di criterio fallito e' `completion_confirmed`: il
@@ -684,7 +719,7 @@ impl FinalGateNode {
     /// PASSED) e che TUTTI i falliti siano `completion_confirmed`.
     fn only_completion_confirmed_failed(results: &[CriterionResult]) -> bool {
         let mut any_failed = false;
-        for r in results.iter().filter(|r| !r.passed) {
+        for r in results.iter().filter(|r| r.failed()) {
             any_failed = true;
             if r.criterion_type != "completion_confirmed" {
                 return false;
@@ -709,7 +744,7 @@ impl FinalGateNode {
     fn failed_criteria_meta(results: &[CriterionResult]) -> Value {
         let items: Vec<Value> = results
             .iter()
-            .filter(|r| !r.passed)
+            .filter(|r| r.failed())
             .map(|r| {
                 let ev = &r.evidence;
                 let excerpt = str_truthy(ev.get("output_excerpt"))
@@ -753,7 +788,7 @@ impl FinalGateNode {
         results: &[CriterionResult],
     ) -> String {
         // Corpo specifico per criterio fallito (aggregato, non testo fisso).
-        let failed: Vec<&CriterionResult> = results.iter().filter(|r| !r.passed).collect();
+        let failed: Vec<&CriterionResult> = results.iter().filter(|r| r.failed()).collect();
         let mut body_parts: Vec<String> = Vec::new();
         // build_errors_count e' load-bearing OLTRE il loop (entra nelle direttive
         // se >0, final_gate.py:464). build_truncated invece e' usato SOLO nel
@@ -969,6 +1004,11 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
             })?;
 
         let passed = Self::all_passed(&results);
+        // Criteri che NON si sono potuti misurare (grafo import non portato,
+        // radice del run non risolta, comando senza exit code, ...). Non
+        // bocciano — non provano nulla sul codice — ma tolgono alla chiusura il
+        // titolo di "verificata".
+        let inconclusive_n = results.iter().filter(|r| r.inconclusive()).count();
 
         // ── Ramo PASSED (final_gate.py:513-522) ───────────────────────────────
         // Chiude con esito canonico CompletedVerified lato mcp-core.
@@ -976,14 +1016,19 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
             tracing::info!(
                 target: "nexus_agent_graph::final_gate",
                 cycle,
+                inconclusive = inconclusive_n,
                 "final_gate: passato -> chiusura"
             );
             crate::nodes::emit_phase_meta(
                 ctx.emit.as_ref(),
                 self.meta_steps.as_ref(),
                 "final_gate",
-                "Verifica superata".to_string(),
-                serde_json::json!({"cycle": cycle, "phase": "passed"}),
+                titolo_verifica_superata(inconclusive_n),
+                serde_json::json!({
+                    "cycle": cycle,
+                    "phase": "passed",
+                    "inconclusive": inconclusive_n,
+                }),
             )
             .await;
             return Ok(StateDelta {
@@ -1001,8 +1046,15 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 // Stessa cosa sul fronte FUNZIONALE: un'app con un servizio HTTP di
                 // cui nessuno ha provato un endpoint non e' un'app verificata,
                 // per quanto il suo codice compili.
+                // Terza forma dello stesso buco, e la sola che prima veniva
+                // scambiata per una misura: un criterio NON MISURABILE. Non
+                // boccia (non prova un difetto) e non assolve (non prova la
+                // correttezza), quindi ha esattamente la conseguenza degli altri
+                // due -- il finalizzatore mappa `CompletedUnverified`.
                 final_gate_unverified: Some(Some(
-                    self.cfg.verify_profile_missing || functional_probe_missing,
+                    self.cfg.verify_profile_missing
+                        || functional_probe_missing
+                        || inconclusive_n > 0,
                 )),
                 ..Default::default()
             }
@@ -1287,6 +1339,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::runtime::ports::CriterionOutcome;
     use crate::runtime::test_doubles::{
         NullEventSink, StubCriteriaRunner, StubLlmGateway, StubMetaStepStore, StubToolExecutor,
     };
@@ -1302,7 +1355,7 @@ mod tests {
     fn ok_result(t: &str) -> CriterionResult {
         CriterionResult {
             criterion_type: t.to_string(),
-            passed: true,
+            outcome: CriterionOutcome::Passed,
             evidence: json!({}),
         }
     }
@@ -1310,8 +1363,16 @@ mod tests {
     fn fail_result(t: &str, evidence: Value) -> CriterionResult {
         CriterionResult {
             criterion_type: t.to_string(),
-            passed: false,
+            outcome: CriterionOutcome::Failed,
             evidence,
+        }
+    }
+
+    fn inconclusive_result(t: &str) -> CriterionResult {
+        CriterionResult {
+            criterion_type: t.to_string(),
+            outcome: CriterionOutcome::Inconclusive,
+            evidence: json!({"skipped_reason": "non interrogabile"}),
         }
     }
 
@@ -1981,7 +2042,7 @@ mod tests {
                             .ends_with("/api/expenses");
                     CriterionResult {
                         criterion_type: c.criterion_type,
-                        passed: !scrittura,
+                        outcome: CriterionOutcome::measured(!scrittura),
                         evidence: if scrittura {
                             json!({"status": 500, "verdict": "POST /api/expenses -> 500 (atteso 200/201/202/204)"})
                         } else {
@@ -2382,6 +2443,99 @@ mod tests {
         // Lista vuota -> all() su iterabile vuoto = true (parita' Python).
         assert!(FinalGateNode::all_passed(&[]));
     }
+
+    // ── Criteri NON MISURABILI ────────────────────────────────────────────────
+
+    #[test]
+    fn il_non_misurabile_e_fuori_dal_conteggio_in_entrambe_le_direzioni() {
+        // Non boccia: un criterio che nessuno ha potuto eseguire non prova un
+        // difetto. Prima `all(r.passed)` lo trattava come un pass PIENO, il che
+        // e' la stessa cosa solo finche' nessuno chiede "quanto e' stato
+        // verificato": la seconda meta' della risposta e' `any_inconclusive`.
+        let solo_inc = [inconclusive_result("no_orphan_imported")];
+        assert!(FinalGateNode::all_passed(&solo_inc));
+        assert!(FinalGateNode::any_inconclusive(&solo_inc));
+
+        // E non copre un criterio davvero fallito.
+        let misto = [
+            inconclusive_result("no_orphan_imported"),
+            fail_result("run_command", json!({})),
+        ];
+        assert!(!FinalGateNode::all_passed(&misto));
+
+        // Nessun inconcludente -> nessuna riserva.
+        assert!(!FinalGateNode::any_inconclusive(&[
+            ok_result("a"),
+            fail_result("b", json!({}))
+        ]));
+    }
+
+    #[test]
+    fn il_non_misurabile_non_e_un_criterio_fallito_da_rendere() {
+        // Il blocco di correzione e la timeline elencano cio' che ha FALLITO:
+        // un criterio non misurato non ha niente da far correggere all'agente.
+        let results = [
+            inconclusive_result("no_orphan_imported"),
+            fail_result("run_command", json!({"output_excerpt": "boom"})),
+        ];
+        let meta = FinalGateNode::failed_criteria_meta(&results);
+        let items = meta.as_array().expect("array");
+        assert_eq!(items.len(), 1, "solo il criterio MISURATO e fallito");
+        assert_eq!(items[0]["type"], json!("run_command"));
+        // E non impedisce il turno di grazia: l'unico criterio FALLITO resta
+        // `completion_confirmed` anche in presenza di un inconcludente.
+        assert!(FinalGateNode::only_completion_confirmed_failed(&[
+            ok_result("run_command"),
+            inconclusive_result("outputs_exist"),
+            fail_result("completion_confirmed", json!({})),
+        ]));
+    }
+
+    #[tokio::test]
+    async fn criterio_non_misurabile_chiude_ma_non_verificato() {
+        // CONSEGUENZA (regola O): non basta che il conteggio escluda
+        // l'inconcludente; il run deve chiudere con `final_gate_unverified`,
+        // che mcp-core mappa su `CompletedUnverified` invece di `Completed`.
+        // Nessun run in piu' chiude VERIFICATO per questa via: i criteri che
+        // passano da `passed=true` a "non misurabile" perdono il titolo.
+        let node = node_with(
+            FinalGateConfig::default(),
+            Arc::new(StubCriteriaRunner::with_results(vec![
+                ok_result("outputs_exist"),
+                inconclusive_result("no_orphan_imported"),
+            ])),
+        );
+        let ctx = ctx_with();
+        let st = software_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(
+            out.stop_reason,
+            Some(StopReason::EndTurn),
+            "un criterio non misurabile NON boccia: il gate chiude"
+        );
+        assert_eq!(out.final_gate_passed, Some(true));
+        assert_eq!(
+            out.final_gate_unverified,
+            Some(true),
+            "nessuno ha misurato quel criterio: la chiusura non e' verificata"
+        );
+    }
+
+    #[tokio::test]
+    async fn tutti_i_criteri_misurati_chiude_verificato() {
+        // Contro-prova della precedente: senza inconcludenti la chiusura resta
+        // verificata (il nuovo segnale non marca tutti i run).
+        let node = node_with(
+            FinalGateConfig::default(),
+            Arc::new(StubCriteriaRunner::with_results(vec![ok_result(
+                "outputs_exist",
+            )])),
+        );
+        let ctx = ctx_with();
+        let st = software_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(out.final_gate_unverified, Some(false));
+    }
 }
 
 #[cfg(test)]
@@ -2405,7 +2559,7 @@ mod golden {
     use super::{count_build_errors, FinalGateNode};
     use crate::routing::config::RoutingConfig;
     use crate::routing::{route_after_final_gate, signals, NodeTarget};
-    use crate::runtime::ports::CriterionResult;
+    use crate::runtime::ports::{CriterionOutcome, CriterionResult};
     use crate::state::{AgentState, ContentBlock, Message, MessageContent};
 
     #[derive(Debug, Deserialize)]
@@ -2502,7 +2656,9 @@ mod golden {
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string(),
-                        passed: r.get("passed").and_then(Value::as_bool).unwrap_or(false),
+                        outcome: CriterionOutcome::measured(
+                            r.get("passed").and_then(Value::as_bool).unwrap_or(false),
+                        ),
                         evidence: r.get("evidence").cloned().unwrap_or(json!({})),
                     })
                     .collect()

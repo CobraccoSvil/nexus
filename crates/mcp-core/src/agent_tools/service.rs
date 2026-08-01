@@ -330,6 +330,140 @@ async fn attende_ascolto(port: u16) -> bool {
     }
 }
 
+/// Dove il servizio stia ascoltando DAVVERO, quando la porta attesa resta muta.
+///
+/// L'attesa scaduta dice solo «non li'»: e' la classe di fallimento numero uno
+/// dei run agentici, e senza il «dove» l'agente non ha nulla da correggere —
+/// misurato il caso `frontend` con porta allocata 24806 mentre l'applicazione
+/// rispondeva sulla 24804 pinnata nel `.env`, dieci run contro una verifica che
+/// nessuna correzione poteva superare e 74 `run_command` di netstat improvvisato.
+///
+/// Il verdetto DICHIARA, non adotta: nessuna porta trovata qui viene registrata,
+/// riallocata o liberata. Nel repo esiste gia' l'incidente opposto (una porta
+/// sbagliata ADOTTATA nel registro, che li' faceva da prova di legittimita' a se
+/// stessa); qui si produce informazione e la decisione resta al chiamante.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AscoltoAltrove {
+    /// Prova diretta: il PID del processo avviato risulta in ascolto su
+    /// un'ALTRA porta. L'unica attribuzione che si puo' dimostrare senza
+    /// indovinare (regola M): il pid e' un dato, il nome del programma no.
+    ProcessoAvviato {
+        port: u16,
+        esito: nexus_tool_kit::ports::PortRegistrability,
+    },
+    /// Nessun listener e' riconducibile a questo processo, ma nel bucket del
+    /// progetto qualcuno ascolta. Fatti ELENCATI, mai attribuiti al servizio: un
+    /// dev server figlio (`npm` -> `node`) gira con un pid diverso da quello
+    /// registrato, quindi la sua porta finisce qui e non fra le prove dirette.
+    NelBucket(Vec<(u16, u32, String)>),
+    /// Interrogato: nessuno ascolta. Il servizio non ha mai fatto bind.
+    Nessuno,
+    /// Non interrogato. Non e' un «nessuno»: e' l'assenza della domanda, e va
+    /// distinta perche' un'assenza spacciata per fatto e' la stessa bugia che
+    /// questo enum esiste per togliere (regola O).
+    NonAccertato,
+}
+
+/// Parte PURA del verdetto: dati i listener della macchina, dove ascolta il
+/// servizio che doveva prendere `porta_attesa`?
+///
+/// Non re-implementa nulla (regola L): i fatti arrivano da
+/// `port_recovery::listening_ports` (punto unico di «chi e' in ascolto») e la
+/// classificazione della porta trovata da `nexus_tool_kit::ports`.
+fn classifica_ascolto_altrove(
+    project_id: &Uuid,
+    porta_attesa: u16,
+    pid_processo: Option<i32>,
+    in_ascolto: &[(u16, u32, String)],
+) -> AscoltoAltrove {
+    let pid_atteso = pid_processo.and_then(|p| u32::try_from(p).ok());
+    let altre = in_ascolto.iter().filter(|(p, _, _)| *p != porta_attesa);
+
+    if let Some(pid) = pid_atteso {
+        if let Some((port, _, _)) = altre.clone().find(|(_, listener, _)| *listener == pid) {
+            return AscoltoAltrove::ProcessoAvviato {
+                port: *port,
+                esito: nexus_tool_kit::ports::classify_project_port(project_id, *port),
+            };
+        }
+    }
+
+    let nel_bucket: Vec<(u16, u32, String)> = altre
+        .filter(|(p, _, _)| nexus_tool_kit::ports::port_in_project_bucket(project_id, *p))
+        .cloned()
+        .collect();
+    if nel_bucket.is_empty() {
+        AscoltoAltrove::Nessuno
+    } else {
+        AscoltoAltrove::NelBucket(nel_bucket)
+    }
+}
+
+/// Interroga la macchina e classifica. Unico confine col sistema operativo di
+/// questa diagnosi: cosi' la decisione resta testabile sui fatti nella forma
+/// esatta che `listening_ports` produce.
+async fn accerta_ascolto_altrove(
+    project_id: Uuid,
+    porta_attesa: u16,
+    pid_processo: Option<i32>,
+) -> AscoltoAltrove {
+    let in_ascolto = crate::project_workspace::port_recovery::listening_ports().await;
+    classifica_ascolto_altrove(&project_id, porta_attesa, pid_processo, &in_ascolto)
+}
+
+/// Traduzione del verdetto in testo per l'agente. Punto unico della resa: il
+/// segnale resta l'enum, la prosa non decide nulla.
+fn nota_ascolto_altrove(altrove: &AscoltoAltrove) -> String {
+    use nexus_tool_kit::ports::PortRegistrability;
+    match altrove {
+        AscoltoAltrove::ProcessoAvviato { port, esito } => {
+            let dove = match esito {
+                PortRegistrability::Registrable => {
+                    format!("porta {port}, nel bucket di questo progetto")
+                }
+                PortRegistrability::Reserved => {
+                    format!("porta {port}, RISERVATA all'infrastruttura Nexus")
+                }
+                PortRegistrability::OutOfProjectRange => {
+                    format!("porta {port}, fuori dal range dei progetti")
+                }
+                PortRegistrability::OutOfProjectBucket {
+                    bucket_start,
+                    bucket_end,
+                } => format!(
+                    "porta {port}, FUORI dal bucket di questo progetto ({bucket_start}-{bucket_end})"
+                ),
+            };
+            format!(
+                "\nDOVE ASCOLTA DAVVERO: il processo appena avviato risulta in ascolto su un'altra \
+                 porta ({dove}). Il servizio sta quindi ignorando la porta assegnata: cerca la \
+                 porta scritta a mano nella configurazione (.env, vite.config, docker-compose) e \
+                 fai leggere al servizio la variabile PORT. Nexus non registra ne' adotta la porta \
+                 trovata: la decisione e' tua.\n"
+            )
+        }
+        AscoltoAltrove::NelBucket(porte) => {
+            let elenco = porte
+                .iter()
+                .map(|(p, pid, program)| format!("{p} (pid {pid}, {program})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "\nDOVE ASCOLTA DAVVERO: nessun listener e' riconducibile al pid del processo \
+                 avviato (un dev server figlio gira con un pid diverso). Nel bucket di questo \
+                 progetto risultano pero' in ascolto: {elenco}. NON e' provato che appartengano a \
+                 questo servizio: verificalo prima di usarne una, e non darla per la porta del \
+                 servizio solo perche' risponde.\n"
+            )
+        }
+        AscoltoAltrove::Nessuno => "\nDOVE ASCOLTA DAVVERO: nessuna porta del bucket di questo \
+             progetto risulta in ascolto. Il servizio non ha mai fatto bind: la causa e' \
+             nell'output qui sotto, non nella porta.\n"
+            .to_string(),
+        AscoltoAltrove::NonAccertato => String::new(),
+    }
+}
+
 /// Parametri di avvio risolti da `resolve_service_launch`.
 struct ServiceLaunch {
     command: String,
@@ -725,28 +859,18 @@ async fn report_started_service(
         }
     };
 
-    // Auto-detect porta dall'output del servizio e registra
-    // in nexus_port_allocations per il pannello Porte.
-    // Che fare della porta rilevata: qui, dove il verdetto e' quello vero e non
-    // una sua ricostruzione. La porta del bucket ALTRUI non si registra (vedi
-    // `register_detected_port`), ma non sparisce: viene auditata, e restando
-    // senza allocazione resta visibile al port_enforcer e al linter.
-    let rilevata = detect_port_from_output(&ctx.project_id, &info.stdout, &info.stderr);
-    let detected_port = match rilevata {
-        Some(r) if r.esito == nexus_tool_kit::ports::PortRegistrability::Registrable => {
-            register_detected_port(ctx, label, r.port as i32, info.pid).await;
-            Some(r.port as i32)
-        }
-        Some(r) => {
-            audita_porta_fuori_bucket(ctx, label, r, info.pid);
-            None
-        }
-        None => None,
-    };
+    let detected_port = registra_o_audita_porta_rilevata(ctx, label, &info).await;
     // Dispatcher: notifica avvio servizio → pannello Servizi aggiorna LED.
     // Se la porta attesa non e' mai entrata in ascolto il servizio NON e' su:
     // emettere l'avvio accenderebbe un LED verde su un servizio morto, cioe'
     // ripeterebbe nel pannello la stessa bugia detta all'agente.
+    // La diagnosi "dove ascolta davvero" si interroga SOLO nel ramo fallito, e
+    // solo qui: e' l'unico punto in cui si conosce sia la porta attesa sia il
+    // pid del processo avviato.
+    let altrove = match ascolto {
+        Some((port, false)) => accerta_ascolto_altrove(ctx.project_id, port, info.pid).await,
+        _ => AscoltoAltrove::NonAccertato,
+    };
     let in_ascolto = !matches!(ascolto, Some((_, false)));
     if in_ascolto {
         nexus_events::dispatcher::emit(
@@ -759,7 +883,31 @@ async fn report_started_service(
             },
         );
     }
-    format_started_message(label, process_id, &info, ascolto)
+    format_started_message(label, process_id, &info, ascolto, &altrove)
+}
+
+/// Che fare della porta che il servizio ha dichiarato nel proprio output: qui,
+/// dove il verdetto e' quello vero e non una sua ricostruzione. La porta del
+/// bucket ALTRUI non si registra (vedi [`audita_porta_fuori_bucket`]) ma non
+/// sparisce: viene auditata, e restando senza allocazione resta visibile al
+/// port_enforcer e al linter. Ritorna la porta REGISTRATA, cioe' l'unica che il
+/// pannello puo' legare a questo servizio.
+async fn registra_o_audita_porta_rilevata(
+    ctx: &AgentToolContext,
+    label: &str,
+    info: &crate::agent_processes::ProcessOutput,
+) -> Option<i32> {
+    match detect_port_from_output(&ctx.project_id, &info.stdout, &info.stderr) {
+        Some(r) if r.esito == nexus_tool_kit::ports::PortRegistrability::Registrable => {
+            register_detected_port(ctx, label, r.port as i32, info.pid).await;
+            Some(r.port as i32)
+        }
+        Some(r) => {
+            audita_porta_fuori_bucket(ctx, label, r, info.pid);
+            None
+        }
+        None => None,
+    }
 }
 
 /// Una porta rilevata FUORI dal bucket del progetto NON viene registrata. La
@@ -850,11 +998,18 @@ async fn register_detected_port(ctx: &AgentToolContext, label: &str, port: i32, 
 /// Messaggio per un servizio che non e' mai entrato in ascolto. Mette lo STDERR
 /// per primo: e' li' che sta la causa, ed e' cio' che l'agente deve leggere per
 /// correggere invece di proseguire.
+///
+/// Il messaggio e' composto con `tool_failure`: senza il marker in testa il
+/// tool_result non DICHIARA il fallimento, e l'anti-loop legge una ripetizione
+/// che "riesce" — cioe' uno stallo da abortire invece di una causa radice da
+/// diagnosticare (regola M). E' la classe di fallimento piu' frequente dei run
+/// agentici: 144 step in 54 run distinti, tutti riportati come esito riuscito.
 fn format_ascolto_mancante(
     label: &str,
     process_id: Uuid,
     info: &crate::agent_processes::ProcessOutput,
     port: u16,
+    altrove: &AscoltoAltrove,
 ) -> String {
     let pid = info
         .pid
@@ -869,6 +1024,9 @@ fn format_ascolto_mancante(
         ATTESA_ASCOLTO_MS / 1000,
         info.status,
     );
+    // Prima dell'output: cambia la diagnosi. Un servizio in ascolto altrove non
+    // ha un errore da correggere nello stderr, ha una porta da riconciliare.
+    msg.push_str(&nota_ascolto_altrove(altrove));
     if !info.stderr.is_empty() {
         msg.push_str(&format!("\nSTDERR:\n{}", info.stderr));
     }
@@ -880,7 +1038,7 @@ fn format_ascolto_mancante(
             "\n(Nessun output: il processo non ha scritto nulla prima di smettere di rispondere.)",
         );
     }
-    msg
+    nexus_types::tool_outcome::tool_failure(msg)
 }
 
 fn format_started_message(
@@ -888,13 +1046,14 @@ fn format_started_message(
     process_id: Uuid,
     info: &crate::agent_processes::ProcessOutput,
     ascolto: Option<(u16, bool)>,
+    altrove: &AscoltoAltrove,
 ) -> String {
     // Un servizio che non e' entrato in ascolto NON e' avviato, per quanto il
     // suo processo sia ancora vivo. Dirlo apertamente e' l'intero scopo del
     // controllo: l'agente deve leggere il fallimento e lo stderr che lo spiega,
     // non una conferma su cui costruire i passi successivi.
     if let Some((port, false)) = ascolto {
-        return format_ascolto_mancante(label, process_id, info, port);
+        return format_ascolto_mancante(label, process_id, info, port, altrove);
     }
     let mut msg = format!(
         "Servizio '{}' avviato (process_id: {}, pid: {}, status: {})\n",
@@ -1502,7 +1661,13 @@ pub(super) async fn tool_service_restart(ctx: &AgentToolContext, input: &Value) 
     });
 
     let result = tool_run_service(ctx, &restart_input, "service").await;
-    format!("Servizio '{}' riavviato.\n{}", label, result)
+    // La premessa NON deve coprire l'esito: `is_tool_failure` legge la testa
+    // della stringa, quindi un `format!` che antepone prosa di successo rende
+    // invisibile un riavvio fallito (regola M). Punto unico della composizione.
+    nexus_types::tool_outcome::prepend_preserving_failure(
+        format!("Servizio '{}' riavviato.", label),
+        &result,
+    )
 }
 
 /// Legge il `working_dir` di un processo dal DB del progetto, ricadendo su
@@ -1760,9 +1925,10 @@ fn format_service_row(proc: &crate::agent_processes::ProcessSummary) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_kind_hint, detect_port_from_output, existing_service_action, format_started_message,
-        looks_like_web_service, resolve_service_label, resolve_service_work_dir, scope_dir,
-        tool_run_service, ExistingServiceAction, PortaRilevata, Uuid,
+        classifica_ascolto_altrove, derive_kind_hint, detect_port_from_output,
+        existing_service_action, format_started_message, looks_like_web_service,
+        resolve_service_label, resolve_service_work_dir, scope_dir, tool_run_service,
+        AscoltoAltrove, ExistingServiceAction, PortaRilevata, Uuid,
     };
     use crate::agent_processes::{is_generic_service_label, similar_service_labels};
     use crate::project_workspace::services::{project_service_slug, service_unit_name};
@@ -2120,7 +2286,20 @@ mod tests {
             "[nodemon] app crashed - waiting for file changes",
             "Error: Cannot find module 'D:\\progetto\\backend\\src\\index.js'",
         );
-        let msg = format_started_message("backend", uuid::Uuid::nil(), &info, Some((32976, false)));
+        let msg = format_started_message(
+            "backend",
+            uuid::Uuid::nil(),
+            &info,
+            Some((32976, false)),
+            &AscoltoAltrove::NonAccertato,
+        );
+        // Il fallimento va DICHIARATO alla macchina, non solo raccontato: senza
+        // marker in testa l'anti-loop legge una ripetizione riuscita e chiude il
+        // run come stallo invece di instradarlo a diagnosi (regola M).
+        assert!(
+            nexus_types::tool_outcome::is_tool_failure(&msg),
+            "il tool_result deve portare il marker di fallimento: {msg}"
+        );
         assert!(
             msg.contains("NON avviato"),
             "un servizio che non ascolta non va annunciato come avviato: {msg}"
@@ -2140,8 +2319,18 @@ mod tests {
     #[test]
     fn con_ascolto_verificato_il_messaggio_lo_dichiara() {
         let info = uscita_processo("running", "server listening", "");
-        let msg = format_started_message("backend", uuid::Uuid::nil(), &info, Some((32976, true)));
+        let msg = format_started_message(
+            "backend",
+            uuid::Uuid::nil(),
+            &info,
+            Some((32976, true)),
+            &AscoltoAltrove::NonAccertato,
+        );
         assert!(msg.contains("avviato"), "{msg}");
+        assert!(
+            !nexus_types::tool_outcome::is_tool_failure(&msg),
+            "un servizio che ascolta non e' un fallimento: {msg}"
+        );
         assert!(
             msg.contains("In ascolto sulla porta 32976 (verificato)"),
             "l'ascolto verificato va dichiarato, cosi' l'agente distingue una \
@@ -2155,10 +2344,111 @@ mod tests {
     #[test]
     fn senza_porta_attesa_il_messaggio_resta_invariato() {
         let info = uscita_processo("running", "job avviato", "");
-        let msg = format_started_message("worker", uuid::Uuid::nil(), &info, None);
+        let msg = format_started_message(
+            "worker",
+            uuid::Uuid::nil(),
+            &info,
+            None,
+            &AscoltoAltrove::NonAccertato,
+        );
         assert!(msg.contains("avviato"), "{msg}");
         assert!(!msg.contains("NON avviato"), "{msg}");
         assert!(!msg.contains("In ascolto"), "{msg}");
+        assert!(!nexus_types::tool_outcome::is_tool_failure(&msg), "{msg}");
+    }
+
+    /// L'incidente misurato: label `frontend`, porta allocata 24806, e
+    /// l'applicazione viva e rispondente sulla 24804 pinnata nel `.env`. Dieci
+    /// run distinti hanno sbattuto contro un messaggio che diceva solo «non li'»,
+    /// e l'agente ha reagito con 74 `run_command` di netstat improvvisato contro
+    /// una sola `request_port`.
+    ///
+    /// I fatti entrano nella forma esatta che `listening_ports` produce
+    /// (`(porta, pid, programma)`), e il verdetto nasce dal classificatore, mai
+    /// scritto a mano (regola O).
+    #[test]
+    fn quando_lascolto_manca_il_messaggio_dice_dove_il_processo_ascolta_davvero() {
+        let progetto = progetto_di_prova();
+        let (bucket_start, _) = project_bucket_range(&progetto);
+        let attesa = bucket_start + 6;
+        let reale = bucket_start + 4;
+        // Il dev server e' un FIGLIO (npm -> node): pid diverso da quello
+        // registrato, quindi nessuna prova diretta e la porta finisce fra i
+        // fatti del bucket, dichiarati e non attribuiti.
+        let fatti = vec![(reale, 9931, "node".to_string())];
+        let altrove = classifica_ascolto_altrove(&progetto, attesa, Some(17488), &fatti);
+        assert_eq!(
+            altrove,
+            AscoltoAltrove::NelBucket(vec![(reale, 9931, "node".to_string())])
+        );
+
+        let info = uscita_processo("running", "VITE ready", "");
+        let msg = format_started_message(
+            "frontend",
+            uuid::Uuid::nil(),
+            &info,
+            Some((attesa, false)),
+            &altrove,
+        );
+        assert!(
+            msg.contains(&reale.to_string()),
+            "il messaggio deve nominare la porta su cui si ascolta davvero: {msg}"
+        );
+        assert!(
+            msg.contains("NON e' provato"),
+            "una porta trovata non e' una porta del servizio: {msg}"
+        );
+    }
+
+    /// Prova diretta: il pid registrato E' quello del listener. Unica
+    /// attribuzione dimostrabile senza indovinare (regola M).
+    #[test]
+    fn il_pid_del_processo_avviato_prova_la_porta_reale() {
+        let progetto = progetto_di_prova();
+        let (bucket_start, bucket_end) = project_bucket_range(&progetto);
+        let attesa = bucket_start + 6;
+        // Fuori bucket: e' il caso in cui il framework ha ripiegato da solo.
+        let fuori = bucket_end + 1;
+        assert!(!nexus_tool_kit::ports::port_in_project_bucket(
+            &progetto, fuori
+        ));
+        let fatti = vec![(fuori, 17488, "node".to_string())];
+        let altrove = classifica_ascolto_altrove(&progetto, attesa, Some(17488), &fatti);
+        assert!(
+            matches!(altrove, AscoltoAltrove::ProcessoAvviato { port, .. } if port == fuori),
+            "{altrove:?}"
+        );
+        let info = uscita_processo("running", "", "");
+        let msg = format_started_message(
+            "frontend",
+            uuid::Uuid::nil(),
+            &info,
+            Some((attesa, false)),
+            &altrove,
+        );
+        assert!(msg.contains(&fuori.to_string()), "{msg}");
+        assert!(
+            msg.contains("processo appena avviato risulta in ascolto"),
+            "{msg}"
+        );
+    }
+
+    /// Nessun listener nel bucket: l'assenza e' un FATTO utile (il servizio non
+    /// ha mai fatto bind), e va distinta dal caso in cui non si e' guardato.
+    #[test]
+    fn senza_listener_nel_bucket_il_verdetto_e_nessuno() {
+        let progetto = progetto_di_prova();
+        let (bucket_start, bucket_end) = project_bucket_range(&progetto);
+        // Porta di un ALTRO bucket: non e' un fatto di questo progetto.
+        let estranea = bucket_end + 1;
+        assert!(!nexus_tool_kit::ports::port_in_project_bucket(
+            &progetto, estranea
+        ));
+        let fatti = vec![(estranea, 4242, "node".to_string())];
+        assert_eq!(
+            classifica_ascolto_altrove(&progetto, bucket_start + 6, Some(17488), &fatti),
+            AscoltoAltrove::Nessuno
+        );
     }
 
     /// Regressione FIX P5 (Pannello "Porte"): la regex `localhost:(\d{4,5})`

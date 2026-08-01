@@ -231,21 +231,14 @@ impl Default for VerifierConfig {
     }
 }
 
-/// `true` se un criterio NON e' valutabile (inconcludente): la sua evidence porta
-/// `inconclusive` truthy (`verifier_node.py:163`,
-/// `(r.get("evidence") or {}).get("inconclusive")`). Semantica truthy Python:
-/// `true` se il campo e' presente e "verita'" (bool true, numero non-zero,
-/// stringa non vuota, lista/oggetto non vuoti); assente / null / falsy -> NON
-/// inconcludente (conta come evaluable).
+/// `true` se un criterio NON e' valutabile (inconcludente).
+///
+/// La risposta viene dal TIPO ([`CriterionOutcome::Inconclusive`]), non piu' da
+/// un flag `inconclusive` truthy dentro l'evidence JSON: un flag in un JSON
+/// opaco e' invisibile al compilatore, quindi ogni consumatore decideva da se'
+/// se guardarlo — e il gemello `final_gate` non lo guardava affatto.
 fn is_inconclusive(r: &CriterionResult) -> bool {
-    match r.evidence.get("inconclusive") {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(Value::Array(a)) => !a.is_empty(),
-        Some(Value::Object(o)) => !o.is_empty(),
-    }
+    r.inconclusive()
 }
 
 /// `_suggest_remediation` (`verifier_node.py:642-669`): hint operativo dedotto
@@ -448,7 +441,7 @@ impl VerifierNode {
         max_cycles: i64,
         results: &[CriterionResult],
     ) -> String {
-        let failed: Vec<&CriterionResult> = results.iter().filter(|r| !r.passed).collect();
+        let failed: Vec<&CriterionResult> = results.iter().filter(|r| r.failed()).collect();
         // failed_rendered: "- [{type}] {json.dumps(evidence)[:300]}" per ciascuno.
         let failed_rendered = failed
             .iter()
@@ -611,7 +604,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for VerifierNode {
             );
         }
         let all_passed = if !evaluable.is_empty() {
-            evaluable.iter().all(|r| r.passed)
+            evaluable.iter().all(|r| r.passed())
         } else {
             // Tutti inconcludenti: fail-closed su task software (gate generali),
             // altrimenti passato (nulla di valutabile). I gate generali vengono
@@ -1002,7 +995,7 @@ fn results_to_value(results: &[CriterionResult]) -> Value {
             .map(|r| {
                 json!({
                     "type": r.criterion_type,
-                    "passed": r.passed,
+                    "passed": r.passed(),
                     "evidence": r.evidence,
                 })
             })
@@ -1024,6 +1017,7 @@ mod tests {
     use super::*;
     use crate::decisions::dag_scheduler::{Todo, TodoStatus};
     use crate::nodes::final_gate::FinalGateConfig;
+    use crate::runtime::ports::CriterionOutcome;
     use crate::runtime::test_doubles::{
         NullEventSink, StubCriteriaRunner, StubLlmGateway, StubTodoStore, StubToolExecutor,
         StubVerifierRunStore,
@@ -1040,7 +1034,7 @@ mod tests {
     fn ok_result(t: &str) -> CriterionResult {
         CriterionResult {
             criterion_type: t.to_string(),
-            passed: true,
+            outcome: CriterionOutcome::Passed,
             evidence: json!({}),
         }
     }
@@ -1158,7 +1152,7 @@ mod tests {
     fn fail_result(t: &str, evidence: Value) -> CriterionResult {
         CriterionResult {
             criterion_type: t.to_string(),
-            passed: false,
+            outcome: CriterionOutcome::Failed,
             evidence,
         }
     }
@@ -1166,8 +1160,8 @@ mod tests {
     fn inconclusive_result(t: &str) -> CriterionResult {
         CriterionResult {
             criterion_type: t.to_string(),
-            passed: false,
-            evidence: json!({"inconclusive": true}),
+            outcome: CriterionOutcome::Inconclusive,
+            evidence: json!({"skipped_reason": "non interrogabile"}),
         }
     }
 
@@ -1438,19 +1432,20 @@ mod tests {
     // ── Conteggio evaluable / inconclusive ────────────────────────────────────────
 
     #[test]
-    fn is_inconclusive_semantica_truthy() {
+    fn is_inconclusive_viene_dal_tipo_non_dall_evidence() {
         assert!(is_inconclusive(&inconclusive_result("http")));
         assert!(!is_inconclusive(&ok_result("http")));
-        // false / null / assente -> NON inconcludente.
+        // L'evidence non decide piu': un residuo `inconclusive` in un JSON non
+        // rende inconcludente un criterio MISURATO, e viceversa.
         assert!(!is_inconclusive(&CriterionResult {
             criterion_type: "x".into(),
-            passed: true,
-            evidence: json!({"inconclusive": false}),
+            outcome: CriterionOutcome::Passed,
+            evidence: json!({"inconclusive": true}),
         }));
-        assert!(!is_inconclusive(&CriterionResult {
+        assert!(is_inconclusive(&CriterionResult {
             criterion_type: "x".into(),
-            passed: true,
-            evidence: json!({"inconclusive": null}),
+            outcome: CriterionOutcome::Inconclusive,
+            evidence: json!({}),
         }));
     }
 
@@ -1532,7 +1527,7 @@ mod golden {
     use serde_json::{json, Value};
 
     use super::{is_inconclusive, suggest_remediation, VerifierNode};
-    use crate::runtime::ports::CriterionResult;
+    use crate::runtime::ports::{CriterionOutcome, CriterionResult};
     use crate::state::AgentState;
 
     #[derive(Debug, Deserialize)]
@@ -1554,7 +1549,9 @@ mod golden {
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string(),
-                        passed: r.get("passed").and_then(Value::as_bool).unwrap_or(false),
+                        outcome: CriterionOutcome::measured(
+                            r.get("passed").and_then(Value::as_bool).unwrap_or(false),
+                        ),
                         evidence: r.get("evidence").cloned().unwrap_or(json!({})),
                     })
                     .collect()
@@ -1585,7 +1582,7 @@ mod golden {
         let evaluable: Vec<&CriterionResult> =
             results.iter().filter(|r| !is_inconclusive(r)).collect();
         let all_passed = if !evaluable.is_empty() {
-            evaluable.iter().all(|r| r.passed)
+            evaluable.iter().all(|r| r.passed())
         } else {
             input
                 .get("_all_passed_when_inconclusive")
@@ -1597,7 +1594,7 @@ mod golden {
             results
                 .iter()
                 .map(|r| {
-                    json!({"type": r.criterion_type, "passed": r.passed, "evidence": r.evidence})
+                    json!({"type": r.criterion_type, "passed": r.passed(), "evidence": r.evidence})
                 })
                 .collect(),
         );

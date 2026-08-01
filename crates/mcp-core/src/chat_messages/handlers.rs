@@ -496,6 +496,67 @@ fn resolve_supervisor_mode(body: &SendChatMessageRequest) -> Result<SupervisorMo
     })
 }
 
+/// PUNTO UNICO (regola L) del system prompt di un turno di CHAT: il template DB
+/// `system.nexus_base`, gated sul consiglio di analisi, piu' il suffisso
+/// act-first, l'account GitHub e il contesto Knowledge Base.
+///
+/// Vi delegano i DUE percorsi che aprono un turno di chat, l'invio e il resend.
+/// Il resend ne teneva una copia LETTERALE nel binario: ~1500 caratteri che
+/// erano il `system.nexus_base` di quando fu scritto, quindi ogni modifica al
+/// template in DB lasciava il retry sul testo di allora — ed e' il testo a
+/// decidere come si comporta l'agente (regola G: la configurazione sta nel DB,
+/// mai nel codice). La copia era anche PIU' POVERA del template: le direttive
+/// aggiunte dopo — fra cui `<operatore_nexus>`, `<safety_progetto>`,
+/// `<attachment_access>` e `<consiglio_analisi>` — non esistevano per il
+/// resend, e con esse il gate che decide se il consiglio si convoca.
+///
+/// Il blocco Knowledge Base arriva gia' risolto dal chiamante: e' l'unico
+/// confine esterno (embedder + Qdrant) e tenerlo fuori rende la composizione
+/// interrogabile senza un `AppState` intero.
+///
+/// I blocchi appesi qui restano nella PARTE STABILE del system (nessun
+/// `CONFINE_DI_TURNO`, vedi `nexus_types::system_prompt`): sono costanti per
+/// tutta la durata del turno e nessuno di essi precede la testa del template,
+/// quindi il prefisso riusabile dal fornitore resta intero.
+async fn compose_chat_system_context(
+    db: &PgPool,
+    template_cache: &crate::prompt_templates::TemplateCache,
+    user_text: &str,
+    automation_mode: AutomationMode,
+    github_username: Option<&str>,
+    knowledge_block: Option<String>,
+) -> String {
+    let system_prompt =
+        crate::prompt_templates::get_template_or_default(db, template_cache, "system.nexus_base")
+            .await;
+    // Gate a soglia del consiglio di analisi (deterministico, DB-driven): sotto la
+    // soglia di complessita' la direttiva <consiglio_analisi> (mig 0549) viene
+    // rimossa dal system prompt (task banale -> percorso agentico diretto); sopra
+    // soglia resta e il modello convoca le figure. Punto unico: gate_council_directive.
+    let mut ctx =
+        crate::prompt_templates::gate_council_directive(db, system_prompt, user_text).await;
+    if automation_mode != AutomationMode::Study {
+        let suffix = crate::prompt_templates::get_template_or_default(
+            db,
+            template_cache,
+            "system.nexus_act_first_suffix",
+        )
+        .await;
+        ctx.push_str(&format!("\n\n{suffix}\n"));
+    }
+    if let Some(gh) = github_username {
+        ctx.push_str(&format!(" Account GitHub: @{gh}."));
+    }
+    // Iniezione Knowledge Base (top-K note semanticamente rilevanti), gia'
+    // risolta dal chiamante. Failsafe: se brain down o KB vuota il flusso
+    // prosegue senza contesto KB.
+    if let Some(kb_block) = knowledge_block {
+        ctx.push_str("\n\n");
+        ctx.push_str(&kb_block);
+    }
+    ctx
+}
+
 pub async fn send_chat_message(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -801,44 +862,15 @@ pub async fn send_chat_message(
             .unwrap_or(None)
             .flatten();
 
-    let system_prompt = crate::prompt_templates::get_template_or_default(
+    let system_context = compose_chat_system_context(
         &state.db,
         &state.template_cache,
-        "system.nexus_base",
+        content,
+        automation_mode,
+        github_username.as_deref(),
+        build_knowledge_context(&state, context.project_id, content).await,
     )
     .await;
-    // Gate a soglia del consiglio di analisi (deterministico, DB-driven): sotto la
-    // soglia di complessita' la direttiva <consiglio_analisi> (mig 0549) viene
-    // rimossa dal system prompt (task banale -> percorso agentico diretto); sopra
-    // soglia resta e il modello convoca le figure. Punto unico: gate_council_directive.
-    let system_prompt =
-        crate::prompt_templates::gate_council_directive(&state.db, system_prompt, &body.content)
-            .await;
-
-    let system_context = {
-        let mut ctx = system_prompt;
-        if automation_mode != AutomationMode::Study {
-            let suffix = crate::prompt_templates::get_template_or_default(
-                &state.db,
-                &state.template_cache,
-                "system.nexus_act_first_suffix",
-            )
-            .await;
-            ctx.push_str(&format!("\n\n{suffix}\n"));
-        }
-        if let Some(ref gh) = github_username {
-            ctx.push_str(&format!(" Account GitHub: @{gh}."));
-        }
-        // ── Iniezione Knowledge Base (top-K note semanticamente rilevanti) ──
-        // Embed del messaggio user → search Qdrant `knowledge_notes` filtrata per progetto
-        // → carica title+body delle top hit → prependi come "Contesto progetto" al system prompt.
-        // Failsafe: se brain down o KB vuota, il flow normale prosegue (no contesto KB).
-        if let Some(kb_block) = build_knowledge_context(&state, context.project_id, content).await {
-            ctx.push_str("\n\n");
-            ctx.push_str(&kb_block);
-        }
-        ctx
-    };
 
     // ── Ripresa run interrotto (riprendi / continua / resume) ─────────────
     // Estratto in helper coeso (behavior-preserving): Some(view) => early return
@@ -1690,58 +1722,18 @@ pub async fn resend_chat_message(
                 .await
                 .unwrap_or(None)
                 .flatten();
-        let system_context_str = {
-            let mut ctx = String::from(
-                "Sei Nexus, agente operativo di sviluppo. Regole:\n\
-                 Output: testo pulito, markdown standard (no emoji, no caratteri grafici).\n\
-                 Tool iniziali: read_file, list_files, search_in_files, write_file, edit_file, run_command.\n\
-                 Tool aggiuntivi: usa request_tools(categories) per sbloccare categorie extra:\n\
-                 - \"git\": git_status, git_stage, git_commit, git_push, git_pull\n\
-                 - \"service\": run_service, read_service_output, stop_service\n\
-                 - \"files_advanced\": delete_file, rename_file\n\
-                 - \"profile\": create_profile, update_profile\n\
-                 - \"mcp\": tool da server MCP esterni\n\
-                 Autonomia: NON chiedere mai struttura, tecnologia, OS, comandi — ricava tutto dal contesto progetto o con list_files/read_file.\n\
-                 PERO' SE ti mancano informazioni che NON puoi ricavare autonomamente (connection string, API keys, credenziali, \
-                 configurazioni specifiche dell'ambiente, password, URL di servizi esterni), DEVI chiedere all'utente. \
-                 Non tentare di indovinare valori sensibili. Interrompi il flusso, spiega cosa ti serve e perche', e attendi la risposta.\n\
-                 File grandi — REGOLA CRITICA PER PERFORMANCE:\n\
-                 read_file restituisce solo le prime 300 righe. Se il file e' piu' grande, usa questo flusso:\n\
-                 1. read_file(path) — ottieni le prime 300 righe + totale righe\n\
-                 2. read_file_lines(path, start_line, end_line) — leggi un range specifico (max 400 righe per chiamata)\n\
-                 3. Se non sai dove si trova la sezione: usa search_in_files o search_codebase_semantic, poi read_file_lines\n\
-                 NON caricare file interi grandi. Usa sempre lettura chirurgica per sezioni specifiche.\n\
-                 Avvio servizi — REGOLE TASSATIVE:\n\
-                 1) Per avviare servizi (server, watcher, processi long-running), usa run_service con label descrittiva.\n\
-                 2) Dopo OGNI run_service, LEGGI l'output restituito. Se serve piu' output, usa read_service_output col process_id.\n\
-             ANTI-LOOP: non chiamare read_service_output piu' di 3 volte consecutive sullo stesso process_id. Se dopo 3 letture il servizio non e' pronto, smetti di aspettare e riferisci all'utente lo stato attuale. Non eseguire run_command in loop per monitorare uno stesso processo.\n\
-                 3) Se l'output contiene errori (exit code != 0, Error, Exception, failed), CORREGGI e RILANCIA (stop_service + run_service).\n\
-                 4) Dopo che i servizi sono avviati, VERIFICA con run_command(\"ss -tlnp | grep PORTA\") che le porte siano in ascolto.\n\
-                 5) Nella risposta finale, fornisci SEMPRE i link URL (es. http://localhost:5000, http://localhost:5173) dove l'utente puo' aprire i servizi.\n\
-                 Errori comuni e correzioni:\n\
-                 - Porta occupata: run_command(\"lsof -t -i:PORTA | xargs kill -9\") poi rilancia\n\
-                 - .NET TargetFramework errato: controlla con run_command(\"dotnet --list-sdks\"), aggiorna .csproj, rilancia\n\
-                 - Build fallita: leggi output, correggi con edit_file, rilancia\n\
-                 - npm module not found: run_command(\"npm install\") poi rilancia\n\
-                 - SEMPRE rilancia dopo una correzione. Mai fermarsi dopo un fix senza verificare.\n\
-                 Persistenza: se un'operazione fallisce, leggi l'errore, analizzalo e riprova. Non arrenderti al primo errore.\n\
-                 Git: usa credenziali utente autenticato. Per cloni parti da $NEXUS_TERMINAL_ROOT.\n\
-                 Profili: quando noti stack tecnico ricorrente, crea/aggiorna profilo con create_profile/update_profile.",
-            );
-            if automation_mode != AutomationMode::Study {
-                let suffix = crate::prompt_templates::get_template_or_default(
-                    &state.db,
-                    &state.template_cache,
-                    "system.nexus_act_first_suffix",
-                )
-                .await;
-                ctx.push_str(&format!("\n\n{suffix}\n"));
-            }
-            if let Some(ref gh) = github_username {
-                ctx.push_str(&format!(" Account GitHub: @{gh}."));
-            }
-            ctx
-        };
+        // Stesso system prompt dell'invio, dallo stesso punto unico: un retry che
+        // parte da un testo diverso non e' un retry (vedi
+        // compose_chat_system_context per la copia hardcoded che stava qui).
+        let system_context_str = compose_chat_system_context(
+            &state.db,
+            &state.template_cache,
+            &source_prompt,
+            automation_mode,
+            github_username.as_deref(),
+            build_knowledge_context(&state, project_id, &source_prompt).await,
+        )
+        .await;
 
         match spawn_agent_run(
             &state,
@@ -2978,5 +2970,166 @@ async fn feedback_assist_suggestion(
         Ok(s) => s,
         Err(PurposeFailoverError::AllCandidatesFailed)
         | Err(PurposeFailoverError::NoCandidate(_)) => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests_system_prompt_della_chat {
+    //! Il difetto misurato: il percorso di RESEND non caricava
+    //! `system.nexus_base` dal DB, ne teneva una copia letterale nel binario
+    //! (~1500 caratteri, il template di quando fu scritta). Il template in DB
+    //! era gia' un superset di quella copia — 36KB contro 1,5KB — quindi ogni
+    //! direttiva aggiunta dopo, gate del consiglio compreso, per il retry non
+    //! esisteva. La copia prescriveva anche `lsof` e `ss -tlnp` su un ambiente
+    //! Windows dove un altro punto dello stesso binario rifiuta quei comandi.
+    //!
+    //! Percio' questi test non misurano il caricatore di template ma la
+    //! CONSEGUENZA: quel che l'amministratore scrive nel template e' quel che
+    //! il turno riceve. Il produttore e' `compose_chat_system_context`, lo
+    //! stesso e con gli stessi argomenti in `send_chat_message` e nel ramo
+    //! agente di `resend_chat_message`; l'handler intero non e' interrogabile
+    //! senza un `AppState` e due DB, e il blocco Knowledge Base — unico confine
+    //! esterno — entra gia' risolto, come `MemoryRecall` nel gemello
+    //! `tests_memorie_di_progetto`.
+    //!
+    //! `META_MIGRATOR` costruisce lo schema meta da zero: `nexus_prompt_templates`
+    //! e il suo contenuto arrivano dalle migrazioni reali, non da una fixture.
+
+    use super::compose_chat_system_context;
+    use crate::orchestrator::AutomationMode;
+    use crate::prompt_templates::TemplateCache;
+    use sqlx::PgPool;
+
+    /// Task ordinario: nessun ambito sensibile, cosi' il gate del consiglio non
+    /// e' la variabile sotto misura qui.
+    const TASK: &str = "elenca i file della cartella e dimmi quanti sono";
+
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_system_della_chat_e_il_template_in_db(pool: PgPool) {
+        let cache = TemplateCache::new();
+        // Il contenuto atteso lo chiedo al punto unico che lo carica, la stessa
+        // strada della produzione: ricopiarlo qui vorrebbe dire tenere allineata
+        // a mano una seconda copia — il difetto stesso che questo test presidia.
+        let template =
+            crate::prompt_templates::get_template_or_default(&pool, &cache, "system.nexus_base")
+                .await;
+        assert!(
+            !template.is_empty(),
+            "nessuna migrazione ha seminato system.nexus_base: il test non misura nulla"
+        );
+
+        let system =
+            compose_chat_system_context(&pool, &cache, TASK, AutomationMode::Study, None, None)
+                .await;
+
+        // La TESTA del template, che nessun gate tocca. Con la copia nel binario
+        // il system iniziava con "Sei Nexus, agente operativo di sviluppo",
+        // mentre il template reale apre sulla direttiva di lingua.
+        let testa: String = template.chars().take(200).collect();
+        assert!(
+            system.contains(&testa),
+            "il system non deriva dal template in DB.\nAttesa la testa:\n{testa}\nOttenuto:\n{system}"
+        );
+    }
+
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn cambiare_il_template_cambia_il_turno(pool: PgPool) {
+        // La domanda vera: la configurazione sta nel DB (regola G) o nel
+        // binario? Un template riscritto e' l'unico modo per distinguerle.
+        const TEMPLATE: &str = "Sei l'agente. Regola unica: chiedi prima di scrivere.";
+        sqlx::query(
+            "UPDATE nexus_prompt_templates SET content = $1 WHERE key = 'system.nexus_base'",
+        )
+        .bind(TEMPLATE)
+        .execute(&pool)
+        .await
+        .expect("riscrittura di system.nexus_base");
+
+        let cache = TemplateCache::new();
+        let system =
+            compose_chat_system_context(&pool, &cache, TASK, AutomationMode::Study, None, None)
+                .await;
+
+        // Uguaglianza esatta: nessun testo aggiunto dal codice. Il template di
+        // prova non porta il sentinel del consiglio, quindi il gate e' un no-op
+        // e la differenza sarebbe soltanto codice che parla per conto suo.
+        assert_eq!(system, TEMPLATE);
+        // Le due direttive che NON devono sopravvivere alla copia rimossa: un
+        // comando POSIX su Windows, e la resa contata sui TENTATIVI invece che
+        // sul progresso.
+        assert!(
+            !system.contains("lsof"),
+            "comando POSIX dal codice: {system}"
+        );
+        assert!(
+            !system.contains("3 volte consecutive"),
+            "resa contata sui tentativi, dal codice: {system}"
+        );
+    }
+
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn fuori_da_studio_il_suffisso_act_first_viene_dal_db(pool: PgPool) {
+        const BASE: &str = "BASE-DI-PROVA";
+        const SUFFISSO: &str = "SUFFISSO-ACT-FIRST-DI-PROVA";
+        for (key, content) in [
+            ("system.nexus_base", BASE),
+            ("system.nexus_act_first_suffix", SUFFISSO),
+        ] {
+            sqlx::query("UPDATE nexus_prompt_templates SET content = $1 WHERE key = $2")
+                .bind(content)
+                .bind(key)
+                .execute(&pool)
+                .await
+                .expect("riscrittura template");
+        }
+
+        let cache = TemplateCache::new();
+        let system = compose_chat_system_context(
+            &pool,
+            &cache,
+            TASK,
+            AutomationMode::Automatic,
+            Some("octocat"),
+            Some("Contesto progetto: la porta e' la 30001.".to_string()),
+        )
+        .await;
+
+        assert!(system.starts_with(BASE), "{system}");
+        assert!(system.contains(SUFFISSO), "{system}");
+        assert!(system.contains("Account GitHub: @octocat"), "{system}");
+        assert!(system.contains("la porta e' la 30001"), "{system}");
+        // Nessun blocco di turno: tutto quel che si appende qui vale per l'intero
+        // turno e resta nella parte stabile del prompt, che e' il tratto che il
+        // fornitore puo' riusare (nexus_types::system_prompt).
+        assert!(
+            !system.contains(nexus_types::system_prompt::CONFINE_DI_TURNO),
+            "un blocco di turno e' entrato nel system della chat: {system}"
+        );
+        assert_eq!(nexus_types::system_prompt::parte_stabile(&system), system);
+    }
+
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn in_studio_il_suffisso_act_first_non_entra(pool: PgPool) {
+        // Il verso opposto, che tiene onesto il test qui sopra.
+        const BASE: &str = "BASE-DI-PROVA";
+        const SUFFISSO: &str = "SUFFISSO-ACT-FIRST-DI-PROVA";
+        for (key, content) in [
+            ("system.nexus_base", BASE),
+            ("system.nexus_act_first_suffix", SUFFISSO),
+        ] {
+            sqlx::query("UPDATE nexus_prompt_templates SET content = $1 WHERE key = $2")
+                .bind(content)
+                .bind(key)
+                .execute(&pool)
+                .await
+                .expect("riscrittura template");
+        }
+
+        let cache = TemplateCache::new();
+        let system =
+            compose_chat_system_context(&pool, &cache, TASK, AutomationMode::Study, None, None)
+                .await;
+
+        assert_eq!(system, BASE);
     }
 }

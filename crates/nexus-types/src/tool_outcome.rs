@@ -73,9 +73,59 @@ pub fn is_tool_failure(risultato: &str) -> bool {
     risultato.trim_start().starts_with(TOOL_FAILURE_MARKER)
 }
 
+/// Antepone una premessa al risultato di un tool CONSERVANDONE la dichiarazione
+/// d'esito.
+///
+/// Esiste perche' il criterio di [`is_tool_failure`] e' la TESTA della stringa:
+/// un chiamante che avvolge il risultato di un tool interno in una frase propria
+/// (`"Servizio X riavviato.\n{risultato}"`, `"[Auto-routing] ...\n{risultato}"`)
+/// spinge il marker in mezzo al testo e il fallimento smette di essere
+/// riconosciuto — l'anti-loop lo vede come una ripetizione RIUSCITA e lo tratta
+/// come stallo invece che come causa radice da diagnosticare (regola M).
+///
+/// Il marker resta in testa, la premessa lo segue: cosi' l'esito e' leggibile
+/// dalla macchina e il contesto resta leggibile dall'umano. Su un risultato
+/// riuscito la composizione e' la concatenazione nuda, senza inventare esiti.
+pub fn prepend_preserving_failure(premessa: impl Display, risultato: &str) -> String {
+    if !is_tool_failure(risultato) {
+        return format!("{premessa}\n{risultato}");
+    }
+    // Il marker si toglie dal corpo e si rimette in testa alla composizione: un
+    // secondo marker in mezzo sarebbe rumore, e lasciarlo li' senza rimetterlo
+    // in testa perderebbe la dichiarazione.
+    let corpo = risultato
+        .trim_start()
+        .trim_start_matches(TOOL_FAILURE_MARKER)
+        .trim_start();
+    tool_failure(format!("{premessa}\n{corpo}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn la_premessa_non_nasconde_il_fallimento() {
+        // Il fallimento nasce dal PRODUTTORE, non da un letterale composto a
+        // mano: e' l'unica forma in cui il test attraversa il contratto reale.
+        let fallito = tool_failure("nessun ascolto sulla porta 24806");
+        let composto = prepend_preserving_failure("Servizio 'frontend' riavviato.", &fallito);
+        assert!(
+            is_tool_failure(&composto),
+            "la premessa ha spinto il marker fuori dalla testa: {composto}"
+        );
+        assert!(composto.contains("Servizio 'frontend' riavviato."));
+        assert!(composto.contains("nessun ascolto sulla porta 24806"));
+        // Un solo marker: quello in testa.
+        assert_eq!(composto.matches(TOOL_FAILURE_MARKER).count(), 1);
+    }
+
+    #[test]
+    fn su_un_risultato_riuscito_non_inventa_un_fallimento() {
+        let composto = prepend_preserving_failure("Servizio 'api' riavviato.", "Avviato, pid 42");
+        assert!(!is_tool_failure(&composto));
+        assert_eq!(composto, "Servizio 'api' riavviato.\nAvviato, pid 42");
+    }
 
     #[test]
     fn il_costruttore_antepone_il_marker() {

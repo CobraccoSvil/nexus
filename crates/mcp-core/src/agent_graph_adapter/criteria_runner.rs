@@ -14,7 +14,7 @@
 //! | `http`                | NATIVO    | chiamata REALE via `reqwest` (parita' httpx Python); status singolo o lista + `body_contains` opzionale |
 //! | `file_exists`         | NATIVO    | interrogazione DIRETTA del filesystem sulla radice del run (vedi [`EsistenzaFile`]) |
 //! | `outputs_exist`       | NATIVO    | lettura `agent_steps` (tool mutativi file del run) + verifica esistenza via `file_exists` |
-//! | `no_orphan_imported`  | TODO (F3) | grafo degli import BFS (~150 righe Python non portabili rapidamente): ritorna `inconclusive` (passed=true) finche' non portato — un criterio non valutabile NON deve far fallire il gate |
+//! | `no_orphan_imported`  | TODO (F3) | grafo degli import BFS (~150 righe Python non portabili rapidamente): ritorna `Inconclusive` finche' non portato — un criterio non valutabile NON deve far fallire il gate, ne' fargli dichiarare una verifica che non c'e' stata |
 //!
 //! RISCHIO AL CUTOVER (lezione "final_gate deve verificare il build"): il criterio
 //! BUILD (`run_command` con `expected.exit_code=0`) e' NATIVO e funzionante: al
@@ -26,9 +26,18 @@
 //!
 //! PARITA' ERRORE (parita' col try/except `final_gate.py:381-385`): un criterio
 //! fallito NON propaga un errore di porta — diventa un [`CriterionResult`] con
-//! `passed=false` + `evidence.error`/`evidence.verdict`. Il [`PortError`] resta
-//! per un guasto infrastrutturale del runner stesso (es. lettura `agent_steps`
-//! fallita in `outputs_exist`).
+//! [`CriterionOutcome::Failed`] + `evidence.error`/`evidence.verdict`. Il
+//! [`PortError`] resta per un guasto infrastrutturale del runner stesso (es.
+//! lettura `agent_steps` fallita in `outputs_exist`).
+//!
+//! MISURA vs NON MISURA: una prova che non si e' potuta ESEGUIRE (grafo import
+//! non portato, radice del run non risolta, log illeggibili, comando senza exit
+//! code) ritorna [`CriterionOutcome::Inconclusive`], mai un `passed`. Prima
+//! erano tutti `true`: il verifier li escludeva dal conteggio leggendo un flag
+//! nell'evidence, il final_gate no — e chiudeva "verifica superata" un run in
+//! cui nessuno aveva misurato niente. Distinto da NON APPLICABILE (`skipped`:
+//! nessun path, nessun pattern, nessuno step mutativo), che resta un pass
+//! perche' non c'e' nulla da misurare.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,7 +49,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use nexus_agent_graph::runtime::ports::{
-    CriteriaRunner, CriterionResult, CriterionSpec, PortError, ToolCall, ToolExecutor, ToolOutcome,
+    CriteriaRunner, CriterionOutcome, CriterionResult, CriterionSpec, PortError, ToolCall,
+    ToolExecutor, ToolOutcome,
 };
 
 /// Timeout di default per i criteri (parita' col Python: `30.0s`). I criteri con
@@ -270,47 +280,52 @@ impl FinalGateCriteriaRunnerAdapter {
         c: &CriterionSpec,
     ) -> Result<CriterionResult, PortError> {
         let timeout_s = c.timeout_s.unwrap_or(DEFAULT_TIMEOUT_S);
-        let (passed, mut evidence) = match c.criterion_type.as_str() {
+        let (outcome, mut evidence) = match c.criterion_type.as_str() {
             "run_command" => {
                 self.check_run_command(&c.spec, &c.expected, timeout_s)
                     .await
             }
-            "design_verify" => Self::check_design_verify(&c.spec),
+            "design_verify" => misurato(Self::check_design_verify(&c.spec)),
             // Criteri STRUTTURALI (ADR 0018 leva 3): PURI, i fatti sono gia'
             // nella spec (estratti dallo stato in FinalGateNode::build_criteria).
-            "action_requested" => Self::check_action_requested(&c.spec),
-            "tool_capability" => Self::check_tool_capability(&c.spec),
-            "completion_confirmed" => Self::check_completion_confirmed(&c.spec),
+            "action_requested" => misurato(Self::check_action_requested(&c.spec)),
+            "tool_capability" => misurato(Self::check_tool_capability(&c.spec)),
+            "completion_confirmed" => misurato(Self::check_completion_confirmed(&c.spec)),
             "service_logs_clean" => {
                 self.check_service_logs_clean(&c.spec, timeout_s)
                     .await
             }
-            "http" => self.check_http(&c.spec, &c.expected, timeout_s).await,
+            "http" => misurato(self.check_http(&c.spec, &c.expected, timeout_s).await),
             "file_exists" => {
                 self.check_file_exists(&c.spec, &c.expected, timeout_s)
                     .await
             }
             "outputs_exist" => self.check_outputs_exist(&c.spec, timeout_s).await?,
-            // Anti-placeholder grafo import: non ancora portato (F3) -> inconclusive.
+            // Anti-placeholder grafo import: non ancora portato (F3). NON
+            // MISURATO: prima diceva "passato", cioe' assolveva il codice per
+            // una lacuna del verificatore.
             "no_orphan_imported" | "imported_code_mounted" => (
-                true,
+                CriterionOutcome::Inconclusive,
                 json!({
-                    "inconclusive": true,
                     "skipped_reason": "no_orphan_imported non ancora portato in Rust (grafo import BFS): criterio inconcludente, escluso dal gate (TODO F3)",
                 }),
             ),
             other => (
-                false,
+                CriterionOutcome::Failed,
                 json!({ "error": format!("tipo di criterion sconosciuto: '{other}'") }),
             ),
         };
-        // Eco del tipo nell'evidence (parita' `run_criterion`: `ev["type"]`).
+        // Eco del tipo nell'evidence (parita' `run_criterion`: `ev["type"]`) +
+        // eco dell'ESITO. Sono proiezioni per persistenza/render: la DECISIONE
+        // resta il tipo `CriterionOutcome`, e nessun consumatore la ri-deduce da
+        // qui (regola M). Un solo punto di scrittura, derivato dall'enum.
         if let Value::Object(map) = &mut evidence {
             map.insert("type".to_string(), json!(c.criterion_type));
+            map.insert("outcome".to_string(), json!(outcome.as_str()));
         }
         Ok(CriterionResult {
             criterion_type: c.criterion_type.clone(),
-            passed,
+            outcome,
             evidence,
         })
     }
@@ -438,10 +453,13 @@ task_complete (outcome + summary)"
         spec: &Value,
         expected: &Value,
         _timeout_s: f64,
-    ) -> (bool, Value) {
+    ) -> (CriterionOutcome, Value) {
         let cmd = spec.get("command").and_then(Value::as_str).unwrap_or("");
         if cmd.is_empty() {
-            return (false, json!({ "error": "spec.command obbligatorio" }));
+            return (
+                CriterionOutcome::Failed,
+                json!({ "error": "spec.command obbligatorio" }),
+            );
         }
         let working_dir = spec.get("working_dir").and_then(Value::as_str);
 
@@ -454,7 +472,7 @@ task_complete (outcome + summary)"
             .await
         {
             let baseline = spec.get("baseline_exit_code").and_then(Value::as_i64);
-            return Self::evidenza_suite(cmd, esito, baseline);
+            return misurato(Self::evidenza_suite(cmd, esito, baseline));
         }
 
         let mut tool_input = json!({ "command": cmd });
@@ -465,9 +483,12 @@ task_complete (outcome + summary)"
         // col try/except Python), non propaga.
         let outcome = match self.run_tool("run_command", tool_input).await {
             Ok(o) => o,
+            // Il tool non e' partito: e' un guasto dell'ESECUZIONE, non una
+            // misura del codice. Bocciare qui significherebbe rimandare in
+            // correzione un lavoro che nessuno ha mai provato.
             Err(e) => {
                 return (
-                    false,
+                    CriterionOutcome::Inconclusive,
                     json!({ "error": format!("execute_tool: {e}"), "command": cmd }),
                 )
             }
@@ -480,6 +501,23 @@ task_complete (outcome + summary)"
             .get("exit_code")
             .and_then(Value::as_i64)
             .unwrap_or(0);
+        // `Option::==` faceva di un exit code ASSENTE lo stesso `false` di uno
+        // SBAGLIATO: il criterio bocciava il codice quando il comando non aveva
+        // prodotto alcuno stato d'uscita. Le due domande restano separate —
+        // "e' stato misurato?" e "il valore misurato e' quello atteso?".
+        //
+        // Un'invocazione RIFIUTATA (`is_error` senza exit code: comando
+        // malformato, working_dir duplicato, guardia che nega l'esecuzione) non
+        // e' un criterio non misurabile — e' un criterio la cui INVOCAZIONE e'
+        // fallita, e la risposta e' rieseguirlo corretto, non assolverlo. La
+        // distinzione e' necessaria perche' il caso dominante di "exit code
+        // assente" e' proprio quello: misurato il 01/08/2026 sui criteri falliti
+        // di gestione-spese, 309 su 329 run_command senza exit code e senza
+        // errori nell'output, di cui 237 rifiuti per working_dir duplicato e 26
+        // che riportano in prosa un servizio NON avviato, cioe' difetti reali.
+        // Trattarli come non misurabili renderebbe il gate muto proprio dove
+        // oggi insegna all'agente come correggere.
+        let esito_misurato = actual_exit.is_some() || outcome.is_error;
         let exit_ok = actual_exit == Some(expected_exit);
 
         // RETE DI SICUREZZA (regola H): alcuni build ESCONO 0 anche quando il
@@ -537,16 +575,14 @@ task_complete (outcome + summary)"
         let preexisting_bootstrap = !exit_ok
             && error_files.is_empty()
             && baseline_exit.is_some_and(|b| b != 0 && actual_exit == Some(b));
-        let passed = if delta_applicable {
-            // Chiude se il task non ha lasciato errori nei file che ha toccato,
-            // anche se il progetto ha debito preesistente altrove.
-            !regression
-        } else if preexisting_bootstrap {
-            true
-        } else {
-            // Fallback fail-closed: criterio assoluto (identico a prima).
-            exit_ok && build_errors == 0
-        };
+        let outcome = verdetto_del_comando(FattiDelComando {
+            delta_applicable,
+            regression,
+            preexisting_bootstrap,
+            build_errors,
+            esito_misurato,
+            exit_ok,
+        });
 
         // max_output_chars (parita' Python: default 600, floor 200). Il criterio
         // BUILD del nodo Rust lo valorizza (build_output_max_chars).
@@ -572,7 +608,11 @@ task_complete (outcome + summary)"
             "baseline_exit_code": baseline_exit,
             "preexisting_bootstrap": preexisting_bootstrap,
         });
-        if preexisting_bootstrap {
+        if outcome.is_inconclusive() {
+            ev["verdict"] = json!(format!(
+                "Comando '{cmd}' terminato SENZA exit code: l'esito non e' stato misurato (il processo non ha prodotto uno stato d'uscita). Non e' una prova di difetto ne' di correttezza: il criterio non conta nel gate e la chiusura resta NON verificata."
+            ));
+        } else if preexisting_bootstrap {
             ev["verdict"] = json!(format!(
                 "Criterio fallito con esito IDENTICO alla baseline pre-lavoro (exit {} gia' misurato all'innesto del profilo): fallimento PRE-ESISTENTE dell'ambiente (es. config del tool assente), non una regressione di questo run. Debito del progetto, non blocca la chiusura.",
                 baseline_exit.unwrap_or_default()
@@ -594,7 +634,7 @@ task_complete (outcome + summary)"
                 "Build uscito con exit ok ma l'output contiene {build_errors} errore/i di build (es. import non risolti): il bundle NON e' valido. Correggi gli errori sopra e riverifica."
             ));
         }
-        (passed, ev)
+        (outcome, ev)
     }
 
     // ── service_logs_clean: run_command + match pattern sui log ───────────────
@@ -603,7 +643,7 @@ task_complete (outcome + summary)"
         &self,
         spec: &Value,
         _timeout_s: f64,
-    ) -> (bool, Value) {
+    ) -> (CriterionOutcome, Value) {
         let cmd = spec.get("command").and_then(Value::as_str).unwrap_or("");
         let patterns: Vec<String> = spec
             .get("patterns")
@@ -617,8 +657,11 @@ task_complete (outcome + summary)"
             })
             .unwrap_or_default();
         if cmd.is_empty() || patterns.is_empty() {
+            // NON APPLICABILE, che e' diverso da NON MISURABILE: non c'e' nulla
+            // da misurare, quindi il criterio non impone nulla e non toglie
+            // nulla alla verifica. Resta un pass, come da sempre.
             return (
-                true,
+                CriterionOutcome::Passed,
                 json!({ "skipped": "service_logs_clean: command/patterns mancanti (N/A)" }),
             );
         }
@@ -627,12 +670,12 @@ task_complete (outcome + summary)"
             .await
         {
             Ok(o) => outcome_text(&o),
-            // Inconclusivo (non un fallimento): non blocchiamo la chiusura su un
-            // errore di lettura log (parita' Python: ritorna passed=true).
+            // I log non si sono potuti leggere: non blocchiamo la chiusura (non
+            // e' una prova di difetto) ma nemmeno la dichiariamo pulita.
             Err(e) => {
                 return (
-                    true,
-                    json!({ "inconclusive": true, "skipped_reason": format!("run_command log fallito: {e}") }),
+                    CriterionOutcome::Inconclusive,
+                    json!({ "skipped_reason": format!("run_command log fallito: {e}") }),
                 )
             }
         };
@@ -660,7 +703,7 @@ task_complete (outcome + summary)"
                 hits.join("\n")
             ));
         }
-        (passed, evidence)
+        (CriterionOutcome::measured(passed), evidence)
     }
 
     // ── http: chiamata REALE via reqwest (parita' httpx Python) ───────────────
@@ -728,12 +771,18 @@ task_complete (outcome + summary)"
     /// L'esito e' a tre stati ([`EsistenzaFile`]) perche' "non ho potuto
     /// guardare" e' una risposta diversa da "non c'e'", e confonderle e' proprio
     /// il modo in cui questo criterio bocciava run corretti.
-    async fn check_file_exists(&self, spec: &Value, expected: &Value, _timeout_s: f64) -> (bool, Value) {
+    async fn check_file_exists(
+        &self,
+        spec: &Value,
+        expected: &Value,
+        _timeout_s: f64,
+    ) -> (CriterionOutcome, Value) {
         let path = spec.get("path").and_then(Value::as_str).unwrap_or("");
         if path.is_empty() {
-            // file_exists senza path: N/A (pass), parita' Python.
+            // file_exists senza path: N/A (pass), parita' Python. Non e' un
+            // "non misurabile": non c'e' nessun file di cui rispondere.
             return (
-                true,
+                CriterionOutcome::Passed,
                 json!({ "skipped": "file_exists senza path: criterio non applicabile (N/A)" }),
             );
         }
@@ -744,15 +793,14 @@ task_complete (outcome + summary)"
         let esito = interroga_esistenza(self.run_root.as_deref(), path).await;
         match esito {
             EsistenzaFile::NonInterrogabile { motivo } => (
-                // Inconclusivo, non fallito: il verifier non conta i criteri
-                // `inconclusive` ne' fra i pass ne' fra i fail. Rispondere "non
-                // esiste" quando non si e' potuto guardare avrebbe la stessa
-                // forma di una misura, e nessuna delle sue garanzie.
-                true,
+                // Non misurabile, e ora lo DICE il tipo: prima era un `true`, e
+                // per il gate un `true` valeva quanto una misura riuscita —
+                // rispondere "esiste" senza aver guardato ha la stessa forma di
+                // una prova e nessuna delle sue garanzie.
+                CriterionOutcome::Inconclusive,
                 json!({
                     "path": path,
                     "expected_exists": expected_exists,
-                    "inconclusive": true,
                     "method": "filesystem",
                     "skipped_reason": motivo,
                 }),
@@ -760,7 +808,7 @@ task_complete (outcome + summary)"
             EsistenzaFile::Esiste | EsistenzaFile::NonEsiste => {
                 let exists = esito == EsistenzaFile::Esiste;
                 (
-                    exists == expected_exists,
+                    CriterionOutcome::measured(exists == expected_exists),
                     json!({
                         "path": path,
                         "exists": exists,
@@ -778,7 +826,7 @@ task_complete (outcome + summary)"
         &self,
         spec: &Value,
         timeout_s: f64,
-    ) -> Result<(bool, Value), PortError> {
+    ) -> Result<(CriterionOutcome, Value), PortError> {
         let run_id = spec
             .get("run_id")
             .and_then(Value::as_str)
@@ -786,7 +834,7 @@ task_complete (outcome + summary)"
             .trim();
         if run_id.is_empty() {
             return Ok((
-                true,
+                CriterionOutcome::Passed,
                 json!({ "skipped": "outputs_exist senza run_id: N/A" }),
             ));
         }
@@ -794,7 +842,7 @@ task_complete (outcome + summary)"
             Ok(u) => u,
             Err(_) => {
                 return Ok((
-                    true,
+                    CriterionOutcome::Passed,
                     json!({ "skipped": "outputs_exist run_id non-UUID: N/A" }),
                 ))
             }
@@ -832,7 +880,7 @@ task_complete (outcome + summary)"
         }
         if paths.is_empty() {
             return Ok((
-                true,
+                CriterionOutcome::Passed,
                 json!({ "skipped": "nessuno step mutativo file nel run: N/A" }),
             ));
         }
@@ -847,19 +895,24 @@ task_complete (outcome + summary)"
         let mut inconclusive: Vec<String> = Vec::new();
         // Cap difensivo (parita' Python: 20 output).
         for p in paths.iter().take(20) {
-            let (ok, ev) = self
+            // L'esito del sotto-criterio arriva TIPIZZATO: prima si rileggeva un
+            // flag dall'evidence JSON che il produttore poteva smettere di
+            // scrivere senza che nulla se ne accorgesse (regola M).
+            let (esito, _ev) = self
                 .check_file_exists(&json!({ "path": p }), &json!({}), timeout_s)
                 .await;
             checked.push(p.clone());
-            if ev.get("inconclusive").and_then(Value::as_bool) == Some(true) {
-                inconclusive.push(p.clone());
-            } else if !ok {
-                missing.push(p.clone());
+            match esito {
+                CriterionOutcome::Inconclusive => inconclusive.push(p.clone()),
+                CriterionOutcome::Failed => missing.push(p.clone()),
+                CriterionOutcome::Passed => {}
             }
         }
         if !missing.is_empty() {
+            // Un file dichiarato e ASSENTE e' una misura, anche se altri path non
+            // si sono potuti guardare: la prova del difetto c'e' gia'.
             return Ok((
-                false,
+                CriterionOutcome::Failed,
                 json!({
                     "missing": missing,
                     "checked": checked,
@@ -873,8 +926,11 @@ task_complete (outcome + summary)"
             evidence["verdict"] = json!(
                 "output presenti dove verificabili; alcuni non erano verificabili (radice del run non risolta) -- NON e' una conferma piena"
             );
+            // L'evidence lo diceva gia' a parole; l'esito diceva "passato". Ora
+            // le due cose coincidono: verifica incompleta = non misurata.
+            return Ok((CriterionOutcome::Inconclusive, evidence));
         }
-        Ok((true, evidence))
+        Ok((CriterionOutcome::Passed, evidence))
     }
 }
 
@@ -890,6 +946,14 @@ impl CriteriaRunner for FinalGateCriteriaRunnerAdapter {
         }
         Ok(out)
     }
+}
+
+/// Promuove l'esito di un criterio che ha DAVVERO misurato (`bool`) alla forma
+/// a tre stati. Da usare solo dove il "non misurabile" non e' rappresentabile:
+/// i criteri puri (fatti gia' nella spec) e quelli la cui prova o riesce o
+/// fallisce (una risposta HTTP e' sempre una misura, anche un 500).
+fn misurato((passed, evidence): (bool, Value)) -> (CriterionOutcome, Value) {
+    (CriterionOutcome::measured(passed), evidence)
 }
 
 /// Status HTTP attesi da un criterio: intero singolo o lista (parita' Python).
@@ -1090,6 +1154,155 @@ async fn interroga_esistenza(run_root: Option<&Path>, path: &str) -> EsistenzaFi
     }
 }
 
+/// Cio' che si e' potuto osservare di UN'esecuzione di comando, gia' ridotto a
+/// fatti. E' l'input di [`verdetto_del_comando`]: la raccolta dei fatti tocca il
+/// mondo (tool, filesystem, DB), il verdetto no, e tenerli insieme rendeva la
+/// parte che vale la pena interrogare raggiungibile solo attraverso quella che
+/// vale la pena isolare.
+struct FattiDelComando {
+    /// L'output ha localizzato errori IN FILE e il run dichiara file toccati:
+    /// si puo' rispondere "questo run ha rotto qualcosa?" invece della domanda
+    /// piu' grossolana "il progetto ha errori?".
+    delta_applicable: bool,
+    /// Almeno un file d'errore e' fra quelli che questo run ha toccato.
+    regression: bool,
+    /// Stesso exit non-zero della baseline pre-lavoro, senza errori localizzati:
+    /// l'ambiente era gia' cosi' prima che il run cominciasse.
+    preexisting_bootstrap: bool,
+    /// Errori di build PROVATI dall'output (rete di sicurezza sull'exit bugiardo).
+    build_errors: usize,
+    /// C'e' stata una misura: exit code presente, oppure il tool ha DICHIARATO
+    /// il fallimento (invocazione rifiutata).
+    esito_misurato: bool,
+    /// L'exit code misurato e' quello atteso.
+    exit_ok: bool,
+}
+
+/// Il verdetto su un criterio comando, dai soli fatti. Puro per costruzione:
+/// nessun I/O, nessun testo analizzato (regola M), quindi interrogabile caso per
+/// caso senza montare un esecutore.
+///
+/// L'ORDINE dei rami e' il contratto, non uno stile: il delta sui file toccati
+/// precede tutto perche' e' la misura piu' fine disponibile; il bootstrap
+/// preesistente precede gli errori di build perche' un ambiente gia' rotto non
+/// diventa colpa di questo run; "non misurato" viene per ULTIMO fra i casi
+/// negativi, cosi' non puo' assorbire un caso che qualcuno aveva gia' misurato.
+fn verdetto_del_comando(f: FattiDelComando) -> CriterionOutcome {
+    if f.delta_applicable {
+        // Chiude se il task non ha lasciato errori nei file che ha toccato,
+        // anche se il progetto ha debito preesistente altrove. E' una MISURA
+        // anche senza exit code: l'output ha localizzato gli errori.
+        return CriterionOutcome::measured(!f.regression);
+    }
+    if f.preexisting_bootstrap {
+        return CriterionOutcome::Passed;
+    }
+    if f.build_errors > 0 {
+        // L'output PROVA errori di build: misura valida a prescindere
+        // dall'exit code.
+        return CriterionOutcome::Failed;
+    }
+    if !f.esito_misurato {
+        // Nessun exit code, nessuna dichiarazione di fallimento, nessun errore
+        // nell'output: non si e' misurato NULLA. Non e' una prova di difetto (il
+        // gate non boccia) e non e' una prova di correttezza (la chiusura non e'
+        // verificata).
+        //
+        // Il delta sulla baseline, che altrove distingue il preesistente
+        // dall'introdotto, qui non e' ponibile: `baseline_exit_code` assente
+        // significa insieme "mai misurata" e "misurata senza exit code"
+        // (`measure_command_exit` collassa i due casi in `None`), quindi
+        // confrontarla sarebbe una risposta inventata su un segnale ambiguo.
+        return CriterionOutcome::Inconclusive;
+    }
+    // Fail-closed: criterio assoluto.
+    CriterionOutcome::measured(f.exit_ok)
+}
+
+#[cfg(test)]
+mod verdetto_del_comando_tests {
+    use super::*;
+
+    fn fatti() -> FattiDelComando {
+        FattiDelComando {
+            delta_applicable: false,
+            regression: false,
+            preexisting_bootstrap: false,
+            build_errors: 0,
+            esito_misurato: true,
+            exit_ok: true,
+        }
+    }
+
+    /// L'ordine dei rami e' il contratto: ogni caso qui fissa una PRECEDENZA,
+    /// non solo un esito. Sono le combinazioni in cui due rami sarebbero
+    /// entrambi applicabili, cioe' le uniche in cui l'ordine si vede.
+    ///
+    /// MUTAZIONE: spostando il ramo `!esito_misurato` sopra `build_errors > 0`,
+    /// il terzo caso torna `Inconclusive` e rosseggia — sarebbe il fail-open che
+    /// assolve un build rotto solo perche' il processo non ha reso un exit code.
+    #[test]
+    fn la_precedenza_fra_i_rami_e_il_contratto() {
+        let delta_vince = FattiDelComando {
+            delta_applicable: true,
+            regression: false,
+            preexisting_bootstrap: true,
+            exit_ok: false,
+            ..fatti()
+        };
+        assert_eq!(
+            verdetto_del_comando(delta_vince),
+            CriterionOutcome::Passed,
+            "il delta sui file toccati e' la misura piu' fine: precede il bootstrap"
+        );
+
+        let bootstrap_vince = FattiDelComando {
+            preexisting_bootstrap: true,
+            build_errors: 3,
+            exit_ok: false,
+            ..fatti()
+        };
+        assert_eq!(
+            verdetto_del_comando(bootstrap_vince),
+            CriterionOutcome::Passed,
+            "un ambiente gia' rotto prima del run non diventa colpa del run"
+        );
+
+        let build_batte_il_non_misurato = FattiDelComando {
+            build_errors: 2,
+            esito_misurato: false,
+            exit_ok: false,
+            ..fatti()
+        };
+        assert_eq!(
+            verdetto_del_comando(build_batte_il_non_misurato),
+            CriterionOutcome::Failed,
+            "l'output PROVA gli errori: l'exit code assente non li cancella"
+        );
+
+        let niente_da_misurare = FattiDelComando {
+            esito_misurato: false,
+            exit_ok: false,
+            ..fatti()
+        };
+        assert_eq!(
+            verdetto_del_comando(niente_da_misurare),
+            CriterionOutcome::Inconclusive,
+            "senza alcun segnale non si boccia e non si assolve"
+        );
+
+        let assoluto = FattiDelComando {
+            exit_ok: false,
+            ..fatti()
+        };
+        assert_eq!(
+            verdetto_del_comando(assoluto),
+            CriterionOutcome::Failed,
+            "fail-closed: misurato e diverso dall'atteso"
+        );
+    }
+}
+
 #[cfg(test)]
 mod verdetto_suite_tests {
     use super::*;
@@ -1275,7 +1488,7 @@ mod tests {
             .await
             .expect("ok");
         assert_eq!(res.len(), 1);
-        assert!(res[0].passed, "exit 0 == expected 0 -> passed");
+        assert!(res[0].passed(), "exit 0 == expected 0 -> passed");
         assert_eq!(res[0].evidence["exit_code"], json!(0));
         assert!(res[0].evidence["output_total_chars"].is_number());
         assert_eq!(res[0].evidence["type"], json!("run_command"));
@@ -1312,7 +1525,7 @@ mod tests {
             .await
             .expect("ok");
         assert!(
-            res[0].passed,
+            res[0].passed(),
             "build vite exit 0 con soli warning deve PASSARE, evidence: {}",
             res[0].evidence
         );
@@ -1339,7 +1552,7 @@ mod tests {
             )
             .await
             .expect("ok");
-        assert!(!res[0].passed, "exit 101 != 0 -> build fallito");
+        assert!(res[0].failed(), "exit 101 != 0 -> build fallito");
         assert_eq!(res[0].evidence["exit_code"], json!(101));
         // output_excerpt presente (render_failed_block ramo build lo legge).
         assert!(res[0].evidence["output_excerpt"].is_string());
@@ -1366,7 +1579,7 @@ mod tests {
             .await
             .expect("ok");
         assert!(
-            res[0].passed,
+            res[0].passed(),
             "fallimento identico alla baseline pre-lavoro = debito ambiente, non regressione"
         );
         assert_eq!(res[0].evidence["preexisting_bootstrap"], json!(true));
@@ -1394,7 +1607,7 @@ mod tests {
             .await
             .expect("ok");
         assert!(
-            !res[0].passed,
+            res[0].failed(),
             "exit 2 con baseline 1: non identico -> boccia"
         );
         assert_eq!(res[0].evidence["preexisting_bootstrap"], json!(false));
@@ -1421,10 +1634,159 @@ mod tests {
             .await
             .expect("ok");
         assert!(
-            !res[0].passed,
+            res[0].failed(),
             "errore localizzato in file toccato = regressione: la baseline non salva"
         );
         assert_eq!(res[0].evidence["preexisting_bootstrap"], json!(false));
+    }
+
+    // ── Exit code ASSENTE: non misurato, non fallito ─────────────────────────
+
+    #[sqlx::test]
+    async fn run_command_senza_exit_code_non_e_misurato(pool: PgPool) {
+        // Il confronto `actual == Some(expected)` faceva di un exit code
+        // ASSENTE lo stesso `false` di uno SBAGLIATO: il gate bocciava il
+        // codice per un guasto dell'esecuzione (misura sui run reali: 94
+        // bocciature run_command, 11 senza exit code). L'output arriva dal
+        // produttore vero (`map_result_to_outcome`), che senza la riga
+        // "EXIT CODE: N" non estrae nulla — esattamente la produzione.
+        let exec = FakeToolExecutor::with(&[("run_command", &["nessuno stato di uscita"])]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
+        let res = runner
+            .run(vec![spec(
+                "run_command",
+                json!({ "command": "pnpm build" }),
+                json!({ "exit_code": 0 }),
+            )])
+            .await
+            .expect("ok");
+        assert!(
+            res[0].inconclusive(),
+            "senza exit code non c'e' misura, evidence: {}",
+            res[0].evidence
+        );
+        assert!(!res[0].failed(), "non e' una prova di difetto");
+        assert!(!res[0].passed(), "e nemmeno una prova di correttezza");
+        assert_eq!(res[0].evidence["exit_code"], json!(null));
+        assert_eq!(res[0].evidence["outcome"], json!("inconclusive"));
+    }
+
+    /// ToolExecutor che fallisce alla PORTA: il tool non parte affatto (runner
+    /// giu', gRPC irraggiungibile). Distinto dal fake che ritorna un testo di
+    /// rifiuto, dove il tool E' partito e ha detto di no.
+    struct ExecutorGuasto;
+
+    #[async_trait]
+    impl ToolExecutor for ExecutorGuasto {
+        async fn execute(
+            &self,
+            _call: ToolCall,
+        ) -> Result<nexus_agent_graph::runtime::ports::ToolOutcome, PortError> {
+            Err(PortError::Tool("tool runner irraggiungibile".to_string().into()))
+        }
+    }
+
+    #[sqlx::test]
+    async fn guasto_della_porta_non_e_una_misura_del_codice(pool: PgPool) {
+        // Terzo caso, distinto dai due sopra: il tool non e' MAI partito perche'
+        // e' l'infrastruttura di esecuzione a essere giu'. Non c'e' nulla da
+        // rieseguire correggendo il comando e non c'e' nulla da correggere nel
+        // codice: bocciare qui rimanderebbe in correzione un lavoro che nessuno
+        // ha provato. E' l'unico dei tre in cui `Inconclusive` e' la risposta
+        // giusta per costruzione, e va tenuto separato dal rifiuto sopra —
+        // altrimenti la stessa parola coprirebbe "guasto mio" e "comando tuo".
+        //
+        // MUTAZIONE: facendo tornare il ramo `Err` a `CriterionOutcome::Failed`
+        // l'assert su `inconclusive()` rosseggia.
+        let runner = FinalGateCriteriaRunnerAdapter::new(Arc::new(ExecutorGuasto), pool, None);
+        let res = runner
+            .run(vec![spec(
+                "run_command",
+                json!({ "command": "pnpm build" }),
+                json!({ "exit_code": 0 }),
+            )])
+            .await
+            .expect("il guasto di UN criterio non fa fallire la batteria");
+        assert!(
+            res[0].inconclusive(),
+            "guasto dell'esecutore: non e' una misura del codice, evidence: {}",
+            res[0].evidence
+        );
+        assert!(
+            !res[0].passed(),
+            "e nemmeno una prova di correttezza: la chiusura resta non verificata"
+        );
+        assert!(res[0].evidence["error"].is_string());
+    }
+
+    #[sqlx::test]
+    async fn run_command_rifiutato_prima_dell_esecuzione_boccia(pool: PgPool) {
+        // "Nessun exit code" ha DUE cause che non vanno confuse: il comando e'
+        // partito e non ha prodotto stato d'uscita (non misurato: il gate non
+        // boccia), oppure l'invocazione e' stata RIFIUTATA da una guardia e il
+        // comando non e' mai partito. Il secondo caso e' un criterio da
+        // rieseguire corretto, non da assolvere: e' anche quello DOMINANTE,
+        // misurato il 01/08/2026 sui criteri falliti di gestione-spese (309 su
+        // 329 run_command senza exit code, di cui 237 rifiuti per working_dir
+        // duplicato). Il rifiuto si riconosce dal marker di fallimento in testa
+        // — segnale strutturato (regola M), non dal testo del messaggio — e il
+        // fake lo traduce in `is_error` passando dal punto unico della
+        // produzione, come farebbe il dispatch vero.
+        //
+        // MUTAZIONE: togliendo `|| outcome.is_error` da `esito_misurato` il
+        // criterio torna `inconclusive`, il gate CHIUDE e il run diventa
+        // `CompletedUnverified`, che `is_success()` dichiara riuscito: il
+        // rifiuto verrebbe assolto invece che corretto.
+        let rifiuto = nexus_types::tool_outcome::tool_failure(
+            "[working_dir gia' applicato] Il comando gira GIA' dentro 'frontend'. \
+             Correggi il comando: togli 'cd frontend'.",
+        );
+        let exec = FakeToolExecutor::with(&[("run_command", &[rifiuto.as_str()])]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
+        let res = runner
+            .run(vec![spec(
+                "run_command",
+                json!({ "command": "cd frontend && pnpm build" }),
+                json!({ "exit_code": 0 }),
+            )])
+            .await
+            .expect("ok");
+        assert!(
+            res[0].failed(),
+            "un'invocazione rifiutata e' un criterio da rieseguire corretto, \
+             non un criterio non misurabile, evidence: {}",
+            res[0].evidence
+        );
+        assert!(
+            !res[0].inconclusive(),
+            "assolverlo renderebbe muto il canale con cui il gate insegna \
+             all'agente come correggere il comando"
+        );
+        assert_eq!(res[0].evidence["exit_code"], json!(null));
+    }
+
+    #[sqlx::test]
+    async fn run_command_senza_exit_code_ma_con_errori_di_build_boccia(pool: PgPool) {
+        // NON e' un lasciapassare: se l'output PROVA errori di build la misura
+        // c'e' lo stesso, e la rete di sicurezza sull'exit-code bugiardo resta.
+        let exec = FakeToolExecutor::with(&[(
+            "run_command",
+            &["error: Could not resolve \"./mancante\" from src/main.ts"],
+        )]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
+        let res = runner
+            .run(vec![spec(
+                "run_command",
+                json!({ "command": "pnpm build" }),
+                json!({ "exit_code": 0 }),
+            )])
+            .await
+            .expect("ok");
+        assert!(
+            res[0].failed(),
+            "errori di build nell'output = misura valida, evidence: {}",
+            res[0].evidence
+        );
     }
 
     // ── Gate DELTA-aware (regola H): regressione vs debito preesistente ──────────
@@ -1449,7 +1811,7 @@ mod tests {
             .await
             .expect("ok");
         assert!(
-            !res[0].passed,
+            res[0].failed(),
             "errore in un file toccato = regressione -> fallisce (no fail-open)"
         );
         assert_eq!(res[0].evidence["delta_applied"], json!(true));
@@ -1479,7 +1841,7 @@ mod tests {
             .await
             .expect("ok");
         assert!(
-            res[0].passed,
+            res[0].passed(),
             "errori solo in file NON toccati (debito preesistente) -> non blocca"
         );
         assert_eq!(res[0].evidence["delta_applied"], json!(true));
@@ -1509,7 +1871,7 @@ mod tests {
             .await
             .expect("ok");
         assert!(
-            !res[0].passed,
+            res[0].failed(),
             "senza file toccati -> fail-closed (criterio assoluto)"
         );
         assert_eq!(res[0].evidence["delta_applied"], json!(false));
@@ -1587,7 +1949,7 @@ mod tests {
             )])
             .await
             .expect("ok");
-        assert!(!res[0].passed, "500 fuori dagli status attesi -> criterio fallito");
+        assert!(res[0].failed(), "500 fuori dagli status attesi -> criterio fallito");
         assert_eq!(res[0].evidence["status"], json!(CODICE_500));
         let verdict = res[0].evidence["verdict"]
             .as_str()
@@ -1620,7 +1982,7 @@ mod tests {
             )])
             .await
             .expect("ok");
-        assert!(res[0].passed, "201 e' un successo di creazione");
+        assert!(res[0].passed(), "201 e' un successo di creazione");
     }
 
     #[sqlx::test]
@@ -1638,7 +2000,7 @@ mod tests {
             )
             .await
             .expect("ok");
-        assert!(res[0].passed, "nessun pattern -> log puliti");
+        assert!(res[0].passed(), "nessun pattern -> log puliti");
     }
 
     #[sqlx::test]
@@ -1658,7 +2020,7 @@ mod tests {
             )
             .await
             .expect("ok");
-        assert!(!res[0].passed, "pattern presente -> errori runtime");
+        assert!(res[0].failed(), "pattern presente -> errori runtime");
         assert_eq!(res[0].evidence["error_lines"], json!(1));
         assert!(res[0].evidence["verdict"].is_string());
     }
@@ -1677,9 +2039,12 @@ mod tests {
             )
             .await
             .expect("ok");
-        // inconclusive -> passed=true (il gate non lo conteggia come fallimento).
-        assert!(res[0].passed);
-        assert_eq!(res[0].evidence["inconclusive"], json!(true));
+        // Non misurabile: il gate non lo conteggia ne' fra i pass ne' fra i
+        // fail. Prima era `passed`, cioe' assolveva il codice per una lacuna
+        // del verificatore.
+        assert!(res[0].inconclusive());
+        assert!(!res[0].passed(), "un criterio mai eseguito non e' un pass");
+        assert_eq!(res[0].evidence["outcome"], json!("inconclusive"));
     }
 
     #[sqlx::test]
@@ -1699,7 +2064,7 @@ mod tests {
             )
             .await
             .expect("ok");
-        assert!(res[0].passed, "history tool_use conferma capacita' tool");
+        assert!(res[0].passed(), "history tool_use conferma capacita' tool");
         assert_eq!(res[0].evidence["tools_count"], json!(0));
         assert_eq!(res[0].evidence["has_tool_calls"], json!(true));
     }
@@ -1719,7 +2084,7 @@ mod tests {
             .await
             .expect("ok");
         assert!(
-            !res[0].passed,
+            res[0].failed(),
             "zero catalogo e zero tool_use resta misconfigurazione"
         );
     }
@@ -1748,7 +2113,7 @@ mod tests {
             )])
             .await
             .expect("ok");
-        assert!(res[0].passed, "file presente sul disco -> esiste");
+        assert!(res[0].passed(), "file presente sul disco -> esiste");
         assert_eq!(res[0].evidence["exists"], json!(true));
         assert_eq!(res[0].evidence["method"], json!("filesystem"));
     }
@@ -1767,7 +2132,7 @@ mod tests {
             .run(vec![spec("file_exists", json!({ "path": ".env" }), json!({}))])
             .await
             .expect("ok");
-        assert!(res[0].passed, ".env scritto sul disco -> esiste, anche se un listing lo nasconde");
+        assert!(res[0].passed(), ".env scritto sul disco -> esiste, anche se un listing lo nasconde");
     }
 
     #[sqlx::test]
@@ -1784,7 +2149,7 @@ mod tests {
             )])
             .await
             .expect("ok");
-        assert!(!res[0].passed, "file assente -> il criterio fallisce");
+        assert!(res[0].failed(), "file assente -> il criterio fallisce");
         assert_eq!(res[0].evidence["exists"], json!(false));
     }
 
@@ -1804,8 +2169,9 @@ mod tests {
             )])
             .await
             .expect("ok");
-        assert!(res[0].passed, "inconclusivo -> non blocca il gate");
-        assert_eq!(res[0].evidence["inconclusive"], json!(true));
+        assert!(res[0].inconclusive(), "non misurabile, non un pass");
+        assert!(!res[0].failed(), "inconclusivo -> non blocca il gate");
+        assert_eq!(res[0].evidence["outcome"], json!("inconclusive"));
     }
 
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
@@ -1824,7 +2190,7 @@ mod tests {
             .await
             .expect("ok");
         // Nessuno step mutativo -> N/A (pass).
-        assert!(res[0].passed);
+        assert!(res[0].passed());
         assert!(res[0].evidence["skipped"].is_string());
     }
 
@@ -1859,7 +2225,7 @@ mod tests {
             )
             .await
             .expect("ok");
-        assert!(!res[0].passed, "output dichiarato assente -> fallisce");
+        assert!(res[0].failed(), "output dichiarato assente -> fallisce");
         assert_eq!(res[0].evidence["missing"], json!(["nuovo.rs"]));
     }
 
@@ -1891,7 +2257,7 @@ mod tests {
             )
             .await
             .expect("ok");
-        assert!(res[0].passed, "output presente sul disco -> passa");
+        assert!(res[0].passed(), "output presente sul disco -> passa");
     }
 
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
@@ -1926,8 +2292,12 @@ mod tests {
             .await
             .expect("ok");
         assert!(
-            res[0].passed,
+            !res[0].failed(),
             "non verificabile != assente: non deve bocciare il gate"
+        );
+        assert!(
+            res[0].inconclusive(),
+            "verifica incompleta: l'evidence lo diceva gia' a parole, ora lo dice l'esito"
         );
         assert_eq!(
             res[0].evidence["inconclusive"],
@@ -1947,7 +2317,7 @@ mod tests {
             )
             .await
             .expect("ok");
-        assert!(!res[0].passed);
+        assert!(!res[0].passed());
         assert!(res[0].evidence["error"].is_string());
     }
 
