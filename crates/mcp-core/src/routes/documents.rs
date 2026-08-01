@@ -53,6 +53,16 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
                 middleware::require_auth,
             )),
         )
+        // Ri-armo esplicito di una riparazione fallita (diagnosi di crash in
+        // `failed_remediation`): il bottone "Riprova riparazione" del pannello
+        // Problemi. Delega a service_recovery::rearm_diagnosis (punto unico).
+        .route(
+            "/api/projects/:id/problems/diagnoses/:diag_id/retry",
+            post(project_workspace::retry_service_diagnosis).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_auth,
+            )),
+        )
         .route(
             "/api/projects/:id/output/channels",
             get(project_workspace::get_output_channels).layer(axum_mw::from_fn_with_state(

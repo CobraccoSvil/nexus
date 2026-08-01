@@ -41,6 +41,8 @@ export interface ProblemItem {
   occurrenceCount?: number;
   relatedIds?: string[];
   instances?: ProblemInstance[];
+  /** Diagnosi di crash in failed_remediation, ri-armabile (segnale backend). */
+  remediationRetryable?: boolean;
 }
 
 export interface ChatSessionUsage {

@@ -19,6 +19,7 @@ import {
   killPortProcess,
   getProjectProblems,
   getRunConfigs,
+  retryServiceDiagnosis,
   getProviderModels,
   getProviders,
   getWorkbenchState,
@@ -592,6 +593,31 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     setPendingExternalAutomation("confirm");
     setPendingAgentTypeHint(ACTION_AGENT_HINT);
   }, []);
+
+  // Ri-armo esplicito di una riparazione fallita: chiama l'endpoint (che
+  // delega al punto unico backend) e rifetcha i problemi, cosi' la riga passa
+  // subito da "FALLITA" a "aperta" senza aspettare l'evento di refresh.
+  const handleRetryRemediation = useCallback(
+    (item: ProblemItem) => {
+      const projectId = activeProjectRef.current?.id;
+      if (!projectId) return;
+      void (async () => {
+        try {
+          await retryServiceDiagnosis(projectId, item.id);
+        } catch {
+          // 409: la diagnosi non era piu' in failed_remediation (gia' ripresa
+          // da un ri-armo automatico o risolta). Il refetch sotto riallinea.
+        }
+        try {
+          const problems = await getProjectProblems(projectId);
+          setProblemItems(problems.items ?? []);
+        } catch {
+          // Refetch best-effort: il pannello si riallinea al prossimo evento.
+        }
+      })();
+    },
+    [],
+  );
 
   const cycleLayoutMode = useCallback(() => {
     setLayoutMode((current) => {
@@ -1946,6 +1972,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
             project={activeProject}
             problemItems={visibleProblemItems}
             onSendProblemToChat={handleSendProblemToChat}
+            onRetryRemediation={handleRetryRemediation}
             outputChannels={outputChannels}
             selectedOutputChannel={selectedOutputChannel}
             outputEvents={outputEvents}

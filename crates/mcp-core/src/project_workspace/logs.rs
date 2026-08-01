@@ -264,6 +264,11 @@ fn diagnosis_row_to_problem(row: sqlx::postgres::PgRow) -> Value {
         threshold,
         &detail,
     );
+    // Segnale STRUTTURATO per la UI (regola M): il bottone "riprova riparazione"
+    // decide su questo campo, mai sul prefisso testuale del messaggio. Vale per
+    // le sole diagnosi di crash in stato terminale fallito: e' l'unico stato che
+    // il ri-armo esplicito (`service_recovery::rearm_diagnosis`) accetta.
+    let remediation_retryable = signal_kind == "crash" && status == "failed_remediation";
     json!({
         "id": row.get::<Uuid, _>("id").to_string(),
         "severity": severity,
@@ -273,7 +278,51 @@ fn diagnosis_row_to_problem(row: sqlx::postgres::PgRow) -> Value {
         "line": serde_json::Value::Null,
         "column": serde_json::Value::Null,
         "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
+        "remediationRetryable": remediation_retryable,
     })
+}
+
+/// Ri-armo ESPLICITO di una riparazione fallita, dal pannello Problemi.
+///
+/// La richiesta umana e' il secondo segnale strutturato che rende una diagnosi
+/// `failed_remediation` di nuovo ammissibile al ciclo di verifica (il primo e'
+/// una scrittura registrata su un file del servizio): copre il caso in cui la
+/// causa e' stata rimossa per una strada che `file_mutations` non vede — una
+/// correzione fatta a mano nell'editor dell'utente. Delega al punto unico
+/// `service_recovery::rearm_diagnosis` (regola L): stessa scrittura, stesse
+/// condizioni, stesso motivo persistito. Da li' in poi il presidio esistente
+/// riprende la riga col suo contratto invariato.
+pub async fn retry_service_diagnosis(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath((id, diag_id)): AxumPath<(String, String)>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let diagnosis_id = Uuid::parse_str(&diag_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Diagnosis id non valido"))?;
+    let _context = load_project_context(&state.db, project_id, user_id).await?;
+
+    let riarmata = crate::project_workspace::service_recovery::rearm_diagnosis(
+        &state.db,
+        project_id,
+        diagnosis_id,
+        crate::project_workspace::service_recovery::REARM_EXPLICIT_REASON,
+    )
+    .await;
+    match riarmata {
+        Some(id) => {
+            emit_problems_panel_refresh(project_id, vec![id]);
+            Ok(Json(json!({ "rearmed": true, "diagnosisId": id.to_string() })))
+        }
+        // La riga non era una diagnosi di crash in stato terminale fallito di
+        // questo progetto: niente da ri-armare, e lo stato non viene toccato.
+        None => Err(api_error(
+            StatusCode::CONFLICT,
+            "La diagnosi non e' in stato failed_remediation: niente da ri-armare",
+        )),
+    }
 }
 
 /// PUNTO UNICO (regola L) del prefisso di stato di una diagnosi: dice a colpo

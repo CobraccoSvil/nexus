@@ -92,6 +92,12 @@ export interface ProblemItem {
   relatedIds?: string[];
   /** Dettaglio per marker editor e prompt chat. */
   instances?: ProblemInstance[];
+  /**
+   * Segnale strutturato dal backend (regola M): diagnosi di crash in
+   * `failed_remediation`, ri-armabile con un nuovo ciclo di verifica.
+   * Il bottone "Riprova riparazione" decide su questo, mai sul testo.
+   */
+  remediationRetryable?: boolean;
 }
 
 /** Espande un problema raggruppato in voci singole per marker/diagnostica. */
@@ -221,6 +227,21 @@ export async function getProjectProblems(
   projectId: string,
 ): Promise<{ items: ProblemItem[] }> {
   return fetchJson(`${API_BASE}/api/projects/${projectId}/problems`);
+}
+
+/**
+ * Ri-armo esplicito di una riparazione fallita: la diagnosi torna ammissibile
+ * al ciclo di verifica del presidio (failed_remediation -> open, lato backend
+ * via il punto unico service_recovery::rearm_diagnosis).
+ */
+export async function retryServiceDiagnosis(
+  projectId: string,
+  diagnosisId: string,
+): Promise<{ rearmed: boolean; diagnosisId: string }> {
+  return fetchJson(
+    `${API_BASE}/api/projects/${projectId}/problems/diagnoses/${diagnosisId}/retry`,
+    { method: "POST" },
+  );
 }
 
 export async function getOutputChannels(

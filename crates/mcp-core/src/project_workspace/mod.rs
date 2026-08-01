@@ -84,7 +84,8 @@ pub use services::{
 
 pub use logs::{
     clear_playwright_runs, get_output_channels, get_output_events, get_playwright_run_detail,
-    get_playwright_runs, get_project_problems, serve_playwright_artifact, stream_playwright_run,
+    get_playwright_runs, get_project_problems, retry_service_diagnosis, serve_playwright_artifact,
+    stream_playwright_run,
 };
 
 pub use wizard::{uninstall_project_service, wizard_detect_services, wizard_install_service};

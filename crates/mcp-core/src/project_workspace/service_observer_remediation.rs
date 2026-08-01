@@ -198,13 +198,28 @@ pub(crate) async fn maybe_trigger_debugger(
         state, project_id, unit,
     )
     .await;
+    // Il vincolo di governance sulle porte sta NEL prompt del task, non solo nei
+    // system prompt: questo messaggio e' l'unico contratto del run di diagnosi
+    // (canale sintetico, regola D "fuori chat"), e senza il vincolo esplicito
+    // l'agente che non riesce a far ripartire il servizio AGGIRA. Misurato il
+    // 31/07/2026 su bacheca-attivita: backend avviato come processo nudo sulla
+    // porta 3001, FUORI dal bucket del progetto, mentre la porta allocata 24826
+    // restava libera — esattamente il workaround che la governance esiste per
+    // impedire.
     let content = format!(
         "Crash rilevato automaticamente nel servizio `{unit}` (tipo: {kind}).\n\n\
          Fatti osservati al momento del guasto:\n```\n{}\n```\n\n\
          Log rilevante:\n```\n{last_log}\n```\n\n\
          Diagnostica la causa radice con metodo scientifico (ipotesi -> falsificazione \
          -> fix -> verifica): leggi i log completi e i file coinvolti prima di concludere, \
-         poi proponi la correzione.",
+         poi proponi la correzione.\n\n\
+         Vincolo di governance (porte e servizi): i servizi del progetto si avviano \
+         ESCLUSIVAMENTE con i tool servizio (`run_service` / riavvio del servizio), che \
+         li legano alla porta ALLOCATA nel registro. Mai avviare processi nudi su porte \
+         scelte a mano o fuori dal bucket del progetto: un servizio su una porta non \
+         allocata e' un guasto mascherato, non una riparazione. Se la porta allocata \
+         risulta occupata, identifica l'occupante e liberala con i tool di gestione \
+         processi/porte; non ripiegare su un'altra porta.",
         facts.render()
     );
     let meta = serde_json::json!({
