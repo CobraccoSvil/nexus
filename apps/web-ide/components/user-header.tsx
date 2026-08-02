@@ -6,6 +6,7 @@ import { useDismissOnOutside } from "../hooks/use-dismiss-on-outside";
 import { fetchMe, logout, User } from "../lib/auth";
 import { useThemeColors } from "../lib/theme";
 import { useI18n } from "../lib/i18n";
+import { stiliBarraUtente } from "./user-header-logic";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
@@ -24,6 +25,8 @@ export function UserHeader() {
   }, []);
 
   if (!user) return null;
+
+  const stili = stiliBarraUtente(tc);
 
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -44,19 +47,7 @@ export function UserHeader() {
           href="/admin"
           title="Apri area Admin"
           aria-label="Apri area Admin"
-          style={{
-            width: 26,
-            height: 26,
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: "center",
-            borderRadius: 5,
-            background: tc.accentBg,
-            color: tc.text,
-            fontSize: 13,
-            textDecoration: "none",
-            fontWeight: 600,
-          }}
+          style={stili.admin}
         >
           Admin
         </a>
@@ -66,21 +57,7 @@ export function UserHeader() {
           href="/"
           title="Apri IDE"
           aria-label="Apri IDE"
-          style={{
-            height: 26,
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: "center",
-            borderRadius: 5,
-            border: `1px solid ${tc.border}`,
-            background: "transparent",
-            color: tc.text,
-            fontSize: 11,
-            textDecoration: "none",
-            padding: "0 8px",
-            fontWeight: 700,
-            letterSpacing: "0.04em",
-          }}
+          style={stili.ide}
         >
           IDE
         </a>
@@ -89,21 +66,9 @@ export function UserHeader() {
         onClick={logout}
         title={t("auth.logout")}
         aria-label={t("auth.logout")}
-        style={{
-          width: 26,
-          height: 26,
-          display: "inline-flex",
-          alignItems: "center",
-          justifyContent: "center",
-          borderRadius: 5,
-          border: `1px solid ${tc.border}`,
-          background: "transparent",
-          color: tc.textMuted,
-          fontSize: 13,
-          cursor: "pointer",
-        }}
+        style={stili.uscita}
       >
-        Esci
+        {t("auth.logout")}
       </button>
     </div>
   );
