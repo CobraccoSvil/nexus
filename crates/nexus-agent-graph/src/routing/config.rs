@@ -95,20 +95,41 @@ pub struct GraphTopologyLimits {
     pub g1_max_nudges: i64,
     /// Max cicli final gate (`agent.final_gate.max_cycles`).
     pub final_gate_max_cycles: i64,
+    /// Quante volte il budget di iterazioni puo' essere RICONCESSO
+    /// (`agent.executor.max_escalations`): un'escalation azzera `iterations`
+    /// (executor, `reset_iterations=true`) e il run riparte con un budget
+    /// pieno. Il tetto dei superstep deve budgetarle tutte, o la promessa del
+    /// reset e' impagabile per costruzione.
+    pub max_escalations: i64,
 }
 
 /// Pavimento topologico: quanti superstep un run puo' consumare al massimo prima
 /// che `iteration_cap` o i nodi di chiusura lo fermino in modo ordinato.
 ///
 /// Formula (punto unico, regola L):
-/// - `iteration_cap × 3` — executor↔tool_dispatch + deviazioni occasionali
-///   (verifier, scale, G1 inline) per iterazione;
+/// - `iteration_cap × (max_escalations + 1) × 3` — executor↔tool_dispatch +
+///   deviazioni occasionali (verifier, scale, G1 inline) per iterazione. Il
+///   moltiplicatore delle escalation e' il pezzo che mancava: un'escalation
+///   AZZERA `iterations` e riconcede il budget pieno, quindi le iterazioni
+///   concedibili in totale sono `cap × (escalations + 1)`, non `cap`. Senza
+///   quel fattore il tetto budgetava UNA sola concessione, e ogni run che
+///   resettava oltre meta' corsa moriva a meta' del budget promesso — misurato
+///   sui run 8ec6f5bf e 99fab373 (bacheca-attivita): reset a superstep ~214,
+///   morte per `recursion_limit` a 350 con un RIMANDO IN CORREZIONE pendente,
+///   cioe' il run ucciso mentre stava rilavorando, e chiuso come errore del
+///   motore. Al reset restavano ~65 iterazioni delle 100 appena riconcesse:
+///   la promessa era impagabile per costruzione, non per sfortuna;
 /// - `stall_max_moves × 2` — stall_recovery→executor (solo se enabled);
 /// - `g1_max_nudges × 2` — g1_continue→executor;
 /// - `final_gate_max_cycles × 4` — final_gate↔executor;
 /// - `CONTOUR_MARGIN` — router/clarify/understanding/planner/reflection/learner.
 ///
 /// Ritorna `max(db_floor, topology_floor)`.
+///
+/// NOTA DI SCOPO: questo tetto non e' un controllo di spesa (uccide senza
+/// chiusura). Il freno alla spesa e' l'hard-cap token/costo del run; se piu'
+/// budget consecutivi sono ritenuti troppo costosi, la leva e'
+/// `agent.executor.max_escalations`, non questo pavimento.
 pub fn effective_recursion_limit(limits: &GraphTopologyLimits) -> u32 {
     const SUPERSTEPS_PER_ITERATION: i64 = 3;
     const SUPERSTEPS_PER_STALL_RECOVERY: i64 = 2;
@@ -116,9 +137,14 @@ pub fn effective_recursion_limit(limits: &GraphTopologyLimits) -> u32 {
     const SUPERSTEPS_PER_FINAL_GATE_CYCLE: i64 = 4;
     const CONTOUR_MARGIN: i64 = 25;
 
-    let mut topology = limits
+    // Budget di iterazioni CONCEDIBILI nel run intero: quello iniziale piu'
+    // una riconcessione per ogni escalation ammessa.
+    let budget_concedibili = limits
         .iteration_cap
         .max(0)
+        .saturating_mul(limits.max_escalations.max(0).saturating_add(1));
+
+    let mut topology = budget_concedibili
         .saturating_mul(SUPERSTEPS_PER_ITERATION)
         .saturating_add(CONTOUR_MARGIN)
         .saturating_add(
@@ -217,7 +243,58 @@ mod tests {
             stall_max_moves: 6,
             g1_max_nudges: 3,
             final_gate_max_cycles: 2,
+            // Allineato a `ExecutorConfig::default().max_escalations`: e' lo
+            // stesso setting (`agent.executor.max_escalations`) e l'invariante
+            // e' coperta da `max_escalations_default_allineato_all_executor`.
+            max_escalations: 3,
         }
+    }
+
+    /// Stesso patto di `iteration_cap_default_allineato_all_executor`: il
+    /// numero di riconcessioni che il TETTO budgeta e quello che l'EXECUTOR
+    /// concede leggono lo stesso setting, e i safe-default non possono
+    /// divergere o a DB spento il tetto tornerebbe a budgetare meno budget di
+    /// quanti l'executor ne conceda — cioe' il difetto che questo campo chiude.
+    #[test]
+    fn max_escalations_default_allineato_all_executor() {
+        assert_eq!(
+            prod_defaults().max_escalations,
+            crate::nodes::ExecutorConfig::default().max_escalations
+        );
+    }
+
+    /// IL test del difetto (run 8ec6f5bf/99fab373): il tetto deve pagare TUTTI
+    /// i budget concedibili, non il primo. Coi valori vivi del DB al momento
+    /// della misura (cap=100, escalations=3, tutto il resto ai default) un run
+    /// che esaurisce il primo budget e viene riconcesso deve avere ancora
+    /// spazio per gli altri tre cicli pieni.
+    ///
+    /// MUTAZIONE: togliere il moltiplicatore (tornare a `iteration_cap` secco)
+    /// fa scendere il tetto a ~351 e la prima asserzione rosseggia con il
+    /// valore del difetto reale (morte a 350 col rimando pendente).
+    #[test]
+    fn il_tetto_budgeta_ogni_riconcessione_del_budget() {
+        let limits = GraphTopologyLimits {
+            db_floor: 200,
+            iteration_cap: 100,
+            stall_recovery_enabled: true,
+            stall_max_moves: 6,
+            g1_max_nudges: 3,
+            final_gate_max_cycles: 2,
+            max_escalations: 3,
+        };
+        let eff = effective_recursion_limit(&limits);
+        // 4 budget da 100 iterazioni × ~3 superstep l'una: il tetto deve
+        // coprirli tutti (il margine di contorno fa il resto).
+        assert!(
+            eff as i64 >= 100 * 4 * 3,
+            "il tetto ({eff}) non copre i 4 budget concedibili: un run \
+             riconcesso muore a meta' del budget promesso"
+        );
+        // E con zero escalation ammesse torna il tetto di una concessione sola.
+        let mut una_sola = limits;
+        una_sola.max_escalations = 0;
+        assert!(effective_recursion_limit(&una_sola) < eff);
     }
 
     /// Le due config che rispondono a "quante iterazioni puo' fare questo run"
@@ -241,14 +318,19 @@ mod tests {
             eff > 150,
             "con iteration_cap=60 e stall_recovery ON il cap deve superare il floor 150, got {eff}"
         );
-        assert_eq!(eff, 231);
+        // 60 × (3+1) budget × 3 superstep + 25 margine + 6 g1 + 8 gate + 12 stall.
+        assert_eq!(eff, 771);
     }
 
     #[test]
     fn db_floor_alto_vince_su_topology() {
+        // Il pavimento deve stare SOPRA la topologia corrente (771 coi default
+        // di produzione) perche' il test misuri davvero "il floor piu' alto
+        // vince": con un floor sotto la topologia vincerebbe questa, e il test
+        // asserirebbe un'altra cosa.
         let mut limits = prod_defaults();
-        limits.db_floor = 500;
-        assert_eq!(effective_recursion_limit(&limits), 500);
+        limits.db_floor = 5000;
+        assert_eq!(effective_recursion_limit(&limits), 5000);
     }
 
     #[test]
@@ -263,6 +345,6 @@ mod tests {
     fn stall_recovery_off_riduce_margine() {
         let mut limits = prod_defaults();
         limits.stall_recovery_enabled = false;
-        assert_eq!(effective_recursion_limit(&limits), 219);
+        assert_eq!(effective_recursion_limit(&limits), 759);
     }
 }

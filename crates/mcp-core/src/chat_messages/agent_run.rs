@@ -2142,7 +2142,12 @@ pub(crate) fn native_engine_failure_result(
         hollow_causes: Default::default(),
         // Fallimento del motore nativo: nessun reasoning utile (FIX D4).
         reasoning: None,
-        // Fallimento prima di produrre una conversazione: nessun messages_json.
+        // Nessun messages_json: questo costruttore non ha in mano la
+        // conversazione. NON significa che non esista — un grafo puo' morire
+        // TARDI (tetto superstep) con decine di iterazioni persistite: chi
+        // chiude quei casi corregge i campi sopra (vedi
+        // `native_recursion_limit_result`), e la cronologia resta leggibile
+        // dagli `agent_steps` gia' scritti per-superstep.
         messages_json: None,
     }
 }
@@ -3314,6 +3319,31 @@ async fn execute_native_run(
             (Some(mapped), true)
         }
         Err(e) => {
+            // Il TETTO del grafo non e' un guasto come gli altri: e' l'unica
+            // condizione di stop che non passava da una chiusura dichiarata,
+            // mentre le gemelle semantiche (iteration_cap, budget token,
+            // escalation esaurite) chiudono tutte con esito e lavoro conservati.
+            // Letto dal TIPO (downcast, regola M), mai dal testo del messaggio.
+            let tetto_del_grafo = e
+                .downcast_ref::<nexus_graph::GraphError>()
+                .and_then(|g| match g {
+                    nexus_graph::GraphError::RecursionLimit(limite) => Some(*limite),
+                    _ => None,
+                });
+            if let Some(limite) = tetto_del_grafo {
+                tracing::error!(
+                    run_id = %run_id,
+                    limite,
+                    "motore nativo: tetto superstep raggiunto — chiusura diagnosticata col lavoro fatto"
+                );
+                return (
+                    Some(
+                        native_recursion_limit_result(db, session_id, run_id, provider, model, limite)
+                            .await,
+                    ),
+                    true,
+                );
+            }
             tracing::error!(
                 run_id = %run_id,
                 "motore nativo: esecuzione fallita — run finalizzato come failed (nessun fallback al brain, regola H)"
@@ -3329,6 +3359,68 @@ async fn execute_native_run(
             )
         }
     }
+}
+
+/// Chiusura DIAGNOSTICATA per il tetto di superstep del grafo: il run ha
+/// lavorato fino all'ultimo superstep e i suoi passi sono gia' persistiti
+/// (PgAgentStepStore scrive per-superstep), quindi chiudere con
+/// `iteration_count = 0` e "fallimento prima di produrre una conversazione"
+/// era falso — misurato sui run 8ec6f5bf/99fab373, morti a superstep 350 con
+/// decine di iterazioni fatte e un rimando in correzione pendente, e
+/// presentati all'utente come un motore che non era mai partito.
+///
+/// Le iterazioni si risolvono dai fatti persistiti con la STESSA inversa del
+/// punto unico (`MAX(step_index) / STEP_INDEX_STRIDE`, come `mark_run` per i
+/// sub-run morti senza outcome). `stop_reason = "recursion_limit"`
+/// (identificatore canonico, regola N) distingue questa chiusura dall'"error"
+/// generico: chi legge i dati puo' chiedersi se il tetto e' dimensionato bene,
+/// domanda che con una parola sola per tutti i guasti resta al buio.
+async fn native_recursion_limit_result(
+    db: &PgPool,
+    session_id: Uuid,
+    run_id: Uuid,
+    provider: &str,
+    model: &str,
+    limite: u32,
+) -> crate::agent_types::AgentRunResult {
+    let iterazioni_fatte: i64 = match crate::project_db_routes::project_data_pool_by_session_from(
+        db, session_id,
+    )
+    .await
+    {
+        Ok(steps_pool) => {
+            let sql = format!(
+                "SELECT COALESCE(MAX(step_index) / {stride}, 0)::int8 \
+                   FROM agent_steps WHERE run_id = $1",
+                stride = nexus_agent_graph::runtime::ports::STEP_INDEX_STRIDE,
+            );
+            sqlx::query_scalar(&sql)
+                .bind(run_id)
+                .fetch_one(&steps_pool)
+                .await
+                .unwrap_or(0)
+        }
+        // DB progetto irraggiungibile: 0 qui e' "non ho potuto guardare", e il
+        // WARN lo dichiara invece di lasciarlo indistinguibile da "zero lavoro".
+        Err(e) => {
+            tracing::warn!(
+                run_id = %run_id,
+                error = %e,
+                "tetto superstep: DB progetto non disponibile, iterazioni non recuperabili"
+            );
+            0
+        }
+    };
+    let msg = format!(
+        "Il run ha esaurito il tetto di superstep del grafo ({limite}) dopo \
+         {iterazioni_fatte} iterazioni. Il lavoro svolto fino a qui (file \
+         scritti, passi eseguiti) e' conservato; il run e' stato chiuso senza \
+         completare la verifica finale."
+    );
+    let mut r = native_engine_failure_result(run_id, provider, model, msg);
+    r.iteration_count = iterazioni_fatte.clamp(0, u32::MAX as i64) as u32;
+    r.stop_reason = Some("recursion_limit".to_string());
+    r
 }
 
 /// L'esito del run viene dal motore nativo: e' l'unico motore.

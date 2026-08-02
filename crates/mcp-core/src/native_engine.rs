@@ -1378,6 +1378,16 @@ async fn load_routing_config(db: &PgPool) -> RoutingConfig {
     let g1_max_nudges = setting_i64(db, "agent.g1_max_nudges", d.g1_max_nudges).await;
     let final_gate_max_cycles =
         setting_i64(db, "agent.final_gate.max_cycles", d.final_gate_max_cycles).await;
+    // Stesso setting e stesso default che l'ExecutorConfig usa per CONCEDERE le
+    // escalation: il tetto deve budgetare ogni riconcessione del budget di
+    // iterazioni, o un run riconcesso muore a meta' della promessa (misurato:
+    // run 8ec6f5bf/99fab373, morte per recursion_limit col rimando pendente).
+    let max_escalations = setting_i64(
+        db,
+        "agent.executor.max_escalations",
+        ExecutorConfig::default().max_escalations,
+    )
+    .await;
     let recursion_limit = nexus_agent_graph::routing::effective_recursion_limit(
         &nexus_agent_graph::routing::GraphTopologyLimits {
             db_floor,
@@ -1386,6 +1396,7 @@ async fn load_routing_config(db: &PgPool) -> RoutingConfig {
             stall_max_moves,
             g1_max_nudges,
             final_gate_max_cycles,
+            max_escalations,
         },
     );
     if recursion_limit > db_floor {
@@ -1397,6 +1408,7 @@ async fn load_routing_config(db: &PgPool) -> RoutingConfig {
             stall_max_moves,
             g1_max_nudges,
             final_gate_max_cycles,
+            max_escalations,
             "recursion_limit scalato sulla topologia del grafo agentico"
         );
     }
