@@ -996,9 +996,12 @@ test("ToolEvent espone input e result dallo step", () => {
   assert.equal(tool.result, "file scritto (12 righe)");
 });
 
-test("unwrap: step storico con toolName vuoto e { tool_name, tool_input } annidato", () => {
+test("unwrap: step con toolName vuoto e { tool_name, tool_input } annidato", () => {
   beforeEach();
-  // Forma DB (getAgentRun): toolName VUOTO, nome e parametri annidati.
+  // Forma prodotta dal difetto di persistenza corretto il 02/08/2026 (colonna
+  // tool_name vuota, involucro dentro tool_input) e riparata nei dati dalla
+  // migrazione project 0015. Il caso resta coperto finche' esistono DB progetto
+  // non migrati.
   const steps: AgentStep[] = [
     step("", "completed", 0, {
       toolInput: { tool_name: "read_file", tool_input: { path: "src/x.ts" } },

@@ -986,6 +986,77 @@ pub trait RunControlStore: Send + Sync {
 /// outcome (timeout, errore del grafo) recupera il contatore dai fatti.
 pub const STEP_INDEX_STRIDE: i64 = 1000;
 
+/// Esito di UN passo persistito. Vocabolario canonico (regola N) e CHIUSO: e' il
+/// segnale strutturato da cui i consumatori a valle decidono (regola M), mai il
+/// testo del risultato.
+///
+/// Due sole varianti, e non e' una semplificazione: la fonte e' `is_error` del
+/// `ToolResultBlock`, un bool STRUTTURATO sempre presente su ogni risultato. Qui
+/// non esiste un ignoto da rappresentare, quindi non esiste una variante per
+/// dichiararlo. Gli altri valori che la colonna `agent_steps.status` ammette
+/// (`running`, `skipped`, `awaiting_confirmation`) descrivono stati transitori
+/// del RUN che questo produttore non emette mai: un passo arriva alla
+/// persistenza solo quando il suo tool ha gia' risposto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepStatus {
+    /// Il tool ha risposto senza errore.
+    Completed,
+    /// Il tool ha fallito (errore applicativo o blocco synthetic di un gate).
+    Failed,
+}
+
+impl StepStatus {
+    /// Dal segnale strutturato del tool_result (regola M): il flag `is_error`,
+    /// mai il contenuto del testo prodotto.
+    pub fn from_is_error(is_error: bool) -> Self {
+        if is_error {
+            Self::Failed
+        } else {
+            Self::Completed
+        }
+    }
+
+    /// Identificatore canonico scritto nella colonna `agent_steps.status`
+    /// (regola N: un solo identificatore in inglese per stato).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// UN passo dell'agente pronto per la persistenza su `agent_steps`.
+///
+/// Regola Q: cio' che i consumatori dovranno leggere viaggia in CAMPI TIPIZZATI.
+/// Fino al 02/08/2026 il contratto erano due `Value` opachi (`block`, `result`)
+/// che il produttore serializzava con certe chiavi e il consumatore ri-parsava
+/// con ALTRE: il produttore scriveva `{"tool_name","tool_input"}`, l'impl leggeva
+/// `block.get("name")`/`block.get("input")`, e lo `status` che il produttore
+/// aveva appena derivato da `is_error` veniva scartato per un letterale
+/// `"completed"`. Nessuno dei due lati era sbagliato da solo: era la giunzione a
+/// non esistere come contratto. Misurato sul DB di bacheca-attivita: 8860 step su
+/// 8860 con `tool_name` vuoto e `status='completed'`, di cui 536 fallimenti reali
+/// letti come successo da quattro consumatori.
+///
+/// Con i campi il disallineamento non e' piu' rappresentabile: non ci sono chiavi
+/// da indovinare, e un rinominamento lo ferma il compilatore invece del DB.
+#[derive(Debug, Clone)]
+pub struct PersistedStep {
+    /// Nome del tool invocato (colonna `tool_name`). Stringa vuota per i blocchi
+    /// che non sono una tool_use.
+    pub tool_name: String,
+    /// Input del tool, in forma PIATTA (colonna `tool_input`): l'oggetto che il
+    /// modello ha passato al tool, non un involucro che lo contenga. E' la forma
+    /// che i consumatori interrogano (`tool_input->>'path'`, `.get("command")`).
+    pub tool_input: Value,
+    /// Risultato reso come stringa (colonna `tool_result`), per l'umano e per gli
+    /// excerpt di errore. NON e' il canale dell'esito: quello e' `status`.
+    pub tool_result: Option<String>,
+    /// Esito strutturato del passo (colonna `status`).
+    pub status: StepStatus,
+}
+
 /// Persistenza dei singoli step dell'agente su `agent_steps`
 /// (modello: [`VerifierRunStore`]). Ogni blocco prodotto in un'iterazione
 /// (tool_use, tool_result, testo) e' uno step indicizzato. Confine d'inversione:
@@ -998,9 +1069,9 @@ pub const STEP_INDEX_STRIDE: i64 = 1000;
 /// tracciati, evita FK orfane).
 #[async_trait]
 pub trait AgentStepStore: Send + Sync {
-    /// Persiste UN blocco di una iterazione. `block` = il blocco emesso
-    /// (tool_use/testo, JSON opaco), `result` = l'eventuale tool_result associato
-    /// (`None` per i blocchi di testo o quando non ancora disponibile).
+    /// Persiste UN passo di una iterazione. L'impl scrive i campi di
+    /// [`PersistedStep`] cosi' come sono: nessuno di essi va derivato di nuovo,
+    /// tantomeno sostituito da un letterale.
     ///
     /// Best-effort come [`VerifierRunStore::record`]: errore DB loggato,
     /// `Ok(())` ritornato (il `PortError` resta per un contratto rotto).
@@ -1009,8 +1080,7 @@ pub trait AgentStepStore: Send + Sync {
         run_id: &str,
         iteration: i64,
         idx: i64,
-        block: Value,
-        result: Option<Value>,
+        step: PersistedStep,
     ) -> Result<(), PortError>;
 }
 

@@ -168,7 +168,7 @@ pub mod test_doubles {
         AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, CriterionResult,
         CriterionSpec, EmbeddingStore, EscalationInputs, EscalationPort, EventSink,
         LlmGateway, LlmRequest, LlmResponse, LlmUsage, MetaStepStore, ModelUpscalePort,
-        NextActionChoice, NextActionsDeriver, OffloadKind, PlanRow, PortError,
+        NextActionChoice, NextActionsDeriver, OffloadKind, PersistedStep, PlanRow, PortError,
         ProviderFailureCause, ProviderUnavailableInfo, RunControlStore,
         SseEvent, SummaryStore, TodoStore, ToolCall, ToolExecutor, ToolOutcome, UpscalePick,
         VerifierRunRecord, VerifierRunStore,
@@ -508,12 +508,13 @@ pub mod test_doubles {
         }
     }
 
-    /// Store step di test: registra i blocchi persistiti.
+    /// Store step di test: registra i passi persistiti.
     #[derive(Default)]
     pub struct StubAgentStepStore {
         /// Step persistiti in ordine: (run_id, step_index = iteration*1000+idx,
-        /// block, result).
-        pub steps: Mutex<Vec<(String, i64, serde_json::Value, Option<serde_json::Value>)>>,
+        /// passo). Il passo si registra INTERO: i suoi campi sono il contratto
+        /// che i test verificano (regola Q).
+        pub steps: Mutex<Vec<(String, i64, PersistedStep)>>,
     }
 
     #[async_trait]
@@ -523,15 +524,13 @@ pub mod test_doubles {
             run_id: &str,
             iteration: i64,
             idx: i64,
-            block: serde_json::Value,
-            result: Option<serde_json::Value>,
+            step: PersistedStep,
         ) -> Result<(), PortError> {
             // step_index deterministico (stessa costante dell'impl concreta).
             self.steps.lock().expect("lock steps").push((
                 run_id.to_string(),
                 iteration * crate::runtime::ports::STEP_INDEX_STRIDE + idx,
-                block,
-                result,
+                step,
             ));
             Ok(())
         }

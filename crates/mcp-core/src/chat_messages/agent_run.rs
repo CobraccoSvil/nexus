@@ -6547,16 +6547,23 @@ pub(crate) fn step_emits_review_panel(tool_name: &str, tool_result: Option<&str>
 }
 
 /// Segnali strutturati dagli step del run (regola M, MAI dalla prosa): file di
-/// CODICE modificati + se un panel di review e' GIA' stato prodotto. Il tool reale
-/// e' annidato in `agent_steps.tool_input` (`{tool_name, tool_input:{path}}`); la
-/// presenza di un panel la decide [`step_emits_review_panel`] dal nome del tool
-/// e dalla chiave strutturata del suo risultato.
+/// CODICE modificati + se un panel di review e' GIA' stato prodotto. La presenza
+/// di un panel la decide [`step_emits_review_panel`] dal nome del tool e dalla
+/// chiave strutturata del suo risultato.
+///
+/// Le colonne si leggono per quello che sono. Fino al 02/08/2026 questa query
+/// pescava da `tool_input->>'tool_name'` e `tool_input->'tool_input'->>'path'`:
+/// non era una scelta, era l'unico modo di far funzionare la lettura mentre
+/// `PgAgentStepStore` scriveva l'intero involucro dentro `tool_input` e lasciava
+/// vuota la colonna `tool_name`. Un consumatore che si adatta alla forma
+/// sbagliata la rende permanente e nasconde il difetto agli altri quattro, che
+/// invece leggevano le colonne e trovavano il vuoto.
 pub(crate) async fn review_gate_signals(pool: &PgPool, run_id: Uuid) -> (Vec<String>, bool) {
     use sqlx::Row;
     const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "create_file", "patch_file"];
     let rows = sqlx::query(
-        "SELECT tool_input->>'tool_name' AS tname, \
-                tool_input->'tool_input'->>'path' AS fpath, \
+        "SELECT tool_name AS tname, \
+                tool_input->>'path' AS fpath, \
                 tool_result \
          FROM agent_steps WHERE run_id = $1 ORDER BY step_index",
     )
@@ -8699,25 +8706,32 @@ mod tests_native_mapping {
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn native_mapping_completed_legge_step_e_usage(pool: sqlx::PgPool) {
         let run = setup_mapping_run(&pool).await;
-        // Step gia' persistiti dal grafo (step_index = iteration*1000+idx).
-        for (si, name, st) in [
-            (1000, "read_file", "completed"),
-            (2000, "write_file", "failed"),
+        // Step persistiti dal PRODUTTORE REALE (regola O): l'INSERT fabbricato che
+        // stava qui sceglieva da se' i valori delle colonne, quindi non poteva
+        // accorgersi che in produzione `tool_name` arrivava vuoto e `status`
+        // sempre `completed` — che e' il difetto corretto il 02/08/2026.
+        // Le iterazioni 1 e 2 danno step_index 1000 e 2000 (iteration*1000+idx).
+        use nexus_agent_graph::runtime::ports::{AgentStepStore as _, PersistedStep, StepStatus};
+        let store =
+            crate::agent_graph_adapter::agent_step_store::PgAgentStepStore::new(pool.clone());
+        for (iteration, name, status) in [
+            (1i64, "read_file", StepStatus::Completed),
+            (2, "write_file", StepStatus::Failed),
         ] {
-            // `tool_input` e' NOT NULL SENZA default nello schema reale: la vecchia
-            // fixture gli aveva inventato un `DEFAULT '{}'` che permetteva di
-            // ometterlo, cosa che in produzione il DB rifiuta.
-            sqlx::query(
-                "INSERT INTO agent_steps (run_id, step_index, tool_name, tool_input, status) \
-                 VALUES ($1,$2,$3,'{}'::jsonb,$4)",
-            )
-            .bind(run)
-            .bind(si)
-            .bind(name)
-            .bind(st)
-            .execute(&pool)
-            .await
-            .expect("insert step");
+            store
+                .persist_step(
+                    &run.to_string(),
+                    iteration,
+                    0,
+                    PersistedStep {
+                        tool_name: name.to_string(),
+                        tool_input: json!({}),
+                        tool_result: None,
+                        status,
+                    },
+                )
+                .await
+                .expect("step persistito");
         }
 
         let r = native_outcome_to_run_result(&pool, run, outcome_base()).await;
@@ -8742,6 +8756,54 @@ mod tests_native_mapping {
             r.messages_json.as_deref(),
             Some(r#"[{"role":"user","content":"ciao"}]"#)
         );
+    }
+
+    /// `review_gate_signals` decide se il run ha toccato CODICE, e quindi se la
+    /// review adversariale va convocata: legge le colonne, e le colonne le
+    /// popola il produttore reale. La catena si verifica per intero (regola O).
+    ///
+    /// Questa funzione non aveva alcun test, ed e' il motivo per cui il difetto
+    /// e' rimasto invisibile a lungo: era l'unico consumatore che FUNZIONAVA,
+    /// perche' si era adattato alla forma sbagliata (`tool_input->>'tool_name'`,
+    /// `tool_input->'tool_input'->>'path'`). Un consumatore che si adegua a un
+    /// produttore rotto lo certifica, e gli altri quattro continuano a leggere
+    /// il vuoto senza che nessuno colleghi le due cose.
+    ///
+    /// PROVA DI MUTAZIONE: rimettendo la vecchia query annidata, `modified`
+    /// torna vuoto — cioe' nessun file di codice risulta toccato e la review non
+    /// verrebbe mai convocata su un run che ha scritto.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn review_gate_signals_vede_i_file_scritti_dal_produttore_reale(pool: sqlx::PgPool) {
+        use nexus_agent_graph::runtime::ports::{AgentStepStore as _, PersistedStep, StepStatus};
+        let run = crate::test_support::seed_agent_run(&pool).await;
+        let store =
+            crate::agent_graph_adapter::agent_step_store::PgAgentStepStore::new(pool.clone());
+        for (idx, tool_name, path) in [
+            (0i64, "read_file", "src/lib.rs"),
+            (1, "write_file", "src/main.rs"),
+        ] {
+            store
+                .persist_step(
+                    &run.to_string(),
+                    0,
+                    idx,
+                    PersistedStep {
+                        tool_name: tool_name.to_string(),
+                        tool_input: json!({ "path": path }),
+                        tool_result: None,
+                        status: StepStatus::Completed,
+                    },
+                )
+                .await
+                .expect("step persistito");
+        }
+        let (modified, reviewed) = review_gate_signals(&pool, run).await;
+        assert_eq!(
+            modified,
+            vec!["src/main.rs".to_string()],
+            "solo i file SCRITTI: un read_file non e' una modifica"
+        );
+        assert!(!reviewed, "nessun panel di review emesso in questo run");
     }
 
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
