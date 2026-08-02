@@ -250,10 +250,19 @@ pub fn get_agent_system_prompt(agent_type: &AgentType) -> String {
     // Rimpiazza placeholder che richiedono contesto runtime che non abbiamo qui.
     // L'agente specializzato (Coder, Tester, ecc.) farà la sostituzione precisa
     // nel suo proprio system_prompt(); qui usiamo default sensati.
+    //
+    // `{{repo_summary}}` mancava dalla lista: sei template lo portano
+    // (agent.coder.base, agent.tester.base, agent.reviewer.general, ...) e da
+    // questo percorso il token arrivava CRUDO al modello — un placeholder non
+    // sostituito e' rumore che il modello prova a interpretare, e su un system
+    // prompt e' rumore con autorita'. Il valore neutro e' il vuoto, come per
+    // gli altri: la sintesi vera la mette chi ce l'ha (deep_analyze,
+    // admin-service preview).
     prompt
         .replace("{{lang_hint}}", "")
         .replace("{{type_hint}}", "task")
         .replace("{{project}}", "")
+        .replace("{{repo_summary}}", "")
 }
 
 /// Snapshot dei 4 contatori A/B per esposizione in Prometheus.
