@@ -60,7 +60,7 @@ async fn tentativi_finali(pool: &PgPool, run_id: Uuid) -> Vec<TentativoOsservato
     // punto unico `STEP_INDEX_STRIDE`); l'inversione la rimette in cronologia,
     // che e' come il criterio la pretende.
     let rows = match sqlx::query(
-        "SELECT tool_name, tool_input, tool_result \
+        "SELECT tool_name, tool_input, tool_result, status \
            FROM agent_steps \
           WHERE run_id = $1 \
           ORDER BY step_index DESC \
@@ -95,11 +95,20 @@ async fn tentativi_finali(pool: &PgPool, run_id: Uuid) -> Vec<TentativoOsservato
             // l'esito: entra come NON fallito, perche' «non lo so» non e' «e'
             // andata male».
             let risultato: Option<String> = r.try_get("tool_result").unwrap_or(None);
+            // L'ESITO viene dalla colonna strutturata: dal 02/08/2026 il
+            // produttore la scrive dal flag `is_error` (PersistedStep, regola
+            // Q), e leggerla e' la regola M applicata — prima si ricostruiva
+            // dal testo col ponte legacy, cioe' dal racconto invece che dal
+            // campo. Il ponte resta SOLO per l'`exit_code`, che una colonna
+            // non ce l'ha ancora, e per le righe storiche in cui lo status
+            // era il letterale "completed" su ogni riga: un fallito
+            // dichiarato da UNA delle due fonti resta fallito.
+            let status_colonna: String = r.try_get("status").unwrap_or_default();
             let risposta = RispostaTool::da_testo_legacy(risultato.unwrap_or_default());
             Some(TentativoOsservato {
                 firma: firma(&strumento, &input),
                 strumento,
-                fallito: risposta.esito.e_fallito(),
+                fallito: status_colonna == "failed" || risposta.esito.e_fallito(),
                 exit_code: risposta.exit_code,
                 messaggio: risposta.testo,
             })
@@ -176,6 +185,43 @@ mod tests {
             )
             .await
             .expect("step persistito");
+    }
+
+    /// L'esito viene dalla COLONNA, non dal racconto: un tool migrato a
+    /// `RispostaTool` (regola Q) scrive un testo senza marker, e il suo
+    /// fallimento vive solo in `agent_steps.status`. Prima di leggere la
+    /// colonna, questa diagnosi lo contava come riuscito — cioe' il primo tool
+    /// migrato spariva dalla causa del timeout proprio mentre falliva.
+    ///
+    /// MUTAZIONE: togliere `status_colonna == "failed"` dall'OR in
+    /// `tentativi_finali` fa tornare `NoFailureAtEnd` su un run il cui ultimo
+    /// passo e' un fallimento dichiarato in colonna — il valore del difetto.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn il_fallimento_dichiarato_in_colonna_conta_anche_senza_marker(pool: PgPool) {
+        let run_id = crate::test_support::seed_agent_run(&pool).await;
+        let store = PgAgentStepStore::new(pool.clone());
+        // Testo PULITO (nessun marker legacy), fallimento SOLO in colonna: e'
+        // la forma che ogni tool migrato produce da oggi in avanti.
+        store
+            .persist_step(
+                &run_id.to_string(),
+                7,
+                0,
+                PersistedStep {
+                    tool_name: "run_command".to_string(),
+                    tool_input: json!({"command": "npm test"}),
+                    tool_result: Some("3 test falliti su 41".to_string()),
+                    status: StepStatus::Failed,
+                },
+            )
+            .await
+            .expect("step persistito");
+        let causa = causa_del_timeout(&pool, run_id).await;
+        assert_eq!(
+            causa.key(),
+            "last_attempt_failed",
+            "un fallimento dichiarato in colonna deve contare senza marker nel testo"
+        );
     }
 
     /// LA prova, sulla catena misurata il 02/08/2026 (sub-run a5f7419c): dopo

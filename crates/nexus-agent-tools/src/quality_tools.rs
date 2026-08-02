@@ -164,13 +164,13 @@ pub async fn tool_batch_analyze_code(ctx: &ToolContextCore, input: &Value) -> St
         .unwrap_or("analyze");
     let files_arr = match input.get("files").and_then(Value::as_array) {
         Some(a) => a.clone(),
-        None => return "[batch_analyze_code] Campo 'files' mancante o non è un array".to_string(),
+        None => return nexus_types::tool_outcome::tool_failure("[batch_analyze_code] Campo 'files' mancante o non è un array"),
     };
     if files_arr.is_empty() {
-        return "[batch_analyze_code] Nessun file specificato".to_string();
+        return nexus_types::tool_outcome::tool_failure("[batch_analyze_code] Nessun file specificato");
     }
     if files_arr.len() > 20 {
-        return "[batch_analyze_code] Massimo 20 file per batch".to_string();
+        return nexus_types::tool_outcome::tool_failure("[batch_analyze_code] Massimo 20 file per batch");
     }
 
     let system_prompt = batch_role_prompt(&ctx.db, task).await;
@@ -223,7 +223,7 @@ pub async fn tool_batch_analyze_code(ctx: &ToolContextCore, input: &Value) -> St
     }
 
     if requests.is_empty() {
-        return "[batch_analyze_code] Nessun file valido trovato".to_string();
+        return nexus_types::tool_outcome::tool_failure("[batch_analyze_code] Nessun file valido trovato");
     }
 
     // Provider/modello dal purpose (regola G: niente modello hardcoded). Il batch
@@ -233,10 +233,10 @@ pub async fn tool_batch_analyze_code(ctx: &ToolContextCore, input: &Value) -> St
     let (provider, model) = match resolve_purpose_via_http(&ctx.db, BATCH_PURPOSE).await {
         Ok(pm) => pm,
         Err(e) => {
-            return format!(
+            return nexus_types::tool_outcome::tool_failure(format!(
                 "[batch_analyze_code] modello batch non risolvibile (purpose '{BATCH_PURPOSE}'): {e}. \
                  Verifica nexus_purpose_model.{BATCH_PURPOSE} (mig 0102/0136)."
-            );
+            ));
         }
     };
 
@@ -244,7 +244,11 @@ pub async fn tool_batch_analyze_code(ctx: &ToolContextCore, input: &Value) -> St
     let batch_id =
         match gateway_batch_submit(&ctx.db, &provider, &model, &requests, BATCH_MAX_TOKENS).await {
             Ok(id) => id,
-            Err(e) => return format!("[batch_analyze_code] Errore sottomissione batch: {e}"),
+            Err(e) => {
+                return nexus_types::tool_outcome::tool_failure(format!(
+                    "[batch_analyze_code] Errore sottomissione batch: {e}"
+                ))
+            }
         };
 
     // Poll con backoff esponenziale (max 10 minuti) su GET /v1/batch/{provider}/{id}.
@@ -256,15 +260,19 @@ pub async fn tool_batch_analyze_code(ctx: &ToolContextCore, input: &Value) -> St
 
         let snapshot = match gateway_batch_status(&ctx.db, &provider, &batch_id).await {
             Ok(s) => s,
-            Err(e) => return format!("[batch_analyze_code] Errore polling status: {e}"),
+            Err(e) => {
+                return nexus_types::tool_outcome::tool_failure(format!(
+                    "[batch_analyze_code] Errore polling status: {e}"
+                ))
+            }
         };
         if snapshot.is_ended() {
             break snapshot.results;
         }
         if tokio::time::Instant::now() >= deadline {
-            return format!(
+            return nexus_types::tool_outcome::tool_failure(format!(
                 "[batch_analyze_code] Timeout: il batch {batch_id} non ha terminato in 10 minuti"
-            );
+            ));
         }
     };
 
@@ -283,12 +291,79 @@ pub async fn tool_batch_analyze_code(ctx: &ToolContextCore, input: &Value) -> St
     }
 
     if output_parts.is_empty() {
-        format!("[batch_analyze_code] Nessun risultato per il batch {batch_id}")
+        nexus_types::tool_outcome::tool_failure(format!(
+            "[batch_analyze_code] Nessun risultato per il batch {batch_id}"
+        ))
     } else {
         format!(
             "## Analisi batch ({task}) — {} file\n\n{}",
             output_parts.len(),
             output_parts.join("\n\n---\n\n")
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexus_types::tool_outcome::is_tool_failure;
+    use serde_json::json;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    /// Contesto reale (la struct di produzione), pool lazy mai contattato: i
+    /// rami qui esercitati rifiutano l'input PRIMA di toccare il DB. Stessa
+    /// forma di `attachments::tests::ctx_di_prova` (il crate non ha un helper
+    /// condiviso per i test; quando nascera', questi due convergono li').
+    fn ctx_di_prova() -> ToolContextCore {
+        use crate::context_core::{NoopEmbedder, NoopMutationHooks};
+        let db =
+            sqlx::PgPool::connect_lazy("postgres://test:test@127.0.0.1:1/test").expect("pool lazy");
+        ToolContextCore {
+            root_path: std::env::temp_dir(),
+            user_id: Uuid::nil(),
+            is_git_repo: false,
+            can_write: true,
+            project_id: Uuid::nil(),
+            session_id: None,
+            db: Arc::new(db.clone()),
+            run_db: Arc::new(db),
+            parent_run_id: None,
+            run_id: None,
+            long_running_patterns: Vec::new(),
+            user_role: "admin".to_string(),
+            is_nexus_operator: true,
+            project_channels: Arc::new(dashmap::DashMap::new()),
+            monitor_registry: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            hooks: Arc::new(NoopMutationHooks),
+            embedder: Arc::new(NoopEmbedder),
+            isolated_subrun: false,
+            write_scope: Vec::new(),
+        }
+    }
+
+    /// Un input rifiutato e' un FALLIMENTO, e deve dichiararlo nel canale che
+    /// il dispatch legge (il marker del ponte legacy, finche' la firma non
+    /// migra a RispostaTool). Fino al 02/08/2026 questi rami tornavano prosa
+    /// nuda: il modello riceveva "Campo 'files' mancante" come un successo, e
+    /// l'anti-loop contava la ripetizione come produttiva.
+    ///
+    /// MUTAZIONE: rimettere `String::from(...)` nudo su uno dei rami fa
+    /// rosseggiare l'asserzione corrispondente — il valore del difetto reale.
+    #[tokio::test]
+    async fn l_input_rifiutato_dichiara_il_fallimento() {
+        let ctx = ctx_di_prova();
+        let casi = [
+            json!({}),                                        // files mancante
+            json!({"files": []}),                             // vuoto
+            json!({"files": (0..21).map(|i| json!({"path": format!("f{i}.rs")})).collect::<Vec<_>>()}), // oltre il cap
+        ];
+        for input in casi {
+            let out = tool_batch_analyze_code(&ctx, &input).await;
+            assert!(
+                is_tool_failure(&out),
+                "il rifiuto deve dichiararsi fallimento nel canale del dispatch: {out}"
+            );
+        }
     }
 }

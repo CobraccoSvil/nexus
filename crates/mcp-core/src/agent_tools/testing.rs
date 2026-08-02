@@ -1708,7 +1708,15 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
         crate::suite_verification::SuiteInvocation::suite(command_str, dir_relativa, timeout);
     let verifica = match deps.verifica(&inv).await {
         Ok(v) => v,
-        Err(e) => return format!("[run_playwright_tests] {e}"),
+        // Fallimento dell'INFRASTRUTTURA di verifica (memoria suite, chiave di
+        // stato), non della suite: e' comunque un tool fallito, e lo dichiara
+        // dal ponte come i dodici altri rami di questo file — nudo, il modello
+        // lo leggeva come un successo senza esito.
+        Err(e) => {
+            return nexus_types::tool_outcome::tool_failure(format!(
+                "[run_playwright_tests] {e}"
+            ))
+        }
     };
 
     // ── 5. Output finale: note del pre-volo + esito dichiarato dal punto unico

@@ -187,22 +187,20 @@ pub async fn execute(
         "nexus_mcp_tool_call" => handle_mcp_tool_call(db, user_id, project_id, &arguments).await,
         "nexus_mcp_tool_reindex" => {
             if user_role != "admin" {
-                return "[Accesso negato] nexus_mcp_tool_reindex richiede ruolo admin.".to_string();
+                return tool_failure("[Accesso negato] nexus_mcp_tool_reindex richiede ruolo admin.");
             }
             handle_mcp_tool_reindex(db, &arguments).await
         }
         // ── admin_settings ────────────────────────────────────────────
         "nexus_admin_setting_get" => {
             if user_role != "admin" {
-                return "[Accesso negato] nexus_admin_setting_get richiede ruolo admin."
-                    .to_string();
+                return tool_failure("[Accesso negato] nexus_admin_setting_get richiede ruolo admin.");
             }
             handle_admin_setting_get(db, &arguments).await
         }
         "nexus_admin_setting_update" => {
             if user_role != "admin" {
-                return "[Accesso negato] nexus_admin_setting_update richiede ruolo admin."
-                    .to_string();
+                return tool_failure("[Accesso negato] nexus_admin_setting_update richiede ruolo admin.");
             }
             handle_admin_setting_update(db, &arguments).await
         }
@@ -1404,7 +1402,7 @@ pub async fn execute_with_neural(
         }
         "nexus_mcp_tool_reindex" => {
             if user_role != "admin" {
-                return "[Accesso negato] nexus_mcp_tool_reindex richiede ruolo admin.".to_string();
+                return tool_failure("[Accesso negato] nexus_mcp_tool_reindex richiede ruolo admin.");
             }
             handle_mcp_tool_reindex(db, &arguments).await
         }
