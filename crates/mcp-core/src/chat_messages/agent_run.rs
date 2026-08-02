@@ -6509,12 +6509,17 @@ const REVIEW_PANEL_TOOL: &str = "dispatch_subagents";
 /// stesso file, o `subagent_native.rs`) marcava il run come gia' revisionato, e
 /// il gate saltava la review con `ReviewSkipReason::AlreadyReviewed`.
 ///
-/// Forma del dato persistito: `{"content": "<json del tool>", "status": ...}`.
-/// L'involucro lo costruisce `persist_turn_steps` con serde DOPO il troncamento,
-/// quindi e' sempre JSON valido; il `content` invece puo' essere stato troncato
-/// testa+coda. Se il content non e' piu' JSON, il ripiego DICHIARATO e' la
-/// presenza della chiave `"panel_verdict"` nella coda preservata — dentro
-/// l'output di quel SOLO tool, mai in un testo qualunque.
+/// Forma CANONICA del dato persistito: `tool_result` E' il risultato del tool.
+/// Fino al 02/08/2026 era invece un involucro `{"content": "<json>", "status":
+/// ...}` in cui `persist_turn_steps` ficcava anche lo status, perche' la colonna
+/// `status` veniva sovrascritta da un letterale e quello era l'unico posto in cui
+/// l'esito sopravviveva. Ora l'esito sta in colonna (regola Q) e l'involucro non
+/// si scrive piu'; resta letto per i DB progetto non ancora migrati (project
+/// 0015), che lo contengono ancora.
+///
+/// Il risultato puo' essere stato troncato testa+coda e non essere piu' JSON: il
+/// ripiego DICHIARATO e' la presenza della chiave `"panel_verdict"` nella coda
+/// preservata — dentro l'output di quel SOLO tool, mai in un testo qualunque.
 pub(crate) fn step_emits_review_panel(tool_name: &str, tool_result: Option<&str>) -> bool {
     if tool_name != REVIEW_PANEL_TOOL {
         return false;
@@ -6522,18 +6527,22 @@ pub(crate) fn step_emits_review_panel(tool_name: &str, tool_result: Option<&str>
     let Some(raw) = tool_result else {
         return false;
     };
-    let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return false;
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        // Troncato a meta': la chiave nella coda preservata di QUEL tool.
+        return raw.contains("\"panel_verdict\"");
     };
-    let content = match wrapper.get("content") {
-        Some(serde_json::Value::String(s)) => s.as_str(),
-        // Forma gia' strutturata (nessun involucro-stringa): chiave letta diretta.
-        Some(v) => return v.get("panel_verdict").is_some(),
-        None => return false,
-    };
-    match serde_json::from_str::<serde_json::Value>(content) {
-        Ok(v) => v.get("panel_verdict").is_some(),
-        Err(_) => content.contains("\"panel_verdict\""),
+    // Forma canonica: il risultato del tool, letto diretto.
+    if v.get("panel_verdict").is_some() {
+        return true;
+    }
+    // Forma involucro (DB non ancora migrati).
+    match v.get("content") {
+        Some(serde_json::Value::String(s)) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(inner) => inner.get("panel_verdict").is_some(),
+            Err(_) => s.contains("\"panel_verdict\""),
+        },
+        Some(inner) => inner.get("panel_verdict").is_some(),
+        None => false,
     }
 }
 
@@ -7242,13 +7251,12 @@ mod tests_review_gate {
         }
     }
 
-    /// Il tool_result di `dispatch_subagents` COME LO PERSISTE la produzione:
-    /// il contenuto e' `out.to_string()` del tool, l'involucro e' quello che
-    /// `tool_dispatch::persist_turn_steps` costruisce con serde
-    /// (`{content, status}`). Il `panel_verdict` nasce dal PRODUTTORE vero
-    /// (`compose_panel_verdict` + `PanelOutcome::to_value`), non da un letterale
-    /// scritto a mano: se il campo cambiasse nome, il test lo seguirebbe.
-    fn step_di_panel() -> String {
+    /// Il risultato che `dispatch_subagents` produce davvero, ed e' cio' che la
+    /// persistenza scrive in `tool_result` (forma canonica). Il `panel_verdict`
+    /// nasce dal PRODUTTORE vero (`compose_panel_verdict` +
+    /// `PanelOutcome::to_value`), non da un letterale scritto a mano: se il campo
+    /// cambiasse nome, il test lo seguirebbe.
+    fn payload_di_panel() -> String {
         use nexus_agent_graph::decisions::{compose_panel_verdict, QuorumPolicy};
         let outcomes = vec![json!({
             "review": { "verdict": "pass", "findings": [] }
@@ -7257,10 +7265,17 @@ mod tests_review_gate {
             .expect("un outcome con `review` e' un panel");
         let mut out = json!({ "count": 1, "ok": 1, "failed": 0, "results": [] });
         out["panel_verdict"] = panel.to_value();
-        involucro_step(&out.to_string())
+        out.to_string()
     }
 
-    /// Involucro del tool_result come lo scrive `persist_turn_steps`.
+    /// Lo stesso payload nella forma STORICA (involucro), per i DB non migrati.
+    fn step_di_panel() -> String {
+        involucro_step(&payload_di_panel())
+    }
+
+    /// Forma STORICA del tool_result: l'involucro che `persist_turn_steps`
+    /// scriveva prima del 02/08/2026. Non si produce piu' (l'esito sta in
+    /// colonna), ma resta nei DB progetto non ancora migrati alla project 0015.
     fn involucro_step(content: &str) -> String {
         json!({ "content": content, "status": "completed" }).to_string()
     }
@@ -7275,6 +7290,23 @@ mod tests_review_gate {
         // Stesso payload, tool diverso: non e' quel tool ad averlo emesso.
         assert!(!super::step_emits_review_panel("read_file", Some(&step)));
         assert!(!super::step_emits_review_panel("dispatch_subagent", Some(&step)));
+    }
+
+    /// La forma CANONICA -- il risultato del tool senza involucro -- e' quella
+    /// che la persistenza scrive da oggi. I test coprivano solo l'involucro,
+    /// cioe' la forma di ieri: togliendolo alla fonte senza guardare qui, la
+    /// rilevazione del panel sarebbe tornata `false` su OGNI run nuovo, il gate
+    /// non avrebbe piu' riconosciuto una review gia' avvenuta e l'avrebbe
+    /// rifatta ogni volta. Un test fedele alla vecchia forma non e' neutro:
+    /// autorizza a cambiare il produttore restando verde (regola O).
+    #[test]
+    fn panel_riconosciuto_nella_forma_canonica_senza_involucro() {
+        let nudo = payload_di_panel();
+        assert!(
+            super::step_emits_review_panel("dispatch_subagents", Some(&nudo)),
+            "il risultato del tool si legge diretto, senza cercare un involucro"
+        );
+        assert!(!super::step_emits_review_panel("read_file", Some(&nudo)));
     }
 
     #[test]
