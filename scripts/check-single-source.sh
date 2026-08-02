@@ -1846,6 +1846,19 @@ assert_single "canale-esito-senza-campo" 'fn testo_con_esito_dichiarato\(' \
 assert_single "prefisso-esito-senza-campo" 'PREFISSO_FALLIMENTO: &str' \
   'crates/nexus-gateway/src/providers/tool_error_channel.rs' crates
 
+# -- passo-persistito (2026-08-02) -------------------------------------------
+#
+# Che cosa arriva in colonna su `agent_steps` lo dice UN tipo, e la sola impl
+# che scrive lo destruttura senza interpretare. Il difetto nasceva proprio
+# dall'assenza del tipo: contratto fatto di due JSON opachi, produttore e
+# consumatore con chiavi diverse per la stessa cosa, e lo status derivato dal
+# segnale strutturato scartato per un letterale. 8860 step su 8860 anonimi e
+# dichiarati riusciti, 536 fallimenti reali compresi. Una seconda derivazione
+# dei campi fuori dal produttore, o un secondo vocabolario dello status, ricrea
+# la giunzione che nessun tipo sorveglia.
+assert_single "passo-persistito" 'pub struct PersistedStep'   'crates/nexus-agent-graph/src/runtime/ports.rs' crates
+assert_single "vocabolario-esito-passo" 'pub enum StepStatus'   'crates/nexus-agent-graph/src/runtime/ports.rs' crates
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1
