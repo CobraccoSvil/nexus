@@ -1,6 +1,7 @@
 //! Tool servizio: avvio processi long-running, lettura output, stop, build immagine progetto.
 
 use super::*;
+use nexus_types::tool_outcome::RispostaTool;
 use std::collections::HashMap;
 
 /// Token che indicano "il comando avvia un server web". Tenuti a scope di
@@ -1865,61 +1866,32 @@ fn append_new_output(
     false
 }
 
-/// Lista i servizi/processi attivi per il progetto corrente.
-pub(super) async fn tool_list_active_services(ctx: &AgentToolContext, _input: &Value) -> String {
+/// Lista i servizi/processi registrati per il progetto corrente.
+///
+/// Migrato alla regola Q: l'esito sta nel campo di [`RispostaTool`] e il testo
+/// e' solo testo — niente marker da anteporre e niente da rileggere a valle. La
+/// resa la compone il punto unico [`super::service_listing`] DAI campi; qui si
+/// raccolgono i fatti e basta.
+pub(super) async fn tool_list_active_services(
+    ctx: &AgentToolContext,
+    _input: &Value,
+) -> RispostaTool {
     let rows = match crate::agent_processes::list_processes(&ctx.db, ctx.project_id).await {
         Ok(r) => r,
-        Err(e) => return format!("\u{274C} [Errore: {}]", e),
+        Err(e) => return RispostaTool::fallito(format!("elenco servizi non leggibile: {e}")),
     };
-
-    if rows.is_empty() {
-        return "Nessun servizio registrato per questo progetto.".to_string();
-    }
-
-    let mut output = String::new();
-    let mut running_count = 0;
-    let mut stopped_count = 0;
-
-    for proc in &rows {
-        let is_running = matches!(proc.status.as_str(), "running" | "starting");
-        if is_running {
-            running_count += 1;
-        } else {
-            stopped_count += 1;
-        }
-        output.push_str(&format_service_row(proc));
-    }
-
-    format!(
-        "Servizi progetto: {} attivi, {} fermi (ultimi 20)\n\n{}",
-        running_count, stopped_count, output
-    )
-}
-
-/// Formatta una riga della lista servizi (icona stato + metadati + comando).
-/// Estratto da `tool_list_active_services`; comportamento invariato.
-fn format_service_row(proc: &crate::agent_processes::ProcessSummary) -> String {
-    let status_icon = match proc.status.as_str() {
-        "running" | "starting" => "[ATTIVO]",
-        "stopped" | "exited" | "finished" => "[FERMO]",
-        _ => "[?]",
-    };
-    let mut row = format!(
-        "{} {} (id: {}, pid: {}, status: {}",
-        status_icon,
-        proc.label,
-        proc.id,
-        proc.pid
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "?".into()),
-        proc.status,
+    // Le porte del progetto dalla cache gia' in contesto: nessuna query nuova, e
+    // soprattutto nessuna seconda idea di "quali porte ha questo progetto"
+    // (regola L). Cache indisponibile -> l'elenco esce senza porte, che e' un
+    // dato in meno, non un dato inventato.
+    let porte = ctx.port_registry.ports_for_project(&ctx.project_id).await;
+    let elenco = super::service_listing::elenco_da_processi(
+        &rows,
+        &porte,
+        chrono::Utc::now(),
+        crate::agent_processes::LIMITE_ELENCO_PROCESSI,
     );
-    if let Some(code) = proc.exit_code {
-        row.push_str(&format!(", exit: {}", code));
-    }
-    row.push_str(&format!(", avviato: {})\n", proc.created_at));
-    row.push_str(&format!("  cmd: {}\n\n", proc.command));
-    row
+    RispostaTool::riuscito(elenco.testo())
 }
 
 #[cfg(test)]

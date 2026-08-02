@@ -55,6 +55,11 @@ async fn esegui_tool_migrato(
         // final_gate e la catena di verifica: viaggia nel campo `exit_code`,
         // non nel testo "EXIT CODE: N" (che resta per il modello).
         "run_command" => Some(command::tool_run_command(ctx, input).await),
+        // L'elenco servizi non ha un esito da annunciare nel testo: la resa la
+        // compone `service_listing` dai campi, e il fallimento (DB illeggibile)
+        // vive in `esito`. Un marker in testa alla prosa qui sarebbe tornato a
+        // essere un campo travestito.
+        "list_active_services" => Some(service::tool_list_active_services(ctx, input).await),
         _ => None,
     }
 }
@@ -102,7 +107,6 @@ async fn esegui_tool_legacy(
         "stop_service" => service::tool_stop_service(ctx, input).await,
         "service_restart" => service::tool_service_restart(ctx, input).await,
         "tail_service_logs" => service::tool_tail_service_logs(ctx, input).await,
-        "list_active_services" => service::tool_list_active_services(ctx, input).await,
         "fs_mkdir" => files::tool_fs_mkdir(ctx, input).await,
         "fs_copy" => files::tool_fs_copy(ctx, input).await,
         "fs_move" => files::tool_fs_move(ctx, input).await,

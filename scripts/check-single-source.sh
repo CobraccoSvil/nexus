@@ -1809,6 +1809,27 @@ if [[ -z "$(awk '
 else
   echo "OK causa-timeout: la chiusura in scadenza dichiara su cosa e' finito il budget"
 fi
+# La RESA dell'elenco servizi si compone in un punto solo (2026-08-02, regole L+Q)
+#
+# `list_active_services` componeva la riga a mano, un `push_str` per colonna, con
+# l'ordine dettato dalle colonne del SELECT invece che dall'importanza per chi
+# legge: uuid e PID prima dello stato, `created_at` stampato come RFC3339 con
+# microsecondi e fuso (32 caratteri per dire "stamattina"), e uno stato fuori
+# vocabolario ridotto a `[?]`, un marcatore che non diceva nemmeno se fosse
+# peggio di `[ATTIVO]`. Nel nastro attivita' (font monospaziato, a capo
+# automatico, taglio a 500 caratteri) tre servizi in quella forma riempivano il
+# riquadro, e QUALE/VIVO/PORTA - le tre cose che si volevano sapere - annegavano.
+#
+# Il testo lo leggono in DUE, il modello e l'utente, e sono lo STESSO testo: e'
+# il vincolo che rende la resa una decisione unica e non una preferenza di chi
+# stampa. Confinarla qui non e' cosmesi: e' cio' che impedisce a un secondo
+# formattatore di nascere accanto al primo con un'altra idea di cosa venga prima.
+#
+# Cosa NON misura questo guard: che i CAMPI siano quelli giusti (lo misurano i
+# test del modulo, che partono da `ProcessSummary` come lo produce
+# `list_processes_from`). Misura solo che la composizione resti una sola.
+assert_single "resa-elenco-servizi" 'fn elenco_da_processi\(|fn eta_leggibile\(' \
+  'crates/mcp-core/src/agent_tools/service_listing.rs' crates
 
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2

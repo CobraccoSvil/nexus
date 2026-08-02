@@ -38,6 +38,8 @@ pub(crate) mod rag_search;
 pub(crate) mod sandbox;
 pub(crate) mod semantic_tools;
 pub(crate) mod service;
+// Campi e resa dell'elenco servizi (punto unico della presentazione, regola L).
+pub(crate) mod service_listing;
 // Orchestrazione NATIVA dei sub-agenti (porting di /agent/subagent-run): vive in
 // mcp-core perche' richiede crate::native_engine (la gerarchia mcp-core ->
 // nexus-agent-tools impedisce a subagent.rs di chiamarlo). Intercetta i tool
