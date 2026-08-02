@@ -3,6 +3,7 @@
 //! Include l'utility `bump_version`.
 
 use super::*;
+use nexus_types::tool_outcome::RispostaTool;
 
 // ---------------------------------------------------------------------------
 // Utility
@@ -417,12 +418,21 @@ fn reject_empty_document(content: &Value, doc_type: &str) -> Result<(), String> 
     ))
 }
 
+/// Genera il documento e ne DICHIARA l'esito in un campo (regola Q).
+///
+/// Ha due chiamanti che non si vedono fra loro: il dispatch dei tool builtin
+/// (`super::execute`, canale legacy a stringa) e l'endpoint REST
+/// `POST /api/projects/:id/documents/generate`, che NON passa dal dispatch dei
+/// tool agente e quindi non incontrerebbe mai il ponte `da_testo_legacy`.
+/// Finche' l'esito viveva nel marker in testa al testo, il secondo era
+/// COSTRETTO a ricostruirlo per conto proprio: col campo non c'e' piu' niente
+/// da ricostruire, e comporre il testo non puo' piu' coprire il fallimento.
 pub async fn handle_doc_generate(
     db: &PgPool,
     project_id: Uuid,
     user_id: Uuid,
     args: &Value,
-) -> String {
+) -> RispostaTool {
     let pid = resolve_target_project_id(db, args, project_id).await;
 
     let GenerateContext {
@@ -433,7 +443,7 @@ pub async fn handle_doc_generate(
         project_name,
     } = match resolve_generate_context(db, pid, args).await {
         Ok(ctx) => ctx,
-        Err(msg) => return tool_failure(msg),
+        Err(msg) => return RispostaTool::fallito(msg),
     };
 
     // Se content_json manca o è vuoto, auto-genera il contenuto analizzando il progetto
@@ -441,12 +451,12 @@ pub async fn handle_doc_generate(
         Some(v) if !v.is_null() && v.as_object().is_none_or(|o| !o.is_empty()) => v.clone(),
         _ => match autogenerate_content_json(db, pid, &project_name, &root_path, &doc_type).await {
             Ok(v) => v,
-            Err(msg) => return tool_failure(msg),
+            Err(msg) => return RispostaTool::fallito(msg),
         },
     };
 
     if let Err(msg) = reject_empty_document(&content, &doc_type) {
-        return tool_failure(msg);
+        return RispostaTool::fallito(msg);
     }
 
     let ctx = GenerateContext {
@@ -467,7 +477,7 @@ async fn finalize_document(
     user_id: Uuid,
     ctx: &GenerateContext,
     content: Value,
-) -> String {
+) -> RispostaTool {
     // Determina versione (incrementa se lo stesso doc_type esiste già)
     let version = next_document_version(db, pid, &ctx.doc_type).await;
 
@@ -477,7 +487,7 @@ async fn finalize_document(
     let content_str = match serde_json::to_string(&content) {
         Ok(s) => s,
         Err(e) => {
-            return tool_failure(format!(
+            return RispostaTool::fallito(format!(
                 "[Errore] Serializzazione contenuto documento fallita: {e}"
             ))
         }
@@ -500,7 +510,7 @@ async fn finalize_document(
     .await
     {
         Ok(r) => r,
-        Err(msg) => return tool_failure(msg),
+        Err(msg) => return RispostaTool::fallito(msg),
     };
     persist_generated_document(
         db,
@@ -586,7 +596,7 @@ async fn persist_generated_document(
     relative_path: &str,
     content: &Value,
     rendered: crate::docx_render::RenderedDoc,
-) -> String {
+) -> RispostaTool {
     let crate::docx_render::RenderedDoc {
         file_path,
         page_count,
@@ -611,7 +621,7 @@ async fn persist_generated_document(
     )
     .await
     {
-        return tool_failure(msg);
+        return RispostaTool::fallito(msg);
     }
 
     spawn_document_side_effects(
@@ -625,7 +635,7 @@ async fn persist_generated_document(
         content,
     );
 
-    format_json(&json!({
+    RispostaTool::riuscito(format_json(&json!({
         "ok": true,
         "document_id": doc_id.to_string(),
         "file_path": relative_path,
@@ -634,7 +644,7 @@ async fn persist_generated_document(
         "page_count": page_count,
         "section_count": section_count,
         "message": format!("Documento '{}' v{} generato in {}", final_title, version, relative_path)
-    }))
+    })))
 }
 
 /// Registra il documento in `project_documents`. FIX 2: prima era `let _ =`,

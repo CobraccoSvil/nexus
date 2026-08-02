@@ -32,6 +32,64 @@ pub(crate) type ApiResult = Result<Json<Value>, ApiError>;
 // `crate::projects::{api_error, parse_user_id}`.
 pub(crate) use nexus_types::{api_error, parse_user_id};
 
+use nexus_types::{
+    api_error_rendered,
+    error_presentation::{render_user_error, AccessDenial, ErrorFacts},
+};
+
+/// Un 403 che porta la propria causa in un CAMPO TIPIZZATO, non nella frase.
+///
+/// Il client sceglie l'azione dal codice canonico (`user_code`); la frase
+/// italiana resta per l'occhio e il testo tecnico storico resta in
+/// `user_detail`, dove log e pannelli diagnostici lo ritrovano. Il vocabolario
+/// e' chiuso in [`AccessDenial`] (punto unico, regola L): qui non nascono
+/// codici nuovi.
+pub(crate) fn negato(denial: AccessDenial, detail: &str) -> ApiError {
+    api_error_rendered(
+        StatusCode::FORBIDDEN,
+        &render_user_error(&ErrorFacts::access(denial, detail)),
+    )
+}
+
+#[cfg(test)]
+mod tests_accesso_negato {
+    use super::*;
+
+    /// Il corpo del 403 porta la causa in un CAMPO, e il testo tecnico storico
+    /// resta dov'era.
+    ///
+    /// Su `user_code` il frontend DECIDE (apps/web-ide/lib/api/project-access.ts):
+    /// e' l'unica chiave che autorizza a buttare via lo stato locale del
+    /// progetto. La frase italiana che prima portava quella decisione resta in
+    /// `error` e `user_detail`, dove log e pannelli diagnostici la ritrovano.
+    #[test]
+    fn il_403_di_accesso_porta_il_codice_e_conserva_il_testo_tecnico() {
+        let (status, Json(body)) =
+            negato(AccessDenial::ProjectNotAccessible, "Progetto non accessibile");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["user_code"], "project_not_accessible");
+        assert_eq!(body["user_detail"], "Progetto non accessibile");
+        assert!(
+            body["user_message"].as_str().is_some_and(|m| !m.trim().is_empty()),
+            "senza frase il client non ha niente da mostrare"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("Progetto non accessibile")),
+            "il testo tecnico storico deve restare leggibile: {}",
+            body["error"]
+        );
+
+        // Permesso negato: codice DIVERSO, perche' li' non si cancella niente.
+        let (_, Json(altro)) = negato(
+            AccessDenial::ProjectPermissionDenied,
+            "Non hai permessi Git su questo progetto",
+        );
+        assert_eq!(altro["user_code"], "project_permission_denied");
+    }
+}
+
 // ── Costanti condivise ────────────────────────────────────────────────────────
 
 pub(crate) const EXCLUDED_NAMES: &[&str] = &[
@@ -897,7 +955,14 @@ pub(crate) async fn load_project_context(
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let Some(row) = row else {
-        return Err(api_error(StatusCode::FORBIDDEN, "Progetto non accessibile"));
+        // Il client DECIDE su questo 403: davanti a un progetto sparito butta
+        // via le chiavi `localStorage` che lo riguardano e reindirizza. La
+        // decisione viaggia percio' come CODICE canonico (`user_code`), mai
+        // come la frase italiana del corpo: prima il frontend faceva
+        // `errText.includes("Progetto non accessibile")`, e una riformulazione
+        // del messaggio avrebbe smesso di cancellare (o iniziato a cancellare
+        // per un 403 di tutt'altra origine) senza che nulla lo segnalasse.
+        return Err(negato(AccessDenial::ProjectNotAccessible, "Progetto non accessibile"));
     };
 
     let role = row
@@ -1082,8 +1147,11 @@ pub(crate) async fn execute_git_paths_operation(
     paths: &[String],
 ) -> ApiResult {
     if !context.access.can_manage_git {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
+        // Permesso negato, NON progetto sparito: i riferimenti locali del
+        // client restano validi. Codice distinto perche' la conseguenza e'
+        // opposta a quella di `ProjectNotAccessible`.
+        return Err(negato(
+            AccessDenial::ProjectPermissionDenied,
             "Non hai permessi Git su questo progetto",
         ));
     }
@@ -1143,8 +1211,11 @@ pub(crate) async fn execute_git_remote_operation(
     body: GitRemoteRequest,
 ) -> ApiResult {
     if !context.access.can_manage_git {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
+        // Permesso negato, NON progetto sparito: i riferimenti locali del
+        // client restano validi. Codice distinto perche' la conseguenza e'
+        // opposta a quella di `ProjectNotAccessible`.
+        return Err(negato(
+            AccessDenial::ProjectPermissionDenied,
             "Non hai permessi Git su questo progetto",
         ));
     }

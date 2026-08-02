@@ -218,6 +218,24 @@ function isRunSummaryMessage(msg: ChatMessage): boolean {
   return trimmed.startsWith("---") && trimmed.includes("**Riepilogo run**");
 }
 
+/** Ruolo del messaggio di compattazione sul wire: `chat_sessions.rs` lo scrive
+ *  come `INSERT INTO chat_messages ... role='summary'` e `to_message_view` lo
+ *  propaga verbatim. E' il VOCABOLARIO canonico del messaggio (regola N), non
+ *  un indizio da riconoscere nel testo: il criterio precedente annusava
+ *  l'incipit del content ("[Riassunto della conversazione precedente"), quindi
+ *  collassava una risposta legittima che citasse quella frase e smetteva di
+ *  riconoscere i riassunti al primo ritocco del prefisso.
+ *  NB: `metadata.isCompactSummary`, scritto accanto al ruolo, NON arriva qui:
+ *  `to_message_view` mappa solo alcune chiavi di metadata e quella non e' fra
+ *  esse. L'unico campo tipizzato disponibile al componente e' `role`.
+ *  Il confronto passa da `string` perche' l'unione dichiarata in
+ *  `lib/api/chat.ts` (`"user" | "assistant"`) e' piu' STRETTA del wire: finche'
+ *  non include 'summary', un confronto diretto sarebbe un errore TS2367. */
+function isCompactSummaryMessage(msg: ChatMessage): boolean {
+  const ruolo: string = msg.role;
+  return ruolo === "summary";
+}
+
 type GroupedItem =
   | { type: "message"; message: ChatMessage; idx: number }
   | { type: "run-group"; messages: ChatMessage[]; startIdx: number };
@@ -1421,7 +1439,7 @@ export function MessageList({
             <div style={{ color: tc.text, minWidth: 0, wordBreak: "break-word", overflowWrap: "break-word" }}>
               {isUser ? (
                 <MarkdownBlock content={message.content} />
-              ) : (message.content ?? "").includes("[Riassunto della conversazione precedente") ? (
+              ) : isCompactSummaryMessage(message) ? (
                 // Riassunti di compattazione: collassati di default (blocco <details>
                 // nativo, nessuno stato React) cosi' non sommergono la chat con 4-5
                 // riassunti lunghi. L'esito reale resta visibile; il dettaglio e' a un clic.

@@ -538,6 +538,36 @@ pub(crate) fn payload_memoria_di_sessione(
     )
 }
 
+/// Verdetto su UN turno neural prodotto per il riassunto di compattazione:
+/// tenerlo, o passare al prossimo candidato del tier.
+///
+/// Delega al PUNTO UNICO del "questo turno va ritentato"
+/// (`orchestrator::neural_value_is_failure`, regole L e M): il fallimento tecnico
+/// e' gia' dichiarato in forma STRUTTURATA dai due soli produttori del Value
+/// neural — `agent_turn_value_from_gw` (`error` null) e
+/// `error_agent_turn_from_error` (`error`/`error_class` non-null) — piu' il caso
+/// del content vuoto. Il TESTO del riassunto non entra nel verdetto: un riassunto
+/// che parla di errori, di billing o di provider mancanti e' un riassunto valido,
+/// non un errore.
+///
+/// Il caso storico del "200 con output inutile" e' gia' chiuso ALLA FONTE: il
+/// gateway riconosce la risposta degenere (`types::is_degenerate_completion`) e
+/// la converte in `CallFailure::empty_completion`, quindi qui arriva come errore
+/// tipizzato, non come prosa da annusare.
+///
+/// Esiste come funzione a se' per la regola O: il verdetto viveva dentro un
+/// closure `async` di [`compact_session_core`], che pretende DB e gateway vivi;
+/// nessun test poteva raggiungerlo per la strada della produzione.
+fn esito_tentativo_riassunto(
+    turn: serde_json::Value,
+) -> crate::internal_routing::AttemptOutcome<serde_json::Value> {
+    use crate::internal_routing::AttemptOutcome;
+    if crate::orchestrator::neural_value_is_failure(&turn) {
+        return AttemptOutcome::Failover;
+    }
+    AttemptOutcome::Done(turn)
+}
+
 pub(crate) async fn compact_session_core(
     state: &AppState,
     session_id: Uuid,
@@ -642,10 +672,10 @@ pub(crate) async fn compact_session_core(
                     .generate_agent_turn(&prov, &mdl, messages_json, "[]", 1500, "")
                     .await
                 {
-                    Ok(v) if !crate::orchestrator::neural_value_is_failure(&v) => {
-                        AttemptOutcome::Done(v)
-                    }
-                    _ => AttemptOutcome::Failover,
+                    Ok(v) => esito_tentativo_riassunto(v),
+                    // Errore LOCALE (bridge non configurato, messages_json
+                    // invalido): il turno non e' mai partito, prova il prossimo.
+                    Err(_) => AttemptOutcome::Failover,
                 }
             }
         };
@@ -708,32 +738,20 @@ pub(crate) async fn compact_session_core(
         summary_text
     };
 
-    // Detection riassunto degenere: il neural service ritorna sempre 200 anche
-    // quando tutti i provider falliscono, con `content` tipo "[Error: ...]" o
-    // "Errore del provider AI. Controlla i log per i dettagli." (vedi
-    // error_handler.py). Questi NON sono riassunti validi: trattali come
-    // failure cosi' il frontend mostra errore esplicito invece di salvare un
-    // "riassunto" inutile che spreca lo slot della session memory.
-    let lower = summary_text.to_lowercase();
-    let is_degenerate = summary_text.is_empty()
-        || summary_text.len() < 40
-        || lower.starts_with("[error")
-        || lower.starts_with("errore del provider")
-        || lower.contains("controlla i log per i dettagli")
-        || lower.contains("nessun provider")
-        || lower.contains("billing");
-    if is_degenerate {
-        tracing::warn!(
-            "compact_session_core: riassunto degenere ({} char): \"{}\"",
-            summary_text.len(),
-            summary_text.chars().take(120).collect::<String>()
-        );
-        return Err(CompactError::new(
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "Compattazione fallita: tutti i provider AI hanno restituito errore. \
-             Riprova fra qualche minuto o sblocca un provider in /admin/settings/providers.",
-        ));
-    }
+    // Qui NON c'e' piu' una "detection riassunto degenere" che rilegga il TESTO
+    // del riassunto (ex `lower.starts_with("[error")`, `contains("billing")`,
+    // `contains("nessun provider")`, `len() < 40`). Il fallimento tecnico e' gia'
+    // dichiarato in modo STRUTTURATO a monte e filtrato da
+    // `esito_tentativo_riassunto`: se il turno arriva fin qui, `error` e'
+    // null e il `content` non e' vuoto (regola M). Il blocco lessicale non
+    // poteva quindi aggiungere veri positivi, ed era SOLO falso-positivo su un
+    // riassunto legittimo — i riassunti di sessioni di debug parlano di errori,
+    // di billing e di provider mancanti per mestiere. Quando scattava, la
+    // sessione perdeva l'intera memoria E leggeva un 503 che affermava il falso
+    // ("tutti i provider AI hanno restituito errore") su una chiamata riuscita.
+    // Il ramo `len() < 40` era l'unica differenza non coperta dal segnale
+    // strutturato: e' una misura di QUALITA', non un fallimento, e un riassunto
+    // breve ma vero vale piu' di nessun riassunto.
 
     // Sezione "stato lavori" DETERMINISTICA (incidente Beauty-Book): i fatti
     // strutturali dei run (esiti, file toccati) vengono appesi al summary da
@@ -1043,7 +1061,80 @@ pub async fn toggle_project_memory(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_session_pin;
+    use super::{esito_tentativo_riassunto, normalize_session_pin};
+    use crate::internal_routing::AttemptOutcome;
+    use crate::nexus_gateway::GwResponse;
+    use crate::orchestrator::neural_client::{agent_turn_value_from_gw, error_agent_turn_value};
+    use serde_json::json;
+
+    /// Il turno di SUCCESSO come lo costruisce la produzione: la risposta del
+    /// gateway arriva deserializzata (`GwResponse`) e passa da
+    /// `agent_turn_value_from_gw`. Fabbricare il Value a mano fisserebbe proprio
+    /// l'assunto da verificare (regola O).
+    fn turno_riuscito(content: &str) -> serde_json::Value {
+        let resp: GwResponse = serde_json::from_value(json!({
+            "content": content,
+            "usage": { "input_tokens": 10, "output_tokens": 20 },
+            "model_used": "gemini-2.5-flash",
+            "provider_used": "google",
+            "latency_ms": 12,
+            "finish_reason": "stop",
+        }))
+        .expect("GwResponse deserializzabile");
+        agent_turn_value_from_gw("google", "gemini-2.5-flash", &resp)
+    }
+
+    #[test]
+    fn un_riassunto_che_parla_di_errori_resta_valido() {
+        // Il caso perso dal blocco lessicale rimosso: una sessione di DEBUG
+        // produce un riassunto che cita per mestiere errori, billing e provider
+        // mancanti. Chi lo ha prodotto ha gia' dichiarato in modo strutturato di
+        // NON essere un errore (`error` null, content pieno): il testo non deve
+        // avere voce in capitolo.
+        let testo = "Sessione di debug: il provider anthropic rispondeva billing_error e \
+                     nessun provider del tier era disponibile. Errore del provider AI \
+                     risolto ricaricando il credito; controlla i log per i dettagli.";
+        let turn = turno_riuscito(testo);
+        match esito_tentativo_riassunto(turn) {
+            AttemptOutcome::Done(v) => {
+                assert_eq!(v.get("content").and_then(|c| c.as_str()), Some(testo));
+            }
+            AttemptOutcome::Failover => panic!("riassunto legittimo scartato"),
+        }
+    }
+
+    #[test]
+    fn un_riassunto_breve_resta_valido() {
+        // Ex `len() < 40`: la brevita' e' una misura di QUALITA', non un
+        // fallimento tecnico. Una sessione cortissima ha un riassunto corto.
+        let turn = turno_riuscito("Nessuna decisione durevole.");
+        assert!(matches!(
+            esito_tentativo_riassunto(turn),
+            AttemptOutcome::Done(_)
+        ));
+    }
+
+    #[test]
+    fn il_turno_di_errore_e_riconosciuto_dal_segnale_strutturato() {
+        // Il turno d'errore come lo costruisce la produzione: content
+        // "[Error: ...]" E `error` non-null. E' il caso che il blocco lessicale
+        // credeva di coprire da solo; il segnale strutturato lo copre a monte.
+        let turn = error_agent_turn_value("anthropic", "claude-x", "billing_error: credito zero");
+        assert!(matches!(
+            esito_tentativo_riassunto(turn),
+            AttemptOutcome::Failover
+        ));
+    }
+
+    #[test]
+    fn il_turno_senza_contenuto_e_un_fallimento() {
+        // Ex `summary_text.is_empty()`: coperto dal punto unico (content vuoto
+        // = turno improduttivo, es. finish_reason=length su Gemini).
+        assert!(matches!(
+            esito_tentativo_riassunto(turno_riuscito("   ")),
+            AttemptOutcome::Failover
+        ));
+    }
 
     #[test]
     fn pin_auto_and_empty_clear_the_preference() {

@@ -126,6 +126,24 @@ pub fn spawn_tool_reindex(db: PgPool) {
 // Dispatch principale
 // ---------------------------------------------------------------------------
 
+/// Ri-codifica nel canale legacy la risposta di un handler gia' MIGRATO alla
+/// regola Q.
+///
+/// `execute` restituisce `String` e chi la consuma (il dispatch dei tool agente)
+/// ricostruisce l'esito dal marker: finche' quella firma esiste, un handler che
+/// dichiara il fallimento in un campo deve rimetterlo in testa al testo USCENDO
+/// di qui, altrimenti il fallimento sparirebbe per quella via. Il vincolo e' che
+/// la ri-codifica sia l'ULTIMA cosa che tocca il testo: comporre dopo di essa
+/// spingerebbe il marker fuori dalla testa. Sparisce quando `execute` porta a
+/// sua volta la `RispostaTool`.
+fn testo_legacy(risposta: nexus_types::tool_outcome::RispostaTool) -> String {
+    if risposta.esito.e_fallito() {
+        tool_failure(risposta.testo)
+    } else {
+        risposta.testo
+    }
+}
+
 pub async fn execute(
     db: &PgPool,
     user_id: Uuid,
@@ -189,7 +207,9 @@ pub async fn execute(
             handle_admin_setting_update(db, &arguments).await
         }
         // ── documents ─────────────────────────────────────────────────
-        "nexus_doc_generate" => handle_doc_generate(db, project_id, user_id, &arguments).await,
+        "nexus_doc_generate" => {
+            testo_legacy(handle_doc_generate(db, project_id, user_id, &arguments).await)
+        }
         "nexus_doc_update" => handle_doc_update(db, project_id, &arguments).await,
         "nexus_doc_list" => handle_doc_list(db, &arguments).await,
         "nexus_doc_search" => handle_doc_search(db, project_id, &arguments).await,
@@ -1945,5 +1965,29 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// Il canale legacy non deve perdere cio' che un handler migrato dichiara
+    /// nel campo: `execute` ritorna `String`, e chi la legge (il ponte
+    /// `da_testo_legacy` nel dispatch dei tool agente) riconosce solo il marker.
+    ///
+    /// MUTAZIONE: si fa ritornare a `testo_legacy` sempre `risposta.testo` e
+    /// questo test rosseggia — il fallimento di `nexus_doc_generate` diventa
+    /// invisibile all'anti-loop e al final_gate, che e' il difetto reale.
+    #[test]
+    fn la_ri_codifica_legacy_conserva_il_fallimento_dichiarato_nel_campo() {
+        use nexus_types::tool_outcome::{is_tool_failure, RispostaTool};
+
+        let fallita = testo_legacy(RispostaTool::fallito("[Errore] Documento non trovato"));
+        assert!(
+            is_tool_failure(&fallita),
+            "il canale a stringa ha perso l'esito: {fallita}"
+        );
+        assert!(fallita.contains("[Errore] Documento non trovato"));
+
+        // Su un successo non si inventa nulla: il testo passa nudo.
+        let riuscita = testo_legacy(RispostaTool::riuscito(r#"{"ok":true}"#));
+        assert_eq!(riuscita, r#"{"ok":true}"#);
+        assert!(!is_tool_failure(&riuscita));
     }
 }

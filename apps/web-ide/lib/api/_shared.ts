@@ -3,6 +3,7 @@
 // I moduli di dominio in lib/api/* importano da qui.
 
 import { readRenderedError, type RenderedError } from "./error-render";
+import { autorizzaOblioProgetto, progettoDallUrl } from "./project-access";
 
 export const API_BASE = typeof window !== "undefined"
   ? ""
@@ -89,6 +90,35 @@ export async function fetchJsonWithRetry<T>(
   throw lastError;
 }
 
+/** Rimuove i riferimenti locali a un progetto sparito e, se la pagina puntava
+ *  ancora a quello, reindirizza. Ritorna `true` solo se ha reindirizzato.
+ *
+ *  Senza questa pulizia l'UI continua a riprovare con l'id morto (URL
+ *  `?project=`, cache dei pannelli in localStorage) e ripropone il toast di
+ *  errore a ogni azione. */
+function dimenticaProgetto(url: string): boolean {
+  const orfano = progettoDallUrl(url);
+  if (!orfano) return false;
+  try {
+    const daRimuovere: string[] = [];
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const k = window.localStorage.key(i);
+      // Qualunque chiave che contenga l'uuid: le entry ideai:*:{id} e le cache
+      // degli altri pannelli.
+      if (k?.includes(orfano)) daRimuovere.push(k);
+    }
+    for (const k of daRimuovere) window.localStorage.removeItem(k);
+  } catch {
+    // Storage non accessibile (cookie bloccati, modalita' privata): la pulizia
+    // e' best-effort e non deve sostituire l'errore HTTP che il chiamante sta
+    // per ricevere. Il redirect qui sotto resta comunque la cosa giusta da fare.
+  }
+  if (new URLSearchParams(window.location.search).get("project") !== orfano) return false;
+  // Senza query: il backend selezionera' l'ultimo progetto valido.
+  window.location.href = "/ide";
+  return true;
+}
+
 export async function fetchJson<T>(url: string, init?: RequestInit, timeoutMs = 30000): Promise<T> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort("timeout"), timeoutMs);
@@ -107,50 +137,16 @@ export async function fetchJson<T>(url: string, init?: RequestInit, timeoutMs = 
     window.location.href = "/login";
     throw new Error("Sessione scaduta");
   }
-  // Bug-fix: quando il backend ritorna 403 "Progetto non accessibile" significa
-  // che il progetto e' stato cancellato (server-side) ma il client ha ancora
-  // riferimenti stale (URL ?project=, localStorage activeTab, ecc.). Senza
-  // questo cleanup l'UI continua a riprovare la PUT e mostra il toast
-  // "Operazione progetto (PUT) fallita: Progetto non accessibile" ad ogni
-  // refresh / azione.
+  // Su un 403 il client puo' dover buttare via lo stato locale del progetto. La
+  // decisione passa dal CODICE canonico della resa (`user_code`), mai dalla
+  // frase del corpo: vedi project-access.ts.
   if (res.status === 403 && typeof window !== "undefined") {
-    try {
-      const cloned = res.clone();
-      const payload = await cloned.json().catch(() => null);
-      const errText =
-        typeof payload?.error === "string"
-          ? payload.error
-          : typeof payload?.message === "string"
-            ? payload.message
-            : "";
-      if (errText.includes("Progetto non accessibile")) {
-        // Estrae l'UUID del progetto dall'URL chiamato (pattern /api/projects/{uuid}/...)
-        const m = String(url).match(/\/api\/projects\/([0-9a-f-]{36})/i);
-        if (m) {
-          const orphanId = m[1];
-          const keysToDrop: string[] = [];
-          for (let i = 0; i < window.localStorage.length; i++) {
-            const k = window.localStorage.key(i);
-            if (!k) continue;
-            // Rimuove tutte le entry ideai:*:{orphanId} e qualsiasi chiave che
-            // contenga l'UUID orfano (cache di altri pannelli)
-            if (k.includes(orphanId)) keysToDrop.push(k);
-          }
-          for (const k of keysToDrop) window.localStorage.removeItem(k);
-          // Se l'URL della pagina punta ancora a quel progetto orfano,
-          // forza il redirect a /ide senza query (il backend selezionera'
-          // automaticamente l'ultimo progetto valido).
-          const currentParam = new URLSearchParams(window.location.search).get("project");
-          if (currentParam === orphanId) {
-            window.location.href = "/ide";
-            throw new Error("Progetto rimosso, reindirizzamento in corso");
-          }
-        }
-      }
-    } catch (cleanupErr) {
-      // se il cleanup fallisce non bloccare il flow di errore originale
-      if (cleanupErr instanceof Error && cleanupErr.message.includes("reindirizzamento")) {
-        throw cleanupErr;
+    const payload = await res.clone().json().catch(() => null);
+    if (autorizzaOblioProgetto(readRenderedError(payload)?.code)) {
+      // Ritorna true solo se ha reindirizzato: allora la richiesta in corso non
+      // ha piu' un esito utile da propagare.
+      if (dimenticaProgetto(String(url))) {
+        throw new Error("Progetto rimosso, reindirizzamento in corso");
       }
     }
   }

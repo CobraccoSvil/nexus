@@ -57,6 +57,73 @@ pub enum ErrorDomain {
     Plugin,
     /// Il database non e' raggiungibile o ha rifiutato la query.
     Db,
+    /// L'accesso a una risorsa di DOMINIO (un progetto, non un fornitore) e'
+    /// stato negato. La causa la porta [`AccessDenial`] in [`ErrorFacts::code`].
+    Access,
+}
+
+/// PERCHE' l'accesso a una risorsa di dominio e' negato. Vocabolario CHIUSO
+/// (regola N: identificatori inglesi, univoci): chi emette il 403 sceglie una
+/// VARIANTE, non scrive una stringa.
+///
+/// Esiste perche' su questi codici il client DECIDE, non si limita a mostrare:
+/// il frontend, davanti a un progetto sparito, butta via le chiavi
+/// `localStorage` che lo riguardano e reindirizza. Prima quella decisione
+/// veniva presa su `errText.includes("Progetto non accessibile")`, cioe' su una
+/// FRASE ITALIANA nel corpo della risposta — che una riformulazione, una
+/// traduzione o un 403 di altra origine avrebbero cambiato in silenzio in
+/// entrambe le direzioni. Una variante in piu' qui costa una riga; una frase
+/// riscritta costava la sessione dell'utente.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessDenial {
+    /// La riga di appartenenza non esiste: il progetto e' stato eliminato
+    /// OPPURE l'utente non ne fa (piu') parte. Il servizio non distingue i due
+    /// casi di proposito — rispondere "esiste ma non e' tuo" direbbe a un
+    /// estraneo che quell'id e' vivo. Per il client la conseguenza e' la stessa:
+    /// i riferimenti locali a quel progetto sono morti.
+    ProjectNotAccessible,
+    /// Il progetto e' raggiungibile, ma il ruolo dell'utente non copre
+    /// l'operazione richiesta. I riferimenti locali restano VALIDI: chi legge
+    /// questo codice non deve buttare via niente.
+    ProjectPermissionDenied,
+}
+
+impl AccessDenial {
+    /// Il vocabolario per esteso, elencato UNA volta: `from_code` e i test
+    /// leggono da qui, cosi' una variante non puo' entrare nel vocabolario
+    /// senza entrare anche nella sua inversa. `code` e `message` restano
+    /// coperti dal compilatore (i loro `match` sono esaustivi).
+    pub const ALL: &'static [Self] = &[Self::ProjectNotAccessible, Self::ProjectPermissionDenied];
+
+    /// L'identificatore sul wire. `const` perche' e' un letterale, non una
+    /// scelta a runtime.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ProjectNotAccessible => "project_not_accessible",
+            Self::ProjectPermissionDenied => "project_permission_denied",
+        }
+    }
+
+    /// L'inversa, per il render. Ignoto = `None`: un codice che non conosciamo
+    /// non diventa la variante piu' comoda (regola Q), degrada alla frase
+    /// generica.
+    fn from_code(code: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|d| d.code() == code)
+    }
+
+    /// La frase si compone DOPO, dalla variante (regola Q): il testo non e' mai
+    /// il canale su cui qualcuno a valle decide.
+    fn message(self) -> &'static str {
+        match self {
+            Self::ProjectNotAccessible => {
+                "Il progetto non esiste piu' oppure non e' piu' fra quelli a cui hai accesso."
+            }
+            Self::ProjectPermissionDenied => {
+                "Non hai i permessi necessari per questa operazione sul progetto."
+            }
+        }
+    }
 }
 
 /// Natura STRUTTURATA di un fallimento di trasporto, dai predicati tipizzati di
@@ -130,6 +197,19 @@ impl ErrorFacts {
             transport: None,
             upstream_message: None,
             detail: detail.into(),
+        }
+    }
+
+    /// Accesso negato a una risorsa di dominio, con la causa TIPIZZATA.
+    ///
+    /// Il costruttore prende l'enum e non una stringa: e' l'unico modo perche'
+    /// il vocabolario resti chiuso al punto di emissione. `detail` porta il
+    /// testo tecnico storico, che resta leggibile nei log e nei pannelli
+    /// diagnostici.
+    pub fn access(denial: AccessDenial, detail: impl Into<String>) -> Self {
+        Self {
+            code: Some(denial.code().to_string()),
+            ..Self::opaque(ErrorDomain::Access, detail)
         }
     }
 
@@ -297,6 +377,7 @@ pub fn render_user_error(facts: &ErrorFacts) -> RenderedError {
         ErrorDomain::Tool => render_tool(facts),
         ErrorDomain::Plugin => render_plugin(facts),
         ErrorDomain::Db => render_db(facts),
+        ErrorDomain::Access => render_access(facts),
     };
     RenderedError {
         code: code.to_string(),
@@ -578,6 +659,15 @@ fn render_plugin(facts: &ErrorFacts) -> (&'static str, String) {
     }
 }
 
+/// Codice e frase vengono dalla STESSA variante: e' cio' che impedisce a una
+/// riformulazione del messaggio di spostare il codice su cui il client decide.
+fn render_access(facts: &ErrorFacts) -> (&'static str, String) {
+    match facts.code.as_deref().and_then(AccessDenial::from_code) {
+        Some(d) => (d.code(), d.message().to_string()),
+        None => ("access_denied", "Accesso negato.".to_string()),
+    }
+}
+
 fn render_db(_facts: &ErrorFacts) -> (&'static str, String) {
     (
         "db_unavailable",
@@ -615,6 +705,7 @@ mod tests {
             ErrorDomain::Tool,
             ErrorDomain::Plugin,
             ErrorDomain::Db,
+            ErrorDomain::Access,
         ];
         for veleno in veleni {
             for dominio in domini {
@@ -782,6 +873,82 @@ mod tests {
     fn i_log_conservano_il_dettaglio() {
         let r = render_user_error(&ErrorFacts::opaque(ErrorDomain::Gateway, "boom os_error=1"));
         assert!(r.log_line().contains("boom os_error=1"));
+    }
+
+    /// Il vocabolario di accesso e' CHIUSO e torna in se stesso.
+    ///
+    /// Il codice attraversa il wire come stringa e rientra da `from_code`: se i
+    /// due lati divergessero anche di un carattere, il render cadrebbe sulla
+    /// frase generica e il client — che su questi codici DECIDE — smetterebbe
+    /// in silenzio di riconoscere il caso.
+    #[test]
+    fn il_vocabolario_di_accesso_torna_in_se_stesso() {
+        for d in AccessDenial::ALL.iter().copied() {
+            assert_eq!(
+                AccessDenial::from_code(d.code()),
+                Some(d),
+                "il codice {} non rientra nella sua variante",
+                d.code()
+            );
+        }
+        // I codici sono DISTINTI: due varianti con lo stesso codice renderebbero
+        // indistinguibili due conseguenze opposte (buttare via lo stato locale
+        // oppure lasciarlo intatto).
+        let mut codici: Vec<&str> = AccessDenial::ALL.iter().map(|d| d.code()).collect();
+        codici.sort_unstable();
+        let quanti = codici.len();
+        codici.dedup();
+        assert_eq!(codici.len(), quanti, "due varianti condividono lo stesso codice");
+
+        // Ignoto = None, mai la variante piu' comoda.
+        assert_eq!(AccessDenial::from_code("Progetto non accessibile"), None);
+        assert_eq!(AccessDenial::from_code(""), None);
+    }
+
+    /// Il 403 di progetto sparito porta un CODICE, e il codice non dipende dalla
+    /// frase: e' la sostanza del fix. Il frontend butta via `localStorage` e
+    /// reindirizza solo su `project_not_accessible`; il permesso negato, che
+    /// lascia validi i riferimenti locali, deve avere un codice DIVERSO.
+    #[test]
+    fn i_due_403_di_progetto_si_distinguono_per_codice_non_per_frase() {
+        let sparito = render_user_error(&ErrorFacts::access(
+            AccessDenial::ProjectNotAccessible,
+            "Progetto non accessibile",
+        ));
+        let vietato = render_user_error(&ErrorFacts::access(
+            AccessDenial::ProjectPermissionDenied,
+            "Non hai permessi Git su questo progetto",
+        ));
+        assert_eq!(sparito.code, "project_not_accessible");
+        assert_eq!(vietato.code, "project_permission_denied");
+        assert_ne!(
+            sparito.code, vietato.code,
+            "due conseguenze opposte non possono avere lo stesso codice"
+        );
+        // Il testo tecnico storico resta raggiungibile, ma NON e' il canale.
+        assert_eq!(sparito.detail, "Progetto non accessibile");
+        assert!(!sparito.message.contains("Progetto non accessibile"));
+
+        // Un dominio Access senza causa riconosciuta non diventa "progetto
+        // sparito": il codice generico non autorizza nessuna cancellazione.
+        let ignoto = render_user_error(
+            &ErrorFacts::opaque(ErrorDomain::Access, "boh").with_code("qualcosa_di_nuovo"),
+        );
+        assert_eq!(ignoto.code, "access_denied");
+    }
+
+    /// Il codice sopravvive al confine JSON: e' li' che il frontend lo legge.
+    #[test]
+    fn il_codice_di_accesso_attraversa_il_wire() {
+        let reso = render_user_error(&ErrorFacts::access(
+            AccessDenial::ProjectNotAccessible,
+            "Progetto non accessibile",
+        ));
+        let mut body = serde_json::json!({ "error": "Progetto non accessibile" });
+        reso.write_into(&mut body);
+        assert_eq!(body["user_code"], "project_not_accessible");
+        let riletto = RenderedError::from_wire(&body).expect("la resa attraversa il confine");
+        assert_eq!(riletto.code, "project_not_accessible");
     }
 
     /// Il TRASPORTO: cio' che un lato scrive, l'altro lo rilegge identico.
