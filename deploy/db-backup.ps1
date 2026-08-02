@@ -65,6 +65,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Invocazione dei binari PostgreSQL: l'esito dall'exit code, non dallo stderr.
+# Senza questo un avviso di pg_dump terminerebbe il backup a meta' set, saltando
+# la gestione d'errore per-database che questo script ha gia'.
+. (Join-Path $PSScriptRoot 'lib\nexus-native.ps1')
+
 # ── Individua i binari PostgreSQL (versione piu' recente installata) ──────────
 function Get-PgBin {
   $root = 'C:\Program Files\PostgreSQL'
@@ -108,11 +113,22 @@ function Resolve-Pw($cluster) {
 }
 
 # Elenca i DB reali di un cluster (esclusi template e 'postgres').
+#
+# Esclusi anche i database effimeri di `#[sqlx::test]`: ognuno vive per la durata
+# di UN test, e non sono dati ma scarti. Salvarli non era solo inutile, faceva
+# fallire il backup — fra l'elenco e il dump la suite ne distrugge parecchi, e
+# `pg_dump` moriva con "il database non esiste" su un nome che un istante prima
+# c'era. Il filtro sta nella QUERY e non attorno al dump: escluderli dopo averli
+# elencati lascerebbe la stessa corsa aperta, solo piu' stretta.
 function Get-Databases($cluster) {
   $env:PGPASSWORD = Resolve-Pw $cluster
-  $sql = "SELECT datname FROM pg_database WHERE datistemplate=false AND datname <> 'postgres' ORDER BY datname"
-  $out = & $Psql -h $cluster.PgHost -p $cluster.Port -U $cluster.User -d postgres -tAqc $sql
-  if ($LASTEXITCODE -ne 0) { throw "psql fallito su $($cluster.Label) (:$($cluster.Port))" }
+  $sql = "SELECT datname FROM pg_database WHERE datistemplate=false AND datname <> 'postgres' AND datname NOT LIKE '\_sqlx\_test\_%' ORDER BY datname"
+  $out = $null
+  $codice = Invoke-NexusNative -Comando {
+    $script:out = & $Psql -h $cluster.PgHost -p $cluster.Port -U $cluster.User -d postgres -tAqc $sql
+  }
+  $out = $script:out
+  if ($codice -ne 0) { throw "psql fallito su $($cluster.Label) (:$($cluster.Port))" }
   return @($out | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 }
 
@@ -131,8 +147,10 @@ if (-not $SyncOnly) {
 
     # Globals (ruoli/permessi)
     $globalsFile = Join-Path $setDir "$($c.Label)-globals.sql"
-    & $PgDumpall -h $c.PgHost -p $c.Port -U $c.User --globals-only -f $globalsFile
-    if ($LASTEXITCODE -ne 0) {
+    $codice = Invoke-NexusNative -Comando {
+      & $PgDumpall -h $c.PgHost -p $c.Port -U $c.User --globals-only -f $globalsFile
+    }
+    if ($codice -ne 0) {
       Write-Host "  globals: FALLITO"; $failures += "$($c.Label)/globals"
     } else {
       Write-Host ("  globals: {0:N1} KB" -f ((Get-Item $globalsFile).Length / 1KB))
@@ -144,12 +162,16 @@ if (-not $SyncOnly) {
     foreach ($db in $dbs) {
       $outFile = Join-Path $setDir "$($c.Label)-$db.dump"
       $env:PGPASSWORD = Resolve-Pw $c
-      & $PgDump -h $c.PgHost -p $c.Port -U $c.User -d $db -Fc --no-owner --no-acl -f $outFile
-      if ($LASTEXITCODE -ne 0) {
+      $codice = Invoke-NexusNative -Comando {
+        & $PgDump -h $c.PgHost -p $c.Port -U $c.User -d $db -Fc --no-owner --no-acl -f $outFile
+      }
+      if ($codice -ne 0) {
         Write-Host "  $db : DUMP FALLITO"; $failures += "$($c.Label)/$db"; continue
       }
       # Verifica integrita': pg_restore -l deve elencare oggetti
-      $objs = (& $PgRestore -l $outFile 2>$null | Where-Object { $_ -and ($_ -notmatch '^;') } | Measure-Object).Count
+      $manifest = @()
+      $null = Invoke-NexusNative -Comando { $script:manifest = & $PgRestore -l $outFile 2>$null }
+      $objs = ($script:manifest | Where-Object { $_ -and ($_ -notmatch '^;') } | Measure-Object).Count
       $mb = [math]::Round((Get-Item $outFile).Length / 1MB, 2)
       if ($objs -lt 1) {
         Write-Host "  $db : dump SOSPETTO (0 oggetti nel manifest), rimuovo"
@@ -186,15 +208,16 @@ if ($Gdrive) {
   if (-not $rclone) {
     Write-Host "== off-site SALTATO: rclone non installato (configura con 'rclone config', tipo drive) =="
   } else {
-    $remotes = & $rclone listremotes 2>$null
+    $null = Invoke-NexusNative -Comando { $script:remotes = & $rclone listremotes 2>$null }
+    $remotes = $script:remotes
     if ($remotes -notcontains "${RcloneRemote}:") {
       Write-Host "== off-site SALTATO: remote '${RcloneRemote}:' non configurato =="
     } else {
       $dest = "${RcloneRemote}:$GdrivePath"
       Write-Host "== off-site: rclone copy $BackupDir -> $dest =="
-      & $rclone copy $BackupDir $dest --transfers 4
-      if ($LASTEXITCODE -eq 0) { Write-Host "  upload OK" }
-      else { Write-Host "  upload FALLITO (exit $LASTEXITCODE)"; $failures += 'rclone-upload' }
+      $codice = Invoke-NexusNative -Comando { & $rclone copy $BackupDir $dest --transfers 4 }
+      if ($codice -eq 0) { Write-Host "  upload OK" }
+      else { Write-Host "  upload FALLITO (exit $codice)"; $failures += 'rclone-upload' }
     }
   }
   Write-Host ''

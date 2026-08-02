@@ -67,15 +67,16 @@ if (-not $NoRestart -and $serviziInstallati) {
 # riuscita. L'esito di un processo e' il suo exit code, mai il testo che ha
 # scritto (regola M) -- e i controlli su $LASTEXITCODE erano gia' scritti nei
 # call site: la preferenza li scavalcava prima che venissero raggiunti.
+. (Join-Path $PSScriptRoot 'lib\nexus-native.ps1')
+
+# Alias locale sul punto unico: la sospensione della preferenza d'errore vive in
+# `lib\nexus-native.ps1`, dove la usa anche db-backup.ps1.
 function Invoke-Nativo {
   param(
     [Parameter(Mandatory)][scriptblock]$Comando,
     [Parameter(Mandatory)][string]$Cosa
   )
-  $preferenzaPrec = $ErrorActionPreference
-  $ErrorActionPreference = 'Continue'
-  try { & $Comando } finally { $ErrorActionPreference = $preferenzaPrec }
-  if ($LASTEXITCODE -ne 0) { throw "$Cosa fallito (exit $LASTEXITCODE)" }
+  Invoke-NexusNativeOrThrow -Comando $Comando -Cosa $Cosa
 }
 
 function Initialize-Msvc {

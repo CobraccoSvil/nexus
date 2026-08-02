@@ -132,7 +132,7 @@ fn primo_token_comando(input: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexus_agent_graph::runtime::ports::AgentStepStore;
+    use nexus_agent_graph::runtime::ports::{AgentStepStore, PersistedStep, StepStatus};
     use nexus_types::tool_outcome::tool_failure;
     use serde_json::json;
 
@@ -156,8 +156,23 @@ mod tests {
                 &run_id.to_string(),
                 iterazione,
                 0,
-                json!({"name": tool, "input": input}),
-                Some(json!(risultato)),
+                PersistedStep {
+                    tool_name: tool.to_string(),
+                    tool_input: input,
+                    tool_result: Some(risultato.to_string()),
+                    // Il consumatore sotto misura il FALLIMENTO leggendo il
+                    // risultato col ponte legacy, non questo campo. Lo status si
+                    // deriva dallo STESSO ponte invece che da un letterale, cosi'
+                    // la riga resta coerente col risultato passato senza che il
+                    // test debba conoscere la forma del marker (regola O).
+                    status: StepStatus::from_is_error(
+                        nexus_types::tool_outcome::RispostaTool::da_testo_legacy(
+                            risultato.to_string(),
+                        )
+                        .esito
+                        .e_fallito(),
+                    ),
+                },
             )
             .await
             .expect("step persistito");
