@@ -2642,6 +2642,7 @@ fn costruisci_gw_request(prompt: String, project_id: Uuid, user_id: Uuid) -> GwR
             tool_call_id: None,
             reasoning: None,
             thinking_signature: None,
+            is_error: None,
         }],
         max_tokens: Some(1024),
         temperature: Some(0.0),

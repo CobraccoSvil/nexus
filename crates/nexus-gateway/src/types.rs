@@ -113,6 +113,33 @@ pub struct LlmMessage {
     /// assente/`None` per tutti gli altri provider, che non vedono il campo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Esito DICHIARATO del tool su un messaggio `role="tool"` (regola Q): il
+    /// tool ha fallito (`Some(true)`), ha fatto cio' che doveva (`Some(false)`),
+    /// oppure nessuno lo ha dichiarato (`None`).
+    ///
+    /// I casi sono TRE e il tipo lo dice: `None` non e' "e' andata bene", e'
+    /// "non lo so" — un messaggio tool ricostruito dal sanitizer, o inviato da
+    /// un chiamante che non parla questa versione del contratto, non porta alcun
+    /// esito e non deve fingerne uno.
+    ///
+    /// PERCHE' ARRIVA FIN QUI: il primo consumatore dell'esito di un tool e' il
+    /// MODELLO, e sul wire quell'esito non aveva un campo. Finche' i tool
+    /// scrivevano il marker `U+274C` in testa al testo il modello lo riceveva
+    /// comunque; per ogni tool migrato a `RispostaTool` quel marker non c'e'
+    /// piu', e senza questo campo un fallimento arriva al modello come un
+    /// tool_result indistinguibile da uno riuscito.
+    ///
+    /// COSA NE FA CIASCUN DIALETTO (nessuno finge un campo che non ha):
+    /// - Anthropic ha `is_error` sul blocco `tool_result` e lo emette nativo;
+    /// - OpenAI-compat e Google NON hanno un campo equivalente sul messaggio
+    ///   tool: il degrado e' dichiarato e reso in un punto solo da
+    ///   [`crate::providers::tool_error_channel`], che compone il TESTO dal
+    ///   campo al confine (regola Q punto 3) invece di lasciare muto l'esito.
+    ///
+    /// Retrocompatibile: `#[serde(default)]` + omesso in serializzazione, quindi
+    /// una richiesta che non lo porta resta valida e vale `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
 }
 
 /// Metadati di tracciamento e tenancy della richiesta (`RequestMetadata`).

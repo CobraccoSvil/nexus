@@ -252,6 +252,23 @@ pub struct LlmMessage {
     /// Anthropic (`GwMessage::thinking_signature` -> `types::LlmMessage`). `None`
     /// per gli altri ruoli/provider. Additivo (`Default`).
     pub thinking_signature: Option<String>,
+    /// Esito DICHIARATO del tool su un messaggio `role="tool"` (regola Q):
+    /// fallito (`Some(true)`), riuscito (`Some(false)`), non dichiarato
+    /// (`None`). Viene dal campo `is_error` del
+    /// [`crate::state::ContentBlock::ToolResult`], che a sua volta viene dal
+    /// campo della `RispostaTool` del tool: nessun anello lo deduce dal testo.
+    ///
+    /// PERCHE' ESISTE: il primo consumatore dell'esito di un tool e' il MODELLO.
+    /// Gli altri consumatori (anti-loop, supervisore, gate) leggono l'esito dai
+    /// `ContentBlock` del canale interno, ma il modello riceve solo cio' che
+    /// finisce sul wire — e li' l'esito non aveva un campo. Finche' i tool
+    /// scrivevano il marker `U+274C` in testa al testo il modello lo riceveva
+    /// comunque; per un tool migrato a `RispostaTool` il marker non c'e' piu',
+    /// e senza questo campo il fallimento arriverebbe come un tool_result
+    /// indistinguibile da uno riuscito. Il gateway lo traduce nel campo nativo
+    /// del dialetto dove esiste (Anthropic `is_error`) e ne dichiara il degrado
+    /// dove non esiste. Additivo (`Default`): `None` su tutti gli altri ruoli.
+    pub is_error: Option<bool>,
 }
 
 /// Richiesta minimale al gateway LLM.

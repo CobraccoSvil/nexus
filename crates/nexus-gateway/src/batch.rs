@@ -510,6 +510,7 @@ mod tests {
                 name: None,
                 thinking_signature: None,
                 reasoning: None,
+                is_error: None,
             });
         }
         messages.push(LlmMessage {
@@ -520,6 +521,7 @@ mod tests {
             name: None,
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         });
         LlmRequest {
             model: model.to_string(),

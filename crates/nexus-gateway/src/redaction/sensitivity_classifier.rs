@@ -126,6 +126,7 @@ mod tests {
             name: None,
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         }
     }
 

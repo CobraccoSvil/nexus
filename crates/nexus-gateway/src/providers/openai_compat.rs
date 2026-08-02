@@ -1111,6 +1111,18 @@ fn to_wire_message(msg: &crate::types::LlmMessage) -> WireMessage {
         content_value
     };
 
+    // ESITO DEL TOOL (regola Q): questo dialetto non ha un campo per dirlo — il
+    // tool message e' `{role, tool_call_id, content}` e basta. Il degrado e'
+    // dichiarato in un punto solo (`tool_error_channel`), che compone il testo
+    // DAL campo `is_error`; senza, un tool fallito arriverebbe al modello
+    // indistinguibile da uno riuscito da quando il marker non e' piu' nel testo.
+    let content = match (msg.role.as_str(), content) {
+        ("tool", Some(WireContent::Text(testo))) => Some(WireContent::Text(
+            crate::providers::tool_error_channel::testo_con_esito_dichiarato(testo, msg.is_error),
+        )),
+        (_, altro) => altro,
+    };
+
     WireMessage {
         role: msg.role.clone(),
         content,
@@ -1989,6 +2001,7 @@ mod tests {
                 name: None,
                 thinking_signature: None,
                 reasoning: None,
+                is_error: None,
             }],
             temperature: Some(0.5),
             max_tokens: Some(256),
@@ -2009,6 +2022,60 @@ mod tests {
         }
     }
 
+    /// Il degrado DICHIARATO: questo dialetto non ha un campo per l'esito, e il
+    /// fallimento arriva al modello nel testo composto DAL campo.
+    ///
+    /// Non e' un ritorno al marker: la direzione consentita dalla regola Q e'
+    /// proprio questa (il testo si compone dai campi, mai il contrario), il
+    /// consumatore qui e' il MODELLO, e nessun codice di Nexus rilegge questo
+    /// prefisso per sapere com'e' andata.
+    ///
+    /// MUTAZIONE: togliere la chiamata a `tool_error_channel` da
+    /// `to_wire_message` -> il messaggio tool torna nudo e il test rosseggia,
+    /// che e' esattamente la cecita' che il modello avrebbe.
+    #[test]
+    fn un_tool_fallito_e_dichiarato_nel_testo_dove_manca_il_campo() {
+        let corpo = |is_error: Option<bool>| {
+            let mut req = sample_request();
+            req.messages = vec![LlmMessage {
+                role: "tool".to_string(),
+                content: MessageContent::Text("nessun ascolto sulla porta 24806".to_string()),
+                tool_call_id: Some("call_42".to_string()),
+                tool_calls: None,
+                name: None,
+                thinking_signature: None,
+                reasoning: None,
+                is_error,
+            }];
+            let body = build_request_body(
+                &req,
+                false,
+                &ResolvedReasoning::none(),
+                PromptCacheKeying::ProviderManaged,
+                None,
+            );
+            serde_json::to_value(body).expect("serializza")
+        };
+
+        let fallito = corpo(Some(true));
+        assert_eq!(
+            fallito["messages"][0]["content"],
+            "[tool_error] nessun ascolto sulla porta 24806",
+            "senza campo nel dialetto, la dichiarazione deve entrare nel testo: {fallito}"
+        );
+
+        // Un tool riuscito non riceve decorazioni, e un esito non dichiarato non
+        // ne inventa uno: chi non sa, tace.
+        assert_eq!(
+            corpo(Some(false))["messages"][0]["content"],
+            "nessun ascolto sulla porta 24806"
+        );
+        assert_eq!(
+            corpo(None)["messages"][0]["content"],
+            "nessun ascolto sulla porta 24806"
+        );
+    }
+
     fn msg(role: &str, testo: &str) -> LlmMessage {
         LlmMessage {
             role: role.to_string(),
@@ -2018,6 +2085,7 @@ mod tests {
             name: None,
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         }
     }
 
@@ -2659,6 +2727,7 @@ mod tests {
                 name: None,
                 thinking_signature: None,
                 reasoning: Some("ho ragionato cosi'".to_string()),
+                is_error: None,
             },
             LlmMessage {
                 role: "user".to_string(),
@@ -2669,6 +2738,7 @@ mod tests {
                 thinking_signature: None,
                 // L'utente non porta reasoning: non deve mai comparire reasoning_content.
                 reasoning: Some("spurio-da-ignorare".to_string()),
+                is_error: None,
             },
         ];
 

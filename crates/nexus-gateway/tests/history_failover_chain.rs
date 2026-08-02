@@ -26,6 +26,7 @@ fn assistant_tool(id: &str, reasoning: &str) -> LlmMessage {
         name: None,
         thinking_signature: Some("anthropic-sig".to_string()),
         reasoning: Some(reasoning.to_string()),
+        is_error: None,
     }
 }
 
@@ -38,6 +39,7 @@ fn trailing_assistant_text() -> LlmMessage {
         name: None,
         thinking_signature: None,
         reasoning: Some("deepseek-reasoning-residue".to_string()),
+        is_error: None,
     }
 }
 
@@ -52,6 +54,7 @@ fn tool_heavy_history_failover_deepseek_to_mistral() {
             name: None,
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         },
         assistant_tool("call_1", "chain-of-thought deepseek"),
         trailing_assistant_text(),

@@ -6394,6 +6394,82 @@ mod multi_turn_wire {
         }
     }
 
+    /// Costruisce il `Message::Human` del `tool_dispatch` dichiarando l'esito.
+    fn human_tool_result_con_esito(tool_use_id: &str, result: &str, is_error: bool) -> Message {
+        Message::Human {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.into(),
+                content: Value::String(result.into()),
+                is_error,
+                exit_code: None,
+            }]),
+        }
+    }
+
+    /// L'ESITO ARRIVA AL WIRE (regola Q): il campo `is_error` del
+    /// `ContentBlock::ToolResult` sopravvive al passaggio verso il messaggio del
+    /// gateway, invece di essere scartato come faceva `extract_tool_results`.
+    ///
+    /// Il test parte dal PRODUTTORE (regola O): il blocco e' quello vero, la
+    /// serializzazione in `anthropic_content` e' quella di produzione, e il
+    /// percorso e' `message_to_history` -> `history_to_llm_messages`. Costruire
+    /// l'`anthropic_content` a mano avrebbe fissato l'assunto da verificare,
+    /// cioe' che quel campo si chiami cosi' e venga serializzato.
+    ///
+    /// MUTAZIONE: togliere `is_error: r.is_error` in `history_msg_to_wire` (o
+    /// far ritornare `None` all'estrazione) -> il primo assert rosseggia. E' la
+    /// perdita che rendeva un tool fallito indistinguibile da uno riuscito per
+    /// il modello, da quando un tool migrato non scrive piu' il marker.
+    #[test]
+    fn l_esito_dichiarato_dal_tool_arriva_al_messaggio_wire() {
+        let fallito = [human_tool_result_con_esito("c1", "porta muta", true)];
+        let hist: Vec<HistoryMessage> = fallito.iter().map(message_to_history).collect();
+        let wire = history_to_llm_messages(&hist);
+        assert_eq!(wire.len(), 1);
+        assert_eq!(wire[0].role, "tool");
+        assert_eq!(
+            wire[0].is_error,
+            Some(true),
+            "il fallimento dichiarato dal tool deve arrivare al wire: {wire:?}"
+        );
+        // Il testo resta testo: l'esito non lo tocca (regola Q).
+        assert_eq!(wire[0].content, json!("porta muta"));
+
+        // Il duale: un tool riuscito dichiara il successo, non l'ignoto.
+        let riuscito = [human_tool_result_con_esito("c1", "fatto", false)];
+        let hist: Vec<HistoryMessage> = riuscito.iter().map(message_to_history).collect();
+        assert_eq!(history_to_llm_messages(&hist)[0].is_error, Some(false));
+    }
+
+    /// Il `Message::Tool` esplicito e' l'altro percorso che porta un risultato
+    /// di tool sul wire, e legge lo stesso campo: l'esito e' una proprieta' del
+    /// BLOCCO, non del testo che lo accompagna, quindi si ritrova anche quando
+    /// il content e' gia' appiattito.
+    #[test]
+    fn anche_il_message_tool_esplicito_porta_l_esito() {
+        let con_blocchi = [Message::Tool {
+            tool_call_id: "c1".into(),
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "c1".into(),
+                content: Value::String("accesso negato".into()),
+                is_error: true,
+                exit_code: None,
+            }]),
+        }];
+        let hist: Vec<HistoryMessage> = con_blocchi.iter().map(message_to_history).collect();
+        let wire = history_to_llm_messages(&hist);
+        assert_eq!(wire[0].role, "tool");
+        assert_eq!(wire[0].is_error, Some(true), "wire = {wire:?}");
+
+        // Un messaggio tool puramente TESTUALE non dichiara nulla: `None` e'
+        // "non lo so", e non deve diventare un successo.
+        let hist: Vec<HistoryMessage> = [super::tool_msg_err("qualcosa")]
+            .iter()
+            .map(message_to_history)
+            .collect();
+        assert_eq!(history_to_llm_messages(&hist)[0].is_error, None);
+    }
+
     #[test]
     fn multi_turn_assistant_tooluse_e_tool_result_preservati_nel_wire() {
         // Sequenza reale: [Human, Ai(tool_use id=c1 nei blocchi, tool_calls VUOTO),

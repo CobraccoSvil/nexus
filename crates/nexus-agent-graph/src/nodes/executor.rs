@@ -9599,8 +9599,11 @@ fn history_to_llm_messages(hist: &[HistoryMessage]) -> Vec<LlmMessage> {
 fn history_msg_to_wire(m: &HistoryMessage) -> Vec<LlmMessage> {
     // 1) `Message::Tool` esplicito: un solo messaggio `role="tool"` + id.
     if m.is_tool {
+        // L'esito si legge dai blocchi anche quando il content e' gia' appiattito:
+        // e' un CAMPO del blocco, non una proprieta' del testo che lo accompagna.
+        let (content_dai_blocchi, is_error) = tool_result_content_ed_esito(&m.anthropic_content);
         let content = if m.content.is_null() {
-            tool_result_content(&m.anthropic_content)
+            content_dai_blocchi
         } else {
             m.content.clone()
         };
@@ -9608,6 +9611,7 @@ fn history_msg_to_wire(m: &HistoryMessage) -> Vec<LlmMessage> {
             role: "tool".to_string(),
             content,
             tool_call_id: m.tool_call_id.clone(),
+            is_error,
             ..Default::default()
         }];
     }
@@ -9617,16 +9621,27 @@ fn history_msg_to_wire(m: &HistoryMessage) -> Vec<LlmMessage> {
     //    sia l'human che trasporta i tool_result del tool_dispatch.
     if let Some(blocks) = m.anthropic_content.as_array() {
         if !blocks.is_empty() {
-            let tool_results = extract_tool_results(blocks);
+            // Solo i tool_result CON id: senza, non c'e' coppia da referenziare
+            // e il messaggio wire sarebbe rifiutato. Il filtro sta qui e non nel
+            // punto unico perche' l'altro chiamante (`Message::Tool`) l'id ce
+            // l'ha sul messaggio; scartare li' il blocco lo renderebbe illeggibile.
+            let tool_results: Vec<ToolResultBlock> = extract_tool_results(blocks)
+                .into_iter()
+                .filter(|r| r.tool_use_id.is_some())
+                .collect();
             let tool_uses = extract_tool_uses(blocks);
             if !tool_results.is_empty() || !tool_uses.is_empty() {
                 let mut out: Vec<LlmMessage> = Vec::new();
-                // I tool_result diventano messaggi `role="tool"` (round-trip id).
-                for (tool_use_id, content) in tool_results {
+                // I tool_result diventano messaggi `role="tool"` (round-trip id)
+                // e portano l'esito nel proprio campo (regola Q): e' l'unico
+                // canale con cui il modello sa che un tool ha fallito, da quando
+                // un tool migrato non scrive piu' il marker nel testo.
+                for r in tool_results {
                     out.push(LlmMessage {
                         role: "tool".to_string(),
-                        content,
-                        tool_call_id: Some(tool_use_id),
+                        content: r.content.unwrap_or_else(|| Value::String(String::new())),
+                        tool_call_id: r.tool_use_id,
+                        is_error: r.is_error,
                         ..Default::default()
                     });
                 }
@@ -9718,22 +9733,61 @@ fn extract_tool_uses(blocks: &[Value]) -> Vec<ToolUse> {
         .collect()
 }
 
-/// Estrae i blocchi `{type:"tool_result", tool_use_id, content}` come coppie
-/// `(tool_use_id, content-stringa)`. Il `tool_use_id` referenzia il `tool_use`
-/// dell'assistant che lo ha richiesto (round-trip). Il content e' reso a stringa
-/// (il server fa comunque `content_to_string` per il ruolo tool).
-fn extract_tool_results(blocks: &[Value]) -> Vec<(String, Value)> {
+/// Un blocco `{type:"tool_result", ...}` letto dall'`anthropic_content`: la
+/// coppia di round-trip, il payload e l'esito che il tool ha DICHIARATO.
+struct ToolResultBlock {
+    /// `tool_use_id`: referenzia il `tool_use` dell'assistant che lo ha chiesto.
+    /// `Option` perche' i due chiamanti ne hanno bisogno in modo diverso: senza
+    /// id non c'e' round-trip (il ramo che produce i messaggi `role="tool"` lo
+    /// esige), ma un `Message::Tool` porta l'id sul MESSAGGIO e il suo blocco
+    /// resta leggibile lo stesso.
+    tool_use_id: Option<String>,
+    /// Payload reso a stringa. `None` quando il blocco non porta la chiave
+    /// `content`: e' un caso patologico e i due chiamanti vi ripiegano in modo
+    /// diverso, quindi il ripiego non si decide qui.
+    content: Option<Value>,
+    /// Esito dichiarato dal tool (`is_error` del `ContentBlock::ToolResult`).
+    /// `None` = nessuna dichiarazione: un blocco serializzato prima che il campo
+    /// esistesse non diventa un successo per il fatto di essere vecchio.
+    is_error: Option<bool>,
+}
+
+/// Estrae i blocchi `tool_result` di un `anthropic_content`. PUNTO UNICO
+/// (regola L) della lettura di quei blocchi: i due percorsi che portano un
+/// risultato di tool sul wire (il `Message::Tool` esplicito e il turno a blocchi
+/// del `tool_dispatch`) leggono lo stesso campo con lo stesso significato.
+///
+/// L'ESITO VIAGGIA QUI (regola Q): prima questa funzione ritornava la sola
+/// coppia `(tool_use_id, content)` e `is_error` moriva nel passaggio al wire.
+/// Finche' i tool scrivevano il marker `U+274C` in testa al testo il modello
+/// riceveva la dichiarazione comunque; per un tool migrato a `RispostaTool` il
+/// marker non c'e' piu', e senza questo campo il fallimento arriverebbe al
+/// modello come un tool_result indistinguibile da uno riuscito.
+///
+/// Il content e' reso a stringa (il server fa comunque `content_to_string` per
+/// il ruolo tool).
+fn extract_tool_results(blocks: &[Value]) -> Vec<ToolResultBlock> {
     blocks
         .iter()
         .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
-        .filter_map(|b| {
-            let id = b.get("tool_use_id").and_then(Value::as_str)?.to_string();
+        .map(|b| {
+            let tool_use_id = b
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let content = match b.get("content") {
-                Some(Value::String(s)) => Value::String(s.clone()),
-                Some(other) => Value::String(serde_json::to_string(other).unwrap_or_default()),
-                None => Value::String(String::new()),
+                Some(Value::String(s)) => Some(Value::String(s.clone())),
+                Some(other) => Some(Value::String(
+                    serde_json::to_string(other).unwrap_or_default(),
+                )),
+                None => None,
             };
-            Some((id, content))
+            ToolResultBlock {
+                tool_use_id,
+                content,
+                // Dal CAMPO del blocco, mai dal testo del risultato (regola M).
+                is_error: b.get("is_error").and_then(Value::as_bool),
+            }
         })
         .collect()
 }
@@ -9756,27 +9810,30 @@ fn flatten_history_blocks_text(anthropic_content: &Value) -> Value {
 
 /// Estrae il payload del/dei blocco/i `{type:"tool_result", content}` di un
 /// `anthropic_content` (forma Anthropic di un `Message::Tool` a blocchi) verso il
-/// content stringa atteso dal server per il ruolo `tool`. Un solo tool_result
-/// (caso comune): il suo content cosi' com'e' (stringa) o serializzato (struttura).
-/// Piu' blocchi o blocchi non-tool_result: serializza l'intero array (il server
-/// fa comunque `content_to_string`). `Value::Null` se non un array.
-fn tool_result_content(anthropic_content: &Value) -> Value {
+/// content stringa atteso dal server per il ruolo `tool`, INSIEME all'esito
+/// dichiarato. Un solo tool_result (caso comune): il suo content cosi' com'e'
+/// (stringa) o serializzato (struttura), e il suo `is_error`. Piu' blocchi o
+/// blocchi non-tool_result: serializza l'intero array (il server fa comunque
+/// `content_to_string`) e l'esito resta NON dichiarato, perche' con piu' blocchi
+/// non e' attribuibile a uno solo. `Value::Null` se non un array.
+///
+/// Content ed esito escono insieme perche' rispondono alla stessa domanda —
+/// "qual e' IL tool_result di questo messaggio?" — e separarli significherebbe
+/// scegliere il blocco due volte, con due criteri destinati a divergere.
+fn tool_result_content_ed_esito(anthropic_content: &Value) -> (Value, Option<bool>) {
     let Some(arr) = anthropic_content.as_array() else {
-        return Value::Null;
+        return (Value::Null, None);
     };
-    let results: Vec<&Value> = arr
-        .iter()
-        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
-        .collect();
-    if let [single] = results.as_slice() {
-        match single.get("content") {
-            Some(Value::String(s)) => return Value::String(s.clone()),
-            Some(other) => return Value::String(serde_json::to_string(other).unwrap_or_default()),
-            None => {}
+    if let [single] = extract_tool_results(arr).as_slice() {
+        if let Some(content) = &single.content {
+            return (content.clone(), single.is_error);
         }
     }
     // Fallback: l'intero array serializzato (il server lo stringifica comunque).
-    Value::String(serde_json::to_string(arr).unwrap_or_default())
+    (
+        Value::String(serde_json::to_string(arr).unwrap_or_default()),
+        None,
+    )
 }
 
 /// Stima chars del contesto a partire dalle [`HistoryMessage`] (riusa

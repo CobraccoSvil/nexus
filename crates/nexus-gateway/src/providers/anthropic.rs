@@ -620,6 +620,11 @@ fn to_anthropic_messages(req: &LlmRequest) -> (Option<String>, Vec<AnthropicMess
                     content: AnthropicContent::Blocks(vec![AnthropicBlock::ToolResult {
                         tool_use_id: msg.tool_call_id.clone().unwrap_or_default(),
                         content: content_to_string(&msg.content),
+                        // Canale STRUTTURATO dell'esito (regola Q): qui il campo
+                        // esiste nel protocollo, quindi il testo resta testo e
+                        // non deve portare alcun marker perche' il modello
+                        // capisca che il tool ha fallito.
+                        is_error: msg.is_error,
                     }]),
                 });
             }
@@ -1180,6 +1185,16 @@ enum AnthropicBlock {
     ToolResult {
         tool_use_id: String,
         content: String,
+        /// Esito del tool nel campo che l'API Messages prevede per questo
+        /// blocco: e' il canale STRUTTURATO con cui il modello riceve un
+        /// fallimento senza doverlo dedurre dalla prosa del risultato.
+        ///
+        /// Omesso quando l'esito non e' stato dichiarato (`None`): l'API tratta
+        /// l'assenza come "nessun errore", ma noi non lo AFFERMIAMO — mandare
+        /// `false` per un esito ignoto significherebbe dichiarare un successo
+        /// che nessuno ha constatato.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
     },
 }
 
@@ -1419,6 +1434,7 @@ mod tests {
             name: None,
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         }
     }
 
@@ -1487,6 +1503,78 @@ mod tests {
         assert_eq!(m["content"][0]["type"], "tool_result");
         assert_eq!(m["content"][0]["tool_use_id"], "call_42");
         assert_eq!(m["content"][0]["content"], "risultato del tool");
+    }
+
+    /// Costruisce il corpo reale e ne ritorna il blocco `tool_result`
+    /// SERIALIZZATO: la domanda e' cosa parte verso l'API, e asserire sui campi
+    /// dello struct risponderebbe a un'altra domanda (regola O).
+    fn blocco_tool_result_sul_wire(is_error: Option<bool>) -> serde_json::Value {
+        let mut tool_msg = msg("tool", "nessun ascolto sulla porta 24806");
+        tool_msg.tool_call_id = Some("call_42".to_string());
+        tool_msg.is_error = is_error;
+        let req = LlmRequest {
+            model: "claude-x".to_string(),
+            messages: vec![tool_msg],
+            temperature: None,
+            max_tokens: Some(100),
+            tools: None,
+            response_format: None,
+            stream: None,
+            thinking: None,
+            tool_choice: None,
+            pin_provider: None,
+            metadata: metadata(),
+            run_timeout_secs: None,
+        };
+        let json =
+            serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
+        json["messages"][0]["content"][0].clone()
+    }
+
+    /// IL test della catena: un tool FALLITO arriva ad Anthropic con
+    /// `is_error: true` nel campo che il protocollo prevede.
+    ///
+    /// Prima di questo canale l'unico residuo dell'esito era la prosa del
+    /// risultato: finche' i tool scrivevano il marker `U+274C` in testa al
+    /// testo il modello lo riceveva comunque, ma per un tool migrato a
+    /// `RispostaTool` il marker non c'e' piu' e il fallimento arrivava
+    /// indistinguibile da un successo.
+    ///
+    /// MUTAZIONE: togliere `is_error: msg.is_error` da `to_anthropic_messages`
+    /// (o riportare il campo a `None`) -> questo test rosseggia perche' il
+    /// blocco non porta piu' alcuna dichiarazione.
+    #[test]
+    fn un_tool_fallito_dichiara_is_error_sul_wire_anthropic() {
+        let blocco = blocco_tool_result_sul_wire(Some(true));
+
+        assert_eq!(
+            blocco["is_error"],
+            serde_json::json!(true),
+            "il fallimento deve viaggiare nel campo del protocollo: {blocco}"
+        );
+        // Il testo resta testo (regola Q): nessun marker, nessuna decorazione.
+        // Dove il campo esiste, la prosa non deve portare l'esito.
+        assert_eq!(blocco["content"], "nessun ascolto sulla porta 24806");
+    }
+
+    /// I tre casi sono distinti anche sul wire: dichiarato-riuscito e
+    /// NON-dichiarato non sono la stessa cosa.
+    ///
+    /// L'API tratta l'assenza del campo come "nessun errore", ma affermarlo con
+    /// un `false` per un esito che nessuno ha constatato sarebbe una
+    /// dichiarazione inventata: il campo omesso dice "non lo so", ed e' cio' che
+    /// un messaggio tool ricostruito dal sanitizer deve dire.
+    #[test]
+    fn un_esito_ignoto_non_viene_dichiarato_riuscito() {
+        assert_eq!(
+            blocco_tool_result_sul_wire(Some(false))["is_error"],
+            serde_json::json!(false),
+            "un successo DICHIARATO puo' dirsi"
+        );
+        assert!(
+            blocco_tool_result_sul_wire(None).get("is_error").is_none(),
+            "un esito non dichiarato non diventa un successo sul wire"
+        );
     }
 
     #[test]
@@ -2021,6 +2109,7 @@ mod tests {
             name: None,
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         }
     }
 
