@@ -1206,14 +1206,14 @@ mod tests {
         }
     }
 
-    /// Numero di caratteri iniziali in comune fra due teste: dice DOVE divergono,
-    /// non solo che divergono. Un numero senza la sua premessa e' un'opinione.
-    fn prefisso_comune(a: &str, b: &str) -> usize {
-        a.chars()
-            .zip(b.chars())
-            .take_while(|(x, y)| x == y)
-            .count()
-    }
+    // Numero di caratteri iniziali in comune fra due teste: dice DOVE divergono,
+    // non solo che divergono. Un numero senza la sua premessa e' un'opinione.
+    //
+    // La misura sta nel punto unico del prefisso (`nexus_types::system_prompt`,
+    // accanto a `parte_stabile`): la stessa domanda se la pone il test del
+    // compositore di RUN in mcp-core (`compose_agent_system_text`), e due
+    // conteggi separati darebbero due idee diverse di "quanto e' comune".
+    use nexus_types::system_prompt::prefisso_comune;
 
     #[tokio::test]
     async fn la_testa_del_prompt_resta_identica_fra_i_turni() {

@@ -7176,6 +7176,161 @@ mod tests_memorie_di_progetto {
 }
 
 #[cfg(test)]
+mod tests_prefisso_fra_run {
+    //! Il prefisso che due RUN dello stesso progetto condividono.
+    //!
+    //! Il caso fra due TURNI dello stesso run e' gia' misurato altrove
+    //! (`nexus_agent_graph::graph::tests::la_testa_del_prompt_resta_identica_fra_i_turni`,
+    //! sul motore reale) ed e' quello che `CONFINE_DI_TURNO` ha chiuso. Questo
+    //! modulo misura l'altro asse, dichiarato in `componi_system_di_run` e fino
+    //! a qui mai verificato: due run CONSECUTIVI dello stesso progetto, con task
+    //! diversi, devono condividere la parte stabile del system.
+    //!
+    //! Perche' e' l'asse che pesa di piu': i turni di un run si susseguono in
+    //! secondi e il prefisso e' ancora caldo, mentre fra un run e l'altro cambia
+    //! la domanda dell'utente — ed e' li' che un blocco variabile anticipato
+    //! decide se il prossimo run ripaga il system intero o ne rilegge la testa.
+    //!
+    //! La misura passa dal produttore vero ([`compose_agent_system_text`], la
+    //! stessa funzione che chiama `spawn_agent_run`), non da stringhe composte
+    //! qui: un test che concatenasse a mano i blocchi verificherebbe il proprio
+    //! ordine, non quello della produzione (regola O). Sostituito il solo
+    //! confine esterno del richiamo memorie (embedder + Qdrant), come nel modulo
+    //! `tests_memorie_di_progetto` qui sopra.
+
+    use super::{compose_agent_system_text, AgentSystemParts};
+    use crate::prompt_memories::recall_di_test::RecallInMemoria;
+    use nexus_types::system_prompt::{parte_stabile, prefisso_comune};
+    use serde_json::{json, Value};
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    /// Le due domande: due run dello stesso progetto, task diversi. E' l'unica
+    /// cosa che cambia fra i due, ed e' cio' che cambia davvero fra due run.
+    const TASK_A: &str = "come si fa il deploy dello stack?";
+    const TASK_B: &str = "perche' il pannello Porte e' vuoto?";
+
+    /// Le due memorie del progetto: entrambe indicizzate da sempre, entrambe
+    /// attive. A cambiare e' quale delle due sia PERTINENTE alla domanda del
+    /// run, che e' esattamente cio' che fa il motore vettoriale in produzione.
+    const MEMORIA_DEPLOY: &str = "Il deploy locale si fa con deploy/deploy-local.ps1, mai a mano.";
+    const MEMORIA_PORTE: &str = "Le porte dei servizi si chiedono con request_port.";
+
+    const PROJECT_HEADER: &str = "PROGETTO: nexus (Rust + Next.js)\n";
+    const ISTRUZIONI_PROGETTO: &str = "\nNiente emoji nei sorgenti.\n";
+    const PROFILO: &str = "\nProfilo: coder.\n";
+
+    /// Il payload di un punto memoria, chiesto al produttore
+    /// (`chat_sessions::payload_memoria_di_sessione`) invece che ricopiato:
+    /// stessa ragione dichiarata in `tests_memorie_di_progetto`.
+    fn punto(project_id: Uuid, text: &str) -> Value {
+        let mut payload =
+            crate::chat_sessions::payload_memoria_di_sessione(project_id, Uuid::new_v4(), text);
+        payload["active"] = json!(true);
+        payload
+    }
+
+    /// Le parti che il PROGETTO mette nel system: identiche nei due run per
+    /// costruzione, perche' il progetto e' lo stesso. Sono la parte che deve
+    /// restare riusabile.
+    fn parti_del_progetto() -> AgentSystemParts {
+        AgentSystemParts {
+            project_header: PROJECT_HEADER.to_string(),
+            risorse_block: String::new(),
+            project_custom_instructions: ISTRUZIONI_PROGETTO.to_string(),
+            automation_instructions: "MODALITA': automatic\n".to_string(),
+            o_series_instructions: String::new(),
+            test_instructions: String::new(),
+            profile_prompt_block: PROFILO.to_string(),
+            system_context: String::new(),
+            self_ref_hint: String::new(),
+        }
+    }
+
+    /// Il primo punto di divergenza fra due teste, in forma leggibile: quanti
+    /// caratteri hanno in comune e cosa viene subito dopo nell'uno e nell'altro.
+    /// Senza questo, un fallimento direbbe "sono diverse" e chi lo legge
+    /// dovrebbe indovinare quale blocco si e' messo davanti.
+    fn dove_divergono(a: &str, b: &str) -> String {
+        let comune = prefisso_comune(a, b);
+        // Gli ultimi caratteri ancora condivisi: e' il testo che precede il
+        // punto di rottura, cioe' l'ultimo blocco che i due run hanno in comune.
+        let coda_comune: String = a
+            .chars()
+            .skip(comune.saturating_sub(60))
+            .take(comune.min(60))
+            .collect();
+        let prosegue = |t: &str| t.chars().skip(comune).take(160).collect::<String>();
+        format!(
+            "primo carattere diverso all'indice {comune} (le due teste sono lunghe {} e {} \
+             caratteri)\n  fin li' in comune: ...{coda_comune:?}\n  run A prosegue con: \
+             {:?}\n  run B prosegue con: {:?}",
+            a.chars().count(),
+            b.chars().count(),
+            prosegue(a),
+            prosegue(b),
+        )
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn due_run_dello_stesso_progetto_con_task_diversi_condividono_la_parte_stabile(
+        pool: PgPool,
+    ) {
+        let project_id = Uuid::new_v4();
+
+        // Run A chiede del deploy: pertinente la memoria sul deploy.
+        let recall_a = RecallInMemoria::nuovo()
+            .con_punto(0.91, punto(project_id, MEMORIA_DEPLOY))
+            .con_punto(0.40, punto(project_id, MEMORIA_PORTE));
+        let sys_a =
+            compose_agent_system_text(&pool, &recall_a, project_id, TASK_A, parti_del_progetto())
+                .await;
+
+        // Run B, stesso progetto, chiede delle porte: pertinente l'altra. Nulla
+        // di cio' che il chiamante fornisce e' cambiato — solo la domanda.
+        let recall_b = RecallInMemoria::nuovo()
+            .con_punto(0.35, punto(project_id, MEMORIA_DEPLOY))
+            .con_punto(0.93, punto(project_id, MEMORIA_PORTE));
+        let sys_b =
+            compose_agent_system_text(&pool, &recall_b, project_id, TASK_B, parti_del_progetto())
+                .await;
+
+        // La premessa, dichiarata: i due system SONO diversi. Senza questo il
+        // test passerebbe anche su due composizioni identiche, cioe' senza aver
+        // misurato nulla.
+        assert_ne!(
+            sys_a, sys_b,
+            "premessa non verificata: i due run devono differire (memorie pertinenti diverse)"
+        );
+        assert!(sys_a.contains(MEMORIA_DEPLOY) && !sys_a.contains(MEMORIA_PORTE), "{sys_a}");
+        assert!(sys_b.contains(MEMORIA_PORTE) && !sys_b.contains(MEMORIA_DEPLOY), "{sys_b}");
+
+        let stabile_a = parte_stabile(&sys_a);
+        let stabile_b = parte_stabile(&sys_b);
+
+        // Non vacuo: la parte stabile deve contenere cio' che il progetto mette.
+        // Due stringhe vuote coinciderebbero, e il contratto sarebbe rispettato
+        // per assenza di prefisso — che e' il difetto, non la sua chiusura.
+        assert!(
+            stabile_a.contains(PROJECT_HEADER) && stabile_a.contains(ISTRUZIONI_PROGETTO),
+            "la parte stabile non contiene le istruzioni di progetto: {stabile_a:?}"
+        );
+
+        assert!(
+            stabile_a == stabile_b,
+            "due run dello stesso progetto con task diversi NON condividono la parte stabile \
+             del system: da quel punto in poi il fornitore non ha nulla da riusare e il run \
+             successivo ripaga il prompt intero.\n{}\n\nQuesto e' il contratto dichiarato da \
+             `componi_system_di_run`: prima i blocchi identici fra run, poi quelli che \
+             cambiano. L'ordine c'e'; a mancare e' il confine che lo rende leggibile a \
+             `parte_stabile`, da cui derivano sia la `prompt_cache_key` di openai_compat sia \
+             il breakpoint `cache_control` di anthropic.",
+            dove_divergono(stabile_a, stabile_b)
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests_compose_report {
     use super::{compose_unconfirmed_report, NOTE_GATE_NON_SUPERATA};
 

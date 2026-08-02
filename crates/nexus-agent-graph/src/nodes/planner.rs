@@ -32,11 +32,13 @@
 //! - **Tool catalog `nexus_todo_write`** (`:221-290`, [`tool_catalog`]): schema
 //!   JSON statico. Costante 1:1.
 //! - **`hinted_system`** (`:296-366`, rami ON, [`PlannerNode::build_hinted_system`]):
-//!   `system_text` + RUN_ID hint + `<comprensione_preliminare>` (context_brief) +
-//!   turn_focus IN CODA dietro il confine di turno (riusa
+//!   `system_text` e basta come parte stabile; RUN_ID hint,
+//!   `<comprensione_preliminare>` (context_brief) e turn_focus stanno tutti IN
+//!   CODA dietro il confine di turno, perche' il planner e' un nodo one-shot e il
+//!   suo unico riuso possibile e' cross-run (riusa
 //!   [`crate::decisions::turn_focus::build_turn_focus_directive`] per il contenuto
-//!   e `inject_turn_focus` per la posizione, punti unici, regola L).
-//!   RAG/backlog/dag = OFF (TODO, vedi sotto).
+//!   e `appendi_blocco_di_turno`/`inject_turn_focus` per la posizione, punti
+//!   unici, regola L). RAG/backlog/dag = OFF (TODO, vedi sotto).
 //! - **Fallback chain decision** (`:399-492`,
 //!   [`PlannerNode::resolve_todo_block`]): `next()` su tool_use per
 //!   `nexus_todo_write`; se None -> fallback tool-robust (provider/model diverso,
@@ -888,32 +890,88 @@ impl PlannerNode {
 
     /// Costruisce `hinted_system` con i SOLI rami ON di default
     /// (`planner_node.py:296-366`). Ordine di concatenazione:
-    ///   1. `system_text`
+    ///   1. `system_text` — l'UNICA parte che entra nell'identita' del prefisso
+    /// e poi, tutti DIETRO il confine di turno:
     ///   2. RUN_ID hint
     ///   3. `<comprensione_preliminare>` (context_brief, se presente)
-    ///   4. turn_focus IN CODA, dietro il confine di turno (se
-    ///      `turn_focus_enabled`, riusa il punto unico dell'iniezione)
+    ///   4. turn_focus (se `turn_focus_enabled`)
     ///
     /// Rami OFF (RAG decisionale, backlog, dag_kb) NON aggiunti (vedi doc modulo).
     /// PURO: nessun I/O (il turn_focus e' una funzione pura sullo stato).
+    ///
+    /// ## Perche' TUTTO il per-run sta dietro il confine
+    ///
+    /// Il planner e' un nodo ONE-SHOT: il grafo lo attraversa una volta sola per
+    /// run (unico arco entrante da `Understanding`, `route_after_planner` non ci
+    /// torna). Non esiste quindi un "secondo turno" di questo nodo che possa
+    /// rileggere la cache scritta dal primo: **l'unico riuso possibile per il
+    /// prompt del planner e' CROSS-RUN**. Ne segue che qualunque dato per-run
+    /// messo davanti al confine non e' solo inutile — e' esattamente cio' che
+    /// annulla il riuso, perche' i due consumatori della `parte_stabile` non
+    /// confrontano il testo grezzo ma proprio quella:
+    ///   - `openai_compat::prompt_cache_key` ne fa lo SHA256: un uuid dentro
+    ///     manda ogni run in un raggruppamento diverso;
+    ///   - `anthropic::build_system_field` ci mette il breakpoint `cache_control`:
+    ///     il blocco memorizzato conterrebbe l'uuid, quindi la cache verrebbe
+    ///     RISCRITTA a ogni run e non riletta mai (su Anthropic scrivere costa
+    ///     1,25x l'input, rileggere 0,1x).
+    ///
+    /// MISURATO sul DB live il 02/08/2026: `agent.planner.base` vale 6.555
+    /// caratteri e il purpose `planner` risolve a `mistral/codestral-latest`,
+    /// cioe' proprio un `PromptCacheKeying::RequiresKey` — su Mistral, senza una
+    /// chiave STABILE il prefisso non viene riusato MAI (misura in
+    /// `nexus-gateway/src/types.rs`: `cached_tokens` resta 0 a ogni chiamata).
+    ///
+    /// Col RUN_ID davanti, la `parte_stabile` era 6.666 caratteri (6.555 + la riga
+    /// dell'hint) DIVERSI a ogni run: due run ne condividevano 6.574 su 6.666, ma
+    /// la chiave e' uno SHA256 — il 98,6% in comune vale esattamente quanto lo 0%.
+    /// E poiche' il planner gira una volta per run, quella chiave era unica per
+    /// OGNI sua chiamata: nessuna coppia di chiamate l'ha mai condivisa. Dietro il
+    /// confine la `parte_stabile` e' 6.555 caratteri IDENTICI, quindi una sola
+    /// chiave per tutte le pianificazioni dello stesso progetto.
+    ///
+    /// Per questo il metro NON e' il prefisso di testo grezzo: quello era gia'
+    /// condiviso (l'hint viene dopo il system) e non e' cio' che i consumatori
+    /// guardano. Il metro e' se la `parte_stabile` coincide, ed e' binario.
+    ///
+    /// Il `context_brief` segue il RUN_ID per la STESSA ragione, non per simmetria
+    /// estetica: e' derivato dalla richiesta di questo run, quindi cambia con essa.
+    /// Oggi e' sempre vuoto — `orchestrator.understanding_enabled = false` sul DB
+    /// live, e il Gate 0 di `UnderstandingNode::run` esce prima di produrlo — per
+    /// cui spostarlo non muove NULLA di misurabile adesso. Lo si sposta perche' la
+    /// migrazione 0667 dichiara che accendere quel nodo e' ormai una decisione da
+    /// `UPDATE` e non da deploy: lasciandolo davanti al confine, il primo che
+    /// eseguisse quell'UPDATE annullerebbe in silenzio il riuso cross-run
+    /// riaprendo questo difetto senza che nulla fallisca.
     pub fn build_hinted_system(&self, state: &AgentState, run_id: &str) -> String {
-        // (1) + (2) system_text + RUN_ID hint (`:296-299`).
-        let mut hinted = format!(
-            "{}\n\nRUN_ID corrente: {run_id} (usalo come parametro run_id nel tool nexus_todo_write)",
-            self.cfg.planner_system_text
+        // (1) La parte STABILE del prefisso: il solo system del planner.
+        let mut hinted = self.cfg.planner_system_text.clone();
+
+        // (2) RUN_ID hint (`:296-299`), dietro il confine (delega al punto unico
+        // della POSIZIONE, regola L: la scelta di dove sta un blocco non si
+        // ricopia qui con un `format!`).
+        hinted = nexus_types::system_prompt::appendi_blocco_di_turno(
+            &hinted,
+            &format!(
+                "RUN_ID corrente: {run_id} \
+                 (usalo come parametro run_id nel tool nexus_todo_write)"
+            ),
         );
 
         // (3) <comprensione_preliminare> dal context_brief del nodo understanding
         // (`:301-309`). `str(state.get("context_brief") or "").strip()`.
         let brief = state.context_brief.as_deref().unwrap_or("").trim();
         if !brief.is_empty() {
-            hinted.push_str(
-                "\n\n<comprensione_preliminare>\n\
-                 Contesto raccolto prima di pianificare (grounding sul codebase + \
-                 esplorazioni). Usalo per un piano fondato, non assunzioni alla cieca.\n",
+            hinted = nexus_types::system_prompt::appendi_blocco_di_turno(
+                &hinted,
+                &format!(
+                    "<comprensione_preliminare>\n\
+                     Contesto raccolto prima di pianificare (grounding sul codebase + \
+                     esplorazioni). Usalo per un piano fondato, non assunzioni alla cieca.\n\
+                     {brief}\n\
+                     </comprensione_preliminare>"
+                ),
             );
-            hinted.push_str(brief);
-            hinted.push_str("\n</comprensione_preliminare>");
         }
 
         // Rami OFF (RAG / backlog / dag_kb): NON portati. Con i default DB
@@ -936,12 +994,18 @@ impl PlannerNode {
         // focus e' ricalcolato dallo stato del run, quindi in testa spostava i
         // primi caratteri del system e il fornitore non trovava piu' nulla da
         // riusare di tutto cio' che lo segue. Misurato su questo nodo: fra due
-        // run la testa in comune scendeva da ~5860 caratteri (il
-        // `planner_system_text` fino al RUN_ID) a ~75, sotto qualunque blocco
+        // run la testa in comune scendeva a ~75 caratteri, sotto qualunque blocco
         // minimo di cache. Nessuna difesa a valle poteva accorgersene, perche'
         // `prompt_cache_key` filtra sulla `parte_stabile` e il confine il planner
         // non lo emetteva mai. In coda la directive non perde forza: e' il testo
         // adiacente alla conversazione (vedi `inject_turn_focus`).
+        //
+        // Quel primo intervento fermo' l'emorragia a meta': il confine cominciava
+        // a esistere, ma davanti gli restava il RUN_ID, quindi la `parte_stabile`
+        // era ancora diversa a ogni run. Il tratto in comune saliva a 6.555
+        // caratteri di TESTO grezzo e restava ZERO per i due consumatori che
+        // guardano la `parte_stabile` (vedi la nota in testa alla funzione): e'
+        // la ragione per cui il metro di questo nodo non e' il prefisso grezzo.
         if self.cfg.turn_focus_enabled {
             if let Some(focus) = build_turn_focus_directive(state, false) {
                 hinted = ctxr::inject_turn_focus(&hinted, &focus);
@@ -2811,18 +2875,147 @@ mod tests {
     }
 
     /// Il verso opposto, che tiene onesto il test sopra: col focus spento il
-    /// prompt non porta ne' la directive ne' il confine, cioe' resta bit-identico
-    /// a quello di un run senza turn_focus.
+    /// prompt non porta la directive.
+    ///
+    /// NON asserisce piu' l'assenza del confine: da quando il RUN_ID sta dietro
+    /// di esso il confine c'e' sempre, ed e' il punto dell'intervento. Cio' che
+    /// resta da provare — e che e' il vero contenuto di "non lascia traccia" — e'
+    /// che spegnere il focus non sposta la parte stabile.
     #[test]
     fn focus_spento_non_lascia_traccia_nel_prompt_del_planner() {
         let cfg = PlannerConfig {
             turn_focus_enabled: false,
             ..cfg_active()
         };
+        let testa = cfg.planner_system_text.clone();
         let node = node_with(cfg, Arc::new(StubTodoStore::with_todos(vec![])));
         let h = node.build_hinted_system(&stato_con_task("crea index.html"), "run-1");
         assert!(!h.contains("FOCUS DEL TURNO"));
-        assert!(!h.contains(nexus_types::system_prompt::CONFINE_DI_TURNO));
+        assert!(!h.contains("crea index.html"), "il focus e' trapelato: {h}");
+        assert_eq!(nexus_types::system_prompt::parte_stabile(&h), testa);
+    }
+
+    // ── posizione del RUN_ID: il riuso CROSS-RUN del prompt del planner ──────
+
+    // La misura del prefisso sta nel punto unico accanto a `parte_stabile`
+    // (nexus-types): due conteggi darebbero due idee diverse di "quanto e'
+    // comune" — e' la stessa delega dei test di graph.rs.
+    use nexus_types::system_prompt::prefisso_comune;
+
+    /// CONTRATTO: due run consecutivi del planner condividono la parte stabile
+    /// per intero.
+    ///
+    /// Il planner e' ONE-SHOT (un solo arco entrante, nessun ritorno): non ha un
+    /// secondo turno che possa rileggere la propria cache, quindi il riuso
+    /// cross-run e' l'unico che abbia. Il RUN_ID davanti al confine lo annullava:
+    /// non toccava il prefisso di TESTO (viene dopo il system, quindi i caratteri
+    /// grezzi in comune restavano tutti), ma spostava la `parte_stabile`, che e'
+    /// cio' che i due consumatori guardano davvero — `prompt_cache_key` ne fa lo
+    /// SHA256, `build_system_field` ci mette il breakpoint `cache_control`.
+    ///
+    /// Per questo il test misura la `parte_stabile` e non il prefisso grezzo: sul
+    /// grezzo sarebbe passato anche col difetto in produzione.
+    #[test]
+    fn il_run_id_non_entra_nella_parte_stabile_del_planner() {
+        let cfg = cfg_active();
+        let testa = cfg.planner_system_text.clone();
+        let node = node_with(cfg, Arc::new(StubTodoStore::with_todos(vec![])));
+
+        // Due run DIVERSI: run_id diverso e task diverso, come due run consecutivi
+        // dello stesso progetto.
+        let ha = node.build_hinted_system(
+            &stato_con_task("crea index.html con la pagina di login"),
+            "11111111-aaaa-4aaa-8aaa-111111111111",
+        );
+        let hb = node.build_hinted_system(
+            &stato_con_task("correggi il calcolo del totale in spese.ts"),
+            "22222222-bbbb-4bbb-8bbb-222222222222",
+        );
+
+        // Il RUN_ID c'e' davvero in entrambi: senza questo il resto passerebbe
+        // anche su un prompt da cui l'hint fosse sparito del tutto.
+        assert!(ha.contains("11111111-aaaa-4aaa-8aaa-111111111111"));
+        assert!(hb.contains("22222222-bbbb-4bbb-8bbb-222222222222"));
+        assert!(ha.contains("nexus_todo_write"), "hint RUN_ID assente: {ha}");
+
+        // (1) La CONSEGUENZA: la parte su cui il gateway costruisce l'identita'
+        // del prefisso e' la STESSA per i due run, ed e' tutto il system.
+        let sa = nexus_types::system_prompt::parte_stabile(&ha);
+        let sb = nexus_types::system_prompt::parte_stabile(&hb);
+        assert_eq!(
+            sa,
+            sb,
+            "la parte stabile differisce fra due run: prompt_cache_key diverso e \
+             cache Anthropic riscritta a ogni run.\ncomuni solo {} caratteri su {}",
+            prefisso_comune(sa, sb),
+            sa.chars().count()
+        );
+        assert_eq!(sa, testa, "la parte stabile non e' il system del planner");
+
+        // (2) Nessun uuid e' finito nella parte stabile — il modo in cui il
+        // difetto si presentava.
+        assert!(!sa.contains("11111111-aaaa"), "il RUN_ID e' nel prefisso: {sa}");
+
+        // (3) Il confine e' uno solo anche con due blocchi appesi (RUN_ID + focus).
+        assert_eq!(
+            ha.matches(nexus_types::system_prompt::CONFINE_DI_TURNO)
+                .count(),
+            1
+        );
+    }
+
+    /// Il RUN_ID resta LEGGIBILE dal modello: sta dietro il confine, non e' stato
+    /// tolto. Il confine e' un marcatore per il gateway, non un troncamento — se
+    /// l'hint sparisse, il planner non saprebbe piu' che `run_id` passare a
+    /// `nexus_todo_write` e il difetto sarebbe peggiore di quello curato.
+    #[test]
+    fn il_run_id_resta_nel_prompt_dietro_il_confine() {
+        let node = node_with(cfg_active(), Arc::new(StubTodoStore::with_todos(vec![])));
+        let h = node.build_hinted_system(&stato_con_task("x"), "run-42");
+        let (stabile, variabile) = h
+            .split_once(nexus_types::system_prompt::CONFINE_DI_TURNO)
+            .expect("il confine deve esserci");
+        assert!(!stabile.contains("run-42"));
+        assert!(
+            variabile.contains("RUN_ID corrente: run-42"),
+            "l'hint non e' dietro il confine: {variabile}"
+        );
+        assert!(variabile.contains("nexus_todo_write"));
+    }
+
+    /// Il `context_brief` segue il RUN_ID dietro il confine.
+    ///
+    /// Oggi questo test descrive un ramo che in produzione non si attraversa mai
+    /// (`orchestrator.understanding_enabled = false` sul DB live, misurato il
+    /// 02/08/2026: il Gate 0 di `UnderstandingNode::run` esce prima di produrre il
+    /// brief). E' scritto lo stesso perche' quel flag e' un `UPDATE` di distanza —
+    /// la migrazione 0667 lo dichiara esplicitamente — e senza questo vincolo il
+    /// primo che lo accendesse rimetterebbe un blocco per-run nella parte stabile,
+    /// riaprendo il difetto senza che nulla fallisca.
+    #[test]
+    fn il_context_brief_non_entra_nella_parte_stabile_del_planner() {
+        let cfg = cfg_active();
+        let testa = cfg.planner_system_text.clone();
+        let node = node_with(cfg, Arc::new(StubTodoStore::with_todos(vec![])));
+
+        let mut a = stato_con_task("task uno");
+        a.context_brief = Some("grounding del run A: src/login.ts".to_string());
+        let mut b = stato_con_task("task due");
+        b.context_brief = Some("grounding del run B: src/spese.ts".to_string());
+
+        let ha = node.build_hinted_system(&a, "run-a");
+        let hb = node.build_hinted_system(&b, "run-b");
+
+        // Il brief c'e' e resta leggibile, col suo involucro.
+        assert!(ha.contains("grounding del run A: src/login.ts"));
+        assert!(ha.contains("<comprensione_preliminare>"));
+        assert!(ha.contains("</comprensione_preliminare>"));
+
+        // La conseguenza: due brief diversi non spostano la parte stabile.
+        let sa = nexus_types::system_prompt::parte_stabile(&ha);
+        assert_eq!(sa, nexus_types::system_prompt::parte_stabile(&hb));
+        assert_eq!(sa, testa);
+        assert!(!sa.contains("grounding del run A"));
     }
 }
 

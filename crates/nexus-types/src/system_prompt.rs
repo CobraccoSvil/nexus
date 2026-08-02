@@ -65,12 +65,38 @@ pub fn appendi_blocco_di_turno(system: &str, blocco: &str) -> String {
 /// Un blocco con lo stato dei servizi in seconda posizione rendeva inutile il
 /// resto del system appena l'agente avviava un servizio.
 ///
-/// Niente separatori aggiunti: i blocchi si isolano da soli (portano gia' i
+/// Il CONFINE lo emette QUESTA funzione, sulla cucitura fra i due gruppi, appena
+/// esiste una parte variabile non vuota. Fino al 02/08/2026 non lo emetteva
+/// nessuno: il marcatore entrava solo se un blocco di turno veniva appeso DOPO
+/// (in mcp-core, il solo blocco KB), quindi il confine dipendeva da un dato
+/// variabile per messaggio — con la ricerca semantica a vuoto, o sotto
+/// `min_score`, [`parte_stabile`] tornava a coprire l'INTERO system, memorie
+/// comprese, e due richieste della stessa sessione finivano in gruppi di cache
+/// diversi. Misurato dal test `tests_prefisso_fra_run` in mcp-core, nato ROSSO
+/// su questo difetto: divergenza a 149 caratteri su 575 fra due run che
+/// dovevano condividere tutta la testa.
+///
+/// L'ordine col ramo `contains` di [`appendi_blocco_di_turno`] e' quello
+/// giusto per costruzione: i blocchi di TURNO appesi dopo si accodano dietro
+/// questo stesso confine senza duplicarlo, e [`parte_stabile`] taglia al PRIMO
+/// marcatore — cioe' sempre alla cucitura stabile/variabile del run.
+///
+/// Niente separatori aggiunti fra i blocchi: si isolano da soli (portano gia' i
 /// propri a capo), come nella concatenazione che questa funzione sostituisce.
 pub fn componi_system_di_run(stabili: &[&str], variabili_fra_run: &[&str]) -> String {
     let mut out = String::new();
-    for parte in stabili.iter().chain(variabili_fra_run.iter()) {
+    for parte in stabili.iter() {
         out.push_str(parte);
+    }
+    // Il confine si emette solo se esiste una parte variabile con del contenuto:
+    // un run senza blocchi variabili resta bit-identico a ieri, e un system che
+    // finisce col marcatore nudo non regala niente a nessuno.
+    if variabili_fra_run.iter().any(|p| !p.trim().is_empty()) {
+        let testa_pulita = out.trim_end().to_string();
+        out = format!("{testa_pulita}\n\n{CONFINE_DI_TURNO}\n");
+        for parte in variabili_fra_run.iter() {
+            out.push_str(parte);
+        }
     }
     out
 }
@@ -86,6 +112,29 @@ pub fn parte_stabile(system: &str) -> &str {
         Some(i) => system[..i].trim_end(),
         None => system,
     }
+}
+
+/// Quanti caratteri iniziali due prompt hanno in comune: DOVE divergono, non
+/// solo che divergono.
+///
+/// E' la misura con cui si legge un prefisso non riusato. Un'asserzione che
+/// dice soltanto "le due teste sono diverse" lascia indovinare quale blocco si
+/// e' messo davanti; il numero, letto insieme ai caratteri che seguono nei due
+/// testi, nomina il punto esatto della divergenza — che e' anche il punto in
+/// cui il fornitore smette di riusare (un numero senza la sua premessa e'
+/// un'opinione, regola O).
+///
+/// Vive qui, accanto a [`parte_stabile`], perche' i due lati del confine si
+/// misurano con lo stesso metro: i test del compositore di RUN (mcp-core,
+/// `compose_agent_system_text`) e quelli del motore che ricompone il system a
+/// ogni TURNO (`nexus-agent-graph`) pongono la stessa domanda, e due copie di
+/// questo conteggio darebbero due idee diverse di "quanto e' comune".
+///
+/// Conta CARATTERI, non byte: il punto di divergenza si legge in un messaggio
+/// di errore, e un indice di byte dentro un carattere multi-byte non e'
+/// affettabile.
+pub fn prefisso_comune(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
 
 #[cfg(test)]
@@ -140,5 +189,60 @@ mod tests {
     fn senza_confine_tutto_il_system_e_stabile() {
         assert_eq!(parte_stabile(BASE), BASE);
         assert_eq!(parte_stabile(""), "");
+    }
+
+    #[test]
+    fn il_compositore_di_run_emette_il_confine_sulla_cucitura() {
+        // Il contratto in una riga: la parte stabile di un system composto e'
+        // ESATTAMENTE il gruppo degli stabili, qualunque cosa contengano i
+        // variabili. Prima del fix il confine non veniva emesso da nessuno, e
+        // parte_stabile copriva l'intero system — memorie comprese.
+        //
+        // MUTAZIONE: togliere l'emissione del confine (tornare alla pura
+        // concatenazione) fa fallire la prima asserzione con la parte stabile
+        // che ingloba "MEMORIE...", che e' il valore del difetto reale.
+        let s = componi_system_di_run(
+            &["PROGETTO: nexus\n", "Istruzioni.\n"],
+            &["MEMORIE: solo di questo run\n"],
+        );
+        assert_eq!(parte_stabile(&s), "PROGETTO: nexus\nIstruzioni.");
+        assert!(s.contains("MEMORIE: solo di questo run"));
+        assert_eq!(s.matches(CONFINE_DI_TURNO).count(), 1);
+
+        // Un blocco di TURNO appeso dopo si accoda dietro lo STESSO confine:
+        // niente secondo marcatore, e la parte stabile non si muove.
+        let con_turno = appendi_blocco_di_turno(&s, "FOCUS: il task di adesso");
+        assert_eq!(con_turno.matches(CONFINE_DI_TURNO).count(), 1);
+        assert_eq!(parte_stabile(&con_turno), "PROGETTO: nexus\nIstruzioni.");
+    }
+
+    #[test]
+    fn senza_variabili_il_compositore_non_emette_il_confine() {
+        // Un run senza parte variabile resta bit-identico alla concatenazione:
+        // nessun marcatore nudo in coda, e tutta la testa e' stabile. Vale anche
+        // per variabili presenti ma VUOTI (il caso reale: memorie a vuoto,
+        // nessuna risorsa) — il confine condizionato alla PRESENZA del dato e
+        // non al suo contenuto era esattamente il difetto.
+        let solo_stabili = componi_system_di_run(&["PROGETTO: nexus\n"], &[]);
+        assert!(!solo_stabili.contains(CONFINE_DI_TURNO));
+        assert_eq!(parte_stabile(&solo_stabili), solo_stabili.as_str());
+
+        let variabili_vuoti = componi_system_di_run(&["PROGETTO: nexus\n"], &["", "  \n"]);
+        assert!(!variabili_vuoti.contains(CONFINE_DI_TURNO));
+        assert_eq!(variabili_vuoti, solo_stabili);
+    }
+
+    #[test]
+    fn il_prefisso_comune_dice_dove_si_diverge() {
+        // Il servizio che rende: l'indice del primo carattere diverso, cioe' il
+        // punto in cui il fornitore smette di riusare.
+        assert_eq!(prefisso_comune("PROGETTO: nexus\nA", "PROGETTO: nexus\nB"), 16);
+        assert_eq!(prefisso_comune("identici", "identici"), 8);
+        assert_eq!(prefisso_comune("", "qualcosa"), 0);
+        // Il piu' corto dei due limita il conteggio: nessun panic sul prefisso
+        // proprio (un system troncato e' un caso reale, non un'ipotesi).
+        assert_eq!(prefisso_comune("abc", "abcdef"), 3);
+        // Caratteri, non byte: un accento conta uno.
+        assert_eq!(prefisso_comune("perche' e' cosi'", "perche' e' colto"), 13);
     }
 }

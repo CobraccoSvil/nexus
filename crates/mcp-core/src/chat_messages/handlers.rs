@@ -514,10 +514,58 @@ fn resolve_supervisor_mode(body: &SendChatMessageRequest) -> Result<SupervisorMo
 /// confine esterno (embedder + Qdrant) e tenerlo fuori rende la composizione
 /// interrogabile senza un `AppState` intero.
 ///
-/// I blocchi appesi qui restano nella PARTE STABILE del system (nessun
-/// `CONFINE_DI_TURNO`, vedi `nexus_types::system_prompt`): sono costanti per
-/// tutta la durata del turno e nessuno di essi precede la testa del template,
-/// quindi il prefisso riusabile dal fornitore resta intero.
+/// ## Che cosa entra nella parte STABILE, e perche' il blocco KB no
+///
+/// L'unita' su cui un fornitore riusa il prefisso non e' il turno: e' la
+/// SESSIONE, cioe' la serie di richieste che condividono una testa identica. Il
+/// commento che stava qui affermava che i blocchi appesi sono «costanti per
+/// tutta la durata del turno» — vero, e irrilevante: un blocco puo' essere
+/// costante per il turno e diverso a ogni messaggio, ed e' esattamente il caso
+/// peggiore, perche' sta nella parte dichiarata stabile e la rimette in
+/// movimento a ogni invio.
+///
+/// Restano nella parte stabile, ciascuno per la sua ragione:
+///   - il template `system.nexus_base`: e' configurazione, cambia quando
+///     l'amministratore lo riscrive;
+///   - il suffisso act-first: dipende dalla sola `automation_mode`, che e' una
+///     scelta di sessione;
+///   - l'account GitHub: e' dell'utente;
+///   - il blocco d'ambiente (`crate::prompt_ambiente`): e' un fatto misurato
+///     sull'host, stabile per la vita del processo. Per questo si appende PRIMA
+///     del blocco KB: il confine e' posizionale, e messo dopo di lui lo
+///     spingerebbe fuori dal prefisso contraddicendo cio' che il suo stesso
+///     modulo dichiara.
+///
+/// Va invece DIETRO il confine (`appendi_blocco_di_turno`) il solo blocco
+/// Knowledge Base: `build_knowledge_context` e' un top-K semantico sul TESTO
+/// del messaggio utente, quindi il blocco cambia a ogni messaggio della stessa
+/// sessione. Da li' cambiava `parte_stabile`, e con essa la `prompt_cache_key`
+/// di `openai_compat` e il breakpoint `cache_control` di `anthropic`, che da
+/// quel punto unico derivano entrambi.
+///
+/// Il blocco resta nel prompt e il modello continua a leggerlo: il confine
+/// decide che cosa entra nell'IDENTITA' del prefisso, non che cosa il modello
+/// vede.
+///
+/// CONSEGUENZA NEL RUN AGENTICO, dichiarata perche' non e' ovvia: in
+/// `compose_agent_system_text` questo testo e' l'ULTIMO dei blocchi stabili, e
+/// il confine sulla cucitura fra `stabili` e `variabili_fra_run` lo emette
+/// `componi_system_di_run` STESSO, incondizionatamente — non il blocco KB. Il
+/// confine appeso qui, quando il KB c'e', si fonde con quello per l'idempotenza
+/// di `appendi_blocco_di_turno`; quando il KB manca (embed fallito, Qdrant giu',
+/// nessuna nota sopra `min_score`) il confine c'e' comunque, e i quattro blocchi
+/// variabili (stato di servizi e porte, memorie richiamate sulla domanda,
+/// istruzioni di test derivate dal messaggio, hint sulla cronologia) restano
+/// fuori dal prefisso. Condizionare il confine alla PRESENZA del dato variabile
+/// era il difetto misurato da `tests_prefisso_fra_run`: divergenza a 149
+/// caratteri su 575 fra due run che dovevano condividere tutta la testa.
+///
+/// NON e' trattato qui, e non va spostato per analogia: il gate del consiglio
+/// (`gate_council_directive`) decide anch'esso sul testo del messaggio, ma non
+/// e' un blocco appeso — e' un taglio DENTRO il corpo del template, e portarlo
+/// dietro il confine significherebbe spostare la direttiva dal punto in cui la
+/// migrazione l'ha messa alla coda del prompt. E' un intervento sul contenuto
+/// del template, non sulla composizione.
 async fn compose_chat_system_context(
     db: &PgPool,
     template_cache: &crate::prompt_templates::TemplateCache,
@@ -547,18 +595,21 @@ async fn compose_chat_system_context(
     if let Some(gh) = github_username {
         ctx.push_str(&format!(" Account GitHub: @{gh}."));
     }
-    // Iniezione Knowledge Base (top-K note semanticamente rilevanti), gia'
-    // risolta dal chiamante. Failsafe: se brain down o KB vuota il flusso
-    // prosegue senza contesto KB.
-    if let Some(kb_block) = knowledge_block {
-        ctx.push_str("\n\n");
-        ctx.push_str(&kb_block);
-    }
     // L'host su cui i comandi gireranno DAVVERO, dichiarato invece che indovinato
     // — e la direttiva sui privilegi tolta se presuppone un gestore che qui non
     // esiste. Sta dentro il compositore, non nel chiamante: un system prompt di
     // esecuzione non deve essere componibile senza (vedi `crate::prompt_ambiente`).
-    crate::prompt_ambiente::con_ambiente(db, ctx).await
+    // PRIMA del blocco KB: e' un fatto stabile e deve restare nel prefisso.
+    let stabile = crate::prompt_ambiente::con_ambiente(db, ctx).await;
+    // Iniezione Knowledge Base (top-K note semanticamente rilevanti), gia'
+    // risolta dal chiamante. Failsafe: se brain down o KB vuota il flusso
+    // prosegue senza contesto KB — e senza confine, perche' un blocco vuoto e'
+    // un no-op: due messaggi, uno con note pertinenti e uno senza, condividono
+    // comunque tutta la testa.
+    nexus_types::system_prompt::appendi_blocco_di_turno(
+        &stabile,
+        knowledge_block.as_deref().unwrap_or_default(),
+    )
 }
 
 pub async fn send_chat_message(
@@ -2998,6 +3049,13 @@ mod tests_system_prompt_della_chat {
     //!
     //! `META_MIGRATOR` costruisce lo schema meta da zero: `nexus_prompt_templates`
     //! e il suo contenuto arrivano dalle migrazioni reali, non da una fixture.
+    //!
+    //! Il modulo presidia un SECONDO contratto sullo stesso produttore, che non
+    //! riguarda il contenuto ma la POSIZIONE: quale parte del system entra
+    //! nell'identita' del prefisso riusabile dal fornitore. Vale per l'unita'
+    //! SESSIONE, non per il turno — un blocco costante per tutto il turno e
+    //! diverso a ogni messaggio e' il caso peggiore, ed era il caso del blocco
+    //! Knowledge Base (vedi `due_messaggi_diversi_condividono_la_testa_del_system`).
 
     use super::compose_chat_system_context;
     use crate::orchestrator::AutomationMode;
@@ -3112,15 +3170,20 @@ mod tests_system_prompt_della_chat {
         assert!(system.starts_with(BASE), "{system}");
         assert!(system.contains(SUFFISSO), "{system}");
         assert!(system.contains("Account GitHub: @octocat"), "{system}");
+        // Il blocco KB entra nel prompt — il modello deve leggerlo — ma dietro il
+        // confine: e' l'unico blocco che cambia a ogni messaggio della sessione.
         assert!(system.contains("la porta e' la 30001"), "{system}");
-        // Nessun blocco di turno: tutto quel che si appende qui vale per l'intero
-        // turno e resta nella parte stabile del prompt, che e' il tratto che il
-        // fornitore puo' riusare (nexus_types::system_prompt).
+        let stabile = nexus_types::system_prompt::parte_stabile(&system);
         assert!(
-            !system.contains(nexus_types::system_prompt::CONFINE_DI_TURNO),
-            "un blocco di turno e' entrato nel system della chat: {system}"
+            !stabile.contains("la porta e' la 30001"),
+            "il blocco KB e' rimasto nella parte stabile: {stabile}"
         );
-        assert_eq!(nexus_types::system_prompt::parte_stabile(&system), system);
+        // Il fatto d'ambiente e' stabile e deve restare nel prefisso: il confine
+        // e' posizionale, quindi appenderlo dopo il KB lo spingerebbe fuori.
+        assert!(
+            stabile.contains(nexus_agent_tools::ambiente::TAG_BLOCCO),
+            "il fatto d'ambiente e' finito dietro il confine: {system}"
+        );
     }
 
     #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
@@ -3153,5 +3216,117 @@ mod tests_system_prompt_della_chat {
             .expect("il fatto d'ambiente non e' entrato nel system della chat");
         assert_eq!(prima_del_fatto.trim_end(), BASE);
         assert!(!system.contains(SUFFISSO), "{system}");
+    }
+
+    /// IL contratto della prompt cache sul system della CHAT: due messaggi
+    /// DIVERSI della stessa sessione devono ottenere la stessa `parte_stabile`.
+    ///
+    /// Il difetto misurato: il blocco Knowledge Base veniva concatenato al
+    /// system con un `push_str` diretto, quindi davanti al confine di turno. E'
+    /// alimentato da `build_knowledge_context`, un top-K semantico sul TESTO del
+    /// messaggio: cambia a OGNI messaggio. Era percio' l'unico blocco che, dentro
+    /// la parte dichiarata stabile, si muoveva a ogni invio — e da li' si
+    /// muovevano la `prompt_cache_key` di `openai_compat` e il breakpoint
+    /// `cache_control` di `anthropic`, che dallo stesso punto unico derivano.
+    ///
+    /// Il test passa dal produttore reale (regola O): `compose_chat_system_context`
+    /// e' la stessa funzione, con gli stessi argomenti, che chiamano
+    /// `send_chat_message` e il ramo agente di `resend_chat_message`. Il blocco KB
+    /// entra gia' risolto perche' in produzione entra gia' risolto: e' l'unico
+    /// confine esterno (embedder + Qdrant) e il compositore lo riceve, non lo
+    /// costruisce.
+    ///
+    /// MUTAZIONE: rimettere il `push_str` diretto al posto di
+    /// `appendi_blocco_di_turno` fa sparire il confine, `parte_stabile` torna a
+    /// coprire l'intero system e l'uguaglianza delle due teste cade.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn due_messaggi_diversi_condividono_la_testa_del_system(pool: PgPool) {
+        // Due richieste ordinarie della stessa sessione. La premessa che le rende
+        // confrontabili si DICHIARA e si accerta poco sotto, invece di darla per
+        // buona.
+        const PRIMO: &str = "elenca i file della cartella e dimmi quanti sono";
+        const SECONDO: &str = "aggiungi un bottone verde in fondo alla pagina di benvenuto";
+
+        let cache = TemplateCache::new();
+        let template =
+            crate::prompt_templates::get_template_or_default(&pool, &cache, "system.nexus_base")
+                .await;
+        assert!(
+            !template.is_empty(),
+            "nessuna migrazione ha seminato system.nexus_base: il test non misura nulla"
+        );
+
+        // PREMESSA DICHIARATA. Il gate del consiglio decide anch'esso sul testo del
+        // messaggio, ma taglia DENTRO il corpo del template e non e' cio' che
+        // questo test misura: qui si accerta — interrogando il punto unico, non
+        // ricopiandone il criterio — che sui due testi si comporti allo stesso
+        // modo, cosi' l'unica variabile che resta e' il blocco KB. Se un giorno
+        // questa uguaglianza cadesse, il test lo direbbe qui invece di fallire
+        // piu' avanti additando il blocco sbagliato.
+        assert_eq!(
+            crate::prompt_templates::gate_council_directive(&pool, template.clone(), PRIMO).await,
+            crate::prompt_templates::gate_council_directive(&pool, template, SECONDO).await,
+            "i due testi di prova non toccano lo stesso ambito: sceglierne altri"
+        );
+
+        // I due blocchi KB nella forma che produce `build_knowledge_context`:
+        // intestazione fissa, note diverse perche' diversa e' la domanda.
+        let kb = |nota: &str| {
+            Some(format!(
+                "## Contesto dal Knowledge Base del progetto\n\n- **{nota}**\n"
+            ))
+        };
+        let a = compose_chat_system_context(
+            &pool,
+            &cache,
+            PRIMO,
+            AutomationMode::Automatic,
+            None,
+            kb("Struttura delle cartelle del repository"),
+        )
+        .await;
+        let b = compose_chat_system_context(
+            &pool,
+            &cache,
+            SECONDO,
+            AutomationMode::Automatic,
+            None,
+            kb("Palette e componenti della pagina di benvenuto"),
+        )
+        .await;
+
+        assert_ne!(
+            a, b,
+            "i due turni non portano contesti KB diversi: il test non misura nulla"
+        );
+
+        let testa_a = nexus_types::system_prompt::parte_stabile(&a);
+        let testa_b = nexus_types::system_prompt::parte_stabile(&b);
+        // Dove divergono, non solo che divergono: un numero senza la sua premessa
+        // e' un'opinione. La premessa e' che le due teste si confrontano carattere
+        // per carattere dall'inizio, che e' il modo in cui il fornitore decide se
+        // riusare il prefisso.
+        let comune = testa_a
+            .chars()
+            .zip(testa_b.chars())
+            .take_while(|(x, y)| x == y)
+            .count();
+        assert_eq!(
+            testa_a,
+            testa_b,
+            "le due teste divergono dopo {comune} caratteri (lunghezze {} e {})",
+            testa_a.chars().count(),
+            testa_b.chars().count()
+        );
+        // E la testa non e' vuota per sbaglio: se lo fosse, l'uguaglianza qui
+        // sopra sarebbe vera e non direbbe niente.
+        assert!(
+            testa_a.contains(nexus_agent_tools::ambiente::TAG_BLOCCO),
+            "la testa non arriva nemmeno al fatto d'ambiente: {testa_a}"
+        );
+        // Il blocco KB resta nel prompt — il modello deve leggerlo — ma fuori
+        // dall'identita' del prefisso.
+        assert!(a.contains("Struttura delle cartelle"), "{a}");
+        assert!(!testa_a.contains("Struttura delle cartelle"), "{testa_a}");
     }
 }

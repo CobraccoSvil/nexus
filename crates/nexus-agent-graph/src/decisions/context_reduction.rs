@@ -1241,12 +1241,31 @@ pub fn inject_turn_focus(system_text: &str, directive: &str) -> String {
 // ──────────────────────────────────────────────────────────────────────────
 
 /// `_inject_verification_directive` (helpers.py:1295): se l'utente ha chiesto una
-/// verifica (`detected`) e la direttiva e' abilitata, la appende in CODA al system
+/// verifica (`detected`) e la direttiva e' abilitata, la aggiunge al system
 /// (idempotente via [`VERIFY_DIRECTIVE_MARKER`]). Ritorna il nuovo `system_text`.
 ///
 /// Regola G: il detection lessicale (`_detect_verification_request`, keyword) e il
 /// caricamento DB (`_load_verification_directive`) restano FUORI; entrano come
 /// `detected`/`enabled`/`directive`. La funzione e' pura.
+///
+/// La POSIZIONE la decide il punto unico [`nexus_types::system_prompt`], come per
+/// [`inject_turn_focus`]; qui restano l'idempotenza e la costruzione del blocco.
+/// Prima il system si componeva qui a mano, con un `format!` che apriva sulla
+/// variabile del system e le accodava marcatore e blocco: cioe' scrivendo al
+/// termine di QUALUNQUE stringa arrivasse. Che quel termine cadesse prima o dopo
+/// il confine di turno lo decideva l'ordine delle chiamate del chiamante, non
+/// questa funzione. Innocuo finche' l'unico chiamante
+/// (`executor::inietta_direttive_system`) invoca il focus per primo, ed e'
+/// esattamente la condizione che la regola L vieta: una correttezza che vive
+/// nell'ordine di invocazione si perde al primo che riordina, in silenzio.
+///
+/// Il blocco va DIETRO il confine perche' e' variabile per costruzione: `detected`
+/// nasce da un detector lessicale sulla RICHIESTA dell'utente, quindi cambia da un
+/// turno all'altro non appena quel detector sara' portato (oggi non lo e': in
+/// `native_engine` `verification_requested` resta al `false` del `Default`, e il
+/// blocco non e' mai emesso in produzione). Anteposto alla parte stabile
+/// invaliderebbe il prefisso di tutto il system a ogni turno in cui compare o
+/// sparisce.
 pub fn inject_verification_directive(
     system_text: &str,
     detected: bool,
@@ -1262,8 +1281,12 @@ pub fn inject_verification_directive(
     if system_text.contains(VERIFY_DIRECTIVE_MARKER) {
         return system_text.to_string();
     }
-    let block = format!("### AUTO-VERIFICA RICHIESTA DALL'UTENTE ###\n{directive}");
-    format!("{system_text}\n\n{VERIFY_DIRECTIVE_MARKER}\n{block}")
+    nexus_types::system_prompt::appendi_blocco_di_turno(
+        system_text,
+        &format!(
+            "{VERIFY_DIRECTIVE_MARKER}\n### AUTO-VERIFICA RICHIESTA DALL'UTENTE ###\n{directive}"
+        ),
+    )
 }
 
 // ──────────────────────────────────────────────────────────────────────────

@@ -403,6 +403,58 @@ fn verification_directive_condizioni() {
     assert_eq!(inject_verification_directive("SYS", true, true, ""), "SYS");
 }
 
+#[test]
+fn verification_directive_non_tocca_la_parte_stabile_in_nessun_ordine() {
+    // Il test che il precedente NON faceva: `starts_with("SYS")` e la presenza
+    // del marker sono veri anche componendo il system a mano, quindi non
+    // distinguevano le due implementazioni. Qui si asserisce la CONSEGUENZA
+    // (regola O): che cosa resta del prefisso su cui il fornitore decide il
+    // riuso, cioe' `parte_stabile`.
+    use nexus_types::system_prompt::parte_stabile;
+
+    const BASE: &str = "Sei l'agente di sviluppo. Lavora sul repository indicato.";
+    let dir = "esegui la verifica reale";
+
+    // 1) Da solo, su un system SENZA confine: il blocco deve aprirlo, non
+    //    finire nella parte stabile. E' il caso in cui il vecchio `format!`
+    //    sbagliava senza bisogno di riordinare nulla — bastava che il focus
+    //    non scattasse (`turn_focus_enabled=false`, o nessuna directive).
+    let solo = inject_verification_directive(BASE, true, true, dir);
+    assert_ne!(solo, BASE, "il blocco e' stato emesso");
+    assert_eq!(
+        parte_stabile(&solo),
+        BASE,
+        "il blocco di verifica non entra nel prefisso stabile"
+    );
+
+    // 2) I DUE ordini di invocazione devono dare la stessa parte stabile: e' il
+    //    punto della regola L. Prima la posizione dipendeva da chi chiamava.
+    //    L'altro blocco lo inietta il suo PRODUTTORE reale, `inject_turn_focus`,
+    //    non una stringa col marker ricopiato a mano (regola O).
+    let focus = "fai X";
+    let focus_poi_verifica =
+        inject_verification_directive(&inject_turn_focus(BASE, focus), true, true, dir);
+    let verifica_poi_focus =
+        inject_turn_focus(&inject_verification_directive(BASE, true, true, dir), focus);
+    assert_eq!(parte_stabile(&focus_poi_verifica), BASE);
+    assert_eq!(parte_stabile(&verifica_poi_focus), BASE);
+    assert_eq!(
+        parte_stabile(&focus_poi_verifica),
+        parte_stabile(&verifica_poi_focus),
+        "l'ordine delle chiamate non deve cambiare il prefisso stabile"
+    );
+
+    // 3) Un solo confine, comunque si componga: due confini spezzerebbero
+    //    `parte_stabile`, che taglia al PRIMO.
+    for s in [&focus_poi_verifica, &verifica_poi_focus] {
+        assert_eq!(
+            s.matches(nexus_types::system_prompt::CONFINE_DI_TURNO).count(),
+            1,
+            "confine emesso una volta sola: {s}"
+        );
+    }
+}
+
 // ── 8b) inject_forced_rag_reminder ────────────────────────────────────────────
 
 #[test]

@@ -6312,6 +6312,13 @@ della finestra {effective_window} del modello {provider}/{model}"
     /// legge dove il turno l'ha fissata (`turn_task`), e la cronologia da questo
     /// nodo in poi contiene tool_result, promemoria e nudge — tutti con ruolo
     /// `user` sul canale interno.
+    ///
+    /// L'ordine qui sotto NON decide piu' dove i blocchi finiscono nel system:
+    /// focus e direttiva di verifica delegano la posizione al punto unico
+    /// `nexus_types::system_prompt`, che li mette dietro il confine di turno
+    /// comunque li si chiami. Finche' la posizione dipendeva da questo ordine,
+    /// riordinare due righe qui bastava a spostare un blocco nella parte stabile
+    /// del prompt senza che nulla fallisse (regola L).
     fn inietta_direttive_system(&self, system_text: &mut String, state: &AgentState) {
         *system_text = ctxr::inject_language_reminder(
             system_text,

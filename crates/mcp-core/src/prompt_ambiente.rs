@@ -45,6 +45,12 @@
 //! shell non cambiano; i gestori hanno una cache a TTL), e viene appeso senza
 //! `CONFINE_DI_TURNO`: resta nella parte stabile del system e non tocca il
 //! prefisso che il fornitore riusa (vedi `nexus_types::system_prompt`).
+//!
+//! Il «resta» pero' non dipende solo da qui: il confine e' POSIZIONALE, quindi
+//! chiamare questa funzione dopo un blocco che il confine lo introduce spinge
+//! anche il fatto d'ambiente fuori dal prefisso. Per questo il compositore della
+//! chat la chiama PRIMA di appendere il blocco Knowledge Base, e lo asserisce
+//! (`tests_system_prompt_della_chat`).
 
 use nexus_agent_tools::ambiente::{self, Disponibilita};
 use sqlx::PgPool;

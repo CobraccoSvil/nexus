@@ -1859,6 +1859,65 @@ assert_single "prefisso-esito-senza-campo" 'PREFISSO_FALLIMENTO: &str' \
 assert_single "passo-persistito" 'pub struct PersistedStep'   'crates/nexus-agent-graph/src/runtime/ports.rs' crates
 assert_single "vocabolario-esito-passo" 'pub enum StepStatus'   'crates/nexus-agent-graph/src/runtime/ports.rs' crates
 
+# ── La POSIZIONE di un blocco nel system la decide il punto unico (2026-08-02) ─
+#
+# Un fornitore riusa il prefisso di una richiesta solo se i primi token sono
+# IDENTICI a quelli di una richiesta gia' vista: un blocco RICALCOLATO messo in
+# testa taglia il riuso di tutto cio' che lo segue. Il criterio vive in un punto
+# solo, `nexus_types::system_prompt` (CONFINE_DI_TURNO / appendi_blocco_di_turno
+# / parte_stabile), da cui derivano sia la `prompt_cache_key` di openai_compat
+# sia il breakpoint `cache_control` di anthropic.
+#
+# PERCHE' UN GUARD, e non i soli test: una composizione a mano non fa fallire
+# NULLA. Un prompt con la testa instabile e' corretto in tutto tranne che nel
+# prezzo, e i test delle singole iniezioni restano verdi — `starts_with("SYS")`
+# e la presenza del marker sono veri in entrambe le implementazioni, quindi non
+# le distinguono. Senza guard la regressione rientra in silenzio.
+#
+# MISURATO il 02/08/2026: `inject_verification_directive` componeva il system a
+# mano, accodando al termine di QUALUNQUE stringa le arrivasse. Innocua solo
+# perche' l'unico chiamante invocava il focus per primo: una correttezza che
+# vive nell'ORDINE DELLE CHIAMATE, cioe' la condizione che la regola L vieta.
+#
+# Tre pattern, perche' uno solo si aggira:
+#   A) il letterale del confine si scrive in un posto solo — chi lo ri-digita
+#      salterebbe qualunque check basato sull'identificatore;
+#   B) nessuno accosta a mano il confine a un blocco;
+#   C) nessuno APPENDE al system con un `format!` che parte dalla variabile del
+#      system. E' la forma del difetto reale, che NON nominava il confine: un
+#      guard sul solo confine non l'avrebbe vista;
+#   D) la stessa cosa scritta con `push_str` invece che con `format!`. Senza
+#      questa, il difetto rientrerebbe riscritto in tre righe invece che in una.
+#      Ristretto a nexus-agent-graph, dove vivono le iniezioni di turno: in
+#      mcp-core il meta-reasoner compone col push_str un system a chiamata
+#      singola, che non ha parte di turno e non e' l'oggetto di questo guard.
+#
+# Cosa NON misura: che la posizione scelta sia quella GIUSTA per quel blocco (lo
+# dicono i test del modulo). Misura che la scelta sia fatta in un posto solo.
+# Fuori portata per costruzione, e volutamente: `inject_language_reminder`, che
+# ANTEPONE un testo costante del run (motivato nel suo doc comment), e i system
+# a chiamata singola del meta-reasoner, che non hanno una parte di turno.
+sysprompt_letterale="$(grep -rIn -F '[[NEXUS_SYSTEM_DI_TURNO]]' --include='*.rs' crates/ 2>/dev/null | grep -v '^crates/nexus-types/src/system_prompt.rs:' || true)"
+sysprompt_confine="$(grep -rInE '\{[A-Za-z_0-9:]*CONFINE_DI_TURNO\}|push_str\([^)]*CONFINE_DI_TURNO|(format|write|writeln|concat)!\([^)]*CONFINE_DI_TURNO' --include='*.rs' crates/ 2>/dev/null | grep -v '^crates/nexus-types/src/system_prompt.rs:' || true)"
+sysprompt_append="$(grep -rInE 'format!\("\{(system|system_text|sys)\}[^"]' --include='*.rs' crates/ 2>/dev/null | grep -v '^crates/nexus-types/src/system_prompt.rs:' || true)"
+sysprompt_pushstr="$(grep -rInE '(system|system_text|sys)\.push_str\(' --include='*.rs' crates/nexus-agent-graph/ 2>/dev/null || true)"
+if [[ -n "$sysprompt_letterale" || -n "$sysprompt_confine" || -n "$sysprompt_append" || -n "$sysprompt_pushstr" ]]; then
+  echo "!! composizione-system-prompt: il system e' composto fuori dal punto unico:" >&2
+  if [[ -n "$sysprompt_letterale" ]]; then echo "$sysprompt_letterale" >&2; fi
+  if [[ -n "$sysprompt_confine" ]]; then echo "$sysprompt_confine" >&2; fi
+  if [[ -n "$sysprompt_append" ]]; then echo "$sysprompt_append" >&2; fi
+  if [[ -n "$sysprompt_pushstr" ]]; then echo "$sysprompt_pushstr" >&2; fi
+  echo "   La POSIZIONE di un blocco nel system la decide nexus_types::system_prompt" >&2
+  echo "   (regola L): appendi_blocco_di_turno per cio' che si ricalcola a ogni turno," >&2
+  echo "   componi_system_di_run per cio' che cambia fra un run e l'altro. Una" >&2
+  echo "   composizione a mano e' corretta o sbagliata a seconda di CHI CHIAMA PRIMA," >&2
+  echo "   e non fa fallire nulla: costa il prefisso che il fornitore non riusa piu'." >&2
+  fail=1
+else
+  echo "OK composizione-system-prompt: la posizione dei blocchi resta al punto unico"
+fi
+
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1
