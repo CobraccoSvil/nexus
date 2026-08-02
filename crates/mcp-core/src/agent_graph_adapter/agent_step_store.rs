@@ -8,13 +8,20 @@
 //! `agent_steps` ha solo un INDEX non-UNIQUE su `(run_id, step_index)` — mig 0009 —
 //! quindi non esiste un constraint su cui fare `ON CONFLICT`). Best-effort: errore
 //! DB loggato, `Ok(())`.
+//!
+//! Questo modulo NON interpreta: scrive in colonna i campi di
+//! [`PersistedStep`]. Fino al 02/08/2026 li ri-derivava da un JSON opaco con
+//! chiavi diverse da quelle che il produttore scriveva (`get("name")` contro
+//! `"tool_name"`) e sovrascriveva lo `status` con un letterale `"completed"`:
+//! ogni passo di ogni run nasceva anonimo e riuscito, fallimenti compresi. Il
+//! rimedio non e' stato correggere le chiavi ma togliere le chiavi di mezzo —
+//! vedi la nota su [`PersistedStep`].
 
 use async_trait::async_trait;
-use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use nexus_agent_graph::runtime::ports::{AgentStepStore, PortError};
+use nexus_agent_graph::runtime::ports::{AgentStepStore, PersistedStep, PortError};
 
 /// Adapter [`AgentStepStore`] -> `agent_steps` via `sqlx`.
 pub struct PgAgentStepStore {
@@ -38,8 +45,7 @@ impl AgentStepStore for PgAgentStepStore {
         run_id: &str,
         iteration: i64,
         idx: i64,
-        block: Value,
-        result: Option<Value>,
+        step: PersistedStep,
     ) -> Result<(), PortError> {
         let run_uuid = match Uuid::parse_str(run_id) {
             Ok(u) => u,
@@ -57,19 +63,16 @@ impl AgentStepStore for PgAgentStepStore {
         let step_index: i32 = (iteration * nexus_agent_graph::runtime::ports::STEP_INDEX_STRIDE
             + idx)
             .clamp(0, i32::MAX as i64) as i32;
-        // tool_name / tool_result derivati dal block/result per riempire le colonne
-        // NOT NULL della tabella. Il block e' il blocco grezzo dell'iterazione
-        // (tool_use/testo); il nome del tool, se presente, popola tool_name.
-        let tool_name = block
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let tool_input = block.get("input").cloned().unwrap_or_else(|| block.clone());
-        let tool_result: Option<String> = result.map(|r| match r {
-            Value::String(s) => s,
-            other => other.to_string(),
-        });
+        // I campi del passo vanno in colonna COSI' COME SONO: nessuno va derivato
+        // di nuovo qui (il produttore li ha gia' stabiliti) ne' sostituito da un
+        // letterale. In particolare `status` viene da `outcome`, che il produttore
+        // ha derivato dal flag strutturato `is_error` del tool_result (regola M).
+        let PersistedStep {
+            tool_name,
+            tool_input,
+            tool_result,
+            status,
+        } = step;
         // INSERT...SELECT con doppio guard: il run deve esistere (no FK orfana,
         // "untracked_run") e lo step non deve esistere gia' (idempotenza retry,
         // surrogato di ON CONFLICT DO NOTHING in assenza di constraint UNIQUE).
@@ -87,7 +90,7 @@ impl AgentStepStore for PgAgentStepStore {
         .bind(&tool_name)
         .bind(&tool_input)
         .bind(tool_result.as_deref())
-        .bind("completed")
+        .bind(status.as_str())
         .execute(&self.db)
         .await;
         match res {
@@ -136,13 +139,29 @@ impl PgAgentStepStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use nexus_agent_graph::runtime::ports::StepStatus;
+    use serde_json::{json, Value};
 
     /// Run reale su cui appendere gli step: `agent_steps.run_id` e' vincolato da
     /// una FK verso `agent_runs(id)`. Le tabelle le porta il migrator del set
     /// `db/migrations/project`.
     async fn insert_run(pool: &PgPool) -> Uuid {
         crate::test_support::seed_agent_run(pool).await
+    }
+
+    /// Passo di prova. NON e' un input "fabbricato" nel senso della regola O: e'
+    /// un tipo, non un JSON con chiavi da indovinare, quindi non puo' divergere
+    /// in silenzio da cio' che il produttore costruisce — un rinominamento lo
+    /// ferma il compilatore. Che il PRODUTTORE popoli questi campi con i valori
+    /// giusti lo verifica il test gemello in `nexus-agent-graph`
+    /// (`tool_dispatch::tests::persistenza_*`), che attraversa il nodo reale.
+    fn passo(tool_name: &str, tool_input: Value, status: StepStatus) -> PersistedStep {
+        PersistedStep {
+            tool_name: tool_name.to_string(),
+            tool_input,
+            tool_result: Some("esito".to_string()),
+            status,
+        }
     }
 
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
@@ -155,8 +174,7 @@ mod tests {
                 &run_id.to_string(),
                 3,
                 2,
-                json!({"name": "edit_file", "input": {"p": "x"}}),
-                Some(json!("done")),
+                passo("edit_file", json!({"path": "x"}), StepStatus::Completed),
             )
             .await
             .expect("ok");
@@ -169,22 +187,101 @@ mod tests {
         .expect("riga");
         assert_eq!(row.0, 3002, "step_index = iteration*1000 + idx");
         assert_eq!(row.1, "edit_file");
-        assert_eq!(row.2.as_deref(), Some("done"));
+        assert_eq!(row.2.as_deref(), Some("esito"));
+    }
+
+    /// Il nome del tool e l'input finiscono nelle COLONNE omonime, e l'input ci
+    /// finisce PIATTO: e' la forma che i consumatori interrogano
+    /// (`criteria_runner`: `tool_input->>'path'`; `session_worklog`:
+    /// `.get("command")`). L'impl scriveva invece l'intero involucro, quindi
+    /// `tool_input->>'path'` era NULL su ogni riga.
+    ///
+    /// PROVA DI MUTAZIONE: rimettendo `.get("name")`/`.get("input")` al posto dei
+    /// campi, `tool_name` torna `""` e `tool_input` torna l'involucro — entrambe
+    /// le asserzioni rosseggiano col valore reale del difetto.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn nome_e_input_finiscono_nelle_colonne_in_forma_piatta(pool: PgPool) {
+        let run_id = insert_run(&pool).await;
+        let store = PgAgentStepStore::new(pool.clone());
+        store
+            .persist_step(
+                &run_id.to_string(),
+                0,
+                0,
+                passo(
+                    "write_file",
+                    json!({"path": "src/main.rs"}),
+                    StepStatus::Completed,
+                ),
+            )
+            .await
+            .expect("ok");
+        let (tool_name, path): (String, Option<String>) = sqlx::query_as(
+            "SELECT tool_name, tool_input->>'path' FROM agent_steps WHERE run_id = $1",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .expect("riga");
+        assert_eq!(
+            tool_name, "write_file",
+            "il nome del tool sta nella colonna tool_name, non annidato altrove"
+        );
+        assert_eq!(
+            path.as_deref(),
+            Some("src/main.rs"),
+            "tool_input e' l'input del tool, non un involucro che lo contiene"
+        );
+    }
+
+    /// Un passo FALLITO resta fallito in colonna. E' il difetto misurato il
+    /// 02/08/2026: `.bind("completed")` LETTERALE scartava l'esito, e 536 passi
+    /// falliti su 8860 (DB bacheca-attivita) risultavano riusciti a tutti i
+    /// consumatori a valle.
+    ///
+    /// PROVA DI MUTAZIONE: rimettendo `.bind("completed")` al posto di
+    /// `.bind(outcome.as_str())` questo test rosseggia con `"completed"` — cioe'
+    /// esattamente il valore che il difetto produceva.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn un_passo_fallito_resta_fallito_in_colonna(pool: PgPool) {
+        let run_id = insert_run(&pool).await;
+        let store = PgAgentStepStore::new(pool.clone());
+        for (idx, outcome) in [(0i64, StepStatus::Completed), (1, StepStatus::Failed)] {
+            store
+                .persist_step(
+                    &run_id.to_string(),
+                    0,
+                    idx,
+                    passo("run_command", json!({"command": "cargo test"}), outcome),
+                )
+                .await
+                .expect("ok");
+        }
+        let stati: Vec<String> = sqlx::query_scalar(
+            "SELECT status FROM agent_steps WHERE run_id = $1 ORDER BY step_index ASC",
+        )
+        .bind(run_id)
+        .fetch_all(&pool)
+        .await
+        .expect("stati");
+        assert_eq!(
+            stati,
+            vec!["completed".to_string(), "failed".to_string()],
+            "lo status in colonna e' l'esito del passo, non un letterale"
+        );
     }
 
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn idempotente_sui_retry(pool: PgPool) {
         let run_id = insert_run(&pool).await;
         let store = PgAgentStepStore::new(pool.clone());
-        let block = json!({"name": "read_file"});
         for _ in 0..3 {
             store
                 .persist_step(
                     &run_id.to_string(),
                     1,
                     0,
-                    block.clone(),
-                    None,
+                    passo("read_file", json!({"path": "a.rs"}), StepStatus::Completed),
                 )
                 .await
                 .expect("ok");
@@ -209,8 +306,7 @@ mod tests {
                 &Uuid::new_v4().to_string(),
                 0,
                 0,
-                json!({}),
-                None,
+                passo("read_file", json!({}), StepStatus::Completed),
             )
             .await
             .expect("best-effort Ok");

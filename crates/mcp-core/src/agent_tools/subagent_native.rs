@@ -6580,6 +6580,22 @@ mod tests {
         );
     }
 
+    /// Passo riuscito da persistire. Questi test guardano la sola convenzione
+    /// `step_index`, quindi l'esito e' `Completed` per comodita': cio' che conta
+    /// e' che il record sia un TIPO, non un JSON con chiavi da indovinare — vedi
+    /// la nota su `PersistedStep`.
+    fn passo_persistito(
+        tool_name: &str,
+        tool_input: serde_json::Value,
+    ) -> nexus_agent_graph::runtime::ports::PersistedStep {
+        nexus_agent_graph::runtime::ports::PersistedStep {
+            tool_name: tool_name.to_string(),
+            tool_input,
+            tool_result: None,
+            status: nexus_agent_graph::runtime::ports::StepStatus::Completed,
+        }
+    }
+
     /// Helper: riga sub-run 'running' + gemella `agent_runs` tracciata (via il
     /// produttore reale `ensure_child_agent_run`), pronta per una chiusura con
     /// `mark_run`. Punto unico del seeding dei test di chiusura.
@@ -6686,8 +6702,7 @@ mod tests {
                     &child.to_string(),
                     iteration,
                     idx,
-                    json!({"name": "read_file", "input": {"path": "src/main.rs"}}),
-                    None,
+                    passo_persistito("read_file", json!({"path": "src/main.rs"})),
                 )
                 .await
                 .expect("step persistito");
@@ -6732,8 +6747,7 @@ mod tests {
                 &child.to_string(),
                 23,
                 0,
-                json!({"name": "run_command", "input": {"command": "ls"}}),
-                None,
+                passo_persistito("run_command", json!({"command": "ls"})),
             )
             .await
             .expect("step persistito");

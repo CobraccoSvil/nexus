@@ -114,8 +114,8 @@ use crate::decisions::tool_dispatch::{
 use crate::decisions::{build_m16_allowed, is_tool_allowed, merge_discovered_run, M16_META_TOOLS};
 use crate::py_json::{py_json_dumps, SortKeys};
 use crate::runtime::ports::{
-    AgentStepStore, ContextOffload, MetaStepStore, OffloadKind, RunControlStore,
-    SseEvent, TodoStore, ToolCall, ToolExecutor,
+    AgentStepStore, ContextOffload, MetaStepStore, OffloadKind, PersistedStep, RunControlStore,
+    SseEvent, StepStatus, TodoStore, ToolCall, ToolExecutor,
 };
 use crate::runtime::AgentNodeCtx;
 use crate::state::{AgentState, Message, MessageContent, MetaStep, StateDelta, StopReason};
@@ -1270,16 +1270,22 @@ impl ToolDispatchNode {
         }
         let iteration = state.iterations.unwrap_or(0);
         for (idx, (b, r)) in pending.iter().zip(results.iter()).enumerate() {
-            let t_name = b.get("name").and_then(Value::as_str).unwrap_or("");
-            let t_input = b.get("input").cloned().unwrap_or(json!({}));
-            let block = json!({"tool_name": t_name, "tool_input": t_input});
-            let result = Some(json!({
-                "content": value_as_json_string(&r.content),
-                "status": if r.is_error { "failed" } else { "completed" },
-            }));
+            // I campi vanno alla persistenza come campi (regola Q). L'esito e' il
+            // flag STRUTTURATO `is_error` (regola M), non una lettura del testo
+            // prodotto dal tool.
+            let step = PersistedStep {
+                tool_name: b
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                tool_input: b.get("input").cloned().unwrap_or(json!({})),
+                tool_result: Some(value_as_json_string(&r.content)),
+                status: StepStatus::from_is_error(r.is_error),
+            };
             let _ = self
                 .steps
-                .persist_step(run_id, iteration, idx as i64, block, result)
+                .persist_step(run_id, iteration, idx as i64, step)
                 .await;
         }
     }
@@ -2945,6 +2951,74 @@ mod tests {
         assert_eq!(persisted.len(), 2);
         assert_eq!(persisted[0].1, 0); // idx 0
         assert_eq!(persisted[1].1, 1); // idx 1
+    }
+
+    /// Il PRODUTTORE REALE davanti alla persistenza: si esegue il nodo e si
+    /// guarda cosa arriva allo store, non un record costruito a mano.
+    ///
+    /// E' la lezione della regola O su questo difetto. I test dell'impl
+    /// (`agent_step_store.rs`) fabbricavano il record nella forma che l'impl si
+    /// aspettava — `{"name","input"}` — mentre questo percorso ne ha sempre
+    /// prodotta un'altra: i due lati erano incompatibili dal primo giorno e i
+    /// test restavano verdi, perche' misuravano un'imitazione del produttore.
+    /// Misurato il 02/08/2026 sul DB di bacheca-attivita: 8860 righe su 8860 con
+    /// `tool_name` vuoto e `status='completed'`, 536 fallimenti reali compresi.
+    ///
+    /// PROVE DI MUTAZIONE, in `persist_turn_steps`:
+    /// - `tool_name: b.get("nome_sbagliato")...` -> la prima asserzione rosseggia
+    ///   con `""`, il valore che il difetto scriveva su ogni riga;
+    /// - `status: StepStatus::Completed` fisso -> l'ultima rosseggia con
+    ///   `Completed` su un tool fallito, che e' esattamente cio' che i quattro
+    ///   consumatori a valle leggevano.
+    #[tokio::test]
+    async fn persistenza_porta_nome_del_tool_ed_esito_del_risultato() {
+        let tools = Arc::new(
+            MapToolExecutor::new()
+                .with(
+                    "read_file",
+                    ToolOutcome {
+                        tool_call_id: "c1".into(),
+                        content: json!("{\"text\":\"contenuto\"}"),
+                        is_error: false,
+                        ..Default::default()
+                    },
+                )
+                .with(
+                    "edit_file",
+                    ToolOutcome {
+                        tool_call_id: "c2".into(),
+                        content: json!("{\"error\":\"file non trovato\"}"),
+                        is_error: true,
+                        ..Default::default()
+                    },
+                ),
+        );
+        let (n, steps, _rc) = node(ToolDispatchConfig::default(), tools);
+        let ctx = ctx_with(CancellationToken::new());
+        let st = state_with_pending(vec![
+            pending_tool("c1", "read_file", json!({"path": "a.rs"})),
+            pending_tool("c2", "edit_file", json!({"path": "b.rs"})),
+        ]);
+        let _ = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+
+        let persisted = steps.steps.lock().unwrap();
+        assert_eq!(persisted.len(), 2, "un passo persistito per tool eseguito");
+        assert_eq!(
+            persisted[0].2.tool_name, "read_file",
+            "il nome del tool arriva alla persistenza"
+        );
+        assert_eq!(persisted[1].2.tool_name, "edit_file");
+        assert_eq!(
+            persisted[1].2.tool_input,
+            json!({"path": "b.rs"}),
+            "l'input arriva PIATTO: e' la forma che i consumatori interrogano"
+        );
+        assert_eq!(persisted[0].2.status, StepStatus::Completed);
+        assert_eq!(
+            persisted[1].2.status,
+            StepStatus::Failed,
+            "un tool fallito si persiste come fallito, non come riuscito"
+        );
     }
 
     // ── (3a) predictive cap -> synthetic-blocked col SENTINEL (non eseguito) ─────

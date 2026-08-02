@@ -601,10 +601,19 @@ function stepTarget(input: Record<string, unknown>): string | undefined {
 }
 
 /** Estrae nome + input REALI di uno step gestendo DUE forme:
- *  - SSE: `toolName` valorizzato, `toolInput` = parametri diretti;
- *  - DB (getAgentRun): `toolName` VUOTO, nome e parametri annidati in
+ *  - CANONICA: `toolName` valorizzato, `toolInput` = parametri diretti;
+ *  - INVOLUCRO: `toolName` VUOTO, nome e parametri annidati in
  *    `toolInput = { tool_name, tool_input: {...} }`.
- *  Il `||`/`??` copre entrambe senza rompere il caso SSE. */
+ *
+ *  La seconda NON e' "la forma del DB", com'era scritto qui: era un DIFETTO di
+ *  scrittura. `PgAgentStepStore` leggeva chiavi che il produttore non scriveva e
+ *  finiva per salvare l'intero involucro in `tool_input` lasciando vuota la
+ *  colonna `tool_name` (misurato il 02/08/2026: 8860 righe su 8860). Corretto
+ *  alla fonte e riparato nei dati dalla migrazione project 0015.
+ *
+ *  Questo unwrap resta come rete per i DB progetto non ancora migrati, e SOLO
+ *  per il display: nessuna decisione tecnica passa di qui. Va rimosso quando
+ *  tutti i DB progetto hanno la 0015. */
 function unwrapStep(step: AgentStep): { name: string; input: Record<string, unknown> } {
   const rawInput = (step.toolInput ?? {}) as Record<string, unknown>;
   const nested = rawInput.tool_input;
@@ -956,8 +965,8 @@ export function composeActivityStream(
       }
     } else if (item.kind === "step" && item.step) {
       const s = item.step;
-      // Unwrap nome + input REALI: gli step storici (DB) annidano nome e
-      // parametri in toolInput = { tool_name, tool_input }, con toolName vuoto.
+      // Unwrap nome + input REALI: vedi `unwrapStep` per il difetto di
+      // persistenza che produceva l'involucro e per quando togliere la rete.
       const { name, input: realInput } = unwrapStep(s);
       // Gli step "supervisor_check" sono meta-verifiche interne, non tool utente.
       if (name === "supervisor_check") continue;
