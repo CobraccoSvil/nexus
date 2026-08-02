@@ -4322,7 +4322,7 @@ pub(crate) async fn compose_agent_system_text(
     //     pertinenza), quindi cambiano a ogni turno di chat.
     //   - `test_instructions`: derivate dal testo del messaggio.
     //   - `self_ref_hint`: costruito sulla cronologia della sessione.
-    nexus_types::system_prompt::componi_system_di_run(
+    let composto = nexus_types::system_prompt::componi_system_di_run(
         &[
             &parts.project_header,
             &parts.project_custom_instructions,
@@ -4337,7 +4337,16 @@ pub(crate) async fn compose_agent_system_text(
             &parts.test_instructions,
             &parts.self_ref_hint,
         ],
-    )
+    );
+    // L'host su cui i comandi gireranno davvero, e la direttiva sui privilegi
+    // tolta se presuppone un gestore che qui non esiste (`crate::prompt_ambiente`).
+    // Qui e non solo nel compositore della chat: di qui passano anche i percorsi
+    // FUORI chat che aprono un run agentico — `process_resume` e i due worker di
+    // remediation (servizi e risorse), che eseguono comandi di sistema e sono
+    // quindi i piu' esposti a un'indicazione sbagliata sulla piattaforma. Per la
+    // chat il fatto e' gia' entrato a monte e la chiamata e' un no-op:
+    // `con_ambiente` e' idempotente sul blocco.
+    crate::prompt_ambiente::con_ambiente(db, composto).await
 }
 
 /// Logica condivisa: carica progetto, costruisce contesto, avvia AgentLoop in background.
@@ -7123,8 +7132,15 @@ mod tests_memorie_di_progetto {
 
         let system = compose_agent_system_text(&pool, &recall, project_id, DOMANDA, parti()).await;
 
-        // Uguaglianza esatta: nessun blocco vuoto, nessuna riga in piu'.
-        assert_eq!(system, "PROGETTO: nexus\nMODALITA': automatic\n");
+        // Uguaglianza esatta sulla parte che dipende dalle memorie: nessun
+        // blocco vuoto, nessuna riga in piu'. Cio' che segue e' il fatto
+        // d'ambiente, che entra sempre e non dipende dal richiamo: si separa e
+        // si asserisce a parte, altrimenti questo test misurerebbe due cose
+        // insieme e fallirebbe per la ragione sbagliata.
+        let (memorie, _fatto) = system
+            .split_once(nexus_agent_tools::ambiente::TAG_BLOCCO)
+            .expect("il fatto d'ambiente non e' entrato nel prompt agentico");
+        assert_eq!(memorie.trim_end(), "PROGETTO: nexus\nMODALITA': automatic");
     }
 
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]

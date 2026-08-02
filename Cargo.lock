@@ -2287,6 +2287,7 @@ dependencies = [
  "mcp-quality",
  "nexus-auth",
  "nexus-build-graph",
+ "nexus-cache",
  "nexus-events",
  "nexus-http",
  "nexus-tool-kit",

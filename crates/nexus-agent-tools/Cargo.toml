@@ -13,6 +13,9 @@ nexus-auth = { path = "../nexus-auth" }
 # Preflight ADR 0020 dei tool di scrittura (era `crate::build_graph` in
 # mcp-core, che e' gia' solo un re-export di questo crate).
 nexus-build-graph = { path = "../nexus-build-graph" }
+# Cache TTL del rilevamento d'ambiente (`ambiente`): punto unico, mai una
+# scadenza ricopiata a mano.
+nexus-cache = { path = "../nexus-cache" }
 nexus-events = { path = "../nexus-events" }
 nexus-http = { path = "../nexus-http" }
 # Punto unico delle esclusioni di walk (`is_skipped_dir`) usato dalla ricerca.

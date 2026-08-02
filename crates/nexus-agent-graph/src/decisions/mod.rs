@@ -77,6 +77,12 @@
 //!     chiamate ai tool di scrittura ne' la prosa dell'agente (regola M); l'I/O
 //!     e' la porta [`crate::runtime::ports::MutationProgressPort`], che porta i
 //!     fatti e non li giudica.
+//!   - [`timeout_cause`]: PUNTO UNICO di "un run e' morto per tempo scaduto: su
+//!     che cosa lo stava spendendo?". Il criterio guarda la CODA della storia e
+//!     legge il fallimento dal CAMPO dell'esito (il ponte
+//!     `nexus_types::tool_outcome::RispostaTool`), mai dal testo (regola M);
+//!     l'I/O (leggere `agent_steps`) sta in `mcp-core`, che porta i fatti e non
+//!     li giudica. E' una MISURA: non allunga budget e non riavvia nulla.
 //!   - [`requirement_conformance`]: PUNTO UNICO di "i requisiti emessi dal
 //!     Consiglio sono stati applicati?". Il criterio e' il CONTENUTO del file
 //!     (regola M), mai la dichiarazione dell'agente; l'incertezza degrada sempre
@@ -117,6 +123,7 @@ pub mod supervisor;
 pub mod switch_reason;
 pub mod text_repetition;
 pub mod tiers;
+pub mod timeout_cause;
 pub mod tool_dispatch;
 pub mod turn_focus;
 pub mod turn_task;
@@ -140,6 +147,7 @@ pub use context_reduction::{
 pub use correction_progress::{
     classify_correction_progress, CorrectionProgress, WriteFact,
 };
+pub use timeout_cause::{classifica_causa_timeout, CausaTimeout, TentativoOsservato};
 pub use requirement_conformance::{
     compose_conformance, conformance_senza_progetto, requirements_from_synthesis,
     ConformanceReport, Direction, FileEvidence, RequirementCriterion, RequirementOutcome,

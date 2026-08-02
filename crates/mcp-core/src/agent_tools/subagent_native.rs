@@ -53,7 +53,8 @@ use uuid::Uuid;
 use super::AgentToolContext;
 use crate::native_engine::{verdict_keys, NativeDeps, NativeRunInput, NativeRunOutcome};
 use nexus_agent_graph::decisions::{
-    AdvisoryPanelVerdict, AdvisoryPolicy, AdvisoryRoster, AdvisorySynthesis, QuorumPolicy,
+    AdvisoryPanelVerdict, AdvisoryPolicy, AdvisoryRoster, AdvisorySynthesis, CausaTimeout,
+    QuorumPolicy,
 };
 
 /// Marker d'errore (stesso contratto di `subagent.rs`: prefisso U+274C ->
@@ -219,8 +220,14 @@ pub async fn convocable_kinds(db: &sqlx::PgPool) -> Vec<String> {
 /// Risolve il system_text del sub-agente dal registry prompt (`nexus_prompt_templates`,
 /// stesso punto del brain `prompt_registry.get_prompt`). Vuoto -> errore (parita'
 /// col brain: prompt mancante -> sub-run fallito).
+///
+/// Al testo del registro si aggiunge il FATTO dell'ambiente
+/// ([`crate::prompt_ambiente`]): la figura non deve scoprire per tentativi su
+/// quale host sta girando. L'innesto e' qui e non nel chiamante per la stessa
+/// ragione delle memorie di progetto — un compositore che si puo' usare senza il
+/// blocco e' un compositore che prima o poi verra' usato senza.
 async fn resolve_system_text(ctx: &AgentToolContext, prompt_key: &str) -> String {
-    sqlx::query_scalar::<_, String>(
+    let registro = sqlx::query_scalar::<_, String>(
         "SELECT content FROM nexus_prompt_templates WHERE key = $1 AND is_active = true",
     )
     .bind(prompt_key)
@@ -228,7 +235,14 @@ async fn resolve_system_text(ctx: &AgentToolContext, prompt_key: &str) -> String
     .await
     .ok()
     .flatten()
-    .unwrap_or_default()
+    .unwrap_or_default();
+    // Prompt mancante: resta vuoto: il guard del chiamante lo tratta come errore
+    // e un blocco d'ambiente appeso al nulla lo renderebbe non piu' vuoto,
+    // trasformando un prompt assente in un sub-run che parte senza istruzioni.
+    if registro.trim().is_empty() {
+        return registro;
+    }
+    crate::prompt_ambiente::con_ambiente(&ctx.core.db, registro).await
 }
 
 /// Costruisce l'array tools del sub-run filtrando lo schema REALE
@@ -1814,7 +1828,7 @@ fn prepare_reject(error_code: &'static str, message: impl Into<String>) -> Value
         "error": message.into(),
         "error_code": error_code,
         "status": "prepare_failed",
-        "outcome": terminal_verdict("failed", error_code),
+        "outcome": terminal_verdict("failed", error_code, None),
     })
 }
 
@@ -1852,7 +1866,18 @@ fn classify_council_figure_result(kind: &str, result: &Value) -> FigureAdvisoryR
         return FigureAdvisoryReport {
             kind: kind.to_string(),
             status: FigureAdvisoryStatus::RunTimeout,
-            detail_code: "run_timeout".to_string(),
+            // La CAUSA della scadenza, in forma macchina (`decisions::CausaTimeout`,
+            // vocabolario canonico): il pannello ne ricava un'etichetta che
+            // distingue una figura ferma su una strada chiusa da una che stava
+            // lavorando. Ripiego sul codice generico solo se il blocco manca
+            // (esito prodotto da una versione che non lo emetteva).
+            detail_code: result
+                .get("outcome")
+                .and_then(|o| o.get(verdict_keys::TIMEOUT_CAUSE))
+                .and_then(|c| c.get("kind"))
+                .and_then(Value::as_str)
+                .unwrap_or("run_timeout")
+                .to_string(),
             detail_message: result
                 .get("error")
                 .and_then(Value::as_str)
@@ -2103,7 +2128,7 @@ where
                         "error": format!("fanout: semaforo chiuso: {e}"),
                         "error_code": "fanout_semaphore_closed",
                         "status": "prepare_failed",
-                        "outcome": terminal_verdict("failed", "fanout_semaphore_closed"),
+                        "outcome": terminal_verdict("failed", "fanout_semaphore_closed", None),
                     })
                 }
             };
@@ -2115,7 +2140,7 @@ where
                             "error": format!("fanout: semaforo di processo chiuso: {e}"),
                             "error_code": "fanout_semaphore_closed",
                             "status": "prepare_failed",
-                            "outcome": terminal_verdict("failed", "fanout_semaphore_closed"),
+                            "outcome": terminal_verdict("failed", "fanout_semaphore_closed", None),
                         })
                     }
                 },
@@ -2136,7 +2161,7 @@ where
                     "error": format!("sub-run interrotto: {e}"),
                     "error_code": "subrun_panicked",
                     "status": "failed",
-                    "outcome": terminal_verdict("failed", "subrun_panicked"),
+                    "outcome": terminal_verdict("failed", "subrun_panicked", None),
                 }));
             }
         }
@@ -4500,6 +4525,14 @@ async fn stop_bridge(bridge: Option<tokio::task::JoinHandle<()>>) {
 }
 
 /// Chiusura del sub-run in TIMEOUT: mark_run + narrazione + tool_result.
+///
+/// La scadenza DICHIARA su cosa il budget e' finito. Prima diceva soltanto
+/// "[Sub-agent timeout]": vero e inutile, perche' non distingue un run fermo su
+/// una strada chiusa da uno che stava lavorando — due diagnosi opposte, e solo
+/// per la seconda ha senso chiedersi se il tetto del kind sia dimensionato bene.
+/// La causa viene dai passi che il run ha lasciato (`agent_steps`), classificati
+/// dal punto unico `decisions::timeout_cause`; il testo si compone DA quella
+/// (regola Q), che e' anche il campo che il coordinatore e il pannello leggono.
 async fn finalize_timeout(
     pool: &sqlx::PgPool,
     meta_db: &sqlx::PgPool,
@@ -4510,24 +4543,33 @@ async fn finalize_timeout(
     provider: &str,
     model: &str,
 ) -> Value {
-    let verdict = terminal_verdict("timed_out", "timeout");
+    // Gli step del sub-run vivono nel DB del PROGETTO, con `run_id` = id del
+    // sub-run (la riga `agent_runs` creata da `ensure_child_agent_run`).
+    let causa = crate::agent_tools::subagent_timeout::causa_del_timeout(pool, sub_run_id).await;
+    let nota = causa.nota();
+    let errore = format!("[Sub-agent timeout dopo {timeout_s}s] {nota}");
+    let verdict = terminal_verdict("timed_out", "timeout", Some(&causa));
     // Un timeout non azzera la spesa gia' fatturata: la prendo dal ledger (META).
     let ledger = crate::chat_messages::fetch_ledger_totals(meta_db, sub_run_id).await;
     let _ = mark_run(
         pool,
         sub_run_id,
-        SubRunClosure::from_ledger("timeout", "[Sub-agent timeout]", verdict.clone(), &ledger),
+        SubRunClosure::from_ledger("timeout", &errore, verdict.clone(), &ledger),
     )
     .await;
     if let Some(n) = narrator {
         n.say(
             "subagent_failed",
-            format!("Subagente {kind} in timeout dopo {timeout_s}s"),
+            format!("Subagente {kind} in timeout dopo {timeout_s}s: {nota}"),
             n.with_pin(json!({
                 K_SUB_RUN_ID: sub_run_id.to_string(),
                 K_SUB_KIND: kind,
                 "status": "timeout",
                 K_TIMEOUT_S: timeout_s,
+                "error": errore,
+                // La causa STRUTTURATA viaggia accanto al testo: il pannello la
+                // legge dal campo, non dalla frase (regola Q).
+                "timeout_cause": serde_json::to_value(&causa).unwrap_or(Value::Null),
             })),
             sub_run_id,
         )
@@ -4537,9 +4579,9 @@ async fn finalize_timeout(
         K_SUB_RUN_ID: sub_run_id.to_string(),
         "kind": kind,
         "status": "timeout",
-        "error": "[Sub-agent timeout]",
+        "error": errore,
         // Verdetto ESITO strutturato (regola M): il coordinatore legge
-        // success/verdict qui, mai dalla prosa di `error`.
+        // success/verdict/timeout_cause qui, mai dalla prosa di `error`.
         "outcome": verdict,
     });
     put_model_fields(&mut out, provider, model);
@@ -4656,7 +4698,7 @@ async fn finalize_failure(
     model: &str,
 ) -> Value {
     let msg = format!("\u{274C} [Errore grafo nativo: {e}]");
-    let verdict = terminal_verdict("failed", "engine_error");
+    let verdict = terminal_verdict("failed", "engine_error", None);
     // Come per il timeout: un errore del grafo non cancella le chiamate gia'
     // fatturate prima del guasto.
     let ledger = crate::chat_messages::fetch_ledger_totals(meta_db, sub_run_id).await;
@@ -4811,7 +4853,10 @@ impl<'a> SubRunClosure<'a> {
 /// `terminal_verdict_stessa_forma_di_structured_verdict` come rete. `verdict`
 /// usa il vocabolario canonico (`AgentRunStatus::as_str`: `timed_out` /
 /// `failed`), `success` e' sempre `false`.
-fn terminal_verdict(verdict: &str, error_class: &str) -> Value {
+///
+/// `timeout_cause` e' `None` per ogni ramo che non sia una scadenza: la causa
+/// esiste solo dove c'e' un budget che si e' esaurito.
+fn terminal_verdict(verdict: &str, error_class: &str, causa: Option<&CausaTimeout>) -> Value {
     use verdict_keys as k;
     json!({
         k::VERDICT: verdict,
@@ -4820,6 +4865,9 @@ fn terminal_verdict(verdict: &str, error_class: &str) -> Value {
         k::REVIEW: Value::Null,
         k::ADVISORY: Value::Null,
         k::DEBATE: Value::Null,
+        k::TIMEOUT_CAUSE: causa
+            .map(|c| serde_json::to_value(c).unwrap_or(Value::Null))
+            .unwrap_or(Value::Null),
         k::FINAL_GATE_PASSED: Value::Null,
         k::FINAL_GATE_UNVERIFIED: Value::Null,
         k::FINAL_GATE_FAILED_PENDING: false,
@@ -6829,7 +6877,7 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            keys(&terminal_verdict("failed", "engine_error")),
+            keys(&terminal_verdict("failed", "engine_error", None)),
             keys(&outcome.structured_verdict()),
             "terminal_verdict e structured_verdict hanno chiavi divergenti"
         );

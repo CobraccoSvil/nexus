@@ -1550,10 +1550,10 @@ if [[ -n "$contratto_ricopiato" ]]; then
   printf '%s' "$contratto_ricopiato" >&2
   echo "   Chiama nexus_types::tool_outcome::is_tool_failure(risultato)." >&2
   fail=1
-else
-  echo "OK contratto-fallimento-tool: nessun call site ricopia la condizione del marker"
-fi
-
+else
+  echo "OK contratto-fallimento-tool: nessun call site ricopia la condizione del marker"
+fi
+
 # L'esito di un tool sta in un CAMPO, non nel testo (2026-08-01, regola Q)
 #
 # `RispostaTool` porta `esito`/`exit_code` accanto al testo, e il ponte
@@ -1590,10 +1590,10 @@ if [ -n "$esito_dal_testo" ]; then
   printf '%s' "$esito_dal_testo" >&2
   echo "   Usa risposta.esito.e_fallito() (regola Q)." >&2
   fail=1
-else
-  echo "OK risposta-tool-esito-dal-campo: l'esito si legge dal campo"
-fi
-
+else
+  echo "OK risposta-tool-esito-dal-campo: l'esito si legge dal campo"
+fi
+
 # Un conflitto di unicita' si riconosce dal CODICE, mai dal messaggio (2026-08-02)
 #
 # Il Display di sqlx::Error dipende da `lc_messages` del server: MISURATO il
@@ -1721,6 +1721,93 @@ if grep -rEln --include='*.rs' --exclude-dir=target 'fn record_playwright_job' c
   fail=1
 else
   echo "OK esecutore-suite-playwright: nessuna registrazione job fuori dal runner"
+fi
+
+# ── ambiente-dichiarato (2026-08-02) ────────────────────────────────────────
+# L'host su cui l'agente eseguira' i comandi e' un FATTO che si rileva in un
+# punto solo, e che deve arrivare in ENTRAMBI i contesti di esecuzione. Il
+# difetto: la figura `verify` (sub-run a5f7419c) ha bruciato 180s e 16 iterazioni
+# per scoprire a tentativi di essere su Windows, e il system prompt le diceva nel
+# frattempo di installare con `sudo apt-get`.
+#
+# 1. La FORMA del blocco vive solo nel rilevatore: un call site che se la
+#    riscrivesse produrrebbe una seconda dichiarazione d'ambiente, e la prima
+#    volta che divergessero il prompt direbbe due cose diverse sullo stesso host.
+assert_single "blocco-ambiente-prompt" '<ambiente_esecuzione>' \
+  'crates/nexus-agent-tools/src/ambiente.rs' crates
+# 2. La SHELL dichiarata e' quella che esegue davvero: si chiede al punto unico
+#    che lancia i comandi, mai a un `cfg!(windows)` scritto qui — un ramo a
+#    codice non vedrebbe l'override `NEXUS_SHELL` ne' un percorso
+#    d'installazione diverso, e direbbe all'agente una shell che non e' la sua.
+if ! grep -q 'nexus_tool_kit::sandbox::agent_shell()' \
+  crates/nexus-agent-tools/src/ambiente.rs 2>/dev/null; then
+  echo "!! ambiente-dichiarato: la shell del blocco non viene piu' da agent_shell()." >&2
+  echo "   E' il punto unico che ESEGUE i comandi dell'agente: dedurla altrimenti" >&2
+  echo "   significa dichiarargli una shell diversa da quella che lo eseguira'." >&2
+  fail=1
+else
+  echo "OK ambiente-dichiarato: la shell dichiarata e' quella che esegue"
+fi
+# 3. L'innesto sta DENTRO i due compositori di system prompt, non nei loro
+#    chiamanti (stessa forma del guard `memorie-nel-prompt`): li' comporre un
+#    prompt di esecuzione senza il fatto tornerebbe possibile, e un prompt senza
+#    quel blocco e' perfettamente valido — la regressione sarebbe invisibile.
+amb_mancanti=""
+amb_innesto() {
+  local file="$1" fn="$2"
+  awk -v fn="$fn" '
+    index($0, fn) { dentro = 1 }
+    dentro && /prompt_ambiente::con_ambiente/ { print "trovato"; exit }
+    dentro && /^}/ { exit }
+  ' "$file" 2>/dev/null
+}
+if [[ -z "$(amb_innesto crates/mcp-core/src/chat_messages/handlers.rs 'async fn compose_chat_system_context')" ]]; then
+  amb_mancanti+="  compose_chat_system_context (chat)"$'\n'
+fi
+if [[ -z "$(amb_innesto crates/mcp-core/src/agent_tools/subagent_native.rs 'async fn resolve_system_text')" ]]; then
+  amb_mancanti+="  resolve_system_text (sub-run / figure del consiglio)"$'\n'
+fi
+# Il terzo: il compositore del run AGENTICO, da cui passano i percorsi FUORI
+# chat (process_resume, remediation di servizi e risorse). Sono quelli che
+# eseguono comandi di sistema senza che nessuno guardi, quindi i piu' esposti a
+# un'indicazione sbagliata sulla piattaforma.
+if [[ -z "$(amb_innesto crates/mcp-core/src/chat_messages/agent_run.rs 'async fn compose_agent_system_text')" ]]; then
+  amb_mancanti+="  compose_agent_system_text (run agentico, resume e remediation)"$'\n'
+fi
+if [[ -n "$amb_mancanti" ]]; then
+  echo "!! ambiente-dichiarato: un contesto di esecuzione non riceve piu' l'ambiente:" >&2
+  printf '%s' "$amb_mancanti" >&2
+  echo "   L'innesto deve restare DENTRO il compositore: nel chiamante, comporre" >&2
+  echo "   quel system prompt senza il fatto tornerebbe possibile." >&2
+  fail=1
+else
+  echo "OK ambiente-dichiarato: chat e sub-run ricevono entrambi l'ambiente reale"
+fi
+
+# ── causa-del-timeout (2026-08-02) ──────────────────────────────────────────
+# «Tempo scaduto» e' vero e non serve a nulla: non distingue un run fermo su una
+# strada chiusa da uno che stava lavorando, e solo per il secondo ha senso
+# chiedersi se il tetto della figura sia dimensionato bene.
+#
+# 1. Il vocabolario delle cause vive nel punto unico. Un secondo posto che
+#    decidesse "questo timeout e' una ripetizione" darebbe due diagnosi per lo
+#    stesso run.
+assert_single "causa-timeout" 'fn classifica_causa_timeout' \
+  'crates/nexus-agent-graph/src/decisions/timeout_cause.rs' crates
+# 2. La chiusura in scadenza deve INTERROGARLO. Senza, `finalize_timeout` torna
+#    a scrivere la sola parola "timeout" — con tutti i test verdi, perche' un
+#    esito senza causa resta un esito valido.
+if [[ -z "$(awk '
+  /async fn finalize_timeout/ { dentro = 1 }
+  dentro && /subagent_timeout::causa_del_timeout/ { print "trovato"; exit }
+  dentro && /^}/ { exit }
+' crates/mcp-core/src/agent_tools/subagent_native.rs 2>/dev/null)" ]]; then
+  echo "!! causa-timeout: la chiusura in scadenza non chiede piu' la causa." >&2
+  echo "   finalize_timeout deve interrogare subagent_timeout::causa_del_timeout:" >&2
+  echo "   senza, il pannello torna a dire 'tempo scaduto' e basta." >&2
+  fail=1
+else
+  echo "OK causa-timeout: la chiusura in scadenza dichiara su cosa e' finito il budget"
 fi
 
 if [[ "$fail" -ne 0 ]]; then

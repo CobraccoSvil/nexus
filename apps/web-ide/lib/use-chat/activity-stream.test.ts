@@ -489,6 +489,48 @@ test("etichetta figura distingue veto e cause tecniche, mai un opaco n/d", () =>
   }
 });
 
+test("una figura scaduta dichiara SU COSA e' finito il budget", () => {
+  beforeEach();
+  // Il `detail_code` porta la causa strutturata prodotta dal backend
+  // (`decisions::CausaTimeout`): l'etichetta si sceglie da quella, non dalla
+  // prosa del dettaglio.
+  const scaduta = (detail_code: string, detail_message: string) =>
+    figureVerdictDisplay({
+      kind: "verify",
+      status: "run_timeout",
+      detail_code,
+      detail_message,
+    });
+
+  // IL caso misurato (sub-run a5f7419c): budget finito su `sudo apt-get` che su
+  // quell'host non poteva funzionare. Prima diceva "tempo scaduto", identico al
+  // caso opposto qui sotto.
+  assert.deepEqual(
+    scaduta("last_attempt_failed", "budget esaurito; ultimo tentativo fallito 'run_command(sudo)'"),
+    { tone: "technical", label: "tempo scaduto dopo un errore" },
+  );
+  assert.deepEqual(scaduta("repeated_failures", "3 tentativi falliti"), {
+    tone: "technical",
+    label: "tempo scaduto su tentativi ripetuti",
+  });
+  // L'unico caso in cui allungare il tetto della figura e' una domanda sensata,
+  // e va distinguibile a colpo d'occhio dai due sopra.
+  assert.deepEqual(scaduta("no_failure_at_end", "lavoro in corso"), {
+    tone: "technical",
+    label: "tempo scaduto mentre lavorava",
+  });
+  // Causa non osservabile, o esito prodotto da una versione che non la emette:
+  // resta la sola cosa che si sa, senza inventare una diagnosi.
+  assert.deepEqual(scaduta("not_observable", "nessun passo osservabile"), {
+    tone: "technical",
+    label: "tempo scaduto",
+  });
+  assert.deepEqual(scaduta("run_timeout", "Sub-agent in timeout"), {
+    tone: "technical",
+    label: "tempo scaduto",
+  });
+});
+
 test("consiglio competenze degradato espone segnale strutturato", () => {
   beforeEach();
   const metaSteps: MetaStepEntry[] = [

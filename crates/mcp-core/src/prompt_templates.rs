@@ -25,16 +25,32 @@ const COUNCIL_DIRECTIVE_END: &str = "</consiglio_analisi>";
 
 /// Rimuove il blocco `<consiglio_analisi>` (mig 0549) da un system prompt. PURA.
 /// Se il blocco non c'e' (sentinel o chiusura assenti) ritorna il prompt invariato.
-/// Toglie anche i newline che precedono il sentinel (l'append era `\n\n`), cosi'
-/// non resta spaziatura orfana. PUNTO UNICO dello strip (regola L).
+/// PUNTO UNICO dello strip della direttiva del consiglio (regola L); la meccanica
+/// del taglio e' [`strip_block_between`].
 pub fn strip_council_directive(prompt: &str) -> String {
-    let Some(start) = prompt.find(COUNCIL_DIRECTIVE_SENTINEL) else {
+    strip_block_between(prompt, COUNCIL_DIRECTIVE_SENTINEL, COUNCIL_DIRECTIVE_END)
+}
+
+/// Toglie da un system prompt il tratto che va da `inizio` alla PRIMA `fine` che
+/// lo segue, estremi compresi. PURA. Se uno dei due marcatori manca, il prompt
+/// torna invariato: un blocco che non c'e' non e' un errore.
+///
+/// Toglie anche i newline che precedono il marcatore d'apertura (gli append sono
+/// `\n\n`), cosi' non resta spaziatura orfana.
+///
+/// PUNTO UNICO della meccanica (regola L): i due blocchi condizionali di oggi —
+/// la direttiva del consiglio, delimitata dal sentinel di migrazione, e quella
+/// dei privilegi di sistema, delimitata dai propri tag — chiedono la stessa cosa
+/// con marcatori diversi. Con due implementazioni, la prossima correzione sui
+/// bordi (gli `\n` orfani, un marcatore ripetuto) verrebbe fatta in una sola.
+pub fn strip_block_between(prompt: &str, inizio: &str, fine: &str) -> String {
+    let Some(start) = prompt.find(inizio) else {
         return prompt.to_string();
     };
-    let Some(end_rel) = prompt[start..].find(COUNCIL_DIRECTIVE_END) else {
+    let Some(end_rel) = prompt[start..].find(fine) else {
         return prompt.to_string();
     };
-    let end = start + end_rel + COUNCIL_DIRECTIVE_END.len();
+    let end = start + end_rel + fine.len();
     let head = prompt[..start].trim_end_matches('\n');
     let mut out = String::with_capacity(head.len() + prompt.len().saturating_sub(end));
     out.push_str(head);
