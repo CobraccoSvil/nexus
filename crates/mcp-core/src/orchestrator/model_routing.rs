@@ -915,6 +915,7 @@ pub(crate) fn build_chat_gateway_call(spec: ChatCallSpec<'_>) -> ChatGatewayCall
                 tool_call_id: None,
                 reasoning: None,
                 thinking_signature: None,
+                is_error: None,
             }],
             max_tokens: Some(spec.token_budget),
             temperature: None,

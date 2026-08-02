@@ -177,6 +177,7 @@ fn richiesta_turno1(modello: &str) -> LlmRequest {
             name: None,
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         }],
         temperature: Some(0.0),
         max_tokens: Some(1024),
@@ -219,6 +220,7 @@ fn richiesta_turno2(modello: &str, risposta1: &LlmResponse) -> LlmRequest {
         name: None,
         thinking_signature: risposta1.thinking_signature.clone(),
         reasoning: risposta1.reasoning.clone(),
+        is_error: None,
     };
 
     // Un messaggio tool per ciascuna tool-call (tool_call_id deve combaciare).
@@ -233,6 +235,7 @@ fn richiesta_turno2(modello: &str, risposta1: &LlmResponse) -> LlmRequest {
             name: None,
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         },
         assistant,
     ];
@@ -276,6 +279,7 @@ fn messaggio_tool(tc: &LlmToolCall) -> LlmMessage {
         name: Some(tc.function.name.clone()),
         thinking_signature: None,
         reasoning: None,
+        is_error: None,
     }
 }
 

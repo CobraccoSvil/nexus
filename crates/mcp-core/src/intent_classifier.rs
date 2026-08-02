@@ -882,6 +882,7 @@ async fn try_classify_once(
             tool_call_id: None,
             reasoning: None,
             thinking_signature: None,
+            is_error: None,
         }],
         pin_provider: Some(provider.to_string()),
         metadata: GwMetadata {

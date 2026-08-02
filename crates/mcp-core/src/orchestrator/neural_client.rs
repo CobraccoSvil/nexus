@@ -163,6 +163,7 @@ impl NeuralCoreClient {
                 tool_call_id: None,
                 reasoning: None,
                 thinking_signature: None,
+                is_error: None,
             }],
             pin_provider: Some(provider.to_string()),
             metadata: GwMetadata {
@@ -261,6 +262,7 @@ impl NeuralCoreClient {
                 tool_call_id: None,
                 reasoning: None,
                 thinking_signature: None,
+                is_error: None,
             });
         }
         all_messages.extend(messages);
@@ -739,6 +741,12 @@ pub(crate) fn gw_message_from_value(v: Value) -> GwMessage {
         .get("thinking_signature")
         .and_then(Value::as_str)
         .map(str::to_string);
+    // Esito dichiarato di un tool_result (regola Q). Vale qui la stessa ragione
+    // dei due round-trip sopra: e' l'ultimo cancello prima del wire, e un campo
+    // che non si legge qui non parte — con la differenza che a perderlo non e'
+    // un vincolo dell'API ma il MODELLO, che riceverebbe un tool fallito
+    // indistinguibile da uno riuscito.
+    let is_error = v.get("is_error").and_then(Value::as_bool);
     GwMessage {
         role,
         content,
@@ -746,6 +754,7 @@ pub(crate) fn gw_message_from_value(v: Value) -> GwMessage {
         tool_call_id,
         reasoning,
         thinking_signature,
+        is_error,
     }
 }
 

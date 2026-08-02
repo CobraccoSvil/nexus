@@ -410,6 +410,11 @@ fn with_content(msg: &LlmMessage, text: String) -> LlmMessage {
         // intatto attraverso la redaction (non e' un payload testuale da
         // redarre: e' il pensiero da ri-passare all'API, vincolo HTTP 400).
         reasoning: msg.reasoning.clone(),
+        // Anche l'esito del tool attraversa la redaction intatto: e' un campo
+        // strutturato, non un payload testuale da redarre, e perderlo qui
+        // renderebbe un tool fallito indistinguibile da uno riuscito per il
+        // solo fatto di essere passato dalla pipeline di redazione.
+        is_error: msg.is_error,
     }
 }
 
@@ -443,6 +448,7 @@ mod tests {
             name: None,
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         }
     }
 
@@ -493,6 +499,7 @@ mod tests {
             name: None,
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         }
     }
 
@@ -594,6 +601,7 @@ mod tests {
             name: None,
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         };
         let req = request(vec![sys], "req-sys");
         let res = p.redact(&req).await.expect("redazione ok");

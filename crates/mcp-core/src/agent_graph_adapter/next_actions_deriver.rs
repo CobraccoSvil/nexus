@@ -253,6 +253,7 @@ impl NextActionsDeriverAdapter {
                 tool_call_id: None,
                 reasoning: None,
                 thinking_signature: None,
+                is_error: None,
             }],
             max_tokens: Some(1024),
             temperature: Some(0.0),

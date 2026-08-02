@@ -346,6 +346,7 @@ fn build_gw_request(req: &LlmRequest) -> GwRequest {
                 tool_call_id: None,
                 reasoning: None,
                 thinking_signature: None,
+                is_error: None,
             });
         }
     }
@@ -391,6 +392,12 @@ fn build_gw_request(req: &LlmRequest) -> GwRequest {
             // del blocco thinking VA ri-passata nei turni con tool (HTTP 400
             // senza). Il server la inoltra SOLO ad Anthropic; inerte altrove.
             thinking_signature: m.thinking_signature.clone(),
+            // ESITO DEL TOOL (regola Q): il campo attraversa il confine HTTP
+            // verso il gateway, che lo traduce nel dialetto del provider. E' il
+            // solo modo in cui il MODELLO viene a sapere che un tool ha fallito
+            // da quando un tool migrato a `RispostaTool` non scrive piu' il
+            // marker nel testo: perderlo qui lo renderebbe muto sul wire.
+            is_error: m.is_error,
         });
     }
 
@@ -1206,6 +1213,7 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
                     tool_call_id: None,
                     reasoning: None,
                     thinking_signature: None,
+                    is_error: None,
                 },
                 LlmMessage {
                     role: "tool".to_string(),
@@ -1214,6 +1222,7 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
                     tool_call_id: Some("call_X".to_string()),
                     reasoning: None,
                     thinking_signature: None,
+                    is_error: None,
                 },
             ],
             ..Default::default()
@@ -1265,6 +1274,61 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
         assert_eq!(m2["tool_call_id"], "call_X");
         // Il messaggio tool NON serializza tool_calls (None -> omesso).
         assert!(m2.get("tool_calls").is_none());
+    }
+
+    /// L'ESITO ATTRAVERSA IL CONFINE HTTP (regola Q): non basta che il campo
+    /// esista sui due lati, devono anche parlarsi.
+    ///
+    /// Il test serializza la richiesta come la manda mcp-core e la DESERIALIZZA
+    /// col tipo del server (`nexus_gateway::types::LlmRequest`), che e' il
+    /// passaggio reale di produzione. Asserire sui campi dello struct proverebbe
+    /// solo che li abbiamo scritti: un nome di campo divergente fra i due lati
+    /// resterebbe verde (regola O, ed e' il difetto gia' misurato in questo repo
+    /// coi costi a $0.00 per un wire in camelCase).
+    ///
+    /// MUTAZIONE: togliere `is_error: m.is_error` da `build_gw_request`, o
+    /// rinominare il campo su uno solo dei due lati -> il test rosseggia.
+    #[test]
+    fn l_esito_del_tool_attraversa_il_confine_verso_il_gateway() {
+        let req = LlmRequest {
+            provider: "anthropic".to_string(),
+            model: "claude-x".to_string(),
+            messages: vec![
+                LlmMessage {
+                    role: "user".to_string(),
+                    content: json!("avvia il servizio"),
+                    ..Default::default()
+                },
+                LlmMessage {
+                    role: "tool".to_string(),
+                    content: json!("nessun ascolto sulla porta 24806"),
+                    tool_call_id: Some("call_X".to_string()),
+                    is_error: Some(true),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let body = serde_json::to_value(build_gw_request(&req)).expect("serializza");
+        assert_eq!(
+            body["messages"][1]["is_error"],
+            json!(true),
+            "l'esito deve essere sul wire, non solo nello struct: {body}"
+        );
+        // Un messaggio che non dichiara nulla non porta il campo: l'assenza e'
+        // "non lo so", e non deve gonfiare ogni turno testuale.
+        assert!(body["messages"][0].get("is_error").is_none());
+
+        // L'ALTRO LATO: il server deserializza e RITROVA la dichiarazione.
+        let lato_server: nexus_gateway::types::LlmRequest =
+            serde_json::from_value(body).expect("il gateway deve saper leggere questa richiesta");
+        assert_eq!(
+            lato_server.messages[1].is_error,
+            Some(true),
+            "il campo non e' arrivato al tipo del server: i due lati non si parlano"
+        );
+        assert_eq!(lato_server.messages[0].is_error, None);
     }
 
     // ── turn_cost_usd: il numero che stringe il freno di spesa ────────────────

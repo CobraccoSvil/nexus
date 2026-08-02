@@ -1830,6 +1830,21 @@ fi
 # `list_processes_from`). Misura solo che la composizione resti una sola.
 assert_single "resa-elenco-servizi" 'fn elenco_da_processi\(|fn eta_leggibile\(' \
   'crates/mcp-core/src/agent_tools/service_listing.rs' crates
+# L'esito di un tool arriva al MODELLO in un campo (2026-08-02, regola Q)
+#
+# Il canale strutturato attraversa la catena fino al confine col provider, e
+# li' ogni dialetto fa cio' che il suo protocollo consente: Anthropic ha
+# `is_error` sul blocco tool_result e l'adapter lo emette nativo; OpenAI-compat
+# e Google non hanno un campo equivalente, e il degrado e' DICHIARATO in un
+# punto solo, che compone il testo DAL campo. Una seconda composizione altrove
+# tornerebbe a spargere il vocabolario dell'esito nella prosa, cioe' il difetto
+# da cui la regola Q nasce: quando il marker viveva nel testo, due composizioni
+# legittime lo spingevano fuori dalla testa e il fallimento smetteva di essere
+# riconosciuto.
+assert_single "canale-esito-senza-campo" 'fn testo_con_esito_dichiarato\(' \
+  'crates/nexus-gateway/src/providers/tool_error_channel.rs' crates
+assert_single "prefisso-esito-senza-campo" 'PREFISSO_FALLIMENTO: &str' \
+  'crates/nexus-gateway/src/providers/tool_error_channel.rs' crates
 
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2

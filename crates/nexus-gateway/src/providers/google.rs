@@ -1836,7 +1836,17 @@ fn tool_result_to_part(
         .and_then(|id| id_to_name.get(id).cloned())
         .or_else(|| msg.tool_call_id.clone())
         .unwrap_or_default();
-    let response = serde_json::json!({ "result": content_to_string(&msg.content) });
+    // ESITO DEL TOOL (regola Q): `functionResponse.response` e' un oggetto
+    // libero, ma nessuna chiave vi ha un significato d'errore CONCORDATO col
+    // modello — inventarne una ("error", "is_error") produrrebbe un campo che
+    // l'API accetta e nessuno interpreta, cioe' un esito dichiarato solo a noi
+    // stessi. Il degrado passa quindi dallo stesso punto unico di
+    // OpenAI-compat: la dichiarazione entra nel testo, composta dal campo.
+    let testo = crate::providers::tool_error_channel::testo_con_esito_dichiarato(
+        content_to_string(&msg.content),
+        msg.is_error,
+    );
+    let response = serde_json::json!({ "result": testo });
     GooglePart::function_response(name, response)
 }
 
@@ -3046,6 +3056,7 @@ mod tests {
             name: None,
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         }
     }
 
@@ -3407,6 +3418,69 @@ mod tests {
         assert_eq!(json["contents"][0]["parts"][0]["text"], "domanda");
         assert_eq!(json["generationConfig"]["temperature"], 0.5);
         assert_eq!(json["generationConfig"]["maxOutputTokens"], 500);
+    }
+
+    /// Il degrado DICHIARATO su Gemini: `functionResponse.response` e' un
+    /// oggetto libero, ma nessuna sua chiave ha un significato d'errore
+    /// concordato col modello — inventarne una darebbe un esito dichiarato solo
+    /// a noi stessi. La dichiarazione entra quindi nel testo, composta DAL campo
+    /// dallo stesso punto unico di OpenAI-compat.
+    ///
+    /// MUTAZIONE: rimettere `content_to_string(&msg.content)` nudo dentro
+    /// `tool_result_to_part` -> il test rosseggia, ed e' la cecita' che il
+    /// modello avrebbe su ogni tool fallito.
+    #[test]
+    fn un_tool_fallito_e_dichiarato_nel_testo_della_function_response() {
+        let corpo = |is_error: Option<bool>| {
+            // La functionCall che ha chiesto il tool deve esserci: Gemini esige
+            // la coppia, e la riconciliazione scarta un functionResponse orfano.
+            let mut chiamante = msg("assistant", "");
+            chiamante.tool_calls = Some(vec![LlmToolCall {
+                id: "call_42".to_string(),
+                kind: "function".to_string(),
+                function: ToolFunctionCall {
+                    name: "run_service".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                thought_signature: None,
+            }]);
+            let mut tool_msg = msg("tool", "nessun ascolto sulla porta 24806");
+            tool_msg.tool_call_id = Some("call_42".to_string());
+            tool_msg.is_error = is_error;
+            let req = LlmRequest {
+                model: "gemini-x".to_string(),
+                messages: vec![chiamante, tool_msg],
+                temperature: None,
+                max_tokens: None,
+                tools: None,
+                response_format: None,
+                stream: None,
+                thinking: None,
+                tool_choice: None,
+                pin_provider: None,
+                metadata: metadata(),
+                run_timeout_secs: None,
+            };
+            serde_json::to_value(build_request_body(&req, GoogleThinking::Absent))
+                .expect("serializza")
+        };
+
+        // contents[0] = turno `model` con la functionCall; contents[1] = turno
+        // `user` che porta la functionResponse.
+        let fallito = corpo(Some(true));
+        assert_eq!(
+            fallito["contents"][1]["parts"][0]["functionResponse"]["response"]["result"],
+            "[tool_error] nessun ascolto sulla porta 24806",
+            "il fallimento deve arrivare al modello: {fallito}"
+        );
+
+        // Riuscito e non-dichiarato restano nudi: nessun esito inventato.
+        for esito in [Some(false), None] {
+            assert_eq!(
+                corpo(esito)["contents"][1]["parts"][0]["functionResponse"]["response"]["result"],
+                "nessun ascolto sulla porta 24806"
+            );
+        }
     }
 
     #[test]
@@ -3883,6 +3957,7 @@ mod tests {
             name: None,
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         };
         let json =
             serde_json::to_value(build_request_body(&req_with(assistant), GoogleThinking::Absent))
@@ -4008,6 +4083,7 @@ mod tests {
             name: None,
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         }
     }
 
@@ -5090,6 +5166,7 @@ mod tests {
                 name: None,
                 thinking_signature: None,
                 reasoning: None,
+                is_error: None,
             }],
             temperature: None,
             max_tokens: None,

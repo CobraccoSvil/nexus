@@ -1809,6 +1809,7 @@ fn image_gen_to_llm_request(body: &ImageGenRequest, model: &str) -> LlmRequest {
             name: None,
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         }],
         temperature: None,
         max_tokens: None,
@@ -1979,6 +1980,7 @@ fn video_gen_to_llm_request(body: &VideoGenRequest, model: &str) -> LlmRequest {
             name: None,
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         }],
         temperature: None,
         max_tokens: None,
@@ -2146,6 +2148,7 @@ fn transcribe_to_llm_request(body: &TranscribeRequest, model: &str) -> LlmReques
             name: None,
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         }],
         temperature: None,
         max_tokens: None,
@@ -2312,6 +2315,7 @@ fn tts_to_llm_request(body: &TtsRequest, model: &str) -> LlmRequest {
             name: None,
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         }],
         temperature: None,
         max_tokens: None,
@@ -3072,6 +3076,7 @@ mod tests {
                 name: None,
                 thinking_signature: None,
                 reasoning: None,
+                is_error: None,
             }],
             temperature: None,
             max_tokens: None,
@@ -3325,6 +3330,7 @@ mod tests {
             name: None,
             thinking_signature: Some("sig-di-un-altro-turno".into()),
             reasoning: None,
+            is_error: None,
         });
         r
     }
@@ -3372,6 +3378,7 @@ mod tests {
             name: None,
             thinking_signature: None,
             reasoning: Some("catena di pensiero deepseek".into()),
+            is_error: None,
         });
         r
     }

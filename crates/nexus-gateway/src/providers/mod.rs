@@ -7,6 +7,7 @@
 
 pub mod openai_compat;
 pub mod tool_choice;
+pub mod tool_error_channel;
 
 pub mod anthropic;
 pub mod deepseek;

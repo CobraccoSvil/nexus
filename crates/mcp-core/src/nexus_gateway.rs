@@ -70,6 +70,21 @@ pub struct GwMessage {
     /// quando `None` (turno senza thinking / altri ruoli o provider).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_signature: Option<String>,
+    /// Esito DICHIARATO del tool su un messaggio `role="tool"` (regola Q): il
+    /// tool ha fallito (`Some(true)`), ha fatto cio' che doveva (`Some(false)`),
+    /// oppure nessuno lo ha dichiarato (`None`). Allineato a
+    /// `LlmMessage::is_error` del server (`nexus-gateway::types`), che lo
+    /// traduce nel campo nativo del dialetto dove esiste (Anthropic `is_error`
+    /// sul blocco `tool_result`) e ne dichiara il degrado dove non esiste.
+    ///
+    /// E' l'ultimo anello del canale strutturato dell'esito: il primo
+    /// consumatore di quell'esito e' il MODELLO, e prima di questo campo gli
+    /// arrivava solo il testo. Finche' i tool scrivevano il marker `U+274C` in
+    /// testa al risultato la dichiarazione passava comunque; per un tool
+    /// migrato a `RispostaTool` il marker non c'e' piu'. Omesso quando `None`
+    /// (qualunque ruolo != tool, o esito non dichiarato).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -1067,6 +1082,7 @@ mod confine_wire_tests {
                 name: None,
                 thinking_signature: None,
                 reasoning: None,
+                is_error: None,
             }],
             temperature: None,
             max_tokens: Some(64),

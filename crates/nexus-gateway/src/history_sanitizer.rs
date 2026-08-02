@@ -325,6 +325,7 @@ fn synthetic_tool_message(tool_call_id: &str, name: &str) -> LlmMessage {
         name: Some(name.to_string()),
         thinking_signature: None,
         reasoning: None,
+        is_error: None,
     }
 }
 
@@ -379,6 +380,7 @@ mod tests {
             name: None,
             thinking_signature: Some("think-a".to_string()),
             reasoning: Some("reason-d".to_string()),
+            is_error: None,
         }
     }
 
@@ -391,6 +393,7 @@ mod tests {
             name: Some("get_time".to_string()),
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         }
     }
 
@@ -466,6 +469,7 @@ mod tests {
                 name: None,
                 thinking_signature: None,
                 reasoning: None,
+                is_error: None,
             },
             LlmMessage {
                 role: "assistant".to_string(),
@@ -475,6 +479,7 @@ mod tests {
                 name: None,
                 thinking_signature: None,
                 reasoning: None,
+                is_error: None,
             },
         ];
         let r = sanitize_history(&mut msgs, "mistral", SanitizeMode::Standard);
@@ -494,6 +499,7 @@ mod tests {
                 name: None,
                 thinking_signature: None,
                 reasoning: None,
+                is_error: None,
             },
             tool_result("orphan"),
         ];
@@ -513,6 +519,7 @@ mod tests {
                 name: None,
                 thinking_signature: None,
                 reasoning: None,
+                is_error: None,
             },
             assistant_with_tools("call_x", "read_file"),
         ];
@@ -587,6 +594,7 @@ mod tests {
             name: None,
             thinking_signature: None,
             reasoning: None,
+            is_error: None,
         }
     }
 
