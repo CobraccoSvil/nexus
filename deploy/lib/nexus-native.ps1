@@ -34,13 +34,24 @@
 
 # Esegue lo scriptblock con la preferenza d'errore sospesa e ne ritorna l'exit
 # code. La preferenza precedente e' ripristinata anche se lo scriptblock solleva.
+#
+# L'output del comando va all'HOST, non nella pipeline: una funzione PowerShell
+# ritorna TUTTO cio' che finisce in pipeline, non solo il `return`, quindi senza
+# questo l'output si mescolerebbe all'exit code e il chiamante riceverebbe un
+# array — e `if ($codice -ne 0)` su un array FILTRA invece di confrontare, cioe'
+# e' vero appena il comando stampa una riga qualunque. MISURATO il 02/08/2026 al
+# primo deploy dopo l'estrazione: `next build` RIUSCITO (95/95 pagine, exit 0)
+# dichiarato fallito, col proprio intero output dentro il messaggio d'errore.
+# Chi deve CATTURARE l'output lo assegna a una variabile dentro lo scriptblock
+# (`$script:out = & ...`), come fa db-backup.ps1: la cattura e' una scelta del
+# chiamante, mai un effetto collaterale del canale dell'esito.
 function Invoke-NexusNative {
   param(
     [Parameter(Mandatory)][scriptblock]$Comando
   )
   $preferenzaPrec = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
-  try { & $Comando } finally { $ErrorActionPreference = $preferenzaPrec }
+  try { & $Comando | Out-Host } finally { $ErrorActionPreference = $preferenzaPrec }
   return $LASTEXITCODE
 }
 
