@@ -91,6 +91,7 @@ mod probe_latent_state;
 mod probe_world;
 mod project_workspace;
 mod projects;
+mod prompt_ambiente;
 mod prompt_memories;
 mod prompt_templates;
 mod provider_cooldown;

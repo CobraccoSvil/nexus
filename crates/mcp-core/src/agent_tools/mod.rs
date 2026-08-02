@@ -43,6 +43,9 @@ pub(crate) mod service;
 // nexus-agent-tools impedisce a subagent.rs di chiamarlo). Intercetta i tool
 // dispatch_subagent* prima della delega.
 pub(crate) mod subagent_native;
+// I FATTI su cui la chiusura in scadenza dichiara la propria causa: porta di
+// `nexus_agent_graph::decisions::timeout_cause` su `agent_steps`.
+pub(crate) mod subagent_timeout;
 pub(crate) mod testing;
 pub(crate) mod tool_not_found;
 // Catena di verifica post-modifica nexus_verify_change (ADR 0019 L3).

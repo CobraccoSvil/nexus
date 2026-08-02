@@ -642,6 +642,12 @@ pub(crate) mod verdict_keys {
     pub const FINAL_GATE_FAILED_PENDING: &str = "final_gate_failed_pending";
     pub const FORCED_CLOSE_UNVERIFIED: &str = "forced_close_unverified";
     pub const ERROR_CLASS: &str = "error_class";
+    /// Su CHE COSA il budget si e' esaurito, per i soli run chiusi in scadenza
+    /// (`nexus_agent_graph::decisions::CausaTimeout`, serializzata); `null`
+    /// ovunque altro. Un run che finisce il tempo su una strada chiusa e uno che
+    /// lo finisce lavorando sono due esiti diversi, e prima erano la stessa
+    /// parola.
+    pub const TIMEOUT_CAUSE: &str = "timeout_cause";
 }
 
 /// Stop_reason che denotano una chiusura coordinata anti-loop/forced: elenco
@@ -807,6 +813,11 @@ impl NativeRunOutcome {
             k::FINAL_GATE_FAILED_PENDING: self.final_gate_failed_pending,
             k::FORCED_CLOSE_UNVERIFIED: self.forced_close_unverified,
             k::ERROR_CLASS: self.error_class,
+            // Un run che e' arrivato a produrre un esito NON e' scaduto: la
+            // causa di scadenza appartiene ai soli rami terminali senza outcome
+            // (`terminal_verdict`). Il campo resta qui, a `null`, perche' le due
+            // forme restino la stessa (vedi la doc di `terminal_verdict`).
+            k::TIMEOUT_CAUSE: Value::Null,
         })
     }
 }

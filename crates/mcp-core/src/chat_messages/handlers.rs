@@ -554,7 +554,11 @@ async fn compose_chat_system_context(
         ctx.push_str("\n\n");
         ctx.push_str(&kb_block);
     }
-    ctx
+    // L'host su cui i comandi gireranno DAVVERO, dichiarato invece che indovinato
+    // — e la direttiva sui privilegi tolta se presuppone un gestore che qui non
+    // esiste. Sta dentro il compositore, non nel chiamante: un system prompt di
+    // esecuzione non deve essere componibile senza (vedi `crate::prompt_ambiente`).
+    crate::prompt_ambiente::con_ambiente(db, ctx).await
 }
 
 pub async fn send_chat_message(
@@ -3050,10 +3054,21 @@ mod tests_system_prompt_della_chat {
             compose_chat_system_context(&pool, &cache, TASK, AutomationMode::Study, None, None)
                 .await;
 
-        // Uguaglianza esatta: nessun testo aggiunto dal codice. Il template di
+        // Nessun testo di CONFIGURAZIONE aggiunto dal codice. Il template di
         // prova non porta il sentinel del consiglio, quindi il gate e' un no-op
         // e la differenza sarebbe soltanto codice che parla per conto suo.
-        assert_eq!(system, TEMPLATE);
+        //
+        // L'unica aggiunta ammessa e' il blocco d'ambiente: non e' configurazione
+        // che il binario si porta dietro — e' un FATTO misurato sull'host
+        // (`nexus_agent_tools::ambiente`), la cui forma vive nel punto unico e il
+        // cui vocabolario sta in `settings`. Si separa e si asserisce a parte,
+        // cosi' il presidio originale resta intero: tutto cio' che PRECEDE il
+        // blocco deve essere ancora, alla lettera, il template in DB.
+        let (prima_del_fatto, fatto) = system
+            .split_once(nexus_agent_tools::ambiente::TAG_BLOCCO)
+            .expect("il fatto d'ambiente non e' entrato nel system della chat");
+        assert_eq!(prima_del_fatto.trim_end(), TEMPLATE);
+        assert!(fatto.contains("Sistema operativo dell'host"), "{fatto}");
         // Le due direttive che NON devono sopravvivere alla copia rimossa: un
         // comando POSIX su Windows, e la resa contata sui TENTATIVI invece che
         // sul progresso.
@@ -3130,6 +3145,13 @@ mod tests_system_prompt_della_chat {
             compose_chat_system_context(&pool, &cache, TASK, AutomationMode::Study, None, None)
                 .await;
 
-        assert_eq!(system, BASE);
+        // In Studio il suffisso act-first non entra: resta il template, piu' il
+        // solo fatto d'ambiente (vedi il test gemello sopra per il perche' quella
+        // aggiunta non e' «codice che parla per conto suo»).
+        let (prima_del_fatto, _) = system
+            .split_once(nexus_agent_tools::ambiente::TAG_BLOCCO)
+            .expect("il fatto d'ambiente non e' entrato nel system della chat");
+        assert_eq!(prima_del_fatto.trim_end(), BASE);
+        assert!(!system.contains(SUFFISSO), "{system}");
     }
 }

@@ -15,6 +15,7 @@
 //! `TextEmbedder` copre l'unico accoppiamento vettoriale di `knowledge`.
 //! Candidato successivo: il pacchetto wiki (richiede de-axumizzazione).
 
+pub mod ambiente;
 pub mod archive_tools;
 pub mod attachment_inspector;
 pub mod attachment_settings;

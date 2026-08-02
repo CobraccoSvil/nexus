@@ -454,6 +454,31 @@ function advisoryOkDisplay(verdict: string | undefined): FigureVerdictDisplay {
   }
 }
 
+/** Etichetta di una figura scaduta, dalla CAUSA strutturata (`detail_code` =
+ *  `decisions::CausaTimeout`, vocabolario canonico del backend), mai dalla prosa
+ *  del dettaglio (regola M).
+ *
+ *  ROOT CAUSE (02/08/2026): "tempo scaduto" e' vero e non serve a nulla. La
+ *  figura `verify` del sub-run a5f7419c aveva speso il proprio budget provando
+ *  `apt-get` su un host Windows, e il pannello mostrava la stessa parola che
+ *  avrebbe mostrato per una figura che stava lavorando bene e non ha fatto in
+ *  tempo — due diagnosi opposte con la stessa faccia, e solo per la seconda ha
+ *  senso chiedersi se il tetto della figura sia dimensionato bene. */
+function timeoutLabel(detailCode: string): string {
+  switch (detailCode) {
+    case "repeated_failures":
+      return "tempo scaduto su tentativi ripetuti";
+    case "last_attempt_failed":
+      return "tempo scaduto dopo un errore";
+    case "no_failure_at_end":
+      return "tempo scaduto mentre lavorava";
+    default:
+      // `not_observable` e i codici di una versione che non emetteva la causa:
+      // resta la sola cosa che si sa.
+      return "tempo scaduto";
+  }
+}
+
 /** Etichetta + tono del parere di UNA figura del consiglio a partire dal SEGNALE
  *  STRUTTURATO `report.status` (enum backend), MAI dalla prosa (regola M).
  *  Distingue un parere ESPRESSO (procede / con modifiche / blocca) da
@@ -469,7 +494,7 @@ export function figureVerdictDisplay(report: FigureAdvisoryReport): FigureVerdic
     case "advisory_ok":
       return advisoryOkDisplay(report.advisory?.verdict ?? report.advisory_verdict);
     case "run_timeout":
-      return { tone: "technical", label: "tempo scaduto" };
+      return { tone: "technical", label: timeoutLabel(report.detail_code) };
     case "run_failed":
       return { tone: "technical", label: "errore" };
     case "prepare_failed":
