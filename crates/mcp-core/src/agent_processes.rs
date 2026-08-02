@@ -645,15 +645,29 @@ pub async fn list_processes(db: &PgPool, project_id: Uuid) -> Result<Vec<Process
     let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id)
         .await
         .map_err(|e| e.to_string())?;
+    list_processes_from(&proj_pool, project_id).await
+}
+
+/// La LETTURA vera, sul pool gia' risolto.
+///
+/// Separata da [`list_processes`] per una sola ragione, ed e' la regola O: un
+/// test che volesse misurare questo elenco sullo schema reale non puo' passare
+/// dal routing dei pool (il `#[sqlx::test]` ha un pool solo e nessun registry
+/// META), e l'alternativa — ricopiare la query nel test — misurerebbe la copia.
+pub(crate) async fn list_processes_from(
+    proj_pool: &PgPool,
+    project_id: Uuid,
+) -> Result<Vec<ProcessSummary>, String> {
     let rows = sqlx::query(
         r#"SELECT id, label, command, pid, status, exit_code, created_at
            FROM agent_processes
            WHERE project_id = $1
            ORDER BY created_at DESC
-           LIMIT 20"#,
+           LIMIT $2"#,
     )
     .bind(project_id)
-    .fetch_all(&proj_pool)
+    .bind(LIMITE_ELENCO_PROCESSI as i64)
+    .fetch_all(proj_pool)
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 
@@ -666,12 +680,16 @@ pub async fn list_processes(db: &PgPool, project_id: Uuid) -> Result<Vec<Process
             pid: row.try_get("pid").unwrap_or(None),
             status: row.get::<String, _>("status"),
             exit_code: row.try_get("exit_code").unwrap_or(None),
-            created_at: row
-                .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
-                .to_rfc3339(),
+            created_at: row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
         })
         .collect())
 }
+
+/// Quante righe al massimo torna [`list_processes`]. Vive qui, accanto alla
+/// query che lo applica, perche' chi RENDE l'elenco deve poter dichiarare il
+/// troncamento con lo stesso numero: scriverlo a mano nella prosa ("ultimi 20")
+/// lo faceva divergere al primo ritocco della query.
+pub const LIMITE_ELENCO_PROCESSI: usize = 20;
 
 pub struct ProcessSummary {
     pub id: Uuid,
@@ -680,7 +698,10 @@ pub struct ProcessSummary {
     pub pid: Option<i32>,
     pub status: String,
     pub exit_code: Option<i32>,
-    pub created_at: String,
+    /// Istante di creazione, NON appiattito in stringa: chi rende l'elenco ne
+    /// calcola l'eta' ("da 2h 14m"), e ri-parsare un RFC3339 gia' formattato per
+    /// riottenere il dato che c'era e' precisamente cio' che la regola M vieta.
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[cfg(test)]
