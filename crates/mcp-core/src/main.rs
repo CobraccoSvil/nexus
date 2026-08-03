@@ -19,6 +19,12 @@ mod agent_turn_setup;
 pub use nexus_build_graph as build_graph;
 mod cache;
 mod capability;
+/// Il metro del registro delle porte (ADR 0042, P0(b)): quante identita' di
+/// servizio contiene `nexus_port_allocations` e quante ne descrivono una viva.
+/// Sola lettura, eseguito on-demand; vive qui perche' la domanda «chi ascolta
+/// adesso» ha un punto unico `pub(crate)` in questo crate (vedi il modulo).
+#[cfg(test)]
+mod censimento_porte;
 mod catalog_sync_worker;
 mod change_drafts;
 mod chat_agent;
@@ -92,6 +98,7 @@ mod probe_world;
 mod project_workspace;
 mod projects;
 mod prompt_ambiente;
+mod prompt_learned;
 mod prompt_memories;
 mod prompt_templates;
 mod provider_cooldown;

@@ -1517,11 +1517,19 @@ impl Orchestrator {
             &input.message,
         )
         .await;
+        // Regole durature del progetto, dallo STESSO punto unico che usa il
+        // percorso agentico (`crate::prompt_learned`): il distillatore le
+        // scriveva e nessuno le leggeva.
+        let apprese = crate::prompt_learned::LearnedInstructions::load(db, project_uuid)
+            .await
+            .section(db)
+            .await;
         let composed_prompt = Self::compose_prompt(
             db,
             &self.template_cache,
             &context.optimized_prompt,
             &memories,
+            apprese,
             input.automation_mode,
             &input.attachments,
         )
@@ -1625,11 +1633,18 @@ impl Orchestrator {
         Ok(OrchestratorResult { payload })
     }
 
+    /// `apprese` sta PRIMA delle memorie e degli allegati: sono le regole
+    /// durature del progetto (punto unico `crate::prompt_learned`), stabili fra
+    /// i turni, mentre memorie e allegati dipendono dal messaggio. Su questo
+    /// percorso il prompt viaggia dentro un messaggio utente e non ha un
+    /// confine di turno, ma l'ordine stabile-prima-di-variabile resta quello
+    /// giusto: e' il tratto che due turni possono condividere.
     async fn compose_prompt(
         db: &PgPool,
         cache: &crate::prompt_templates::TemplateCache,
         base_prompt: &str,
         memories: &crate::prompt_memories::ProjectMemories,
+        apprese: Option<String>,
         automation_mode: AutomationMode,
         attachments: &[ChatAttachment],
     ) -> String {
@@ -1637,6 +1652,9 @@ impl Orchestrator {
         let mode_instruction =
             crate::prompt_templates::get_template_or_default(db, cache, tpl_key).await;
         let mut sections = vec![mode_instruction];
+        if let Some(block) = apprese {
+            sections.push(block);
+        }
         if let Some(block) = memories.section() {
             sections.push(block);
         }

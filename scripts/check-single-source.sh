@@ -1918,6 +1918,29 @@ else
 fi
 
 
+# -- istruzioni-apprese-nel-prompt (2026-08-03) -------------------------------
+#
+# QUALI regole apprese entrano nel prompt, e COME si rendono, lo decide UN
+# modulo. Il difetto era l'assenza del consumo, non la sua duplicazione: il
+# distillatore scriveva 68 regole attive, il pannello le mostrava, il template
+# esisteva col suo placeholder, e nessun compositore leggeva la tabella. Un
+# secondo lettore che si componesse il blocco per conto proprio riaprirebbe la
+# strada a due idee diverse di "quali regole valgono" e a un ordine non
+# deterministico, che nella parte stabile del system costa il prefisso.
+assert_single "istruzioni-apprese-nel-prompt" 'pub\(crate\) struct LearnedInstructions'   'crates/mcp-core/src/prompt_learned.rs' crates
+# La tabella si legge da UN modulo per il prompt: chi la interroga altrove per
+# comporre contesto sta ricreando il punto unico. Restano legittimi il
+# distillatore che la scrive e le rotte admin che la mostrano.
+apprese_fuori="$(grep -rIn -F 'FROM nexus_learned_instructions' --include='*.rs' crates/ 2>/dev/null | grep -v '^crates/mcp-core/src/prompt_learned.rs:' | grep -v '^crates/mcp-core/src/learned_instructions.rs:' || true)"
+if [[ -n "$apprese_fuori" ]]; then
+  echo "!! istruzioni-apprese-nel-prompt: la tabella e' letta fuori dai due punti ammessi:" >&2
+  echo "$apprese_fuori" >&2
+  echo "   Per il PROMPT esiste crates/mcp-core/src/prompt_learned.rs (regola L)." >&2
+  fail=1
+else
+  echo "OK istruzioni-apprese-nel-prompt: la tabella resta ai due punti ammessi"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

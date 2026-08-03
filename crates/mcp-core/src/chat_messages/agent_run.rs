@@ -4401,6 +4401,16 @@ pub(crate) async fn compose_agent_system_text(
         // Le parti sono concatenate senza separatore: il blocco si isola da solo.
         .map(|block| format!("\n{block}\n"))
         .unwrap_or_default();
+    // Regole durature del progetto (punto unico `crate::prompt_learned`). STABILI,
+    // non variabili: cambiano quando il distillatore gira o l'utente le corregge,
+    // non con la domanda del turno — quindi entrano nel primo gruppo e restano
+    // dentro il prefisso riusabile.
+    let apprese = crate::prompt_learned::LearnedInstructions::load(db, project_id)
+        .await
+        .section(db)
+        .await
+        .map(|block| format!("\n{block}\n"))
+        .unwrap_or_default();
     // L'ordine non e' estetico: e' il tratto di prompt che due run dello stesso
     // progetto possono condividere. Prima cio' che resta identico fra run, poi
     // cio' che cambia da un run all'altro — e il criterio sta nel punto unico
@@ -4418,6 +4428,7 @@ pub(crate) async fn compose_agent_system_text(
         &[
             &parts.project_header,
             &parts.project_custom_instructions,
+            &apprese,
             &parts.automation_instructions,
             &parts.o_series_instructions,
             &parts.profile_prompt_block,
