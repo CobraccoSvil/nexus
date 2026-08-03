@@ -71,11 +71,74 @@ const WEB_TOKENS: &[&str] = &[
     "yarn serve",
 ];
 
+/// Runtime che eseguono uno SCRIPT passato come percorso: per questi il token
+/// contiguo non basta, va guardato il file che eseguono (vedi
+/// [`runtime_esegue_un_server`]).
+const RUNTIME_CON_SCRIPT: &[&str] = &["node", "ts-node", "tsx", "bun", "deno", "nodemon"];
+
+/// Nomi di file che, per convenzione universale, sono il punto d'ingresso di un
+/// server. Il confronto e' sul BASENAME, non sulla riga intera.
+const ENTRYPOINT_SERVER: &[&str] = &["server", "app", "index", "main"];
+
+/// Estensioni degli script riconosciuti come entrypoint.
+const ESTENSIONI_SCRIPT: &[&str] = &["js", "mjs", "cjs", "ts", "mts", "cts"];
+
+/// `true` se la riga esegue un RUNTIME su uno script il cui nome dice
+/// «server»: `node src/backend/server.js`, `tsx api/main.ts`, `bun app.js`.
+///
+/// ROOT CAUSE, misurata il 03/08/2026 su catalogo-libri: [`WEB_TOKENS`] conteneva
+/// `"node server"`, `"node app"`, `"node index"`, `"node main"` — token
+/// CONTIGUI. Il comando reale era `node src/backend/server.js`, dove fra il
+/// runtime e il nome del file c'e' il percorso: `contains("node server")` e'
+/// falso, quindi il servizio non risultava un web service, non riceveva porta
+/// ne' `PORT`, e ripiegava sul default scritto nel codice. Il progetto ha
+/// chiuso il run con ZERO allocazioni e il backend fallito due volte.
+///
+/// Il difetto non era un token mancante: era la FORMA del criterio. Aggiungere
+/// `"node src/backend/server"` alla lista avrebbe coperto un percorso e lasciato
+/// fuori tutti gli altri — inseguire le varianti a codice e' la toppa che la
+/// regola H vieta. Qui si scompone la riga come farebbe la shell e si guarda
+/// cosa esegue davvero, cioe' la stessa scelta gia' fatta per il riconoscimento
+/// della suite Playwright.
+fn runtime_esegue_un_server(comando: &str) -> bool {
+    let mut token = comando.split_whitespace();
+    let programma = match token.next() {
+        Some(p) => p.trim_matches(['"', '\'']).to_ascii_lowercase(),
+        None => return false,
+    };
+    // Il programma puo' arrivare col percorso (`/usr/bin/node`, `C:\...\node.exe`).
+    let programma = programma
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&programma)
+        .trim_end_matches(".exe");
+    if !RUNTIME_CON_SCRIPT.contains(&programma) {
+        return false;
+    }
+    // Primo argomento che non sia un flag: e' lo script.
+    for arg in token {
+        let arg = arg.trim_matches(['"', '\'']);
+        if arg.starts_with('-') {
+            continue;
+        }
+        let file = arg.rsplit(['/', '\\']).next().unwrap_or(arg).to_ascii_lowercase();
+        let (nome, estensione) = match file.rsplit_once('.') {
+            Some((n, e)) => (n, e),
+            // Senza estensione non e' uno script: `deno serve`, `bun run dev`
+            // li copre gia' il token contiguo.
+            None => return false,
+        };
+        return ENTRYPOINT_SERVER.contains(&nome) && ESTENSIONI_SCRIPT.contains(&estensione);
+    }
+    false
+}
+
 /// Heuristica: il comando avvia un server web/long-running che ha bisogno di
 /// una porta TCP? Riconosce:
 /// - script comuni: `next dev|start`, `vite`, `webpack-dev-server`, `astro dev`
 /// - framework Python: `gunicorn`, `uvicorn`, `flask run`, `django runserver`
-/// - Node generici: `node server.js`, `npm run dev|start|serve`
+/// - Node generici: `npm run dev|start|serve`, e un runtime su un entrypoint di
+///   server anche con percorso (`node src/backend/server.js`)
 /// - Rust/Go/.NET dev server: `cargo run`, `go run`, `dotnet run`, `dotnet watch`
 ///
 /// In caso di dubbio (es. `make foo`), NON inietta PORT: l'agente puo' chiamare
@@ -86,7 +149,7 @@ pub(crate) fn looks_like_web_service(command: &str) -> bool {
         return false;
     }
     let lc = command.to_lowercase();
-    WEB_TOKENS.iter().any(|t| lc.contains(t))
+    WEB_TOKENS.iter().any(|t| lc.contains(t)) || runtime_esegue_un_server(&lc)
 }
 
 /// Porta candidata trovata nell'output di un servizio, col verdetto sul suo
@@ -1938,8 +2001,8 @@ mod tests {
     use super::{
         classifica_ascolto_altrove, derive_kind_hint, detect_port_from_output,
         existing_service_action, format_started_message, looks_like_web_service,
-        resolve_service_label, resolve_service_work_dir, scope_dir, tool_run_service,
-        AscoltoAltrove, ExistingServiceAction, PortaRilevata, Uuid,
+        resolve_service_label, resolve_service_work_dir, runtime_esegue_un_server, scope_dir,
+        tool_run_service, AscoltoAltrove, ExistingServiceAction, PortaRilevata, Uuid,
     };
     use crate::agent_processes::{is_generic_service_label, similar_service_labels};
     use crate::project_workspace::services::{project_service_slug, service_unit_name};
@@ -1994,6 +2057,59 @@ mod tests {
         .classifica(kind);
         let unit = service_unit_name(&slug, &label);
         (label, unit, kind)
+    }
+
+    /// IL CASO MISURATO: un server Node avviato col PERCORSO non era riconosciuto.
+    ///
+    /// Il 03/08/2026 su catalogo-libri il comando era `node src/backend/server.js`
+    /// e `WEB_TOKENS` conteneva il token CONTIGUO "node server": fra runtime e
+    /// nome del file c'e' il percorso, quindi `contains` era falso. Il servizio
+    /// non risultava un web service, non riceveva porta ne' PORT, e il progetto
+    /// ha chiuso con ZERO allocazioni e il backend fallito due volte.
+    ///
+    /// MUTAZIONE: togliere `|| runtime_esegue_un_server(&lc)` da
+    /// `looks_like_web_service` fa rosseggiare la prima asserzione — il valore
+    /// del difetto reale.
+    #[test]
+    fn un_server_node_col_percorso_e_un_web_service() {
+        assert!(
+            looks_like_web_service("node src/backend/server.js"),
+            "il caso misurato: il percorso fra runtime e nome del file non deve nascondere il server"
+        );
+        assert!(looks_like_web_service("node dist/main.js"));
+        assert!(looks_like_web_service("tsx api/server.ts"));
+        assert!(looks_like_web_service("bun src/index.ts"));
+        assert!(looks_like_web_service("nodemon backend/app.js"));
+        // Il runtime puo' arrivare col proprio percorso.
+        assert!(looks_like_web_service("/usr/bin/node dist/server.js"));
+        // NOTA su un difetto ADIACENTE, non coperto da questo fix: un server che
+        // vive sotto `build/` non arriva nemmeno qui, perche' `is_long_oneshot`
+        // cerca " build" come substring e lo scambia per un comando di build.
+        // E' la stessa forma di difetto (substring invece che lessicale) su una
+        // funzione con molti piu' chiamanti: va corretta li', separatamente.
+        assert!(!looks_like_web_service("node build/server.js"));
+        // E i token contigui continuano a valere.
+        assert!(looks_like_web_service("npm run dev"));
+        assert!(looks_like_web_service("node server.js"));
+    }
+
+    /// Il criterio non allarga a cio' che server non e': uno script con un altro
+    /// nome, o un one-shot, restano fuori. Iniettare PORT a un processo che non
+    /// ascolta non fa danno diretto, ma gli alloca una porta del bucket che
+    /// nessuno usera' — ed e' il genere di riga fantasma che il GC deve poi
+    /// rilasciare.
+    #[test]
+    fn cio_che_non_e_un_server_resta_fuori() {
+        assert!(!looks_like_web_service("node scripts/seed.js"));
+        assert!(!looks_like_web_service("node tools/migrate.js"));
+        assert!(!looks_like_web_service("npx eslint src --max-warnings=0"));
+        assert!(!looks_like_web_service("npm run build"));
+        // Un runtime senza script: lo coprono i token contigui, non questo ramo.
+        assert!(!runtime_esegue_un_server("node"));
+        // Estensione non da script: il ramo nuovo lo rifiuta. (La riga intera
+        // resta catturata dal token contiguo "node server" di WEB_TOKENS, che e'
+        // un falso positivo preesistente e innocuo: nessuno avvia un .txt.)
+        assert!(!runtime_esegue_un_server("node server.txt"));
     }
 
     /// LA CATENA VERA, riprodotta: il valore che il registro consegnava
