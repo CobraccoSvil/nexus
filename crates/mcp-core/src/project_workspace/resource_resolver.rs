@@ -398,13 +398,124 @@ pub async fn render_prompt_block(
     lines.push_str(
         "Regola: se un servizio e' gia' ATTIVO usa la sua porta; se e' allocato-ma-spento riavvialo; chiama request_port SOLO per un servizio NUOVO.\n",
     );
+    lines.push_str(&variabili_iniettate_ai_servizi(&resources));
     lines.push_str("=== FINE RISORSE PROGETTO ===\n\n");
     lines
+}
+
+/// Le variabili d'ambiente che Nexus INIETTA nei servizi del progetto, dette
+/// all'agente per nome.
+///
+/// ROOT CAUSE, misurata il 03/08/2026 su catalogo-libri: il canale che porta al
+/// frontend l'indirizzo del backend era stato aperto
+/// (`allocate_port::indirizzi_dei_fratelli` inietta `BACKEND_URL`,
+/// `BACKEND_API_URL`, `VITE_API_URL`) ma NESSUN prompt lo nominava — zero
+/// template su tutta la tabella. L'agente, non sapendo che quelle variabili
+/// esistono, ne ha inventata una propria e le ha dato un valore inventato:
+/// `VITE_API_BASE_URL=http://localhost:3000`, cioe' la porta della web-ide di
+/// NEXUS, non del backend dell'app.
+///
+/// E' lo stesso difetto delle istruzioni apprese, in un'altra forma: un canale
+/// che nessuno sa di avere non e' un canale. Aprirlo senza dichiararlo non
+/// riduce le invenzioni, le sposta.
+///
+/// Sta QUI e non in un template statico perche' l'elenco dipende da cosa il
+/// progetto ha davvero: dichiarare `BACKEND_URL` a un progetto senza backend
+/// insegnerebbe a usare una variabile che non arrivera' mai, che e' il difetto
+/// di prima al contrario. Il blocco compare solo quando la variabile verra'
+/// iniettata per davvero.
+///
+/// I nomi sono gli STESSI che `indirizzi_dei_fratelli` inserisce nell'env: se
+/// un giorno divergessero, l'agente userebbe una variabile che nessuno popola.
+fn variabili_iniettate_ai_servizi(resources: &ProjectResources) -> String {
+    // Il backend e' l'unico ruolo per cui oggi esiste un indirizzo iniettato.
+    let ha_backend = resources
+        .services
+        .iter()
+        .any(|s| service_class(&s.label) == Some(ServiceClass::Backend));
+    if !ha_backend {
+        return String::new();
+    }
+    let mut b = String::new();
+    b.push_str(
+        "Variabili che Nexus inietta AUTOMATICAMENTE nei servizi che avvia (run_service, \
+         pannello Servizi): non ricostruirle, non inventarne altre, non scrivere URL o \
+         porte nei sorgenti.\n",
+    );
+    b.push_str("- PORT, HOST: la porta di QUESTO servizio.\n");
+    b.push_str(
+        "- BACKEND_URL, BACKEND_API_URL, VITE_API_URL: l'indirizzo del backend del progetto, \
+         per i servizi che lo chiamano. Nel frontend leggi queste, non un literal: la porta \
+         del backend puo' cambiare fra un avvio e l'altro.\n",
+    );
+    b.push_str("- DATABASE_URL: il database applicativo del progetto.\n");
+    b
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Risorsa di prova con la struct REALE: se un domani nasce un campo
+    /// obbligatorio, questo helper smette di compilare invece di lasciare due
+    /// fixture divergenti.
+    fn risorsa(label: &str) -> ServiceResource {
+        ServiceResource {
+            label: label.to_string(),
+            port: Some(26001),
+            listening: true,
+            pid: None,
+            program: None,
+            service_unit: None,
+            source: ResourceSource::PortAllocation,
+            allocation_mode: Some("dynamic".to_string()),
+            suggested_action: SuggestedAction::Reuse,
+        }
+    }
+
+    /// I nomi DICHIARATI all'agente sono quelli INIETTATI davvero.
+    ///
+    /// Il difetto misurato il 03/08/2026 su catalogo-libri: il canale era
+    /// aperto (`indirizzi_dei_fratelli` inseriva BACKEND_URL/BACKEND_API_URL/
+    /// VITE_API_URL nell'env) ma nessun prompt lo nominava, e l'agente ha
+    /// inventato `VITE_API_BASE_URL=http://localhost:3000` — la porta della
+    /// web-ide di Nexus, non del backend dell'app.
+    ///
+    /// Questo test lega le due liste: se un domani il produttore rinomina una
+    /// variabile e il blocco resta indietro, l'agente userebbe un nome che
+    /// nessuno popola — cioe' lo stesso difetto con i ruoli invertiti.
+    ///
+    /// MUTAZIONE: togliere una variabile dal blocco fa rosseggiare
+    /// l'asserzione corrispondente.
+    #[test]
+    fn le_variabili_dichiarate_sono_quelle_iniettate() {
+        let resources = ProjectResources {
+            bucket_start: 26000,
+            bucket_end: 26049,
+            services: vec![risorsa("backend")],
+        };
+        let blocco = variabili_iniettate_ai_servizi(&resources);
+        // I nomi sono quelli che allocate_port::indirizzi_dei_fratelli inserisce
+        // nell'env, piu' quelli di web_service_port_env.
+        for nome in ["PORT", "HOST", "BACKEND_URL", "BACKEND_API_URL", "VITE_API_URL"] {
+            assert!(
+                blocco.contains(nome),
+                "il blocco deve nominare {nome}, che il servizio ricevera' davvero: {blocco}"
+            );
+        }
+    }
+
+    /// Senza backend il blocco non compare: dichiarare una variabile che non
+    /// arrivera' mai e' il difetto di prima al contrario.
+    #[test]
+    fn senza_backend_nessuna_variabile_dichiarata() {
+        let resources = ProjectResources {
+            bucket_start: 26000,
+            bucket_end: 26049,
+            services: vec![risorsa("frontend")],
+        };
+        assert!(variabili_iniettate_ai_servizi(&resources).is_empty());
+    }
 
     #[test]
     fn service_class_disgiunta() {
