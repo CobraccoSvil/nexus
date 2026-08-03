@@ -1633,12 +1633,20 @@ async fn release_stale_port(
     port: i32,
     alloc_label: &str,
 ) {
-    // Verifica che la porta non sia effettivamente in uso (bind test).
-    let port_in_use = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
-        .await
-        .is_err();
-    if port_in_use {
-        return;
+    // Questa funzione CANCELLA una riga di allocazione: si procede solo su una
+    // porta osservata LIBERA, mai su un esito che non sappiamo interpretare.
+    //
+    // Il punto unico classifica i tre casi (`PortBind`): con `.is_err()`
+    // l'occupazione e l'impossibilita' di interrogare il sistema collassavano
+    // nello stesso `true` — qui per fortuna nel verso prudente (non cancella),
+    // ma per caso, non per scelta. Scritto col `match` la prudenza e'
+    // dichiarata, e chi un domani invertisse la condizione vedrebbe i tre rami
+    // invece di un booleano.
+    match super::super::project_workspace::port_recovery::probe_bind(port as u16).await {
+        crate::project_workspace::port_recovery::PortBind::Libera => {}
+        // Occupata: la porta serve a qualcuno, l'allocazione resta.
+        // Non interrogabile: non si distrugge niente su cio' che non si e' visto.
+        _ => return,
     }
     let _ = sqlx::query("DELETE FROM nexus_port_allocations WHERE project_id = $1 AND port = $2")
         .bind(project_id)

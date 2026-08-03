@@ -602,8 +602,29 @@ pub async fn web_service_port_env(
     // `service_unit` NULL e il GC (`cleanup_orphaned_ports`) la rilascia appena il
     // servizio e' fermo: al riavvio la porta cambia e il pannello non ha piu' un
     // indirizzo attendibile (drift 31792->31798, incidente Beaty-Book).
-    if let Some(unit) = super::services::project_service_unit(db, project_id, label).await {
-        link_allocation_to_service_unit(db, project_id, label, &unit).await;
+    //
+    // Il `None` NON si salta in silenzio. `project_service_unit` ritorna `None`
+    // per un solo motivo, e il suo doc lo dichiara: il DB meta non e' leggibile.
+    // Proseguire significava restituire un `PORT` valido per un'allocazione NON
+    // protetta, cioe' consegnare al servizio una porta che il GC gli togliera'
+    // al primo giro in cui lo trova fermo — esattamente il drift che il commento
+    // qui sopra dice di voler evitare. Meglio non avviare che avviare su una
+    // porta che sparira'.
+    match super::services::project_service_unit(db, project_id, label).await {
+        Some(unit) => link_allocation_to_service_unit(db, project_id, label, &unit).await,
+        None => {
+            tracing::warn!(
+                label = %label,
+                port = alloc.port,
+                "allocazione porte: unit del servizio non risolvibile (DB meta), avvio non instradato"
+            );
+            return Err(format!(
+                "la porta {} e' stata allocata a '{}' ma non si e' potuto legarla alla unit del \
+                 servizio (nome del progetto non leggibile): senza quel legame il GC la \
+                 rilascerebbe al primo riavvio. Riprova quando il DB risponde.",
+                alloc.port, label
+            ));
+        }
     }
 
     match super::port_recovery::wait_port_bindable(

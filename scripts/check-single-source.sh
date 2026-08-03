@@ -1941,6 +1941,30 @@ else
   echo "OK istruzioni-apprese-nel-prompt: la tabella resta ai due punti ammessi"
 fi
 
+# -- bind-come-domanda (2026-08-03) ------------------------------------------
+#
+# Un `TcpListener::bind(..).is_ok()` usato come DOMANDA («questa porta e'
+# libera?») appiattisce tre casi in due: «libera», «occupata da un processo» e
+# «il sistema non puo' rispondere» (WSAENOBUFS a pool di porte effimere
+# esaurito, misurato in questo repo). Il terzo diventa indistinguibile dal
+# secondo, e chi decide su quel booleano sceglie male: le due funzioni che
+# SCELGONO la porta del bucket esaurivano tutte le candidate credendole occupate,
+# e chi CANCELLA un'allocazione lo faceva su un esito che non sapeva leggere.
+#
+# Il punto unico e' `port_recovery::probe_bind -> PortBind{Libera|Occupata|
+# NonInterrogabile}`. Bindare per SERVIRE (un server che si mette in ascolto)
+# non e' una domanda e resta legittimo: il guard cerca il bind seguito da
+# `.is_ok()`/`.is_err()`, cioe' la forma in cui il bind e' un test.
+bind_domanda="$(grep -rIn -A 2 'TcpListener::bind' --include='*.rs' crates/ 2>/dev/null | grep -E '\.is_(ok|err)\(\)' | grep -v 'port_recovery.rs' || true)"
+if [[ -n "$bind_domanda" ]]; then
+  echo "!! bind-come-domanda: un bind e' usato come test fuori dal punto unico:" >&2
+  echo "$bind_domanda" >&2
+  echo "   Usa port_recovery::probe_bind, che distingue Occupata da NonInterrogabile." >&2
+  fail=1
+else
+  echo "OK bind-come-domanda: nessun bind usato come test fuori dal punto unico"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

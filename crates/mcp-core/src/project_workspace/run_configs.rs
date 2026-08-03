@@ -1254,9 +1254,10 @@ async fn build_env_vars(
                     NEXUS_RESERVED_PORTS.iter().copied().collect();
                 let is_free = !reserved.contains(&configured_port)
                     && state.port_registry.is_port_available(configured_port).await
-                    && tokio::net::TcpListener::bind(format!("127.0.0.1:{}", configured_port))
-                        .await
-                        .is_ok();
+                    && matches!(
+                        super::port_recovery::probe_bind(configured_port).await,
+                        super::port_recovery::PortBind::Libera
+                    );
                 let actual_port = if is_free {
                     configured_port
                 } else {

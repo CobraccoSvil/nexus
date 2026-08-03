@@ -1576,9 +1576,10 @@ async fn scegli_porta_bucket(
     if let Some(p) = existing {
         let ok = !reserved.contains(&p)
             && state.port_registry.is_port_available(p).await
-            && tokio::net::TcpListener::bind(format!("127.0.0.1:{}", p))
-                .await
-                .is_ok();
+            && matches!(
+                super::port_recovery::probe_bind(p).await,
+                super::port_recovery::PortBind::Libera
+            );
         if ok {
             return p;
         }

@@ -2565,9 +2565,17 @@ pub(super) async fn find_free_project_port(
     while port <= end {
         if !reserved.contains(&port)
             && !allocated.contains(&port)
-            && tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
-                .await
-                .is_ok()
+            // Il bind passa dal punto unico che CLASSIFICA l'esito: con
+            // `.is_ok()` un pool di porte effimere esaurito (WSAENOBUFS, 10055)
+            // era indistinguibile da «occupata», ogni candidata del bucket
+            // sembrava presa e il ciclo lo esauriva tutto per poi ripiegare su
+            // una porta scelta a caso. Solo `Libera` autorizza a usarla: sia
+            // `Occupata` sia `NonInterrogabile` fanno passare alla successiva,
+            // ma il secondo caso ora e' anche VISIBILE nei log del punto unico.
+            && matches!(
+                super::port_recovery::probe_bind(port).await,
+                super::port_recovery::PortBind::Libera
+            )
         {
             return port;
         }
@@ -2616,9 +2624,17 @@ pub(super) async fn deterministic_project_port_for_key(
             && port <= end
             && !reserved.contains(&port)
             && !allocated.contains(&port)
-            && tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
-                .await
-                .is_ok()
+            // Il bind passa dal punto unico che CLASSIFICA l'esito: con
+            // `.is_ok()` un pool di porte effimere esaurito (WSAENOBUFS, 10055)
+            // era indistinguibile da «occupata», ogni candidata del bucket
+            // sembrava presa e il ciclo lo esauriva tutto per poi ripiegare su
+            // una porta scelta a caso. Solo `Libera` autorizza a usarla: sia
+            // `Occupata` sia `NonInterrogabile` fanno passare alla successiva,
+            // ma il secondo caso ora e' anche VISIBILE nei log del punto unico.
+            && matches!(
+                super::port_recovery::probe_bind(port).await,
+                super::port_recovery::PortBind::Libera
+            )
         {
             return port;
         }
