@@ -1309,7 +1309,39 @@ async fn install_service_windows(
 
     let full_command = costruisci_full_command(command, &body);
     // env: stringa "K=V" per riga, oppure oggetto JSON.
-    let env_map = parse_env_body(&body);
+    let mut env_map = parse_env_body(&body);
+
+    // La PORTA non viene dal body. Questo era il QUARTO percorso di avvio, e
+    // l'unico che non passava dal punto unico: prendeva `PORT` dalla proposta
+    // del wizard (`suggest_port`) e lo iniettava direttamente, senza allocazione
+    // registrata, senza legame all'unit e senza verifica che la porta fosse
+    // bindabile. Il doc di `web_service_port_env` enumera «i tre percorsi»: qui
+    // c'era il quarto, e non compariva.
+    //
+    // Conseguenza: un servizio installato dal wizard nasceva con una porta che
+    // il registro non conosce — quindi il GC non la protegge, il pannello non
+    // la mostra come allocata e il port_enforcer la vede come non autorizzata.
+    if crate::agent_tools::service::looks_like_web_service(&full_command) {
+        match super::allocate_port::web_service_port_env(
+            &state.db,
+            &state.port_registry,
+            project_id,
+            short,
+        )
+        .await
+        {
+            Ok(porta_env) => {
+                // Il punto unico VINCE sulla proposta del body: se il wizard
+                // aveva suggerito una porta, quella era un'ipotesi; questa e'
+                // un'allocazione registrata e legata all'unit.
+                env_map.extend(porta_env);
+            }
+            // Stessa postura degli altri tre percorsi: se la porta non e'
+            // utilizzabile non si avvia. Proseguire lascerebbe scegliere la
+            // porta al literal nel sorgente, fuori dal bucket del progetto.
+            Err(e) => return Err(api_error(StatusCode::CONFLICT, &e)),
+        }
+    }
 
     // PUNTO UNICO anti-duplicato (regola L): l'install del wizard spawnava a
     // fianco dei processi gia' running dello stesso scopo (due vite, due

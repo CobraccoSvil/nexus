@@ -415,6 +415,57 @@ impl ModoScritturaBatch {
     pub fn richiede_isolamento(self) -> bool {
         matches!(self, Self::Isolato)
     }
+
+    /// L'ondata di elementi che possono scrivere INSIEME, o `None` se non se ne
+    /// puo' aprire nessuna.
+    ///
+    /// Esiste perche' il verdetto arrivi FIN DENTRO la funzione che apre il
+    /// dispatch parallelo, invece di fermarsi al chiamante che la invoca:
+    /// [`OndataDiScrittura`] non ha costruttori pubblici, quindi una firma che
+    /// la pretende non e' invocabile senza essere passati di qui. Un secondo
+    /// call site — un ramo di retry, un percorso di recovery — non puo' aprire
+    /// un fronte parallelo «per distrazione», che e' la forma esatta degli
+    /// incidenti del 22/07 e del 03/08.
+    ///
+    /// Il taglio a `cap_configurato` avviene QUI: era un `take(8)` letterale nel
+    /// chiamante, cioe' un numero slegato dal verdetto che lo autorizzava.
+    pub fn ondata<T>(self, pronti: Vec<T>, cap_configurato: usize) -> Option<OndataDiScrittura<T>> {
+        match self {
+            Self::UnoAllaVolta => None,
+            Self::Isolato => {
+                let quanti = self.scrittori_concorrenti(cap_configurato);
+                Some(OndataDiScrittura {
+                    elementi: pronti.into_iter().take(quanti).collect(),
+                })
+            }
+        }
+    }
+}
+
+/// Un gruppo di elementi che possono scrivere in PARALLELO, gia' tagliato al cap.
+///
+/// Campo privato e nessun costruttore pubblico: l'unico modo di ottenerne una e'
+/// [`ModoScritturaBatch::ondata`], che la restituisce solo per
+/// [`ModoScritturaBatch::Isolato`]. Una funzione che la pretende nella firma
+/// dichiara cosi', nel tipo, di essere raggiungibile solo col verdetto in mano.
+#[derive(Debug, Clone)]
+pub struct OndataDiScrittura<T> {
+    elementi: Vec<T>,
+}
+
+impl<T> OndataDiScrittura<T> {
+    /// Gli elementi dell'ondata. Consuma: un'ondata si esegue una volta sola.
+    pub fn elementi(self) -> Vec<T> {
+        self.elementi
+    }
+
+    pub fn len(&self) -> usize {
+        self.elementi.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.elementi.is_empty()
+    }
 }
 
 /// PUNTO UNICO (regola L) della domanda "posso far scrivere PIU' sub-run in

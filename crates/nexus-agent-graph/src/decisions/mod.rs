@@ -188,7 +188,7 @@ pub use meta_reason::{build_stall_context, translate, validate_move, work_epoch,
 pub use orchestration_reason::{
     build_orchestration_context, classify_write, context_pressure_from_tokens, delegation_forbidden,
     modo_scrittura_batch, orch_epoch, path_in_scope, subtasks_are_disjoint, validate_orch_move,
-    ModoScritturaBatch, ScopeVerdict,
+    ModoScritturaBatch, OndataDiScrittura, ScopeVerdict,
 };
 pub use panel_quorum::{classify_panel, PanelClass, QuorumTally};
 pub use predictive_cap::{is_cap_exempt, predictive_cap_check, PREDICTIVE_CAP_SENTINEL};

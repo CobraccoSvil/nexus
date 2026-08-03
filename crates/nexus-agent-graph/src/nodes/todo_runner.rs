@@ -539,10 +539,15 @@ impl TodoRunnerNode {
         state: &AgentState,
         run_id: &str,
         todos: &[Todo],
-        ready: Vec<Todo>,
+        // L'ondata PORTA il verdetto: `OndataDiScrittura` non ha costruttori
+        // pubblici e nasce solo da `ModoScritturaBatch::ondata` su `Isolato`.
+        // Prima la firma accettava un `Vec<Todo>` nudo e il cap era un `take(8)`
+        // letterale qui dentro: un secondo call site avrebbe aperto un fronte
+        // parallelo sulla root condivisa senza che nulla lo fermasse, che e' la
+        // forma degli incidenti del 22/07 e del 03/08.
+        ondata: crate::decisions::OndataDiScrittura<Todo>,
     ) -> Result<OpaqueDelta, NodeError> {
-        // Cap all'ampiezza del batch del tool (dispatch_subagents: max 8 task).
-        let wave: Vec<Todo> = ready.into_iter().take(8).collect();
+        let wave: Vec<Todo> = ondata.elementi();
         let prior = state.subagent_results.clone().unwrap_or_default();
 
         // Marca in_progress + costruisci i task (ordine preservato = ordine results:
@@ -791,11 +796,11 @@ impl GraphNode<AgentState, AgentNodeCtx> for TodoRunnerNode {
             // Falso -> nessuna wave: si prosegue con `dispatch_one`, UN todo per
             // re-ingresso del nodo (degrada il PARALLELISMO, non l'isolamento).
             let scopes: Vec<Vec<String>> = ready.iter().map(|t| t.write_scope.clone()).collect();
-            let writers_ok = crate::decisions::orchestration_reason::modo_scrittura_batch(
+            let modo = crate::decisions::orchestration_reason::modo_scrittura_batch(
                 ctx.isolation_available,
                 &scopes,
-            )
-            .richiede_isolamento();
+            );
+            let writers_ok = modo.richiede_isolamento();
             if ready.len() >= 2 && !writers_ok {
                 // Il degrado non deve essere silenzioso (regola M: il motivo e' un
                 // dato, non un'assenza): senza questa riga l'operatore vede solo
@@ -807,13 +812,14 @@ impl GraphNode<AgentState, AgentNodeCtx> for TodoRunnerNode {
                     "todo_runner: ondata parallela NON aperta (isolamento assente o scope non disgiunti) -> un todo per volta"
                 );
             }
-            if ready.len() >= 2
-                && writers_ok
-                && dag_scheduler::should_parallelize(&ready, &todos, &dag_cfg)
-            {
-                return self
-                    .dispatch_wave(state, &run_id, &todos, ready)
-                    .await;
+            if ready.len() >= 2 && dag_scheduler::should_parallelize(&ready, &todos, &dag_cfg) {
+                // Il cap del batch del tool (`dispatch_subagents`: max 8 task) e'
+                // il cap CONFIGURATO che il modo applica: non piu' un letterale
+                // dentro `dispatch_wave`.
+                const CAP_BATCH_TOOL: usize = 8;
+                if let Some(ondata) = modo.ondata(ready, CAP_BATCH_TOOL) {
+                    return self.dispatch_wave(state, &run_id, &todos, ondata).await;
+                }
             }
         }
 
