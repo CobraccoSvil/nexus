@@ -100,6 +100,11 @@ pub(super) async fn handle_service_control(db: &PgPool, project_id: Uuid, args: 
         .unwrap_or(&service)
         .to_string();
 
+    // Nessun registro porte qui: questo tool gira nel dispatch `execute()`, che
+    // riceve solo il pool. Non e' un dettaglio da aggirare — su un servizio WEB
+    // lo start viene rifiutato con un messaggio che indirizza a run_service, e
+    // il rifiuto e' la sola alternativa onesta all'avviarlo su una porta decisa
+    // dal sorgente. stop/status restano pienamente serviti.
     let ctx = service_manager::ServiceContext {
         db,
         port_registry: None,

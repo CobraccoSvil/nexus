@@ -631,7 +631,102 @@ pub async fn web_service_port_env(
     let mut env = std::collections::HashMap::new();
     env.insert("PORT".to_string(), alloc.port.to_string());
     env.insert("HOST".to_string(), "0.0.0.0".to_string());
+    env.extend(indirizzi_dei_fratelli(db, project_id, label).await);
     Ok(env)
+}
+
+/// Indirizzi dei servizi FRATELLI dello stesso progetto, per il servizio che sta
+/// per partire.
+///
+/// ROOT CAUSE: un servizio non aveva modo di chiedere «dove sono i miei
+/// fratelli», quindi la risposta veniva incisa nel sorgente. Misurato il
+/// 03/08/2026 su agenda-corsi: `frontend/src/api.ts` cablava
+/// `http://localhost:26548/api`, il backend e' poi ripartito su un'altra porta
+/// e la UI e' rimasta rotta con "Failed to fetch". Il canale che avrebbe dovuto
+/// darglielo esisteva (`wizard::derive_frontend_sibling_env`) ma viveva sotto
+/// `#[cfg(not(windows))]`, cioe' era irraggiungibile proprio sull'ambiente
+/// canonico, e riconosceva i fratelli per PREFISSO della label.
+///
+/// La forma e' quella gia' collaudata per un'altra risorsa: `direct_spawn_env`
+/// inietta `DATABASE_URL` in ogni processo di progetto, e il prompt dice «non
+/// chiederla, non ricostruirla, non copiarla». L'indirizzo di un fratello e' lo
+/// stesso genere di fatto: risolto a runtime, mai copiato.
+///
+/// Sta QUI e non nel wizard perche' questo e' il punto per cui passano TUTTI
+/// gli avvii di un web service (pannello, service_manager, tool agente): un
+/// canale che copre un percorso su tre e' un canale su cui non si puo' contare,
+/// e sarebbe l'agente a decidere se la garanzia vale, scegliendo il tool.
+///
+/// Il ruolo del fratello NON si deduce dal testo della label (regola M: il nome
+/// non dice il ruolo). Si usa il vocabolario del punto unico che risponde gia'
+/// alla domanda «due label sono lo stesso servizio?», con il contesto di
+/// progetto che toglie di mezzo le parole non distintive. Dove il ruolo non e'
+/// accertabile la variabile NON si inietta: meglio un frontend che fallisce
+/// dicendo «non so dove sia il backend» di uno che chiama un literal scaduto.
+async fn indirizzi_dei_fratelli(
+    db: &PgPool,
+    project_id: Uuid,
+    label_richiedente: &str,
+) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+    let righe: Vec<(String, i32)> = match sqlx::query_as(
+        "SELECT label, port FROM nexus_port_allocations \
+          WHERE project_id = $1 AND label <> $2 ORDER BY port",
+    )
+    .bind(project_id)
+    .bind(label_richiedente)
+    .fetch_all(db)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %e,
+                "indirizzi dei fratelli non leggibili: il servizio parte senza"
+            );
+            return env;
+        }
+    };
+
+    let contesto = match sqlx::query_scalar::<_, String>("SELECT name FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_optional(db)
+        .await
+    {
+        Ok(Some(nome)) => crate::agent_processes::ContestoProgetto::dallo_slug(
+            &super::services::project_service_slug(&nome),
+        ),
+        _ => crate::agent_processes::ContestoProgetto::ignoto(),
+    };
+
+    // Il solo fratello di cui oggi si conosce il nome della variabile e' il
+    // BACKEND: e' l'unico ruolo per cui esiste una convenzione stabilita fra i
+    // framework (`VITE_API_URL`, `BACKEND_API_URL`). Aggiungere altri ruoli
+    // significa aggiungere qui la coppia (ruolo, nomi di variabile), non
+    // inventare un nome dal testo della label.
+    let backend = righe.iter().find(|(l, _)| {
+        crate::agent_processes::similar_service_labels_in(l, "backend", &contesto)
+            || crate::agent_processes::similar_service_labels_in(l, "api", &contesto)
+    });
+    if let Some((l, porta)) = backend {
+        // Non si inietta a se stessi: un backend non ha bisogno del proprio
+        // indirizzo, e dichiararglielo lo inviterebbe a chiamarsi da solo.
+        let richiedente_e_il_backend =
+            crate::agent_processes::similar_service_labels_in(label_richiedente, l, &contesto);
+        if !richiedente_e_il_backend {
+            let url = format!("http://127.0.0.1:{porta}");
+            tracing::info!(
+                richiedente = %label_richiedente, fratello = %l, port = porta,
+                "indirizzo del backend iniettato al servizio che parte"
+            );
+            env.insert("BACKEND_URL".to_string(), url.clone());
+            env.insert("BACKEND_API_URL".to_string(), format!("{url}/api"));
+            // Vite espone al client solo le variabili con questo prefisso.
+            env.insert("VITE_API_URL".to_string(), format!("{url}/api"));
+        }
+    }
+    env
 }
 
 pub async fn allocate_port(

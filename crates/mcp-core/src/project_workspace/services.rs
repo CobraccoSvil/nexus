@@ -397,8 +397,13 @@ pub(crate) async fn project_service_unit(
 ///   non un servizio) o se superseded da una label simile con storia piu'
 ///   recente ("frontend-dev" morta dopo che "frontend" l'ha sostituita).
 /// Ritorna (label, running) ordinate per label.
+/// `pub(crate)` e non `pub(super)`: la stessa domanda («quali servizi esistono
+/// ancora?») se la pone anche il GC delle porte (`port_registry`), che prima la
+/// risolveva guardando l'intera storia append-only di `agent_processes` e
+/// percio' non rilasciava mai nulla. Due criteri per la stessa domanda erano il
+/// difetto; questa e' la risposta unica.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(super) fn visible_windows_services(
+pub(crate) fn visible_windows_services(
     rows: &[(String, String, chrono::DateTime<chrono::Utc>)],
 ) -> Vec<(String, bool)> {
     // Riga piu' recente per label: rows e' gia' ordinata (label, created_at DESC),

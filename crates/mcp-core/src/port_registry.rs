@@ -523,16 +523,39 @@ async fn windows_service_unit_still_exists(db: &PgPool, project_id: Uuid, unit: 
             return true;
         }
     };
-    match sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT label FROM agent_processes WHERE project_id = $1 AND kind = 'service'",
+    // La domanda e' «esiste un servizio INSTALLATO con questa identita'?», non
+    // «e' MAI esistita una riga con questa label».
+    //
+    // `SELECT DISTINCT label` guardava l'intera storia di `agent_processes`, che
+    // e' append-only: la riga porta e' stata scritta da
+    // `link_allocation_to_service_unit` con la STESSA label che ha creato la riga
+    // processo, quindi la condizione era vera per costruzione e restava vera per
+    // sempre. Il GC esaminava tutte le allocazioni e le conservava tutte —
+    // misurato il 03/08/2026: 26 righe su 26 preservate, fra cui una porta la cui
+    // unica traccia erano tre righe 'Frontend (Vite)' morte dal giorno prima.
+    //
+    // `visible_windows_services` risponde alla domanda giusta: per ogni label
+    // guarda la riga PIU' RECENTE, tiene le running/starting e nasconde le morte
+    // (generiche o superseded da una label simile piu' recente). E' lo stesso
+    // criterio con cui il pannello decide cosa mostrare, quindi il GC e il
+    // pannello smettono di avere due idee di quali servizi esistano.
+    let righe: Vec<(String, String, chrono::DateTime<chrono::Utc>)> = match sqlx::query_as(
+        "SELECT label, status, created_at FROM agent_processes \
+          WHERE project_id = $1 AND kind = 'service' \
+          ORDER BY label, created_at DESC",
     )
     .bind(project_id)
     .fetch_all(&proj_pool)
     .await
     {
-        Ok(labels) => windows_unit_backed_by_label(&slug, unit, &labels),
-        Err(_) => true, // pool PROGETTO transitorio: preserva la riserva
-    }
+        Ok(r) => r,
+        Err(_) => return true, // pool PROGETTO transitorio: preserva la riserva
+    };
+    let vive: Vec<String> = crate::project_workspace::services::visible_windows_services(&righe)
+        .into_iter()
+        .map(|(label, _running)| label)
+        .collect();
+    windows_unit_backed_by_label(&slug, unit, &vive)
 }
 
 /// Rilascia le allocazioni porta auto-gestite ORFANE: oltre la grace period e
@@ -1206,6 +1229,59 @@ mod tests {
             Some(unit.as_str()),
             "il link all'unit deve sopravvivere al riavvio: e' cio' che preserva la porta \
              quando il servizio e' fermo"
+        );
+    }
+
+    /// IL DIFETTO DEL GC, riprodotto: la storia append-only di `agent_processes`
+    /// rendeva ogni riga porta auto-protetta.
+    ///
+    /// `SELECT DISTINCT label` vedeva anche le label MORTE da giorni, e la riga
+    /// porta era stata scritta con la stessa label che aveva creato la riga
+    /// processo: la condizione era vera per costruzione e restava vera per
+    /// sempre. Misurato il 03/08/2026: 26 allocazioni su 26 preservate, fra cui
+    /// la porta 26533 la cui unica traccia erano tre righe `Frontend (Vite)`
+    /// morte il giorno prima.
+    ///
+    /// Il criterio giusto e' quello del pannello: per ogni label la riga PIU'
+    /// RECENTE, e una label morta superseded da una simile piu' recente non
+    /// conta piu'.
+    ///
+    /// MUTAZIONE: tornare a passare TUTTE le label storiche (invece delle sole
+    /// visibili) fa tornare `true` la prima asserzione, cioe' la riga fantasma
+    /// resta preservata.
+    #[test]
+    fn la_label_morta_e_superseded_non_protegge_piu_la_sua_porta() {
+        use crate::project_workspace::services::visible_windows_services;
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(3);
+        let t1 = chrono::Utc::now();
+        // La storia REALE del caso: 'Frontend (Vite)' morta, poi 'frontend'
+        // running che la sostituisce. Ordine (label, created_at DESC) come lo
+        // produce la query.
+        let storia = vec![
+            ("Frontend (Vite)".to_string(), "stopped".to_string(), t0),
+            ("frontend".to_string(), "running".to_string(), t1),
+        ];
+        let vive: Vec<String> = visible_windows_services(&storia)
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect();
+
+        // L'unit della label morta non e' piu' protetta...
+        assert!(
+            !windows_unit_backed_by_label("agenda-corsi", "agenda-corsi-Frontend (Vite).service", &vive),
+            "una label morta e superseded non tiene in vita la propria allocazione"
+        );
+        // ...mentre quella del servizio vivo lo resta.
+        assert!(
+            windows_unit_backed_by_label("agenda-corsi", "agenda-corsi-frontend.service", &vive),
+            "il servizio vivo conserva la sua porta"
+        );
+        // E la prova che il difetto stava nella FONTE, non nel criterio: con
+        // tutte le label storiche la riga fantasma tornava protetta.
+        let tutte: Vec<String> = storia.iter().map(|(l, _, _)| l.clone()).collect();
+        assert!(
+            windows_unit_backed_by_label("agenda-corsi", "agenda-corsi-Frontend (Vite).service", &tutte),
+            "con la storia intera la riga si autoproteggeva: e' il difetto misurato"
         );
     }
 

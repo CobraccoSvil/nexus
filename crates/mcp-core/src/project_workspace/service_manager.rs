@@ -187,10 +187,14 @@ pub struct ServiceContext<'a> {
     pub db: &'a sqlx::PgPool,
     /// Registro porte per l'alloca+inietta della porta stabile ai web service
     /// Windows. `None` quando il chiamante non ha un registry a disposizione (es.
-    /// i tool agente, che girano nel contesto `execute()` senza `AppState`): in
-    /// quel caso lo start di un web service NON inietta PORT (il servizio parte
-    /// comunque, la porta la gestisce il flusso run_service/run_config). Il
-    /// pannello e gli handler HTTP passano sempre `Some`.
+    /// i tool agente, che girano nel contesto `execute()` senza `AppState`).
+    ///
+    /// `None` NON significa piu' "parte senza PORT": lo start di un servizio WEB
+    /// da un contesto senza registro viene RIFIUTATO e lo dice. Iniettare PORT e'
+    /// il contratto di avvio di un web service — senza, la porta la sceglie il
+    /// literal nel sorgente, fuori dal bucket e magari su una porta di un altro
+    /// servizio (misurato il 03/08/2026 su agenda-corsi). Un contesto senza
+    /// registro resta valido per list/status/stop, che non avviano nulla.
     pub port_registry: Option<&'a PortRegistryCache>,
     pub project_id: Uuid,
     /// Slug di servizio del progetto (`project_service_slug`), NON `projects.slug`.
@@ -421,9 +425,7 @@ async fn control_windows(
         .unwrap_or_else(|| ctx.project_root.to_string_lossy().to_string());
 
     // Web service: alloca+inietta la porta stabile del bucket PRIMA dello spawn
-    // (PUNTO UNICO `web_service_port_env`). Solo se il chiamante ha un registry
-    // (il contesto tool agente ne e' privo -> niente iniezione, il servizio parte
-    // comunque).
+    // (PUNTO UNICO `web_service_port_env`).
     let port_env = match (
         crate::agent_tools::service::looks_like_web_service(&command),
         ctx.port_registry,
@@ -443,7 +445,29 @@ async fn control_windows(
                 Err(e) => return ServiceActionOutcome::noop(e),
             }
         }
-        _ => None,
+        // Web service SENZA registro: non si avvia. Prima cadeva nel catch-all e
+        // partiva senza PORT, cioe' lasciando decidere la porta al literal nel
+        // sorgente — ed e' la stessa conseguenza che il ramo sopra rifiuta
+        // esplicitamente due righe piu' su. La differenza era solo che li'
+        // l'errore era visibile e qui il silenzio no.
+        //
+        // MISURATO il 03/08/2026 su agenda-corsi: `service_control` (tool
+        // agente, costruito con `port_registry: None`) avviava il frontend, e
+        // `vite.config.ts` ripiegava sul proprio default numerico 26548 — una
+        // porta nel frattempo registrata a un ALTRO servizio.
+        //
+        // Non e' un ripiego mancato: e' un contratto che il chiamante non puo'
+        // onorare, e dirlo e' l'unico modo perche' venga riparato invece che
+        // aggirato.
+        (true, None) => {
+            return ServiceActionOutcome::noop(format!(
+                "servizio '{short}' non avviato: e' un servizio web e questo percorso non ha \
+                 accesso al registro delle porte, quindi PORT non puo' essere iniettato. \
+                 Avvialo con run_service (tool agente) o dal pannello Servizi, che allocano \
+                 la porta dal bucket del progetto."
+            ));
+        }
+        (false, _) => None,
     };
 
     match crate::agent_processes::spawn_agent_process(
