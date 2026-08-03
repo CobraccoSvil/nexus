@@ -9,7 +9,12 @@ import {
   setTerminalPresence,
 } from "../lib/api-client";
 import { useTheme, useThemeColors } from "../lib/theme";
-import { inFaseRavvicinata, ritardoRiconnessioneMs } from "./terminal-reconnect-logic";
+import {
+  erroreDaMostrare,
+  inFaseRavvicinata,
+  messaggioErroreTerminale,
+  ritardoRiconnessioneMs,
+} from "./terminal-reconnect-logic";
 
 interface TerminalTab {
   id: string;
@@ -233,11 +238,15 @@ function TerminalInstance({
           if (disposed || disposedLocal) return;
           // Ignore AbortError — triggered by component unmount or navigation, not a real error
           if (error instanceof Error && error.name === "AbortError") return;
-          term.writeln(
-            `\x1b[31mImpossibile avviare il terminale: ${
-              error instanceof Error ? error.message : "errore sconosciuto"
-            }\x1b[0m`,
-          );
+          const dettaglio = error instanceof Error ? error.message : "errore sconosciuto";
+          // Da qui si RIPROVA sempre (scheduleReconnect, riga sotto), quindi
+          // l'errore non si scrive nel terminale: la riga del retry dice gia'
+          // tutto. Prima si scriveva comunque, in rosso e con l'errore crudo del
+          // browser, e ogni giro produceva DUE righe — una allarmante e inutile,
+          // una corretta. Durante un deploy (evento normale) il pannello si
+          // riempiva di rosso mentre il sistema faceva esattamente il previsto.
+          // Il dettaglio tecnico resta nella console per chi indaga.
+          console.debug("[terminale] connessione fallita, riprovo:", dettaglio);
           exposeDisconnectedWriter();
           scheduleReconnect("abnormal");
         }
@@ -324,11 +333,13 @@ function TerminalInstance({
           }
         });
       } catch (error) {
-        term.writeln(
-          `\x1b[31mImpossibile avviare il terminale: ${
-            error instanceof Error ? error.message : "errore sconosciuto"
-          }\x1b[0m`,
-        );
+        // Qui NON si riprova (e' l'allestimento di xterm, non la connessione):
+        // l'errore e' l'unica cosa che l'utente ricevera', e va detto per
+        // intero — tradotto dal punto unico, col dettaglio tecnico in coda.
+        const dettaglio = error instanceof Error ? error.message : "errore sconosciuto";
+        if (erroreDaMostrare(false)) {
+          term.writeln(`\x1b[31m${messaggioErroreTerminale(dettaglio)}\x1b[0m`);
+        }
       }
 
       const ro = new ResizeObserver(() => {

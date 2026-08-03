@@ -51,3 +51,42 @@ export function ritardoRiconnessioneMs(tentativo: number): number {
 export function inFaseRavvicinata(tentativo: number): boolean {
   return ritardoRiconnessioneMs(tentativo) < RITARDO_MASSIMO_MS;
 }
+
+/**
+ * L'errore di connessione va MOSTRATO all'utente, o e' il rumore normale di un
+ * backend che sta ripartendo?
+ *
+ * Il difetto: il catch di `connectTerminal` scriveva sempre, in ROSSO,
+ * `Impossibile avviare il terminale: <errore crudo del browser>`, e subito dopo
+ * la riconnessione scriveva in grigio il messaggio giusto
+ * («Backend non raggiungibile: riprovo ogni 30s»). Ogni ciclo produceva quindi
+ * DUE righe: una allarmante e inutile, una corretta. Durante un deploy — evento
+ * normale, tre volte in una sera — il pannello si riempiva di rosso mentre il
+ * sistema stava funzionando esattamente come previsto.
+ *
+ * Il criterio non e' il TESTO dell'errore (`Failed to fetch` e' quello che
+ * produce Chrome, altri browser dicono altro, e domani potrebbe cambiare): e'
+ * se il chiamante RIPROVERA'. Quando riprovera', la riga del retry dice gia'
+ * tutto, e il dettaglio tecnico appartiene alla console, non al terminale
+ * dell'utente. Quando NON riprovera', l'errore e' l'unica cosa che l'utente
+ * ricevera' e va detto per intero.
+ */
+export function erroreDaMostrare(riprovera: boolean): boolean {
+  return !riprovera;
+}
+
+/**
+ * Il messaggio di un errore di avvio del terminale, per l'utente.
+ *
+ * L'errore crudo (`Failed to fetch`, `NetworkError`, ...) e' il vocabolario del
+ * browser, non del progetto: dice all'utente che qualcosa e' andato storto senza
+ * dirgli ne' cosa ne' che fare. Qui si traduce, e il dettaglio tecnico resta
+ * disponibile fra parentesi per chi apre una segnalazione.
+ */
+export function messaggioErroreTerminale(dettaglio: string): string {
+  return (
+    `Terminale non avviato: il backend non ha risposto. ` +
+    `Se e' in corso un riavvio, riparte da solo; altrimenti verifica che mcp-core sia attivo. ` +
+    `(${dettaglio})`
+  );
+}
