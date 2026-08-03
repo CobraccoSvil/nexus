@@ -1278,16 +1278,101 @@ pub(crate) enum RepairDecision {
     Disabled,
     /// I tentativi previsti sono finiti: si smette di riavviare e lo si dichiara.
     AttemptsExhausted,
+    /// Un agente sta gia' lavorando su questo progetto: non si riavvia niente
+    /// sotto i suoi piedi. La diagnosi resta `open` e verra' ripresa al giro
+    /// successivo, quando il campo sara' libero.
+    AgenteAlLavoro,
 }
 
-pub(crate) fn repair_decision(enabled: bool, attempts: i64, max_attempts: i64) -> RepairDecision {
+/// La decisione, dato anche il fatto «un agente sta lavorando su questo
+/// progetto».
+///
+/// ROOT CAUSE del parametro, misurata il 03/08/2026 su DUE progetti: il guard
+/// «c'e' gia' un run attivo» esisteva solo sul percorso che SPAWNA un run di
+/// diagnosi (`service_observer_remediation`), non su quello che RIAVVIA il
+/// servizio. Il worker e l'agente finivano cosi' a muovere gli stessi servizi
+/// nello stesso momento:
+///   - agenda-corsi, 01:17:32 — riparazione di
+///     `agenda-corsi-agenda-corsi-frontend.service.service` mentre il run
+///     d293ae40 era attivo (01:10:01-01:30:53), chiuso `blocked_needs_input`;
+///   - bacheca-attivita, 02:22:58 — riparazione di
+///     `bacheca-attivita-frontend.service` mentre il run 90924d59 era attivo
+///     (02:14:43-02:36:55), chiuso `failed_diagnosed`.
+/// Su 1405 diagnosi, 78 hanno tentato un riavvio: non e' un caso di confine.
+///
+/// Il criterio e' il PROGETTO, non la sessione: un run agentico avvia, ferma e
+/// riavvia qualunque servizio del progetto su cui lavora, quindi un riavvio
+/// concorrente su un'altra unit e' altrettanto capace di togliergli il terreno
+/// (la dedup per scopo ferma processi che il worker non stava guardando). Il
+/// guard dell'auto-debug, che invece ragiona per sessione, risponde a un'altra
+/// domanda — «questa conversazione ha gia' un agente?» — e resta dov'e'.
+///
+/// Non e' un rinvio a vuoto: la diagnosi non viene consumata, resta `open` e il
+/// prossimo giro la riprende. Se il servizio e' ancora giu' quando l'agente ha
+/// finito, viene riparato allora; se e' l'agente ad averlo rimesso in piedi, la
+/// verifica del contratto chiudera' la diagnosi senza toccare nulla.
+pub(crate) fn repair_decision_con_agente(
+    enabled: bool,
+    attempts: i64,
+    max_attempts: i64,
+    agente_al_lavoro: bool,
+) -> RepairDecision {
     if !enabled {
         return RepairDecision::Disabled;
     }
     if attempts >= max_attempts {
         return RepairDecision::AttemptsExhausted;
     }
+    // DOPO l'esaurimento: una diagnosi che ha finito i tentativi va dichiarata
+    // tale anche mentre un agente lavora, o resterebbe `open` per sempre senza
+    // che nessuno spieghi perche'.
+    if agente_al_lavoro {
+        return RepairDecision::AgenteAlLavoro;
+    }
     RepairDecision::Attend
+}
+
+#[cfg(test)]
+pub(crate) fn repair_decision(enabled: bool, attempts: i64, max_attempts: i64) -> RepairDecision {
+    repair_decision_con_agente(enabled, attempts, max_attempts, false)
+}
+
+/// `true` se il progetto ha un run agentico in corso.
+///
+/// Interroga `agent_runs` sul pool del PROGETTO (tabella migrata). Un errore
+/// non diventa «campo libero»: se non si e' potuto guardare si risponde
+/// «occupato», perche' la conseguenza di sbagliare in un verso (un riavvio
+/// rimandato di un giro) e' incomparabilmente piu' lieve di quella nell'altro
+/// (un servizio riavviato sotto i piedi di un agente che ci sta lavorando).
+async fn agente_al_lavoro_sul_progetto(state: &AppState, project_id: Uuid) -> bool {
+    let pool = match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %e,
+                "presidio servizi: DB progetto non interrogabile, considero il campo occupato"
+            );
+            return true;
+        }
+    };
+    match sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_runs \
+          WHERE status IN ('running', 'awaiting_confirmation', 'awaiting_subagents')",
+    )
+    .fetch_one(&pool)
+    .await
+    {
+        Ok(n) => n > 0,
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %e,
+                "presidio servizi: run attivi non leggibili, considero il campo occupato"
+            );
+            true
+        }
+    }
 }
 
 /// Prende in carico UNA diagnosi: `open` -> `diagnosing`, col cooldown del
@@ -1415,7 +1500,28 @@ async fn dispatch_repair_decision(
     policy: &RepairPolicy,
     crash: PendingCrash,
 ) {
-    match repair_decision(policy.enabled, crash.attempts, policy.max_attempts) {
+    // Il fatto si misura QUI, fuori dalla regola (regola G: l'I/O al chiamante,
+    // la decisione al punto unico). Si legge solo se la riparazione e' accesa e
+    // ci sono ancora tentativi: interrogare il DB per una diagnosi che verrebbe
+    // comunque dichiarata esaurita sarebbe lavoro a vuoto a ogni giro.
+    let agente_al_lavoro = if policy.enabled && crash.attempts < policy.max_attempts {
+        agente_al_lavoro_sul_progetto(state, project_id).await
+    } else {
+        false
+    };
+    match repair_decision_con_agente(
+        policy.enabled,
+        crash.attempts,
+        policy.max_attempts,
+        agente_al_lavoro,
+    ) {
+        RepairDecision::AgenteAlLavoro => {
+            tracing::debug!(
+                unit = %crash.unit,
+                project_id = %project_id,
+                "presidio servizi: un agente sta lavorando sul progetto, riparazione rimandata"
+            );
+        }
         RepairDecision::Disabled => {}
         RepairDecision::AttemptsExhausted => {
             let esito = RepairOutcome::Exhausted {
@@ -2533,6 +2639,47 @@ mod tests {
     /// MUTAZIONE: togliendo il confronto sui tentativi (`repair_decision` che
     /// ritorna sempre `Attend` a presidio acceso) rosseggia la terza asserzione,
     /// col valore del difetto reale — un servizio riavviato all'infinito.
+    /// IL CONFLITTO, riprodotto: il presidio non riavvia un servizio mentre un
+    /// agente lavora sul progetto.
+    ///
+    /// Misurato il 03/08/2026 su DUE progetti indipendenti. agenda-corsi: il
+    /// worker ripara alle 01:17:32 mentre il run d293ae40 e' attivo
+    /// (01:10:01-01:30:53), che chiude `blocked_needs_input`. bacheca-attivita:
+    /// riparazione alle 02:22:58 durante il run 90924d59 (02:14:43-02:36:55),
+    /// che chiude `failed_diagnosed`. Su 1405 diagnosi, 78 hanno tentato un
+    /// riavvio: la sovrapposizione non e' un caso di confine.
+    ///
+    /// L'ordine dei controlli e' parte del contratto: l'esaurimento dei
+    /// tentativi viene PRIMA, o una diagnosi finita resterebbe `open` per
+    /// sempre ogni volta che un agente lavora, senza che nessuno dichiari
+    /// perche'.
+    ///
+    /// MUTAZIONE: togliere il ramo `agente_al_lavoro` fa tornare `Attend` alla
+    /// prima asserzione, cioe' il riavvio sotto i piedi dell'agente.
+    #[test]
+    fn il_presidio_non_riavvia_mentre_un_agente_lavora() {
+        assert_eq!(
+            repair_decision_con_agente(true, 0, 3, true),
+            RepairDecision::AgenteAlLavoro,
+            "campo occupato: la diagnosi resta open e si riprende dopo"
+        );
+        assert_eq!(
+            repair_decision_con_agente(true, 0, 3, false),
+            RepairDecision::Attend,
+            "campo libero: si ripara"
+        );
+        // L'esaurimento vince sul campo occupato: va dichiarato comunque.
+        assert_eq!(
+            repair_decision_con_agente(true, 3, 3, true),
+            RepairDecision::AttemptsExhausted
+        );
+        // E il presidio spento resta spento.
+        assert_eq!(
+            repair_decision_con_agente(false, 0, 3, true),
+            RepairDecision::Disabled
+        );
+    }
+
     #[test]
     fn il_presidio_smette_di_riavviare_quando_i_tentativi_sono_finiti() {
         assert_eq!(repair_decision(false, 0, 3), RepairDecision::Disabled);
