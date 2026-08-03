@@ -1509,11 +1509,22 @@ pub(super) async fn esegui_suite_delegata(
     let input = input_per_runner(inv, working_dir_param, riga);
     let coda = avvertenze_di_traduzione(inv);
     let out = tool_run_playwright_tests(ctx, &input).await;
-    format!(
-        "[{tool} -> run_playwright_tests] La suite Playwright ha un solo esecutore: BASE_URL dalle \
-         porte allocate al progetto, preflight Chromium, attesa del servizio bersaglio e \
-         registrazione nel pannello Playwright. La riga e' stata eseguita da li' con i suoi \
-         argomenti.{coda}\n{out}"
+    // La premessa si antepone dal PONTE, non con un `format!`:
+    // `tool_run_playwright_tests` dichiara il fallimento col marker IN TESTA
+    // (`tool_failure`), e qualunque testo messo davanti lo spingeva in mezzo
+    // alla stringa — dove `is_tool_failure`, che guarda solo la testa, non lo
+    // vede piu'. Il tool risultava RIUSCITO a tutti i consumatori a valle
+    // (`inoltro_legacy`, `tool_run_tests`, `tool_run_service`): una suite rossa
+    // passava per verde. Il ponte esiste apposta e lo dichiara nel proprio doc:
+    // toglie il marker dal corpo e lo rimette in testa alla composizione.
+    nexus_types::tool_outcome::prepend_preserving_failure(
+        format!(
+            "[{tool} -> run_playwright_tests] La suite Playwright ha un solo esecutore: BASE_URL dalle \
+             porte allocate al progetto, preflight Chromium, attesa del servizio bersaglio e \
+             registrazione nel pannello Playwright. La riga e' stata eseguita da li' con i suoi \
+             argomenti.{coda}"
+        ),
+        &out,
     )
 }
 
@@ -2534,6 +2545,49 @@ fn truncate_output_tail(text: String, max_out: usize) -> String {
 #[cfg(test)]
 mod comando_delegato_tests {
     use super::*;
+
+    /// LA PROVA del difetto chiuso: la premessa non deve nascondere l'esito.
+    ///
+    /// `esegui_suite_delegata` anteponeva la propria spiegazione con un
+    /// `format!`, e `tool_run_playwright_tests` dichiara il fallimento col
+    /// marker IN TESTA: il testo davanti lo spingeva in mezzo alla stringa, dove
+    /// `is_tool_failure` — che guarda solo la testa — non lo vedeva piu'. Una
+    /// suite rossa arrivava ai consumatori a valle come riuscita.
+    ///
+    /// Il test misura la COMPOSIZIONE, cioe' quello che il chiamante fa davvero,
+    /// partendo dal produttore reale del fallimento (`tool_failure`) e non da
+    /// una stringa scritta a mano col marker copiato (regola O).
+    ///
+    /// MUTAZIONE: tornare al `format!` che antepone la premessa con una
+    /// concatenazione fa rosseggiare la prima asserzione — il valore del
+    /// difetto reale.
+    #[test]
+    fn la_premessa_non_nasconde_il_fallimento_della_suite() {
+        use nexus_types::tool_outcome::{is_tool_failure, prepend_preserving_failure, tool_failure};
+
+        let esito_rosso = tool_failure("3 test falliti su 41");
+        assert!(is_tool_failure(&esito_rosso), "premessa del test: il produttore dichiara il fallimento");
+
+        let composto = prepend_preserving_failure(
+            "[run_command -> run_playwright_tests] La suite Playwright ha un solo esecutore.",
+            &esito_rosso,
+        );
+        assert!(
+            is_tool_failure(&composto),
+            "dopo la premessa il fallimento deve restare riconoscibile: {composto}"
+        );
+        // La premessa c'e' comunque, e il corpo non ha un secondo marker in mezzo.
+        assert!(composto.contains("un solo esecutore"));
+        assert!(composto.contains("3 test falliti su 41"));
+
+        // E un esito RIUSCITO non diventa un fallimento per il solo fatto di
+        // avere una premessa davanti.
+        let composto_ok = prepend_preserving_failure(
+            "[run_command -> run_playwright_tests] La suite Playwright ha un solo esecutore.",
+            "41 test passati",
+        );
+        assert!(!is_tool_failure(&composto_ok));
+    }
 
     /// Gli argomenti NON si costruiscono a mano: si prendono da dove nascono in
     /// produzione, cioe' dalla riga scritta dall'agente passata per
