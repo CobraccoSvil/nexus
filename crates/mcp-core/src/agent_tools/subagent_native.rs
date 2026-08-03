@@ -571,7 +571,38 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
     // Esecuzione a ondate concorrenti (cap conservativo). I guard per-sub
     // (enabled/whitelist/depth/cost) sono valutati per ogni sub-run; nel batch
     // il cost cap e' best-effort (race tollerata dato il cap conservativo).
-    let results: Vec<Value> = if background {
+    // Il BACKGROUND non apre un fronte concorrente su una root condivisa.
+    //
+    // `isolation_available` e' `false` per costruzione quando `background` e'
+    // vero (riga sopra: il ramo isolato esige sub-run terminati per l'apply
+    // serializzato), quindi questi figli scrivono TUTTI sulla root reale del
+    // progetto — e `run_batch_background` li spawna tutti insieme (SPAWN-ALL).
+    //
+    // MISURATO il 03/08/2026 su officina-veicoli, dopo aver serializzato il solo
+    // ramo sincrono: cinque figure con lo stesso dispatcher (frontend_implementer,
+    // db_architect x2, test_author, implement) hanno scritto in finestre
+    // sovrapposte, e `.env` e `prisma/schema.prisma` risultano scritti da DUE run
+    // diversi. Il fix precedente aveva coperto meta' del ramo condiviso: questa e'
+    // l'altra meta'.
+    //
+    // Con piu' di un task e nessun isolamento si degrada il PARALLELISMO — la
+    // stessa conseguenza che il punto unico impone al ramo sincrono — eseguendo
+    // il batch in modo sincrono e sequenziale. Il fan-in non serve: i figli sono
+    // gia' terminati quando il tool ritorna, quindi il padre non si sospende e
+    // non c'e' alcuna COUNT da attendere. Un solo task in background resta
+    // fire-and-forget: senza concorrenti non c'e' race da togliere.
+    let background_concorrente_pericoloso = background
+        && parsed.len() > 1
+        && !nexus_agent_graph::decisions::modo_scrittura_batch(isolation_available, &scopes)
+            .richiede_isolamento();
+    if background_concorrente_pericoloso {
+        tracing::info!(
+            sub_run = parsed.len(),
+            "batch background su root condivisa: eseguito UNO ALLA VOLTA invece che in parallelo"
+        );
+    }
+
+    let results: Vec<Value> = if background && !background_concorrente_pericoloso {
         // BACKGROUND: PREPARE-ALL poi SPAWN-ALL (bug fan-in prematuro). Se
         // preparassimo+spawnassimo una alla volta, il 1o figlio potrebbe terminare
         // (task detached) mentre gli altri non sono ancora in nexus_subagent_runs
@@ -5889,6 +5920,42 @@ mod tests {
 
     fn sc(paths: &[&str]) -> Vec<String> {
         paths.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Il BACKGROUND non fa eccezione: senza isolamento, piu' di un task
+    /// significa uno alla volta.
+    ///
+    /// `isolation_available` e' `false` per costruzione quando il batch e' in
+    /// background (il ramo isolato esige sub-run terminati), quindi il modo e'
+    /// sempre `UnoAllaVolta` e la condizione che governa lo SPAWN-ALL dipende
+    /// solo dal numero di task.
+    ///
+    /// MISURATO il 03/08/2026 su officina-veicoli: cinque figure con lo stesso
+    /// dispatcher hanno scritto in finestre sovrapposte, e `.env` e
+    /// `prisma/schema.prisma` risultano scritti da DUE run diversi. Il fix
+    /// precedente aveva serializzato il solo ramo sincrono.
+    #[test]
+    fn il_background_senza_isolamento_non_apre_un_fronte() {
+        use nexus_agent_graph::decisions::{modo_scrittura_batch, ModoScritturaBatch};
+
+        // In background l'isolamento non e' mai disponibile: il modo lo dice.
+        let scopes_disgiunti = vec![vec!["src/a".to_string()], vec!["src/b".to_string()]];
+        assert_eq!(
+            modo_scrittura_batch(false, &scopes_disgiunti),
+            ModoScritturaBatch::UnoAllaVolta,
+            "senza isolamento fisico nemmeno scope disgiunti autorizzano il parallelo"
+        );
+
+        // Un solo task resta fire-and-forget: senza concorrenti non c'e' race.
+        let uno_solo = vec![vec!["src/a".to_string()]];
+        assert_eq!(
+            modo_scrittura_batch(false, &uno_solo),
+            ModoScritturaBatch::UnoAllaVolta
+        );
+        assert_eq!(
+            modo_scrittura_batch(false, &uno_solo).scrittori_concorrenti(8),
+            1
+        );
     }
 
     #[test]
