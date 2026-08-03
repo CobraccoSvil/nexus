@@ -588,7 +588,7 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
         // OFF, root non git) o gli scope dichiarati NON sono disgiunti. In
         // entrambi i casi questi sub-run condividono la root REALE del progetto,
         // e la conseguenza la detta il punto unico
-        // (`decisions::parallel_writers_allowed`), che la dichiara nel proprio
+        // (`decisions::modo_scrittura_batch`), che ora la porta nel TIPO invece che nel
         // commento: «chi risponde no NON deve degradare l'ISOLAMENTO (eseguendo
         // comunque in parallelo sulla root condivisa, che e' il difetto
         // trovato): deve degradare il PARALLELISMO, cioe' procedere un todo per
@@ -607,11 +607,14 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
         // Il degrado e' a UNO, non a un numero piu' piccolo: due scrittori sulla
         // stessa root sono una race quanto otto, e la differenza e' solo quanto
         // spesso la si incontra.
-        // Non serve ricalcolare la condizione: si arriva qui SOLO se
-        // `should_isolate_batch` ha detto no, e quella e' la stessa domanda a cui
-        // risponde `parallel_writers_allowed` (isolamento E scope disgiunti). Qui
-        // dentro, per costruzione, la risposta e' sempre «uno alla volta».
-        const SCRITTORI_INSIEME: usize = 1;
+        // Il NUMERO di scrittori concorrenti lo dice il tipo, non questo
+        // chiamante: e' l'unico modo per ottenerlo, e per costruzione qui vale 1
+        // (si arriva in questo ramo solo quando il modo NON e' Isolato).
+        let scrittori_insieme = nexus_agent_graph::decisions::modo_scrittura_batch(
+            isolation_available,
+            &scopes,
+        )
+        .scrittori_concorrenti(max_parallel);
         if parsed.len() > 1 {
             tracing::info!(
                 sub_run = parsed.len(),
@@ -620,7 +623,7 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
             );
         }
         let mut results: Vec<Value> = Vec::with_capacity(parsed.len());
-        for wave in parsed.chunks(SCRITTORI_INSIEME) {
+        for wave in parsed.chunks(scrittori_insieme) {
             let futs = wave.iter().map(|p| run_parsed_task(ctx, p, None));
             let wave_res = futures::future::join_all(futs).await;
             results.extend(wave_res);
@@ -758,7 +761,8 @@ fn should_isolate_batch(isolation_available: bool, scopes: &[Vec<String>]) -> bo
     // STESSA domanda («piu' sub-run possono scrivere insieme?»), e due copie
     // divergerebbero al primo termine aggiunto — con la copia di qua che manda in
     // parallelo cio' che il punto unico di la' avrebbe fermato.
-    nexus_agent_graph::decisions::parallel_writers_allowed(isolation_available, scopes)
+    nexus_agent_graph::decisions::modo_scrittura_batch(isolation_available, scopes)
+        .richiede_isolamento()
 }
 
 /// Esegue il batch di sub-run in ISOLAMENTO FISICO (FASE 2). Precondizione (gia'

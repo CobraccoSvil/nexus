@@ -370,23 +370,72 @@ pub fn subtasks_are_disjoint(scopes: &[Vec<String>]) -> bool {
     true
 }
 
+/// COME si esegue un batch di sub-run che scrivono file.
+///
+/// Non e' un `bool` per una ragione precisa, imparata a spese di un incidente:
+/// un booleano risponde «isolo?» e lascia al chiamante la parte che conta —
+/// cosa fare del `false`. Davanti a quel `false` le strade sono due, degradare
+/// l'ISOLAMENTO (eseguire comunque in parallelo sulla root condivisa) o
+/// degradare il PARALLELISMO (un todo per volta), e solo una e' corretta. La
+/// vecchia firma non ne privilegiava nessuna: la scelta giusta viveva in un
+/// commento, e un commento non vincola niente.
+///
+/// MISURATO due volte, a un anno di distanza fra le forme ma con lo stesso
+/// esito: il 22/07/2026 (progetto non-git, wave da 8) sette sub-run hanno
+/// scritto lo stesso file e `server.js` e' stato troncato da 2.3KB a 595B da un
+/// edit concorrente; il 03/08/2026 su catalogo-libri tre figure lanciate
+/// insieme hanno prodotto DUE backend incompatibili (Rust e Node), due delle
+/// quali scrivendo gli stessi file, e l'app non e' mai partita. In entrambi i
+/// casi il chiamante aveva ricevuto `false` e aveva degradato l'isolamento.
+///
+/// Ora la risposta PORTA la conseguenza: chi la riceve non decide piu' cosa
+/// significhi, e il numero di scrittori concorrenti lo chiede al tipo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModoScritturaBatch {
+    /// Isolamento fisico disponibile e scope disgiunti: i sub-run possono
+    /// scrivere insieme, ciascuno nel proprio worktree.
+    Isolato,
+    /// Root CONDIVISA: si procede uno per volta. Non e' una precauzione
+    /// proporzionale al rischio — due scrittori sulla stessa root sono una race
+    /// quanto otto, e la differenza e' solo quanto spesso la si incontra.
+    UnoAllaVolta,
+}
+
+impl ModoScritturaBatch {
+    /// Quanti sub-run possono scrivere INSIEME. E' l'unico modo per ottenere
+    /// quel numero: il chiamante non lo compone da se'.
+    pub fn scrittori_concorrenti(self, cap_configurato: usize) -> usize {
+        match self {
+            Self::Isolato => cap_configurato.max(1),
+            Self::UnoAllaVolta => 1,
+        }
+    }
+
+    /// `true` se il batch va eseguito nel ramo con worktree effimeri.
+    pub fn richiede_isolamento(self) -> bool {
+        matches!(self, Self::Isolato)
+    }
+}
+
 /// PUNTO UNICO (regola L) della domanda "posso far scrivere PIU' sub-run in
-/// PARALLELO?". Vero solo se esiste l'isolamento FISICO (worktree git effimeri)
-/// E gli scope di scrittura dichiarati sono DISGIUNTI.
+/// PARALLELO?". [`ModoScritturaBatch::Isolato`] solo se esiste l'isolamento
+/// FISICO (worktree git effimeri) E gli scope di scrittura dichiarati sono
+/// DISGIUNTI.
 ///
 /// Servono ENTRAMBI i termini, e per ragioni diverse: la disgiunzione e' una
 /// promessa DICHIARATIVA del pianificatore, l'isolamento e' la guard FISICA.
 /// Senza isolamento i sub-run condividono la root reale del progetto, quindi
 /// qualunque svista o incompletezza del piano si traduce in una race sul
-/// filesystem. Incidente del 2026-07-22 (progetto non-git, wave da 8): sette
-/// sub-run hanno scritto lo stesso file, `server.js` e' stato troncato da 2.3KB a
-/// 595B da un edit concorrente e sono nati file duplicati.
-///
-/// Chi risponde "no" NON deve degradare l'ISOLAMENTO (eseguendo comunque in
-/// parallelo sulla root condivisa, che e' il difetto trovato): deve degradare il
-/// PARALLELISMO, cioe' procedere un todo per volta.
-pub fn parallel_writers_allowed(isolation_available: bool, scopes: &[Vec<String>]) -> bool {
-    isolation_available && subtasks_are_disjoint(scopes)
+/// filesystem.
+pub fn modo_scrittura_batch(
+    isolation_available: bool,
+    scopes: &[Vec<String>],
+) -> ModoScritturaBatch {
+    if isolation_available && subtasks_are_disjoint(scopes) {
+        ModoScritturaBatch::Isolato
+    } else {
+        ModoScritturaBatch::UnoAllaVolta
+    }
 }
 
 /// Valida l'output JSON dell'LLM contro l'enum CHIUSO [`OrchestrationMove`]. Punto
@@ -447,7 +496,7 @@ pub fn validate_orch_move(
             // Delega al punto unico (regola L): la stessa domanda la pone anche il
             // TodoRunner quando apre l'ondata dei todo. Prima erano due luoghi, e
             // solo questo — il meno battuto — la poneva davvero.
-            let coordination = if parallel_writers_allowed(isolation_available, &scopes) {
+            let coordination = if modo_scrittura_batch(isolation_available, &scopes).richiede_isolamento() {
                 Coordination::ParallelIsolated
             } else {
                 Coordination::Sequential
@@ -850,17 +899,17 @@ mod tests {
         let disgiunti = [sc(&["src/a"]), sc(&["src/b"])];
         let sovrapposti = [sc(&["src/a"]), sc(&["src/a"])];
         // Unico caso ammesso: guard fisica presente E promessa del piano coerente.
-        assert!(parallel_writers_allowed(true, &disgiunti));
+        assert!(modo_scrittura_batch(true, &disgiunti).richiede_isolamento());
         // ISOLAMENTO ASSENTE (ogni progetto non-git): anche con scope
         // PERFETTAMENTE disgiunti il fronte parallelo non e' ammesso. La
         // disgiunzione e' una promessa dichiarativa del pianificatore, non una
         // guard fisica: se il piano sbaglia, i sub-run si pestano sulla root reale.
-        assert!(!parallel_writers_allowed(false, &disgiunti));
+        assert!(!modo_scrittura_batch(false, &disgiunti).richiede_isolamento());
         // Isolamento presente ma aree dichiarate sovrapposte.
-        assert!(!parallel_writers_allowed(true, &sovrapposti));
-        assert!(!parallel_writers_allowed(false, &sovrapposti));
+        assert!(!modo_scrittura_batch(true, &sovrapposti).richiede_isolamento());
+        assert!(!modo_scrittura_batch(false, &sovrapposti).richiede_isolamento());
         // Scope non dichiarato -> nessun parallelismo (coerente con subtasks_are_disjoint).
-        assert!(!parallel_writers_allowed(true, &[sc(&[]), sc(&["src/b"])]));
+        assert!(!modo_scrittura_batch(true, &[sc(&[]), sc(&["src/b"])]).richiede_isolamento());
     }
 
     #[test]

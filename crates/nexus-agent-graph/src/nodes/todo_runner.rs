@@ -448,7 +448,7 @@ impl TodoRunnerNode {
     /// campo incluso). Alimenta la MISURA delle scritture fuori scope (mig 0646),
     /// e serve QUI in particolare: questa e' la via del passo-per-volta, cioe'
     /// quella che prende il traffico ogni volta che il parallelismo non e'
-    /// concesso — e non lo e' quasi mai, perche' `parallel_writers_allowed` esige
+    /// concesso — e non lo e' quasi mai, perche' `modo_scrittura_batch` esige
     /// l'isolamento fisico, di default spento. Finche' lo scope viaggiava solo in
     /// [`Self::dispatch_wave`], misurare voleva dire misurare il ramo che non
     /// gira: colonna piena di "non dichiarato" e la conclusione, falsa, che il
@@ -782,7 +782,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for TodoRunnerNode {
                 dag_parallel_min_ready: self.cfg.dag_parallel_min_ready,
             };
             // GUARD FISICA ANTI-RACE (regola L, punto unico
-            // `parallel_writers_allowed`): un fronte parallelo di SCRITTORI e'
+            // `modo_scrittura_batch`): un fronte parallelo di SCRITTORI e'
             // ammesso solo con isolamento disponibile E scope disgiunti. Senza
             // isolamento i sub-run condividono la root reale del progetto: prima
             // questa domanda qui non veniva posta affatto (il campo
@@ -791,10 +791,11 @@ impl GraphNode<AgentState, AgentNodeCtx> for TodoRunnerNode {
             // Falso -> nessuna wave: si prosegue con `dispatch_one`, UN todo per
             // re-ingresso del nodo (degrada il PARALLELISMO, non l'isolamento).
             let scopes: Vec<Vec<String>> = ready.iter().map(|t| t.write_scope.clone()).collect();
-            let writers_ok = crate::decisions::orchestration_reason::parallel_writers_allowed(
+            let writers_ok = crate::decisions::orchestration_reason::modo_scrittura_batch(
                 ctx.isolation_available,
                 &scopes,
-            );
+            )
+            .richiede_isolamento();
             if ready.len() >= 2 && !writers_ok {
                 // Il degrado non deve essere silenzioso (regola M: il motivo e' un
                 // dato, non un'assenza): senza questa riga l'operatore vede solo
@@ -1026,7 +1027,7 @@ fn end_turn_no_active() -> OpaqueDelta {
 /// Perche' esiste: finche' i due rami costruivano questo JSON ognuno per conto
 /// proprio, `write_scope` viaggiava SOLO nella wave. Il ramo sequenziale — quello
 /// che prende il traffico ogni volta che il parallelismo non e' concesso, cioe'
-/// quasi sempre, perche' `parallel_writers_allowed` esige l'isolamento fisico di
+/// quasi sempre, perche' `modo_scrittura_batch` esige l'isolamento fisico di
 /// default spento — lo perdeva per strada. La misura delle scritture fuori scope
 /// (mig 0646) sarebbe stata cieca proprio dove passa il lavoro, e avrebbe
 /// riportato "il pianificatore non sbaglia mai" per non aver misurato nulla.
@@ -1479,7 +1480,7 @@ mod tests {
         // ritorna entrambi, should_parallelize=true -> UN solo dispatch_subagents con
         // 2 task (ondata), non due dispatch sequenziali. Entrambi completed -> end_turn.
         // Scope DISGIUNTI + isolamento disponibile: sono le due condizioni del
-        // punto unico `parallel_writers_allowed`. Se ne manca una, niente ondata.
+        // punto unico `modo_scrittura_batch`. Se ne manca una, niente ondata.
         let store = Arc::new(StubTodoStore::with_todos(vec![
             todo_scoped("a", TodoStatus::Pending, &[], 1, &["src/a.rs"]),
             todo_scoped("b", TodoStatus::Pending, &[], 2, &["src/b.rs"]),
@@ -1530,7 +1531,7 @@ mod tests {
     /// Il percorso e' quello del passo-per-volta (`dispatch_one`), cioe' quello che
     /// prende il traffico ogni volta che il parallelismo non e' concesso: qui
     /// `isolation_available=false`, che e' il default di ogni progetto non-git e la
-    /// condizione in cui `parallel_writers_allowed` nega la wave. Finche' lo scope
+    /// condizione in cui `modo_scrittura_batch` nega la wave. Finche' lo scope
     /// viaggiava solo in `dispatch_wave`, misurare le violazioni voleva dire
     /// misurare il ramo che quasi non gira: la colonna si sarebbe riempita di
     /// `no_scope_declared` e il numero avrebbe detto "il pianificatore e' preciso"
