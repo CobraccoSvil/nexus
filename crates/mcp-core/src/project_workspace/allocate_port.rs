@@ -115,7 +115,33 @@ pub async fn find_or_allocate(
         // frontend Vite di bacheca-attivita' (misurato 31/07/2026): non
         // "occupata da chissi'" ma occupata per davvero, solo su una famiglia
         // di indirizzo che il vecchio gate non sapeva interrogare.
-        let occupant = super::port_recovery::port_occupant(p).await;
+        // L'esito distingue «nessuno ascolta» da «non ho potuto chiedere»:
+        // `port_occupant` appiattisce i due casi in un `None`, e il doc di
+        // `occupante_osservato` lo vieta esplicitamente a «chi deduce
+        // un'assenza» — che e' quello che il ramo `else` qui sotto fa, adottando
+        // la porta come stale. Sotto WSAENOBUFS (pool di porte effimere
+        // esaurito) o con la tabella dei listener non interrogabile, un servizio
+        // VIVO risultava senza occupante e la sua porta veniva adottata sotto di
+        // lui.
+        let osservazione = super::port_recovery::occupante_osservato(p).await;
+        let occupant = match osservazione {
+            Some(o) => o,
+            None => {
+                // Non si e' potuto guardare: non si adotta e non si rialloca.
+                // Un'allocazione lasciata com'e' costa un giro; una porta tolta
+                // a un servizio vivo costa il servizio.
+                tracing::warn!(
+                    port = p,
+                    label = %label,
+                    "allocazione porte: tabella dei listener non interrogabile, la riga resta com'e'"
+                );
+                return Err(
+                    "stato delle porte non interrogabile in questo momento: riprova fra poco \
+                     (nessuna allocazione modificata)"
+                        .to_string(),
+                );
+            }
+        };
         if occupant.is_some() {
             // La porta risponde: qualcuno ascolta DAVVERO. Storicamente questo
             // ramo ritornava 'existing' senza chiedersi CHI: se l'occupante era
