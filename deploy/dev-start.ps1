@@ -152,3 +152,26 @@ Write-Host "Stack avviato ($($started.Count) processi). PID: $PIDFILE" -Foregrou
 Write-Host "Log: $LOGDIR   |   Stop: .\deploy\dev-stop.ps1" -ForegroundColor Cyan
 Write-Host "NB: Explorer mostra 0 KB finche' il processo tiene aperto l'handle del log (size NTFS pigra)." -ForegroundColor DarkGray
 Write-Host "    Leggere con: Get-Content $LOGDIR\<servizio>.out.log -Tail 50 [-Wait]" -ForegroundColor DarkGray
+
+# ESITO DICHIARATO, non dedotto dal codice d'uscita.
+#
+# Questo script non chiama mai `exit`: i fallimenti per-servizio sono degradati a
+# Write-Warning e il ramo "stack gia' attivo" fa `return`. In PowerShell, `&` su
+# un .ps1 che non chiama `exit` NON aggiorna $LASTEXITCODE — il chiamante legge
+# il valore dell'ULTIMO comando nativo precedente, cioe' un residuo di `cargo`.
+# deploy-local.ps1 lo leggeva per decidere fra «stack riavviato» e «i servizi
+# sono GIU'»: una diagnosi tirata a sorte, che su uno stack a pezzi diceva
+# «riavviato» perche' l'ultima cargo era andata bene.
+#
+# Il canale giusto e' un VALORE: chi vuole sapere com'e' andata interroga i
+# campi, come deploy-local.ps1 fa gia' con Publish-NexusArtifacts. Non si
+# aggiunge un `exit`: un exit code e' un numero che il chiamante puo' ignorare
+# senza che nulla lo fermi, e qui il chiamante lo ignorava gia' credendo di
+# leggerlo.
+[pscustomobject]@{
+  Attesi  = $order.Count
+  Avviati = $started.Count
+  Completo = ($started.Count -ge $order.Count)
+  PidFile = $PIDFILE
+  LogDir  = $LOGDIR
+}

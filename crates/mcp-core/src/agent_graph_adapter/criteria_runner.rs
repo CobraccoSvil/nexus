@@ -183,16 +183,26 @@ impl FinalGateCriteriaRunnerAdapter {
         cmd: &str,
         esito: Result<crate::suite_verification::SuiteVerification, String>,
         baseline_exit: Option<i64>,
-    ) -> (bool, Value) {
+    ) -> (CriterionOutcome, Value) {
         let v = match esito {
             Ok(v) => v,
+            // GUASTO DELL'ESECUZIONE, non misura del codice: radice non
+            // risolvibile, DB del progetto non disponibile, errore di avvio del
+            // processo, timeout. Nessuno di questi dice nulla sul codice sotto
+            // esame, e prima uscivano `false` — cioe' `Failed`, cioe' il gate
+            // bocciava codice che nessuno aveva provato. `Inconclusive` esiste
+            // apposta ed e' gia' usato dal ramo gemello `check_run_command`
+            // venticinque righe piu' sotto: qui mancava solo perche' la firma
+            // `-> (bool, Value)` non aveva un posto dove metterlo.
             Err(e) => {
                 return (
-                    false,
+                    CriterionOutcome::Inconclusive,
                     json!({
                         "command": cmd,
                         "error": format!("verifica a suite non riuscita: {e}"),
-                        "verdict": format!("La suite non ha prodotto un esito: {e}"),
+                        "verdict": format!(
+                            "La suite non ha prodotto un esito: {e}. E' un guasto dell'esecuzione,                              non una misura del codice: il criterio non conta nel gate e la                              chiusura resta NON verificata."
+                        ),
                     }),
                 )
             }
@@ -211,7 +221,9 @@ impl FinalGateCriteriaRunnerAdapter {
         const MAX_OUTPUT_SUITE: usize = 4000;
         let excerpt = truncate_chars(&v.testo, MAX_OUTPUT_SUITE);
         (
-            passed,
+            // La suite ha prodotto un esito: qui si e' MISURATO, e il verdetto
+            // segue il passed (che il ramo delta-aware puo' aver gia' corretto).
+            CriterionOutcome::measured(passed),
             json!({
                 "command": cmd,
                 "exit_code": v.exit_code,
@@ -472,7 +484,7 @@ task_complete (outcome + summary)"
             .await
         {
             let baseline = spec.get("baseline_exit_code").and_then(Value::as_i64);
-            return misurato(Self::evidenza_suite(cmd, esito, baseline));
+            return Self::evidenza_suite(cmd, esito, baseline);
         }
 
         let mut tool_input = json!({ "command": cmd });
@@ -572,13 +584,17 @@ task_complete (outcome + summary)"
         // avesse ROTTO lui il bootstrap (es. config cancellata), la baseline
         // sarebbe 0 e il confronto NON scatterebbe. `None` = fail-closed.
         let baseline_exit = spec.get("baseline_exit_code").and_then(Value::as_i64);
-        let preexisting_bootstrap = !exit_ok
-            && error_files.is_empty()
-            && baseline_exit.is_some_and(|b| b != 0 && actual_exit == Some(b));
+        // I due fatti viaggiano SEPARATI fino al verdetto: comporli qui
+        // significava concludere «ambiente gia' rotto» senza avere sotto gli
+        // occhi `build_errors`, cioe' la prova che invece un errore c'e'.
+        let nessuna_localizzazione = error_files.is_empty();
+        let stesso_esito_della_baseline =
+            !exit_ok && baseline_exit.is_some_and(|b| b != 0 && actual_exit == Some(b));
         let outcome = verdetto_del_comando(FattiDelComando {
             delta_applicable,
             regression,
-            preexisting_bootstrap,
+            nessuna_localizzazione,
+            stesso_esito_della_baseline,
             build_errors,
             esito_misurato,
             exit_ok,
@@ -606,13 +622,18 @@ task_complete (outcome + summary)"
             "preexisting_error_files": preexisting_files,
             "regressed_files": regressed_files.clone(),
             "baseline_exit_code": baseline_exit,
-            "preexisting_bootstrap": preexisting_bootstrap,
+            "preexisting_bootstrap": matches!(outcome, CriterionOutcome::Passed)
+                && stesso_esito_della_baseline
+                && nessuna_localizzazione,
         });
         if outcome.is_inconclusive() {
             ev["verdict"] = json!(format!(
                 "Comando '{cmd}' terminato SENZA exit code: l'esito non e' stato misurato (il processo non ha prodotto uno stato d'uscita). Non e' una prova di difetto ne' di correttezza: il criterio non conta nel gate e la chiusura resta NON verificata."
             ));
-        } else if preexisting_bootstrap {
+        } else if matches!(outcome, CriterionOutcome::Passed)
+            && stesso_esito_della_baseline
+            && nessuna_localizzazione
+        {
             ev["verdict"] = json!(format!(
                 "Criterio fallito con esito IDENTICO alla baseline pre-lavoro (exit {} gia' misurato all'innesto del profilo): fallimento PRE-ESISTENTE dell'ambiente (es. config del tool assente), non una regressione di questo run. Debito del progetto, non blocca la chiusura.",
                 baseline_exit.unwrap_or_default()
@@ -1166,9 +1187,16 @@ struct FattiDelComando {
     delta_applicable: bool,
     /// Almeno un file d'errore e' fra quelli che questo run ha toccato.
     regression: bool,
-    /// Stesso exit non-zero della baseline pre-lavoro, senza errori localizzati:
-    /// l'ambiente era gia' cosi' prima che il run cominciasse.
-    preexisting_bootstrap: bool,
+    /// L'output NON ha attribuito nessun errore a un file: o il progetto e'
+    /// pulito, o il formato non e' fra quelli che `build_error_files` sa
+    /// leggere. I due casi qui NON si distinguono, ed e' esattamente il motivo
+    /// per cui questo campo e' un FATTO GREZZO e non l'ipotesi gia' conclusa:
+    /// chi la conclude deve vedere anche `build_errors`, che invece PROVA gli
+    /// errori (vedi `verdetto_del_comando`).
+    nessuna_localizzazione: bool,
+    /// Exit non-zero IDENTICO alla baseline misurata prima del lavoro:
+    /// l'ambiente rispondeva cosi' anche prima che il run cominciasse.
+    stesso_esito_della_baseline: bool,
     /// Errori di build PROVATI dall'output (rete di sicurezza sull'exit bugiardo).
     build_errors: usize,
     /// C'e' stata una misura: exit code presente, oppure il tool ha DICHIARATO
@@ -1183,10 +1211,25 @@ struct FattiDelComando {
 /// caso senza montare un esecutore.
 ///
 /// L'ORDINE dei rami e' il contratto, non uno stile: il delta sui file toccati
-/// precede tutto perche' e' la misura piu' fine disponibile; il bootstrap
-/// preesistente precede gli errori di build perche' un ambiente gia' rotto non
-/// diventa colpa di questo run; "non misurato" viene per ULTIMO fra i casi
-/// negativi, cosi' non puo' assorbire un caso che qualcuno aveva gia' misurato.
+/// precede tutto perche' e' la misura piu' fine disponibile; gli errori PROVATI
+/// vengono prima dell'ipotesi «ambiente gia' rotto», perche' quell'ipotesi si
+/// regge su un'ASSENZA (nessun file localizzato) e un'assenza non batte una
+/// prova; "non misurato" viene per ULTIMO fra i casi negativi, cosi' non puo'
+/// assorbire un caso che qualcuno aveva gia' misurato.
+///
+/// ROOT CAUSE dell'ordine attuale: `preexisting_bootstrap` arrivava qui GIA'
+/// composto dal chiamante, che lo costruiva con `error_files.is_empty()` —
+/// mentre il doc di `build_error_files` (final_gate.rs) dichiara: «un set VUOTO
+/// significa "nessuna localizzazione ricavabile" (formato non coperto o output
+/// pulito) — il chiamante NON deve dedurne "nessun errore"... ma ricadere sul
+/// criterio assoluto (fail-closed)». Il ramo assolveva PRIMA di guardare
+/// `build_errors`, quindi un criterio con 3 errori di build provati usciva
+/// `Passed` — comportamento che un test fissava perfino come atteso.
+///
+/// Ora i due fatti arrivano separati e l'ipotesi si compone QUI, dove la prova
+/// e' visibile: un output che non attribuisce errori a un file puo' significare
+/// «pulito» o «non so leggerlo», e nel dubbio non si assolve niente che il
+/// conteggio degli errori abbia gia' provato.
 fn verdetto_del_comando(f: FattiDelComando) -> CriterionOutcome {
     if f.delta_applicable {
         // Chiude se il task non ha lasciato errori nei file che ha toccato,
@@ -1194,13 +1237,17 @@ fn verdetto_del_comando(f: FattiDelComando) -> CriterionOutcome {
         // anche senza exit code: l'output ha localizzato gli errori.
         return CriterionOutcome::measured(!f.regression);
     }
-    if f.preexisting_bootstrap {
-        return CriterionOutcome::Passed;
-    }
     if f.build_errors > 0 {
         // L'output PROVA errori di build: misura valida a prescindere
-        // dall'exit code.
+        // dall'exit code, e a prescindere da come stava l'ambiente prima.
         return CriterionOutcome::Failed;
+    }
+    // Ipotesi «l'ambiente era gia' cosi'»: si compone solo ORA, cioe' dopo aver
+    // escluso gli errori provati. Pretende ENTRAMBI i fatti — stesso esito della
+    // baseline E nessuna localizzazione — perche' il secondo da solo non
+    // distingue un progetto pulito da un formato che non sappiamo leggere.
+    if f.stesso_esito_della_baseline && f.nessuna_localizzazione {
+        return CriterionOutcome::Passed;
     }
     if !f.esito_misurato {
         // Nessun exit code, nessuna dichiarazione di fallimento, nessun errore
@@ -1227,7 +1274,8 @@ mod verdetto_del_comando_tests {
         FattiDelComando {
             delta_applicable: false,
             regression: false,
-            preexisting_bootstrap: false,
+            nessuna_localizzazione: false,
+            stesso_esito_della_baseline: false,
             build_errors: 0,
             esito_misurato: true,
             exit_ok: true,
@@ -1243,10 +1291,15 @@ mod verdetto_del_comando_tests {
     /// assolve un build rotto solo perche' il processo non ha reso un exit code.
     #[test]
     fn la_precedenza_fra_i_rami_e_il_contratto() {
+        // Il delta pretende errori LOCALIZZATI, il bootstrap pretende che non
+        // ce ne siano: la vecchia fixture li accendeva insieme, fissando una
+        // precedenza fra due rami che il produttore non puo' emettere insieme
+        // (regola O). Qui la precedenza si misura su cio' che e' costruibile:
+        // delta applicabile e stesso esito della baseline.
         let delta_vince = FattiDelComando {
             delta_applicable: true,
             regression: false,
-            preexisting_bootstrap: true,
+            stesso_esito_della_baseline: true,
             exit_ok: false,
             ..fatti()
         };
@@ -1256,16 +1309,52 @@ mod verdetto_del_comando_tests {
             "il delta sui file toccati e' la misura piu' fine: precede il bootstrap"
         );
 
-        let bootstrap_vince = FattiDelComando {
-            preexisting_bootstrap: true,
+        // LA PRECEDENZA CORRETTA, che prima era fissata al contrario: una PROVA
+        // (build_errors) batte un'IPOTESI che si regge su un'assenza (nessuna
+        // localizzazione). Il vecchio test pretendeva `Passed` con 3 errori di
+        // build provati, cioe' fissava il fail-open come contratto.
+        //
+        // MUTAZIONE: rimettere il ramo bootstrap sopra `build_errors > 0` fa
+        // tornare `Passed` e rosseggiare — col valore del difetto reale.
+        let prova_batte_ipotesi = FattiDelComando {
+            stesso_esito_della_baseline: true,
+            nessuna_localizzazione: true,
             build_errors: 3,
             exit_ok: false,
             ..fatti()
         };
         assert_eq!(
-            verdetto_del_comando(bootstrap_vince),
+            verdetto_del_comando(prova_batte_ipotesi),
+            CriterionOutcome::Failed,
+            "3 errori di build PROVATI non si assolvono perche' l'output non li ha attribuiti a un file"
+        );
+
+        // Senza errori provati, l'ipotesi regge: e' il caso legittimo per cui il
+        // ramo esiste (config del tool assente da prima del run).
+        let bootstrap_legittimo = FattiDelComando {
+            stesso_esito_della_baseline: true,
+            nessuna_localizzazione: true,
+            exit_ok: false,
+            ..fatti()
+        };
+        assert_eq!(
+            verdetto_del_comando(bootstrap_legittimo),
             CriterionOutcome::Passed,
-            "un ambiente gia' rotto prima del run non diventa colpa del run"
+            "un ambiente gia' rotto prima del run, senza errori provati, non diventa colpa del run"
+        );
+
+        // E i due fatti servono ENTRAMBI: la sola assenza di localizzazione non
+        // assolve, o un formato che non sappiamo leggere diventerebbe un
+        // lasciapassare.
+        let solo_assenza = FattiDelComando {
+            nessuna_localizzazione: true,
+            exit_ok: false,
+            ..fatti()
+        };
+        assert_eq!(
+            verdetto_del_comando(solo_assenza),
+            CriterionOutcome::Failed,
+            "senza la baseline che lo confermi, un output non localizzato non assolve"
         );
 
         let build_batte_il_non_misurato = FattiDelComando {
@@ -1334,12 +1423,12 @@ mod verdetto_suite_tests {
     /// difetto misurato il 31/07/2026.
     #[test]
     fn flaky_non_boccia_il_criterio_e_lo_dichiara() {
-        let (passed, ev) = FinalGateCriteriaRunnerAdapter::evidenza_suite(
+        let (esito, ev) = FinalGateCriteriaRunnerAdapter::evidenza_suite(
             "npx playwright test",
             Ok(verifica(SuiteOutcome::Flaky, Some(1))),
             None,
         );
-        assert!(passed);
+        assert_eq!(esito, CriterionOutcome::Passed);
         assert_eq!(ev["suite_outcome"], json!("flaky"));
         assert_eq!(ev["flaky_tests"][0], json!("e2e/home.spec.ts:5:3"));
     }
@@ -1347,12 +1436,12 @@ mod verdetto_suite_tests {
     /// Un fallimento riprodotto boccia, come prima.
     #[test]
     fn tests_failed_boccia_il_criterio() {
-        let (passed, ev) = FinalGateCriteriaRunnerAdapter::evidenza_suite(
+        let (esito, ev) = FinalGateCriteriaRunnerAdapter::evidenza_suite(
             "npx playwright test",
             Ok(verifica(SuiteOutcome::TestsFailed, Some(1))),
             None,
         );
-        assert!(!passed);
+        assert_eq!(esito, CriterionOutcome::Failed);
         assert_eq!(ev["suite_outcome"], json!("tests_failed"));
     }
 
@@ -1362,12 +1451,12 @@ mod verdetto_suite_tests {
     /// introdotto proprio la bocciatura che il gate delta-aware evita.
     #[test]
     fn fallimento_identico_alla_baseline_non_boccia() {
-        let (passed, ev) = FinalGateCriteriaRunnerAdapter::evidenza_suite(
+        let (esito, ev) = FinalGateCriteriaRunnerAdapter::evidenza_suite(
             "npx playwright test",
             Ok(verifica(SuiteOutcome::TestsFailed, Some(1))),
             Some(1),
         );
-        assert!(passed);
+        assert_eq!(esito, CriterionOutcome::Passed);
         assert_eq!(ev["preexisting_bootstrap"], json!(true));
         assert!(ev["verdict"].as_str().unwrap().contains("pre-lavoro"));
     }
@@ -1375,25 +1464,41 @@ mod verdetto_suite_tests {
     /// Baseline VERDE: il run ha rotto la suite, e va bocciato.
     #[test]
     fn baseline_verde_e_suite_rossa_boccia() {
-        let (passed, _) = FinalGateCriteriaRunnerAdapter::evidenza_suite(
+        let (esito, _) = FinalGateCriteriaRunnerAdapter::evidenza_suite(
             "npx playwright test",
             Ok(verifica(SuiteOutcome::TestsFailed, Some(1))),
             Some(0),
         );
-        assert!(!passed);
+        assert_eq!(esito, CriterionOutcome::Failed);
     }
 
-    /// Una verifica che non ha prodotto esito (timeout, runner morto) fallisce
-    /// il criterio dichiarandolo: non si ripiega su una seconda esecuzione.
+    /// Una verifica che non ha prodotto esito (timeout, runner morto, DB del
+    /// progetto assente, radice non risolvibile) NON boccia il criterio: e' un
+    /// guasto dell'ESECUZIONE, non una misura del codice.
+    ///
+    /// Prima usciva `Failed`, e il gate bocciava codice che nessuno aveva
+    /// provato — il difetto non stava nel giudizio ma nella firma: `evidenza_suite`
+    /// ritornava `(bool, Value)`, e in un bool il «non lo so» non ha un posto
+    /// dove stare. Il ramo gemello `check_run_command`, venticinque righe piu'
+    /// sotto, gestiva gia' lo stesso caso come `Inconclusive`.
+    ///
+    /// MUTAZIONE: rimettere `CriterionOutcome::measured(false)` sul ramo `Err`
+    /// fa tornare `Failed` e rosseggiare — col valore del difetto reale.
     #[test]
-    fn verifica_non_riuscita_boccia_dichiarando() {
-        let (passed, ev) = FinalGateCriteriaRunnerAdapter::evidenza_suite(
+    fn il_guasto_della_verifica_non_boccia_il_codice() {
+        let (esito, ev) = FinalGateCriteriaRunnerAdapter::evidenza_suite(
             "npx playwright test",
             Err("Timeout dopo 600s".to_string()),
             None,
         );
-        assert!(!passed);
+        assert_eq!(
+            esito,
+            CriterionOutcome::Inconclusive,
+            "un runner morto non e' una prova di difetto del codice"
+        );
         assert!(ev["error"].as_str().unwrap().contains("Timeout"));
+        // Il motivo resta leggibile: inconcludente non vuol dire muto.
+        assert!(ev["verdict"].as_str().unwrap().contains("guasto dell'esecuzione"));
     }
 }
 

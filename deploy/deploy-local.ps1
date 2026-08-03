@@ -288,11 +288,18 @@ if (-not $NoRestart) {
     # sui servizi inesistenti e nessuno riavviava i processi (incidente
     # 2026-07-19). dev-start.ps1 rispetta l'ordine (mcp-core prima, +5s) e ruota
     # i log; NON richiede admin.
-    & (Join-Path $PSScriptRoot 'dev-start.ps1')
-    if ($LASTEXITCODE -ne 0) {
-      Write-Host 'dev-start.ps1 non ha avviato lo stack: i binari sono aggiornati ma i servizi sono GIU.' -ForegroundColor Red
+    # L'esito si legge dai CAMPI che dev-start.ps1 dichiara, non da
+    # $LASTEXITCODE: quello script non chiama mai `exit`, quindi il codice letto
+    # qui era il residuo dell'ultimo comando nativo (una `cargo` andata bene) e
+    # la diagnosi «stack riavviato» / «servizi GIU'» usciva a sorte. Stesso
+    # canale gia' usato per Publish-NexusArtifacts qui sopra.
+    $avvio = & (Join-Path $PSScriptRoot 'dev-start.ps1') | Select-Object -Last 1
+    if (-not $avvio -or -not $avvio.PSObject.Properties['Completo']) {
+      Write-Host 'dev-start.ps1 non ha dichiarato un esito: impossibile sapere se lo stack e su.' -ForegroundColor Red
+    } elseif (-not $avvio.Completo) {
+      Write-Host ("dev-start.ps1 ha avviato {0}/{1} processi: i binari sono aggiornati ma parte dello stack e GIU. Log: {2}" -f $avvio.Avviati, $avvio.Attesi, $avvio.LogDir) -ForegroundColor Red
     } else {
-      Write-Host '== stack riavviato (processi) ==' -ForegroundColor Green
+      Write-Host ("== stack riavviato ({0}/{1} processi) ==" -f $avvio.Avviati, $avvio.Attesi) -ForegroundColor Green
     }
   } else {
     if ($doRust) { Start-Service nexus-mcp-core -ErrorAction Continue; Start-Sleep -Seconds 5; foreach ($s in $rustSvc | Where-Object { $_ -ne 'nexus-mcp-core' }) { Start-Service $s -ErrorAction Continue } }
