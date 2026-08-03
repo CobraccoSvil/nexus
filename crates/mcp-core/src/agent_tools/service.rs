@@ -530,6 +530,18 @@ async fn resolve_service_launch(
     // La conseguenza sulla classificazione la dichiara l'identita' stessa
     // (`classifica`), non il chiamante: un `kind='service'` senza identita' non
     // e' un servizio di progetto e viene declassato come il one-shot qui sopra.
+    // Slug del progetto dai due punti unici (nome in `projects` ->
+    // `project_service_slug`), lo STESSO da cui nasce il nome unit: serve a
+    // riconoscere una label che ripete il progetto. Se il nome non e' leggibile
+    // resta `None` e il riconoscimento si regge sul solo suffisso `.service`.
+    let slug = sqlx::query_scalar::<_, String>("SELECT name FROM projects WHERE id = $1")
+        .bind(ctx.project_id)
+        .fetch_optional(ctx.db.as_ref())
+        .await
+        .ok()
+        .flatten()
+        .map(|nome| crate::project_workspace::services::project_service_slug(&nome));
+
     let (kind, label) = resolve_service_label(
         input,
         &command,
@@ -537,6 +549,7 @@ async fn resolve_service_launch(
         &ctx.root_path,
         &work_dir,
         ctx.project_id,
+        slug,
     )
     .classifica(kind);
 
@@ -634,13 +647,29 @@ fn resolve_service_label(
     root: &std::path::Path,
     work_dir: &std::path::Path,
     project_id: uuid::Uuid,
+    // `slug`: quando il chiamante ce l'ha, serve a riconoscere una label che
+    // RIPETE il nome del progetto (l'altra traccia del valore derivato). `None`
+    // non indebolisce il criterio principale — il suffisso `.service` si
+    // riconosce da solo — ma lascia passare la forma `{slug}-{ruolo}` senza
+    // suffisso.
+    slug: Option<String>,
 ) -> ServiceIdentity {
     let explicit_label = input
         .get("label")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .filter(|s| !crate::agent_processes::is_generic_service_label(s));
+        .filter(|s| !crate::agent_processes::is_generic_service_label(s))
+        // Una label che e' gia' un nome unit non e' un'identita' nuova: e' il
+        // valore DERIVATO da un'identita' precedente, riproposto come se fosse
+        // primitivo. Accettarlo chiude il ciclo che si autoalimenta (il
+        // riconoscimento e la sua misura stanno accanto al produttore,
+        // `services::e_nome_unit_derivato`). Si SCARTA, non si ripulisce: la
+        // vera identita' la dicono i segnali sotto — comando, scopo, percorso —
+        // che sono fatti, mentre una label ripulita sarebbe un'ipotesi.
+        .filter(|s| {
+            !crate::project_workspace::services::e_nome_unit_derivato(s, slug.as_deref())
+        });
     if let Some(label) = explicit_label {
         return ServiceIdentity::Ruolo(label.to_string());
     }
@@ -667,12 +696,22 @@ fn resolve_service_label(
     // un comando qualunque arrivato qui con `background=true`) l'assenza di
     // identita' e' la risposta giusta, non un problema da aggirare.
     if looks_like_web_service(command) {
-        return ServiceIdentity::SoloAncoraggio(format!(
-            "service-{}",
-            &project_id.simple().to_string()[..8]
-        ));
+        return ServiceIdentity::SoloAncoraggio(label_di_solo_ancoraggio(project_id));
     }
     ServiceIdentity::NonServizio
+}
+
+/// PUNTO UNICO (regola L) della label di SOLO ANCORAGGIO: il nome che nasce
+/// quando nessun segnale dice il ruolo ma il comando avvia un server.
+///
+/// Estratta perche' ha un secondo interrogante oltre al produttore: il censimento
+/// del registro porte (ADR 0042, P0(b)) deve saper riconoscere le righe nate da
+/// questa via, e riconoscerle CONFRONTANDOLE con cio' che il produttore
+/// emetterebbe per quel progetto — non con una regex che ne indovina la forma.
+/// Due formule separate divergerebbero al primo cambio di taglio dell'uuid, e il
+/// censimento direbbe "nessuna identita' di ripiego" su un parco pieno.
+pub(crate) fn label_di_solo_ancoraggio(project_id: uuid::Uuid) -> String {
+    format!("service-{}", &project_id.simple().to_string()[..8])
 }
 
 /// Identita' derivata dal PERCORSO: nome della cartella da cui il servizio gira,
@@ -1939,11 +1978,105 @@ mod tests {
     ) -> (String, String, String) {
         let command = input["command"].as_str().unwrap_or_default().to_string();
         let work_dir = resolve_service_work_dir(root, input).expect("working dir risolta");
-        let (kind, label) =
-            resolve_service_label(input, &command, kind, root, &work_dir, id("1a2b3c4d"))
-                .classifica(kind);
-        let unit = service_unit_name(&project_service_slug(nome_progetto), &label);
+        // Lo slug lo passa il PRODUTTORE, come in produzione: e' lo stesso da
+        // cui nasce l'unit sotto, quindi il test non puo' misurare uno slug
+        // diverso da quello con cui il riconoscimento del derivato lavora.
+        let slug = project_service_slug(nome_progetto);
+        let (kind, label) = resolve_service_label(
+            input,
+            &command,
+            kind,
+            root,
+            &work_dir,
+            id("1a2b3c4d"),
+            Some(slug.clone()),
+        )
+        .classifica(kind);
+        let unit = service_unit_name(&slug, &label);
         (label, unit, kind)
+    }
+
+    /// LA CATENA VERA, riprodotta: il valore che il registro consegnava
+    /// all'agente rientra come identita' e il ciclo si autoalimenta.
+    ///
+    /// Misurato su DUE progetti indipendenti (agenda-corsi 02/08 22:35, 76
+    /// secondi dopo aver letto `nexus_list_ports`; bacheca-attivita 30/07
+    /// 05:36, 47 secondi dopo): il modello copia `service_unit` dentro `label`,
+    /// `service_unit_name` antepone di nuovo lo slug, e l'unit successiva se lo
+    /// ripete dentro. Sul parco misurato, 10 righe su 26 avevano per label un
+    /// nome gia' derivato, fino alla TERZA generazione.
+    ///
+    /// Il test parte dal PRODUTTORE (`service_unit_name`), non da una stringa
+    /// scritta a mano: e' esattamente il valore che l'agente aveva in mano
+    /// (regola O). Se un domani il formato dell'unit cambia, questo test lo
+    /// segue invece di misurare una forma fossile.
+    ///
+    /// MUTAZIONE: togliere il filtro `e_nome_unit_derivato` da
+    /// `resolve_service_label` fa passare la label derivata e l'unit diventa
+    /// `agenda-corsi-agenda-corsi-Backend API (Express).service.service`, che e'
+    /// la riga misurata in `nexus_port_allocations`.
+    #[test]
+    fn il_nome_unit_riproposto_come_label_non_diventa_identita() {
+        let (_tmp, root) = progetto("agenda-corsi", &["backend"]);
+        let slug = project_service_slug("agenda-corsi");
+
+        // Il giro 1: l'identita' vera, e cio' che il registro ne derivava.
+        let unit_del_giro_1 = service_unit_name(&slug, "Backend API (Express)");
+        assert_eq!(unit_del_giro_1, "agenda-corsi-Backend API (Express).service");
+
+        // Il giro 2: l'agente ripropone quel valore come label.
+        let input = json!({
+            "command": "npm run dev",
+            "working_dir": "backend",
+            "label": unit_del_giro_1,
+        });
+        let (label, unit, kind) = identita("agenda-corsi", &root, &input, "service");
+
+        assert_ne!(
+            label, unit_del_giro_1,
+            "un nome unit non e' un'identita' nuova: e' il derivato di una precedente"
+        );
+        assert_eq!(
+            label, "backend",
+            "scartata la label derivata, l'identita' la dicono i fatti (comando + cartella)"
+        );
+        assert_eq!(unit, "agenda-corsi-backend.service", "niente slug ripetuto");
+        assert_eq!(kind, "service");
+    }
+
+    /// L'altra traccia del derivato: la label che RIPETE lo slug, senza il
+    /// suffisso `.service`. E' la forma di seconda generazione misurata su
+    /// gestione-spese (`gestione-spese-gestione-spese-backend`).
+    #[test]
+    fn la_label_che_ripete_il_progetto_non_diventa_identita() {
+        let (_tmp, root) = progetto("gestione-spese", &["backend"]);
+        let input = json!({
+            "command": "npm start",
+            "working_dir": "backend",
+            "label": "gestione-spese-backend",
+        });
+        let (label, unit, _) = identita("Gestione Spese", &root, &input, "service");
+        assert_eq!(label, "backend");
+        assert_eq!(unit, "gestione-spese-backend.service");
+    }
+
+    /// Il criterio non e' un divieto sul TESTO: una label legittima che contenga
+    /// per caso la parola del progetto in mezzo, o un ruolo dal nome lungo, deve
+    /// passare. Si rifiuta solo cio' che il produttore emette DAVVERO: suffisso
+    /// `.service`, o prefisso `{slug}-`.
+    #[test]
+    fn una_label_legittima_non_viene_scartata() {
+        let (_tmp, root) = progetto("agenda-corsi", &["backend"]);
+        let input = json!({
+            "command": "npm run dev",
+            "working_dir": "backend",
+            "label": "api-agenda-corsi-v2",
+        });
+        let (label, _, _) = identita("agenda-corsi", &root, &input, "service");
+        assert_eq!(
+            label, "api-agenda-corsi-v2",
+            "il progetto nominato in MEZZO non fa di una label un valore derivato"
+        );
     }
 
     /// REGRESSIONE (caso reale, progetto gestione-spese): il backend girava con

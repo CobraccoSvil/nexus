@@ -315,6 +315,59 @@ pub(crate) fn service_unit_name(slug: &str, label: &str) -> String {
     format!("{slug}-{label}.service")
 }
 
+/// `true` se `candidato` e' un nome gia' PRODOTTO da [`service_unit_name`],
+/// cioe' un valore derivato che qualcuno sta riproponendo come se fosse una
+/// label primitiva.
+///
+/// Vive QUI, accanto al produttore, per la stessa ragione per cui ci vive
+/// l'inverso: riconoscere cio' che una funzione emette e' una domanda che si
+/// pone a quella funzione. Una regex ricopiata in un altro modulo divergerebbe
+/// al primo cambio di formato dell'unit, e il riconoscimento smetterebbe di
+/// funzionare senza che nulla fallisse.
+///
+/// ROOT CAUSE che l'ha resa necessaria, misurata il 02-03/08/2026 su DUE
+/// progetti indipendenti: `nexus_list_ports` consegnava all'agente
+/// `service_unit` come fratello di `label` nello stesso oggetto JSON, e nulla
+/// nel tipo distingueva il derivato dal primitivo. Su agenda-corsi il modello ha
+/// copiato `service_unit` dentro `label` 76 secondi dopo averlo letto; su
+/// bacheca-attivita, tre giorni prima, 47 secondi dopo. Da li' il ciclo si
+/// autoalimenta: `service_unit_name` antepone di nuovo lo slug, l'unit
+/// successiva se lo ripete dentro, e l'output del giro N e' l'input del giro
+/// N+1 — misurate 10 righe su 26 con label gia' derivata, fino alla TERZA
+/// generazione (`gestione-spese-gestione-spese-backend`).
+///
+/// Due criteri, perche' il produttore lascia due tracce:
+///   - il suffisso `.service`, che e' la firma inconfondibile dell'unit e non
+///     appartiene a nessuna label legittima;
+///   - il prefisso `{slug}-`, quando lo slug e' noto: la label e' per
+///     costruzione la parte che distingue un servizio dall'altro DENTRO il
+///     progetto, quindi ripetervi il nome del progetto non aggiunge nulla (e' lo
+///     stesso motivo per cui il nome della cartella di progetto non e' un
+///     candidato in `resolve_service_label`).
+///
+/// NON e' una normalizzazione: chi la usa RIFIUTA il candidato, non lo ripulisce.
+/// Ripulirlo in silenzio lascerebbe due strade per la stessa identita' e
+/// riaprirebbe l'ambiguita' che questo riconoscimento serve a chiudere.
+pub(crate) fn e_nome_unit_derivato(candidato: &str, slug: Option<&str>) -> bool {
+    let c = candidato.trim();
+    if c.is_empty() {
+        return false;
+    }
+    if c.to_ascii_lowercase().ends_with(".service") {
+        return true;
+    }
+    match slug {
+        // Il confronto e' case-insensitive perche' lo slug nasce da
+        // `project_service_slug`, che gia' abbassa il caso: una label che
+        // ripete il progetto con altre maiuscole e' lo stesso valore derivato.
+        Some(s) if !s.trim().is_empty() => {
+            let prefisso = format!("{}-", s.trim().to_ascii_lowercase());
+            c.to_ascii_lowercase().starts_with(&prefisso)
+        }
+        _ => false,
+    }
+}
+
 /// Nome unit di un servizio per chi ha in mano solo il `project_id` (i tool
 /// agente): legge il NOME del progetto e passa dai due punti unici
 /// `project_service_slug` + `service_unit_name`, cosi' l'unit a cui viene legata

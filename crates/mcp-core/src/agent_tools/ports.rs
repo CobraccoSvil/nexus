@@ -91,11 +91,26 @@ pub async fn tool_nexus_list_ports(ctx: &AgentToolContext, _input: &Value) -> St
         Ok(rows) => rows
             .into_iter()
             .map(|r| {
+                // `service_unit` NON esce piu' accanto a `label`.
+                //
+                // E' un valore DERIVATO (`service_unit_name` = `{slug}-{label}.service`)
+                // e stava nello stesso oggetto dell'identificatore primitivo,
+                // senza nulla che li distinguesse. Misurato su DUE progetti
+                // indipendenti: il modello lo ha copiato dentro `label` alla
+                // chiamata seguente (agenda-corsi a 76 secondi, bacheca-attivita
+                // a 47 tre giorni prima), e da li' il ciclo si autoalimenta —
+                // 10 righe su 26 con label gia' derivata, fino alla terza
+                // generazione. Il difetto non era la disattenzione del modello:
+                // era offrirgli due stringhe intercambiabili e chiamarne una
+                // sola "identita'".
+                //
+                // Chi ha bisogno del nome unit lo RICOSTRUISCE dal punto unico a
+                // partire da label e slug; qui non serve a nessuna decisione che
+                // l'agente debba prendere.
                 json!({
                     "port": r.try_get::<i32, _>("port").unwrap_or(0),
                     "label": r.try_get::<String, _>("label").unwrap_or_default(),
                     "allocation_mode": r.try_get::<String, _>("allocation_mode").unwrap_or_default(),
-                    "service_unit": r.try_get::<Option<String>, _>("service_unit").ok().flatten(),
                     "created_at": r
                         .try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")
                         .map(|t| t.to_rfc3339())
