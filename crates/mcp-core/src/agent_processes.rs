@@ -25,40 +25,122 @@ pub fn kind_for_run_config_role(role: Option<&str>) -> &'static str {
 /// di similarita' tra label.
 const GENERIC_SERVICE_WORDS: &[&str] = &["service", "server", "run", "dev", "start", "app"];
 
-/// Parole significative di una label servizio: lowercase, split su spazi,
-/// trattini, underscore e punti ("frontend-dev" -> {"frontend"}), escluse le
-/// parole generiche e quelle troppo corte.
-fn significant_service_words(label: &str) -> std::collections::HashSet<String> {
-    label
+/// Parole del contesto in cui le label si confrontano, che percio' NON
+/// distinguono un servizio dall'altro.
+///
+/// Oggi contiene i token dello slug di progetto. Il nome del progetto e' vero
+/// per ogni servizio che ci vive dentro, esattamente come "service" o "server":
+/// e' la stessa ragione per cui quelle stanno in [`GENERIC_SERVICE_WORDS`], e
+/// per cui `resolve_service_label` rifiuta il nome della cartella di progetto
+/// come identita'.
+///
+/// ROOT CAUSE, misurata il 03/08/2026 su agenda-corsi: con label che portavano
+/// lo slug (`agenda-corsi-frontend.service` e
+/// `agenda-corsi-agenda-corsi-Backend API (Express).service`) l'intersezione
+/// delle parole significative era `{agenda, corsi}` — non vuota — quindi
+/// `similar_service_labels` diceva SI'. Alle 01:04:18 un `service_restart` sul
+/// FRONTEND ha fermato anche il backend (pid 15016, stopped_at 01:04:22), e da
+/// quel momento nel bucket e' rimasto un solo listener. Una sola dedup, due
+/// servizi diversi fermati.
+///
+/// Vuoto quando il contesto non e' noto: il degrado e' dichiarato e vale il
+/// criterio di prima, mai un'invenzione.
+#[derive(Debug, Clone, Default)]
+pub struct ContestoProgetto {
+    ignorate: std::collections::HashSet<String>,
+}
+
+impl ContestoProgetto {
+    /// Dal nome o slug del progetto: i suoi token diventano non distintivi.
+    pub fn dallo_slug(slug: &str) -> Self {
+        Self {
+            ignorate: spezza_in_parole(slug).collect(),
+        }
+    }
+
+    /// Nessun contesto noto: il confronto resta quello storico. Esiste come
+    /// costruttore NOMINATO, non come `Default` implicito, perche' un chiamante
+    /// che non ha lo slug lo stia dichiarando invece di lasciarlo intendere.
+    pub fn ignoto() -> Self {
+        Self::default()
+    }
+
+    fn e_ignorata(&self, parola: &str) -> bool {
+        self.ignorate.contains(parola)
+    }
+}
+
+/// Spezzettamento canonico di una label in parole: lowercase, split su spazi,
+/// trattini, underscore e punti. Non filtra: il filtro e' di chi la usa.
+fn spezza_in_parole(testo: &str) -> impl Iterator<Item = String> + '_ {
+    testo
         .to_lowercase()
         .split(|c: char| c.is_whitespace() || c == '-' || c == '_' || c == '.')
-        .filter(|w| w.len() > 2 && !GENERIC_SERVICE_WORDS.contains(w))
+        .filter(|w| w.len() > 2)
         .map(String::from)
+        .collect::<Vec<_>>()
+        .into_iter()
+}
+
+/// Parole significative di una label servizio: lowercase, split su spazi,
+/// trattini, underscore e punti ("frontend-dev" -> {"frontend"}), escluse le
+/// parole generiche, quelle del contesto di progetto e quelle troppo corte.
+fn significant_service_words(
+    label: &str,
+    contesto: &ContestoProgetto,
+) -> std::collections::HashSet<String> {
+    spezza_in_parole(label)
+        .filter(|w| !GENERIC_SERVICE_WORDS.contains(&w.as_str()))
+        .filter(|w| !contesto.e_ignorata(w))
         .collect()
 }
 
 /// Una label e' generica quando non ha nessuna parola significativa
 /// ("Service", "server", "dev-server"): non identifica uno scopo e non deve
 /// diventare una voce autonoma del pannello Servizi.
+///
+/// Col contesto di progetto lo diventa anche una label fatta del solo nome del
+/// progetto (`agenda-corsi` dentro agenda-corsi): non dice quale servizio sia,
+/// ed e' cio' che `resolve_service_label` gia' rifiuta quando la deriva.
+pub fn is_generic_service_label_in(label: &str, contesto: &ContestoProgetto) -> bool {
+    significant_service_words(label, contesto).is_empty()
+}
+
+/// Come [`is_generic_service_label_in`] senza contesto di progetto noto.
 pub fn is_generic_service_label(label: &str) -> bool {
-    significant_service_words(label).is_empty()
+    is_generic_service_label_in(label, &ContestoProgetto::ignoto())
 }
 
 /// PUNTO UNICO (regola L): due label indicano lo stesso servizio di progetto?
 /// Match esatto case-insensitive oppure almeno una parola significativa in
 /// comune ("frontend-dev" ~ "frontend", "Backend API" ~ "backend").
-pub fn similar_service_labels(a: &str, b: &str) -> bool {
+///
+/// Il contesto e' un parametro e non un filtro del chiamante: filtrare lo slug
+/// prima di chiamare lascerebbe `service_ownership` a rispondere alla stessa
+/// domanda con l'altro criterio, cioe' ricreerebbe la doppia risposta.
+pub fn similar_service_labels_in(a: &str, b: &str, contesto: &ContestoProgetto) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
-        || !significant_service_words(a).is_disjoint(&significant_service_words(b))
+        || !significant_service_words(a, contesto)
+            .is_disjoint(&significant_service_words(b, contesto))
+}
+
+/// Come [`similar_service_labels_in`] senza contesto di progetto noto.
+pub fn similar_service_labels(a: &str, b: &str) -> bool {
+    similar_service_labels_in(a, b, &ContestoProgetto::ignoto())
 }
 
 /// PUNTO UNICO (regola L): numero di parole significative in comune tra due
 /// label. Serve a disambiguare in modo DETERMINISTICO un match ambiguo
 /// (preferire il candidato che condivide piu' scopo con la label di riferimento).
-pub fn shared_significant_words(a: &str, b: &str) -> usize {
-    significant_service_words(a)
-        .intersection(&significant_service_words(b))
+pub fn shared_significant_words_in(a: &str, b: &str, contesto: &ContestoProgetto) -> usize {
+    significant_service_words(a, contesto)
+        .intersection(&significant_service_words(b, contesto))
         .count()
+}
+
+/// Come [`shared_significant_words_in`] senza contesto di progetto noto.
+pub fn shared_significant_words(a: &str, b: &str) -> usize {
+    shared_significant_words_in(a, b, &ContestoProgetto::ignoto())
 }
 
 /// PUNTO UNICO (regola L): ferma i processi `kind='service'` running/starting
@@ -98,9 +180,35 @@ pub async fn stop_similar_running_services(
     .await
     .unwrap_or_default();
 
+    // Il contesto dice quali parole NON distinguono un servizio dall'altro
+    // DENTRO questo progetto. Senza, il nome del progetto presente in due label
+    // le rendeva "simili" e una sola dedup ne fermava due (misurato il
+    // 03/08/2026: un restart del frontend ha fermato il backend). Lo slug viene
+    // dal punto unico che lo produce, non da una manipolazione locale del nome.
+    let contesto = match sqlx::query_scalar::<_, String>("SELECT name FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_optional(db)
+        .await
+    {
+        Ok(Some(nome)) => ContestoProgetto::dallo_slug(
+            &crate::project_workspace::services::project_service_slug(&nome),
+        ),
+        // Nome non leggibile: il criterio degrada a quello storico e lo
+        // dichiara. Meglio una dedup piu' larga di una dedup che non avviene:
+        // il duplicato vivo e' il difetto che questa funzione esiste per
+        // togliere.
+        _ => {
+            tracing::warn!(
+                project_id = %project_id,
+                "dedup servizi: nome progetto non leggibile, confronto label senza contesto"
+            );
+            ContestoProgetto::ignoto()
+        }
+    };
+
     let mut stopped = Vec::new();
     for (id, other) in rows {
-        if similar_service_labels(label, &other) {
+        if similar_service_labels_in(label, &other, &contesto) {
             tracing::info!(
                 old_label = %other,
                 new_label = %label,
@@ -707,8 +815,9 @@ pub struct ProcessSummary {
 #[cfg(test)]
 mod tests {
     use super::{
-        direct_spawn_env, is_generic_service_label, kind_for_run_config_role,
-        similar_service_labels,
+        direct_spawn_env, is_generic_service_label, is_generic_service_label_in,
+        kind_for_run_config_role, similar_service_labels, similar_service_labels_in,
+        ContestoProgetto,
     };
     use std::collections::HashMap;
 
@@ -750,6 +859,59 @@ mod tests {
                 r"C:\Users\x\AppData\Roaming".to_string(),
             ),
         ]
+    }
+
+    /// LO STOP SBAGLIATO, riprodotto coi valori misurati il 03/08/2026 su
+    /// agenda-corsi: alle 01:04:18 un `service_restart` sul FRONTEND ha fermato
+    /// anche il backend (pid 15016, stopped_at 01:04:22), perche' le due label
+    /// portavano entrambe il nome del progetto e l'intersezione delle parole
+    /// significative era `{agenda, corsi}` — non vuota, quindi "stesso
+    /// servizio". Da quel momento nel bucket 26500-26599 e' rimasto un solo
+    /// listener.
+    ///
+    /// MUTAZIONE: passare `ContestoProgetto::ignoto()` al posto del contesto
+    /// vero fa tornare `true` alla prima asserzione, cioe' il difetto misurato.
+    #[test]
+    fn il_nome_del_progetto_non_rende_simili_due_servizi_diversi() {
+        let contesto = ContestoProgetto::dallo_slug("agenda-corsi");
+        let frontend = "agenda-corsi-frontend.service";
+        let backend = "agenda-corsi-agenda-corsi-Backend API (Express).service";
+
+        assert!(
+            !similar_service_labels_in(frontend, backend, &contesto),
+            "frontend e backend restano servizi DIVERSI dentro lo stesso progetto"
+        );
+        // Senza contesto e' il comportamento che ha fermato il servizio
+        // sbagliato: e' qui per dichiarare cosa cambia, non come approvazione.
+        assert!(
+            similar_service_labels(frontend, backend),
+            "senza contesto le due label condividono le parole del progetto"
+        );
+    }
+
+    /// Il contesto non indebolisce cio' che il criterio deve ancora vedere: due
+    /// forme dello STESSO servizio restano simili, ed e' il motivo per cui la
+    /// dedup esiste (senza, il progetto accumula due backend sulla stessa
+    /// codebase).
+    #[test]
+    fn due_forme_dello_stesso_servizio_restano_simili() {
+        let contesto = ContestoProgetto::dallo_slug("agenda-corsi");
+        assert!(similar_service_labels_in("frontend", "frontend-dev", &contesto));
+        assert!(similar_service_labels_in("Backend API", "backend", &contesto));
+        // Match esatto: vale anche se ogni parola e' del contesto.
+        assert!(similar_service_labels_in("agenda-corsi", "agenda-corsi", &contesto));
+    }
+
+    /// Una label fatta del solo nome del progetto non dice QUALE servizio sia:
+    /// dentro quel progetto e' generica quanto "Service", ed e' la stessa cosa
+    /// che `resolve_service_label` rifiuta quando la deriverebbe.
+    #[test]
+    fn la_label_col_solo_nome_del_progetto_e_generica_dentro_il_progetto() {
+        let contesto = ContestoProgetto::dallo_slug("agenda-corsi");
+        assert!(is_generic_service_label_in("agenda-corsi", &contesto));
+        assert!(is_generic_service_label_in("agenda corsi service", &contesto));
+        // Ma un ruolo vero non lo diventa mai.
+        assert!(!is_generic_service_label_in("agenda-corsi-backend", &contesto));
     }
 
     #[test]
