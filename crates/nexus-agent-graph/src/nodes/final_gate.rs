@@ -39,7 +39,7 @@
 //!   excerpt per criterio, ramo speciale build (max_output_chars,
 //!   output_truncated, header), direttive fail-closed, prefisso `<autonomy_hint>`
 //!   se behavior_mode autonomo. Stringhe deterministiche 1:1.
-//! - **`all_passed`** (`final_gate.py:392`): `all(passed)` sui soli risultati
+//! - **`esito_criteri`** (`final_gate.py:392`): il reduce sui risultati
 //!   MISURABILI; i non misurabili non bocciano ma tolgono alla chiusura il
 //!   titolo di "verificata" (vedi [`CriterionOutcome`]).
 //!
@@ -424,6 +424,25 @@ pub fn error_file_matches_touched(error_file: &str, touched_file: &str) -> bool 
     e == t || e.ends_with(&format!("/{t}")) || t.ends_with(&format!("/{e}"))
 }
 
+/// Esito dei criteri di verifica, in un tipo che porta anche i BUCHI.
+///
+/// Tre casi e non due, perche' «nessuno ha bocciato» e «tutti hanno passato»
+/// sono affermazioni diverse: la prima e' vera anche quando non si e' misurato
+/// nulla. Un `bool` le confonde, ed e' cosi' che gate generali tutti
+/// inconcludenti chiudevano un todo come `Completed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EsitoCriteri {
+    /// Almeno un criterio misurato, nessuno bocciato, nessun buco.
+    Superato,
+    /// Nessun criterio bocciato, ma la verifica ha dei buchi: criteri
+    /// inconcludenti, o nessun criterio misurabile affatto. Non e' una prova di
+    /// difetto (non boccia) e non e' una prova di correttezza: chi chiude su
+    /// questo lo fa sapendo che la chiusura non e' VERIFICATA.
+    SuperatoNonVerificato { inconclusive: usize },
+    /// Almeno un criterio misurato ha fallito.
+    Fallito,
+}
+
 /// Nodo final_gate. Stateless: legge lo stato + la config passata + la
 /// `RoutingConfig` (per `is_software_task`/lista mutator). I criteri sono
 /// eseguiti dietro il trait [`crate::runtime::ports::CriteriaRunner`], iniettato
@@ -686,28 +705,40 @@ impl FinalGateNode {
         criteria
     }
 
-    /// `all_passed` reduce (`final_gate.py:392`): tutti i criteri MISURABILI
-    /// sono passati?
+    /// Il reduce sui criteri, in UNA risposta che porta anche i buchi.
     ///
-    /// Converge col gemello [`crate::nodes::verifier`], che gia' escludeva gli
-    /// inconcludenti dal conteggio: un criterio non misurabile non e' una prova
-    /// di difetto, quindi non boccia. Non e' nemmeno una prova di correttezza —
-    /// quella meta' della risposta la porta [`Self::any_inconclusive`], e il
-    /// chiamante la usa per NON dichiarare verificata la chiusura.
+    /// ROOT CAUSE del tipo: la risposta viveva in DUE funzioni, `all_passed` e
+    /// `any_inconclusive`, e il doc della prima diceva «quella meta' della
+    /// risposta la porta any_inconclusive, e il chiamante la usa per NON
+    /// dichiarare verificata la chiusura». Ma una meta' si puo' dimenticare, e
+    /// `verifier::run_general_gates` la dimenticava: prendeva solo `all_passed`
+    /// e ritornava `(bool, Vec<CriterionResult>)`. Con gate generali TUTTI
+    /// inconcludenti, `all_passed` e' vero per vacuita' — quindi il ramo
+    /// fail-closed su task software chiudeva il todo come `Completed` e la riga
+    /// `nexus_agent_verifier_runs` diceva `passed: true`, senza che nessuno
+    /// avesse misurato niente.
     ///
-    /// Lista vuota (o tutti inconcludenti) -> vero per vacuita': e' il
-    /// comportamento storico del reduce, e non e' un'assoluzione perche' in quel
-    /// caso `any_inconclusive` degrada comunque la chiusura.
-    pub fn all_passed(results: &[CriterionResult]) -> bool {
-        results.iter().filter(|r| !r.inconclusive()).all(|r| r.passed())
-    }
-
-    /// Almeno un criterio NON e' stato misurabile: la verifica ha dei buchi.
-    /// Non boccia (nessuna prova di difetto) ma toglie alla chiusura il titolo
-    /// di "verificata" — stessa conseguenza gia' scelta per il profilo di
-    /// verifica assente e per le prove funzionali mai eseguite.
-    pub fn any_inconclusive(results: &[CriterionResult]) -> bool {
-        results.iter().any(|r| r.inconclusive())
+    /// Ora la risposta e' una sola e l'ignoto e' una VARIANTE (regola Q), non un
+    /// valore comodo: chi la riceve deve nominare `SuperatoNonVerificato` per
+    /// trattarlo come un successo, e a quel punto lo sta scegliendo invece di
+    /// subirlo. Niente `impl From<..> for bool` e niente `is_passed()`: sono le
+    /// proiezioni che riaprirebbero esattamente la scelta che il tipo chiude.
+    pub fn esito_criteri(results: &[CriterionResult]) -> EsitoCriteri {
+        let inconclusive = results.iter().filter(|r| r.inconclusive()).count();
+        let misurabili: Vec<&CriterionResult> =
+            results.iter().filter(|r| !r.inconclusive()).collect();
+        if misurabili.iter().any(|r| !r.passed()) {
+            return EsitoCriteri::Fallito;
+        }
+        // Nessun criterio bocciato. Se pero' non se n'e' misurato NESSUNO — lista
+        // vuota o tutti inconcludenti — il "passato" e' per vacuita' e va detto.
+        if misurabili.is_empty() {
+            return EsitoCriteri::SuperatoNonVerificato { inconclusive };
+        }
+        if inconclusive > 0 {
+            return EsitoCriteri::SuperatoNonVerificato { inconclusive };
+        }
+        EsitoCriteri::Superato
     }
 
     /// True se l'UNICO tipo di criterio fallito e' `completion_confirmed`: il
@@ -1003,12 +1034,18 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 message: format!("esecuzione criteri fallita: {e}"),
             })?;
 
-        let passed = Self::all_passed(&results);
-        // Criteri che NON si sono potuti misurare (grafo import non portato,
-        // radice del run non risolta, comando senza exit code, ...). Non
-        // bocciano — non provano nulla sul codice — ma tolgono alla chiusura il
-        // titolo di "verificata".
-        let inconclusive_n = results.iter().filter(|r| r.inconclusive()).count();
+        // L'esito porta gia' i buchi: `SuperatoNonVerificato` non boccia (non
+        // prova nulla sul codice) ma toglie alla chiusura il titolo di
+        // "verificata". Qui il ramo di chiusura resta lo stesso per entrambi i
+        // casi non-falliti — la distinzione la usa il titolo, come prima — ma
+        // ora e' il TIPO a portarla, non due letture separate che si possono
+        // disallineare.
+        let esito = Self::esito_criteri(&results);
+        let inconclusive_n = match esito {
+            EsitoCriteri::SuperatoNonVerificato { inconclusive } => inconclusive,
+            _ => 0,
+        };
+        let passed = !matches!(esito, EsitoCriteri::Fallito);
 
         // ── Ramo PASSED (final_gate.py:513-522) ───────────────────────────────
         // Chiude con esito canonico CompletedVerified lato mcp-core.
@@ -2434,14 +2471,22 @@ mod tests {
     }
 
     #[test]
-    fn all_passed_reduce() {
-        assert!(FinalGateNode::all_passed(&[ok_result("a"), ok_result("b")]));
-        assert!(!FinalGateNode::all_passed(&[
-            ok_result("a"),
-            fail_result("b", json!({}))
-        ]));
-        // Lista vuota -> all() su iterabile vuoto = true (parita' Python).
-        assert!(FinalGateNode::all_passed(&[]));
+    fn esito_criteri_reduce() {
+        assert_eq!(
+            FinalGateNode::esito_criteri(&[ok_result("a"), ok_result("b")]),
+            EsitoCriteri::Superato
+        );
+        assert_eq!(
+            FinalGateNode::esito_criteri(&[ok_result("a"), fail_result("b", json!({}))]),
+            EsitoCriteri::Fallito
+        );
+        // Lista VUOTA: non ha bocciato nessuno, ma non ha nemmeno misurato
+        // niente. Prima usciva `true` come un pass pieno (parita' col reduce
+        // Python), e da li' un todo si chiudeva Completed senza prove.
+        assert_eq!(
+            FinalGateNode::esito_criteri(&[]),
+            EsitoCriteri::SuperatoNonVerificato { inconclusive: 0 }
+        );
     }
 
     // ── Criteri NON MISURABILI ────────────────────────────────────────────────
@@ -2452,22 +2497,39 @@ mod tests {
         // difetto. Prima `all(r.passed)` lo trattava come un pass PIENO, il che
         // e' la stessa cosa solo finche' nessuno chiede "quanto e' stato
         // verificato": la seconda meta' della risposta e' `any_inconclusive`.
+        // LA PROVA del difetto chiuso: tutti inconcludenti non e' un pass
+        // pieno. Le due meta' della risposta ora sono UNA, e chi la riceve deve
+        // nominare la variante per trattarla come un successo.
+        //
+        // MUTAZIONE: far tornare `Superato` quando `misurabili.is_empty()` fa
+        // rosseggiare questa asserzione — ed e' il valore del difetto reale, per
+        // cui un todo si chiudeva `Completed` con zero criteri misurati.
         let solo_inc = [inconclusive_result("no_orphan_imported")];
-        assert!(FinalGateNode::all_passed(&solo_inc));
-        assert!(FinalGateNode::any_inconclusive(&solo_inc));
+        assert_eq!(
+            FinalGateNode::esito_criteri(&solo_inc),
+            EsitoCriteri::SuperatoNonVerificato { inconclusive: 1 },
+            "un criterio non misurabile non boccia, ma non verifica nemmeno"
+        );
 
         // E non copre un criterio davvero fallito.
         let misto = [
             inconclusive_result("no_orphan_imported"),
             fail_result("run_command", json!({})),
         ];
-        assert!(!FinalGateNode::all_passed(&misto));
+        assert_eq!(FinalGateNode::esito_criteri(&misto), EsitoCriteri::Fallito);
+
+        // Un misurato che passa INSIEME a un inconcludente: passa, ma con
+        // riserva dichiarata.
+        assert_eq!(
+            FinalGateNode::esito_criteri(&[ok_result("a"), inconclusive_result("b")]),
+            EsitoCriteri::SuperatoNonVerificato { inconclusive: 1 }
+        );
 
         // Nessun inconcludente -> nessuna riserva.
-        assert!(!FinalGateNode::any_inconclusive(&[
-            ok_result("a"),
-            fail_result("b", json!({}))
-        ]));
+        assert_eq!(
+            FinalGateNode::esito_criteri(&[ok_result("a"), fail_result("b", json!({}))]),
+            EsitoCriteri::Fallito
+        );
     }
 
     #[test]
@@ -2556,7 +2618,7 @@ mod golden {
     use serde::Deserialize;
     use serde_json::{json, Value};
 
-    use super::{count_build_errors, FinalGateNode};
+    use super::{count_build_errors, EsitoCriteri, FinalGateNode};
     use crate::routing::config::RoutingConfig;
     use crate::routing::{route_after_final_gate, signals, NodeTarget};
     use crate::runtime::ports::{CriterionOutcome, CriterionResult};
@@ -2672,7 +2734,10 @@ mod golden {
     /// confrontabile col Python (`{}` o dict). NON esegue i criteri (input).
     fn decision_delta(st: &AgentState, results: &[CriterionResult], max_cycles: i64) -> Value {
         let cycle = st.final_gate_cycle.unwrap_or(0) + 1;
-        let passed = FinalGateNode::all_passed(results);
+        let passed = !matches!(
+            FinalGateNode::esito_criteri(results),
+            EsitoCriteri::Fallito
+        );
         if passed {
             return json!({
                 "final_gate_cycle": 0,

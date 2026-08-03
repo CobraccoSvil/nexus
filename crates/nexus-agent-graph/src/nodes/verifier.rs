@@ -46,7 +46,7 @@
 //! - **`run_general_gates`** (per il ramo fail-closed, `final_gate.py:381-486`):
 //!   i criteri generali sono ESATTAMENTE quelli costruiti da
 //!   [`FinalGateNode::build_criteria`] (RIUSO, regola L: il verifier delega a quel
-//!   punto + [`FinalGateNode::all_passed`], non duplica la costruzione). Sono i 2
+//!   punto + [`FinalGateNode::esito_criteri`], non duplica la costruzione). Sono i 2
 //!   criteri sempre presenti (`no_orphan_imported` + `outputs_exist`) PIU' gli
 //!   opzionali risolti a monte nella `FinalGateConfig` (`service_logs_clean`,
 //!   `run_command`-build, `http`-endpoint): delegando a `build_criteria` il
@@ -95,7 +95,7 @@ use nexus_graph::node::{GraphNode, NodeError, NodeId};
 use nexus_graph::StateDelta as OpaqueDelta;
 
 use crate::decisions::dag_scheduler::{self, TodoStatus};
-use crate::nodes::final_gate::FinalGateNode;
+use crate::nodes::final_gate::{EsitoCriteri, FinalGateNode};
 use crate::py_json::{py_json_dumps, SortKeys};
 use crate::routing::config::RoutingConfig;
 use crate::routing::signals;
@@ -611,9 +611,24 @@ impl GraphNode<AgentState, AgentNodeCtx> for VerifierNode {
             // ACCODATI ai results (verifier_node.py:178-181) cosi' la persistenza
             // / il render li vede.
             if self.cfg.fail_closed && signals::is_software_task(state, &self.routing_cfg) {
-                let (gate_passed, gate_results) = self.run_general_gates(state).await?;
+                let (esito_gate, gate_results) = self.run_general_gates(state).await?;
                 results.extend(gate_results);
-                gate_passed
+                match esito_gate {
+                    EsitoCriteri::Superato => true,
+                    // Gate generali tutti inconcludenti su un task SOFTWARE in
+                    // modalita' fail-closed: non si e' misurato niente, e il
+                    // fail-closed esiste apposta per non chiudere al buio.
+                    // Prima questo caso usciva `true` per vacuita'.
+                    EsitoCriteri::SuperatoNonVerificato { inconclusive } => {
+                        tracing::warn!(
+                            target: "nexus_agent_graph::verifier",
+                            inconclusive,
+                            "gate generali non misurabili su task software: fail-closed, la chiusura non e' verificata"
+                        );
+                        false
+                    }
+                    EsitoCriteri::Fallito => false,
+                }
             } else {
                 true
             }
@@ -757,8 +772,12 @@ impl VerifierNode {
         }
 
         // Fail-closed: esegui i gate generali (no_orphan_imported + outputs_exist).
-        let (gate_passed, gate_results) = self.run_general_gates(state).await?;
-        if gate_passed {
+        //
+        // SECONDO chiamante che prima prendeva solo la meta' della risposta: qui
+        // il `bool` chiudeva il todo come `Completed` anche con gate tutti
+        // inconcludenti. Fail-closed significa che senza misura NON si chiude.
+        let (esito_gate, gate_results) = self.run_general_gates(state).await?;
+        if matches!(esito_gate, EsitoCriteri::Superato) {
             self.store
                 .mark_status(active_todo_id, TodoStatus::Completed)
                 .await
@@ -826,7 +845,7 @@ impl VerifierNode {
     async fn run_general_gates(
         &self,
         state: &AgentState,
-    ) -> Result<(bool, Vec<CriterionResult>), NodeError> {
+    ) -> Result<(EsitoCriteri, Vec<CriterionResult>), NodeError> {
         let criteria = self.final_gate.build_criteria(state);
         let results = self
             .criteria
@@ -836,8 +855,11 @@ impl VerifierNode {
                 node: "verifier",
                 message: format!("gate generali falliti: {e}"),
             })?;
-        let passed = FinalGateNode::all_passed(&results);
-        Ok((passed, results))
+        // L'esito porta anche i buchi: prima si prendeva `all_passed` e basta,
+        // e con gate generali TUTTI inconcludenti quel bool era vero per
+        // vacuita' — il todo si chiudeva `Completed` senza che nulla fosse
+        // stato misurato.
+        Ok((FinalGateNode::esito_criteri(&results), results))
     }
 
     /// Costruisce il testo del HumanMessage da iniettare al retry: il blocco
