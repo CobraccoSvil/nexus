@@ -1529,11 +1529,37 @@ pub(crate) async fn native_outcome_to_run_result(
         status: String,
         created_at: chrono::DateTime<chrono::Utc>,
     }
+    // Gli step del run E QUELLI DEI SUOI FIGLI. Un coordinatore che delega tutto
+    // ai sub-agenti non ha step propri: leggendo il solo `run_id` risulta inerte,
+    // e il resoconto in chat lo dichiara tale.
+    //
+    // MISURATO il 04/08/2026 su biblioteca-scolastica: il run di chat (mistral)
+    // ha chiuso con ZERO step propri mentre i suoi figli avevano scritto 29 file,
+    // e in chat e' comparso «Nessuna risposta utile prodotta dall'agente — mistral
+    // ha chiuso il turno con un completamento vuoto». Un'ora di lavoro reale
+    // presentata come nulla, perche' `build_action_recap` riceveva una lista
+    // vuota e cadeva sull'ultimo ripiego della catena.
+    //
+    // La parentela viene dal punto unico (`run_lineage`, regola L), non da una
+    // seconda idea di "figlio" scritta qui. Un errore di lettura degrada ai soli
+    // step propri: e' il comportamento di prima, mai meno.
+    let mut run_ids = vec![run_id];
+    match crate::run_lineage::child_runs_of(db, run_id).await {
+        Ok(figli) => run_ids.extend(figli),
+        Err(e) => tracing::warn!(
+            %run_id, error = %e,
+            "discendenza non leggibile: il resoconto vedra' i soli step propri del run"
+        ),
+    }
+    // ORDINE per `created_at`: `step_index` e' una convenzione INTERNA al singolo
+    // run (iterazione*STRIDE+idx), quindi fra run diversi non e' confrontabile —
+    // ordinarci sopra intreccerebbe le azioni di padre e figli in un ordine che
+    // non e' mai accaduto.
     let rows: Vec<StepRow> = sqlx::query_as::<_, StepRow>(
         "SELECT step_index, tool_name, tool_input, tool_result, status, created_at \
-         FROM agent_steps WHERE run_id = $1 ORDER BY step_index ASC",
+         FROM agent_steps WHERE run_id = ANY($1) ORDER BY created_at ASC, step_index ASC",
     )
-    .bind(run_id)
+    .bind(&run_ids)
     .fetch_all(db)
     .await
     .unwrap_or_default();

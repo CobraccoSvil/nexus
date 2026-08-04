@@ -1318,6 +1318,52 @@ export function useChat(
     void confirmAgent(runId, true);
   }, [autoConfirmRunId, confirmAgent, sessionId]);
 
+  // Un run puo' NASCERE senza che l'utente scriva: `process_resume` risveglia
+  // l'agente quando un comando in background termina, e quel run ha un id nuovo.
+  // La sottoscrizione SSE e' per-RUN: chiusa quella del run precedente, nessuno
+  // ascolta il successivo, e la chat resta ferma su un turno concluso mentre il
+  // lavoro prosegue.
+  //
+  // MISURATO il 04/08/2026 su biblioteca-scolastica: il run di chat chiude alle
+  // 13:01:36, `process_resume` inietta l'esito del comando alle 13:01:45, il run
+  // 176af2e2 parte alle 13:01:50 e produce 98 step — invisibili finche' non si
+  // ricarica la pagina. Al refresh l'effetto qui sotto li trovava: mancava solo
+  // che qualcuno lo richiamasse senza ricaricare.
+  //
+  // La finestra e' limitata (`SVEGLIA_*`): un risveglio arriva entro pochi
+  // secondi dalla fine, e un polling perpetuo su ogni sessione aperta costerebbe
+  // senza coprire nulla di piu'.
+  useEffect(() => {
+    if (!isReady || !sessionId || agentRun !== null) return;
+    let annullato = false;
+    let tentativi = 0;
+    const SVEGLIA_INTERVALLO_MS = 4000;
+    const SVEGLIA_TENTATIVI_MAX = 20; // ~80s dopo la fine di un turno
+    const timer = setInterval(() => {
+      if (annullato) return;
+      if (++tentativi > SVEGLIA_TENTATIVI_MAX) {
+        clearInterval(timer);
+        return;
+      }
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      void getActiveRunForSession(sessionId)
+        .then(({ activeRun }) => {
+          if (annullato || !activeRun || !isAgentRunLiveOrWaiting(activeRun.status)) return;
+          clearInterval(timer);
+          const runId = activeRun.runId;
+          setAgentRun(activeRun);
+          setAgentSteps(activeRun.steps ?? []);
+          setAgentRuns((prev) => new Map(prev).set(runId, activeRun));
+          setAgentStepsMap((prev) => new Map(prev).set(runId, activeRun.steps ?? []));
+          setIsLoading(true);
+          subscribeToRun(sessionId, runId, true);
+        })
+        .catch(() => { /* transitorio: si riprova al tick successivo */ });
+    }, SVEGLIA_INTERVALLO_MS);
+    return () => { annullato = true; clearInterval(timer); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isReady, sessionId, agentRun]);
+
   // Dopo bootstrap: riconnetti all'agente in corso (se il browser è stato refreshato mentre girava)
   useEffect(() => {
     if (!isReady || !sessionId) return;

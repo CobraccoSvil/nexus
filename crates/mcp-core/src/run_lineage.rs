@@ -93,6 +93,37 @@ pub async fn parent_run_by_child(
     Ok(out)
 }
 
+/// I run che compongono il lavoro di `run_id`: i suoi figli DIRETTI.
+///
+/// Verso opposto di [`parent_run_by_child`], stesso criterio di parentela
+/// (`COALESCE(dispatcher_run_id, parent_run_id)`): due definizioni di "figlio"
+/// darebbero due idee diverse di che cosa un run abbia fatto.
+///
+/// Serve a chi deve rispondere «questo run ha prodotto qualcosa?» guardando il
+/// lavoro COMPLESSIVO. Un coordinatore che delega tutto ai sub-agenti non ha
+/// step propri, e chi legge i soli `agent_steps` del suo `run_id` lo vede
+/// inerte. MISURATO il 04/08/2026 su biblioteca-scolastica: il run di chat
+/// aveva ZERO step propri mentre i suoi figli avevano scritto 29 file, e il
+/// resoconto in chat diceva «Nessuna risposta utile prodotta dall'agente».
+///
+/// Non ricorsivo: i figli dei figli restano fuori. Un livello copre il caso che
+/// conta (il coordinatore che delega) senza aprire la ricorsione su un grafo la
+/// cui profondita' non e' vincolata; se domani servisse, e' un `WITH RECURSIVE`
+/// da aggiungere QUI, non in un secondo posto.
+pub async fn child_runs_of(run_pool: &PgPool, run_id: Uuid) -> Result<Vec<Uuid>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT s.id AS child_id FROM nexus_subagent_runs s \
+         WHERE COALESCE(s.dispatcher_run_id, s.parent_run_id) = $1 AND s.id <> $1",
+    )
+    .bind(run_id)
+    .fetch_all(run_pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| r.try_get::<Uuid, _>("child_id").ok())
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +151,63 @@ mod tests {
             .await
             .expect("lettura ok");
         assert_eq!(mappa.get(&revisore), Some(&padre));
+
+        // Verso opposto, stesso criterio: il padre deve poter elencare il lavoro
+        // che ha delegato.
+        let figli = child_runs_of(&pool, padre).await.expect("lettura ok");
+        assert_eq!(figli, vec![revisore], "il padre non ritrova il proprio figlio");
+    }
+
+    /// IL CASO MISURATO il 04/08/2026 su biblioteca-scolastica: un coordinatore
+    /// che delega TUTTO non ha step propri, e chi guardava il solo `run_id` lo
+    /// dichiarava inerte — «Nessuna risposta utile prodotta dall'agente» a
+    /// fronte di 29 file scritti dai figli.
+    ///
+    /// MUTAZIONE: far ritornare `Ok(Vec::new())` a `child_runs_of` fa rosseggiare
+    /// l'asserzione sui due figli, che e' esattamente il lavoro che spariva dal
+    /// resoconto.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn il_coordinatore_che_delega_ritrova_il_lavoro_dei_figli(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let session_id = seed_chat_session(&pool, project_id).await;
+        let coordinatore =
+            insert_agent_run_as(&pool, session_id, project_id, user_id, "completed").await;
+        let estraneo =
+            insert_agent_run_as(&pool, session_id, project_id, user_id, "completed").await;
+
+        for kind in ["implement", "test_author"] {
+            seed_subagent_run(
+                &pool,
+                session_id,
+                project_id,
+                user_id,
+                session_id, // ancora di famiglia: la sessione, non il run
+                Some(coordinatore),
+                kind,
+            )
+            .await;
+        }
+        // Un figlio di un ALTRO run non deve entrare nel lavoro di questo.
+        seed_subagent_run(
+            &pool,
+            session_id,
+            project_id,
+            user_id,
+            session_id,
+            Some(estraneo),
+            "review",
+        )
+        .await;
+
+        let figli = child_runs_of(&pool, coordinatore).await.expect("lettura ok");
+        assert_eq!(
+            figli.len(),
+            2,
+            "il coordinatore deve ritrovare i due sub-run che ha dispatchato: {figli:?}"
+        );
+        let altrui = child_runs_of(&pool, estraneo).await.expect("lettura ok");
+        assert_eq!(altrui.len(), 1, "e non quelli di un altro run: {altrui:?}");
     }
 
     /// Il caso MISURATO sul progetto e2e-todo: i sub-run dispatchati da un tool
