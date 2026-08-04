@@ -369,6 +369,17 @@ pub fn is_sentinel_provider(provider: &str) -> bool {
     provider.is_empty() || SENTINELS.contains(&provider)
 }
 
+/// Guida d'uso dei tipi di criterio (riferita da [`tool_catalog`]): fuori
+/// dalla json! per non produrre righe oltre il limite di stile.
+const DESCRIZIONE_TIPI_CRITERIO: &str = "run_command: esegue il comando e confronta \
+    l'exit code (0 = passa); http: sonda l'URL e confronta lo status con \
+    expected_status; file_exists: il path esiste.";
+
+/// Descrizione dei criteri della voce (stessa ragione della costante sopra).
+const DESCRIZIONE_CRITERI_VOCE: &str = "Criteri di accettazione ESEGUIBILI della \
+    voce: ogni voce implementativa ne dichiara almeno uno. Un criterio che \
+    nessun tool puo' controllare non e' un criterio.";
+
 /// Tool catalog `nexus_todo_write` dichiarato al planner (`planner_node.py:221-290`).
 /// Schema JSON STATICO (costante 1:1): action/run_id/todos[content,status,
 /// priority,acceptance_criteria,node_key,dep_keys]/planner_model/rationale/
@@ -392,13 +403,26 @@ pub fn tool_catalog() -> Vec<Value> {
                             "priority": {"type": "string", "enum": ["high", "normal", "low"]},
                             "acceptance_criteria": {
                                 "type": "array",
+                                "description": DESCRIZIONE_CRITERI_VOCE,
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "type": {"type": "string"},
+                                        // Vocabolario UNICO (regola L): la lista vive in
+                                        // runtime::ports::PLAN_CRITERION_TYPES accanto al
+                                        // contratto CriterionSpec; qui si INTERPOLA, mai
+                                        // si ridigita — due liste divergerebbero.
+                                        "type": {
+                                            "type": "string",
+                                            "enum": crate::runtime::ports::PLAN_CRITERION_TYPES,
+                                            "description": DESCRIZIONE_TIPI_CRITERIO
+                                        },
                                         "command": {"type": "string"},
                                         "expected": {"type": "string"},
                                         "url": {"type": "string"},
+                                        "expected_status": {
+                                            "type": "integer",
+                                            "description": "Per type=http: lo status HTTP atteso (default 200)."
+                                        },
                                         "path": {"type": "string"}
                                     }
                                 }
@@ -1740,6 +1764,24 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    /// Lo schema dei criteri di accettazione usa il vocabolario del CONTRATTO
+    /// (`PLAN_CRITERION_TYPES`, regola L), attraverso il produttore reale
+    /// (`tool_catalog`): il giorno in cui qualcuno sostituisse
+    /// l'interpolazione con una lista ridigitata e divergente, questo test
+    /// rosseggia — due vocabolari per la stessa domanda sono il difetto, non
+    /// un dettaglio (incidente `routing-due-tabelle-capability-divergenti`).
+    #[test]
+    fn lo_schema_dei_criteri_usa_il_vocabolario_del_contratto() {
+        let catalog = tool_catalog();
+        let enum_vals = &catalog[0]["input_schema"]["properties"]["todos"]["items"]
+            ["properties"]["acceptance_criteria"]["items"]["properties"]["type"]["enum"];
+        assert_eq!(
+            *enum_vals,
+            json!(crate::runtime::ports::PLAN_CRITERION_TYPES),
+            "lo schema non deriva piu' dalla costante del contratto"
+        );
+    }
     use crate::decisions::dag_scheduler::{Todo, TodoStatus};
     use crate::runtime::ports::{
         LlmResponse, LlmUsage, PortError, ToolCall, ToolOutcome,

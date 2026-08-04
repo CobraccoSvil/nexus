@@ -275,30 +275,11 @@ pub fn suggest_remediation(failed: &[CriterionResult]) -> String {
             format!("comando ritorna exit_code={exit_c}: leggi STDERR e correggi")
         }
         "file_exists" => "il file non esiste sul filesystem: scrivilo con write_file".to_string(),
-        "db_query" => {
-            // `notes = ev.get("notes") or []`; "; ".join(notes) se non vuota.
-            let notes: Vec<String> = ev
-                .get("notes")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .map(|n| match n {
-                            Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if notes.is_empty() {
-                "verifica lo schema e lo stato del DB".to_string()
-            } else {
-                notes.join("; ")
-            }
-        }
-        "regex_in_output" => {
-            "il pattern atteso non e' presente nell'output: rivedi il comando o l'output"
-                .to_string()
-        }
+        // I rami db_query e regex_in_output sono stati POTATI (review W1,
+        // rilievo F3): quei tipi non sono nel vocabolario eseguibile e con la
+        // provenienza Authored degradano a Inconclusive, quindi non possono
+        // piu' produrre il Failed che arrivava qui — erano irraggiungibili
+        // per costruzione, e un ramo morto che pare vivo e' un debito.
         _ => "rivedi il criterion e applica una correzione mirata".to_string(),
     }
 }
@@ -921,7 +902,13 @@ fn criterion_type_repr(t: &str) -> String {
 }
 
 /// Chiavi che non fanno parte della `spec` di un criterio: sono metadati suoi.
-const CHIAVI_NON_SPEC: &[&str] = &["type", "spec", "expected", "timeout_s", "id"];
+/// `expected_status` e' il canale PIATTO dello status atteso di un criterio
+/// http (review W1, rilievo F9: la forma piatta non aveva dove metterlo e
+/// `check_http` legge `expected.status`): viene MAPPATO in `expected`, non
+/// lasciato cadere nella spec.
+const CHIAVE_STATUS_ATTESO: &str = "expected_status";
+const CHIAVI_NON_SPEC: &[&str] =
+    &["type", "spec", "expected", CHIAVE_STATUS_ATTESO, "timeout_s", "id"];
 
 /// Normalizza `acceptance_criteria` del todo: lista ->
 /// [`crate::runtime::ports::CriterionSpec`]; stringa -> json.loads (se array);
@@ -970,8 +957,19 @@ fn normalize_criteria(v: Option<&Value>) -> Vec<crate::runtime::ports::Criterion
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
+                // L'UNICO costruttore a provenienza Authored: questi criteri
+                // li ha scritti il MODELLO nel piano, e un tipo fuori
+                // vocabolario degrada a Inconclusive invece di bocciare la
+                // voce per forma.
+                provenance: crate::runtime::ports::CriterionProvenance::Authored,
                 spec,
-                expected: map.get("expected").cloned().unwrap_or(json!({})),
+                // Mappatura STRUTTURALE della forma piatta (mai interpretazione
+                // del contenuto): `expected_status: 201` diventa
+                // `expected.status = 201`, che e' dove `check_http` guarda.
+                expected: match map.get(CHIAVE_STATUS_ATTESO).and_then(Value::as_i64) {
+                    Some(status) => json!({ "status": status }),
+                    None => map.get("expected").cloned().unwrap_or(json!({})),
+                },
                 timeout_s: map.get("timeout_s").and_then(Value::as_f64),
             })
         })
@@ -1504,14 +1502,13 @@ mod tests {
         assert!(
             suggest_remediation(&[fail_result("file_exists", json!({}))]).contains("write_file")
         );
-        assert!(suggest_remediation(&[fail_result(
-            "db_query",
-            json!({"notes": ["tabella mancante", "indice assente"]})
-        )])
-        .contains("tabella mancante; indice assente"));
+        // db_query e regex_in_output non hanno piu' un ramo dedicato (potati
+        // con la review W1: fuori vocabolario, da provenienza Authored
+        // degradano a Inconclusive e non possono produrre il Failed che
+        // arrivava qui): cadono nel ramo generico dei tipi non riconosciuti.
         assert!(
-            suggest_remediation(&[fail_result("regex_in_output", json!({}))])
-                .contains("pattern atteso")
+            suggest_remediation(&[fail_result("db_query", json!({}))])
+                .contains("correzione mirata")
         );
         assert!(
             suggest_remediation(&[fail_result("sconosciuto", json!({}))])

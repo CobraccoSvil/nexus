@@ -1355,6 +1355,7 @@ fn criterion_from_http_spec(
     }
     Some(nexus_agent_graph::runtime::ports::CriterionSpec {
         criterion_type: "http".to_string(),
+        provenance: nexus_agent_graph::runtime::ports::CriterionProvenance::Gate,
         spec: serde_json::Value::Object(spec),
         expected: serde_json::Value::Object(expected),
         timeout_s: Some(timeout_s),

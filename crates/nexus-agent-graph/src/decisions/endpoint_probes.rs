@@ -58,7 +58,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::runtime::ports::CriterionSpec;
+use crate::runtime::ports::{CriterionProvenance, CriterionSpec};
 
 /// Metodi HTTP dichiarabili in `task_complete.endpoints` (enum dello schema del
 /// tool: il vocabolario e' UNO, regola N).
@@ -256,6 +256,7 @@ fn criterio_integrazione(
     spec.insert("source".to_string(), json!("frontend_integration"));
     Some(CriterionSpec {
         criterion_type: "http".to_string(),
+        provenance: CriterionProvenance::Gate,
         spec: Value::Object(spec),
         // `reject_html`: attraverso il frontend, un endpoint di API deve
         // restituire il DATO del backend. Se risponde HTML ha servito la propria
@@ -310,6 +311,7 @@ fn criterion_from_endpoint(endpoint: &Value, timeout_s: f64) -> Option<Criterion
     };
     Some(CriterionSpec {
         criterion_type: "http".to_string(),
+        provenance: CriterionProvenance::Gate,
         spec: Value::Object(spec),
         expected: json!({ "status": statuses }),
         timeout_s: Some(timeout_s),

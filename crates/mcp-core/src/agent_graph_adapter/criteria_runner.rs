@@ -49,9 +49,14 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use nexus_agent_graph::runtime::ports::{
-    CriteriaRunner, CriterionOutcome, CriterionResult, CriterionSpec, PortError, ToolCall,
-    ToolExecutor, ToolOutcome,
+    CriteriaRunner, CriterionOutcome, CriterionProvenance, CriterionResult, CriterionSpec,
+    PortError, ToolCall, ToolExecutor, ToolOutcome,
 };
+
+/// Chiavi dell'evidence per i criteri del piano non misurabili: UN solo punto
+/// di scrittura (i test le referenziano da qui, mai come letterali sparsi).
+pub(crate) const CHIAVE_DEGENERE: &str = "degenerate";
+pub(crate) const CHIAVE_UNRECOGNIZED: &str = "unrecognized";
 
 /// Timeout di default per i criteri (parita' col Python: `30.0s`). I criteri con
 /// `timeout_s` valorizzato (solo il build) lo sovrascrivono.
@@ -283,6 +288,76 @@ impl FinalGateCriteriaRunnerAdapter {
         self.run_tool("run_command", tool_input).await.ok()?.exit_code
     }
 
+    /// Campo essenziale mancante in un criterio scritto nel piano, per i
+    /// tipi del vocabolario (`PLAN_CRITERION_TYPES`): senza quel campo il
+    /// criterio non puo' misurare niente. La domanda e' di FORMA (il campo
+    /// c'e'?), mai di merito: il contenuto lo giudica il check del tipo.
+    fn spec_degenere_authored(tipo: &str, spec: &Value) -> Option<&'static str> {
+        let manca = |k: &str| {
+            spec.get(k)
+                .and_then(Value::as_str)
+                .is_none_or(|s| s.trim().is_empty())
+        };
+        match tipo {
+            "run_command" if manca("command") => Some("command"),
+            "http" if manca("url") => Some("url"),
+            "file_exists" if manca("path") => Some("path"),
+            _ => None,
+        }
+    }
+
+    /// Il gate di FORMA che precede il dispatch: solo per i criteri scritti
+    /// nel piano (provenienza `Authored`), una spec senza il campo essenziale
+    /// chiude Inconclusive prima di toccare qualunque porta. Vive fuori da
+    /// `run_one` perche' quella funzione resti il solo dispatch.
+    fn esito_di_forma(c: &CriterionSpec) -> Option<CriterionResult> {
+        if c.provenance != CriterionProvenance::Authored {
+            return None;
+        }
+        Self::spec_degenere_authored(&c.criterion_type, &c.spec)
+            .map(|campo| Self::esito_degenere(c, campo))
+    }
+
+    /// L'esito Inconclusive di un tipo fuori vocabolario scritto nel piano:
+    /// unico produttore della chiave `unrecognized` che la telemetria legge.
+    fn esito_non_riconosciuto(tipo: &str) -> (CriterionOutcome, Value) {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "skipped_reason".to_string(),
+            json!(format!(
+                "tipo di criterio '{tipo}' non nel vocabolario del runner: \
+                 escluso dal conteggio, la voce si valuta sui criteri eseguibili"
+            )),
+        );
+        map.insert(CHIAVE_UNRECOGNIZED.to_string(), json!(true));
+        (CriterionOutcome::Inconclusive, Value::Object(map))
+    }
+
+    /// L'esito Inconclusive di un criterio del piano con spec degenere:
+    /// costruito qui (e non inline in `run_one`) perche' l'evidence abbia un
+    /// solo produttore e `run_one` resti leggibile.
+    fn esito_degenere(c: &CriterionSpec, campo: &str) -> CriterionResult {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "skipped_reason".to_string(),
+            json!(format!(
+                "criterio '{}' senza il campo essenziale '{campo}': non misurabile",
+                c.criterion_type
+            )),
+        );
+        map.insert(CHIAVE_DEGENERE.to_string(), json!(true));
+        map.insert("type".to_string(), json!(c.criterion_type));
+        map.insert(
+            "outcome".to_string(),
+            json!(CriterionOutcome::Inconclusive.as_str()),
+        );
+        CriterionResult {
+            criterion_type: c.criterion_type.clone(),
+            outcome: CriterionOutcome::Inconclusive,
+            evidence: Value::Object(map),
+        }
+    }
+
     /// Esegue UN criterio. Parita' col `run_criterion` Python: il dispatch per
     /// `criterion_type` + il try/except che mappa un fallimento su
     /// `passed=false`/`evidence.error` (mai un panico). Il [`PortError`] risale solo
@@ -292,6 +367,18 @@ impl FinalGateCriteriaRunnerAdapter {
         c: &CriterionSpec,
     ) -> Result<CriterionResult, PortError> {
         let timeout_s = c.timeout_s.unwrap_or(DEFAULT_TIMEOUT_S);
+        // Spec DEGENERE di un criterio scritto nel piano (review W1, F2/F5):
+        // un tipo NOTO senza il suo campo essenziale chiudeva Passed-"N/A" —
+        // cioe' VALUTABILE — e una voce coi soli criteri degeneri passava
+        // senza alcuna misura, scavalcando anche il fail-closed dei gate
+        // generali (che scatta solo a evaluable vuoto). "Non ho potuto
+        // misurare" non diventa "va bene" (regola M): degrada a Inconclusive
+        // col motivo, come il tipo ignoto. Vale SOLO per la provenienza
+        // Authored: le spec del GATE le costruisce il codice dai fatti, e li'
+        // un campo mancante e' un bug da far esplodere, non da assorbire.
+        if let Some(esito) = Self::esito_di_forma(c) {
+            return Ok(esito);
+        }
         let (outcome, mut evidence) = match c.criterion_type.as_str() {
             "run_command" => {
                 self.check_run_command(&c.spec, &c.expected, timeout_s)
@@ -322,10 +409,21 @@ impl FinalGateCriteriaRunnerAdapter {
                     "skipped_reason": "no_orphan_imported non ancora portato in Rust (grafo import BFS): criterio inconcludente, escluso dal gate (TODO F3)",
                 }),
             ),
-            other => (
-                CriterionOutcome::Failed,
-                json!({ "error": format!("tipo di criterion sconosciuto: '{other}'") }),
-            ),
+            // Tipo fuori dal dispatch: la conseguenza la decide la PROVENIENZA
+            // (campo del contratto, regola M/Q — mai dedotta dal contenuto).
+            // Un criterio scritto nel piano degrada a Inconclusive col motivo
+            // (una voce non si boccia per la FORMA di un criterio: mig 0635,
+            // il 57% falliva cosi'); un criterio costruito dal GATE fallisce
+            // RUMOROSAMENTE, perche' li' il tipo sconosciuto e' un typo del
+            // costruttore e un degrado silenzioso sarebbe un downgrade della
+            // rete di sicurezza (rilievo A6 della review del piano).
+            other => match c.provenance {
+                CriterionProvenance::Authored => Self::esito_non_riconosciuto(other),
+                CriterionProvenance::Gate => (
+                    CriterionOutcome::Failed,
+                    json!({ "error": format!("tipo di criterion sconosciuto: '{other}'") }),
+                ),
+            },
         };
         // Eco del tipo nell'evidence (parita' `run_criterion`: `ev["type"]`) +
         // eco dell'ESITO. Sono proiezioni per persistenza/render: la DECISIONE
@@ -1756,10 +1854,179 @@ mod tests {
     fn spec(criterion_type: &str, spec: Value, expected: Value) -> CriterionSpec {
         CriterionSpec {
             criterion_type: criterion_type.to_string(),
+            // I test storici esercitano criteri costruiti dal GATE (la
+            // variante severa): la provenienza Todo la dichiarano solo i test
+            // che misurano il degrado.
+            provenance: CriterionProvenance::Gate,
             spec,
             expected,
             timeout_s: None,
         }
+    }
+
+    fn spec_authored(criterion_type: &str, spec_v: Value, expected: Value) -> CriterionSpec {
+        CriterionSpec {
+            provenance: CriterionProvenance::Authored,
+            ..spec(criterion_type, spec_v, expected)
+        }
+    }
+
+    /// ALLINEAMENTO vocabolario<->dispatch (regola L, rilievo A5 della review):
+    /// ogni tipo dichiarato in `PLAN_CRITERION_TYPES` (la costante che governa
+    /// lo schema di `nexus_todo_write` e il prompt del planner) deve
+    /// raggiungere il SUO handler nel dispatch di `run_one` — mai il catch-all
+    /// del tipo ignoto. La lista vive accanto al contratto (nexus-agent-graph
+    /// non puo' dipendere da mcp-core); questo test e' la saldatura che tiene
+    /// le due parti allineate.
+    ///
+    /// MUTAZIONE: aggiungere un tipo alla costante senza il ramo nel dispatch
+    /// (o rinominare un ramo) fa comparire `unrecognized` e il test rosseggia.
+    #[sqlx::test]
+    async fn il_vocabolario_del_piano_e_tutto_eseguibile(pool: PgPool) {
+        let exec = FakeToolExecutor::with(&[(
+            "run_command",
+            &["EXIT CODE: 1"; nexus_agent_graph::runtime::ports::PLAN_CRITERION_TYPES.len()],
+        )]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
+        for tipo in nexus_agent_graph::runtime::ports::PLAN_CRITERION_TYPES {
+            // Spec minima COMPLETA per tipo (il campo essenziale c'e'): il
+            // bersaglio non e' l'esito del criterio (che qui puo'
+            // legittimamente fallire) ma il fatto che il dispatch lo riconosca
+            // e che la spec non sia degenere.
+            let s = match tipo {
+                "run_command" => json!({ "command": "echo prova" }),
+                "http" => json!({ "url": "http://127.0.0.1:1/definitamente-giu" }),
+                "file_exists" => json!({ "path": "file-che-non-esiste" }),
+                other => panic!("tipo '{other}' senza spec di prova: aggiungerla qui"),
+            };
+            let res = runner
+                .run(vec![spec_authored(tipo, s, json!({}))])
+                .await
+                .expect("nessun PortError per un tipo dichiarato");
+            assert!(
+                res[0].evidence.get(CHIAVE_UNRECOGNIZED).is_none()
+                    && res[0].evidence.get(CHIAVE_DEGENERE).is_none(),
+                "tipo dichiarato '{tipo}' non ha raggiunto il suo handler: {:?}",
+                res[0].evidence
+            );
+        }
+    }
+
+    /// Il CATALOGO (`AGENT_TOOLS_JSON`, cio' che vedono il run principale e i
+    /// sub-agenti con `nexus_todo_write` in whitelist, es. il kind `plan`)
+    /// dichiara lo STESSO vocabolario del contratto. La review W1 (rilievo F1)
+    /// ha trovato qui la seconda fonte della deriva: description che insegnava
+    /// `regex_in_output`/`db_query` e items senza schema — il test del planner
+    /// misurava l'ALTRO schema e non poteva vederla.
+    ///
+    /// MUTAZIONE: cambiare l'enum nel catalogo o nella costante (o reintrodurre
+    /// i tipi rimossi nella description) fa rosseggiare.
+    #[test]
+    fn il_catalogo_di_nexus_todo_write_usa_il_vocabolario_del_contratto() {
+        let tools: Value = serde_json::from_str(nexus_agent_tools::tool_schema::AGENT_TOOLS_JSON)
+            .expect("catalogo parsabile");
+        let tool = tools
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|t| t["name"] == "nexus_todo_write")
+            .expect("nexus_todo_write nel catalogo")
+            .clone();
+        let enum_vals = &tool["input_schema"]["properties"]["todos"]["items"]["properties"]
+            ["acceptance_criteria"]["items"]["properties"]["type"]["enum"];
+        assert_eq!(
+            *enum_vals,
+            json!(nexus_agent_graph::runtime::ports::PLAN_CRITERION_TYPES),
+            "il catalogo non dichiara il vocabolario del contratto"
+        );
+        let testo = serde_json::to_string(&tool).expect("serializzabile");
+        assert!(
+            !testo.contains("regex_in_output") && !testo.contains("db_query"),
+            "il catalogo insegna ancora tipi fuori vocabolario: {testo}"
+        );
+    }
+
+    /// Una spec DEGENERE authored da un todo (tipo noto, campo essenziale
+    /// assente) degrada a Inconclusive, mai a Passed-senza-misura (rilievo
+    /// F2/F5: la rete di sicurezza era invertita — un tipo noto con spec vuota
+    /// era trattato meglio di un tipo ignoto).
+    ///
+    /// MUTAZIONE: togliere il guard `spec_degenere_authored` da `run_one` fa
+    /// tornare l'esito del ramo del tipo (per run_command senza command un
+    /// Failed misurato o peggio) e la prima asserzione cade.
+    #[sqlx::test]
+    async fn spec_degenere_authored_degrada_a_inconclusive(pool: PgPool) {
+        let exec = FakeToolExecutor::with(&[]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
+        for (tipo, campo) in [("run_command", "command"), ("http", "url"), ("file_exists", "path")]
+        {
+            let res = runner
+                .run(vec![spec_authored(tipo, json!({}), json!({}))])
+                .await
+                .expect("ok");
+            assert_eq!(
+                res[0].outcome,
+                CriterionOutcome::Inconclusive,
+                "{tipo}: {:?}",
+                res[0]
+            );
+            assert_eq!(res[0].evidence[CHIAVE_DEGENERE], json!(true), "{tipo}");
+            assert!(
+                res[0].evidence["skipped_reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(campo),
+                "{tipo}: {:?}",
+                res[0].evidence
+            );
+        }
+        // La stessa spec vuota dal GATE resta rumorosa: il guard vale solo per
+        // la provenienza Todo (una spec del gate la costruisce il codice, e un
+        // campo mancante li' e' un bug da vedere subito).
+        let res = runner
+            .run(vec![spec("file_exists", json!({}), json!({}))])
+            .await
+            .expect("ok");
+        assert!(
+            res[0].evidence.get(CHIAVE_DEGENERE).is_none(),
+            "il guard e' scattato su un criterio del gate: {:?}",
+            res[0]
+        );
+    }
+
+    /// Il DEGRADO del tipo ignoto e' deciso dalla PROVENIENZA (rilievo A6):
+    /// authored nel todo -> Inconclusive col motivo (mai bocciare per forma);
+    /// costruito dal gate -> Failed rumoroso (un typo nel costruttore non deve
+    /// degradare in silenzio la rete di sicurezza).
+    ///
+    /// MUTAZIONE: rimettere il `Failed` incondizionato nel catch-all fa cadere
+    /// la prima asserzione (il difetto della mig 0635: il 57% dei todo bocciato
+    /// per forma); degradare anche il ramo Gate fa cadere la terza.
+    #[sqlx::test]
+    async fn tipo_ignoto_degrada_per_provenienza(pool: PgPool) {
+        let exec = FakeToolExecutor::with(&[]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
+
+        let res = runner
+            .run(vec![spec_authored("regex_in_output", json!({}), json!({}))])
+            .await
+            .expect("ok");
+        assert_eq!(res[0].outcome, CriterionOutcome::Inconclusive, "{:?}", res[0]);
+        assert_eq!(res[0].evidence[CHIAVE_UNRECOGNIZED], json!(true));
+
+        let res = runner
+            .run(vec![spec("regex_in_output", json!({}), json!({}))])
+            .await
+            .expect("ok");
+        assert_eq!(res[0].outcome, CriterionOutcome::Failed, "{:?}", res[0]);
+        assert!(
+            res[0].evidence["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("sconosciuto"),
+            "{:?}",
+            res[0].evidence
+        );
     }
 
     // sqlx::test fornisce un pool; per i criteri che non toccano il DB usiamo

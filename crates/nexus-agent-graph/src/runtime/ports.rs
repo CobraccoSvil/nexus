@@ -511,11 +511,68 @@ pub trait ToolExecutor: Send + Sync {
 /// `Serialize`/`Deserialize`: serve a [`crate::nodes::final_gate::FinalGateConfig`]
 /// (che incapsula un `Option<CriterionSpec>` come criterio endpoint risolto a
 /// monte) per restare serializzabile.
+/// Vocabolario dei tipi di criterio che il runner ESEGUE per i criteri di
+/// accettazione scritti nelle voci del piano (regola L: unica fonte — schema
+/// `nexus_todo_write` nel planner, il prompt del planner e i test di
+/// allineamento del runner leggono QUESTA lista, mai una copia ridigitata).
+///
+/// La lista deriva dal dispatch reale di `criteria_runner::run_one` (mcp-core,
+/// che dipende da questo crate e non viceversa: per questo la costante vive
+/// qui, accanto al contratto, e il runner vi si ALLINEA con un test che
+/// attraversa il produttore — un tipo dichiarato qui e non eseguibile la' fa
+/// rosso). I tipi STRUTTURALI del gate (`action_requested`, `tool_capability`,
+/// `completion_confirmed`) non ci sono per scelta: li costruisce il codice del
+/// final_gate dai fatti dello stato, una voce di piano non puo' scriverli.
+///
+/// TRE tipi, non tutti quelli che il runner sa eseguire (review W1, rilievo
+/// F2/F5): un tipo entra solo se la forma PIATTA che lo schema insegna
+/// (command/url/path/expected_status) basta a MISURARLO. `outputs_exist`
+/// vuole il run_id (che una voce di piano non ha; `file_exists` copre i
+/// path), `design_verify` misura solo dalla history del gate,
+/// `service_logs_clean` vuole command+patterns che lo schema piatto non
+/// porta: scritti in un piano chiudevano Passed-senza-misura — un tipo NOTO
+/// con spec degenere trattato meglio di un tipo ignoto, la rete di sicurezza
+/// invertita. La dry-run sui 9 DB progetto conferma: il 100% dell'uso
+/// in-vocabolario e' di questi tre.
+///
+/// (Nomenclatura: niente prefisso T-O-D-O in costanti e varianti — la parola
+/// isolata e' il vocabolario dei marker di debito del quality-scan e del
+/// ratchet, e ogni menzione diventerebbe un finding.)
+pub const PLAN_CRITERION_TYPES: [&str; 3] = ["run_command", "http", "file_exists"];
+
+/// Chi ha SCRITTO il criterio: decide come degrada un tipo fuori vocabolario
+/// (regola M/Q: la provenienza e' un CAMPO del contratto, mai dedotta dal
+/// contenuto).
+///
+/// - `Gate`: costruito dal CODICE (final_gate, endpoint, build) — un tipo
+///   sconosciuto e' un difetto del costruttore e deve fallire RUMOROSAMENTE
+///   (un typo in un criterio di gate che degradasse in silenzio sarebbe un
+///   downgrade della rete di sicurezza).
+/// - `Authored`: scritto dal MODELLO nel piano (acceptance_criteria delle
+///   voci) — un tipo fuori vocabolario degrada a `Inconclusive` col motivo
+///   dichiarato: una voce di piano non si boccia per la FORMA di un criterio
+///   (mig 0635, il 57% falliva cosi').
+///
+/// Il default e' `Gate` (fail-rumoroso): la provenienza permissiva va
+/// dichiarata, mai ereditata per distrazione da un costruttore nuovo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CriterionProvenance {
+    #[default]
+    Gate,
+    Authored,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CriterionSpec {
     /// Tipo del criterio (`no_orphan_imported`, `outputs_exist`,
     /// `service_logs_clean`, `run_command`).
     pub criterion_type: String,
+    /// Chi l'ha authored (vedi [`CriterionProvenance`]). `serde(default)` per
+    /// le config gia' serializzate prima del campo: un criterio senza
+    /// provenienza e' del gate, cioe' della variante severa.
+    #[serde(default)]
+    pub provenance: CriterionProvenance,
     /// Parametri del criterio (`spec` Python: staging_dir, command, ...).
     pub spec: Value,
     /// Atteso (`expected` Python: `{mounted:true}`, `{exit_code:0}`, ...).

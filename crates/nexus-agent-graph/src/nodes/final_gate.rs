@@ -75,7 +75,7 @@ use nexus_graph::StateDelta as OpaqueDelta;
 
 use crate::routing::config::RoutingConfig;
 use crate::routing::signals;
-use crate::runtime::ports::{CriterionResult, CriterionSpec};
+use crate::runtime::ports::{CriterionProvenance, CriterionResult, CriterionSpec};
 use crate::runtime::AgentNodeCtx;
 use crate::state::{
     AgentState, FinalGateVerdict, GateRouting, Message, MessageContent, StateDelta, StopReason,
@@ -518,6 +518,7 @@ impl FinalGateNode {
 
         // (1) no_orphan_imported (anti-placeholder), sempre.
         criteria.push(CriterionSpec {
+            provenance: CriterionProvenance::Gate,
             criterion_type: "no_orphan_imported".to_string(),
             spec: json!({
                 "staging_dir": self.cfg.import_staging_dirs,
@@ -530,6 +531,7 @@ impl FinalGateNode {
         // (2) outputs_exist (claim-vs-fatti), sempre. run_id = thread_id.
         let run_id = state.thread_id.clone().unwrap_or_default();
         criteria.push(CriterionSpec {
+            provenance: CriterionProvenance::Gate,
             criterion_type: "outputs_exist".to_string(),
             spec: json!({ "run_id": run_id }),
             expected: json!({}),
@@ -540,6 +542,7 @@ impl FinalGateNode {
         //     comando log risolto a monte.
         if self.cfg.runtime_check_enabled && !self.cfg.log_command.is_empty() {
             criteria.push(CriterionSpec {
+                provenance: CriterionProvenance::Gate,
                 criterion_type: "service_logs_clean".to_string(),
                 spec: json!({
                     "command": self.cfg.log_command,
@@ -590,6 +593,7 @@ impl FinalGateNode {
                 spec.insert("baseline_exit_code".to_string(), json!(be));
             }
             criteria.push(CriterionSpec {
+                provenance: CriterionProvenance::Gate,
                 criterion_type: "run_command".to_string(),
                 spec: Value::Object(spec),
                 expected: json!({ "exit_code": 0 }),
@@ -650,6 +654,7 @@ impl FinalGateNode {
             }
             if let Some(score) = last_score {
                 criteria.push(CriterionSpec {
+                    provenance: CriterionProvenance::Gate,
                     criterion_type: "design_verify".to_string(),
                     spec: json!({
                         "similarity_score": score,
@@ -670,6 +675,7 @@ impl FinalGateNode {
             // action_requested: una richiesta d'azione chiusa senza NESSUNA
             // azione produttiva in history non puo' passare il gate.
             criteria.push(CriterionSpec {
+                provenance: CriterionProvenance::Gate,
                 criterion_type: "action_requested".to_string(),
                 spec: json!({
                     "action_oriented": action_oriented,
@@ -686,6 +692,7 @@ impl FinalGateNode {
             // per un `tools_json` non propagato al gate/resume.
             let tools_count = state.tools_json.as_ref().map(|t| t.len()).unwrap_or(0);
             criteria.push(CriterionSpec {
+                provenance: CriterionProvenance::Gate,
                 criterion_type: "tool_capability".to_string(),
                 spec: json!({
                     "tools_count": tools_count,
@@ -713,6 +720,7 @@ impl FinalGateNode {
             // MACCHINA dalla history (regola M), punto unico signals (regola L).
             let subagent_completed = signals::has_completed_subagent_dispatch(&state.messages);
             criteria.push(CriterionSpec {
+                provenance: CriterionProvenance::Gate,
                 criterion_type: "completion_confirmed".to_string(),
                 spec: json!({
                     "declared_outcome": declared,
@@ -1935,6 +1943,7 @@ mod tests {
         // nell'ordine (`final_gate.py:468-470`). Le spec arrivano pronte dal
         // risolutore DB (`load_configured_endpoint_criteria`): il nodo le accoda 1:1.
         let endpoint = CriterionSpec {
+            provenance: CriterionProvenance::Gate,
             criterion_type: "http".to_string(),
             spec: json!({ "url": "http://localhost:3000/api/login", "method": "POST" }),
             expected: json!({ "status": 200 }),
@@ -2056,6 +2065,7 @@ mod tests {
         let cfg = FinalGateConfig {
             endpoint_check_enabled: false,
             endpoint_criteria: vec![CriterionSpec {
+                provenance: CriterionProvenance::Gate,
                 criterion_type: "http".to_string(),
                 spec: json!({ "url": URL_HEALTH }),
                 expected: json!({ "status": 200 }),

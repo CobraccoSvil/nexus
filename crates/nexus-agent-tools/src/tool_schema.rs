@@ -227,7 +227,22 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
               "priority": {"type": "string", "enum": ["high", "normal", "low"], "description": "Default 'normal'"},
               "acceptance_criteria": {
                 "type": "array",
-                "description": "Array di check verificabili: [{type:'run_command'|'http'|'file_exists'|'regex_in_output'|'db_query', spec:{...}, expected:{...}}]"
+                "description": "Criteri di accettazione ESEGUIBILI della voce. Forma piatta: type + il campo del tipo.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": ["run_command", "http", "file_exists"],
+                      "description": "run_command: exit code 0 = passa; http: url + expected_status; file_exists: path."
+                    },
+                    "command": {"type": "string"},
+                    "expected": {"type": "string"},
+                    "url": {"type": "string"},
+                    "expected_status": {"type": "integer", "description": "Per type=http: status atteso (default 200)."},
+                    "path": {"type": "string"}
+                  }
+                }
               }
             }
           }
