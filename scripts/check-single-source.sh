@@ -1965,6 +1965,34 @@ else
   echo "OK bind-come-domanda: nessun bind usato come test fuori dal punto unico"
 fi
 
+# -- listener-protetto-prima-del-kill (2026-08-04) ---------------------------
+#
+# «Questa porta e' autorizzata a QUESTO progetto?» e «questo listener si puo'
+# uccidere?» sono due domande diverse. La seconda ha il suo punto unico,
+# `is_protected_nexus_listener`, e il port_enforcer non gliela poneva: decideva
+# sulla sola autorizzazione e sparava.
+#
+# MISURATO su `nexus_resource_audit`: 3.916 righe `port_violation_kill`, fra cui
+# officina-veicoli che ha ucciso MCP-CORE — il processo che esegue l'enforcer —
+# 845 volte su ciascuna delle porte 4000/50500/50501, e bacheca-attivita che ha
+# ucciso i tre cluster Postgres e i servizi di sistema Windows. Basta un pid
+# attribuito al progetto sbagliato perche' l'enforcer spari sull'infrastruttura.
+#
+# Il guard pretende che chi termina un processo per violazione di porta passi
+# prima da quel punto: e' la difesa che regge anche quando l'attribuzione
+# sbaglia.
+enforcer_file="crates/mcp-core/src/security/port_enforcer.rs"
+if [[ -f "$enforcer_file" ]]; then
+  if grep -q 'kill_pid' "$enforcer_file" && ! grep -q 'is_protected_nexus_listener' "$enforcer_file"; then
+    echo "!! listener-protetto-prima-del-kill: il port_enforcer termina processi senza chiedere" >&2
+    echo "   a is_protected_nexus_listener se il listener e' infrastruttura Nexus." >&2
+    echo "   Ha gia' ucciso mcp-core 845 volte: interponi il punto unico prima di kill_pid." >&2
+    fail=1
+  else
+    echo "OK listener-protetto-prima-del-kill: l'enforcer interroga il punto unico"
+  fi
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

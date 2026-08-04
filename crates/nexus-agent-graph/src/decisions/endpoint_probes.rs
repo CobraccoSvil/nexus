@@ -171,6 +171,111 @@ pub fn endpoint_criteria_from_declaration(
         .collect()
 }
 
+/// Prova gli stessi endpoint dichiarati ATTRAVERSO l'origine del frontend, per
+/// accertare che i due servizi si parlino.
+///
+/// ROOT CAUSE, misurata il 04/08/2026 su inventario-magazzino. Backend corretto
+/// (`GET /api/articles` -> 200, e il vincolo di business rispettato), frontend
+/// servito e compilato (home -> 200): il gate ha chiuso verde. Ma
+/// `vite.config.ts` portava
+/// `proxy: {'/api': {target, rewrite: p => p.replace(/^\/api/, '')}}` mentre il
+/// backend espone proprio `/api/articles` — il proxy inoltrava a
+/// `localhost:36376/articles`, che non esiste. Misurato:
+///
+/// | chiamata                          | esito |
+/// |-----------------------------------|-------|
+/// | backend `/api/articles`           | 200   |
+/// | backend `/articles`               | 404   |
+/// | via proxy frontend `/api/articles`| 404   |
+///
+/// Pagina vuota, nessun errore in console. Le due meta' erano sane e
+/// l'applicazione non esisteva: nessuno verificava l'unica cosa che le rende un
+/// insieme. E' la stessa forma di difetto che il modulo gia' chiude — si misura
+/// cio' che e' comodo misurare (il pezzo risponde) invece di cio' che conta (il
+/// pezzo fa il suo lavoro).
+///
+/// Che cosa si prova, e perche' solo quello:
+/// - **solo i GET**: una POST rieseguita attraverso il frontend creerebbe un
+///   secondo record, e il costo non compra nulla — un proxy rotto lo e' per
+///   qualunque metodo;
+/// - **solo il PATH**, riattaccato all'origine del frontend: e' esattamente
+///   l'URL che il browser chiamerebbe;
+/// - **mai la root** (`/`): sul frontend e' la sua pagina, e risponderebbe 200
+///   dicendo nulla sull'integrazione.
+///
+/// LIMITE DICHIARATO: una SPA con fallback su `index.html` puo' rispondere 200
+/// a un path di API mai proxato. Questo criterio cattura il proxy ASSENTE o
+/// mal indirizzato (404/502, il caso misurato), non il fallback silenzioso —
+/// distinguerlo richiederebbe di guardare il CORPO, e la regola M vuole che si
+/// decida sullo status. Meglio una verifica che copre la classe misurata di
+/// nessuna verifica.
+pub fn criteri_integrazione_frontend(
+    declared_outcome: Option<&Value>,
+    origine_frontend: Option<&str>,
+    timeout_s: f64,
+) -> Vec<CriterionSpec> {
+    let Some(origine) = origine_frontend.map(str::trim).filter(|o| !o.is_empty()) else {
+        return Vec::new();
+    };
+    let origine = origine.trim_end_matches('/');
+    declared_outcome
+        .and_then(|d| d.get("endpoints"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|e| criterio_integrazione(e, origine, timeout_s))
+        .collect()
+}
+
+/// Il criterio d'integrazione di UNA voce dichiarata, se ha senso provarla.
+fn criterio_integrazione(
+    endpoint: &Value,
+    origine_frontend: &str,
+    timeout_s: f64,
+) -> Option<CriterionSpec> {
+    let obj = endpoint.as_object()?;
+    let metodo = obj.get("method").and_then(Value::as_str).unwrap_or("GET");
+    if !metodo.eq_ignore_ascii_case("GET") {
+        return None;
+    }
+    let percorso = percorso_di(obj.get("url").and_then(Value::as_str)?);
+    if percorso.is_empty() || percorso == "/" {
+        return None;
+    }
+    let mut spec = Map::new();
+    spec.insert("url".to_string(), json!(format!("{origine_frontend}{percorso}")));
+    spec.insert("method".to_string(), json!("GET"));
+    // Provenienza distinta dalle altre due: nell'evidence si deve vedere che il
+    // rosso viene dall'INTEGRAZIONE, non dal backend — altrimenti la diagnosi
+    // manda a cercare il difetto nel servizio sbagliato.
+    spec.insert("source".to_string(), json!("frontend_integration"));
+    Some(CriterionSpec {
+        criterion_type: "http".to_string(),
+        spec: Value::Object(spec),
+        expected: json!({ "status": DEFAULT_SUCCESS_STATUSES.to_vec() }),
+        timeout_s: Some(timeout_s),
+    })
+}
+
+/// Percorso (con query) di un URL assoluto o gia' relativo.
+///
+/// Scomposizione a mano invece di una dipendenza da un parser di URL: qui serve
+/// solo separare `schema://host:porta` dal resto, e l'origine del frontend la
+/// fornisce il chiamante.
+fn percorso_di(url: &str) -> &str {
+    let url = url.trim();
+    match url.find("://") {
+        Some(i) => match url[i + 3..].find('/') {
+            Some(j) => &url[i + 3 + j..],
+            // `http://host:porta` senza percorso: e' la root.
+            None => "/",
+        },
+        None if url.starts_with('/') => url,
+        None => "",
+    }
+}
+
 /// Costruisce il criterio `http` di UNA voce gia' normalizzata. `None` se la voce
 /// non ha i campi minimi (difesa: `declared_outcome` puo' arrivare da un
 /// checkpoint scritto da una versione precedente della normalizzazione).
@@ -202,6 +307,85 @@ fn criterion_from_endpoint(endpoint: &Value, timeout_s: f64) -> Option<Criterion
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Costruisce la dichiarazione come la produce la PORTA della produzione
+    /// (`normalize_endpoints`), non a mano: un test che fabbrica l'input gia'
+    /// prodotto altrove fissa l'assunto invece di verificarlo (regola O).
+    fn dichiarazione(voci: Value) -> Value {
+        json!({ "outcome": "done", "endpoints": normalize_endpoints(Some(&voci)) })
+    }
+
+    /// IL CASO MISURATO il 04/08/2026 su inventario-magazzino: backend sano,
+    /// frontend servito, proxy che riscrive `/api` via -> 404, gate VERDE.
+    ///
+    /// MUTAZIONE: far ritornare `Vec::new()` a `criteri_integrazione_frontend`
+    /// fa rosseggiare la prima asserzione — nessuna prova attraverso il
+    /// frontend, cioe' esattamente il gate che ha lasciato passare due servizi
+    /// vivi che non si parlavano.
+    #[test]
+    fn gli_endpoint_si_provano_anche_attraverso_il_frontend() {
+        let declared = dichiarazione(json!([
+            {"method": "GET", "url": "http://127.0.0.1:36376/api/articles"},
+        ]));
+        let out = criteri_integrazione_frontend(
+            Some(&declared),
+            Some("http://127.0.0.1:36354"),
+            15.0,
+        );
+        assert_eq!(out.len(), 1, "l'integrazione va provata: {out:?}");
+        assert_eq!(
+            out[0].spec["url"],
+            json!("http://127.0.0.1:36354/api/articles"),
+            "stesso PERCORSO, origine del frontend"
+        );
+        assert_eq!(out[0].spec["source"], json!("frontend_integration"),
+            "la provenienza distingue il rosso d'integrazione da quello del backend");
+    }
+
+    #[test]
+    fn senza_frontend_non_si_prova_niente() {
+        let declared = dichiarazione(json!([
+            {"method": "GET", "url": "http://127.0.0.1:36376/api/articles"},
+        ]));
+        // Nessun servizio frontend, o porta non risolvibile: mai un host indovinato.
+        assert!(criteri_integrazione_frontend(Some(&declared), None, 15.0).is_empty());
+        assert!(criteri_integrazione_frontend(Some(&declared), Some("  "), 15.0).is_empty());
+    }
+
+    #[test]
+    fn attraverso_il_frontend_solo_le_letture_e_mai_la_root() {
+        let declared = dichiarazione(json!([
+            // Una POST rieseguita creerebbe un secondo record, e un proxy rotto
+            // lo e' per qualunque metodo.
+            {"method": "POST", "url": "http://127.0.0.1:36376/api/articles",
+             "body": {"code": "X"}, "status": 201},
+            // La root del frontend e' la sua pagina: 200 che non dice nulla.
+            {"method": "GET", "url": "http://127.0.0.1:36376/"},
+            {"method": "GET", "url": "http://127.0.0.1:36376/api/health"},
+        ]));
+        let out = criteri_integrazione_frontend(
+            Some(&declared),
+            Some("http://127.0.0.1:36354/"),
+            15.0,
+        );
+        assert_eq!(out.len(), 1, "solo la GET non-root: {out:?}");
+        assert_eq!(
+            out[0].spec["url"],
+            json!("http://127.0.0.1:36354/api/health"),
+            "l'origine si normalizza senza doppia barra"
+        );
+    }
+
+    #[test]
+    fn il_percorso_si_estrae_da_url_assoluti_e_relativi() {
+        assert_eq!(percorso_di("http://h:1/api/x?y=1"), "/api/x?y=1");
+        assert_eq!(percorso_di("https://h/api/x"), "/api/x");
+        // Origine nuda: e' la root, e la root non si prova.
+        assert_eq!(percorso_di("http://127.0.0.1:36376"), "/");
+        assert_eq!(percorso_di("/api/x"), "/api/x");
+        // Ne' assoluto ne' relativo: non se ne ricava un percorso.
+        assert_eq!(percorso_di("api/x"), "");
+    }
 
     #[test]
     fn normalizza_scarta_le_voci_non_provabili() {

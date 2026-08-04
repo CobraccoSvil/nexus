@@ -522,6 +522,16 @@ async fn run_command_probe(
         Err(_) => {
             // Probe timeout.
             let _ = child.kill().await;
+            // I due drainer vanno ABORTITI, non lasciati cadere: in tokio
+            // droppare un `JoinHandle` STACCA il task, non lo annulla. Restavano
+            // in `read_to_end` senza tetto su una pipe il cui write end e'
+            // ancora aperto dai NIPOTI del processo ucciso (su Windows non c'e'
+            // un job object che li porti via con il padre), quindi non
+            // terminavano mai e trattenevano il buffer gia' letto piu' la catena
+            // di processi orfani. Un `.abort()` chiude il read end e libera
+            // entrambi.
+            stdout_task.abort();
+            stderr_task.abort();
             command_probe_timeout_result(ctx, input, command, is_oneshot, probe_secs, hints_prefix)
                 .await
         }

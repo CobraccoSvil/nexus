@@ -2518,6 +2518,13 @@ async fn spawn_and_capture_output(
         Ok(Err(e)) => return Err(format!("\u{274C} [Errore attesa processo: {}]", e)),
         Err(_) => {
             let _ = child.start_kill();
+            // Come nel ramo timeout di `command.rs`: droppare un `JoinHandle`
+            // STACCA il task invece di annullarlo, e i due drainer restano in
+            // `read_to_end` su una pipe che i nipoti del processo ucciso
+            // tengono aperta. Qui il `return` anticipato li lasciava vivi per
+            // sempre.
+            stdout_task.abort();
+            stderr_task.abort();
             return Err(format!(
                 "[Timeout dopo {}s. Comando: {}]",
                 timeout_secs, command

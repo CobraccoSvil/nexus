@@ -186,6 +186,15 @@ pub struct FinalGateConfig {
     /// Timeout (s) di UNA chiamata HTTP del gate
     /// (`agent.final_gate.endpoint_timeout_seconds`, mig 0455, default 15).
     pub endpoint_timeout_s: f64,
+    /// Origine del servizio FRONTEND del progetto (`http://host:porta`), quando
+    /// ne esiste uno con una porta allocata. `None` = nessun frontend, o porta
+    /// non risolvibile: non si prova nulla, mai un host indovinato.
+    ///
+    /// Serve a provare gli endpoint dichiarati ANCHE attraverso il frontend
+    /// (`decisions::endpoint_probes::criteri_integrazione_frontend`): due
+    /// servizi sani che non si parlano non sono un'applicazione, ed e'
+    /// esattamente cio' che il gate lasciava passare.
+    pub origine_frontend: Option<String>,
     /// P5: gate design_verify abilitato (agent.final_gate.design_verify_enabled,
     /// default true). Si applica SOLO se nella history c'e' un nexus_visual_compare
     /// (task figma): None = non-figma -> non blocca.
@@ -273,6 +282,7 @@ impl Default for FinalGateConfig {
             structural_criteria_enabled: true,
             verify_steps: Vec::new(),
             verify_profile_missing: false,
+            origine_frontend: None,
             // Trigger di escalation su non-convergenza del gate ON di default
             // (il gap che chiudeva secco un modello scadente). max_escalations
             // = safe-default dell'executor (3): stesso budget condiviso.
@@ -607,6 +617,17 @@ impl FinalGateNode {
             criteria.extend(
                 crate::decisions::endpoint_probes::endpoint_criteria_from_declaration(
                     state.declared_outcome.as_ref(),
+                    self.cfg.endpoint_timeout_s,
+                ),
+            );
+            // Gli STESSI endpoint, ma attraverso il frontend: e' la sola prova
+            // che i due servizi si parlino. Backend sano + frontend servito +
+            // proxy mal configurato = due processi vivi e nessuna applicazione,
+            // ed era verde (inventario-magazzino, 2026-08-04).
+            criteria.extend(
+                crate::decisions::endpoint_probes::criteri_integrazione_frontend(
+                    state.declared_outcome.as_ref(),
+                    self.cfg.origine_frontend.as_deref(),
                     self.cfg.endpoint_timeout_s,
                 ),
             );

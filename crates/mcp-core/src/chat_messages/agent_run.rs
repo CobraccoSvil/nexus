@@ -4582,7 +4582,14 @@ pub(crate) async fn spawn_agent_run(
 
     // Stop & alert se nessun provider capable: niente run, niente chiamata LLM.
     if routing_result.no_capable_provider {
-        return handle_no_capable_provider(&msgs_pool, &params, run_id, &routing_result, &tx).await;
+        let esito =
+            handle_no_capable_provider(&msgs_pool, &params, run_id, &routing_result, &tx).await;
+        // Il canale inserito sopra non avra' mai un consumatore: qui nessun run
+        // parte, e ogni altro ramo terminale lo rimuove tranne questo. La
+        // rimozione sta DOPO la chiamata perche' e' li' dentro che l'alert viene
+        // emesso sul canale: toglierlo prima zittirebbe il banner della UI.
+        state.agent_channels.remove(&run_id);
+        return esito;
     }
 
     // Last-wins (punto unico, regola L): questo nuovo run supera OGNI run ancora

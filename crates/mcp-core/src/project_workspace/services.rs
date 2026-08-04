@@ -1301,7 +1301,7 @@ pub async fn restart_all_project_services(
 ///   gateway 4060, ...). In WSL `systemctl --user` non popola `protected_pids`,
 ///   quindi questa e' l'unica barriera che impedisce al reset porte di uccidere
 ///   il core (e gli altri servizi) dal pannello.
-pub(super) fn is_protected_nexus_listener(pid: u32, port: u16, own_pid: u32) -> bool {
+pub(crate) fn is_protected_nexus_listener(pid: u32, port: u16, own_pid: u32) -> bool {
     pid == 0 || pid == 1 || pid == own_pid || NEXUS_RESERVED_PORTS.contains(&port)
 }
 

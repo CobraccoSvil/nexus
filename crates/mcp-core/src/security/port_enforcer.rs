@@ -75,6 +75,41 @@ async fn scan_and_enforce(state: &crate::AppState) -> Result<(), String> {
         if port_authorized_for_project(db, &project_id, b.port).await {
             continue;
         }
+
+        // «Questa porta e' autorizzata a QUESTO progetto?» e «questo listener si
+        // puo' uccidere?» sono due domande diverse, e finora se ne poneva una
+        // sola. La seconda ha gia' il suo punto unico
+        // (`is_protected_nexus_listener`), che fino a qui aveva UN solo
+        // chiamante e non era questo.
+        //
+        // Conseguenza MISURATA sul parco progetti (`nexus_resource_audit`,
+        // 3.916 righe `port_violation_kill`): officina-veicoli ha ucciso
+        // mcp-core — il processo che esegue questo stesso codice — 845 volte su
+        // ciascuna delle porte 4000, 50500 e 50501, fra le 23:02 del 03/08 e le
+        // 00:12 del 04/08; bacheca-attivita ha ucciso i tre cluster Postgres e
+        // i servizi di sistema Windows sulle 49664-49671. Un pid attribuito al
+        // progetto sbagliato (l'attribuzione risale una catena di PPID che
+        // Windows non invalida) bastava a far sparare l'enforcer
+        // sull'infrastruttura.
+        //
+        // Il controllo sta QUI e non nell'attribuzione perche' e' la difesa che
+        // regge anche quando l'attribuzione sbaglia: sono due difetti distinti,
+        // e questo e' quello che costa poche righe.
+        if crate::project_workspace::services::is_protected_nexus_listener(
+            b.pid,
+            b.port,
+            std::process::id(),
+        ) {
+            tracing::warn!(
+                pid = b.pid,
+                port = b.port,
+                project_id = %project_id,
+                program = %b.program,
+                "port_enforcer: porta non autorizzata ma listener PROTETTO (infrastruttura Nexus o processo proprio): non terminato"
+            );
+            continue;
+        }
+
         let (bucket, bucket_end) = project_bucket_range(&project_id);
 
         current_violations.push((project_id, b.port as f64));

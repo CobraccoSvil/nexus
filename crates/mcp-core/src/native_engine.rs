@@ -1141,6 +1141,12 @@ async fn load_final_gate_config(db: &PgPool, project_id: Option<Uuid>) -> FinalG
         (true, Some(pid)) => load_configured_endpoint_criteria(db, pid, endpoint_timeout_s).await,
         _ => Vec::new(),
     };
+    // Origine del frontend, per provare gli endpoint ANCHE attraverso di esso
+    // (regola G: il nodo non legge il DB, la risoluzione sta qui).
+    let origine_frontend = match (endpoint_check_enabled, project_id) {
+        (true, Some(pid)) => load_origine_frontend(db, pid).await,
+        _ => None,
+    };
     // Criteri COMANDO (ADR 0036): la catena per-ambiente arriva dal profilo
     // inferito da LLM (`verify_profile::ensure_profile`), risolta in
     // `run_engine` e innestata in `verify_steps` DOPO questo loader (serve
@@ -1190,6 +1196,7 @@ async fn load_final_gate_config(db: &PgPool, project_id: Option<Uuid>) -> FinalG
         endpoint_criteria,
         endpoint_check_enabled,
         endpoint_timeout_s,
+        origine_frontend,
         design_verify_enabled: setting_bool(
             db,
             "agent.final_gate.design_verify_enabled",
@@ -1235,6 +1242,42 @@ async fn load_final_gate_config(db: &PgPool, project_id: Option<Uuid>) -> FinalG
 ///
 /// La TRADUZIONE della riga sta in [`criterion_from_http_spec`], che e' pura e si
 /// esercita senza un DB addosso.
+/// Origine HTTP del servizio FRONTEND del progetto, se ne esiste uno con una
+/// porta allocata.
+///
+/// La porta viene dal REGISTRO (`nexus_port_allocations`), non da un processo
+/// osservato: e' la stessa riga su cui il resto del sistema lega unit e
+/// servizio, quindi la prova d'integrazione interroga l'indirizzo che il
+/// progetto DICHIARA di usare. Il riconoscimento della label riusa il
+/// vocabolario del punto unico (`similar_service_labels`): «frontend», «web»,
+/// «ui» sono lo stesso RUOLO, e inseguirne le varianti qui sarebbe la toppa
+/// che la regola H vieta.
+///
+/// `None` quando non c'e' un frontend, o quando il DB non risponde: senza una
+/// porta non si prova nulla. Un host indovinato darebbe un rosso che parla di
+/// un servizio inesistente, cioe' peggio del silenzio.
+async fn load_origine_frontend(db: &PgPool, project_id: Uuid) -> Option<String> {
+    let righe: Vec<(i32, String)> = sqlx::query_as(
+        "SELECT port, label FROM nexus_port_allocations WHERE project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_all(db)
+    .await
+    .inspect_err(|e| {
+        tracing::warn!(
+            target: "mcp_core::native_engine",
+            error = %e,
+            %project_id,
+            "porte del progetto non leggibili: nessuna prova d'integrazione col frontend"
+        );
+    })
+    .unwrap_or_default();
+    righe
+        .into_iter()
+        .find(|(_, label)| crate::agent_processes::similar_service_labels(label, "frontend"))
+        .map(|(port, _)| format!("http://127.0.0.1:{port}"))
+}
+
 async fn load_configured_endpoint_criteria(
     db: &PgPool,
     project_id: Uuid,
