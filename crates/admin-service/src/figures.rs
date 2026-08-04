@@ -73,7 +73,7 @@ const MUTATOR_TOOLS_KEY: &str = "agent.tools.result_cache_mutators";
 /// Tool di chiusura strutturata di una figura advisory (gemello di
 /// `review_verdict`/`debate_position`): senza, la figura parlerebbe in prosa e
 /// nessun aggregatore potrebbe contarne il verdetto.
-const ADVISORY_VERDICT_TOOL: &str = "advisory_verdict";
+use nexus_types::figure_advisory::ADVISORY_VERDICT_TOOL;
 
 /// Categoria dei prompt di sub-agente in `nexus_prompt_templates`
 /// (CHECK mig 0035: system|quality|automation). Le figure seedate (0546/0554/
@@ -268,13 +268,11 @@ pub fn missing_prompt_sections(content: &str) -> Vec<&'static str> {
 /// Tool della whitelist che MUTANO stato, dato l'elenco autoritativo letto dal
 /// setting `agent.tools.result_cache_mutators`. Stesso test di appartenenza di
 /// `hitl::is_mutator_tool_name`; la LISTA e' la stessa riga di DB.
-pub fn mutator_tools_in(tools: &[String], mutator_tools: &[String]) -> Vec<String> {
-    tools
-        .iter()
-        .filter(|t| mutator_tools.iter().any(|m| m == *t))
-        .cloned()
-        .collect()
-}
+///
+/// Re-export dal punto unico (regola L): la stessa domanda la pone anche la
+/// CONVOCAZIONE delle figure del Consiglio, e due copie divergerebbero — e' gia'
+/// successo, con l'esito descritto in [`nexus_types::figure_advisory`].
+pub use nexus_types::figure_advisory::mutator_tools_in;
 
 /// Tutti i rifiuti che NON richiedono il DB, in ordine deterministico.
 /// `mutator_tools` arriva dal chiamante (regola G: la config e' un parametro,
@@ -282,6 +280,9 @@ pub fn mutator_tools_in(tools: &[String], mutator_tools: &[String]) -> Vec<Strin
 /// Contratto della figura ADVISORY: dichiara il verdetto sul proprio canale e
 /// non muta lo stato. Sono due facce della stessa promessa ("analizza, non
 /// esegue"), percio' condividono il codice d'errore.
+/// I due rifiuti restano separati per dire al wizard COSA manca, ma il criterio
+/// e' quello del punto unico: `is_advisory_kind` risponde si' esattamente quando
+/// nessuno dei due rami qui sotto scatta.
 fn validate_advisory_readonly(
     req: &FigureRequest,
     mutator_tools: &[String],

@@ -19,6 +19,10 @@ pub mod code_files;
 pub mod db_error;
 pub mod documents_dto;
 pub mod error_presentation;
+// «Questa figura da' un parere o mette le mani nel codice?» (punto unico,
+// regola L): il contratto advisory, condiviso fra chi crea le figure e chi le
+// convoca.
+pub mod figure_advisory;
 pub mod gateway_client;
 pub mod git_exec;
 pub mod llm_json;

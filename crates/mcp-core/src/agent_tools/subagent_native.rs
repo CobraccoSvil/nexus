@@ -1,4 +1,4 @@
-//! Orchestrazione NATIVA dei sub-agenti (porting Rust di `/agent/subagent-run`).
+﻿//! Orchestrazione NATIVA dei sub-agenti (porting Rust di `/agent/subagent-run`).
 //!
 //! Verso zero-Python: prima `dispatch_subagent` (in `nexus-agent-tools`) chiamava
 //! l'endpoint REST `POST /agent/subagent-run` del brain Python, che eseguiva un
@@ -215,6 +215,40 @@ pub async fn convocable_kinds(db: &sqlx::PgPool) -> Vec<String> {
     .fetch_all(db)
     .await
     .unwrap_or_default()
+}
+
+/// I kind che possono essere convocati per dare un PARERE: `tool_whitelist` con
+/// il canale del verdetto e senza tool che mutano lo stato.
+///
+/// Distinta da [`convocable_kinds`] per costruzione, perche' le due domande sono
+/// diverse: quella risponde a «cosa puo' dispatchare il modello» e deve
+/// comprendere le scrittrici — passano da `tool_dispatch_subagents`, che
+/// serializza e da' a ciascuna un mandato proprio. Qui il mandato e' il testo
+/// utente integrale, uguale per tutte.
+///
+/// Il criterio e' il punto unico (regola L); il vocabolario dei mutatori e' la
+/// stessa riga di settings che governa il gate HITL.
+async fn advisory_kinds(db: &sqlx::PgPool) -> Vec<String> {
+    let mutatori = nexus_auth::get_csv_setting(db, "agent.tools.result_cache_mutators").await;
+    // Vocabolario assente: non si puo' dire chi muta, quindi non si puo' dire
+    // chi e' advisory. Meglio nessun filtro che un filtro cieco che escluda
+    // tutti (regola Q: l'ignoto non degrada a "nessuno").
+    if mutatori.is_empty() {
+        tracing::warn!(
+            "advisory_kinds: 'agent.tools.result_cache_mutators' vuoto, filtro advisory non applicato"
+        );
+        return Vec::new();
+    }
+    sqlx::query_as::<_, (String, Vec<String>)>(
+        "SELECT kind, tool_whitelist FROM nexus_subagent_definitions WHERE is_enabled",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .filter(|(_, tools)| nexus_types::figure_advisory::is_advisory_kind(tools, &mutatori))
+    .map(|(kind, _)| kind)
+    .collect()
 }
 
 /// Risolve il system_text del sub-agente dal registry prompt (`nexus_prompt_templates`,
@@ -1290,6 +1324,19 @@ pub(crate) struct CouncilConfig {
     pub domain_axes: Vec<CouncilDomainAxis>,
     /// Cap del numero di figure convocate (`orchestrator.council_max_figures`).
     pub max_figures: usize,
+    /// Chi puo' essere convocato per dare un PARERE: i kind la cui
+    /// `tool_whitelist` supera [`nexus_types::figure_advisory::is_advisory_kind`].
+    ///
+    /// E' una domanda DIVERSA da `convocable_kinds` («cosa puo' dispatchare il
+    /// modello»), che deve continuare a comprendere le figure scrittrici: quelle
+    /// passano da `tool_dispatch_subagents`, che serializza le scritture e
+    /// riceve un mandato proprio. Qui il mandato e' il testo utente integrale,
+    /// identico per tutte, e una scrittrice lo esegue invece di commentarlo.
+    ///
+    /// Vuoto = nessun filtro applicabile (roster non leggibile): il Consiglio
+    /// resta come prima invece di azzerarsi, perche' un DB muto non e' una
+    /// dichiarazione che nessuna figura sia advisory.
+    pub advisory_kinds: Vec<String>,
 }
 
 /// Un asse d'ambito del consiglio: keyword che lo attivano + figure che convoca.
@@ -1596,6 +1643,7 @@ pub(crate) async fn read_council_config(db: &sqlx::PgPool) -> CouncilConfig {
         base_figures: base,
         domain_axes,
         max_figures,
+        advisory_kinds: advisory_kinds(db).await,
     }
 }
 
@@ -1634,8 +1682,16 @@ pub(crate) fn select_council_figures(
     target: Option<usize>,
     declared_competencies: Option<&[String]>,
 ) -> Vec<String> {
+    // Chi si convoca per un PARERE deve saperne dare uno e non mettere le mani
+    // nel codice. Il classificatore dichiara le competenze PERTINENTI al task —
+    // e su «crea un'applicazione» sono pertinenti proprio le figure che
+    // scrivono — ma pertinenza non e' titolo a partecipare: qui si compone un
+    // parere, non si esegue il lavoro.
+    //
+    // Roster vuoto = non leggibile: nessun filtro, il Consiglio resta com'era.
+    let ammessa = |f: &str| cfg.advisory_kinds.is_empty() || cfg.advisory_kinds.iter().any(|a| a == f);
     let push = |f: &String, figures: &mut Vec<String>| {
-        if !f.is_empty() && !figures.iter().any(|e| e == f) {
+        if !f.is_empty() && ammessa(f) && !figures.iter().any(|e| e == f) {
             figures.push(f.clone());
         }
     };
@@ -7342,6 +7398,7 @@ mod tests {
                 axis("infra", &["deploy", "docker"], &["sysadmin"]),
                 axis("ui", &["interfaccia", "pagina"], &["ui_ux_designer"]),
             ],
+            advisory_kinds: Vec::new(),
             max_figures: 6,
         }
     }
@@ -7415,6 +7472,7 @@ mod tests {
         let cfg = CouncilConfig {
             base_figures: vec!["functional_analyst".to_string()],
             domain_axes: vec![axis("ui", &["pagina"], &["ui_ux_designer", "functional_analyst"])],
+            advisory_kinds: Vec::new(),
             max_figures: 1,
         };
         let got = select_council_figures("sistema la pagina", &cfg, Some(5), None);
@@ -7440,6 +7498,7 @@ mod tests {
                 &["deploy"],
                 &["security_engineer", "sysadmin"],
             )],
+            advisory_kinds: Vec::new(),
             max_figures: 2,
         };
         let got = select_council_figures("deploy dell'app", &cfg, None, None);
@@ -7549,9 +7608,89 @@ mod tests {
         let cfg = CouncilConfig {
             base_figures: vec![],
             domain_axes: vec![],
+            advisory_kinds: Vec::new(),
             max_figures: 6,
         };
         assert!(select_council_figures("qualunque testo", &cfg, None, None).is_empty());
+    }
+
+    // ─── Chi si convoca per un parere non mette le mani nel codice ───────────
+
+    /// IL CASO MISURATO il 04/08/2026 su prenotazioni-sala.
+    ///
+    /// Il classificatore aveva dichiarato pertinenti — e lo erano — le figure
+    /// che sanno costruire un'applicazione. Convocate come Consiglio, hanno
+    /// ricevuto il testo utente integrale come mandato (un solo md5 su otto
+    /// sub-run) e l'hanno ESEGUITO: 107 file scritti, ciascuna il proprio
+    /// stack. Sul disco sono finiti `backend/Cargo.toml` e
+    /// `backend/package.json` nella stessa cartella, e l'app non e' partita.
+    ///
+    /// MUTAZIONE: togliere `ammessa(f) &&` dalla closure `push` in
+    /// `select_council_figures` fa rosseggiare questa asserzione con i quattro
+    /// nomi delle scrittrici nel risultato — gli stessi delle 107 scritture.
+    #[test]
+    fn le_figure_che_scrivono_non_entrano_nel_consiglio() {
+        let cfg = CouncilConfig {
+            base_figures: vec!["functional_analyst".to_string()],
+            domain_axes: vec![],
+            // Il roster reale: le otto advisory misurate in DB.
+            advisory_kinds: [
+                "functional_analyst",
+                "program_manager",
+                "project_manager",
+                "provider_analyst",
+                "security_engineer",
+                "software_architect",
+                "sysadmin",
+                "ui_ux_designer",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            max_figures: 6,
+        };
+        // Cio' che il classificatore aveva dichiarato quel giorno.
+        let dichiarate: Vec<String> = [
+            "db_architect",
+            "frontend_implementer",
+            "implement",
+            "test_author",
+            "software_architect",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let got = select_council_figures(
+            "Crea un'applicazione web per prenotare le sale riunioni di un ufficio.",
+            &cfg,
+            None,
+            Some(&dichiarate),
+        );
+        for scrittrice in ["db_architect", "frontend_implementer", "implement", "test_author"] {
+            assert!(
+                !got.iter().any(|f| f == scrittrice),
+                "{scrittrice} scrive codice: non puo' sedere in un consiglio consultivo. Ottenuto: {got:?}"
+            );
+        }
+        assert!(
+            got.iter().any(|f| f == "software_architect"),
+            "le figure advisory dichiarate restano: {got:?}"
+        );
+    }
+
+    /// Roster non leggibile (DB muto, vocabolario mutatori assente): nessun
+    /// filtro. Un'assenza di dati non e' la dichiarazione che nessuna figura sia
+    /// advisory, e azzerare il Consiglio sarebbe spegnerlo di nascosto.
+    #[test]
+    fn roster_advisory_vuoto_non_azzera_il_consiglio() {
+        let cfg = council_cfg();
+        assert!(cfg.advisory_kinds.is_empty());
+        let dichiarate = vec!["db_architect".to_string()];
+        let got = select_council_figures("qualunque testo", &cfg, None, Some(&dichiarate));
+        assert!(
+            got.iter().any(|f| f == "db_architect"),
+            "senza roster il comportamento resta quello di prima: {got:?}"
+        );
     }
 
     // ─── Competenze dichiarate dal classificatore governano al posto delle keyword ───
