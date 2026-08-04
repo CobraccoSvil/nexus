@@ -7180,10 +7180,18 @@ async fn build_native_deps(state: &AppState) -> crate::native_engine::NativeDeps
     // Client gateway dalla porta nel DB (regola G/L: punto unico del cablaggio).
     let gateway = crate::nexus_gateway::NexusGatewayClient::from_db(&state.db).await;
 
+    // Gate duale sui passi critici (mig 0677): l'adapter si cabla solo se il
+    // mode non e' `off` — a gate spento il ctx porta None e il dispatch resta
+    // bit-identico.
+    let step_gate =
+        crate::agent_graph_adapter::step_validation::build_step_gate(&state.db, gateway.clone())
+            .await;
+
     crate::native_engine::NativeDeps {
         db: state.db.clone(),
         tool_runner_deps,
         gateway,
+        step_gate,
     }
 }
 

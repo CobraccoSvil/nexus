@@ -170,6 +170,14 @@ pub struct NativeDeps {
     /// Client del gateway LLM (HTTP verso il Nexus LLM Gateway, catena Fallback
     /// DB-driven). Provider/model arrivano gia' risolti nella richiesta.
     pub gateway: NexusGatewayClient,
+    /// Gate duale sui passi critici (mig 0677): SETUP armato da
+    /// `build_native_deps` quando `orchestrator.critical_step_gate_mode` non
+    /// e' `off`; `None` = gate non cablato (ramo legacy bit-identico). E' un
+    /// setup e non la porta finita perche' l'identita' contabile del run
+    /// (project/user per il ledger) e il provider ESECUTORE (su cui vale il
+    /// veto «giudice != worker») si conoscono solo in `run_engine`: la porta
+    /// si finalizza li', dalla stessa fonte del `GatewayLlmAdapter` del ctx.
+    pub step_gate: Option<std::sync::Arc<crate::agent_graph_adapter::step_validation::StepGateSetup>>,
 }
 
 /// Parametri di un run nativo, gia' RISOLTI a monte dal call site (lo stesso
@@ -2254,23 +2262,16 @@ async fn load_tool_dispatch_config(
     fs_mutator_tools: Vec<String>,
 ) -> ToolDispatchConfig {
     let d = ToolDispatchConfig::default();
+    let (step_gate_mode, step_gate_rules, step_gate_max_rejections) =
+        load_step_gate_dispatch(db, d.step_gate_max_rejections).await;
+    let (tool_result_max_chars, attachment_budget_bytes) =
+        load_dispatch_limits(db, provider, model, &d).await;
     ToolDispatchConfig {
         predictive_cap_ratio: load_predictive_cap_ratio(db, d.predictive_cap_ratio).await,
         // Gia' risolto a monte dal catalog (`resolve_context_window`).
         context_window,
-        tool_result_max_chars: resolve_tool_result_max_chars(
-            db,
-            provider,
-            model,
-            d.tool_result_max_chars,
-        )
-        .await,
-        attachment_budget_bytes: setting_i64(
-            db,
-            "agent.attachment.session_read_budget_bytes",
-            d.attachment_budget_bytes,
-        )
-        .await,
+        tool_result_max_chars,
+        attachment_budget_bytes,
         // NON cablato su `agent.tools.discovery_first_enabled` (true in DB), e la
         // costante e' una DECISIONE dichiarata, non un default ereditato.
         //
@@ -2330,7 +2331,57 @@ async fn load_tool_dispatch_config(
         // CLAMP alla deadline residua del run (fase 3): una barriera che attende
         // oltre la deadline produrrebbe un `time_budget` mascherato da gate.
         advisory_gate_timeout_s: advisory_gate_timeout(db).await,
+        step_gate_mode,
+        step_gate_rules,
+        step_gate_max_rejections,
     }
+}
+
+/// I due limiti dimensionali del dispatch (cap del singolo tool_result dalla
+/// capability del modello + budget letture allegati della sessione).
+async fn load_dispatch_limits(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    d: &ToolDispatchConfig,
+) -> (usize, i64) {
+    let tool_result_max_chars =
+        resolve_tool_result_max_chars(db, provider, model, d.tool_result_max_chars).await;
+    let attachment_budget_bytes = setting_i64(
+        db,
+        "agent.attachment.session_read_budget_bytes",
+        d.attachment_budget_bytes,
+    )
+    .await;
+    (tool_result_max_chars, attachment_budget_bytes)
+}
+
+/// I tre campi del gate duale (mig 0677) per la [`ToolDispatchConfig`]. Il
+/// mode passa dallo stesso parse dell'adapter (`load_mode`, punto unico del
+/// vocabolario); le regole rotte sono scartate una a una con WARN da
+/// `parse_rules`.
+async fn load_step_gate_dispatch(
+    db: &PgPool,
+    default_max_rejections: u32,
+) -> (
+    nexus_agent_graph::decisions::step_gate::StepGateMode,
+    Vec<nexus_agent_graph::decisions::step_gate::CriticalityRule>,
+    u32,
+) {
+    let mode = crate::agent_graph_adapter::step_validation::load_mode(db).await;
+    let rules = nexus_agent_graph::decisions::step_gate::parse_rules(
+        &nexus_auth::get_setting(db, "orchestrator.critical_step_rules")
+            .await
+            .unwrap_or_default(),
+    );
+    let max_rejections = setting_i64(
+        db,
+        "orchestrator.critical_step_max_rejections",
+        i64::from(default_max_rejections),
+    )
+    .await
+    .max(0) as u32;
+    (mode, rules, max_rejections)
 }
 
 /// Costruisce la [`ClarifyConfig`] DB-driven (regola G, prefisso `clarify.`).
@@ -2642,6 +2693,11 @@ async fn build_native_engine(
     // planner (Fase C3 Part B); `false` di default -> ParallelIsolated degrada a
     // Sequential (invariato).
     bool,
+    // Porta del gate duale sui passi critici (mig 0677), gia' FINALIZZATA con
+    // l'identita' contabile del run (stessa coppia del GatewayLlmAdapter) e il
+    // provider ESECUTORE del turno (veto «giudice != worker»). `None` = gate
+    // spento, ramo legacy bit-identico.
+    Option<Arc<dyn nexus_agent_graph::runtime::ports::StepValidationPort>>,
 )> {
     let db = deps.db.clone();
 
@@ -2677,31 +2733,44 @@ async fn build_native_engine(
     // ── Porte I/O concrete ────────────────────────────────────────────────────
     // Gateway LLM: GatewayLlmAdapter REAL (provider/model gia' risolti, il client
     // non re-instrada).
-    let llm: Arc<dyn LlmGateway> = {
-        // Identita' del run per il ledger di billing: ricavata dalla sessione
-        // (chat_sessions.project_id/user_id). Senza, il gateway scarta la
-        // registrazione usage (record_usage_to_ledger esce su tenant vuoto) e
-        // il costo risulta sempre 0. Lettura puntuale (una volta per run).
-        let (proj_id, usr_id) = sqlx::query_as::<_, (Option<Uuid>, Option<Uuid>)>(
-            "SELECT project_id, user_id FROM chat_sessions WHERE id = $1",
+    // Identita' del run per il ledger di billing: ricavata dalla sessione
+    // (chat_sessions.project_id/user_id). Senza, il gateway scarta la
+    // registrazione usage (record_usage_to_ledger esce su tenant vuoto) e
+    // il costo risulta sempre 0. Lettura puntuale (una volta per run), UNICA
+    // per i due consumatori che pagano con quell'identita': il GatewayLlmAdapter
+    // del ctx e il gate duale sui passi critici.
+    let (proj_id, usr_id) = sqlx::query_as::<_, (Option<Uuid>, Option<Uuid>)>(
+        "SELECT project_id, user_id FROM chat_sessions WHERE id = $1",
+    )
+    .bind(input.session_id)
+    .fetch_optional(&run_db)
+    .await
+    .ok()
+    .flatten()
+    .map(|(p, u)| {
+        (
+            p.map(|x| x.to_string()).unwrap_or_default(),
+            u.map(|x| x.to_string()).unwrap_or_default(),
         )
-        .bind(input.session_id)
-        .fetch_optional(&run_db)
-        .await
-        .ok()
-        .flatten()
-        .map(|(p, u)| {
-            (
-                p.map(|x| x.to_string()).unwrap_or_default(),
-                u.map(|x| x.to_string()).unwrap_or_default(),
-            )
-        })
-        .unwrap_or_default();
+    })
+    .unwrap_or_default();
+    // Gate duale sui passi critici (mig 0677): il setup armato dai deps si
+    // finalizza con la STESSA identita' contabile dell'adapter LLM e col
+    // provider ESECUTORE del turno (veto «giudice != worker»).
+    let step_gate = deps.step_gate.as_ref().map(|setup| {
+        crate::agent_graph_adapter::step_validation::adapter(
+            setup.clone(),
+            proj_id.clone(),
+            usr_id.clone(),
+            input.provider.clone(),
+        )
+    });
+    let llm: Arc<dyn LlmGateway> = {
         Arc::new(GatewayLlmAdapter::new(
             deps.gateway.clone(),
             deps.db.clone(),
-            proj_id,
-            usr_id,
+            proj_id.clone(),
+            usr_id.clone(),
         ))
     };
 
@@ -3105,7 +3174,15 @@ async fn build_native_engine(
         supervisor_cfg,
         checkpointer,
     );
-    Ok((engine, routing_cfg, llm, tools, emit, isolation_available))
+    Ok((
+        engine,
+        routing_cfg,
+        llm,
+        tools,
+        emit,
+        isolation_available,
+        step_gate,
+    ))
 }
 
 /// Risolve `(project_id, repository_root_path)` di una sessione. PUNTO UNICO
@@ -3659,7 +3736,7 @@ async fn run_engine(
     input: &NativeRunInput,
     mode: RunMode,
 ) -> anyhow::Result<StepOutcome<AgentState>> {
-    let (engine, routing_cfg, llm, tools, emit, isolation_available) =
+    let (engine, routing_cfg, llm, tools, emit, isolation_available, step_gate) =
         build_native_engine(deps, input).await?;
 
     let ctx = AgentNodeCtx {
@@ -3679,6 +3756,10 @@ async fn run_engine(
         // chiamante ha avviato il run PRIMA dei panel. `None` = ramo classico
         // (verdetti gia' nello stato iniziale) -> gate inerte, bit-identico.
         advisory_gate: input.advisory_gate.clone(),
+        // Gate duale sui passi critici (mig 0677): porta gia' finalizzata da
+        // `build_native_engine` con l'identita' contabile del run e il provider
+        // esecutore. `None` = ramo legacy bit-identico.
+        step_gate,
     };
 
     // Avvio nuovo: parte da `entry` con l'initial_state dal prompt.

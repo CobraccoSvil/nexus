@@ -5154,10 +5154,20 @@ async fn build_native_deps_for_tool(ctx: &AgentToolContext, run_timeout_s: i64) 
         u64::try_from(run_timeout_s).ok().filter(|&s| s > 0),
     )
     .await;
+    // Anche i SUB-RUN portano il gate duale: l'apply del worktree copre solo
+    // le mutazioni FILE, mentre stop di servizi, kill di processi e SQL
+    // distruttivo eseguiti da un figlio colpiscono il sistema reale
+    // direttamente (incidente misurato: mcp-core ucciso 845 volte da agenti
+    // di progetto). Nessuna ricorsione: i validatori sono chiamate one-shot,
+    // non sub-run. Rationale precedente («i passi critici dei figli arrivano
+    // dall'albero del padre all'apply») refutato dalla review del 05/08.
+    let step_gate =
+        crate::agent_graph_adapter::step_validation::build_step_gate(&db, gateway.clone()).await;
     NativeDeps {
         db,
         tool_runner_deps,
         gateway,
+        step_gate,
     }
 }
 

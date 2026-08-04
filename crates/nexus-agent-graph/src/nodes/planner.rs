@@ -2109,6 +2109,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
             advisory_gate: None,
+        step_gate: None,
         }
     }
 

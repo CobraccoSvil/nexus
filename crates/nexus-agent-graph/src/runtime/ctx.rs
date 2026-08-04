@@ -64,6 +64,11 @@ pub struct AgentNodeCtx {
     /// MUTATIVO attende che la barriera si sciolga. E' un `watch`: leggerlo non
     /// consuma nulla, e chi arriva tardi vede subito l'ultimo stato.
     pub advisory_gate: Option<tokio::sync::watch::Receiver<crate::nodes::AdvisoryGateState>>,
+    /// Gate duale sui passi CRITICI (mig 0677): la porta che sottopone un
+    /// batch classificato Critical/Irreversible a DUE validatori su provider
+    /// distinti dall'esecutore. `None` = gate non cablato: ramo legacy
+    /// bit-identico (stesso contratto di `advisory_gate`).
+    pub step_gate: Option<Arc<dyn crate::runtime::ports::StepValidationPort>>,
 }
 
 /// Adattatore al motore di grafo (`nexus_graph::GraphEngine`): il motore richiede

@@ -69,4 +69,5 @@ pub mod review_panel;
 //     MutationProgressPort (sopra `file_mutations`, hash del contenuto) ---
 pub mod mutation_progress;
 pub mod llm_gateway;
+pub mod step_validation;
 pub mod tool_executor;

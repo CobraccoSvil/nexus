@@ -114,8 +114,8 @@ use crate::decisions::tool_dispatch::{
 use crate::decisions::{build_m16_allowed, is_tool_allowed, merge_discovered_run, M16_META_TOOLS};
 use crate::py_json::{py_json_dumps, SortKeys};
 use crate::runtime::ports::{
-    AgentStepStore, ContextOffload, MetaStepStore, OffloadKind, PersistedStep, RunControlStore,
-    SseEvent, StepStatus, TodoStore, ToolCall, ToolExecutor,
+    self as ports, AgentStepStore, ContextOffload, MetaStepStore, OffloadKind, PersistedStep,
+    RunControlStore, SseEvent, StepStatus, TodoStore, ToolCall, ToolExecutor,
 };
 use crate::runtime::AgentNodeCtx;
 use crate::state::{AgentState, Message, MessageContent, MetaStep, StateDelta, StopReason};
@@ -123,6 +123,16 @@ use crate::state::{AgentState, Message, MessageContent, MetaStep, StateDelta, St
 /// Tool brain-only `task_complete` (`TASK_COMPLETE_TOOL_NAME`, helpers.py:413):
 /// non eseguito via ToolExecutor, registra l'esito dichiarato.
 const TASK_COMPLETE_TOOL_NAME: &str = "task_complete";
+
+/// Cap di default (byte) dello schema di un tool scoperto via M16: oltre, lo
+/// schema si scarta (safe-default identico al brain; il valore vero e' il
+/// setting `agent.tools.discovery_schema_max_bytes`).
+const DEFAULT_DISCOVERY_SCHEMA_MAX_BYTES: usize = 8192;
+
+/// Attesa di default (s) della barriera advisory = il timeout tipico di un
+/// panel a monte (mig 0546: 240-300s per figura). Vale solo se il DB tace; il
+/// valore vero e' `orchestrator.advisory_gate_timeout_s` (mig 0606).
+const DEFAULT_ADVISORY_GATE_TIMEOUT_S: u64 = 300;
 
 /// Tool brain-only `nexus_run_notes` (`RUN_NOTES_TOOL_NAME`, helpers.py:450):
 /// aggiorna il taccuino del run nello stato, non eseguito via ToolExecutor.
@@ -312,6 +322,18 @@ pub struct ToolDispatchConfig {
     /// clampa alla deadline residua del run: una barriera che attende oltre la
     /// deadline produrrebbe un `time_budget` mascherato da gate.
     pub advisory_gate_timeout_s: u64,
+    /// Mode del gate duale sui passi critici
+    /// (`orchestrator.critical_step_gate_mode`, mig 0677). `Off` = passo 2a
+    /// inerte, dispatch bit-identico.
+    pub step_gate_mode: crate::decisions::step_gate::StepGateMode,
+    /// Regole di criticita' gia' PARSE a monte
+    /// (`orchestrator.critical_step_rules`, JSON in settings; le voci rotte
+    /// sono gia' state scartate una a una con WARN da `parse_rules`).
+    pub step_gate_rules: Vec<crate::decisions::step_gate::CriticalityRule>,
+    /// Rimandi massimi del gate duale prima di degradare a NeedsHuman
+    /// (`orchestrator.critical_step_max_rejections`): il cap anti ping-pong
+    /// fra modello e validatori.
+    pub step_gate_max_rejections: u32,
 }
 
 impl Default for ToolDispatchConfig {
@@ -329,16 +351,17 @@ impl Default for ToolDispatchConfig {
                 "nexus_mcp_tool_call".to_string(),
             ],
             always_on_tools: Vec::new(),
-            discovery_schema_max_bytes: 8192,
+            discovery_schema_max_bytes: DEFAULT_DISCOVERY_SCHEMA_MAX_BYTES,
             todo_reminder_every_n_steps: 5,
             max_context_chars: crate::decisions::tool_dispatch::MAX_CONTEXT_CHARS,
             fs_mutator_tools: crate::routing::RoutingConfig::default()
                 .fs_mutator_tools
                 .clone(),
-            // Safe-default = il timeout tipico di un panel a monte (mig 0546:
-            // 240-300s per figura). Vale solo se il DB tace; il valore vero e'
-            // orchestrator.advisory_gate_timeout_s (mig 0606).
-            advisory_gate_timeout_s: 300,
+            advisory_gate_timeout_s: DEFAULT_ADVISORY_GATE_TIMEOUT_S,
+            // Gate duale spento di default: si accende SOLO dal DB (mig 0677).
+            step_gate_mode: crate::decisions::step_gate::StepGateMode::Off,
+            step_gate_rules: Vec::new(),
+            step_gate_max_rejections: 2,
         }
     }
 }
@@ -367,6 +390,10 @@ enum MotivoBlocco {
     /// task_complete ripetuto nello stesso turno (mig 0676, GAP-9): la
     /// dichiarazione e' terminale, la seconda e' un'anomalia dichiarata.
     DichiarazioneRipetuta,
+    /// Gate duale sui passi critici (mig 0677): almeno un validatore ha
+    /// rifiutato il batch. Il tool_result porta i motivi e l'eventuale
+    /// alternativa piu' sicura: e' un rimando al modello, mai una chiusura.
+    StepGateRejected,
 }
 
 /// Esito di UNA tool_result, prima della ricomposizione nell'ordine dei pending.
@@ -998,6 +1025,18 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
         // Heartbeat best-effort (anti-recovery prematuro).
         let _ = self.run_control.heartbeat(&run_id).await;
 
+        // ── (2a) GATE DUALE sui passi critici (mig 0677) ──────────────────────
+        // PRIMA di HITL (2b): le macchine filtrano, l'umano vede il filtrato
+        // coi verdetti allegati. In Confirm il costo di validare un passo che
+        // l'umano potrebbe bocciare e' accettato (rilievo A3: i critici sono
+        // pochi per run); in Automatic e' l'unica barriera sui passi critici.
+        if let Some(delta) = self
+            .step_gate_barrier(state, &pending, ctx, &run_id)
+            .await
+        {
+            return Ok(delta);
+        }
+
         // ── (2b) HITL Conferma: sospensione strutturale prima dei mutators ───
         if should_suspend_for_hitl(
             state.automation_mode,
@@ -1141,11 +1180,39 @@ impl ToolDispatchNode {
     /// (interrupt-resume prima dell'executor, parita' graph.py). NESSUN tool
     /// eseguito.
     fn hitl_suspend_delta(&self, state: &AgentState, pending: &[Value]) -> OpaqueDelta {
+        self.hitl_suspend_delta_con_validazioni(state, pending, None)
+    }
+
+    /// Come [`Self::hitl_suspend_delta`], con i verdetti del gate duale
+    /// allegati quando la sospensione nasce da un suo `NeedsHuman`: l'umano
+    /// decide VEDENDO cosa hanno detto i validatori (chiave
+    /// [`step_gate::STEP_GATE_VERDICTS_EXTRA_KEY`]), anche in Automatic.
+    fn hitl_suspend_delta_con_validazioni(
+        &self,
+        state: &AgentState,
+        pending: &[Value],
+        step_validations: Option<Value>,
+    ) -> OpaqueDelta {
         let actions = build_pending_actions_json(pending, &self.cfg.fs_mutator_tools);
         let mut extra = state.extra.clone();
         extra.insert(
             HITL_PENDING_ACTIONS_EXTRA_KEY.to_string(),
             Value::Array(actions),
+        );
+        if let Some(v) = step_validations {
+            extra.insert(
+                crate::decisions::step_gate::STEP_GATE_VERDICTS_EXTRA_KEY.to_string(),
+                v,
+            );
+        }
+        // Il marker del batch deliberato, su OGNI sospensione HITL: al resume
+        // con approvazione umana gli STESSI id non si ri-validano (la
+        // decisione umana e' finale, rilievo A3 — e per il batch arrivato a
+        // 2b il gate aveva gia' deliberato, essendo 2a a monte); un batch con
+        // id nuovi non matcha e riceve validazione fresca.
+        extra.insert(
+            crate::decisions::step_gate::STEP_GATE_CLEARED_EXTRA_KEY.to_string(),
+            ids_del_batch(pending),
         );
         tracing::info!(
             target: "nexus_agent_graph::tool_dispatch",
@@ -1154,6 +1221,283 @@ impl ToolDispatchNode {
         );
         StateDelta {
             awaiting_confirmation: Some(Some(true)),
+            extra: Some(extra),
+            ..Default::default()
+        }
+        .into_opaque()
+    }
+
+    /// (2a) Gate duale sui passi critici (mig 0677). `None` = si procede (gate
+    /// spento, batch sotto soglia, batch gia' deliberato o validatori
+    /// unanimi); `Some(delta)` = il turno finisce qui (rimando o sospensione).
+    ///
+    /// La decisione umana su un batch e' FINALE (rilievo A3), e il batch e'
+    /// identificato dagli ID (marker [`step_gate::STEP_GATE_CLEARED_EXTRA_KEY`],
+    /// scritto alla sospensione): un batch NUOVO — id nuovi — riceve
+    /// validazione fresca. MAI `state.approved` come corto-circuito: quel flag
+    /// e' seminato a `true` dallo stato iniziale in Automatic/Continuous per
+    /// saltare HITL, e leggerlo qui spegneva il gate proprio nella modalita'
+    /// in cui e' l'unica barriera (review avversaria del 05/08, pre-commit).
+    async fn step_gate_barrier(
+        &self,
+        state: &AgentState,
+        pending: &[Value],
+        ctx: &AgentNodeCtx,
+        run_id: &str,
+    ) -> Option<OpaqueDelta> {
+        use crate::decisions::step_gate::{self, StepGateMode};
+        let mode = self.cfg.step_gate_mode;
+        if mode == StepGateMode::Off {
+            return None;
+        }
+        // Batch gia' deliberato (sospeso e poi approvato dall'umano al
+        // resume): stessi id = stessa decisione, id diversi = batch nuovo.
+        let marker = state.extra.get(step_gate::STEP_GATE_CLEARED_EXTRA_KEY);
+        if marker.is_some() && marker == Some(&ids_del_batch(pending)) {
+            return None;
+        }
+
+        // Classificazione in-memory (costo zero per i batch ordinari).
+        let (level, critici, steps_slim) = self.classifica_batch(pending)?;
+
+        if !mode.convoca(level) {
+            self.osserva_batch(ctx, level, steps_slim).await;
+            return None;
+        }
+
+        let prior_rejections = state
+            .extra
+            .get(step_gate::STEP_GATE_REJECTIONS_EXTRA_KEY)
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+
+        let report = Self::convoca_porta(ctx, state, run_id, critici, level, prior_rejections)
+            .await;
+
+        let (decision, cap_raggiunto) = self.decidi_con_cap(&report, level, prior_rejections);
+        let payload = payload_convocazione(
+            &decision,
+            level,
+            steps_slim,
+            &report,
+            prior_rejections,
+            cap_raggiunto,
+        );
+        crate::nodes::emit_phase_meta(
+            ctx.emit.as_ref(),
+            self.meta_steps.as_ref(),
+            step_gate::STEP_VALIDATION_META_KIND,
+            format!("Gate duale su passo {}: {:?}", level.as_str(), decision),
+            payload.clone(),
+        )
+        .await;
+
+        self.esito_decisione(decision, state, pending, &report, prior_rejections, run_id, payload)
+            .await
+    }
+
+    /// (2a) La CONSEGUENZA della decisione sul flusso del turno: `None` = i
+    /// tool si eseguono; `Some(delta)` = rimando o sospensione.
+    #[allow(clippy::too_many_arguments)]
+    async fn esito_decisione(
+        &self,
+        decision: crate::decisions::step_gate::StepGateDecision,
+        state: &AgentState,
+        pending: &[Value],
+        report: &ports::StepValidationReport,
+        prior_rejections: u32,
+        run_id: &str,
+        payload: Value,
+    ) -> Option<OpaqueDelta> {
+        use crate::decisions::step_gate::StepGateDecision;
+        match decision {
+            StepGateDecision::Approved => None,
+            StepGateDecision::UnavailableDeclared => {
+                tracing::warn!(
+                    target: "nexus_agent_graph::tool_dispatch",
+                    "gate duale senza verdetti utilizzabili su un Critical: si procede DICHIARANDOLO"
+                );
+                None
+            }
+            StepGateDecision::NeedsHuman => Some(self.hitl_suspend_delta_con_validazioni(
+                state,
+                pending,
+                Some(payload),
+            )),
+            StepGateDecision::Rejected => Some(
+                self.step_gate_reject_delta(state, pending, report, prior_rejections, run_id)
+                    .await,
+            ),
+        }
+    }
+
+    /// (2a) Telemetria di taratura (observe / Critical in
+    /// enforce_irreversible): la classificazione si PERSISTE come meta_step,
+    /// il batch procede senza costo LLM.
+    async fn osserva_batch(
+        &self,
+        ctx: &AgentNodeCtx,
+        level: crate::decisions::step_gate::StepCriticality,
+        steps_slim: Vec<Value>,
+    ) {
+        crate::nodes::emit_phase_meta(
+            ctx.emit.as_ref(),
+            self.meta_steps.as_ref(),
+            crate::decisions::step_gate::STEP_VALIDATION_META_KIND,
+            format!("Passo {} osservato dal gate duale", level.as_str()),
+            json!({
+                "decision": "observed",
+                "level": level.as_str(),
+                "steps": steps_slim,
+            }),
+        )
+        .await;
+    }
+
+    /// (2a) Classifica il batch: `None` = sotto soglia (nessun passo >=
+    /// Critical), il gate non ha nulla da dire. Ritorna il livello massimo, i
+    /// passi al livello alto (quelli che i validatori vedono) e la loro forma
+    /// slim per il payload del meta_step.
+    fn classifica_batch(
+        &self,
+        pending: &[Value],
+    ) -> Option<(
+        crate::decisions::step_gate::StepCriticality,
+        Vec<ports::PendingStepInfo>,
+        Vec<Value>,
+    )> {
+        use crate::decisions::step_gate::{self, StepCriticality};
+        let classificati: Vec<step_gate::StepClassification> = pending
+            .iter()
+            .map(|p| {
+                step_gate::classify_step(
+                    p.get("name").and_then(Value::as_str).unwrap_or(""),
+                    p.get("input").unwrap_or(&Value::Null),
+                    &self.cfg.fs_mutator_tools,
+                    &self.cfg.step_gate_rules,
+                )
+            })
+            .collect();
+        let level = classificati.iter().map(|c| c.level).max()?;
+        if level < StepCriticality::Critical {
+            return None;
+        }
+        let critici: Vec<ports::PendingStepInfo> = pending
+            .iter()
+            .zip(&classificati)
+            .filter(|(_, c)| c.level >= StepCriticality::Critical)
+            .map(|(p, c)| ports::PendingStepInfo {
+                tool_use_id: p
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                tool_name: p
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                tool_input: p.get("input").cloned().unwrap_or(Value::Null),
+                matched_category: c.matched_category.clone(),
+            })
+            .collect();
+        let steps_slim: Vec<Value> = critici
+            .iter()
+            .map(|s| json!({"tool_name": s.tool_name, "category": s.matched_category}))
+            .collect();
+        Some((level, critici, steps_slim))
+    }
+
+    /// (2a) La decisione dai verdetti + il cap anti ping-pong: un ennesimo
+    /// rimando non riparte verso il modello, degrada alla decisione umana
+    /// (dichiarato nel payload con `cap_reached`).
+    fn decidi_con_cap(
+        &self,
+        report: &ports::StepValidationReport,
+        level: crate::decisions::step_gate::StepCriticality,
+        prior_rejections: u32,
+    ) -> (crate::decisions::step_gate::StepGateDecision, bool) {
+        use crate::decisions::step_gate::{decide_step_gate, StepGateDecision, StepVerdict};
+        let verdetti: Vec<StepVerdict> = report.verdicts.iter().map(|v| v.verdict).collect();
+        let decision = decide_step_gate(&verdetti, level);
+        let cap_raggiunto = decision == StepGateDecision::Rejected
+            && prior_rejections + 1 >= self.cfg.step_gate_max_rejections.max(1);
+        if cap_raggiunto {
+            (StepGateDecision::NeedsHuman, true)
+        } else {
+            (decision, false)
+        }
+    }
+
+    /// (2a) Convoca la porta. La porta assente con mode acceso e' un report
+    /// vuoto (degrado DICHIARATO): la matrice della doppia astensione decide,
+    /// mai un salto silenzioso.
+    async fn convoca_porta(
+        ctx: &AgentNodeCtx,
+        state: &AgentState,
+        run_id: &str,
+        critici: Vec<ports::PendingStepInfo>,
+        level: crate::decisions::step_gate::StepCriticality,
+        prior_rejections: u32,
+    ) -> ports::StepValidationReport {
+        let Some(gate) = ctx.step_gate.as_ref() else {
+            return report_degradato("porta di validazione non cablata (setup non armato)");
+        };
+        let req = ports::StepValidationRequest {
+            run_id: run_id.to_string(),
+            executor_provider: state.sticky_provider.clone().unwrap_or_default(),
+            steps: critici,
+            level,
+            plan_excerpt: crate::decisions::turn_task::current_turn_task(state)
+                .map(str::to_string),
+            prior_rejections,
+        };
+        match gate.validate(req).await {
+            Ok(r) => r,
+            Err(e) => report_degradato(&format!("porta di validazione in errore: {e}")),
+        }
+    }
+
+    /// Il delta del RIMANDO: nessun tool eseguito, ogni pending riceve un
+    /// tool_result sintetico coi motivi dei validatori (e l'alternativa piu'
+    /// sicura, se proposta). Il turno torna al modello (`ToolUse`), il
+    /// contatore dei rimandi sale nello stato.
+    async fn step_gate_reject_delta(
+        &self,
+        state: &AgentState,
+        pending: &[Value],
+        report: &ports::StepValidationReport,
+        prior_rejections: u32,
+        run_id: &str,
+    ) -> OpaqueDelta {
+        use crate::decisions::step_gate::STEP_GATE_REJECTIONS_EXTRA_KEY;
+        let testo = testo_rimando(report);
+        let results: Vec<ToolResultBlock> = pending
+            .iter()
+            .map(|p| {
+                Self::synthetic_error(
+                    p.get("id").and_then(Value::as_str).unwrap_or_default(),
+                    json!(testo.clone()),
+                    MotivoBlocco::StepGateRejected,
+                )
+            })
+            .collect();
+        // Lo storico conserva i rifiuti come passi persistiti (stesso canale
+        // dei turni normali: `agent_steps` vede il batch respinto).
+        self.persist_turn_steps(run_id, state, pending, &results)
+            .await;
+        let tool_msg = build_tool_message(&results, None, None, None);
+        let tool_steps = build_tool_steps(state, pending, &results);
+        let mut extra = state.extra.clone();
+        extra.insert(
+            STEP_GATE_REJECTIONS_EXTRA_KEY.to_string(),
+            json!(prior_rejections + 1),
+        );
+        StateDelta {
+            messages: Some(vec![tool_msg]),
+            meta_steps: Some(tool_steps),
+            pending_tool_uses: Some(Some(vec![])),
+            stop_reason: Some(Some(StopReason::ToolUse)),
             extra: Some(extra),
             ..Default::default()
         }
@@ -1922,6 +2266,105 @@ pub fn tool_target_from_input(input: &Value) -> Option<String> {
 /// `delta.meta_steps` (canale `add`); l'emissione SSE live + la persistenza DB
 /// sono I/O dell'integrazione (`EventSink`/`MetaStepStore`).
 ///
+/// Gli id di un batch di pending nella forma canonica del marker
+/// anti-rivalidazione (delega a `step_gate::batch_ids` per l'ordinamento).
+fn ids_del_batch(pending: &[Value]) -> Value {
+    let mut ids: Vec<String> = pending
+        .iter()
+        .filter_map(|p| p.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    crate::decisions::step_gate::batch_ids(&mut ids)
+}
+
+/// Un report senza convocati col degrado DICHIARATO (GAP-2: la matrice della
+/// doppia astensione decide, mai un salto silenzioso).
+fn report_degradato(motivo: &str) -> ports::StepValidationReport {
+    ports::StepValidationReport {
+        verdicts: Vec::new(),
+        degraded: Some(motivo.to_string()),
+    }
+}
+
+/// Payload slim del meta_step `step_validation` (i lettori sono il replay SSE
+/// e le query di taratura: per ogni validatore provider, modello,
+/// verdetto|astensione+causa e costo — GAP-2, il denominatore resta visibile).
+fn payload_convocazione(
+    decision: &crate::decisions::step_gate::StepGateDecision,
+    level: crate::decisions::step_gate::StepCriticality,
+    steps_slim: Vec<Value>,
+    report: &ports::StepValidationReport,
+    prior_rejections: u32,
+    cap_raggiunto: bool,
+) -> Value {
+    let validators_slim: Vec<Value> = report
+        .verdicts
+        .iter()
+        .map(|v| {
+            json!({
+                "role": v.role,
+                "provider": v.provider,
+                "model": v.model,
+                "verdict": v.verdict,
+                "abstain_cause": v.abstain_cause,
+                "reasons": v.reasons,
+                "safer_alternative": v.safer_alternative,
+                "cost_usd": v.cost_usd,
+            })
+        })
+        .collect();
+    json!({
+        "decision": decision,
+        "level": level.as_str(),
+        "steps": steps_slim,
+        "validators": validators_slim,
+        "degraded": report.degraded,
+        "prior_rejections": prior_rejections,
+        "cap_reached": cap_raggiunto,
+    })
+}
+
+/// Il testo del rimando del gate duale, composto DAI campi del report (regola
+/// Q, punto 3: renderer struttura->prosa; il consumatore e' il modello).
+fn testo_rimando(report: &ports::StepValidationReport) -> String {
+    use crate::decisions::step_gate::StepVerdict;
+    let mut motivi: Vec<String> = Vec::new();
+    for v in report.verdicts.iter().filter(|v| v.verdict == StepVerdict::Reject) {
+        for r in &v.reasons {
+            motivi.push(format!(
+                "[{}] {} ({})",
+                r.get("severity").and_then(Value::as_str).unwrap_or("-"),
+                r.get("description").and_then(Value::as_str).unwrap_or("-"),
+                v.provider
+            ));
+        }
+    }
+    let mut testo = format!(
+        "Il gate di validazione sui passi critici ha RIFIUTATO questo batch: \
+         nessun tool e' stato eseguito.\nMotivi:\n{}",
+        if motivi.is_empty() {
+            "- (nessun motivo dettagliato riportato)".to_string()
+        } else {
+            motivi
+                .iter()
+                .map(|m| format!("- {m}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    );
+    if let Some(a) = report
+        .verdicts
+        .iter()
+        .find_map(|v| v.safer_alternative.clone())
+    {
+        testo.push_str(&format!("\nAlternativa piu' sicura proposta: {a}"));
+    }
+    testo.push_str(
+        "\nRivedi il passo: proponi una variante piu' sicura o motiva nel piano \
+         perche' il passo e' necessario cosi'.",
+    );
+    testo
+}
+
 /// `created_at` resta `None` (come `planner_node`): il timestamp e' assegnato a
 /// valle dall'integrazione, restando deterministico per i golden-test.
 fn tool_executed_meta_step(
@@ -2433,6 +2876,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
             advisory_gate: None,
+            step_gate: None,
         }
     }
 
@@ -3831,6 +4275,244 @@ mod tests {
         assert_eq!(offload.offloaded.lock().unwrap().len(), 1);
     }
 
+    // ── (2a) Gate duale sui passi critici (mig 0677) ─────────────────────────
+
+    /// Porta stub del gate duale: risponde col report configurato.
+    struct StubStepGate {
+        report: ports::StepValidationReport,
+        chiamate: std::sync::Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl ports::StepValidationPort for StubStepGate {
+        async fn validate(
+            &self,
+            _req: ports::StepValidationRequest,
+        ) -> Result<ports::StepValidationReport, PortError> {
+            *self.chiamate.lock().unwrap() += 1;
+            Ok(self.report.clone())
+        }
+    }
+
+    fn verdetto(role: &str, v: crate::decisions::step_gate::StepVerdict) -> ports::ValidatorVerdict {
+        ports::ValidatorVerdict {
+            role: role.into(),
+            provider: if role == "gatekeeper" { "openai" } else { "google" }.into(),
+            model: "m".into(),
+            verdict: v,
+            reasons: vec![json!({"severity": "alta", "description": "bersaglio fuori progetto"})],
+            safer_alternative: Some("usa il filtro label del progetto".into()),
+            abstain_cause: None,
+            cost_usd: Some(0.001),
+        }
+    }
+
+    fn regole_kill() -> Vec<crate::decisions::step_gate::CriticalityRule> {
+        crate::decisions::step_gate::parse_rules(
+            r#"[{"matcher_kind":"command_token","pattern":"rm -rf","level":"irreversible","category":"destructive_fs"}]"#,
+        )
+    }
+
+    fn cfg_gate() -> ToolDispatchConfig {
+        ToolDispatchConfig {
+            step_gate_mode: crate::decisions::step_gate::StepGateMode::EnforceIrreversible,
+            step_gate_rules: regole_kill(),
+            ..ToolDispatchConfig::default()
+        }
+    }
+
+    fn ctx_con_gate(gate: Arc<StubStepGate>) -> AgentNodeCtx {
+        AgentNodeCtx {
+            step_gate: Some(gate),
+            ..ctx_with(CancellationToken::new())
+        }
+    }
+
+    /// REJECT: nessun tool eseguito, ogni pending riceve il synthetic coi
+    /// motivi, il contatore dei rimandi sale. Mutazione: eseguire comunque i
+    /// tool col reject -> l'esecutore stub registrerebbe la chiamata -> rosso.
+    #[tokio::test]
+    async fn gate_duale_reject_non_esegue_e_rimanda_con_motivi() {
+        use crate::decisions::step_gate::StepVerdict;
+        let gate = Arc::new(StubStepGate {
+            report: ports::StepValidationReport {
+                verdicts: vec![
+                    verdetto("gatekeeper", StepVerdict::Approve),
+                    verdetto("challenger", StepVerdict::Reject),
+                ],
+                degraded: None,
+            },
+            chiamate: std::sync::Mutex::new(0),
+        });
+        let tools = Arc::new(MapToolExecutor::new());
+        let (n, _steps, _rc) = node(cfg_gate(), tools.clone());
+        let ctx = ctx_con_gate(gate.clone());
+        let st = state_with_pending(vec![pending_tool(
+            "k1",
+            "run_command",
+            json!({"command": "rm -rf /srv/dati"}),
+        )]);
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(*gate.chiamate.lock().unwrap(), 1, "porta convocata una volta");
+        assert!(tools.seen.lock().unwrap().is_empty(), "NESSUN tool eseguito");
+        let blocks = blocks_of(out.messages.last().expect("msg"));
+        let content = blocks[0]["content"].as_str().unwrap();
+        assert!(content.contains("RIFIUTATO"));
+        assert!(content.contains("bersaglio fuori progetto"));
+        assert!(content.contains("usa il filtro label del progetto"));
+        assert_eq!(
+            out.extra
+                .get(crate::decisions::step_gate::STEP_GATE_REJECTIONS_EXTRA_KEY)
+                .and_then(Value::as_u64),
+            Some(1),
+            "il contatore dei rimandi sale nello stato"
+        );
+    }
+
+    /// NEEDS_HUMAN (approve + astensione, GAP-2: l'astensione non e' un si'):
+    /// sospensione HITL anche in Automatic, verdetti allegati in extra.
+    #[tokio::test]
+    async fn gate_duale_astensione_sospende_con_verdetti_allegati() {
+        use crate::decisions::step_gate::StepVerdict;
+        let mut astenuto = verdetto("challenger", StepVerdict::Abstained);
+        astenuto.abstain_cause = Some("timeout".into());
+        let gate = Arc::new(StubStepGate {
+            report: ports::StepValidationReport {
+                verdicts: vec![verdetto("gatekeeper", StepVerdict::Approve), astenuto],
+                degraded: None,
+            },
+            chiamate: std::sync::Mutex::new(0),
+        });
+        let tools = Arc::new(MapToolExecutor::new());
+        let (n, _steps, _rc) = node(cfg_gate(), tools.clone());
+        let ctx = ctx_con_gate(gate);
+        let st = state_with_pending(vec![pending_tool(
+            "k1",
+            "run_command",
+            json!({"command": "rm -rf /srv/dati"}),
+        )]);
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        assert!(tools.seen.lock().unwrap().is_empty(), "NESSUN tool eseguito");
+        assert_eq!(out.awaiting_confirmation, Some(true), "sospeso anche in Automatic");
+        let verdetti = out
+            .extra
+            .get(crate::decisions::step_gate::STEP_GATE_VERDICTS_EXTRA_KEY)
+            .expect("verdetti allegati alla sospensione");
+        assert_eq!(verdetti["validators"][1]["abstain_cause"], "timeout");
+    }
+
+    /// Gate con verdetti unanimi Approve, gia' costruito su un batch rm -rf.
+    fn scenario_approve() -> (Arc<StubStepGate>, Arc<MapToolExecutor>, ToolDispatchNode) {
+        use crate::decisions::step_gate::StepVerdict;
+        let gate = Arc::new(StubStepGate {
+            report: ports::StepValidationReport {
+                verdicts: vec![
+                    verdetto("gatekeeper", StepVerdict::Approve),
+                    verdetto("challenger", StepVerdict::Approve),
+                ],
+                degraded: None,
+            },
+            chiamate: std::sync::Mutex::new(0),
+        });
+        let tools = Arc::new(MapToolExecutor::new());
+        let (n, _steps, _rc) = node(cfg_gate(), tools.clone());
+        (gate, tools, n)
+    }
+
+    fn batch_rm_rf() -> AgentState {
+        state_with_pending(vec![pending_tool(
+            "k1",
+            "run_command",
+            json!({"command": "rm -rf /srv/dati"}),
+        )])
+    }
+
+    /// APPROVE unanime: i tool si eseguono (il gate non ferma il flusso).
+    #[tokio::test]
+    async fn gate_duale_approve_esegue_il_batch() {
+        let (gate, tools, n) = scenario_approve();
+        let ctx = ctx_con_gate(gate.clone());
+        let st = batch_rm_rf();
+        let _ = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(*gate.chiamate.lock().unwrap(), 1);
+        assert_eq!(tools.seen.lock().unwrap().len(), 1, "tool eseguito dopo l'unanimita'");
+    }
+
+    /// Batch gia' deliberato (marker con gli STESSI id, scritto dalla
+    /// sospensione): la porta NON viene riconvocata (rilievo A3: la decisione
+    /// umana e' finale per il batch). Un batch con id NUOVI riceve
+    /// validazione fresca. Mutazione: corto-circuito su `state.approved`
+    /// invece che sul marker -> il caso id-nuovi non riconvoca -> rosso.
+    #[tokio::test]
+    async fn gate_duale_batch_deliberato_non_riconvoca_ma_id_nuovi_si() {
+        let (gate, _tools, n) = scenario_approve();
+        let ctx = ctx_con_gate(gate.clone());
+        let mut st = batch_rm_rf();
+        st.extra.insert(
+            crate::decisions::step_gate::STEP_GATE_CLEARED_EXTRA_KEY.to_string(),
+            super::ids_del_batch(&st.pending_tool_uses.clone().unwrap()),
+        );
+        let _ = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(*gate.chiamate.lock().unwrap(), 0, "stessi id: non si ri-valida");
+
+        // Id nuovi: il marker non matcha, la porta viene convocata.
+        let mut st2 = state_with_pending(vec![pending_tool(
+            "k2",
+            "run_command",
+            json!({"command": "rm -rf /srv/dati"}),
+        )]);
+        st2.extra = st.extra.clone();
+        let _ = apply(st2.clone(), n.run(&st2, &ctx).await.expect("run ok"));
+        assert_eq!(*gate.chiamate.lock().unwrap(), 1, "id nuovi: validazione fresca");
+    }
+
+    /// REGOLA O (il test attraversa il PRODUTTORE dello stato): in Automatic
+    /// lo stato iniziale semina `approved=Some(true)` per saltare HITL — il
+    /// gate DEVE convocare lo stesso, perche' in quella modalita' e' l'unica
+    /// barriera sui passi critici. Mutazione: reintrodurre il corto-circuito
+    /// su `state.approved` nel barrier -> chiamate=0 -> rosso (il difetto
+    /// trovato dalla review avversaria del 05/08).
+    #[tokio::test]
+    async fn gate_duale_convoca_anche_con_approved_seminato_dal_mode() {
+        let (gate, tools, n) = scenario_approve();
+        let ctx = ctx_con_gate(gate.clone());
+        let mut st = batch_rm_rf();
+        st.approved = Some(true); // come build_initial_state in Automatic/Continuous
+        let _ = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(
+            *gate.chiamate.lock().unwrap(),
+            1,
+            "approved del MODE non e' un'approvazione del batch: il gate convoca"
+        );
+        assert_eq!(tools.seen.lock().unwrap().len(), 1, "unanimita': tool eseguito");
+    }
+
+    /// Un batch sotto soglia (Mutating) non convoca MAI la porta: la
+    /// classificazione in-memory e' l'unico costo. Mutazione: convocare su
+    /// Mutating -> chiamate=1 -> rosso.
+    #[tokio::test]
+    async fn gate_duale_sotto_soglia_non_convoca() {
+        use crate::decisions::step_gate::StepVerdict;
+        let gate = Arc::new(StubStepGate {
+            report: ports::StepValidationReport {
+                verdicts: vec![verdetto("gatekeeper", StepVerdict::Reject)],
+                degraded: None,
+            },
+            chiamate: std::sync::Mutex::new(0),
+        });
+        let tools = Arc::new(MapToolExecutor::new());
+        let (n, _steps, _rc) = node(cfg_gate(), tools.clone());
+        let ctx = ctx_con_gate(gate.clone());
+        // write_file e' un mutatore ordinario: HITL/review lo coprono, il gate no.
+        let st = state_with_pending(vec![pending_tool(
+            "w1",
+            "write_file",
+            json!({"path": "a.txt", "content": "x"}),
+        )]);
+        let _ = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(*gate.chiamate.lock().unwrap(), 0, "porta mai convocata sotto soglia");
+        assert_eq!(tools.seen.lock().unwrap().len(), 1, "tool eseguito normalmente");
+    }
 }
 
 #[cfg(test)]
@@ -3978,6 +4660,11 @@ mod golden {
             // Il golden non esercita la barriera advisory (nessun canale nel ctx
             // -> gate inerte): il valore e' irrilevante.
             advisory_gate_timeout_s: d.advisory_gate_timeout_s,
+            // Il golden non esercita il gate duale (mode Off di default:
+            // passo 2a inerte, dispatch bit-identico ai fixture).
+            step_gate_mode: d.step_gate_mode,
+            step_gate_rules: d.step_gate_rules,
+            step_gate_max_rejections: d.step_gate_max_rejections,
         }
     }
 
@@ -4048,6 +4735,7 @@ mod golden {
             session_id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
             advisory_gate: None,
+        step_gate: None,
         }
     }
 

@@ -743,6 +743,84 @@ pub trait ReviewPanelPort: Send + Sync {
     async fn review(&self, req: ReviewPanelRequest) -> Result<ReviewPanelReport, PortError>;
 }
 
+/// La richiesta di validazione di un BATCH di passi critici (gate duale, mig
+/// 0677): il passo canonicalizzato + l'estratto del piano — MAI la history
+/// del run (il contesto del validatore e' minimo per contratto).
+#[derive(Debug, Clone)]
+pub struct StepValidationRequest {
+    pub run_id: String,
+    /// Provider ESECUTORE del turno CORRENTE (sticky dopo un cascade): il
+    /// veto «giudice != worker» vale su chi sta scrivendo ADESSO, non sul
+    /// provider di partenza del run. Vuoto = nessun cascade: l'adapter usa il
+    /// provider iniziale con cui e' stato finalizzato.
+    pub executor_provider: String,
+    /// I passi del batch al livello che ha fatto scattare il gate.
+    pub steps: Vec<PendingStepInfo>,
+    /// Livello massimo del batch (decide il fail-mode della doppia astensione).
+    pub level: crate::decisions::step_gate::StepCriticality,
+    /// Estratto del piano attivo (rationale + vincoli), se esiste.
+    pub plan_excerpt: Option<String>,
+    /// Rimandi gia' consumati in questo run (per il cap anti ping-pong).
+    pub prior_rejections: u32,
+}
+
+/// UN passo da validare, gia' classificato.
+#[derive(Debug, Clone)]
+pub struct PendingStepInfo {
+    pub tool_use_id: String,
+    pub tool_name: String,
+    pub tool_input: Value,
+    pub matched_category: Option<String>,
+}
+
+/// Il verdetto di UN validatore, con la sua identita' (chi ha votato E' parte
+/// dell'esito: il pannello deve poter dire "validato da openai e google").
+#[derive(Debug, Clone)]
+pub struct ValidatorVerdict {
+    /// `gatekeeper` (mandato neutro) o `challenger` (mandato refutativo).
+    pub role: String,
+    pub provider: String,
+    pub model: String,
+    pub verdict: crate::decisions::step_gate::StepVerdict,
+    /// Motivi strutturati `[{severity, description}]` (vocabolario di
+    /// `decisions::severity`); vuoto per approve/astensione.
+    pub reasons: Vec<Value>,
+    /// Variante piu' sicura proposta dal validatore, se esiste (entra nel
+    /// rimando al modello).
+    pub safer_alternative: Option<String>,
+    /// Causa STRUTTURATA di un `Abstained` (regola M/Q, vocabolario canonico:
+    /// `timeout` | `join_error` | `call_error` | `schema_mismatch` |
+    /// `executor_fallback`). `None` per i verdetti espressi. Il payload del
+    /// meta_step la riporta cosi' com'e': "astenuto" senza il perche' non
+    /// permette la taratura del gate.
+    pub abstain_cause: Option<String>,
+    /// Costo della chiamata dal listino (`turn_cost_usd`). `None` = non
+    /// calcolabile (listino muto, astensione senza chiamata): l'ignoto non
+    /// degrada a 0.0 (regola Q).
+    pub cost_usd: Option<f64>,
+}
+
+/// L'esito della convocazione: i verdetti dei CONVOCATI (mai filtrati — il
+/// denominatore dell'unanimita' e' questo) piu' il degrado dichiarato quando
+/// la diversita' di provider non e' raggiungibile.
+#[derive(Debug, Clone)]
+pub struct StepValidationReport {
+    pub verdicts: Vec<ValidatorVerdict>,
+    /// `Some(motivo)` quando la selezione non ha potuto garantire 2 provider
+    /// distinti dall'esecutore: il chiamante lo DICHIARA nell'esito.
+    pub degraded: Option<String>,
+}
+
+/// Porta del gate duale (gemella di [`ReviewPanelPort`]): il concreto in
+/// mcp-core fa le due chiamate one-shot su provider distinti (veto
+/// sull'esecutore incluso) con l'identita' contabile del run; il nodo decide
+/// SOLO con `decisions::step_gate::decide_step_gate` sul report.
+#[async_trait]
+pub trait StepValidationPort: Send + Sync {
+    async fn validate(&self, req: StepValidationRequest)
+        -> Result<StepValidationReport, PortError>;
+}
+
 /// Scritture registrate oltre un watermark, con il watermark aggiornato.
 ///
 /// Il watermark e' l'`id` (BIGSERIAL, monotono) dell'ultima scrittura vista, non

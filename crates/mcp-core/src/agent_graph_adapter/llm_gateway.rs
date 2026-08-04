@@ -549,7 +549,12 @@ pub(crate) fn normalize_gw_finish_reason(finish: &str) -> String {
 /// token di prompt a tariffa piena. Non era solo cosmetica: questo numero
 /// alimenta `run_cost_cumulative_usd`, il FRENO DI SPESA del run, quindi la
 /// sovrastima stringeva il freno.
-async fn turn_cost_usd(db: &PgPool, provider: &str, model: &str, usage: &LlmUsage) -> Option<f64> {
+pub(crate) async fn turn_cost_usd(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    usage: &LlmUsage,
+) -> Option<f64> {
     let lookup = match nexus_pricing::resolve_active_price(db, provider, model).await {
         Ok(l) => l,
         Err(e) => {
