@@ -1784,6 +1784,54 @@ else
   echo "OK ambiente-dichiarato: chat e sub-run ricevono entrambi l'ambiente reale"
 fi
 
+# ── processo-operativo (2026-08-04) ─────────────────────────────────────────
+# Il processo di implementazione standard (mig 0674) e' UN template DB innestato
+# dai compositori: appenderlo alle chiavi avrebbe raggiunto solo le figure di
+# oggi, non quelle create domani dal wizard. Tre presidi:
+#
+# 1. La FORMA (tag) vive solo nel modulo: un secondo produttore del tag sarebbe
+#    una seconda autorita' sullo stesso processo.
+assert_single "blocco-processo-prompt" '<processo_implementazione>' \
+  'crates/mcp-core/src/prompt_processo.rs' crates
+# 2. L'innesto sta DENTRO i tre compositori di system prompt (stessa terna di
+#    `ambiente-dichiarato`): nel chiamante, comporre un prompt di esecuzione
+#    senza processo tornerebbe possibile e la regressione sarebbe invisibile.
+proc_mancanti=""
+proc_innesto() {
+  local file="$1" fn="$2"
+  awk -v fn="$fn" '
+    index($0, fn) { dentro = 1 }
+    dentro && /prompt_processo::/ { print "trovato"; exit }
+    dentro && /^}/ { exit }
+  ' "$file" 2>/dev/null
+}
+if [[ -z "$(proc_innesto crates/mcp-core/src/chat_messages/handlers.rs 'async fn compose_chat_system_context')" ]]; then
+  proc_mancanti+="  compose_chat_system_context (chat)"$'\n'
+fi
+if [[ -z "$(proc_innesto crates/mcp-core/src/agent_tools/subagent_native.rs 'async fn resolve_system_text')" ]]; then
+  proc_mancanti+="  resolve_system_text (sub-run / figure)"$'\n'
+fi
+if [[ -z "$(proc_innesto crates/mcp-core/src/chat_messages/agent_run.rs 'async fn compose_agent_system_text')" ]]; then
+  proc_mancanti+="  compose_agent_system_text (run agentico)"$'\n'
+fi
+if [[ -n "$proc_mancanti" ]]; then
+  echo "!! processo-operativo: un contesto di esecuzione non riceve piu' il processo:" >&2
+  printf '%s' "$proc_mancanti" >&2
+  fail=1
+else
+  echo "OK processo-operativo: i tre compositori innestano il processo standard"
+fi
+# 3. Il discriminante advisory resta il punto unico: un elenco di nomi al suo
+#    posto e' la regressione del commit 303e1437 (chi da' pareri trattato come
+#    chi scrive).
+if ! grep -q 'figure_advisory::is_advisory_kind' \
+  crates/mcp-core/src/prompt_processo.rs 2>/dev/null; then
+  echo "!! processo-operativo: prompt_processo non discrimina piu' con is_advisory_kind." >&2
+  fail=1
+else
+  echo "OK processo-operativo: le advisory sono discriminate dal punto unico"
+fi
+
 # ── causa-del-timeout (2026-08-02) ──────────────────────────────────────────
 # «Tempo scaduto» e' vero e non serve a nulla: non distingue un run fermo su una
 # strada chiusa da uno che stava lavorando, e solo per il secondo ha senso

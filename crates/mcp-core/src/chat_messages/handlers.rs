@@ -595,6 +595,10 @@ async fn compose_chat_system_context(
     if let Some(gh) = github_username {
         ctx.push_str(&format!(" Account GitHub: @{gh}."));
     }
+    // Il processo operativo standard (mig 0674): sta dentro il compositore per
+    // la stessa ragione dell'ambiente, e PRIMA del blocco KB perche' e' testo
+    // stabile che deve restare nel prefisso riusabile.
+    let ctx = crate::prompt_processo::con_processo(db, ctx).await;
     // L'host su cui i comandi gireranno DAVVERO, dichiarato invece che indovinato
     // — e la direttiva sui privilegi tolta se presuppone un gestore che qui non
     // esiste. Sta dentro il compositore, non nel chiamante: un system prompt di
@@ -3094,6 +3098,37 @@ mod tests_system_prompt_della_chat {
         );
     }
 
+    /// Il processo operativo standard (mig 0674) entra nel system della chat e
+    /// sta NELLA PARTE STABILE: la posizione e' il contratto, non la presenza —
+    /// un blocco stabile finito dietro il confine di turno esce dal prefisso
+    /// riusabile e nessun test di solo `contains` se ne accorgerebbe.
+    ///
+    /// MUTAZIONE: spostare `con_processo` DOPO `appendi_blocco_di_turno` nel
+    /// compositore lascia il tag nel system ma fuori da `parte_stabile`, e la
+    /// seconda asserzione cade.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_chat_riceve_il_processo_nella_parte_stabile(pool: PgPool) {
+        let cache = TemplateCache::new();
+        // Blocco KB presente: solo cosi' il confine di turno viene emesso e la
+        // posizione del processo rispetto al confine e' misurabile davvero.
+        let kb = Some("### Note pertinenti\n- nota di prova".to_string());
+        let system =
+            compose_chat_system_context(&pool, &cache, TASK, AutomationMode::Study, None, kb)
+                .await;
+
+        let tag = crate::prompt_processo::TAG_APERTURA;
+        assert_eq!(system.matches(tag).count(), 1, "{system}");
+        let stabile = nexus_types::system_prompt::parte_stabile(&system);
+        assert!(
+            stabile.contains(tag),
+            "il processo e' nel system ma FUORI dalla parte stabile: da li' non \
+             entra nel prefisso che il fornitore riusa.\n{system}"
+        );
+        // La premessa del confine: il blocco KB sta DOPO, quindi fuori dalla
+        // parte stabile — altrimenti questo test non distingue le posizioni.
+        assert!(!stabile.contains("Note pertinenti"), "{stabile}");
+    }
+
     #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn cambiare_il_template_cambia_il_turno(pool: PgPool) {
         // La domanda vera: la configurazione sta nel DB (regola G) o nel
@@ -3116,16 +3151,33 @@ mod tests_system_prompt_della_chat {
         // prova non porta il sentinel del consiglio, quindi il gate e' un no-op
         // e la differenza sarebbe soltanto codice che parla per conto suo.
         //
-        // L'unica aggiunta ammessa e' il blocco d'ambiente: non e' configurazione
-        // che il binario si porta dietro — e' un FATTO misurato sull'host
-        // (`nexus_agent_tools::ambiente`), la cui forma vive nel punto unico e il
-        // cui vocabolario sta in `settings`. Si separa e si asserisce a parte,
-        // cosi' il presidio originale resta intero: tutto cio' che PRECEDE il
-        // blocco deve essere ancora, alla lettera, il template in DB.
-        let (prima_del_fatto, fatto) = system
+        // Le DUE aggiunte ammesse, nessuna delle quali e' codice che parla per
+        // conto suo: il processo operativo standard (mig 0674 — TESTO che vive
+        // in un'ALTRA riga di nexus_prompt_templates, innestato dal compositore)
+        // e il blocco d'ambiente (FATTO misurato sull'host). Si separano e si
+        // asseriscono a parte, cosi' il presidio originale resta intero: tutto
+        // cio' che PRECEDE il primo innesto deve essere ancora, alla lettera,
+        // il template in DB — e il blocco processo deve COINCIDERE con la sua
+        // riga in DB, che e' la prova di provenienza (aggiornato con la 0674:
+        // il cambio di comportamento e' intenzionale e questa e' la sua forma).
+        let (prima_del_processo, resto) = system
+            .split_once(crate::prompt_processo::TAG_APERTURA)
+            .expect("il processo operativo non e' entrato nel system della chat");
+        assert_eq!(prima_del_processo.trim_end(), TEMPLATE);
+        let processo_in_db: String = sqlx::query_scalar(
+            "SELECT content FROM nexus_prompt_templates \
+              WHERE key = 'system.implementation_process' AND is_active = true",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("la 0674 semina il template del processo");
+        assert!(
+            system.contains(processo_in_db.trim()),
+            "il blocco processo nel system non coincide con la riga in DB"
+        );
+        let (_, fatto) = resto
             .split_once(nexus_agent_tools::ambiente::TAG_BLOCCO)
             .expect("il fatto d'ambiente non e' entrato nel system della chat");
-        assert_eq!(prima_del_fatto.trim_end(), TEMPLATE);
         assert!(fatto.contains("Sistema operativo dell'host"), "{fatto}");
         // Le due direttive che NON devono sopravvivere alla copia rimossa: un
         // comando POSIX su Windows, e la resa contata sui TENTATIVI invece che
@@ -3208,13 +3260,14 @@ mod tests_system_prompt_della_chat {
             compose_chat_system_context(&pool, &cache, TASK, AutomationMode::Study, None, None)
                 .await;
 
-        // In Studio il suffisso act-first non entra: resta il template, piu' il
-        // solo fatto d'ambiente (vedi il test gemello sopra per il perche' quella
-        // aggiunta non e' «codice che parla per conto suo»).
-        let (prima_del_fatto, _) = system
-            .split_once(nexus_agent_tools::ambiente::TAG_BLOCCO)
-            .expect("il fatto d'ambiente non e' entrato nel system della chat");
-        assert_eq!(prima_del_fatto.trim_end(), BASE);
+        // In Studio il suffisso act-first non entra: resta il template, piu' i
+        // soli blocchi processo (dal DB, mig 0674) e ambiente (vedi il test
+        // gemello sopra per il perche' nessuno dei due e' «codice che parla per
+        // conto suo»).
+        let (prima_del_processo, _) = system
+            .split_once(crate::prompt_processo::TAG_APERTURA)
+            .expect("il processo operativo non e' entrato nel system della chat");
+        assert_eq!(prima_del_processo.trim_end(), BASE);
         assert!(!system.contains(SUFFISSO), "{system}");
     }
 

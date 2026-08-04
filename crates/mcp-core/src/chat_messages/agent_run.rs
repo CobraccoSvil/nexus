@@ -4437,6 +4437,19 @@ pub(crate) async fn compose_agent_system_text(
         .await
         .map(|block| format!("\n{block}\n"))
         .unwrap_or_default();
+    // Il processo operativo standard (mig 0674, punto unico
+    // `crate::prompt_processo`). STABILE: cambia solo su edit admin del
+    // template, quindi entra nel primo gruppo e resta nel prefisso riusabile —
+    // in coda finirebbe DIETRO il confine di turno appena esiste una parte
+    // variabile, fuori dal prefisso e dopo le direttive di turno.
+    let processo = if parts.system_context.contains(crate::prompt_processo::TAG_CHIUSURA) {
+        String::new()
+    } else {
+        crate::prompt_processo::section(db)
+            .await
+            .map(|block| format!("\n{block}\n"))
+            .unwrap_or_default()
+    };
     // L'ordine non e' estetico: e' il tratto di prompt che due run dello stesso
     // progetto possono condividere. Prima cio' che resta identico fra run, poi
     // cio' che cambia da un run all'altro — e il criterio sta nel punto unico
@@ -4458,6 +4471,7 @@ pub(crate) async fn compose_agent_system_text(
             &parts.automation_instructions,
             &parts.o_series_instructions,
             &parts.profile_prompt_block,
+            &processo,
             &parts.system_context,
         ],
         &[
@@ -7463,6 +7477,40 @@ mod tests_prefisso_fra_run {
              il breakpoint `cache_control` di anthropic.",
             dove_divergono(stabile_a, stabile_b)
         );
+    }
+
+    /// Il processo operativo standard (mig 0674) sta nel gruppo STABILE del
+    /// system agentico, PRIMA del confine di turno: con una parte variabile non
+    /// vuota (qui le memorie pertinenti), il tag deve restare dentro
+    /// `parte_stabile`. Serve il migratore META: il template del processo lo
+    /// semina la 0674 (set META); su questo pool le tabelle di progetto non
+    /// servono, i confini esterni sono gia' sostituiti.
+    ///
+    /// MUTAZIONE: innestare il blocco in coda al compositore (come
+    /// `con_ambiente`, dopo `componi_system_di_run`) lo spinge dietro il
+    /// confine appena esiste una parte variabile, e l'asserzione sulla parte
+    /// stabile cade — e' la prova che la POSIZIONE scelta e' misurata, non
+    /// stilistica.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_processo_sta_nella_parte_stabile_del_system_agentico(pool: PgPool) {
+        let project_id = Uuid::new_v4();
+        let recall = RecallInMemoria::nuovo().con_punto(0.91, punto(project_id, MEMORIA_DEPLOY));
+        let sys =
+            compose_agent_system_text(&pool, &recall, project_id, TASK_A, parti_del_progetto())
+                .await;
+
+        let tag = crate::prompt_processo::TAG_APERTURA;
+        assert_eq!(sys.matches(tag).count(), 1, "{sys}");
+        // Premessa: la parte variabile esiste (la memoria richiamata e' dietro
+        // il confine), altrimenti `parte_stabile` sarebbe l'intero system e la
+        // posizione non sarebbe misurata.
+        let stabile = parte_stabile(&sys);
+        assert!(stabile.len() < sys.len(), "nessun confine emesso: {sys}");
+        assert!(
+            stabile.contains(tag),
+            "il processo e' nel system agentico ma FUORI dalla parte stabile.\n{sys}"
+        );
+        assert!(!stabile.contains(MEMORIA_DEPLOY), "{stabile}");
     }
 }
 

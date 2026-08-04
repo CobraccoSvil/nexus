@@ -260,7 +260,11 @@ async fn advisory_kinds(db: &sqlx::PgPool) -> Vec<String> {
 /// quale host sta girando. L'innesto e' qui e non nel chiamante per la stessa
 /// ragione delle memorie di progetto — un compositore che si puo' usare senza il
 /// blocco e' un compositore che prima o poi verra' usato senza.
-async fn resolve_system_text(ctx: &AgentToolContext, prompt_key: &str) -> String {
+async fn resolve_system_text(
+    ctx: &AgentToolContext,
+    prompt_key: &str,
+    tool_whitelist: &[String],
+) -> String {
     let registro = sqlx::query_scalar::<_, String>(
         "SELECT content FROM nexus_prompt_templates WHERE key = $1 AND is_active = true",
     )
@@ -276,6 +280,12 @@ async fn resolve_system_text(ctx: &AgentToolContext, prompt_key: &str) -> String
     if registro.trim().is_empty() {
         return registro;
     }
+    // Il processo operativo standard (mig 0674), SOLO alle figure non-advisory:
+    // la whitelist e' il discriminante (punto unico is_advisory_kind), e la
+    // decisione vive dentro `prompt_processo`, non qui.
+    let registro =
+        crate::prompt_processo::con_processo_figura(&ctx.core.db, registro, tool_whitelist)
+            .await;
     crate::prompt_ambiente::con_ambiente(&ctx.core.db, registro).await
 }
 
@@ -3641,7 +3651,8 @@ async fn prepare_subagent_run(
     }
 
     // ── Risoluzione system_text + tools + modello worker (DB-driven) ──────────
-    let system_text = resolve_system_text(ctx, &definition.prompt_key).await;
+    let system_text =
+        resolve_system_text(ctx, &definition.prompt_key, &definition.tool_whitelist).await;
     if system_text.trim().is_empty() {
         return Err(prepare_reject(
             "prompt_missing",

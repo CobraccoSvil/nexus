@@ -100,6 +100,7 @@ mod projects;
 mod prompt_ambiente;
 mod prompt_learned;
 mod prompt_memories;
+mod prompt_processo;
 mod prompt_templates;
 mod provider_cooldown;
 mod provider_error_classifier;

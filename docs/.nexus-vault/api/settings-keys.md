@@ -498,7 +498,6 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `orchestrator.plan_phase_enabled` | `true` | Feature flag globale per il planner_node (PR-1). Off -> grafo si comporta come oggi. |
 | `orchestrator.plan_rationale_enabled` | `true` | Se true, il planner recupera decisioni passate via RAG, produce rationale/constraints/alternatives e li tramanda all'executor. |
 | `orchestrator.plan_rationale_min_score` | `0.55` | Soglia minima di similarita' per includere una decisione passata nel contesto del planner. |
-| `orchestrator.plan_rationale_persist_as_note` | `false` | Se true, dopo la creazione del piano il razionale viene salvato come nota knowledge intent=decision (chiude il ciclo RAG). |
 | `orchestrator.plan_rationale_rag_topk` | `5` | Quante decisioni/interazioni passate recuperare per informare il razionale del planner. |
 | `orchestrator.subagent_cost_cap_per_run_usd` | `5.00` | Hard cap di spesa cumulativa sub-agents per singolo parent run. |
 | `orchestrator.subagent_default_timeout_s` | `300` | Timeout default per kind se non specificato in nexus_subagent_definitions. |
