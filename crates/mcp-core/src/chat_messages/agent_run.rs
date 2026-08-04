@@ -3929,19 +3929,35 @@ async fn persist_run_outcome(
     status_str: &str,
     final_answer_db: Option<&str>,
 ) {
-    let pending_actions_json = if result.pending_actions.is_empty() {
+    // Le pending actions hanno senso SOLO in attesa di conferma (review W2,
+    // rilievo 7): su un run che chiude, la pending `plan_approval` (o tool)
+    // rimasta nello stato dal resume e' un fossile — persisterla mostrerebbe
+    // "azioni in attesa" su un run completed. Fuori da awaiting: NULL
+    // esplicito, non COALESCE (il fossile va CANCELLATO, non conservato).
+    let in_attesa = status_str == "awaiting_confirmation";
+    let pending_actions_json = if !in_attesa || result.pending_actions.is_empty() {
         None
     } else {
         Some(serde_json::to_value(&result.pending_actions).unwrap_or(json!([])))
     };
-    let _ = sqlx::query(
+    // In attesa: COALESCE preserva un valore scritto a monte se l'outcome non
+    // ne porta uno nuovo. Fuori attesa: $15 e' None per costruzione (ramo
+    // sopra) e l'assegnazione DIRETTA azzera il fossile — COALESCE lo
+    // conserverebbe. $15 resta referenziato in entrambe le varianti: il
+    // conteggio dei bind non cambia col ramo.
+    let pending_sql = if in_attesa {
+        "pending_actions_json=COALESCE($15, pending_actions_json)"
+    } else {
+        "pending_actions_json=$15"
+    };
+    let _ = sqlx::query(&format!(
         "UPDATE agent_runs SET status=$2, final_answer=$3, iteration_count=$4, \
          prompt_tokens=$5, completion_tokens=$6, total_tokens=$7, total_cost=$8, \
          nexus_override_applied=$9, nexus_agent_type=$10, nexus_task_type=$11, \
          provider=$12, model=$13, messages_json=COALESCE($14, messages_json), \
-         pending_actions_json=COALESCE($15, pending_actions_json), \
+         {pending_sql}, \
          completed_at=NOW() WHERE id=$1",
-    )
+    ))
     .bind(run_id)
     .bind(status_str)
     .bind(final_answer_db)
@@ -5273,9 +5289,10 @@ pub(crate) async fn resume_via_native(
     state: &AppState,
     input: &crate::native_engine::NativeRunInput,
     resume_message: &str,
+    kind: crate::native_engine::ResumeKind,
 ) -> anyhow::Result<crate::native_engine::NativeRunOutcome> {
     let deps = build_native_deps(state).await;
-    crate::native_engine::resume_native(&deps, input, resume_message).await
+    crate::native_engine::resume_native(&deps, input, resume_message, kind).await
 }
 
 /// RESUME completo di un run nativo (Engine::Rust) in `awaiting_confirmation`.
@@ -5307,6 +5324,7 @@ pub(crate) async fn confirm_native_run(
     model: String,
     automation_mode: String,
     resume_message: &str,
+    kind: crate::native_engine::ResumeKind,
 ) -> Result<crate::agent_types::AgentRunStatus, String> {
     // Canale SSE del run: riusa quello esistente (i client sono gia' agganciati);
     // se assente (es. dopo un restart), creane uno nuovo registrato sotto run_id
@@ -5368,7 +5386,7 @@ pub(crate) async fn confirm_native_run(
         advisory_gate: None,
     };
 
-    let outcome = resume_via_native(state, &input, resume_message).await;
+    let outcome = resume_via_native(state, &input, resume_message, kind).await;
 
     // Pool del progetto risolto dalla sessione (separazione DB): agent_runs
     // migrata -> instrada le UPDATE di finalize (esito Ok/Err) sul DB del

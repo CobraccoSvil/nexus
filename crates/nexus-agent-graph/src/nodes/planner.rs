@@ -138,6 +138,15 @@ pub struct PlannerConfig {
     /// System prompt del planner RISOLTO a monte dal registry (regola G): vuoto
     /// = prompt non trovato -> skip `prompt_missing` (`planner_node.py:214-216`).
     pub planner_system_text: String,
+    /// Gate di approvazione umana del PIANO (`plan_approval_gate_enabled`,
+    /// chiave `orchestrator.plan_approval_gate_enabled`, mig 0676). Il Default
+    /// Rust e' FALSE: a DB irraggiungibile un gate nuovo non deve appendere i
+    /// run — il seed in migrazione lo accende.
+    pub plan_approval_gate_enabled: bool,
+    /// Soglia di complessita' da cui il gate scatta
+    /// (`orchestrator.plan_approval_min_complexity`, vocabolario
+    /// low|medium|high via `TaskComplexity::try_parse` — punto unico).
+    pub plan_approval_min_complexity: crate::state::TaskComplexity,
     /// Clarifying pre-flight abilitata (`clarifying_questions_enabled`, default
     /// TRUE = RAMO ON).
     pub clarifying_questions_enabled: bool,
@@ -203,6 +212,10 @@ impl Default for PlannerConfig {
             plan_min_token_budget: 2000,
             planner_prompt_key: "agent.planner.base".to_string(),
             planner_system_text: String::new(),
+            // FALSE a DB muto: un gate nuovo non deve appendere i run se la
+            // configurazione non e' leggibile; il seed (mig 0676) lo accende.
+            plan_approval_gate_enabled: false,
+            plan_approval_min_complexity: crate::state::TaskComplexity::Medium,
             clarifying_questions_enabled: true,
             clarifying_questions_max: 3,
             turn_focus_enabled: true,
@@ -380,6 +393,35 @@ const DESCRIZIONE_CRITERI_VOCE: &str = "Criteri di accettazione ESEGUIBILI della
     voce: ogni voce implementativa ne dichiara almeno uno. Un criterio che \
     nessun tool puo' controllare non e' un criterio.";
 
+/// Lo schema degli acceptance_criteria della voce, estratto dal catalogo per
+/// leggibilita' del letterale. Vocabolario UNICO (regola L): l'enum INTERPOLA
+/// `runtime::ports::PLAN_CRITERION_TYPES` accanto al contratto CriterionSpec,
+/// mai una lista ridigitata — due liste divergerebbero.
+fn schema_criteri_accettazione() -> Value {
+    json!({
+        "type": "array",
+        "description": DESCRIZIONE_CRITERI_VOCE,
+        "items": {
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": crate::runtime::ports::PLAN_CRITERION_TYPES,
+                    "description": DESCRIZIONE_TIPI_CRITERIO
+                },
+                "command": {"type": "string"},
+                "expected": {"type": "string"},
+                "url": {"type": "string"},
+                "expected_status": {
+                    "type": "integer",
+                    "description": "Per type=http: lo status HTTP atteso (default 200)."
+                },
+                "path": {"type": "string"}
+            }
+        }
+    })
+}
+
 /// Tool catalog `nexus_todo_write` dichiarato al planner (`planner_node.py:221-290`).
 /// Schema JSON STATICO (costante 1:1): action/run_id/todos[content,status,
 /// priority,acceptance_criteria,node_key,dep_keys]/planner_model/rationale/
@@ -401,32 +443,7 @@ pub fn tool_catalog() -> Vec<Value> {
                             "content": {"type": "string"},
                             "status": {"type": "string", "enum": ["pending"]},
                             "priority": {"type": "string", "enum": ["high", "normal", "low"]},
-                            "acceptance_criteria": {
-                                "type": "array",
-                                "description": DESCRIZIONE_CRITERI_VOCE,
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        // Vocabolario UNICO (regola L): la lista vive in
-                                        // runtime::ports::PLAN_CRITERION_TYPES accanto al
-                                        // contratto CriterionSpec; qui si INTERPOLA, mai
-                                        // si ridigita — due liste divergerebbero.
-                                        "type": {
-                                            "type": "string",
-                                            "enum": crate::runtime::ports::PLAN_CRITERION_TYPES,
-                                            "description": DESCRIZIONE_TIPI_CRITERIO
-                                        },
-                                        "command": {"type": "string"},
-                                        "expected": {"type": "string"},
-                                        "url": {"type": "string"},
-                                        "expected_status": {
-                                            "type": "integer",
-                                            "description": "Per type=http: lo status HTTP atteso (default 200)."
-                                        },
-                                        "path": {"type": "string"}
-                                    }
-                                }
-                            },
+                            "acceptance_criteria": schema_criteri_accettazione(),
                             "node_key": {
                                 "type": "string",
                                 "description": "Comp.3a (DAG): chiave logica univoca del todo (es. 'schema_db', 'api', 'frontend'), per referenziarlo come dipendenza."
@@ -757,13 +774,27 @@ impl PlannerNode {
 
     /// Delta di RIUSO PIANO (`planner_node.py:108-113`): plan_phase_active true +
     /// current_plan_id + current_todos + active_todo_id. `active_id` e' l'id del
-    /// todo attivo (o None). PURO.
-    fn reuse_delta(run_id: &str, todos: Vec<Value>, active_id: Option<String>) -> OpaqueDelta {
+    /// todo attivo (o None). PURO nella costruzione; la SOSPENSIONE per
+    /// approvazione arriva dal chiamante (rilievo A10: un piano riattivato ma
+    /// mai approvato in Confirm sopra soglia sospende come uno nuovo — il
+    /// riuso non e' una porta di servizio attorno al gate).
+    fn reuse_delta(
+        run_id: &str,
+        todos: Vec<Value>,
+        active_id: Option<String>,
+        sospensione: (
+            Option<Option<bool>>,
+            Option<serde_json::Map<String, Value>>,
+        ),
+    ) -> OpaqueDelta {
+        let (awaiting_confirmation, extra) = sospensione;
         StateDelta {
             plan_phase_active: Some(Some(true)),
             current_plan_id: Some(Some(run_id.to_string())),
             current_todos: Some(Some(todos)),
             active_todo_id: Some(active_id),
+            awaiting_confirmation,
+            extra,
             ..Default::default()
         }
         .into_opaque()
@@ -1356,10 +1387,14 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
                         todos = todos.len(),
                         "planner: piano valido, riuso"
                     );
+                    let todos_values = todos_to_values(&todos);
+                    let sospensione =
+                        self.sospensione_per_approvazione(state, &run_id, &todos_values);
                     return Ok(Self::reuse_delta(
                         &run_id,
-                        todos_to_values(&todos),
+                        todos_values,
                         active_id,
+                        sospensione,
                     ));
                 }
                 // Stale/NoPlan: prosegue alla creazione di un nuovo piano.
@@ -1594,6 +1629,14 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
         // Estrazione rationale/constraints/alternatives: RAMO OFF (plan_rationale
         // _enabled false di default) -> non popolato (parita' col Python che li
         // lascia vuoti/None). TODO quando la porta KB-search permettera' il ramo ON.
+        // Gate di approvazione del PIANO (mig 0676, review A2/A10): in Confirm
+        // sopra soglia il run si ferma QUI, col piano appena persistito, sul
+        // canale HITL esistente — pending action `plan_approval` con le voci e
+        // la copertura dei criteri (approvazione informata). Il resume
+        // (biforcato in mcp-core) scrive approved_at/approved_by e setta
+        // plan_approved=true: questo delta non tocca `approved`, i mutatori
+        // concreti restano sotto il LORO gate.
+        let (awaiting, extra) = self.sospensione_per_approvazione(state, &run_id, &todos_values);
         Ok(StateDelta {
             plan_phase_active: Some(Some(true)),
             current_plan_id: Some(Some(run_id.clone())),
@@ -1608,9 +1651,53 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
             meta_steps: Some(vec![plan_meta]),
             // Trasparenza: assunzioni di default applicate (ramo Automatico/Continuo).
             applied_default_assumptions: applied_assumptions.map(Some),
+            awaiting_confirmation: awaiting,
+            extra,
             ..Default::default()
         }
         .into_opaque())
+    }
+}
+
+impl PlannerNode {
+    /// I due campi del delta che sospendono il run per l'approvazione del
+    /// piano, o `(None, None)` quando il gate non scatta. La DECISIONE e' del
+    /// punto unico `hitl::should_suspend_for_plan_approval`; qui solo la
+    /// costruzione del delta (extra CLONATO dallo stato: il campo `extra` del
+    /// delta SOSTITUISCE la mappa, come documentato sul tipo).
+    fn sospensione_per_approvazione(
+        &self,
+        state: &AgentState,
+        run_id: &str,
+        todos_values: &[Value],
+    ) -> (
+        Option<Option<bool>>,
+        Option<serde_json::Map<String, Value>>,
+    ) {
+        let scatta = crate::decisions::hitl::should_suspend_for_plan_approval(
+            self.cfg.plan_approval_gate_enabled,
+            state.automation_mode,
+            state.plan_approved,
+            state.task_complexity,
+            self.cfg.plan_approval_min_complexity,
+            state.subagent_depth,
+        );
+        if !scatta {
+            return (None, None);
+        }
+        let azione = crate::decisions::hitl::build_plan_approval_action(
+            run_id,
+            todos_values,
+            crate::decisions::hitl::plan_criteria_coverage(todos_values),
+        );
+        // put_extra e' il punto unico "scrivi UNA chiave preservando le altre"
+        // (review W2, rilievo 5: il clone+insert a mano era la terza copia).
+        let extra = crate::state::delta::put_extra(
+            state,
+            crate::decisions::hitl::HITL_PENDING_ACTIONS_EXTRA_KEY,
+            json!([azione]),
+        );
+        (Some(Some(true)), Some(extra))
     }
 }
 
@@ -2062,6 +2149,50 @@ mod tests {
         // behavior_mode None/"" salta il gate del mode (parita' falsy Python).
         assert!(cfg.is_eligible(None, Some("code"), 8000));
         assert!(cfg.is_eligible(Some(""), Some("code"), 8000));
+    }
+
+    /// La COLLA della sospensione per approvazione del piano: col gate acceso,
+    /// in Confirm sopra soglia il delta porta `awaiting_confirmation=true` e
+    /// la pending action `plan_approval` in extra (che CLONA lo stato: il
+    /// campo extra del delta sostituisce la mappa); fuori dalle condizioni,
+    /// `(None, None)` — il delta di successo resta bit-identico a prima.
+    ///
+    /// MUTAZIONE: dimenticare il clone di `state.extra` (mappa nuova) fa
+    /// sparire la chiave preesistente e la terza asserzione cade.
+    #[test]
+    fn sospensione_per_approvazione_costruisce_delta_e_preserva_extra() {
+        let store = Arc::new(StubTodoStore::with_todos(vec![]));
+        let cfg = PlannerConfig {
+            plan_approval_gate_enabled: true,
+            ..PlannerConfig::default()
+        };
+        let node = node_with(cfg, store);
+        let mut st = AgentState {
+            automation_mode: Some(crate::state::AutomationMode::Confirm),
+            task_complexity: Some(crate::state::TaskComplexity::High),
+            ..Default::default()
+        };
+        st.extra
+            .insert("chiave_preesistente".to_string(), json!("resta"));
+        let todos = vec![json!({"content": "a", "acceptance_criteria": [
+            {"type": "run_command", "command": "echo ok"}
+        ]})];
+
+        let (awaiting, extra) = node.sospensione_per_approvazione(&st, "run-1", &todos);
+        assert_eq!(awaiting, Some(Some(true)));
+        let extra = extra.expect("extra presente");
+        let azioni = extra
+            .get(crate::decisions::hitl::HITL_PENDING_ACTIONS_EXTRA_KEY)
+            .and_then(Value::as_array)
+            .expect("pending actions");
+        assert_eq!(azioni[0]["toolName"], "plan_approval");
+        assert_eq!(extra.get("chiave_preesistente"), Some(&json!("resta")));
+
+        // In Automatic il gate non scatta e il delta resta invariato.
+        st.automation_mode = Some(crate::state::AutomationMode::Automatic);
+        let (awaiting, extra) = node.sospensione_per_approvazione(&st, "run-1", &todos);
+        assert_eq!(awaiting, None);
+        assert!(extra.is_none());
     }
 
     // ── Pass-through non eligible ───────────────────────────────────────────

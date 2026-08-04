@@ -123,6 +123,14 @@ mod adr0034_contract_tests {
             valid(nexus_agent_graph::decisions::tool_dispatch::VALID_BLOCKERS),
             "enum blocker dello schema divergente da VALID_BLOCKERS"
         );
+        // docs_updated (mig 0676): stesso legame — un valore aggiunto solo
+        // allo schema verrebbe dichiarato dal modello e scartato in silenzio
+        // da normalize_declared_outcome (review W2, rilievo 14).
+        assert_eq!(
+            set(&schema["docs_updated"]["enum"]),
+            valid(nexus_agent_graph::decisions::tool_dispatch::VALID_DOCS_UPDATED),
+            "enum docs_updated dello schema divergente da VALID_DOCS_UPDATED"
+        );
     }
 
     /// Stesso legame per gli ENDPOINT dichiarati in `task_complete` (le prove

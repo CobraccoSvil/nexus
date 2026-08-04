@@ -206,6 +206,13 @@ pub struct FinalGateConfig {
     /// `tool_capability` / `completion_confirmed`
     /// (`agent.final_gate.structural_criteria_enabled`, default true, mig 0503).
     pub structural_criteria_enabled: bool,
+    /// Criterio docs claim-vs-fatti (`agent.final_gate.docs_criterion_enabled`,
+    /// mig 0676). Default Rust FALSE: a DB muto un criterio nuovo non boccia.
+    pub docs_criterion_enabled: bool,
+    /// Glob dei file di documentazione (`agent.final_gate.docs_globs`,
+    /// separatore `;`, es. `README*;docs/**`): il claim `updated` pretende
+    /// almeno un file toccato che vi corrisponda.
+    pub docs_globs: Vec<String>,
     /// ADR 0036: catena di verifica PER-AMBIENTE risolta a monte (profilo
     /// inferito da LLM in `project_verify_profiles`, step marcati gate=true).
     /// Un criterio `run_command` per step, nell'ordine del profilo (es.
@@ -280,6 +287,9 @@ impl Default for FinalGateConfig {
             design_verify_enabled: true,
             design_verify_min_score: 70,
             structural_criteria_enabled: true,
+            // FALSE a DB muto: il seed (mig 0676) lo accende.
+            docs_criterion_enabled: false,
+            docs_globs: vec!["README*".to_string(), "docs/**".to_string()],
             verify_steps: Vec::new(),
             verify_profile_missing: false,
             origine_frontend: None,
@@ -731,7 +741,43 @@ impl FinalGateNode {
             });
         }
 
+        // docs_updated (mig 0676): coerenza fra il CLAIM sulla documentazione
+        // e i file davvero toccati ("hai DICHIARATO updated: e' vero?" e'
+        // misurabile sul diff — claim-vs-fatti, ADR 0034). FUORI dal blocco
+        // strutturale (review W2, rilievo 8): ha il SUO kill-switch, spegnere
+        // i criteri strutturali non deve spegnerlo in silenzio. Porta anche il
+        // fatto `subagent_completed` (rilievo 3/10, stessa lezione del run
+        // 48793fde su completion_confirmed): nei run orchestrati i file li
+        // scrivono i SUB-RUN e la history del padre non ha write_file — un
+        // "updated" senza doc locale ma con delega completata degrada a
+        // Inconclusive invece di bocciare un lavoro sano.
+        if self.cfg.docs_criterion_enabled {
+            criteria.push(self.criterio_docs(state, &touched_files));
+        }
+
         criteria
+    }
+
+    /// Il criterio docs (mig 0676): estratto per tenere piatto `build_criteria`
+    /// e dare alla spec UN solo costruttore.
+    fn criterio_docs(&self, state: &AgentState, touched_files: &[String]) -> CriterionSpec {
+        let docs_declared = state
+            .declared_outcome
+            .as_ref()
+            .and_then(|v| v.get("docs_updated"))
+            .and_then(Value::as_str);
+        CriterionSpec {
+            provenance: CriterionProvenance::Gate,
+            criterion_type: "docs_updated".to_string(),
+            spec: json!({
+                "declared": docs_declared,
+                "touched_files": touched_files,
+                "docs_globs": self.cfg.docs_globs,
+                "subagent_completed": signals::has_completed_subagent_dispatch(&state.messages),
+            }),
+            expected: json!({ "consistent": true }),
+            timeout_s: None,
+        }
     }
 
     /// Il reduce sui criteri, in UNA risposta che porta anche i buchi.

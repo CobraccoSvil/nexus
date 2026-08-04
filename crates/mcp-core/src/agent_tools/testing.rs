@@ -582,7 +582,7 @@ async fn run_preflight_check(ctx: &AgentToolContext, root: &Path) -> Result<(), 
 }
 
 /// Estrae la porta numerica da una URL `http(s)://localhost:PORT/...`.
-fn port_from_localhost_url(url: &str) -> Option<i32> {
+pub(crate) fn port_from_localhost_url(url: &str) -> Option<i32> {
     url.trim_start_matches("http://localhost:")
         .trim_start_matches("https://localhost:")
         .split('/')
@@ -687,7 +687,11 @@ async fn check_server_status(
 /// rispondere prima del lancio — e' il caso del `webServer` avviato dalla
 /// suite stessa, la cui porta risponde solo DOPO, e un'attesa qui lo
 /// bloccherebbe sempre.
-async fn await_target_service_ready(
+/// `pub(crate)`: e' il PUNTO UNICO della readiness del bersaglio prima di una
+/// verifica che lo interroga — lo riusano il runner Playwright e le sonde
+/// `http` del criteria_runner (GAP-6: un probe a servizio freddo produceva
+/// `Failed` su codice sano, 31 rossi su 53 giri fabbricati dal cold start).
+pub(crate) async fn await_target_service_ready(
     db: &sqlx::PgPool,
     project_id: Uuid,
     base_url: Option<&str>,

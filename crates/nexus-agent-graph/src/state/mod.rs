@@ -493,6 +493,12 @@ pub struct AgentState {
     pub session_id: Option<String>,
     /// `true` dopo /agent/approve (HITL): salta interrupt in loop.
     pub approved: Option<bool>,
+    /// `true` dopo l'approvazione del PIANO (gate in Confirm, complessita' >=
+    /// soglia). Campo DISTINTO da `approved` per decisione dichiarata (review
+    /// del piano, rilievo A2): approvare il piano NON pre-approva i tool
+    /// mutativi concreti — l'utente in Confirm continua a vedere le azioni
+    /// reali al primo batch. Un solo flag li avrebbe fusi in silenzio.
+    pub plan_approved: Option<bool>,
     /// Provider forzato dall'esterno (override routing).
     pub provider_override: Option<String>,
     /// Modello forzato dall'esterno (override routing).

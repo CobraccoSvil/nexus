@@ -85,6 +85,9 @@ const TOOL_LABELS: Record<string, string> = {
   nexus_get_worklog: "Legge il diario di lavoro",
   // Supervisione
   supervisor_check: "Verifica del supervisore",
+  // Azione sintetica del gate di approvazione del piano (mig 0676): non e' un
+  // tool del catalogo, e' il contratto della pending action `plan_approval`.
+  plan_approval: "Approvazione del piano",
 };
 
 /** Etichetta umana (italiano) per un tool agente. Fallback per i tool MCP o

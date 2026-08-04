@@ -1045,6 +1045,24 @@ async fn load_planner_config(db: &PgPool) -> PlannerConfig {
         )
         .await,
         planner_prompt_key,
+        plan_approval_gate_enabled: setting_bool(
+            db,
+            "orchestrator.plan_approval_gate_enabled",
+            d.plan_approval_gate_enabled,
+        )
+        .await,
+        // Parse dal punto unico del vocabolario (regola N): un valore fuori
+        // vocabolario ricade sul default, mai su un ramo inventato qui.
+        plan_approval_min_complexity: nexus_auth::get_setting(
+            db,
+            "orchestrator.plan_approval_min_complexity",
+        )
+        .await
+        .and_then(|v| {
+            nexus_agent_graph::decisions::orchestration_sizing::TaskComplexity::try_parse(&v)
+        })
+        .map(nexus_agent_graph::state::TaskComplexity::from)
+        .unwrap_or(d.plan_approval_min_complexity),
         clarifying_questions_enabled: setting_bool(
             db,
             "orchestrator.clarifying_questions_enabled",
@@ -1216,6 +1234,23 @@ async fn load_final_gate_config(db: &PgPool, project_id: Option<Uuid>) -> FinalG
             d.structural_criteria_enabled,
         )
         .await,
+        docs_criterion_enabled: setting_bool(
+            db,
+            "agent.final_gate.docs_criterion_enabled",
+            d.docs_criterion_enabled,
+        )
+        .await,
+        // Separatore `;` (come i path pattern della lente UI): i glob possono
+        // contenere virgole nei nomi, il CSV standard li spezzerebbe.
+        docs_globs: nexus_auth::get_setting(db, "agent.final_gate.docs_globs")
+            .await
+            .map(|v| {
+                v.split(';')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or(d.docs_globs),
         // Escalation su non-convergenza del gate (mig 0577): al cap di max_cycles con
         // criteri oggettivi ancora falliti, cede il turno all'executor per promuovere
         // un modello piu' capace invece di chiudere secco. `max_escalations` RIUSA la
@@ -3450,8 +3485,9 @@ pub async fn resume_native(
     deps: &NativeDeps,
     input: &NativeRunInput,
     resume_message: &str,
+    kind: ResumeKind,
 ) -> anyhow::Result<NativeRunOutcome> {
-    let resume_delta = build_resume_delta(resume_message, Some(&input.automation_mode));
+    let resume_delta = build_resume_delta(resume_message, Some(&input.automation_mode), kind);
     let outcome = run_engine(
         deps,
         input,
@@ -3461,19 +3497,46 @@ pub async fn resume_native(
     Ok(map_outcome_con_riscontro(deps, input, outcome).await)
 }
 
+/// Il MOTIVO del resume HITL: decide QUALE consenso il delta scrive (review
+/// del piano, rilievo A2 — approvare il PIANO non approva i MUTATORI: due
+/// domande, due flag; un solo `approved` le avrebbe fuse in silenzio e
+/// l'ok su un piano astratto avrebbe pre-firmato ogni scrittura concreta).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeKind {
+    /// Conferma delle azioni tool pendenti: `approved=true` (il gate sui
+    /// mutatori non re-interrompe per il resto del run).
+    ToolApproval,
+    /// Approvazione del piano: `plan_approved=true`, `approved` NON toccato —
+    /// il primo batch mutativo sospende comunque col suo gate, e l'utente
+    /// vede le azioni concrete come oggi.
+    PlanApproval,
+}
+
 /// Costruisce il delta opaco del runtime che sblocca un interrupt HITL: azzera
 /// `awaiting_confirmation` e accoda il messaggio umano di approvazione (campo
 /// `messages`, reducer append). Costruito col delta TIPIZZATO del grafo ->
 /// `into_opaque` (punto unico tipizzato->opaco, regola L).
-fn build_resume_delta(resume_message: &str, automation_mode: Option<&str>) -> nexus_graph::StateDelta {
+fn build_resume_delta(
+    resume_message: &str,
+    automation_mode: Option<&str>,
+    kind: ResumeKind,
+) -> nexus_graph::StateDelta {
     use nexus_agent_graph::state::{Message, MessageContent};
     let parsed_mode = automation_mode.and_then(parse_automation_mode);
     let typed = nexus_agent_graph::state::StateDelta {
         // Azzera il predicato di interrupt: senza, il motore si re-interrompe sul
         // checkpoint ancora-in-attesa (loop di conferma).
         awaiting_confirmation: Some(Some(false)),
-        // Dopo l'approvazione esegui i tool mutativi senza re-interrompere.
-        approved: Some(Some(true)),
+        // QUALE consenso scrivere lo dice il kind: l'approvazione dei TOOL
+        // spegne il gate sui mutatori; quella del PIANO no (rilievo A2).
+        approved: match kind {
+            ResumeKind::ToolApproval => Some(Some(true)),
+            ResumeKind::PlanApproval => None,
+        },
+        plan_approved: match kind {
+            ResumeKind::PlanApproval => Some(Some(true)),
+            ResumeKind::ToolApproval => None,
+        },
         // Ripara automation_mode su checkpoint legacy (None -> HITL spurio).
         automation_mode: parsed_mode.map(Some),
         // Accoda l'approvazione come turno utente: l'executor la rilegge nel
@@ -4690,7 +4753,8 @@ mod tests {
             ..Default::default()
         };
         // Applica il delta di resume (via reducer, punto unico).
-        let delta = build_resume_delta("Azioni confermate dall'utente.", None);
+        let delta =
+            build_resume_delta("Azioni confermate dall'utente.", None, ResumeKind::ToolApproval);
         state.merge(delta);
 
         assert!(
@@ -4710,6 +4774,40 @@ mod tests {
             }
             other => panic!("atteso Human in coda, trovato {other:?}"),
         }
+        // ToolApproval scrive `approved`, MAI `plan_approved`.
+        assert_eq!(state.approved, Some(true));
+        assert_eq!(state.plan_approved, None);
+    }
+
+    /// La BIFORCAZIONE del resume (review A2): l'approvazione del PIANO scrive
+    /// `plan_approved` e NON tocca `approved` — il gate HITL sui mutatori
+    /// concreti resta armato, l'utente in Confirm vede le azioni reali al
+    /// primo batch come oggi.
+    ///
+    /// MUTAZIONE: far scrivere `approved=true` anche al ramo PlanApproval
+    /// (tornare al delta unico) fa cadere l'ultima asserzione — ed e'
+    /// esattamente la regressione silenziosa del presidio umano che il campo
+    /// dedicato esiste per impedire.
+    #[test]
+    fn build_resume_delta_plan_approval_non_preapprova_i_mutatori() {
+        use nexus_graph::GraphState;
+        let mut state = AgentState {
+            awaiting_confirmation: Some(true),
+            ..Default::default()
+        };
+        let delta = build_resume_delta(
+            "Piano approvato dall'utente. Procedi con l'esecuzione.",
+            None,
+            ResumeKind::PlanApproval,
+        );
+        state.merge(delta);
+
+        assert!(!state.is_awaiting_confirmation());
+        assert_eq!(state.plan_approved, Some(true));
+        assert_eq!(
+            state.approved, None,
+            "l'approvazione del piano NON deve pre-approvare i tool mutativi"
+        );
     }
 
     #[test]

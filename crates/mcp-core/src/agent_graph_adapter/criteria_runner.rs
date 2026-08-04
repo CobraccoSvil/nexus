@@ -58,6 +58,18 @@ use nexus_agent_graph::runtime::ports::{
 pub(crate) const CHIAVE_DEGENERE: &str = "degenerate";
 pub(crate) const CHIAVE_UNRECOGNIZED: &str = "unrecognized";
 
+/// Vocabolario del criterio docs (mig 0676): chiavi della spec e valori del
+/// claim, ciascuno con un punto di scrittura solo.
+pub(crate) const DOCS_DECLARED: &str = "declared";
+pub(crate) const DOCS_GLOBS: &str = "docs_globs";
+pub(crate) const DOCS_UPDATED: &str = "updated";
+pub(crate) const DOCS_MISSING: &str = "missing";
+pub(crate) const DOCS_NOT_NEEDED: &str = "not_needed";
+
+/// Chiave del fatto "delega completata" nelle spec dei criteri strutturali
+/// (docs e completion_confirmed la leggono entrambe).
+pub(crate) const CHIAVE_SUBAGENT_COMPLETED: &str = "subagent_completed";
+
 /// Timeout di default per i criteri (parita' col Python: `30.0s`). I criteri con
 /// `timeout_s` valorizzato (solo il build) lo sovrascrivono.
 const DEFAULT_TIMEOUT_S: f64 = 30.0;
@@ -103,6 +115,12 @@ pub struct FinalGateCriteriaRunnerAdapter {
     /// comando qualunque (nessuna memoria, nessuna classificazione), che e' il
     /// comportamento storico.
     progetto: Option<(PgPool, Uuid)>,
+    /// Porte gia' attese in QUESTA invocazione del gate (azzerata a ogni
+    /// `run`): la readiness si paga una volta per porta per ciclo, mai per
+    /// criterio — e resta per-ciclo (non per-adapter) perche' fra un ciclo e
+    /// l'altro una correzione puo' riavviare il servizio, e un memo perpetuo
+    /// sonderebbe un riavvio ancora freddo.
+    porte_attese: std::sync::Mutex<std::collections::HashSet<i32>>,
 }
 
 impl FinalGateCriteriaRunnerAdapter {
@@ -120,6 +138,7 @@ impl FinalGateCriteriaRunnerAdapter {
             http_client: reqwest::Client::new(),
             run_root,
             progetto: None,
+            porte_attese: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -306,6 +325,158 @@ impl FinalGateCriteriaRunnerAdapter {
         }
     }
 
+    /// Marca la porta come attesa e dice se lo era GIA' (memo per invocazione
+    /// del gate, vedi campo `porte_attese`).
+    fn porta_gia_attesa(&self, porta: i32) -> bool {
+        !self
+            .porte_attese
+            .lock()
+            .expect("lock porte attese")
+            .insert(porta)
+    }
+
+    /// Attende (best-effort) che il bersaglio di una sonda `http` sia pronto:
+    /// delega al punto unico della readiness
+    /// (`testing::await_target_service_ready`) e MEMOIZZA la porta — la
+    /// stessa porta non ripaga l'attesa dentro la stessa invocazione del
+    /// gate. Non decide MAI l'esito: la sonda parte comunque, e l'eventuale
+    /// causa di non-readiness resta solo nel log (l'esito lo misura la
+    /// chiamata reale). Senza progetto associato (test, contesti senza DB)
+    /// non c'e' registro porte da consultare e si procede subito.
+    async fn attesa_bersaglio_http(&self, spec: &Value) {
+        let Some((db, project_id)) = self.progetto.as_ref() else {
+            return;
+        };
+        let Some(url) = spec.get("url").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(porta) = crate::agent_tools::testing::port_from_localhost_url(url) else {
+            return;
+        };
+        if self.porta_gia_attesa(porta) {
+            return;
+        }
+        let causa =
+            crate::agent_tools::testing::await_target_service_ready(db, *project_id, Some(url))
+                .await;
+        log_bersaglio_non_pronto(porta, causa);
+    }
+
+    /// Coerenza del claim `docs_updated` di task_complete coi FILE davvero
+    /// toccati (mig 0676, criterio strutturale del gate). PURO: i fatti sono
+    /// nella spec (`declared`, `touched_files`, `docs_globs`), estratti dallo
+    /// stato in `build_criteria`.
+    ///
+    /// La domanda NON e' "le docs andavano aggiornate?" (giudizio, falsi
+    /// positivi strutturali) ma "il claim regge sul diff?":
+    /// - `updated` senza alcun file-doc toccato -> FALSO (claim smentito);
+    /// - `missing` -> dichiarazione onesta di DoD non rispettata: il gate
+    ///   rimanda in correzione (e' il funzionamento, non una punizione);
+    /// - `not_needed` -> passa (spot-check umano/review possibile a valle);
+    /// - assente -> Inconclusive: fase 1 del rollout, i run in volo e i prompt
+    ///   che ancora non insegnano il campo non vengono bocciati.
+    fn check_docs_updated(spec: &Value) -> (bool, Value) {
+        let declared = spec.get(DOCS_DECLARED).and_then(Value::as_str);
+        let globs: Vec<&str> = spec
+            .get(DOCS_GLOBS)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let touched: Vec<&str> = spec
+            .get("touched_files")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let doc_toccato = touched
+            .iter()
+            .find(|p| globs.iter().any(|g| Self::corrisponde_a_glob(p, g)));
+        let evidenza = |verdict: Option<&str>, extra: Option<(&str, Value)>| {
+            Self::evidenza_docs(declared, verdict, extra)
+        };
+        const SMENTITO: &str = "claim smentito: nessun file di documentazione fra i toccati";
+        const MANCANTE: &str = "documentazione dichiarata mancante: va aggiornata nello stesso change";
+        // Il ramo orchestrato lo intercetta `esito_docs_updated` PRIMA di
+        // arrivare qui (subagent_completed => Inconclusive). L'assenza del
+        // claim idem; il fuori-vocabolario lo scarta normalize_declared_outcome.
+        if declared == Some(DOCS_MISSING) {
+            return (false, evidenza(Some(MANCANTE), None));
+        }
+        if declared != Some(DOCS_UPDATED) {
+            return (true, evidenza(None, None));
+        }
+        match doc_toccato {
+            Some(p) => (true, evidenza(None, Some(("doc_file", json!(p))))),
+            None => (false, evidenza(Some(SMENTITO), Some((DOCS_GLOBS, json!(globs))))),
+        }
+    }
+
+    /// L'evidence del criterio docs: un solo costruttore, piatto.
+    fn evidenza_docs(
+        declared: Option<&str>,
+        verdict: Option<&str>,
+        extra: Option<(&str, Value)>,
+    ) -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert(DOCS_DECLARED.to_string(), json!(declared));
+        if let Some(v) = verdict {
+            m.insert("verdict".to_string(), json!(v));
+        }
+        if let Some((k, v)) = extra {
+            m.insert(k.to_string(), v);
+        }
+        Value::Object(m)
+    }
+
+    /// L'esito a TRE stati del criterio docs: l'assenza del claim non e' ne'
+    /// un pass ne' un fail — e' la fase 1 del rollout (Inconclusive, il gate
+    /// non boccia i run che ancora non conoscono il campo). Il resto e'
+    /// misurato da [`Self::check_docs_updated`].
+    fn esito_docs_updated(spec: &Value) -> (CriterionOutcome, Value) {
+        const NON_DICHIARATO: &str =
+            "docs_updated non dichiarato in task_complete: criterio escluso (fase 1 del rollout)";
+        const ORCHESTRATO: &str =
+            "docs_updated=updated con lavoro delegato ai sub-run: i file toccati del padre non lo possono provare";
+        let inconclusivo =
+            |motivo: &str| (CriterionOutcome::Inconclusive, json!({ "skipped_reason": motivo }));
+        if spec.get(DOCS_DECLARED).and_then(Value::as_str).is_none() {
+            return inconclusivo(NON_DICHIARATO);
+        }
+        let (passed, evidence) = Self::check_docs_updated(spec);
+        // Run ORCHESTRATO (review W2, rilievo 3/10): i file li scrivono i
+        // sub-run, la history del padre non ha write_file — un "updated"
+        // smentito localmente ma con delega completata non e' misurabile a
+        // questo livello: Inconclusive dichiarato, mai un Failed su lavoro
+        // sano (ne' un Passed sulla parola: la misura manca, non e' assolta).
+        let smentito_ma_orchestrato = !passed
+            && spec.get(DOCS_DECLARED).and_then(Value::as_str) == Some(DOCS_UPDATED)
+            && spec.get(CHIAVE_SUBAGENT_COMPLETED).and_then(Value::as_bool) == Some(true);
+        if smentito_ma_orchestrato {
+            return inconclusivo(ORCHESTRATO);
+        }
+        misurato((passed, evidence))
+    }
+
+    /// Glob MINIMO e deterministico per i path di documentazione: `dir/**` =
+    /// prefisso di directory; `NOME*` = prefisso sul nome file (o sul path);
+    /// altrimenti uguaglianza. CASE-INSENSITIVE per contratto (review W2,
+    /// rilievo 12): il filesystem di riferimento lo e', e `readme.md` e' lo
+    /// stesso claim di `README.md`. Niente motore glob completo: due forme
+    /// coprono il vocabolario reale (`README*`, `docs/**`) e le varianti si
+    /// configurano, non si inseguono a codice.
+    fn corrisponde_a_glob(path: &str, glob: &str) -> bool {
+        let path_norm = path.replace('\\', "/").to_ascii_lowercase();
+        let glob = glob.to_ascii_lowercase();
+        let nome_file = path_norm.rsplit('/').next().unwrap_or(&path_norm);
+        if let Some(dir) = glob.strip_suffix("/**") {
+            let prefisso = format!("{dir}/");
+            return path_norm.starts_with(&prefisso) || path_norm.contains(&format!("/{prefisso}"));
+        }
+        if let Some(prefisso) = glob.strip_suffix('*') {
+            return nome_file.starts_with(prefisso) || path_norm.starts_with(prefisso);
+        }
+        path_norm == glob || nome_file == glob
+    }
+
     /// Il gate di FORMA che precede il dispatch: solo per i criteri scritti
     /// nel piano (provenienza `Authored`), una spec senza il campo essenziale
     /// chiude Inconclusive prima di toccare qualunque porta. Vive fuori da
@@ -388,13 +559,26 @@ impl FinalGateCriteriaRunnerAdapter {
             // Criteri STRUTTURALI (ADR 0018 leva 3): PURI, i fatti sono gia'
             // nella spec (estratti dallo stato in FinalGateNode::build_criteria).
             "action_requested" => misurato(Self::check_action_requested(&c.spec)),
+            "docs_updated" => Self::esito_docs_updated(&c.spec),
             "tool_capability" => misurato(Self::check_tool_capability(&c.spec)),
             "completion_confirmed" => misurato(Self::check_completion_confirmed(&c.spec)),
             "service_logs_clean" => {
                 self.check_service_logs_clean(&c.spec, timeout_s)
                     .await
             }
-            "http" => misurato(self.check_http(&c.spec, &c.expected, timeout_s).await),
+            // GAP-6 (rivisto dalla review W2, rilievi 1/2/9): l'attesa di
+            // readiness da' TEMPO al servizio FREDDO, ma non fa mai da SCUDO
+            // al servizio MORTO — dopo la finestra si sonda COMUNQUE, e il
+            // morto produce il Failed MISURATO (connection refused) che apre
+            // il ciclo di correzione: declassarlo a Inconclusive chiudeva il
+            // run CompletedUnverified proprio nel caso piu' grave. L'attesa si
+            // paga UNA volta per porta per invocazione del gate (memo
+            // azzerata a ogni `run`): senza, 6 endpoint sulla stessa porta
+            // costavano ~16s l'uno di stabilita' anche a servizio sano.
+            "http" => {
+                self.attesa_bersaglio_http(&c.spec).await;
+                misurato(self.check_http(&c.spec, &c.expected, timeout_s).await)
+            }
             "file_exists" => {
                 self.check_file_exists(&c.spec, &c.expected, timeout_s)
                     .await
@@ -535,7 +719,7 @@ whitelist (verificare supports_tool_use e le whitelist agent.tools.*)"
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty());
         let subagent_completed = spec
-            .get("subagent_completed")
+            .get(CHIAVE_SUBAGENT_COMPLETED)
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let passed = declared.is_some() || subagent_completed;
@@ -1062,11 +1246,27 @@ impl CriteriaRunner for FinalGateCriteriaRunnerAdapter {
         &self,
         criteria: Vec<CriterionSpec>,
     ) -> Result<Vec<CriterionResult>, PortError> {
+        // Nuovo ciclo del gate = nuova finestra di readiness per le porte
+        // (vedi campo `porte_attese`): fra un ciclo e l'altro una correzione
+        // puo' aver riavviato il servizio.
+        self.porte_attese.lock().expect("lock porte attese").clear();
         let mut out = Vec::with_capacity(criteria.len());
         for c in &criteria {
             out.push(self.run_one(c).await?);
         }
         Ok(out)
+    }
+}
+
+/// Il log dell'attesa scaduta (fuori dalla funzione per tenerla piatta): la
+/// causa NON decide nulla — la sonda parte comunque e l'esito lo misura lei.
+fn log_bersaglio_non_pronto(porta: i32, causa: Option<String>) {
+    if let Some(causa) = causa {
+        tracing::warn!(
+            porta,
+            %causa,
+            "sonda http: bersaglio non pronto a fine finestra, si sonda comunque"
+        );
     }
 }
 
@@ -1944,6 +2144,79 @@ mod tests {
             !testo.contains("regex_in_output") && !testo.contains("db_query"),
             "il catalogo insegna ancora tipi fuori vocabolario: {testo}"
         );
+    }
+
+    /// Il criterio docs misura la COERENZA claim-vs-fatti (mig 0676), coi
+    /// QUATTRO esiti del contratto: updated smentito -> Failed; updated con
+    /// file-doc nel diff -> Passed; missing -> Failed (DoD dichiaratamente non
+    /// rispettata); not_needed -> Passed; assente -> Inconclusive (fase 1).
+    ///
+    /// MUTAZIONE: far passare `updated` senza file-doc toccati (togliere il
+    /// confronto coi glob) fa cadere la prima asserzione — il claim tornerebbe
+    /// a valere come fatto, che e' il difetto ADR 0034 che il criterio chiude.
+    #[sqlx::test]
+    async fn docs_updated_confronta_il_claim_coi_file_toccati(pool: PgPool) {
+        let exec = FakeToolExecutor::with(&[]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool, None);
+        let spec_docs = |declared: Value, touched: Value| {
+            spec(
+                "docs_updated",
+                json!({
+                    "declared": declared,
+                    "touched_files": touched,
+                    "docs_globs": ["README*", "docs/**"],
+                }),
+                json!({ "consistent": true }),
+            )
+        };
+
+        let casi = [
+            // (declared, touched, atteso, nome)
+            (json!("updated"), json!(["src/a.rs"]), CriterionOutcome::Failed, "updated smentito"),
+            (
+                json!("updated"),
+                json!(["src/a.rs", "docs/guida.md"]),
+                CriterionOutcome::Passed,
+                "updated con doc nel diff",
+            ),
+            (
+                json!("updated"),
+                json!(["README.md"]),
+                CriterionOutcome::Passed,
+                "updated con README",
+            ),
+            (json!("missing"), json!(["src/a.rs"]), CriterionOutcome::Failed, "missing onesto"),
+            (json!("not_needed"), json!(["src/a.rs"]), CriterionOutcome::Passed, "not_needed"),
+            (Value::Null, json!(["src/a.rs"]), CriterionOutcome::Inconclusive, "assente"),
+            // Case-insensitive per contratto (rilievo 12).
+            (json!("updated"), json!(["readme.md"]), CriterionOutcome::Passed, "readme minuscolo"),
+        ];
+        for (declared, touched, atteso, nome) in casi {
+            let res = runner
+                .run(vec![spec_docs(declared, touched)])
+                .await
+                .expect("ok");
+            assert_eq!(res[0].outcome, atteso, "{nome}: {:?}", res[0].evidence);
+        }
+
+        // Run ORCHESTRATO (rilievo 3/10): "updated" senza doc locale ma con
+        // delega completata NON e' un claim smentito — i file li hanno scritti
+        // i sub-run e la history del padre non li porta: Inconclusive, mai un
+        // Failed su lavoro sano (e mai un Passed sulla parola).
+        let res = runner
+            .run(vec![spec(
+                "docs_updated",
+                json!({
+                    "declared": "updated",
+                    "touched_files": ["src/a.rs"],
+                    "docs_globs": ["README*", "docs/**"],
+                    "subagent_completed": true,
+                }),
+                json!({ "consistent": true }),
+            )])
+            .await
+            .expect("ok");
+        assert_eq!(res[0].outcome, CriterionOutcome::Inconclusive, "{:?}", res[0].evidence);
     }
 
     /// Una spec DEGENERE authored da un todo (tipo noto, campo essenziale

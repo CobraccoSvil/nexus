@@ -364,6 +364,9 @@ enum MotivoBlocco {
     /// La porta ha sollevato un errore invece di rispondere (guasto infra o
     /// eccezione applicativa): la chiamata e' partita, non e' stata rifiutata.
     PortaInErrore,
+    /// task_complete ripetuto nello stesso turno (mig 0676, GAP-9): la
+    /// dichiarazione e' terminale, la seconda e' un'anomalia dichiarata.
+    DichiarazioneRipetuta,
 }
 
 /// Esito di UNA tool_result, prima della ricomposizione nell'ordine dei pending.
@@ -633,6 +636,21 @@ impl ToolDispatchNode {
     /// `motivo` e' obbligatorio: chi fabbrica un risultato al posto del tool sa
     /// PERCHE' lo sta facendo, e dichiararlo qui e' cio' che evita a valle di
     /// dover riconoscere il proprio stesso messaggio (regola Q).
+    /// L'anomalia della SECONDA task_complete nello stesso turno (GAP-9):
+    /// costruita qui perche' il testo abbia un solo produttore e il ramo nel
+    /// dispatch resti piatto.
+    fn dichiarazione_ripetuta(tool_use_id: &str) -> ToolResultBlock {
+        Self::synthetic_error(
+            tool_use_id,
+            json!(
+                "task_complete e' terminale: hai gia' dichiarato l'esito in questo \
+                 turno. La dichiarazione precedente resta valida; se l'esito e' \
+                 cambiato, prosegui il lavoro e dichiara al turno successivo."
+            ),
+            MotivoBlocco::DichiarazioneRipetuta,
+        )
+    }
+
     fn synthetic_error(
         tool_use_id: &str,
         content: Value,
@@ -699,19 +717,34 @@ impl ToolDispatchNode {
 
         // ── task_complete (brain-only) ────────────────────────────────────────
         if name == TASK_COMPLETE_TOOL_NAME {
+            // task_complete e' TERMINALE per il turno (mig 0676, GAP-9): la
+            // seconda chiamata nello stesso turno e' un'anomalia STRUTTURATA
+            // (tool_result di errore col motivo), mai una seconda valutazione
+            // silenziosa in cui "l'ultimo prevale" — era il ciclo
+            // dell'incidente e2e-bacheca: tre dichiarazioni senza chiudere,
+            // ognuna sovrascriveva la precedente e nessuno lo diceva al
+            // modello.
+            // La normalizzazione e' SINCRONA: si calcola prima, cosi' il
+            // check-e-push sotto sta in UNA sezione critica (review W2,
+            // rilievo 13: due lock separati erano corretti solo per la
+            // concorrenza cooperativa di oggi — un await aggiunto in mezzo
+            // domani avrebbe riaperto la corsa senza che nessun test lo
+            // vedesse).
+            let decl = normalize_declared_outcome(&input);
+            {
+                let mut outcomes = collector.declared_outcomes.lock().expect("lock outcomes");
+                if !outcomes.is_empty() {
+                    return Self::dichiarazione_ripetuta(&tool_use_id);
+                }
+                if let Ok(d) = &decl {
+                    outcomes.push(d.clone());
+                }
+            }
             collector
                 .task_complete_ids
                 .lock()
                 .expect("lock tc ids")
                 .push(tool_use_id.clone());
-            let decl = normalize_declared_outcome(&input);
-            if let Ok(d) = &decl {
-                collector
-                    .declared_outcomes
-                    .lock()
-                    .expect("lock outcomes")
-                    .push(d.clone());
-            }
             return declarative_tool_result(tool_use_id, "outcome", decl.as_ref());
         }
 

@@ -832,15 +832,61 @@ pub async fn confirm_agent_run(
     let pending_json: Option<Value> = run
         .try_get::<Option<Value>, _>("pending_actions_json")
         .unwrap_or(None);
-    let pending_actions_str = pending_json
+    // Il MOTIVO della sospensione si legge dal CAMPO toolName delle pending
+    // (regola M), mai dal testo: `plan_approval` e' il contratto del gate di
+    // approvazione del piano (mig 0676) e biforca il resume — un piano
+    // approvato non pre-approva i mutatori (rilievo A2), quindi il kind
+    // decide QUALE flag il delta scrive e il messaggio non e' il dump JSON
+    // delle azioni (privo di senso su un piano).
+    let e_approvazione_piano = pending_json
         .as_ref()
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "[]".to_string());
+        .and_then(Value::as_array)
+        .is_some_and(|arr| {
+            arr.iter().any(|a| {
+                a.get(nexus_agent_graph::decisions::hitl::AZIONE_TOOL_NAME)
+                    .and_then(Value::as_str)
+                    == Some(nexus_agent_graph::decisions::hitl::PLAN_APPROVAL_ACTION)
+            })
+        });
+    let (resume_kind, resume_message) = if e_approvazione_piano {
+        (
+            crate::native_engine::ResumeKind::PlanApproval,
+            "Piano approvato dall'utente. Procedi con l'esecuzione.".to_string(),
+        )
+    } else {
+        let pending_actions_str = pending_json
+            .as_ref()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "[]".to_string());
+        (
+            crate::native_engine::ResumeKind::ToolApproval,
+            format!(
+                "Azioni confermate dall'utente. Esegui le seguenti operazioni: {}",
+                pending_actions_str
+            ),
+        )
+    };
 
-    let resume_message = format!(
-        "Azioni confermate dall'utente. Esegui le seguenti operazioni: {}",
-        pending_actions_str
-    );
+    // L'approvazione del PIANO diventa un FATTO persistito: le colonne
+    // approved_at/approved_by (mig 0148) esistevano da sempre e nessuno le
+    // scriveva — il pannello admin mostrava null. Best-effort: un piano gia'
+    // cancellato non blocca il resume.
+    if e_approvazione_piano {
+        // Best-effort ma MAI muto (review W2, rilievo 4): l'errore ingoiato
+        // qui farebbe rinascere in silenzio il difetto che questo change
+        // chiude (colonne mai scritte, pannello a null).
+        if let Err(err) = sqlx::query(
+            "UPDATE nexus_agent_plans SET approved_at = NOW(), approved_by = $2 \
+              WHERE run_id = $1",
+        )
+        .bind(run_id)
+        .bind(user_id)
+        .execute(&run_pool)
+        .await
+        {
+            tracing::warn!(%run_id, error = %err, "approvazione piano: UPDATE approved_at/by fallita");
+        }
+    }
 
     // Segna come running prima di riprendere (sia nativo sia brain).
     sqlx::query("UPDATE agent_runs SET status='running', completed_at=NULL WHERE id=$1")
@@ -877,6 +923,7 @@ pub async fn confirm_agent_run(
             model,
             automation_mode,
             &resume_message_bg,
+            resume_kind,
         )
         .await;
     });

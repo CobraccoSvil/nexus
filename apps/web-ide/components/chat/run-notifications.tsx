@@ -21,6 +21,7 @@ import { useScrollToAnchor } from "../../hooks/use-scroll-to-anchor";
 import { useThemeColors } from "../../lib/theme";
 import { withAlpha } from "../../lib/color";
 import { toolLabel } from "./tool-labels";
+import { PlanChecklist } from "./agent-meta-step-card";
 import {
   filePathFromToolInput,
   formatStepInput,
@@ -563,6 +564,38 @@ export function RunNotifications({
                 Azioni in attesa:
               </div>
               {pendingActions!.map((action, idx) => {
+                // Approvazione del PIANO (mig 0676): la pending action porta le
+                // voci nel toolInput e la card le rende con la STESSA checklist
+                // del meta_step plan (PlanChecklist, regola L) piu' la copertura
+                // dei criteri eseguibili — l'utente approva vedendo quanto del
+                // piano ha una verifica automatica, non un dump JSON.
+                if (action.toolName === "plan_approval") {
+                  const input = action.toolInput as {
+                    todos?: unknown[];
+                    executableCriteria?: number;
+                    totalItems?: number;
+                  };
+                  const todos = Array.isArray(input.todos) ? input.todos : [];
+                  return (
+                    <div
+                      key={`pending-${idx}`}
+                      style={{ display: "flex", flexDirection: "column", gap: 3 }}
+                    >
+                      <div style={{ fontSize: 10.5, fontWeight: 600, color: tc.text }}>
+                        Piano proposto — {input.totalItems ?? todos.length} passi
+                        {typeof input.executableCriteria === "number" && (
+                          <span style={{ color: tc.textSecondary, fontWeight: 500 }}>
+                            {" "}({input.executableCriteria} con verifica automatica)
+                          </span>
+                        )}
+                      </div>
+                      <PlanChecklist todos={todos as never[]} />
+                      <div style={{ fontSize: 10, color: tc.textSecondary }}>
+                        Puoi modificare i passi dal pannello del piano prima di approvare.
+                      </div>
+                    </div>
+                  );
+                }
                 // HITL informato: mostra il tool + i parametri ESATTI che verranno
                 // eseguiti (delega a toolLabel/formatStepInput, regola L), cosi'
                 // l'approvazione e' consapevole. Se il bersaglio e' un file, lo si

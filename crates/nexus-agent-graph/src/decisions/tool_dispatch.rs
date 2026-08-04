@@ -105,6 +105,11 @@ pub const VALID_BLOCKERS: &[&str] = &[
     "safety",
 ];
 
+/// Vocabolario del claim `docs_updated` di task_complete (mig 0676): non un
+/// bool perche' i casi sono TRE — "non serviva" e "serviva e manca" non
+/// possono collassare (regola Q: l'ignoto e' una variante).
+pub const VALID_DOCS_UPDATED: &[&str] = &["updated", "not_needed", "missing"];
+
 /// Cap sul numero di voci accettate in `files_touched` (self-report, solo
 /// display/telemetria: il ground truth resta `modified_files_from_messages`).
 const FILES_TOUCHED_CAP: usize = 50;
@@ -156,6 +161,15 @@ pub fn normalize_declared_outcome(tool_input: &Value) -> Result<Value, Declarati
     // `refusal` (ADR 0034): bool, incluso solo se true (assente = false).
     if obj.get("refusal").and_then(Value::as_bool) == Some(true) {
         out.insert("refusal".to_string(), Value::Bool(true));
+    }
+    // `docs_updated` (mig 0676): claim sulla documentazione, accettato SOLO se
+    // nell'enum — il final_gate lo confronta coi file davvero toccati
+    // (coerenza claim-vs-fatti); un valore fuori vocabolario e' come assente.
+    if let Some(d) = obj.get("docs_updated").and_then(Value::as_str) {
+        let d = d.trim().to_lowercase();
+        if VALID_DOCS_UPDATED.contains(&d.as_str()) {
+            out.insert("docs_updated".to_string(), Value::String(d));
+        }
     }
     // `files_touched` (ADR 0034): self-report, solo display/telemetria.
     if let Some(arr) = obj.get("files_touched").and_then(Value::as_array) {
