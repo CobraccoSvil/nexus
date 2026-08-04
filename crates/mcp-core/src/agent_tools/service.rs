@@ -1,4 +1,4 @@
-//! Tool servizio: avvio processi long-running, lettura output, stop, build immagine progetto.
+﻿//! Tool servizio: avvio processi long-running, lettura output, stop, build immagine progetto.
 
 use super::*;
 use nexus_types::tool_outcome::RispostaTool;
@@ -225,7 +225,20 @@ async fn gate_pre_avvio(
     command: &str,
     work_dir: &Path,
 ) -> Option<String> {
-    dedup_and_cleanup_ports(ctx, label, command, work_dir).await;
+    // La dedup FERMA i servizi vivi con label simile, e lo fa PRIMA che questo
+    // processo esista. E' il potere piu' distruttivo del lancio, e spetta solo a
+    // chi un servizio lo e': sostituire un servizio con la sua nuova istanza ha
+    // senso, un comando qualunque che ne stronca uno vivo no.
+    //
+    // Era concesso a chiunque passasse di qui, `kind` ignorato. MISURATO sul
+    // parco progetti il 03/08/2026: un `grep`, un `dir`, un `ls` e un
+    // `vite --version` hanno fermato servizi vivi da ore — fino a un vite da
+    // 3h45m. Il riconoscimento lessicale (`avvio_server`) toglie a quei comandi
+    // l'ETICHETTA di servizio; questo gate toglie loro il POTERE, che e' la
+    // difesa che regge anche quando il riconoscimento sbaglia.
+    if kind == "service" {
+        dedup_and_cleanup_ports(ctx, label, command, work_dir).await;
+    }
 
     if let Some(kind_hint) = kind_hint_for(ctx, label, command, work_dir) {
         if let Some(refuse_msg) = refuse_if_same_scope_active(ctx, kind_hint).await {
@@ -452,18 +465,20 @@ async fn resolve_service_launch(
 ) -> Result<ServiceLaunch, String> {
     let command = validate_service_command(ctx, input).await?;
 
-    // Declassamento one-shot: install/build/test lunghi arrivano qui via
+    // Declassamento: comandi che NON avviano un server arrivano qui via
     // auto-routing di run_command (background=true, pattern long-running,
-    // auto-probe) con kind="service", ma NON sono servizi del progetto.
-    // Registrarli con kind='service' li fa comparire per sempre nel pannello
-    // Servizi (list_services_windows). Il processo resta gestito identico
-    // (stessa tabella, stop/read_output per id): cambia solo la classificazione.
-    let kind =
-        if kind == "service" && is_long_oneshot(&command) && !looks_like_web_service(&command) {
-            "task"
-        } else {
-            kind
-        };
+    // auto-probe) con kind="service", ma servizi del progetto non sono.
+    // Registrarli con kind='service' li fa comparire nel pannello Servizi e,
+    // molto peggio, concede loro i poteri di un servizio. Il processo resta
+    // gestito identico (stessa tabella, stop/read_output per id): cambia solo
+    // la classificazione.
+    //
+    // Il criterio e' POSITIVO — «avvia un server?» — e non piu' l'elenco dei
+    // one-shot noti. Quell'elenco conteneva `prisma generate` ma non
+    // `prisma init`, e le voci mancanti non sono un difetto da tappare una per
+    // una: sono la conseguenza di una domanda che non puo' avere risposta
+    // completa.
+    let kind = declassa_se_non_e_un_servizio(kind, &command);
 
     // Risoluzione working directory (punto unico riusato anche dal restart).
     let work_dir = resolve_service_work_dir(&ctx.root_path, input)?;
@@ -501,6 +516,26 @@ async fn resolve_service_launch(
         label,
         work_dir,
     })
+}
+
+/// Un `kind='service'` chiesto per un comando che non avvia un server diventa
+/// `task`.
+///
+/// Il processo gira identico (stessa tabella, stop/read_output per id): perde
+/// la unit, l'allocazione, la riga nel pannello Servizi e — il punto che conta —
+/// il potere di fermare i servizi vivi con label simile.
+///
+/// MISURATO il 04/08/2026 su prenotazioni-sala, quando il criterio della PORTA
+/// era gia' corretto ma questo ancora no: `cd backend && npm init -y` e
+/// `cd backend && cargo clippy --all-targets` risultavano `kind='service'` con
+/// label `backend`, indistinguibili dal backend vero e capaci di stroncarlo.
+/// La meta' mancante di un fix e' la meta' che fa danno.
+fn declassa_se_non_e_un_servizio<'a>(kind: &'a str, command: &str) -> &'a str {
+    if kind == "service" && !looks_like_web_service(command) {
+        "task"
+    } else {
+        kind
+    }
 }
 
 /// Label priva di scopo, deliberata: la porta chi NON e' un servizio di progetto
@@ -1886,9 +1921,9 @@ pub(super) async fn tool_list_active_services(
 #[cfg(test)]
 mod tests {
     use super::{
-        classifica_ascolto_altrove, derive_kind_hint, detect_port_from_output,
-        existing_service_action, format_started_message, looks_like_web_service,
-        resolve_service_label, resolve_service_work_dir, scope_dir,
+        classifica_ascolto_altrove, declassa_se_non_e_un_servizio, derive_kind_hint,
+        detect_port_from_output, existing_service_action, format_started_message,
+        looks_like_web_service, resolve_service_label, resolve_service_work_dir, scope_dir,
         tool_run_service, AscoltoAltrove, ExistingServiceAction, PortaRilevata, Uuid,
     };
     use crate::agent_processes::{is_generic_service_label, similar_service_labels};
@@ -1980,6 +2015,54 @@ mod tests {
         );
         assert!(looks_like_web_service("npm run dev"));
         assert!(looks_like_web_service("node server.js"));
+    }
+
+    /// I comandi MISURATI il 04/08/2026 su prenotazioni-sala, che il criterio
+    /// della sola porta lasciava passare come servizi.
+    ///
+    /// Non e' una ripetizione dei test di `avvio_server`: quelli verificano la
+    /// RISPOSTA, questo verifica la CONSEGUENZA — che un `kind='service'`
+    /// chiesto per quei comandi diventi `task`, e con esso perda il potere di
+    /// fermare i servizi vivi.
+    ///
+    /// MUTAZIONE: rimettere `is_long_oneshot(command) &&` nella condizione di
+    /// `declassa_se_non_e_un_servizio` fa rosseggiare le prime due asserzioni —
+    /// ne' `npm init` ne' `cargo clippy` sono in quell'elenco.
+    #[test]
+    fn cio_che_non_avvia_un_server_non_resta_un_servizio() {
+        assert_eq!(
+            declassa_se_non_e_un_servizio("service", "cd backend && npm init -y"),
+            "task"
+        );
+        assert_eq!(
+            declassa_se_non_e_un_servizio("service", "cd backend && cargo clippy --all-targets"),
+            "task"
+        );
+        assert_eq!(
+            declassa_se_non_e_un_servizio("service", "npx prisma init --datasource-provider postgresql"),
+            "task"
+        );
+        assert_eq!(
+            declassa_se_non_e_un_servizio("service", r#"grep -r "VITE_API_URL" frontend/"#),
+            "task"
+        );
+        // I servizi veri restano servizi: declassarli e' il danno peggiore
+        // (niente porta, niente unit, invisibili nel pannello).
+        assert_eq!(declassa_se_non_e_un_servizio("service", "npm run dev"), "service");
+        assert_eq!(
+            declassa_se_non_e_un_servizio("service", "cd backend && npm run start"),
+            "service"
+        );
+        assert_eq!(
+            declassa_se_non_e_un_servizio("service", "vite --port 24804 --host 0.0.0.0"),
+            "service"
+        );
+        assert_eq!(
+            declassa_se_non_e_un_servizio("service", "node src/backend/server.js"),
+            "service"
+        );
+        // Un task resta task: la funzione non promuove mai.
+        assert_eq!(declassa_se_non_e_un_servizio("task", "npm run dev"), "task");
     }
 
     /// Il criterio non allarga a cio' che server non e': uno script con un altro
