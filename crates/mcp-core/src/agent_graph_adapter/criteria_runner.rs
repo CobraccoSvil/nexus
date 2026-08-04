@@ -757,21 +757,24 @@ task_complete (outcome + summary)"
                 .timeout(Duration::from_secs_f64(timeout_s)),
             spec,
         );
-        let resp = match rb.send().await {
+        let ricevuta = match risposta_ricevuta(rb).await {
             Ok(r) => r,
             // Servizio spento o irraggiungibile: e' un fallimento della prova,
             // non un guasto del runner (parita' col try/except Python).
             Err(e) => return (false, json!({ "error": format!("http call: {e}"), "url": url })),
         };
-        let actual = resp.status().as_u16();
-        let text = resp.text().await.unwrap_or_default();
         esito_http(
             &method,
             url,
             &expected_statuses,
             expected.get("body_contains").and_then(Value::as_str),
-            actual,
-            &text,
+            expected
+                .get("reject_html")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            ricevuta.status,
+            ricevuta.content_type.as_deref(),
+            &ricevuta.text,
         )
     }
 
@@ -1016,6 +1019,41 @@ fn with_body_and_headers(
     rb
 }
 
+/// Cio' che si e' potuto osservare di una risposta HTTP.
+///
+/// Esiste come tipo perche' i tre campi si leggono in un ORDINE obbligato: il
+/// `Content-Type` sta negli header e va preso PRIMA che `text()` consumi la
+/// risposta. Tenerli insieme rende quell'ordine una proprieta' della
+/// costruzione invece di una regola da ricordare al call site.
+struct RispostaRicevuta {
+    status: u16,
+    /// Header standard, quindi segnale strutturato: leggerlo non e' dedurre lo
+    /// stato dal testo (regola M), e' chiedere al protocollo che FORMA abbia la
+    /// risposta. `None` se il server non lo manda.
+    content_type: Option<String>,
+    text: String,
+}
+
+/// Esegue la richiesta e raccoglie cio' che serve a giudicarla.
+///
+/// Separata da `check_http` perche' sono due responsabilita': qui si tocca la
+/// rete, li' si decide. La decisione e' poi tutta in `esito_http`, che e' pura.
+async fn risposta_ricevuta(rb: reqwest::RequestBuilder) -> Result<RispostaRicevuta, reqwest::Error> {
+    let resp = rb.send().await?;
+    let status = resp.status().as_u16();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let text = resp.text().await.unwrap_or_default();
+    Ok(RispostaRicevuta {
+        status,
+        content_type,
+        text,
+    })
+}
+
 /// Esito di una prova HTTP data la risposta ricevuta. PURA (nessuna rete): si
 /// esercita senza server, e per lo stesso motivo il test che ne verifica il
 /// contenuto puo' partire dal produttore vero invece di fabbricare l'evidence.
@@ -1024,12 +1062,20 @@ fn with_body_and_headers(
 /// nella decisione SOLO se il criterio dichiara `body_contains` — cosa che fanno
 /// i criteri configurati a mano, mai quelli derivati da una dichiarazione
 /// dell'agente; per tutti gli altri e' materiale diagnostico.
+///
+/// `reject_html` e' la sola eccezione, e non e' una lettura del corpo: guarda il
+/// `Content-Type`, header standard. Serve a una domanda che lo status da solo non
+/// puo' distinguere — «questa risposta viene dal backend, o e' la pagina del
+/// frontend?». Vedi [`risposta_e_html`].
+#[allow(clippy::too_many_arguments)]
 fn esito_http(
     method: &str,
     url: &str,
     expected_statuses: &[u16],
     body_contains: Option<&str>,
+    reject_html: bool,
     actual: u16,
+    content_type: Option<&str>,
     text: &str,
 ) -> (bool, Value) {
     let body_excerpt = truncate_chars(text, HTTP_BODY_EXCERPT_CHARS);
@@ -1037,7 +1083,19 @@ fn esito_http(
     if let Some(needle) = body_contains {
         passed = passed && text.contains(needle);
     }
-    let verdict = http_verdict(method, url, actual, expected_statuses, &body_excerpt);
+    let html_indebito = reject_html && risposta_e_html(content_type, text);
+    if html_indebito {
+        passed = false;
+    }
+    let mut verdict = http_verdict(method, url, actual, expected_statuses, &body_excerpt);
+    if html_indebito {
+        verdict = format!(
+            "{verdict} — RISPOSTA HTML: il frontend ha servito la propria pagina invece \
+             dei dati del backend. Il proxy non raggiunge l'API (tipicamente un `rewrite` \
+             che toglie il prefisso su cui il backend espone), e il fallback della SPA \
+             maschera il 404 con un 200."
+        );
+    }
     (
         passed,
         json!({
@@ -1045,10 +1103,43 @@ fn esito_http(
             "method": method,
             "status": actual,
             "expected_status": expected_statuses,
+            "content_type": content_type,
             "body_excerpt": body_excerpt,
             "verdict": verdict,
         }),
     )
+}
+
+/// La risposta e' una pagina HTML invece del dato atteso da un endpoint di API?
+///
+/// ROOT CAUSE, misurata il 04/08/2026 su biblioteca-scolastica. Il criterio
+/// d'integrazione (`endpoint_probes::criteri_integrazione_frontend`) prova gli
+/// endpoint ANCHE attraverso l'origine del frontend, e decideva sul solo status:
+///
+///     35954/api/books -> HTTP 200, Content-Type: text/html        <- la SPA
+///     35976/api/books -> HTTP 200, Content-Type: application/json <- il backend
+///     35976/books     -> HTTP 404
+///
+/// `vite.config.ts` aveva `rewrite: p => p.replace(/^\/api/, '')`, che toglie il
+/// prefisso su cui il backend espone: il proxy inoltrava a `/books`, il backend
+/// rispondeva 404, e Vite ripiegava su `index.html` con **status 200**. Il gate
+/// vedeva 200 e approvava un'applicazione le cui due meta' non si parlavano.
+///
+/// Era il limite DICHIARATO nel commento di quel criterio quando fu scritto
+/// ("cattura il proxy assente o mal indirizzato, non il fallback silenzioso");
+/// qui viene chiuso, e la chiusura non passa dal corpo ma dall'header.
+///
+/// Il `Content-Type` e' la fonte: e' cio' che il server DICHIARA di aver
+/// mandato. Il corpo interviene solo quando l'header manca — un `<!DOCTYPE html`
+/// in testa e' sintassi, non prosa, e senza header non c'e' altro da chiedere.
+fn risposta_e_html(content_type: Option<&str>, text: &str) -> bool {
+    if let Some(ct) = content_type {
+        let ct = ct.to_ascii_lowercase();
+        // `text/html`, `text/html; charset=utf-8`, `application/xhtml+xml`.
+        return ct.contains("text/html") || ct.contains("xhtml");
+    }
+    let inizio = text.trim_start().to_ascii_lowercase();
+    inizio.starts_with("<!doctype html") || inizio.starts_with("<html")
 }
 
 /// Caratteri di corpo della risposta conservati nell'evidence di una prova HTTP.
@@ -1506,6 +1597,101 @@ mod verdetto_suite_tests {
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+
+    /// Chiama `esito_http` come lo chiama la produzione, leggendo `reject_html`
+    /// dal criterio invece di passarlo a mano: cosi' il test attraversa anche la
+    /// dichiarazione, non solo il calcolo (regola O).
+    fn prova_http(
+        expected: &Value,
+        status: u16,
+        content_type: Option<&str>,
+        corpo: &str,
+    ) -> (bool, Value) {
+        esito_http(
+            "GET",
+            "http://127.0.0.1:35954/api/books",
+            &expected_statuses_from(expected.get("status")),
+            expected.get("body_contains").and_then(Value::as_str),
+            expected
+                .get("reject_html")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            status,
+            content_type,
+            corpo,
+        )
+    }
+
+    /// IL CASO MISURATO il 04/08/2026 su biblioteca-scolastica: attraverso il
+    /// frontend l'endpoint risponde 200 con `text/html` — e' la pagina della
+    /// SPA, non i dati del backend.
+    ///
+    /// MUTAZIONE: togliere `if html_indebito { passed = false; }` da
+    /// `esito_http` fa rosseggiare la prima asserzione, cioe' il gate torna ad
+    /// approvare un'applicazione le cui due meta' non si parlano.
+    #[test]
+    fn attraverso_il_frontend_una_pagina_html_non_e_una_risposta_del_backend() {
+        // Il criterio lo costruisce il PRODUTTORE, non il test.
+        let declared = json!({
+            "outcome": "done",
+            "endpoints": nexus_agent_graph::decisions::endpoint_probes::normalize_endpoints(
+                Some(&json!([{ "method": "GET", "url": "http://127.0.0.1:35976/api/books" }])),
+            ),
+        });
+        let criteri = nexus_agent_graph::decisions::endpoint_probes::criteri_integrazione_frontend(
+            Some(&declared),
+            Some("http://127.0.0.1:35954"),
+            15.0,
+        );
+        assert_eq!(criteri.len(), 1, "il produttore deve emettere la prova: {criteri:?}");
+        let expected = &criteri[0].expected;
+
+        // Il fallback SPA: status 200, ma la forma e' una pagina.
+        let (passed, ev) = prova_http(
+            expected,
+            200,
+            Some("text/html"),
+            "<!DOCTYPE html>\n<html lang=\"en\">",
+        );
+        assert!(!passed, "200 con text/html attraverso il frontend NON e' una risposta valida");
+        let verdetto = ev["verdict"].as_str().unwrap_or_default();
+        assert!(
+            verdetto.contains("RISPOSTA HTML"),
+            "il verdetto deve dire COSA e' successo, non solo che e' fallito: {verdetto}"
+        );
+        assert_eq!(ev["content_type"], json!("text/html"), "l'evidenza porta l'header");
+
+        // Il backend vero, attraverso lo stesso proxy: passa.
+        let (passed, _) = prova_http(
+            expected,
+            200,
+            Some("application/json; charset=utf-8"),
+            "[{\"id\":2,\"title\":\"Harry Potter\"}]",
+        );
+        assert!(passed, "il JSON del backend attraverso il proxy e' l'esito atteso");
+    }
+
+    /// Senza `reject_html` (criteri diretti al backend, o configurati a mano) una
+    /// risposta HTML resta legittima: una GET sulla home di un servizio web
+    /// risponde HTML per definizione.
+    #[test]
+    fn sul_backend_una_risposta_html_resta_legittima() {
+        let expected = json!({ "status": [200] });
+        let (passed, _) = prova_http(&expected, 200, Some("text/html"), "<!DOCTYPE html>");
+        assert!(passed, "senza reject_html l'HTML non e' un difetto");
+    }
+
+    /// Header assente: si guarda l'inizio del corpo, che e' sintassi e non prosa.
+    /// Un JSON che PARLA di html non e' una pagina.
+    #[test]
+    fn senza_header_decide_la_sintassi_non_una_parola_nel_corpo() {
+        assert!(risposta_e_html(None, "  <!DOCTYPE html><html>"));
+        assert!(risposta_e_html(None, "<html><body>x</body></html>"));
+        assert!(!risposta_e_html(None, "{\"tipo\":\"text/html\",\"nota\":\"<html> nel dato\"}"));
+        // L'header, quando c'e', ha la precedenza sul corpo.
+        assert!(!risposta_e_html(Some("application/json"), "<!DOCTYPE html>"));
+        assert!(risposta_e_html(Some("text/html; charset=utf-8"), "{}"));
+    }
 
     /// ToolExecutor fittizio: ritorna risultati pre-programmati per nome, e
     /// registra le chiamate ricevute (per asserire gli args).

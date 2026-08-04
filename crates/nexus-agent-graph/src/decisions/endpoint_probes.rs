@@ -203,12 +203,16 @@ pub fn endpoint_criteria_from_declaration(
 /// - **mai la root** (`/`): sul frontend e' la sua pagina, e risponderebbe 200
 ///   dicendo nulla sull'integrazione.
 ///
-/// LIMITE DICHIARATO: una SPA con fallback su `index.html` puo' rispondere 200
-/// a un path di API mai proxato. Questo criterio cattura il proxy ASSENTE o
-/// mal indirizzato (404/502, il caso misurato), non il fallback silenzioso —
-/// distinguerlo richiederebbe di guardare il CORPO, e la regola M vuole che si
-/// decida sullo status. Meglio una verifica che copre la classe misurata di
-/// nessuna verifica.
+/// Il fallback della SPA e' coperto da `reject_html`, e non passa dal corpo: un
+/// endpoint di API che risponde `Content-Type: text/html` ha servito la pagina
+/// del frontend, non i dati.
+///
+/// Era il limite dichiarato di questo criterio quando fu scritto, e si e'
+/// materializzato al primo giro (biblioteca-scolastica, 04/08/2026): il
+/// `rewrite` del proxy toglieva `/api`, il backend rispondeva 404 e Vite
+/// ripiegava su `index.html` con **status 200**. Deciso sul solo status, il
+/// gate approvava un'applicazione le cui due meta' non si parlavano. Vedi
+/// `criteria_runner::risposta_e_html`.
 pub fn criteri_integrazione_frontend(
     declared_outcome: Option<&Value>,
     origine_frontend: Option<&str>,
@@ -253,7 +257,15 @@ fn criterio_integrazione(
     Some(CriterionSpec {
         criterion_type: "http".to_string(),
         spec: Value::Object(spec),
-        expected: json!({ "status": DEFAULT_SUCCESS_STATUSES.to_vec() }),
+        // `reject_html`: attraverso il frontend, un endpoint di API deve
+        // restituire il DATO del backend. Se risponde HTML ha servito la propria
+        // pagina — il proxy non raggiunge l'API e il fallback della SPA maschera
+        // il 404 con un 200. Vale solo per questi criteri: sull'origine del
+        // BACKEND una risposta HTML puo' essere legittima.
+        expected: json!({
+            "status": DEFAULT_SUCCESS_STATUSES.to_vec(),
+            "reject_html": true,
+        }),
         timeout_s: Some(timeout_s),
     })
 }
