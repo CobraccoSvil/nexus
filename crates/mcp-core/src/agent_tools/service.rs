@@ -4,152 +4,31 @@ use super::*;
 use nexus_types::tool_outcome::RispostaTool;
 use std::collections::HashMap;
 
-/// Token che indicano "il comando avvia un server web". Tenuti a scope di
-/// modulo (non dentro la funzione) per contenere la lunghezza di
-/// `looks_like_web_service`; l'insieme e' invariato.
-const WEB_TOKENS: &[&str] = &[
-    "next dev",
-    "next start",
-    "vite",
-    "vite dev",
-    "vite preview",
-    "webpack-dev-server",
-    "webpack serve",
-    "astro dev",
-    "astro start",
-    "astro preview",
-    "nuxt dev",
-    "nuxt start",
-    "svelte-kit dev",
-    "ng serve",            // Angular
-    "react-scripts start", // CRA
-    "expo start",          // React Native web
-    "remix dev",
-    "gunicorn",
-    "uvicorn",
-    "hypercorn",
-    "daphne",
-    "flask run",
-    "django runserver",
-    "manage.py runserver",
-    "rails server",
-    "rails s ",
-    "sinatra",
-    "node server",
-    "node app",
-    "node index",
-    "node main",
-    "ts-node server",
-    "tsx server",
-    "deno serve",
-    "bun --hot",
-    "bun run dev",
-    "bun run start",
-    "cargo run",
-    "cargo watch",
-    "go run",
-    "dotnet run",
-    "dotnet watch",
-    "php -S",
-    "ruby -run",
-    "live-server",
-    "http-server",
-    "browser-sync",
-    // Make/script wrapper noti
-    "npm run dev",
-    "npm run start",
-    // `npm start` nudo e' l'alias built-in di `npm run start`: senza questo
-    // token il servizio partiva SENZA PORT injection e leggeva la porta
-    // stantia dal .env (incidente Beaty-Book 2026-07-02, EADDRINUSE).
-    "npm start",
-    "npm run serve",
-    "pnpm dev",
-    "pnpm start",
-    "pnpm serve",
-    "yarn dev",
-    "yarn start",
-    "yarn serve",
-];
-
-/// Runtime che eseguono uno SCRIPT passato come percorso: per questi il token
-/// contiguo non basta, va guardato il file che eseguono (vedi
-/// [`runtime_esegue_un_server`]).
-const RUNTIME_CON_SCRIPT: &[&str] = &["node", "ts-node", "tsx", "bun", "deno", "nodemon"];
-
-/// Nomi di file che, per convenzione universale, sono il punto d'ingresso di un
-/// server. Il confronto e' sul BASENAME, non sulla riga intera.
-const ENTRYPOINT_SERVER: &[&str] = &["server", "app", "index", "main"];
-
-/// Estensioni degli script riconosciuti come entrypoint.
-const ESTENSIONI_SCRIPT: &[&str] = &["js", "mjs", "cjs", "ts", "mts", "cts"];
-
-/// `true` se la riga esegue un RUNTIME su uno script il cui nome dice
-/// «server»: `node src/backend/server.js`, `tsx api/main.ts`, `bun app.js`.
+/// Il comando avvia un server che ha bisogno di una porta TCP?
 ///
-/// ROOT CAUSE, misurata il 03/08/2026 su catalogo-libri: [`WEB_TOKENS`] conteneva
-/// `"node server"`, `"node app"`, `"node index"`, `"node main"` — token
-/// CONTIGUI. Il comando reale era `node src/backend/server.js`, dove fra il
-/// runtime e il nome del file c'e' il percorso: `contains("node server")` e'
-/// falso, quindi il servizio non risultava un web service, non riceveva porta
-/// ne' `PORT`, e ripiegava sul default scritto nel codice. Il progetto ha
-/// chiuso il run con ZERO allocazioni e il backend fallito due volte.
+/// Facciata: la risposta la da' il punto unico [`super::avvio_server`], che
+/// scompone la riga come farebbe la shell e chiede «l'ESEGUIBILE di uno di
+/// questi comandi avvia un server?».
 ///
-/// Il difetto non era un token mancante: era la FORMA del criterio. Aggiungere
-/// `"node src/backend/server"` alla lista avrebbe coperto un percorso e lasciato
-/// fuori tutti gli altri — inseguire le varianti a codice e' la toppa che la
-/// regola H vieta. Qui si scompone la riga come farebbe la shell e si guarda
-/// cosa esegue davvero, cioe' la stessa scelta gia' fatta per il riconoscimento
-/// della suite Playwright.
-fn runtime_esegue_un_server(comando: &str) -> bool {
-    let mut token = comando.split_whitespace();
-    let programma = match token.next() {
-        Some(p) => p.trim_matches(['"', '\'']).to_ascii_lowercase(),
-        None => return false,
-    };
-    // Il programma puo' arrivare col percorso (`/usr/bin/node`, `C:\...\node.exe`).
-    let programma = programma
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(&programma)
-        .trim_end_matches(".exe");
-    if !RUNTIME_CON_SCRIPT.contains(&programma) {
-        return false;
-    }
-    // Primo argomento che non sia un flag: e' lo script.
-    for arg in token {
-        let arg = arg.trim_matches(['"', '\'']);
-        if arg.starts_with('-') {
-            continue;
-        }
-        let file = arg.rsplit(['/', '\\']).next().unwrap_or(arg).to_ascii_lowercase();
-        let (nome, estensione) = match file.rsplit_once('.') {
-            Some((n, e)) => (n, e),
-            // Senza estensione non e' uno script: `deno serve`, `bun run dev`
-            // li copre gia' il token contiguo.
-            None => return false,
-        };
-        return ENTRYPOINT_SERVER.contains(&nome) && ESTENSIONI_SCRIPT.contains(&estensione);
-    }
-    false
-}
-
-/// Heuristica: il comando avvia un server web/long-running che ha bisogno di
-/// una porta TCP? Riconosce:
-/// - script comuni: `next dev|start`, `vite`, `webpack-dev-server`, `astro dev`
-/// - framework Python: `gunicorn`, `uvicorn`, `flask run`, `django runserver`
-/// - Node generici: `npm run dev|start|serve`, e un runtime su un entrypoint di
-///   server anche con percorso (`node src/backend/server.js`)
-/// - Rust/Go/.NET dev server: `cargo run`, `go run`, `dotnet run`, `dotnet watch`
+/// Il criterio viveva qui ed era `command.to_lowercase().contains(token)` su un
+/// vocabolario di sottostringhe. Ha sbagliato nei due versi, e le due volte era
+/// lo stesso difetto di FORMA:
+/// - token CONTIGUI ciechi al percorso: `"node server"` non compariva in
+///   `node src/backend/server.js`, quindi il servizio non riceveva `PORT` e
+///   ripiegava sulla porta scritta nel codice (catalogo-libri, 03/08/2026);
+/// - token NUDI ciechi al contesto: `"vite"` compariva in `VITE_API_URL`,
+///   quindi `grep -r "VITE_API_URL" frontend/` risultava un servizio web,
+///   riceveva dalla working directory la label `frontend`, e il gate pre-avvio
+///   fermava il frontend vero — vivo da 3h45m — per «deduplicarlo».
 ///
-/// In caso di dubbio (es. `make foo`), NON inietta PORT: l'agente puo' chiamare
+/// Il primo fu corretto per i soli runtime (`node`, `tsx`, ...); il secondo
+/// mostra che la mezza correzione non bastava. Il criterio e' ora uno solo, e
+/// vale per l'intera riga.
+///
+/// In caso di dubbio (es. `make foo`) NON inietta `PORT`: l'agente puo' chiamare
 /// `request_port` esplicitamente e includere la porta nel comando.
 pub(crate) fn looks_like_web_service(command: &str) -> bool {
-    // One-shot build/install/test: non sono servizi web (regola L: is_long_oneshot).
-    if is_long_oneshot(command) {
-        return false;
-    }
-    let lc = command.to_lowercase();
-    WEB_TOKENS.iter().any(|t| lc.contains(t)) || runtime_esegue_un_server(&lc)
+    super::avvio_server::riga_avvia_server(command)
 }
 
 /// Porta candidata trovata nell'output di un servizio, col verdetto sul suo
@@ -2009,7 +1888,7 @@ mod tests {
     use super::{
         classifica_ascolto_altrove, derive_kind_hint, detect_port_from_output,
         existing_service_action, format_started_message, looks_like_web_service,
-        resolve_service_label, resolve_service_work_dir, runtime_esegue_un_server, scope_dir,
+        resolve_service_label, resolve_service_work_dir, scope_dir,
         tool_run_service, AscoltoAltrove, ExistingServiceAction, PortaRilevata, Uuid,
     };
     use crate::agent_processes::{is_generic_service_label, similar_service_labels};
@@ -2075,9 +1954,9 @@ mod tests {
     /// non risultava un web service, non riceveva porta ne' PORT, e il progetto
     /// ha chiuso con ZERO allocazioni e il backend fallito due volte.
     ///
-    /// MUTAZIONE: togliere `|| runtime_esegue_un_server(&lc)` da
-    /// `looks_like_web_service` fa rosseggiare la prima asserzione — il valore
-    /// del difetto reale.
+    /// MUTAZIONE: togliere il ramo `RUNTIME_CON_SCRIPT` da
+    /// `avvio_server::comando_avvia_server` fa rosseggiare la prima asserzione —
+    /// il valore del difetto reale.
     #[test]
     fn un_server_node_col_percorso_e_un_web_service() {
         assert!(
@@ -2090,13 +1969,15 @@ mod tests {
         assert!(looks_like_web_service("nodemon backend/app.js"));
         // Il runtime puo' arrivare col proprio percorso.
         assert!(looks_like_web_service("/usr/bin/node dist/server.js"));
-        // NOTA su un difetto ADIACENTE, non coperto da questo fix: un server che
-        // vive sotto `build/` non arriva nemmeno qui, perche' `is_long_oneshot`
-        // cerca " build" come substring e lo scambia per un comando di build.
-        // E' la stessa forma di difetto (substring invece che lessicale) su una
-        // funzione con molti piu' chiamanti: va corretta li', separatamente.
-        assert!(!looks_like_web_service("node build/server.js"));
-        // E i token contigui continuano a valere.
+        // Il difetto ADIACENTE che questo test dichiarava non coperto — un server
+        // sotto `build/` bocciato da `is_long_oneshot`, che cercava " build" come
+        // substring — e' chiuso: il criterio non passa piu' da quella funzione,
+        // perche' un criterio POSITIVO non ha bisogno di un veto che elenchi cio'
+        // che server non e'.
+        assert!(
+            looks_like_web_service("node build/server.js"),
+            "la cartella in cui vive lo script non dice cosa lo script fa"
+        );
         assert!(looks_like_web_service("npm run dev"));
         assert!(looks_like_web_service("node server.js"));
     }
@@ -2112,12 +1993,12 @@ mod tests {
         assert!(!looks_like_web_service("node tools/migrate.js"));
         assert!(!looks_like_web_service("npx eslint src --max-warnings=0"));
         assert!(!looks_like_web_service("npm run build"));
-        // Un runtime senza script: lo coprono i token contigui, non questo ramo.
-        assert!(!runtime_esegue_un_server("node"));
-        // Estensione non da script: il ramo nuovo lo rifiuta. (La riga intera
-        // resta catturata dal token contiguo "node server" di WEB_TOKENS, che e'
-        // un falso positivo preesistente e innocuo: nessuno avvia un .txt.)
-        assert!(!runtime_esegue_un_server("node server.txt"));
+        // Un runtime senza script non avvia niente.
+        assert!(!looks_like_web_service("node"));
+        // Estensione che non e' di uno script: nessuno avvia un .txt. Col
+        // vocabolario a sottostringhe questa riga era un falso positivo,
+        // catturata dal token contiguo "node server".
+        assert!(!looks_like_web_service("node server.txt"));
     }
 
     /// LA CATENA VERA, riprodotta: il valore che il registro consegnava

@@ -25,6 +25,9 @@
 // crate nexus-agent-tools; il re-export mantiene i path crate::agent_tools::*.
 pub use nexus_agent_tools::*;
 
+// «Questa riga di shell avvia un server?» (punto unico, regola L): la domanda
+// posta sulla riga SCOMPOSTA, non sul testo grezzo.
+pub(crate) mod avvio_server;
 pub(crate) mod command;
 pub(crate) mod context;
 pub(crate) mod dispatch;
