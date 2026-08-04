@@ -349,10 +349,74 @@ fn has_system_systemctl(cmd: &str) -> bool {
     false
 }
 
+/// Nomi che Windows riserva a livello di filesystem: non sono file, e un file
+/// che li porta non si apre ne' si cancella con le API normali (serve il
+/// prefisso `\\?\`).
+///
+/// L'elenco e' quello del SISTEMA OPERATIVO, non un'euristica nostra: e' chiuso
+/// e non cambia.
+const NOMI_RISERVATI_WINDOWS: &[&str] = &[
+    "nul", "con", "aux", "prn", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// La riga redirige verso un nome riservato di Windows (`... > nul`)?
+///
+/// E' l'errore silenzioso piu' costoso della shell: `> nul` e' la sintassi di
+/// cmd, ma la shell degli agenti e' POSIX, dove `nul` non e' un dispositivo —
+/// e' un nome di file qualunque. Il comando NON fallisce: crea un file che poi
+/// nessuna API normale riesce a rimuovere, e che blocca la cancellazione
+/// dell'intera cartella del progetto.
+///
+/// MISURATO il 04/08/2026: sei progetti su sedici non si sono lasciati
+/// eliminare per questo, e ci e' voluto il prefisso `\\?\` per venirne fuori.
+///
+/// Si guarda il TARGET della redirezione, non la presenza della parola: `grep
+/// nul file.txt` e `echo "nul"` restano legittimi.
+fn redirige_su_nome_riservato(cmd: &str) -> Option<&'static str> {
+    let b = cmd.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'>' {
+            i += 1;
+            continue;
+        }
+        // `>`, `>>`, `2>`, `&>`: dopo l'ultimo '>' inizia il target.
+        let mut j = i + 1;
+        while j < b.len() && b[j] == b'>' {
+            j += 1;
+        }
+        while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+            j += 1;
+        }
+        let inizio = j;
+        while j < b.len() && !b[j].is_ascii_whitespace() && b[j] != b';' && b[j] != b'|' && b[j] != b'&' {
+            j += 1;
+        }
+        let target = cmd[inizio..j].trim_matches(['"', '\'']).to_ascii_lowercase();
+        // Solo il nome NUDO: `> nul` e' l'errore, `> ./nul.txt` e' un file vero.
+        if let Some(nome) = NOMI_RISERVATI_WINDOWS.iter().find(|n| **n == target) {
+            return Some(nome);
+        }
+        i = j.max(i + 1);
+    }
+    None
+}
+
 pub fn check_command(cmd: &str) -> Option<BlockReason> {
     let normalized = cmd.trim();
     if normalized.is_empty() {
         return None;
+    }
+    // `> nul` non fallisce: crea un file che poi non si riesce piu' a cancellare.
+    // Si rifiuta invece di riscriverlo in silenzio, perche' una correzione
+    // invisibile lascerebbe l'agente convinto che quella sintassi funzioni.
+    if redirige_su_nome_riservato(normalized).is_some() {
+        return Some(BlockReason {
+            category: "nome_riservato_windows",
+            message: "Redirezione verso un nome riservato di Windows (nul/con/aux/prn/com*/lpt*)",
+            remediation: "La shell qui e' POSIX: `nul` non e' un dispositivo, e `> nul` CREA un file che poi non si riesce piu' a cancellare. Usa `> /dev/null` (e `2>/dev/null`, `> /dev/null 2>&1`).",
+        });
     }
     // systemctl context-aware (vedi has_system_systemctl): `systemctl --user`
     // (servizi del progetto) e' permesso; `systemctl` di sistema e' bloccato.

@@ -111,16 +111,24 @@ test("run lungo E fermo: l'etichetta dichiara l'attesa, non l'elaborazione", () 
   assert.ok(s.title.includes("8m 0s"), "manca la durata del run nel tooltip");
 });
 
-test("run lungo ma attivo: elaborazione, e il tooltip nega esplicitamente il blocco", () => {
+test("run lungo ma attivo: nessun avviso, e resta scritto COSA sta facendo", () => {
+  // Un run lungo che procede non e' un'anomalia. Il ramo che qui scriveva
+  // "⚠ AI in elaborazione" in arancione doveva poi rassicurare nel tooltip
+  // ("non e' fermo"), e per dirlo sacrificava l'unica informazione non
+  // ricavabile dal pallino, dal cronometro e dal pulsante Interrompi: il
+  // lavoro in corso.
   const s = activityStatusView({
     runElapsedSeconds: 300,
     secondsSinceLastStep: 4,
     isAgentStuck: false,
-    busyLabel: "AI al lavoro",
+    busyLabel: "Subagente implement: al lavoro da 4m",
   });
-  assert.equal(s.text, "⚠ AI in elaborazione");
-  assert.ok(s.warn);
-  assert.ok(s.title.includes("non e' fermo"));
+  assert.equal(s.text, "Subagente implement: al lavoro da 4m");
+  assert.ok(!s.warn, "un run lungo che procede non e' un avviso");
+  assert.ok(!s.text.includes("⚠"));
+  // I due tempi restano entrambi nel tooltip.
+  assert.ok(s.title.includes("5m 0s"), "manca la durata del run");
+  assert.ok(s.title.includes("4s"), "manca il tempo dall'ultimo passo");
 });
 
 test("run breve e fermo: l'attesa si vede anche sotto la soglia dei 2 minuti", () => {

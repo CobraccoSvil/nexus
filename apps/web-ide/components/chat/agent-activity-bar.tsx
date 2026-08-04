@@ -7,7 +7,6 @@ import {
   activityStatusView,
   formatDuration,
   interruptButtonView,
-  RUN_LONG_THRESHOLD_SECONDS,
 } from "./interrupt-button-logic";
 
 /**
@@ -81,7 +80,6 @@ export function AgentActivityBar({
     isAgentStuck,
     busyLabel,
   });
-  const runIsLong = runElapsedSeconds > RUN_LONG_THRESHOLD_SECONDS;
   return (
     <div
       style={{
@@ -162,7 +160,13 @@ export function AgentActivityBar({
             title="Tempo trascorso dall'avvio del run"
             style={{
               fontSize: 10,
-              color: runIsLong ? "#f97316" : tc.textMuted,
+              // Neutro: il cronometro dice il TEMPO, non un giudizio. Sopra i
+              // due minuti diventava arancione, cioe' segnalava come anomalia un
+              // run lungo che sta procedendo — e l'unica anomalia vera (agente
+              // FERMO) ha gia' il suo avviso nella riga di stato, col tempo di
+              // inattivita' dentro. Due allarmi di cui uno falso non fanno
+              // guardare meglio: fanno smettere di guardare.
+              color: tc.textMuted,
               fontVariantNumeric: "tabular-nums",
               marginLeft: 4,
             }}

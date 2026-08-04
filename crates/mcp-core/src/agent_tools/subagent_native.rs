@@ -1662,14 +1662,21 @@ pub(crate) async fn read_council_config(db: &sqlx::PgPool) -> CouncilConfig {
 /// testo veniva scartata a favore delle prime tre voci di un CSV. Ogni asse
 /// nuovo avrebbe ereditato lo stesso silenzio.
 ///
-/// `declared_competencies` e' il giudizio SEMANTICO del classificatore
-/// (`intent_classifier::AgenticIntent::competencies`, gia' validato contro il
-/// roster figure): quando presente, GOVERNA la scelta d'ambito al posto delle
-/// keyword — sono le competenze che il task richiede DAVVERO, non quelle che
-/// hanno la fortuna di condividere una parola col testo. `Some(vec![])` e' un
-/// giudizio valido ("nessuna lente d'ambito serve"), diverso da `None`
-/// ("non dichiarabile": classifier caduto o vocabolario non iniettato), che fa
-/// ripiegare sulle keyword d'ambito — l'unico caso in cui restano usate.
+/// ORDINE, e la ragione di ciascun posto:
+/// 1. le lenti che il TESTO attiva (keyword d'ambito): criterio deterministico,
+///    verificabile e configurabile dal DB — di ogni figura si puo' dire perche'
+///    c'e', e la si corregge cambiando un dato;
+/// 2. `declared_competencies`, il giudizio del classificatore
+///    (`intent_classifier::AgenticIntent::competencies`, validato contro il
+///    roster figure): si SOMMA, perche' sa cogliere un ambito che il vocabolario
+///    non nomina ancora;
+/// 3. le `base_figures`, default cieco per i posti rimasti.
+///
+/// Il giudizio del modello NON governa piu' la scelta. Governava — "le
+/// competenze dichiarate SONO le figure d'ambito, niente match testuale" — e
+/// quando sbagliava toglieva una lente senza che nulla lo segnalasse. In un
+/// panel advisory il costo e' asimmetrico: una figura in piu' e' un parere in
+/// piu', una in meno e' un punto cieco.
 /// L'attivazione da keyword riusa il PUNTO UNICO del match a parola intera
 /// [`crate::prompt_templates::touches_domain_keyword`] (regola L): a
 /// sottostringa un vocabolario d'ambito non e' affidabile — `log` trova
@@ -1696,23 +1703,42 @@ pub(crate) fn select_council_figures(
         }
     };
     let mut figures: Vec<String> = Vec::new();
-    if let Some(declared) = declared_competencies {
-        // Giudizio semantico gia' validato dal classificatore: le competenze
-        // dichiarate SONO le figure d'ambito, niente match testuale.
-        for f in declared {
-            push(f, &mut figures);
-        }
-    } else {
-        // Ripiego keyword: SOLO quando il classificatore non ha potuto
-        // dichiarare (caduto, o vocabolario non iniettato nel prompt).
-        for axis in &cfg.domain_axes {
-            if crate::prompt_templates::touches_domain_keyword(user_text, &axis.keywords) {
-                for f in &axis.figures {
-                    push(f, &mut figures);
-                }
+
+    // (1) Le lenti che il TESTO attiva. Entrano per prime e non sono negoziabili:
+    // il criterio e' deterministico, verificabile e configurabile dal DB
+    // (`orchestrator.council_<asse>_keywords`, regola G), quindi si puo' dire
+    // PERCHE' una figura c'e' o non c'e' — e correggerlo cambiando un dato.
+    //
+    // Erano il RIPIEGO di un classificatore caduto: quando lui dichiarava
+    // qualcosa, non venivano consultate affatto. MISURATO il 04/08/2026 su
+    // biblioteca-scolastica: un task che dice «applicazione web ... frontend con
+    // il catalogo» e «avvia i servizi» ha convocato le CINQUE base su SETTE
+    // posti, senza `ui_ux_designer` (asse `ui`: `applicazione`, `frontend`,
+    // `web`, `gestionale`) ne' `sysadmin` (asse `infra`: `servizi`). Due lenti
+    // pertinenti perse mentre due sedie restavano vuote, e nessun segnale lo
+    // diceva.
+    //
+    // Il giudizio di un modello non governa piu' questa scelta: quando sbaglia
+    // toglie una lente in silenzio, e il costo e' asimmetrico — una figura in
+    // piu' in un panel ADVISORY costa un parere, una in meno costa un punto
+    // cieco.
+    for axis in &cfg.domain_axes {
+        if crate::prompt_templates::touches_domain_keyword(user_text, &axis.keywords) {
+            for f in &axis.figures {
+                push(f, &mut figures);
             }
         }
     }
+
+    // (2) Le competenze dichiarate dal classificatore si SOMMANO: sanno cogliere
+    // un ambito che il vocabolario non nomina ancora, e questo resta un
+    // guadagno. Non possono pero' escludere cio' che il testo ha gia' attivato.
+    if let Some(declared) = declared_competencies {
+        for f in declared {
+            push(f, &mut figures);
+        }
+    }
+
     // Posti totali. Il target puo' ALLARGARSI per ospitare le figure d'ambito
     // (sono obbligatorie), mai oltre il backstop assoluto `max_figures`.
     let posti = match target {
@@ -1721,6 +1747,9 @@ pub(crate) fn select_council_figures(
         None => cfg.max_figures,
     };
     figures.truncate(posti);
+
+    // (3) Le base riempiono cio' che resta: sono un default cieco, nessun
+    // segnale del task le ha scelte.
     for f in &cfg.base_figures {
         if figures.len() >= posti {
             break;
@@ -7678,6 +7707,75 @@ mod tests {
         );
     }
 
+    /// IL CASO MISURATO il 04/08/2026 su biblioteca-scolastica, notato a occhio
+    /// sul pannello: un task palesemente d'interfaccia ha convocato le sole
+    /// figure base, e la lente UI non c'era.
+    ///
+    /// Il classificatore aveva dichiarato competenze che non includevano
+    /// `ui_ux_designer`; le keyword d'ambito, che l'avrebbero presa, non
+    /// venivano consultate perche' erano il RIPIEGO del classificatore caduto.
+    /// Cosi' i posti liberi andavano al default cieco.
+    ///
+    /// MUTAZIONE: rimettere il ciclo sugli assi dentro un ramo `else` del
+    /// giudizio dichiarato fa rosseggiare la prima asserzione —
+    /// `ui_ux_designer` sparisce, esattamente com'era sul pannello.
+    #[test]
+    fn le_lenti_d_ambito_entrano_sempre_e_per_prime() {
+        let cfg = CouncilConfig {
+            base_figures: vec!["functional_analyst".into(), "project_manager".into()],
+            domain_axes: vec![axis("ui", &["frontend", "applicazione"], &["ui_ux_designer"])],
+            advisory_kinds: vec![
+                "functional_analyst".into(),
+                "project_manager".into(),
+                "software_architect".into(),
+                "ui_ux_designer".into(),
+            ],
+            max_figures: 4,
+        };
+        // Il classificatore dichiara una competenza pertinente ma non la lente UI.
+        let dichiarate = vec!["software_architect".to_string()];
+        let got = select_council_figures(
+            "Crea un'applicazione web con frontend per il catalogo",
+            &cfg,
+            None,
+            Some(&dichiarate),
+        );
+        assert!(
+            got.iter().any(|f| f == "ui_ux_designer"),
+            "il testo attiva l'asse ui: la lente non e' negoziabile dal classificatore: {got:?}"
+        );
+        // L'ordine dichiara chi decide: prima cio' che il TESTO attiva (criterio
+        // verificabile), poi il giudizio del modello, infine il default cieco.
+        assert_eq!(
+            got[0], "ui_ux_designer",
+            "la lente attivata dal testo viene per prima: {got:?}"
+        );
+        assert!(
+            got.iter().any(|f| f == "software_architect"),
+            "il giudizio del classificatore si somma, non viene scartato: {got:?}"
+        );
+        assert!(
+            got.iter().position(|f| f == "software_architect")
+                < got.iter().position(|f| f == "functional_analyst"),
+            "le dichiarate precedono comunque le base: {got:?}"
+        );
+    }
+
+    /// Il testo che NON tocca l'ambito non convoca la sua lente: il riempimento
+    /// resta alle base.
+    #[test]
+    fn senza_keyword_d_ambito_i_posti_vanno_alle_base() {
+        let cfg = CouncilConfig {
+            base_figures: vec!["functional_analyst".into(), "project_manager".into()],
+            domain_axes: vec![axis("ui", &["frontend", "applicazione"], &["ui_ux_designer"])],
+            advisory_kinds: Vec::new(),
+            max_figures: 3,
+        };
+        let got = select_council_figures("rivedi la politica di retention dei log", &cfg, None, None);
+        assert!(!got.iter().any(|f| f == "ui_ux_designer"), "{got:?}");
+        assert!(got.iter().any(|f| f == "functional_analyst"), "{got:?}");
+    }
+
     /// Roster non leggibile (DB muto, vocabolario mutatori assente): nessun
     /// filtro. Un'assenza di dati non e' la dichiarazione che nessuna figura sia
     /// advisory, e azzerare il Consiglio sarebbe spegnerlo di nascosto.
@@ -7713,11 +7811,20 @@ mod tests {
         );
     }
 
-    /// `Some(vec![])` e' un giudizio: "nessuna lente d'ambito serve". Anche col
-    /// testo che contiene una keyword d'asse (qui "deploy"), le competenze
-    /// dichiarate governano — la vecchia strada keyword non deve piu' scattare.
+    /// ROVESCIATO il 04/08/2026, ed e' il difetto in forma pura: questo test
+    /// asseriva che un task che dice «prepara il deploy con docker in
+    /// produzione» NON convocasse `sysadmin`, perche' il classificatore aveva
+    /// risposto `Some(vec![])` — "nessuna lente d'ambito serve".
+    ///
+    /// Un giudizio di un modello sopprimeva cosi' un criterio verificabile,
+    /// senza che nulla lo segnalasse. Sul pannello lo si e' visto al contrario
+    /// (una lente UI mancante su un task d'interfaccia), ma la forma e' questa:
+    /// quando il giudizio sbaglia, la lente sparisce e non se ne sa il perche'.
+    ///
+    /// Ora le keyword entrano SEMPRE: `Some(vec![])` significa "il classificatore
+    /// non aggiunge nulla", non "il testo non conta".
     #[test]
-    fn competenze_dichiarate_vuote_non_convocano_ambito_anche_con_keyword_nel_testo() {
+    fn il_giudizio_vuoto_non_sopprime_la_lente_che_il_testo_attiva() {
         let cfg = council_cfg();
         let got = select_council_figures(
             "prepara il deploy con docker in produzione",
@@ -7726,19 +7833,18 @@ mod tests {
             Some(&[]),
         );
         assert!(
-            !got.iter().any(|f| f == "sysadmin"),
-            "competencies=Some(vec![]) e' un giudizio esplicito, niente ripiego keyword: {got:?}"
+            got.iter().any(|f| f == "sysadmin"),
+            "il testo dice `deploy`: la lente infra non e' negoziabile da un giudizio vuoto: {got:?}"
         );
-        assert_eq!(got, vec![
-            "functional_analyst",
-            "software_architect",
-            "security_engineer",
-            "project_manager"
-        ]);
+        assert_eq!(
+            got[0], "sysadmin",
+            "cio' che il testo attiva viene per primo: {got:?}"
+        );
     }
 
-    /// `None` (classificatore non ha potuto dichiarare) e' l'UNICO caso in cui
-    /// le keyword d'ambito restano usate: comportamento pre-esistente invariato.
+    /// `None` (il classificatore non ha potuto dichiarare) convoca l'ambito come
+    /// sempre. Non e' piu' l'UNICO caso in cui le keyword valgono — ora valgono
+    /// sempre — ma resta il caso in cui sono l'unica fonte.
     #[test]
     fn competenze_non_dichiarabili_ripiegano_sulle_keyword() {
         let cfg = council_cfg();

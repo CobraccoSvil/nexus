@@ -80,16 +80,21 @@ export function formatDuration(seconds: number): string {
 /**
  * Etichetta di stato della barra attivita'.
  *
- * PRECEDENZA: l'attesa reale vince sulla durata. Era il contrario — un run oltre
- * i 2 minuti scriveva "AI in elaborazione" anche mentre era fermo da tre, e
- * l'informazione specifica (nessun passo in arrivo) veniva soppressa da quella
- * generica (sta lavorando da tanto). Chi guardava la barra leggeva "elaborazione"
- * e aspettava. Se e' fermo ora lo dice, e dice da quanto: "fermo" senza il tempo
- * non fa decidere nulla.
+ * UN SOLO avviso, e riguarda un FATTO: nessun passo in arrivo da N secondi.
+ * "Fermo" senza il tempo non fa decidere nulla, quindi il tempo e' nel testo —
+ * ed e' l'INATTIVITA', mentre il timer accanto e' la durata del run. Sono due
+ * numeri diversi e il tooltip li nomina entrambi, cosi' chi legge non deve
+ * indovinare quale sta guardando.
  *
- * Il tempo scritto nell'etichetta e' l'INATTIVITA'; il timer accanto resta la
- * durata del run. Sono due numeri diversi e il tooltip li nomina entrambi, cosi'
- * chi legge non deve indovinare quale dei due sta guardando.
+ * Un run LUNGO non e' un avviso. C'era un secondo ramo che oltre una soglia di
+ * durata scriveva "AI in elaborazione" in arancione con l'icona di allerta, e
+ * il suo stesso tooltip doveva poi rassicurare: "l'agente sta lavorando, non e'
+ * fermo". Diceva cioe' che va tutto bene, con la grafica del problema — mentre
+ * il pallino verde, il cronometro e il pulsante Interrompi erano gia' li' a
+ * dire le stesse tre cose. In cambio SOPPRIMEVA `busyLabel`, che e' l'unica
+ * informazione non ricavabile altrove: cosa l'agente stia facendo adesso
+ * ("Subagente implement: al lavoro da…"). Un avviso che scatta sul normale
+ * insegna a ignorare gli avvisi, e questo costava anche l'unico dato utile.
  */
 export function activityStatusView(input: ActivityStatusInput): ActivityStatusView {
   const { runElapsedSeconds, secondsSinceLastStep, isAgentStuck, busyLabel } = input;
@@ -100,13 +105,6 @@ export function activityStatusView(input: ActivityStatusInput): ActivityStatusVi
     return {
       text: `⚠ Agente in attesa da ${inattivita}`,
       title: `Nessuno step ne' meta-step da ${inattivita}. ${durata}.`,
-      warn: true,
-    };
-  }
-  if (runElapsedSeconds > RUN_LONG_THRESHOLD_SECONDS) {
-    return {
-      text: "⚠ AI in elaborazione",
-      title: `${durata}; ultimo passo ${inattivita} fa: l'agente sta lavorando, non e' fermo.`,
       warn: true,
     };
   }
