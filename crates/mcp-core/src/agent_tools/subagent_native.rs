@@ -283,9 +283,18 @@ async fn resolve_system_text(
     // Il processo operativo standard (mig 0674), SOLO alle figure non-advisory:
     // la whitelist e' il discriminante (punto unico is_advisory_kind), e la
     // decisione vive dentro `prompt_processo`, non qui.
-    let registro =
+    let mut registro =
         crate::prompt_processo::con_processo_figura(&ctx.core.db, registro, tool_whitelist)
             .await;
+    // Direttiva <recupero_contesto> (W4), SOLO se la whitelist ha tool
+    // semantici: stabile per kind, quindi ammessa nel system (cache intatta).
+    if let Some(direttiva) =
+        crate::agent_tools::mandate_recall::direttiva_recupero(&ctx.core.db, tool_whitelist)
+            .await
+    {
+        registro.push_str("\n\n");
+        registro.push_str(&direttiva);
+    }
     crate::prompt_ambiente::con_ambiente(&ctx.core.db, registro).await
 }
 
@@ -3702,6 +3711,20 @@ async fn prepare_subagent_run(
     if !expected_format.trim().is_empty() {
         initial_msg.push_str("\n\n## Formato output atteso\n");
         initial_msg.push_str(expected_format.trim());
+    }
+    // Contesto richiamato per pertinenza (W4, punto UNICO di innesto: tutti i
+    // canali di convocazione passano da qui). Nel MESSAGGIO, mai nel system
+    // (disciplina cache); fail-open; skip quando il chiamante ha gia' fornito
+    // un context_blob sostanzioso — il recall integra il mandato scarno, non
+    // gonfia quello gia' curato.
+    const RECALL_SKIP_SE_CONTEXT_OLTRE: usize = 20_000;
+    if context_blob.chars().count() < RECALL_SKIP_SE_CONTEXT_OLTRE {
+        if let Some(blocco) =
+            crate::agent_tools::mandate_recall::contesto_richiamato(db, task, project_id).await
+        {
+            initial_msg.push_str("\n\n");
+            initial_msg.push_str(&blocco);
+        }
     }
 
     // ── Crea row in nexus_subagent_runs (status='running' subito: la catena depth

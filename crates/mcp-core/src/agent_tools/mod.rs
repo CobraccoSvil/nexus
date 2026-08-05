@@ -32,6 +32,7 @@ pub(crate) mod command;
 pub(crate) mod context;
 pub(crate) mod dispatch;
 pub(crate) mod helpers;
+pub(crate) mod mandate_recall;
 pub(crate) mod playwright_cli;
 pub(crate) mod port_scanner;
 pub(crate) mod ports;

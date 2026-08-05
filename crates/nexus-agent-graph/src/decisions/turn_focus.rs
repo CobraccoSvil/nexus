@@ -82,7 +82,7 @@ const EXCERPT_MAX_CHARS: usize = 600;
 // DOTALL (`.` matcha anche `\n`), `.*?` = non-greedy come il Python.
 static SYSTEM_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?is)<allegati[^>]*>.*?</allegati>|<allegati_sessione[^>]*>.*?</allegati_sessione>|<task_playbook[^>]*>.*?</task_playbook>",
+        r"(?is)<allegati[^>]*>.*?</allegati>|<allegati_sessione[^>]*>.*?</allegati_sessione>|<task_playbook[^>]*>.*?</task_playbook>|<contesto_richiamato[^>]*>.*?</contesto_richiamato>",
     )
     .expect("regex system block valida")
 });
@@ -99,7 +99,7 @@ pub fn user_text_only(text: &str) -> String {
 /// alternative di [`SYSTEM_BLOCK_RE`] (case-insensitive, gemella per costruzione:
 /// se qui si aggiunge un tag va aggiunto anche li').
 static UNTRUSTED_CLOSE_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)</(allegati_sessione|allegati|task_playbook)>")
+    Regex::new(r"(?i)</(allegati_sessione|allegati|task_playbook|contesto_richiamato)>")
         .expect("regex tag di chiusura valida")
 });
 

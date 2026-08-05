@@ -1603,7 +1603,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   ,
   {
     "name": "nexus_search_semantic",
-    "description": "Cerca semanticamente nel contesto del progetto: allegati indicizzati, knowledge base, chat history passate, tool result cached. Usalo per recuperare informazioni rilevanti senza dover ri-leggere file interi. Restituisce chunk testuali ordinati per score di similarita' coseno.",
+    "description": "Cerca semanticamente nel contesto del progetto: codice sorgente indicizzato, allegati, knowledge base, chat history passate, tool result cached. Usalo PRIMA di letture massive: recupera i frammenti pertinenti senza ri-leggere file interi. Restituisce chunk testuali ordinati per score di similarita' coseno, con fonte dichiarata.",
     "input_schema": {
       "type": "object",
       "properties": {
