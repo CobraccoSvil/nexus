@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 pub mod errore;
+pub mod fine_riga;
 pub mod registro;
 pub mod set;
 

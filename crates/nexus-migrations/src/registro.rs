@@ -34,6 +34,7 @@ use sqlx::migrate::{AppliedMigration, Migrate, MigrateError};
 use sqlx::{Acquire, Postgres};
 
 use crate::{ErroreMigrazione, OrigineSet, Set};
+use crate::fine_riga::{a_crlf, a_lf};
 
 /// L'unica scrittura di questo crate, come LETTERALE.
 ///
@@ -351,33 +352,11 @@ fn sha384(byte: &[u8]) -> Vec<u8> {
     Sha384::digest(byte).to_vec()
 }
 
-/// La stessa sequenza con i fine-riga dell'altra convenzione. Passa per la
-/// forma LF anche in andata, cosi' un file gia' misto non produce `\r\r\n`.
-fn a_crlf(byte: &[u8]) -> Vec<u8> {
-    let lf = a_lf(byte);
-    let mut out = Vec::with_capacity(lf.len());
-    for b in lf {
-        if b == b'\n' {
-            out.push(b'\r');
-        }
-        out.push(b);
-    }
-    out
-}
-
-fn a_lf(byte: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(byte.len());
-    let mut i = 0;
-    while i < byte.len() {
-        if byte[i] == b'\r' && byte.get(i + 1) == Some(&b'\n') {
-            i += 1;
-            continue;
-        }
-        out.push(byte[i]);
-        i += 1;
-    }
-    out
-}
+// Le due materializzazioni vivono in `crate::fine_riga`, insieme al criterio
+// che le usa. Il difetto dei fine-riga si e' presentato in TRE posti diversi
+// (mig 0500, mig 117/118, e il progresso delle correzioni in
+// nexus-agent-graph): tenerne una copia qui avrebbe garantito che alla quarta
+// occorrenza divergessero.
 
 #[cfg(test)]
 mod tests {
