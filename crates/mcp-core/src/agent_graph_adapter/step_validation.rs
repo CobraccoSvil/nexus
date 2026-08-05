@@ -316,9 +316,10 @@ async fn chiamata_one_shot(
     let resp = match llm.complete(richiesta_verdetto(&cand, system, blob, run_id)).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(role, provider = %cand.provider, errore = %e,
+            let causa = causa_di(&e);
+            tracing::warn!(role, provider = %cand.provider, causa, errore = %e,
                 "chiamata del validatore fallita: astensione dichiarata");
-            return astensione(role, &cand, CAUSA_CALL);
+            return astensione(role, &cand, causa);
         }
     };
 
@@ -536,6 +537,25 @@ fn schema_step_verdict() -> Value {
     Value::Object(tool)
 }
 
+/// La causa dell'astensione dal SEGNALE STRUTTURATO dell'errore (regola M),
+/// mai dal suo testo. Il gateway classifica gia' il perche' di una chiamata
+/// caduta (`billing`, `cooldown`, `client_error`, `empty_completion`, ...) e
+/// quel vocabolario e' il suo: collassarlo in un generico `call_error`
+/// costringerebbe chi legge il meta_step a indovinare se il validatore tace
+/// perche' non sa produrre il verdetto (difetto del modello: va escluso dal
+/// purpose) o perche' il conto e' a zero (fatto d'ambiente: nessuna
+/// esclusione, si ricarica). Misurato dalla prova GAP-4 del 05/08/2026: due
+/// candidati su tre astenevano per credito esaurito, e il payload diceva solo
+/// «call_error».
+fn causa_di(e: &nexus_agent_graph::runtime::ports::PortError) -> &'static str {
+    match e {
+        nexus_agent_graph::runtime::ports::PortError::ProviderUnavailable(info) => {
+            info.cause.as_str()
+        }
+        _ => CAUSA_CALL,
+    }
+}
+
 fn astensione(role: &str, cand: &PurposeProviderCandidate, causa: &str) -> ValidatorVerdict {
     astensione_su(role, cand.provider.clone(), cand.model.clone(), causa)
 }
@@ -641,5 +661,155 @@ mod tests {
         assert_eq!(v.abstain_cause.as_deref(), Some("timeout"));
         assert_eq!(v.cost_usd, None);
         assert_eq!(v.role, "challenger");
+    }
+
+    /// GAP-4 — LA PROVA dei validatori con mandato REALE, su OGNI provider
+    /// candidato del purpose, PRIMA che il gate lavori sotto carico.
+    ///
+    /// Perche' esiste: un provider che ritorna contenuto vuoto o fuori schema
+    /// (i thinking model lo fanno proprio sotto carico reale — incidente
+    /// `nuovi-provider-mai-selezionati`) non fallisce rumorosamente: diventa
+    /// un'astensione, e due astensioni su un Irreversible sono una
+    /// sospensione umana a ogni passo distruttivo. Scoprirlo in esercizio
+    /// significa scoprirlo da un run bloccato di notte.
+    ///
+    /// STRADA DELLA PRODUZIONE (regola O): il test NON fabbrica la richiesta.
+    /// Passa da `build_step_gate` (setup vero: mode, prompt, timeout dal DB),
+    /// `risolvi_candidati` (gli stessi candidati che convocherebbe il gate) e
+    /// `chiamata_one_shot` (la funzione che il fan-out chiama), per ENTRAMBI i
+    /// mandati asimmetrici. Un test che costruisse a mano l'HTTP proverebbe la
+    /// propria imitazione.
+    ///
+    /// Non gira in `pnpm verify` (servizi vivi + chiamate a pagamento):
+    ///   cargo test --bin mcp-core -- --ignored --nocapture gap4_validatori
+    ///
+    /// L'identita' contabile e' VUOTA di proposito: e' una prova diagnostica,
+    /// non il lavoro di un progetto, e non deve comparire nel suo ledger.
+    #[tokio::test]
+    #[ignore]
+    async fn gap4_validatori_rispondono_su_ogni_provider_candidato() {
+        let _ = dotenvy::dotenv();
+        // I WARN dell'adapter sono la DIAGNOSI: senza, `call_error` non dice
+        // se il provider ha rifiutato la richiesta, se manca la chiave o se
+        // e' il credito. Chi esegue questa prova deve leggere la causa.
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_test_writer()
+            .try_init();
+        let url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL non impostata (ne' in ambiente ne' in .env)");
+        let db = PgPool::connect(&url).await.expect("connessione al DB meta");
+        let gateway = crate::nexus_gateway::NexusGatewayClient::from_db(&db).await;
+
+        let setup = build_step_gate(&db, gateway)
+            .await
+            .expect("gate non armato: mode 'off' o prompt assenti (applicare la mig 0677)");
+        let candidati = risolvi_candidati(&db)
+            .await
+            .unwrap_or_else(|r| panic!("purpose {PURPOSE} non risolvibile: {:?}", r.degraded));
+        assert!(
+            !candidati.is_empty(),
+            "nessun candidato per {PURPOSE}: il gate non potrebbe convocare nessuno"
+        );
+
+        // Cause che dicono «questo MODELLO non sa produrre il verdetto»: sono
+        // le sole che squalificano un candidato dal purpose. Il credito a
+        // zero, il cooldown e un timeout dicono altro — sono fatti
+        // d'ambiente, e cancellare un modello per un conto scarico sarebbe la
+        // toppa che la regola H vieta.
+        const SQUALIFICANTI: &[&str] = &[
+            CAUSA_SCHEMA,
+            "empty_completion",
+            "client_error",
+            "context_too_long",
+        ];
+
+        let req = richiesta();
+        let mut squalificati: Vec<String> = Vec::new();
+        let mut indisponibili: Vec<String> = Vec::new();
+        let mut giudici_vivi: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for cand in &candidati {
+            for (role, system) in [
+                (RUOLO_GATEKEEPER, setup.gatekeeper_system.clone()),
+                (RUOLO_CHALLENGER, setup.challenger_system.clone()),
+            ] {
+                let v = chiamata_one_shot(
+                    setup.clone(),
+                    cand.clone(),
+                    role,
+                    system,
+                    blob_del_batch(&req),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    "gap4-prova".to_string(),
+                )
+                .await;
+                println!(
+                    "{:<12} {:<28} {role:<11} -> {:?}{} costo={:?}",
+                    v.provider,
+                    v.model,
+                    v.verdict,
+                    v.abstain_cause
+                        .as_deref()
+                        .map(|c| format!(" ({c})"))
+                        .unwrap_or_default(),
+                    v.cost_usd,
+                );
+                match v.verdict {
+                    StepVerdict::Abstained => {
+                        let causa = v.abstain_cause.as_deref().unwrap_or("causa non dichiarata");
+                        let riga = format!("{}/{} [{role}]: {causa}", v.provider, v.model);
+                        if SQUALIFICANTI.contains(&causa) {
+                            squalificati.push(riga);
+                        } else {
+                            indisponibili.push(riga);
+                        }
+                    }
+                    // Verdetto ESPRESSO (qualunque sia): questo giudice sa
+                    // rispondere nella forma che il gate pretende.
+                    _ => {
+                        giudici_vivi.insert(v.provider.clone());
+                    }
+                }
+            }
+        }
+
+        if !indisponibili.is_empty() {
+            println!(
+                "\nINDISPONIBILI ORA (fatto d'ambiente, nessuna esclusione dal purpose):\n{}",
+                indisponibili.join("\n")
+            );
+        }
+
+        assert!(
+            squalificati.is_empty(),
+            "questi candidati NON producono il verdetto strutturato e, sotto \
+             carico, astengono a ogni convocazione — vanno esclusi dal purpose \
+             {PURPOSE} PRIMA dell'esercizio, non scoperti da un run sospeso:\n{}",
+            squalificati.join("\n")
+        );
+
+        // L'invariante che conta per il gate, e che nessun altro test puo'
+        // vedere: «due entita' distinte» non e' un auspicio del piano, e' il
+        // requisito. Con meno di due giudici REALMENTE utilizzabili, ogni
+        // passo Irreversible finisce in sospensione umana (decide_step_gate:
+        // un solo Approve non fa unanimita' a due) — il gate resta corretto,
+        // ma in Automatic si comporta come una barriera che ferma sempre.
+        assert!(
+            giudici_vivi.len() >= 2,
+            "il gate ha {} provider utilizzabile/i su {} candidati: non puo' \
+             formare l'unanimita' a DUE che il requisito pretende, quindi ogni \
+             passo Irreversible sospendera' in attesa dell'umano. Giudici che \
+             rispondono: {:?}. Indisponibili ora:\n{}",
+            giudici_vivi.len(),
+            candidati.len(),
+            giudici_vivi,
+            if indisponibili.is_empty() {
+                "(nessuno)".to_string()
+            } else {
+                indisponibili.join("\n")
+            }
+        );
     }
 }
