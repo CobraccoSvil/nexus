@@ -1409,23 +1409,13 @@ mod tests {
             .connect_with(opts.database(&gemello))
             .await
             .expect("connessione al database gemello");
-        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            .execute(&pool_gemello)
-            .await
-            .expect("settings del gemello");
-        sqlx::query("INSERT INTO settings (key, value) VALUES ($1, 'true'), ($2, 'true')")
-            .bind(ENFORCE_ROUTING_GATE_KEY)
-            .bind(EXCLUDE_PREVIEW_AGENTIC_KEY)
-            .execute(&pool_gemello)
-            .await
-            .expect("gate acceso nel gemello");
+        crate::test_support::create_settings_table_with(&pool_gemello, ENFORCE_ROUTING_GATE_KEY, "true")
+            .await;
+        crate::test_support::seed_setting(&pool_gemello, EXCLUDE_PREVIEW_AGENTIC_KEY, "true").await;
 
         // Il DB del fixture ha la tabella, ma NESSUNA delle due chiavi: il gate
         // deve restare spento (fail-safe storico).
-        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            .execute(&pool)
-            .await
-            .expect("settings del fixture");
+        crate::test_support::create_settings_table(&pool).await;
 
         let acceso = qualification_gate(&pool_gemello).await;
         assert!(

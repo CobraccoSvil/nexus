@@ -2126,12 +2126,7 @@ mod tests {
 
     /// Crea le tabelle minimali toccate da `maybe_auto_scan_file` su un DB di test.
     async fn setup_schema(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-        )
-        .execute(pool)
-        .await
-        .expect("create settings");
+        crate::test_support::create_settings_table(pool).await;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS project_quality_findings (\
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
@@ -2149,10 +2144,7 @@ mod tests {
         .execute(pool)
         .await
         .expect("create project_quality_findings");
-        sqlx::query("INSERT INTO settings (key, value) VALUES ('quality_auto_scan', 'true')")
-            .execute(pool)
-            .await
-            .expect("seed quality_auto_scan");
+        crate::test_support::seed_setting(pool, "quality_auto_scan", "true").await;
     }
 
     /// Regressione del bug "i problemi risolti non vengono eliminati": un file

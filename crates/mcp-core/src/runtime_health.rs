@@ -126,24 +126,13 @@ mod tests {
 
     #[sqlx::test]
     async fn soglia_dal_db_con_default(pool: sqlx::PgPool) {
-        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            .execute(&pool)
-            .await
-            .expect("settings");
+        crate::test_support::create_settings_table(&pool).await;
         assert_eq!(threshold_ms(&pool).await, DEFAULT_STARVATION_ALERT_MS);
-        sqlx::query("INSERT INTO settings (key, value) VALUES ('runtime.starvation_alert_ms', '750')")
-            .execute(&pool)
-            .await
-            .expect("insert");
-        // Scrittura DIRETTA (fuori dal punto unico): la lettura e' cache-ata,
-        // il test dichiara l'invalidazione come farebbe una sessione esterna.
-        nexus_auth::invalidate_setting_cache(&pool, "runtime.starvation_alert_ms");
+        // Il seed invalida la cache di processo: senza, questa rilettura
+        // servirebbe il "non c'e'" memorizzato dall'assert precedente.
+        crate::test_support::seed_setting(&pool, "runtime.starvation_alert_ms", "750").await;
         assert_eq!(threshold_ms(&pool).await, 750, "il DB governa (regola G)");
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'runtime.starvation_alert_ms'")
-            .execute(&pool)
-            .await
-            .expect("update");
-        nexus_auth::invalidate_setting_cache(&pool, "runtime.starvation_alert_ms");
+        crate::test_support::seed_setting(&pool, "runtime.starvation_alert_ms", "0").await;
         assert_eq!(
             threshold_ms(&pool).await,
             DEFAULT_STARVATION_ALERT_MS,

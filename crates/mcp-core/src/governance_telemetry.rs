@@ -244,12 +244,7 @@ mod tests {
     /// Schema minimale usato da `load_model_telemetry`: catalog (contatori) +
     /// storico health (esiti recenti) + settings (finestra, assente -> default).
     async fn create_schema(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, category TEXT)",
-        )
-        .execute(pool)
-        .await
-        .expect("create settings");
+        crate::test_support::create_settings_table(pool).await;
         sqlx::query(
             "CREATE TABLE ai_price_catalog ( \
                  provider TEXT NOT NULL, model TEXT NOT NULL, \

@@ -3714,23 +3714,22 @@ mod tests {
             .execute(pool)
             .await
             .expect("pulizia catalog");
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES \
-             ('catalog.measured_band.frontier_pct', '0.92'), \
-             ('catalog.measured_band.heavy_pct', '0.65'), \
-             ('catalog.measured_band.high_pct', '0.45'), \
-             ('catalog.measured_band.medium_pct', '0.20'), \
-             ('catalog.measured_band.anchor', ''), \
-             ('catalog.measured_band.anchor_model', ''), \
-             ('catalog.measured_band.anchor_at', ''), \
-             ('catalog.measured_band.anchor_deadband_pct', '0.03'), \
-             ('catalog.measured_band.demote_margin', '3'), \
-             ('catalog.measured_band.min_population', '3') \
-             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        crate::test_support::seed_settings(
+            pool,
+            &[
+                ("catalog.measured_band.frontier_pct", "0.92"),
+                ("catalog.measured_band.heavy_pct", "0.65"),
+                ("catalog.measured_band.high_pct", "0.45"),
+                ("catalog.measured_band.medium_pct", "0.20"),
+                ("catalog.measured_band.anchor", ""),
+                ("catalog.measured_band.anchor_model", ""),
+                ("catalog.measured_band.anchor_at", ""),
+                ("catalog.measured_band.anchor_deadband_pct", "0.03"),
+                ("catalog.measured_band.demote_margin", "3"),
+                ("catalog.measured_band.min_population", "3"),
+            ],
         )
-        .execute(pool)
-        .await
-        .expect("seed settings");
+        .await;
     }
 
     /// MIN_POPULATION: sotto 3 modelli misurati a suite corrente le bande

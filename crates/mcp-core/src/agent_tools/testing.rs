@@ -2920,11 +2920,7 @@ mod target_readiness_tests {
         let project = seed_project(&pool).await;
         let port = porta_muta().await;
         seed_allocation(&pool, project, port, Some("demo-frontend.service")).await;
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = $1")
-            .bind(PLAYWRIGHT_READINESS_KEY)
-            .execute(&pool)
-            .await
-            .expect("azzera la finestra per il test");
+        crate::test_support::seed_setting(&pool, PLAYWRIGHT_READINESS_KEY, "0").await;
 
         let base_url = format!("http://localhost:{port}");
         let cause = await_target_service_ready(&pool, project, Some(&base_url)).await;

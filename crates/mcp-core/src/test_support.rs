@@ -352,6 +352,101 @@ pub(crate) async fn seed_todo(pool: &PgPool, run_id: Uuid, seq: i32, status: &st
 /// `DEFAULT 'medium'` era il fallback magico che rendeva "non lo so" e "e' medium"
 /// indistinguibili): questo specchio l'aveva ancora, e un test che seminava un
 /// tier NULL falliva per un vincolo che in produzione non esiste piu'.
+/// Schema di test della tabella META `settings`, allineato alla mig
+/// `0002_settings.sql` (key/value/category/description/is_secret/updated_at).
+///
+/// Punto unico (regola L) di una fixture che viveva ricopiata QUINDICI volte in
+/// DODICI `mod tests` del crate, e gia' divergente: sei colonne in `ui_flags`,
+/// tre in `governance_telemetry` (che dichiara `category`), due altrove, e in
+/// `native_engine` un `value TEXT` NULLABLE che in produzione e' `NOT NULL
+/// DEFAULT ''`. Una fixture che diverge dallo schema non fallisce: prova
+/// un'altra cosa restando verde (regola O).
+///
+/// Fixture e non migrator, per la stessa ragione documentata sopra per
+/// [`create_ai_price_catalog_table`]: i test che ne hanno bisogno girano su un
+/// DB vuoto o su `PROJECT_MIGRATOR`, dove `META_MIGRATOR` non e' applicabile
+/// (numerazione sovrapposta dei due set). `IF NOT EXISTS` perche' chiamarla su
+/// un pool gia' migrato sia un no-op invece di un errore.
+///
+/// PERCHE' TUTTE E SEI e non le sole colonne lette. Tre servono davvero:
+/// `key`/`value` a `get_setting`, `is_secret` a `get_setting_public`,
+/// `updated_at` all'upsert di [`seed_setting`]. `category` e `description` non
+/// le legge nessun test — misurato, non supposto: la vecchia fixture di
+/// `governance_telemetry` dichiarava `category` e nessun suo `INSERT` la
+/// popolava. Restano perche' il criterio "solo cio' che si legge" ha un costo
+/// nascosto: il giorno in cui un test comincia a leggerne una, la fixture va
+/// estesa e il fallimento arriva come "column does not exist" invece che come
+/// una riga rifiutata dallo schema vero (e' il modo in cui la mig 0478 ruppe le
+/// due copie di `ai_price_catalog`). Sei colonne con DEFAULT non impongono nulla
+/// ai chiamanti; una colonna mancante si', il giorno in cui serve.
+pub(crate) async fn create_settings_table(pool: &PgPool) {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS settings ( \
+             key TEXT PRIMARY KEY, \
+             value TEXT NOT NULL DEFAULT '', \
+             category TEXT NOT NULL DEFAULT 'general', \
+             description TEXT NOT NULL DEFAULT '', \
+             is_secret BOOLEAN NOT NULL DEFAULT FALSE, \
+             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW() )",
+    )
+    .execute(pool)
+    .await
+    .expect("create table settings");
+}
+
+/// Scrive una coppia in `settings` e invalida la voce corrispondente della cache
+/// di processo. Upsert: serve sia al primo seed sia al cambio di valore a meta'
+/// test.
+///
+/// L'INVALIDAZIONE E' IL PUNTO, e sta qui e non nei chiamanti perche' e' cio'
+/// che la produzione fa gia' accanto alla propria scrittura
+/// (`nexus_auth::update_setting_value`). `get_setting` legge attraverso
+/// `SETTINGS_CACHE`, un `LazyLock` di PROCESSO con TTL 60s chiavato su
+/// `(pool_identity, key)`: un test che scrive con una query propria e poi rilegge
+/// ottiene il valore precedente per un minuto, cioe' piu' della durata dell'intera
+/// suite. Quattro moduli l'avevano gia' scoperto da soli e chiamavano
+/// `invalidate_setting_cache` a mano attorno alle proprie scritture
+/// (`runtime_health`, `native_engine`, `subagent_native`, `nexus-agent-tools::files`):
+/// un rimedio che ogni autore deve RICORDARSI e' un rimedio che prima o poi
+/// qualcuno dimentica — ed era gia' dimenticato in `agent_tools::testing`, che
+/// azzera `agent.playwright.readiness_timeout_seconds` con un `UPDATE` nudo.
+///
+/// COSA NON E' (regola O: dichiarare da dove si guarda). Non protegge da una
+/// collisione fra test DIVERSI: quella non e' raggiungibile per costruzione,
+/// perche' `sqlx::test` non pesca da un pool di nomi riciclati ma deriva il nome
+/// del database dal percorso del test — `_sqlx_test_<sha512(test_path)>`, in
+/// `sqlx_core::testing::TestSupport::db_name` — quindi due test hanno sempre
+/// identita' di pool distinte e non possono leggersi a vicenda i valori. Il caso
+/// reale, e l'unico, e' DENTRO un test: una lettura che precede il seed, o un
+/// secondo seed della stessa chiave.
+pub(crate) async fn seed_setting(pool: &PgPool, key: &str, value: &str) {
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ($1, $2) \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await
+    .expect("seed settings");
+    nexus_auth::invalidate_setting_cache(pool, key);
+}
+
+/// Piu' coppie in un colpo, ognuna con lo stesso contratto di [`seed_setting`]
+/// (upsert + invalidazione). L'invalidazione e' per-chiave, quindi deve avvenire
+/// per ognuna: un `INSERT` multi-riga ne invaliderebbe zero.
+pub(crate) async fn seed_settings(pool: &PgPool, pairs: &[(&str, &str)]) {
+    for (key, value) in pairs {
+        seed_setting(pool, key, value).await;
+    }
+}
+
+/// Tabella `settings` piu' una coppia: il caso piu' frequente in una riga sola.
+pub(crate) async fn create_settings_table_with(pool: &PgPool, key: &str, value: &str) {
+    create_settings_table(pool).await;
+    seed_setting(pool, key, value).await;
+}
+
 pub(crate) async fn create_ai_price_catalog_table(pool: &PgPool) {
     sqlx::query(
         "CREATE TABLE ai_price_catalog ( \
@@ -388,39 +483,46 @@ pub(crate) async fn create_ai_price_catalog_table(pool: &PgPool) {
     .expect("create ai_price_catalog");
 }
 
-/// Fixture della tabella META `settings` con una chiave gia' seminata, per i
-/// test che esercitano codice DB-driven (regola G) su un pool solo.
-///
-/// Stessa natura di [`create_ai_price_catalog_table`]: e' una tabella META, che
-/// il migrator del set `project` non porta. Le colonne sono le tre che
-/// `nexus_auth::get_setting` legge davvero (`key`, `value`) piu' `is_secret`,
-/// che `get_setting_public` interroga: uno specchio minimo e non l'intero
-/// schema, perche' cio' che non viene letto non puo' divergere in silenzio.
-pub(crate) async fn create_settings_table_with(pool: &PgPool, key: &str, value: &str) {
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS settings ( \
-             key TEXT PRIMARY KEY, \
-             value TEXT NOT NULL DEFAULT '', \
-             is_secret BOOLEAN NOT NULL DEFAULT false \
-         )",
-    )
-    .execute(pool)
-    .await
-    .expect("create settings");
-    sqlx::query("INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")
-        .bind(key)
-        .bind(value)
-        .execute(pool)
-        .await
-        .expect("seed settings");
-    // La cache dei settings e' un `LazyLock` di PROCESSO chiavato su
-    // (identita' del pool, chiave), e l'identita' comprende il nome del
-    // database: `sqlx::test` riusa i nomi dei database temporanei, quindi due
-    // test dello stesso processo possono ritrovarsi la stessa identita' e
-    // leggersi a vicenda il valore — un esito che dipende dall'ordine di
-    // esecuzione (regola F). L'invalidazione e' precauzionale e non nasce da
-    // un caso osservato: e' cio' che la produzione fa gia' accanto a ogni
-    // scrittura di settings (`update_setting_value`, vedi nexus-auth), quindi
-    // la fixture segue la stessa strada invece di dipendere dal TTL.
-    nexus_auth::invalidate_setting_cache(pool, key);
+// La copia di `create_settings_table_with` che stava qui e' stata assorbita
+// dal punto unico piu' sopra (`create_settings_table` + `seed_setting`), che
+// porta gia' l'invalidazione della cache per-chiave: due fixture per la stessa
+// tabella erano il difetto che questo lavoro chiude.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// La fixture e' provata per la strada della produzione (regola O): la
+    /// lettura e' `nexus_auth::get_setting`, la stessa che chiama il codice sotto
+    /// test, non una `SELECT` scritta qui — che confermerebbe solo che l'`INSERT`
+    /// e' andato a segno, cioe' l'unica cosa che non era in dubbio.
+    ///
+    /// I due assert coprono i due modi in cui la cache di processo morde dentro
+    /// un test, e MUTAZIONE per entrambi: togliendo
+    /// `invalidate_setting_cache` da [`seed_setting`], il primo rosseggia con
+    /// `None` (il "non c'e'" letto prima del seed resta valido per 60s) e il
+    /// secondo con `Some("primo")` (il valore precedente sopravvive al nuovo
+    /// seed).
+    #[sqlx::test]
+    async fn il_seed_e_visibile_alla_lettura_della_produzione(pool: PgPool) {
+        const K: &str = "test.fixture.settings";
+        create_settings_table(&pool).await;
+
+        // Il fatto "chiave assente" viene memorizzato come qualunque altro.
+        assert_eq!(nexus_auth::get_setting(&pool, K).await, None);
+
+        seed_setting(&pool, K, "primo").await;
+        assert_eq!(
+            nexus_auth::get_setting(&pool, K).await.as_deref(),
+            Some("primo"),
+            "un seed dopo una lettura deve essere visibile: e' il caso che ha \
+             costretto quattro moduli a invalidare a mano",
+        );
+
+        seed_setting(&pool, K, "secondo").await;
+        assert_eq!(
+            nexus_auth::get_setting(&pool, K).await.as_deref(),
+            Some("secondo"),
+            "un secondo seed della stessa chiave deve sostituire il primo",
+        );
+    }
 }

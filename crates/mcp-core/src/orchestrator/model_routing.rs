@@ -1563,17 +1563,6 @@ mod agentic_tier_floor_tests {
         .expect("create ai_price_catalog");
     }
 
-    async fn create_settings_table(pool: &sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE settings ( \
-                 key TEXT PRIMARY KEY, \
-                 value TEXT NOT NULL \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create settings");
-    }
 
     #[sqlx::test]
     async fn turno_agentico_sceglie_almeno_medium(pool: sqlx::PgPool) {
@@ -1646,15 +1635,14 @@ mod agentic_tier_floor_tests {
     #[sqlx::test]
     async fn setting_db_driven_alza_il_pavimento_a_heavy(pool: sqlx::PgPool) {
         create_catalog_table(&pool).await;
-        create_settings_table(&pool).await;
         // Pavimento configurato a 'heavy' via DB (regola G): un turno agentico a
         // base_tier 'light' deve salire fino a 'heavy', scartando light e medium.
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES ('agent.routing.agentic_min_tier', 'heavy')",
+        crate::test_support::create_settings_table_with(
+            &pool,
+            "agent.routing.agentic_min_tier",
+            "heavy",
         )
-        .execute(&pool)
-        .await
-        .expect("insert setting");
+        .await;
         sqlx::query(
             "INSERT INTO ai_price_catalog \
              (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens, capabilities) VALUES \
