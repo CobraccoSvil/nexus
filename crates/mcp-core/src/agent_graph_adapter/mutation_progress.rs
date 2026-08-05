@@ -105,6 +105,11 @@ impl MutationProgressPort for MutationProgressAdapter {
             facts.push(WriteFact {
                 before_sha256: r.try_get("before_sha256").ok().flatten(),
                 after_sha256: r.try_get("after_sha256").ok().flatten(),
+                // NULL sulle righe anteriori alla mig 0680: resta `None`, e il
+                // criterio ricade sul confronto degli hash. La porta PORTA i
+                // fatti e non li giudica — anche quando il fatto e' "non
+                // misurato".
+                solo_fine_riga: r.try_get("solo_fine_riga").ok().flatten(),
             });
         }
         Ok(WriteScan { watermark, facts })

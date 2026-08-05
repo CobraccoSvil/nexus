@@ -1863,6 +1863,13 @@ pub(crate) async fn mutations_since(
         fact: WriteFact {
             before_sha256,
             after_sha256,
+            // Il ri-armo chiede "il codice e' cambiato dopo il crash?", e li'
+            // una riscrittura di soli fine-riga NON e' un cambiamento: la
+            // colonna e' pero' fuori da questo SELECT, che legge quattro campi
+            // scelti per un'altra domanda. `None` mantiene il comportamento
+            // storico (confronto sugli hash); se un giorno il ri-armo dovesse
+            // distinguere anche questo caso, la colonna e' li' dalla mig 0680.
+            solo_fine_riga: None,
         },
         at,
     })

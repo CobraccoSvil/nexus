@@ -1256,6 +1256,7 @@ mod tests {
         crate::decisions::WriteFact {
             before_sha256: Some(before.to_string()),
             after_sha256: Some(after.to_string()),
+            solo_fine_riga: None,
         }
     }
 
@@ -1569,6 +1570,7 @@ mod tests {
                 vec![crate::decisions::WriteFact {
                     before_sha256: Some("prima".into()),
                     after_sha256: Some("dopo".into()),
+                    solo_fine_riga: None,
                 }]
             } else {
                 Vec::new()

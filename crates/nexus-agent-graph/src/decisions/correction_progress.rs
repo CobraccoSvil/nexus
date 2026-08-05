@@ -70,6 +70,15 @@ pub struct WriteFact {
     pub before_sha256: Option<String>,
     /// SHA-256 del contenuto DOPO la scrittura (`None` = il file e' stato cancellato).
     pub after_sha256: Option<String>,
+    /// La scrittura ha cambiato i SOLI fine-riga? Misurato alla fonte, dove i
+    /// byte esistono ancora (`mcp-core::file_mutations`, mig 0680), perche' da
+    /// due hash non e' deducibile.
+    ///
+    /// `None` = non misurato: righe anteriori alla migrazione, o casi in cui la
+    /// domanda non si pone (file creato o cancellato). Li' il criterio ricade
+    /// sul confronto degli hash, cioe' sul comportamento di prima — l'ignoto
+    /// non degrada ne' a "e' cambiato" ne' a "non e' cambiato" (regola Q).
+    pub solo_fine_riga: Option<bool>,
 }
 
 impl WriteFact {
@@ -81,6 +90,17 @@ impl WriteFact {
     /// `None == None` (chiamata degenere senza contenuto da nessun lato) non e'
     /// un cambiamento e cade sotto lo stesso confronto.
     pub fn cambia_il_contenuto(&self) -> bool {
+        // Una riscrittura che cambia i soli fine-riga ha hash DIVERSI e contenuto
+        // identico: senza questo ramo passerebbe per lavoro fatto, ed e' la
+        // stessa cosa che questo modulo esiste per vedere — solo travestita.
+        // Misurata alla fonte (mig 0680) perche' da due digest non si deduce.
+        //
+        // Non e' teorico su Windows: `core.autocrlf=true` e' attivo, e il
+        // 2026-08-05 quindici script del repo risultavano CRLF sul disco col
+        // blob a LF.
+        if self.solo_fine_riga == Some(true) {
+            return false;
+        }
         self.before_sha256 != self.after_sha256
     }
 }
@@ -184,6 +204,7 @@ mod tests {
         let facts = vec![WriteFact {
             before_sha256: hash("aaa"),
             after_sha256: hash("bbb"),
+            solo_fine_riga: None,
         }];
         let p = classify_correction_progress(&facts);
         assert_eq!(p, CorrectionProgress::Effettivo { scritture_efficaci: 1 });
@@ -218,10 +239,12 @@ mod tests {
             WriteFact {
                 before_sha256: hash("uguale"),
                 after_sha256: hash("uguale"),
+                solo_fine_riga: None,
             },
             WriteFact {
                 before_sha256: hash("anche-questo"),
                 after_sha256: hash("anche-questo"),
+                solo_fine_riga: None,
             },
         ];
         let p = classify_correction_progress(&facts);
@@ -248,14 +271,17 @@ mod tests {
             WriteFact {
                 before_sha256: hash("x"),
                 after_sha256: hash("x"),
+                solo_fine_riga: None,
             },
             WriteFact {
                 before_sha256: hash("y"),
                 after_sha256: hash("z"),
+                solo_fine_riga: None,
             },
             WriteFact {
                 before_sha256: hash("w"),
                 after_sha256: hash("w"),
+                solo_fine_riga: None,
             },
         ];
         assert_eq!(
@@ -272,14 +298,17 @@ mod tests {
         let creato = WriteFact {
             before_sha256: None,
             after_sha256: hash("nuovo"),
+            solo_fine_riga: None,
         };
         let cancellato = WriteFact {
             before_sha256: hash("vecchio"),
             after_sha256: None,
+            solo_fine_riga: None,
         };
         let degenere = WriteFact {
             before_sha256: None,
             after_sha256: None,
+            solo_fine_riga: None,
         };
         assert!(creato.cambia_il_contenuto());
         assert!(cancellato.cambia_il_contenuto());
@@ -302,5 +331,53 @@ mod tests {
             "rewrites_only"
         );
         assert_eq!(CorrectionProgress::NessunaScrittura.as_str(), "no_writes");
+    }
+
+    /// IL CASO DELLA MIG 0680: una riscrittura che cambia i soli fine-riga ha
+    /// hash DIVERSI, e senza il campo misurato alla fonte passerebbe per
+    /// progresso — cioe' per lavoro fatto su un file in cui non e' cambiato
+    /// nulla. E' la stessa cosa che questo modulo esiste per vedere, travestita.
+    #[test]
+    fn una_riscrittura_di_soli_fine_riga_non_e_progresso() {
+        let facts = vec![WriteFact {
+            before_sha256: Some("hash-del-file-lf".into()),
+            after_sha256: Some("hash-del-file-crlf".into()),
+            solo_fine_riga: Some(true),
+        }];
+        assert!(!facts[0].cambia_il_contenuto());
+        assert_eq!(
+            classify_correction_progress(&facts),
+            CorrectionProgress::SoloRiscritture { riscritture: 1 }
+        );
+    }
+
+    /// Il controcampo: hash diversi E contenuto davvero diverso restano
+    /// progresso. Senza questo, un `return false` incondizionato passerebbe il
+    /// test sopra e romperebbe il criterio.
+    #[test]
+    fn un_contenuto_diverso_resta_progresso() {
+        let facts = vec![WriteFact {
+            before_sha256: Some("a".into()),
+            after_sha256: Some("b".into()),
+            solo_fine_riga: Some(false),
+        }];
+        assert!(facts[0].cambia_il_contenuto());
+        assert_eq!(
+            classify_correction_progress(&facts),
+            CorrectionProgress::Effettivo { scritture_efficaci: 1 }
+        );
+    }
+
+    /// `None` = non misurato (righe anteriori alla mig 0680): il criterio ricade
+    /// sul confronto degli hash, cioe' sul comportamento di prima. L'ignoto non
+    /// degrada a "non e' cambiato".
+    #[test]
+    fn il_non_misurato_ricade_sul_confronto_degli_hash() {
+        let f = WriteFact {
+            before_sha256: Some("a".into()),
+            after_sha256: Some("b".into()),
+            solo_fine_riga: None,
+        };
+        assert!(f.cambia_il_contenuto());
     }
 }

@@ -74,6 +74,13 @@ struct MutationBody<'a> {
     after_sha: Option<String>,
     before_size: Option<i64>,
     after_size: Option<i64>,
+    /// `Some(true)` se la scrittura ha cambiato i SOLI fine-riga: contenuto
+    /// identico, byte diversi. `None` quando la domanda non si pone (creazione
+    /// o cancellazione: manca uno dei due lati da confrontare).
+    ///
+    /// Serve a `correction_progress`, che decide sul confronto degli hash e
+    /// senza questo campo leggerebbe una riscrittura CRLF->LF come progresso.
+    solo_fine_riga: Option<bool>,
 }
 
 impl<'a> MutationBody<'a> {
@@ -104,8 +111,25 @@ impl<'a> MutationBody<'a> {
             after_sha: after_bytes.map(sha256_hex),
             before_size,
             after_size,
+            solo_fine_riga: solo_fine_riga(before_bytes, after_bytes),
         }
     }
+}
+
+/// La scrittura ha cambiato i soli fine-riga?
+///
+/// `None` quando la domanda non si pone: senza uno dei due lati (file creato o
+/// cancellato) non c'e' nulla da confrontare, e un `false` affermerebbe che il
+/// contenuto e' cambiato davvero — vero in quei due casi, ma per una ragione
+/// diversa da quella che questo campo misura. L'ignoto resta ignoto (regola Q).
+///
+/// Il criterio non e' scritto qui: e' `nexus_migrations::fine_riga`, che
+/// risponde alla stessa domanda anche per i checksum delle migrazioni. Tenerne
+/// una seconda versione qui avrebbe garantito che divergessero.
+fn solo_fine_riga(before: Option<&[u8]>, after: Option<&[u8]>) -> Option<bool> {
+    use nexus_migrations::fine_riga::{classifica_contenuto, EsitoFineRiga};
+    let (b, a) = (before?, after?);
+    Some(matches!(classifica_contenuto(b, a), EsitoFineRiga::SoloFineRiga))
 }
 
 /// Calcola lo SHA-256 in hex di un blocco di byte.
@@ -162,6 +186,7 @@ pub async fn record_mutation(
         after_sha,
         before_size,
         after_size,
+        solo_fine_riga,
     } = body;
 
     // Lo scope dichiarato si persiste SOLO quando c'e' un verdetto: un array senza
@@ -174,8 +199,8 @@ pub async fn record_mutation(
             (project_id, session_id, user_id, file_path, tool_name, op,
              before_content, after_content,
              before_sha256, after_sha256, before_size, after_size,
-             scope_verdict, declared_write_scope, run_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+             scope_verdict, declared_write_scope, run_id, solo_fine_riga)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
            RETURNING id"#,
     )
     .bind(project_id)
@@ -193,6 +218,7 @@ pub async fn record_mutation(
     .bind(scope.verdict)
     .bind(declared_scope)
     .bind(run_id)
+    .bind(solo_fine_riga)
     .fetch_one(db)
     .await?;
 
