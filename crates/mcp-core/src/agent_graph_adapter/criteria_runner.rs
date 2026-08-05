@@ -1414,9 +1414,11 @@ fn esito_http(
 /// d'integrazione (`endpoint_probes::criteri_integrazione_frontend`) prova gli
 /// endpoint ANCHE attraverso l'origine del frontend, e decideva sul solo status:
 ///
-///     35954/api/books -> HTTP 200, Content-Type: text/html        <- la SPA
-///     35976/api/books -> HTTP 200, Content-Type: application/json <- il backend
-///     35976/books     -> HTTP 404
+/// ```text
+/// 35954/api/books -> HTTP 200, Content-Type: text/html        <- la SPA
+/// 35976/api/books -> HTTP 200, Content-Type: application/json <- il backend
+/// 35976/books     -> HTTP 404
+/// ```
 ///
 /// `vite.config.ts` aveva `rewrite: p => p.replace(/^\/api/, '')`, che toglie il
 /// prefisso su cui il backend espone: il proxy inoltrava a `/books`, il backend
