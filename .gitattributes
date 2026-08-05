@@ -8,3 +8,29 @@
 # previously applied but has been modified" (incidente 2026-07-02, mig 0500).
 # eol=lf rende i byte identici su ogni piattaforma e checkout.
 *.sql text eol=lf
+
+# Gli altri file i cui BYTE contano. Fino al 2026-08-05 qui c'era solo *.sql, e
+# la copertura era ferma alle migrazioni: erano l'unico posto in cui il difetto
+# si era MANIFESTATO (due volte), non l'unico in cui puo' vivere.
+#
+# `scripts/check-eol.sh` LEGGE i pattern da questo file invece di ricopiarli,
+# quindi ogni riga aggiunta qui estende il gate senza toccarlo.
+#
+# Perche' elencati uno per uno e non `*.json`: quel glob prenderebbe ~migliaia
+# di file (package.json, tsconfig, lockfile) e il gate — che deve APRIRE ogni
+# candidato per sapere cosa c'e' sul disco — passerebbe da 0,75s a una scansione
+# quasi totale. Un gate che costa troppo e' un gate che qualcuno disattiva.
+
+# Golden cross-linguaggio: la stessa fixture e' letta da pytest E da cargo test,
+# e Wave 8 dichiara che il drift fra i due lati e' un bug per costruzione. Un
+# fine-riga diverso E' drift: cambia i byte che i due runtime confrontano.
+tests/fixtures/*_golden.json text eol=lf
+
+# Baseline dei gate ratchet: gli strumenti le RISCRIVONO (--update-baseline).
+# Se lo strumento scrive LF e il checkout materializza CRLF, ogni esecuzione
+# produce un diff spurio che nessuno sa spiegare. Misurato il 2026-08-05:
+# .dup-baseline.json era gia' w/crlf con l'indice a i/lf.
+.dup-baseline.json text eol=lf
+scripts/audit-settings-baseline.json text eol=lf
+scripts/markers-baseline.json text eol=lf
+scripts/quality-baseline.json text eol=lf
