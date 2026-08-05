@@ -11,6 +11,12 @@
 //! delega a `nexus-migrations`, lo stesso codice che mcp-core esegue all'avvio.
 //! Se ne portasse uno suo sarebbe la decima incarnazione del concern, cioe' il
 //! difetto che quel crate esiste per chiudere.
+//!
+//! `--repair-checksums` e' l'unico modo che scrive sul registro
+//! `_sqlx_migrations`, e serve al caso in cui il registro conservi l'hash degli
+//! stessi byte con altri fine-riga (vedi `nexus-migrations::registro`). Non puo'
+//! essere una migrazione: il migrator valida i checksum PRIMA di applicare, e
+//! una migrazione riparatrice non verrebbe mai eseguita.
 
 use anyhow::Context;
 use nexus_migrations::{OrigineSet, Set};
@@ -24,6 +30,11 @@ use crate::premessa::db_dichiarato;
 /// perche'). Un unico codice costringerebbe chi lo consuma a leggere il testo,
 /// che e' cio' che la regola M vieta.
 const USCITA_PENDENTI: i32 = 3;
+
+/// Il registro non corrisponde al set: `--apply` non partirebbe affatto, e la
+/// cura non e' applicare. Separato dal 3 per la stessa ragione per cui il 3 e'
+/// separato dall'1 — sono tre azioni diverse.
+const USCITA_REGISTRO_DISALLINEATO: i32 = 4;
 
 struct Opzioni {
     set: Set,
@@ -40,6 +51,9 @@ enum Modo {
     Check,
     /// Applica.
     Apply,
+    /// Riallinea il checksum registrato delle sole versioni la cui divergenza
+    /// e' provata essere di soli fine-riga. Non applica nulla.
+    RepairChecksums,
 }
 
 fn parse(args: &[String]) -> anyhow::Result<Opzioni> {
@@ -70,6 +84,7 @@ fn parse(args: &[String]) -> anyhow::Result<Opzioni> {
             "--dry-run" => o.modo = Some(Modo::DryRun),
             "--check" => o.modo = Some(Modo::Check),
             "--apply" => o.modo = Some(Modo::Apply),
+            "--repair-checksums" => o.modo = Some(Modo::RepairChecksums),
             altro => anyhow::bail!("argomento sconosciuto: {altro}"),
         }
         i += 1;
@@ -123,14 +138,79 @@ fn risolvi_url(esplicito: Option<&String>) -> anyhow::Result<(String, &'static s
     }
 }
 
-/// Le migrazioni pendenti rispetto al registro del database.
-async fn pendenti(pool: &sqlx::PgPool, versioni: &[i64]) -> anyhow::Result<Vec<i64>> {
-    let applicate = applicate_sul_db(pool).await?;
-    Ok(versioni
-        .iter()
-        .copied()
-        .filter(|v| !applicate.contains(v))
-        .collect())
+/// Le prime cifre di un checksum: bastano a distinguerlo, e una riga di
+/// diagnosi con due hash interi non la legge nessuno.
+fn breve(checksum: Option<&Vec<u8>>) -> String {
+    match checksum {
+        Some(c) => c.iter().take(8).map(|b| format!("{b:02x}")).collect(),
+        None => "-".into(),
+    }
+}
+
+/// Cosa dice il censimento, oltre al numero delle pendenti.
+///
+/// Sta qui e non nel crate perche' e' resa, non decisione: il verdetto e' gia'
+/// stato preso in `nexus-migrations::registro`.
+fn stampa_divergenti(divergenti: &[&nexus_migrations::registro::Voce]) {
+    println!("{} migrazioni col checksum divergente:", divergenti.len());
+    for v in divergenti {
+        let nexus_migrations::VerdettoVersione::Divergente(causa) = v.verdetto else {
+            continue;
+        };
+        println!(
+            "  {} registrato {} disco {} -> {:?}: {}",
+            v.versione,
+            breve(v.checksum_registrato.as_ref()),
+            breve(v.checksum_sul_disco.as_ref()),
+            causa,
+            causa.cura()
+        );
+    }
+}
+
+fn stampa_senza_file(senza_file: &[i64]) {
+    let elenco: Vec<String> = senza_file.iter().map(|v| v.to_string()).collect();
+    println!(
+        "{} migrazioni applicate senza file nel set: {}. Questo albero non \
+         contiene lo schema che il database dichiara: allinearlo al branch da \
+         cui il DB e' stato migrato, oppure indicare l'albero giusto con \
+         --migrations-root.",
+        senza_file.len(),
+        elenco.join(", ")
+    );
+}
+
+fn racconta(censimento: &nexus_migrations::Censimento) -> i32 {
+    let pendenti = censimento.pendenti();
+    let divergenti = censimento.divergenti();
+    let senza_file = censimento.senza_file();
+
+    if !divergenti.is_empty() {
+        stampa_divergenti(&divergenti);
+    }
+    if !senza_file.is_empty() {
+        stampa_senza_file(&senza_file);
+    }
+
+    if !censimento.bloccanti_non_riparabili().is_empty() {
+        return USCITA_REGISTRO_DISALLINEATO;
+    }
+    if !divergenti.is_empty() {
+        // Riparabili: il DB non e' indietro, il registro e' da riallineare.
+        println!("per riallinearle: cargo xtask migrate --set {} --repair-checksums", censimento.set);
+        return USCITA_REGISTRO_DISALLINEATO;
+    }
+    if !pendenti.is_empty() {
+        let elenco: Vec<String> = pendenti.iter().map(|v| v.to_string()).collect();
+        println!("{} migrazioni pendenti: {}", pendenti.len(), elenco.join(", "));
+        println!(
+            "per applicarle: cargo xtask migrate --set {} --apply",
+            censimento.set
+        );
+        return USCITA_PENDENTI;
+    }
+    println!("nessuna migrazione pendente, nessun checksum divergente");
+    0
 }
 
 async fn esegui(
@@ -166,28 +246,70 @@ async fn esegui(
             println!("set '{set}' applicato");
             0
         }
+        Modo::RepairChecksums => ripara(&pool, set, origine).await?,
+        // `--check` passa dal censimento e non da un conteggio delle versioni:
+        // confrontare le sole liste diceva "nessuna migrazione pendente" anche
+        // quando `--apply` sarebbe morto sul primo checksum divergente, cioe'
+        // dava un verde che non prova cio' che chi lo legge crede provato
+        // (regola O).
         _ => {
-            let p = pendenti(&pool, &versioni).await?;
-            if p.is_empty() {
-                println!("nessuna migrazione pendente");
-                0
-            } else {
-                let elenco: Vec<String> = p.iter().map(|v| v.to_string()).collect();
-                println!("{} migrazioni pendenti: {}", p.len(), elenco.join(", "));
-                println!("per applicarle: cargo xtask migrate --set {set} --apply");
-                USCITA_PENDENTI
-            }
+            let censimento = nexus_migrations::registro::censisci(&pool, set, origine).await?;
+            racconta(&censimento)
         }
     };
     pool.close().await;
     Ok(esito)
 }
 
+/// Riallinea i checksum riparabili, dopo aver detto quali e perche'.
+///
+/// Il piano si stampa PRIMA della scrittura: e' l'unico comando del repo che
+/// tocca il registro delle migrazioni, e chi lo esegue deve poter riconoscere
+/// cio' che sta per cambiare senza rileggere il codice.
+async fn ripara(
+    pool: &sqlx::PgPool,
+    set: Set,
+    origine: &OrigineSet,
+) -> anyhow::Result<i32> {
+    let censimento = nexus_migrations::registro::censisci(pool, set, origine).await?;
+    let riparabili = censimento.riparabili();
+    if riparabili.is_empty() {
+        println!("nessun checksum da riallineare");
+        // Il resoconto resta dovuto: puo' esserci una divergenza NON riparabile,
+        // e chiudere con uno 0 la nasconderebbe.
+        return Ok(racconta(&censimento));
+    }
+
+    println!(
+        "{} checksum da riallineare (divergenza provata di soli fine-riga, file \
+         sul disco gia' canonico):",
+        riparabili.len()
+    );
+    for v in &riparabili {
+        println!(
+            "  {}: {} -> {}",
+            v.versione,
+            breve(v.checksum_registrato.as_ref()),
+            breve(v.checksum_sul_disco.as_ref())
+        );
+    }
+
+    let riscritte = nexus_migrations::registro::ripara_fine_riga(pool, &censimento).await?;
+    let elenco: Vec<String> = riscritte.iter().map(|v| v.to_string()).collect();
+    println!("registro riallineato per le versioni: {}", elenco.join(", "));
+
+    // Si ri-censisce invece di dichiarare il successo: il verdetto che conta e'
+    // quello del prossimo avvio, e lo si misura sui dati appena scritti.
+    let dopo = nexus_migrations::registro::censisci(pool, set, origine).await?;
+    Ok(racconta(&dopo))
+}
+
 pub fn run(args: &[String]) -> anyhow::Result<i32> {
     let o = parse(args)?;
     let Some(modo) = o.modo else {
         eprintln!(
-            "uso: cargo xtask migrate --set meta|project (--dry-run | --check | --apply) \
+            "uso: cargo xtask migrate --set meta|project \
+             (--dry-run | --check | --apply | --repair-checksums) \
              [--database-url URL] [--migrations-root DIR]"
         );
         return Ok(2);
@@ -217,22 +339,11 @@ pub fn run(args: &[String]) -> anyhow::Result<i32> {
         .block_on(esegui(modo, o.set, &origine, &url))
 }
 
-/// Versioni gia' applicate, lette con l'API di sqlx.
-async fn applicate_sul_db(pool: &sqlx::PgPool) -> anyhow::Result<Vec<i64>> {
-    use sqlx::migrate::Migrate;
-    let mut conn = pool.acquire().await.context("connessione per il registro")?;
-    // `ensure_migrations_table` e' idempotente: su un DB vergine crea il
-    // registro vuoto invece di far fallire la lettura con "relation does not
-    // exist", che sarebbe un errore travestito da assenza.
-    conn.ensure_migrations_table()
-        .await
-        .context("registro delle migrazioni")?;
-    let applicate = conn
-        .list_applied_migrations()
-        .await
-        .context("lettura del registro delle migrazioni")?;
-    Ok(applicate.into_iter().map(|m| m.version).collect())
-}
+// La lettura del registro non vive piu' qui: la fa `nexus-migrations::registro`,
+// che e' anche il punto in cui si decide se una versione e' pendente, divergente
+// o senza file. Due letture con due criteri erano il motivo per cui `--check`
+// poteva dire "nessuna migrazione pendente" su un database che rifiutava di
+// migrare (regola L).
 
 #[cfg(test)]
 mod tests {
@@ -250,6 +361,30 @@ mod tests {
     fn senza_modo_non_si_fa_nulla() {
         let o = parse(&["--set".into(), "meta".into()]).expect("parse");
         assert!(o.modo.is_none(), "nessun modo predefinito: applicare non e' un default");
+    }
+
+    #[test]
+    fn la_riparazione_del_registro_e_un_modo_esplicito() {
+        let o = parse(&[
+            "--set".into(),
+            "meta".into(),
+            "--repair-checksums".into(),
+        ])
+        .expect("parse");
+        assert!(matches!(o.modo, Some(Modo::RepairChecksums)));
+        // Non e' un effetto collaterale di --apply: una scrittura sul registro
+        // delle migrazioni la si chiede per nome.
+        let a = parse(&["--apply".into()]).expect("parse");
+        assert!(matches!(a.modo, Some(Modo::Apply)));
+    }
+
+    #[test]
+    fn i_codici_di_uscita_distinguono_le_tre_azioni() {
+        // "il DB e' indietro", "il registro non corrisponde" e "non ho potuto
+        // guardare" vogliono tre risposte diverse da chi consuma il codice.
+        assert_ne!(USCITA_PENDENTI, USCITA_REGISTRO_DISALLINEATO);
+        assert_ne!(USCITA_PENDENTI, 1);
+        assert_ne!(USCITA_REGISTRO_DISALLINEATO, 1);
     }
 
     #[test]

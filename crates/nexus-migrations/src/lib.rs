@@ -22,9 +22,11 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 pub mod errore;
+pub mod registro;
 pub mod set;
 
 pub use errore::ErroreMigrazione;
+pub use registro::{Censimento, CausaDivergenza, VerdettoVersione};
 pub use set::Set;
 
 /// Da dove si prendono i file di migrazione.

@@ -45,6 +45,18 @@ pre-commit:
       run: bash scripts/check-hook-tree.sh
       fail_text: "pre-commit: i gate non girano nell'albero che sta committando."
 
+    # Fine-riga dichiarati vs materializzati: un file 'eol=lf' che sul disco ha
+    # CRLF non e' visibile a 'git diff' ne', sul repo reale, a 'git status' —
+    # ma i suoi byte sono altri, e per le migrazioni i byte sono il checksum in
+    # '_sqlx_migrations'. Senza glob e senza dipendere dai file staged: il
+    # difetto non sta nel commit, sta nell'albero, e questo e' l'unico momento
+    # in cui qualcuno lo guarda. Costo 0,75s (misurato): i candidati sono i soli
+    # pattern che .gitattributes dichiara eol=lf, non l'albero intero (20s).
+    eol_guard:
+      priority: 2
+      run: bash scripts/check-eol.sh
+      fail_text: "pre-commit: un file dichiarato eol=lf e' materializzato CRLF. Ri-materializzalo (il messaggio sopra ha i comandi)."
+
     turbo_quick:
       glob:
         - "*.ts"
