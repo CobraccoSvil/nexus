@@ -18,15 +18,15 @@
 //!   conteggio (incidente `consiglio-quorum-onesto`: il voto del morto
 //!   trasformava 1/2 in consenso).
 //!
-//! Il matcher sui comandi opera sui TOKEN della riga scomposta, MAI con
+//! Il matcher sui comandi opera sulle PAROLE della riga scomposta, MAI con
 //! contains/regex sulla riga intera (incidente
 //! `contains-non-distingue-nomina-da-esegue`: un comando che NOMINA `rm -rf`
-//! non lo esegue). La tokenizzazione qui e' un sottoinsieme DICHIARATO della
-//! scomposizione di `playwright_cli::comandi` (separatori fuori-quote, niente
-//! espansioni): il consolidamento in un punto unico condiviso e' debito
-//! dichiarato — il vincolo di dipendenza (questo crate non puo' importare
-//! mcp-core) impone che sia quella scomposizione a migrare qui, non il
-//! contrario.
+//! non lo esegue). La scomposizione e' il punto unico
+//! [`super::shell_command::comandi`] (stesso scompositore di
+//! `playwright_cli`): il matcher guarda le sole `parole` di ogni comando —
+//! le assegnazioni `env` in testa (`FOO=1`) e i bersagli delle redirezioni
+//! (`> out.log`) non sono parole eseguite e non devono far scattare un
+//! pattern.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -150,77 +150,6 @@ pub struct StepClassification {
     pub matched_category: Option<String>,
 }
 
-/// Tokenizzazione MINIMA di una riga shell per il matcher `command_token`:
-/// spezza sui separatori (`&&`, `||`, `;`, `|`, newline) FUORI dalle
-/// virgolette e poi in parole per whitespace. Sottoinsieme dichiarato della
-/// scomposizione di playwright_cli (vedi doc del modulo).
-pub fn token_di_comando(riga: &str) -> Vec<Vec<String>> {
-    let mut acc = AccumulatoreToken::default();
-    let mut quote: Option<char> = None;
-    let chars: Vec<char> = riga.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        match quote {
-            Some(q) => {
-                if c == q {
-                    quote = None;
-                } else {
-                    acc.parola.push(c);
-                }
-                i += 1;
-            }
-            None => match c {
-                '\'' | '"' => {
-                    quote = Some(c);
-                    i += 1;
-                }
-                ';' | '\n' => {
-                    acc.chiudi_comando();
-                    i += 1;
-                }
-                '&' | '|' => {
-                    acc.chiudi_comando();
-                    i += if i + 1 < chars.len() && chars[i + 1] == c { 2 } else { 1 };
-                }
-                c if c.is_whitespace() => {
-                    acc.chiudi_parola();
-                    i += 1;
-                }
-                _ => {
-                    acc.parola.push(c);
-                    i += 1;
-                }
-            },
-        }
-    }
-    acc.chiudi_comando();
-    acc.comandi
-}
-
-/// Accumulatore della scomposizione: parola corrente -> comando corrente ->
-/// lista dei comandi (la chiusura ai separatori sta QUI, non ripetuta nei rami).
-#[derive(Default)]
-struct AccumulatoreToken {
-    comandi: Vec<Vec<String>>,
-    corrente: Vec<String>,
-    parola: String,
-}
-
-impl AccumulatoreToken {
-    fn chiudi_parola(&mut self) {
-        if !self.parola.is_empty() {
-            self.corrente.push(std::mem::take(&mut self.parola));
-        }
-    }
-    fn chiudi_comando(&mut self) {
-        self.chiudi_parola();
-        if !self.corrente.is_empty() {
-            self.comandi.push(std::mem::take(&mut self.corrente));
-        }
-    }
-}
-
 /// I token del pattern compaiono come SOTTOSEQUENZA CONTIGUA fra i token del
 /// comando (mai match di sottostringa dentro un token). Case-insensitive:
 /// `TASKKILL` e `taskkill` sono lo stesso programma, e questo e' un INNESCO
@@ -299,11 +228,14 @@ fn regola_colpisce(r: &CriticalityRule, tool_name: &str, tool_input: &Value) -> 
     }
 }
 
-/// La riga scomposta contiene il pattern in ALMENO uno dei suoi comandi.
+/// La riga scomposta (punto unico [`super::shell_command::comandi`]) contiene
+/// il pattern nelle PAROLE di almeno uno dei suoi comandi. Il match e' sulle
+/// sole `parole`: le assegnazioni `env` in testa e i bersagli delle
+/// redirezioni non sono parole eseguite e non devono far scattare un pattern.
 fn comando_matcha(riga: &str, pattern: &str) -> bool {
-    token_di_comando(riga)
+    super::shell_command::comandi(riga)
         .iter()
-        .any(|tokens| pattern_nei_token(tokens, pattern))
+        .any(|c| pattern_nei_token(&c.parole, pattern))
 }
 
 fn comando_del_passo(input: &Value) -> Option<String> {
@@ -519,6 +451,27 @@ mod tests {
             StepCriticality::Critical
         );
         assert_eq!(classify("docker compose up -d").level, StepCriticality::Mutating);
+
+        // Delega allo scompositore unico (consolidamento): un'assegnazione env
+        // in testa non spezza il match sulle PAROLE del comando.
+        assert_eq!(
+            classify("FORCE=1 rm -rf build/").level,
+            StepCriticality::Irreversible
+        );
+        // La redirezione non produce piu' token spuri (`2>&1` non lascia un
+        // comando fantasma): un `rm` come BERSAGLIO di redirezione, non
+        // eseguito, non matcha. MUTAZIONE: far vedere al matcher env+parole o
+        // ripristinare l'ex tokenizzatore -> uno di questi due casi cade.
+        assert_eq!(
+            classify("node build.js 2>&1").level,
+            StepCriticality::Mutating,
+            "run_command e' mutatore; il pattern rm -rf non c'e' fra le parole"
+        );
+        assert_eq!(
+            classify("echo done > rm -rf").level,
+            StepCriticality::Mutating,
+            "rm/-rf sono bersaglio di redirezione e argomento, non un rm eseguito"
+        );
     }
 
     /// Il livello base viene dal vocabolario mutatori ESISTENTE (consumato,

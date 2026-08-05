@@ -1710,6 +1710,16 @@ done
 assert_single "esecutore-suite-playwright" 'fn invocazione_suite' \
   'crates/mcp-core/src/agent_tools/playwright_cli.rs' crates
 
+# ── scomposizione-riga-shell (2026-08-05) ───────────────────────────────────
+# La SCOMPOSIZIONE di una riga shell in comandi/parole/env/redirezioni ha un
+# punto unico in nexus-agent-graph: playwright_cli (riconoscimento suite),
+# avvio_server (avvia un server?) e step_gate (matcher command_token) delegano.
+# Prima esistevano DUE scompositori indipendenti che divergevano nel silenzio
+# (`2>&1` produceva un comando fantasma `["1"]` nell'ex tokenizzatore di
+# step_gate). La `pub fn comandi` deve stare SOLO nel modulo del punto unico.
+assert_single "scomposizione-riga-shell" 'pub fn comandi' \
+  'crates/nexus-agent-graph/src/decisions/shell_command.rs' crates
+
 # Regressione diretta: la registrazione a posteriori non deve tornare. Cerca la
 # DEFINIZIONE, non il nome: il commento che ne spiega la rimozione lo cita.
 if grep -rEln --include='*.rs' --exclude-dir=target 'fn record_playwright_job' crates >/dev/null 2>&1; then

@@ -115,6 +115,7 @@ pub mod orchestration_reason;
 pub mod orchestration_sizing;
 pub mod panel_quorum;
 pub mod severity;
+pub mod shell_command;
 pub mod predictive_cap;
 pub mod progress_controller;
 pub mod requirement_conformance;

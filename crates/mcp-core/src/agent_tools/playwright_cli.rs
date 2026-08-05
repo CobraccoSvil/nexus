@@ -40,16 +40,11 @@
 
 use super::AgentToolContext;
 
-/// Un comando semplice della catena shell, gia' scomposto.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Comando {
-    /// Assegnazioni `NOME=valore` che precedono l'eseguibile.
-    pub env: Vec<(String, String)>,
-    /// Parole del comando, virgolette risolte, redirezioni escluse.
-    pub parole: Vec<String>,
-    /// La riga portava redirezioni su questo comando (`>`, `2>&1`, ...).
-    pub redirezioni: bool,
-}
+// La SCOMPOSIZIONE della riga shell (`Comando`, `comandi`) e' il punto unico
+// `nexus_agent_graph::decisions::shell_command` (regola L): questo modulo ci
+// delega e tiene il solo RICONOSCIMENTO della suite. La direzione e' obbligata
+// dal grafo delle dipendenze (mcp-core dipende da nexus-agent-graph).
+use nexus_agent_graph::decisions::shell_command::{comandi, Comando};
 
 /// Invocazione della suite riconosciuta in una riga.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,177 +61,6 @@ pub(super) struct InvocazioneSuite {
     /// La delega non e' possibile: eseguirebbe solo la suite, saltando in
     /// silenzio il resto della catena.
     pub composita: bool,
-}
-
-/// Scompone una riga di shell nei suoi comandi semplici.
-///
-/// Punto unico (regola L) della scomposizione: separatori (`&&`, `||`, `;`,
-/// `|`, `&`, newline) riconosciuti FUORI dalle virgolette, redirezioni tolte
-/// dalle parole e segnalate a parte, assegnazioni env inline separate
-/// dall'eseguibile. Non e' una shell: non espande variabili, glob o
-/// sostituzioni di comando — serve a RICONOSCERE cosa la riga chiede, mai a
-/// deciderne l'esecuzione al posto della shell vera.
-pub(super) fn comandi(riga: &str) -> Vec<Comando> {
-    let mut s = Scomposizione::default();
-    let chars: Vec<char> = riga.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        let c = chars[i];
-        i = match c {
-            '\'' | '"' => s.consuma_stringa(&chars, i),
-            '\\' if i + 1 < chars.len() => {
-                s.corrente.push(chars[i + 1]);
-                s.ha_corrente = true;
-                i + 2
-            }
-            c if c.is_whitespace() && c != '\n' => {
-                s.chiudi_parola();
-                i + 1
-            }
-            '\n' | ';' => {
-                s.chiudi_comando();
-                i + 1
-            }
-            '&' | '|' => {
-                s.chiudi_comando();
-                // `&&` e `||` sono un separatore solo, come `&` e `|` singoli.
-                i + if i + 1 < chars.len() && chars[i + 1] == c {
-                    2
-                } else {
-                    1
-                }
-            }
-            '>' | '<' => s.consuma_redirezione(&chars, i),
-            _ => {
-                s.corrente.push(c);
-                s.ha_corrente = true;
-                i + 1
-            }
-        };
-    }
-    s.chiudi_comando();
-    s.comandi
-}
-
-/// Stato della scansione di [`comandi`].
-#[derive(Default)]
-struct Scomposizione {
-    comandi: Vec<Comando>,
-    parole: Vec<String>,
-    corrente: String,
-    ha_corrente: bool,
-    redirezioni: bool,
-    /// La prossima parola e' il bersaglio di una redirezione, non un argomento.
-    attesa_target: bool,
-}
-
-impl Scomposizione {
-    /// Consuma una stringa quotata a partire dall'apice in `i`, aggiungendone
-    /// il contenuto alla parola in costruzione. Ritorna l'indice successivo
-    /// alla chiusura (o la fine della riga, se l'apice non e' chiuso).
-    fn consuma_stringa(&mut self, chars: &[char], i: usize) -> usize {
-        let apice = chars[i];
-        let mut j = i + 1;
-        self.ha_corrente = true;
-        while j < chars.len() && chars[j] != apice {
-            self.corrente.push(chars[j]);
-            j += 1;
-        }
-        j + 1
-    }
-
-    /// Consuma una redirezione (`>`, `>>`, `2>`, `2>&1`, `<`) e i suoi spazi:
-    /// segnala il fatto e arma lo scarto del bersaglio, che non e' una parola
-    /// del comando. Ritorna l'indice della prossima cosa da leggere.
-    fn consuma_redirezione(&mut self, chars: &[char], i: usize) -> usize {
-        // La parola in costruzione, se e' il solo numero di descrittore
-        // (`2>`), non e' una parola del comando.
-        if self.ha_corrente && self.corrente.chars().all(|c| c.is_ascii_digit()) {
-            self.corrente.clear();
-            self.ha_corrente = false;
-        } else {
-            self.chiudi_parola();
-        }
-        self.redirezioni = true;
-        let mut j = i + 1;
-        // Operatore esteso: `>>`, `>&1`, `&>`.
-        while j < chars.len() && matches!(chars[j], '>' | '&') {
-            j += 1;
-        }
-        // Il bersaglio, attaccato (`>/dev/null`) o staccato (`> out.log`), non
-        // e' una parola del comando.
-        self.attesa_target = true;
-        while j < chars.len() && chars[j].is_whitespace() && chars[j] != '\n' {
-            j += 1;
-        }
-        j
-    }
-
-    fn chiudi_parola(&mut self) {
-        if !self.ha_corrente {
-            return;
-        }
-        let parola = std::mem::take(&mut self.corrente);
-        self.ha_corrente = false;
-        if self.attesa_target {
-            self.attesa_target = false;
-        } else {
-            self.parole.push(parola);
-        }
-    }
-
-    fn chiudi_comando(&mut self) {
-        self.chiudi_parola();
-        self.attesa_target = false;
-        let parole = std::mem::take(&mut self.parole);
-        let redirezioni = std::mem::take(&mut self.redirezioni);
-        if !parole.is_empty() {
-            self.comandi.push(Comando::nuovo(parole, redirezioni));
-        }
-    }
-}
-
-impl Comando {
-    /// Separa le assegnazioni env inline (`NOME=valore` in testa) dalle parole
-    /// del comando vero e proprio.
-    fn nuovo(parole: Vec<String>, redirezioni: bool) -> Self {
-        let mut env = Vec::new();
-        let mut resto = Vec::new();
-        let mut ancora_env = true;
-        for p in parole {
-            if ancora_env {
-                if let Some((nome, valore)) = assegnazione_env(&p) {
-                    env.push((nome, valore));
-                    continue;
-                }
-                ancora_env = false;
-            }
-            resto.push(p);
-        }
-        Comando {
-            env,
-            parole: resto,
-            redirezioni,
-        }
-    }
-}
-
-/// `NOME=valore` con NOME identificatore di shell valido, altrimenti None
-/// (`--flag=x` e `foo=bar/baz` come argomento posizionale non lo sono).
-fn assegnazione_env(p: &str) -> Option<(String, String)> {
-    let (nome, valore) = p.split_once('=')?;
-    if nome.is_empty() {
-        return None;
-    }
-    let primo_ok = nome
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
-    if !primo_ok || !nome.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return None;
-    }
-    Some((nome.to_string(), valore.to_string()))
 }
 
 /// Lanciatori di pacchetto che precedono l'eseguibile vero.
@@ -397,58 +221,11 @@ fn rifiuto_riga_composita(tool: &str, command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn parole(riga: &str) -> Vec<Vec<String>> {
-        comandi(riga).into_iter().map(|c| c.parole).collect()
-    }
-
-    #[test]
-    fn scompone_separatori_fuori_dalle_virgolette() {
-        assert_eq!(
-            parole("npm ci && npx playwright test"),
-            vec![
-                vec!["npm".to_string(), "ci".to_string()],
-                vec![
-                    "npx".to_string(),
-                    "playwright".to_string(),
-                    "test".to_string()
-                ],
-            ]
-        );
-        // Il `;` dentro le virgolette non separa: e' testo dell'argomento.
-        assert_eq!(
-            parole("echo \"a; b\""),
-            vec![vec!["echo".to_string(), "a; b".to_string()]]
-        );
-    }
-
-    #[test]
-    fn toglie_le_redirezioni_dalle_parole() {
-        let cmds = comandi("npx playwright test 2>&1 > out.log");
-        assert_eq!(cmds.len(), 1);
-        assert_eq!(
-            cmds[0].parole,
-            vec![
-                "npx".to_string(),
-                "playwright".to_string(),
-                "test".to_string()
-            ]
-        );
-        assert!(cmds[0].redirezioni, "la redirezione va segnalata a parte");
-    }
-
-    #[test]
-    fn separa_le_assegnazioni_env_inline() {
-        let cmds = comandi("BASE_URL=http://127.0.0.1:5173 npx playwright test");
-        assert_eq!(
-            cmds[0].env,
-            vec![(
-                "BASE_URL".to_string(),
-                "http://127.0.0.1:5173".to_string()
-            )]
-        );
-        assert_eq!(cmds[0].parole[0], "npx");
-    }
+    // La scomposizione (`comandi`) e' testata nel suo punto unico
+    // (`nexus_agent_graph::decisions::shell_command`). Qui si testa il
+    // RICONOSCIMENTO della suite, che attraversa la delega: rompere lo
+    // scompositore fa cadere questi test end-to-end oltre a quelli del punto
+    // unico (mutazione osservabile per ENTRAMBI i consumatori).
 
     /// Le forme con cui un agente lancia davvero la suite.
     #[test]
@@ -538,5 +315,17 @@ mod tests {
             .expect("suite riconosciuta");
         assert_eq!(inv.env_inline.len(), 1);
         assert_eq!(inv.env_inline[0].0, "BASE_URL");
+    }
+
+    /// Il campo `redirezioni` propagato dallo scompositore fino a
+    /// `InvocazioneSuite` (contratto lato consumatore, attraverso la delega):
+    /// il runner sa che l'output era ridiretto. Mutazione: rompere il ramo
+    /// redirezione del punto unico -> questo test cade insieme a quelli di
+    /// shell_command.
+    #[test]
+    fn redirezione_propagata_all_invocazione() {
+        let inv = invocazione_suite("npx playwright test 2>&1 > out.log").expect("suite");
+        assert!(inv.redirezioni, "la redirezione arriva all'esecutore");
+        assert!(!inv.composita, "la sola redirezione non e' un secondo comando");
     }
 }

@@ -28,7 +28,7 @@
 //! toppa che la regola H vieta, e il vocabolario porta gia' nel codice due
 //! accrescimenti per incidente. Il difetto era la FORMA della domanda. Qui la
 //! riga viene scomposta in comandi e parole dal punto unico
-//! [`super::playwright_cli::comandi`] (virgolette risolte, separatori `&&`,
+//! [`nexus_agent_graph::decisions::shell_command::comandi`] (virgolette risolte, separatori `&&`,
 //! `||`, `;`, `|`, `&`, assegnazioni env inline separate) e la domanda diventa
 //! «l'ESEGUIBILE di uno di questi comandi avvia un server?».
 //!
@@ -42,7 +42,7 @@
 //! Quello e' un fatto osservabile e arriva dopo (`attende_ascolto`); qui si
 //! decidono i POTERI del lancio, e un potere si concede prima di eseguire.
 
-use super::playwright_cli::{comandi, Comando};
+use nexus_agent_graph::decisions::shell_command::{comandi, Comando};
 
 /// Come un eseguibile si rapporta ai propri sottocomandi, per la sola domanda
 /// «avvia un server?».
