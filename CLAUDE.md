@@ -12,7 +12,10 @@ Questo file raccoglie le direttive vincolanti per qualunque agente (umano o AI) 
 ## B. Build verification (direttiva #9)
 
 - Dopo ogni modifica non banale eseguire `pnpm verify` (orchestratore: `scripts/verify.sh`).
-- `pnpm verify` esegue: `turbo run typecheck lint test` + `cargo check --workspace` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace --no-fail-fast`.
+- `pnpm verify` esegue: `turbo run typecheck lint test` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo nextest run --workspace --no-fail-fast` + `cargo test --doc --workspace`.
+- **L'esecutore dei test e' `cargo-nextest`** (`cargo install cargo-nextest --locked`; in CI via `taiki-e/install-action@nextest`). Se manca, il gate si ferma con un messaggio esplicito: non ripiega su `cargo test`, altrimenti locale e CI misurerebbero cose diverse. **La fase `cargo test --doc` che lo segue non e' ridondante**: nextest esegue solo binari di test compilati e non esegue i 90 doctest del workspace.
+- **Niente `cargo check --workspace`**: `clippy --all-targets` ne e' un superset stretto (clippy *e'* rustc con lint aggiuntive, e `--all-targets` copre piu' target). Le due fasi non condividono la cache — clippy imposta `RUSTC_WORKSPACE_WRAPPER=clippy-driver`, che cambia il fingerprint dei crate del workspace — quindi il check era un attraversamento completo dei 37 crate buttato via. Rimosso il 2026-08-05.
+- **`CARGO_INCREMENTAL` dipende dal regime** (`scripts/gate-env.sh`): `0` in CI (runner usa-e-getta, la cache non verrebbe mai riletta), `1` in locale (stessa macchina, stesso target, modifiche piccole: e' il solo meccanismo sotto il livello del crate, e senza di esso una riga in `mcp-core` ne ricompila 215.421). Discriminante: la variabile `CI`, segnale strutturato (regola M).
 - Un commit che rompe `pnpm verify` non può essere unito in `main`. L'hook `lefthook` pre-commit lo blocca localmente.
 - CI: `.github/workflows/verify.yml` esegue lo stesso gate su ogni push/PR.
 

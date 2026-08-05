@@ -18,12 +18,24 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-# Usa il binario gia' compilato se presente (gate CI: `cargo check --workspace`
-# lo costruisce prima), altrimenti compila al volo con cargo run. L'audit
-# legge i path relativi a ROOT_DIR (cwd), quindi l'invocazione deve restare qui.
-XTASK_BIN="$ROOT_DIR/target/debug/xtask"
-if [ -x "$XTASK_BIN" ]; then
-  exec "$XTASK_BIN" audit-settings "$@"
-else
-  exec cargo run --quiet -p xtask -- audit-settings "$@"
-fi
+# Ambiente comune dei gate (target dir, incrementale, DATABASE_URL): punto
+# unico. Serve perche' la riga sotto invoca cargo, e un gate che compilasse in
+# un target diverso dagli altri non riuserebbe nulla.
+# shellcheck source=scripts/gate-env.sh
+source "$ROOT_DIR/scripts/gate-env.sh"
+
+# SEMPRE via cargo, come scripts/quality-scan.sh (regola O: lo strumento misura
+# il codice CORRENTE).
+#
+# Fino al 2026-08-05 qui c'era uno shortcut su `$ROOT_DIR/target/debug/xtask`,
+# con due difetti:
+#   1. il path era hardcoded e ignorava CARGO_TARGET_DIR — con un target diverso
+#      l'audit girava con un binario STANTIO, misurando con la logica vecchia
+#      contro la baseline nuova (lo stesso difetto che quality-scan.sh dichiara
+#      di aver gia' corretto: "il gate mentiva in entrambe le direzioni");
+#   2. la motivazione era falsa: diceva che `cargo check --workspace` costruisce
+#      quel binario, ma `cargo check` non linka — non lo ha mai prodotto.
+# A target caldo cargo costa ~1s e garantisce la freschezza da se'.
+#
+# L'audit legge i path relativi a ROOT_DIR (cwd), quindi l'invocazione resta qui.
+exec cargo run --quiet -p xtask -- audit-settings "$@"

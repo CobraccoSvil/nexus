@@ -72,12 +72,18 @@ pre-commit:
     # .proto). Il glob yaml/yml ereditato dallo scaffold iniziale faceva girare un
     # cargo check dell'intero workspace a ogni commit di config (es. questo stesso
     # lefthook.yml): 10+ minuti inutili che spingono verso --no-verify (vietato, C).
+    # Dal 2026-08-05 esegue `cargo clippy --all-targets -- -D warnings`, lo
+    # STESSO comando di `pnpm verify`, non piu' `cargo check`: i due non
+    # condividono gli artefatti (clippy imposta RUSTC_WORKSPACE_WRAPPER, che
+    # cambia il fingerprint dei crate del workspace), quindi con comandi diversi
+    # questo hook ricompilava tutto anche subito dopo un gate verde. Il nome
+    # della voce resta per non spezzare gli hook gia' installati.
     cargo_check_quick:
       glob:
         - "*.rs"
         - "*.toml"
       run: bash scripts/precommit-cargo-check.sh
-      fail_text: "pre-commit cargo fallito: correggi cargo check."
+      fail_text: "pre-commit cargo fallito: correggi gli errori/warning clippy."
 
     # Gate ratchet qualita (scripts/quality-baseline.json): ~2-8s a target caldo.
     # Sta qui e non solo in `pnpm verify`/CI perche' e' un gate GLOBALE: chi lo

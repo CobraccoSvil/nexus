@@ -71,6 +71,17 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # Esecutore dei test del gate (scripts/verify.sh). Va installato QUI e non
+      # lasciato a un `cargo install` dentro il gate: quello ricompilerebbe
+      # nextest a ogni run, ed e' lo stesso costo per cui `cargo install
+      # sqlx-cli` e' stato tolto da questo workflow. L'action scarica il binario
+      # precompilato.
+      #
+      # Se manca, verify.sh si FERMA con un messaggio esplicito invece di
+      # ripiegare su `cargo test`: locale e CI devono misurare la stessa cosa.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 

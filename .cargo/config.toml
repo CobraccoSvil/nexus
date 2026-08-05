@@ -4,4 +4,28 @@
 # e nascondendo 170 warning di dead code reali. Rimosso dopo la bonifica
 # (zero warning sul workspace): i lint delle DIPENDENZE esterne restano
 # silenziati da cargo automaticamente, il flag globale non serviva.
-[build]
+
+# Linker: rust-lld al posto di link.exe (MSVC).
+#
+# Perche': `cargo test --workspace` linka una sessantina di binari (21 test di
+# integrazione, un lib-test per crate, 7 bin). Su MSVC il link e' il collo di
+# bottiglia tipico, ed e' l'unica parte del gate che la compilazione
+# incrementale non tocca — quella riusa le codegen unit, ma il link va rifatto
+# comunque.
+#
+# rust-lld e' distribuito CON la toolchain
+# (lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe): nessuna installazione,
+# nessuna dipendenza esterna. Va nominato cosi', senza percorso: rustc risolve
+# `rust-lld` dalla propria sysroot, quindi la riga resta valida a ogni bump di
+# `rust-toolchain.toml` senza inseguire il numero di versione nel path.
+#
+# VERIFICATO empiricamente il 2026-08-05, non assunto: su un crate isolato,
+# `cargo build -v` mostra `-C linker=rust-lld.exe` e il link riesce; col
+# controfattuale (`linker = "linker-che-non-esiste.exe"`) la compilazione
+# FALLISCE, il che prova che questa sezione viene davvero letta e non ignorata.
+#
+# Se una dipendenza si rivelasse incompatibile con lld il sintomo e' un errore
+# di LINK esplicito, non un binario silenziosamente sbagliato: si commenta
+# questa sezione e si torna al default con una riga.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
