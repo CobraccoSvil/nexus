@@ -145,21 +145,17 @@ fn normalize_scope(raw: Option<&str>) -> Result<String, (StatusCode, Json<Value>
     })
 }
 
-fn parse_string_array(raw: &Value) -> Vec<String> {
-    raw.as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
 
 // Gemelli identici di quelli in `mcp-core/src/plugins/mod.rs`, consolidati il
 // 2026-08-05 dopo che il censimento delle firme li ha fatti emergere. Non erano
 // visibili a jscpd: blocchi da 6-10 righe, sotto la sua soglia di 15.
+// Gemelle identiche di quelle in mcp-core/src/plugins/mod.rs: definizione unica
+// in nexus_mcp_client::plugin_storage dal 2026-08-05.
+use nexus_mcp_client::plugin_storage::{
+    is_figma_pat, parse_string_array, resolve_secret_value, sanitize_return_to,
+    upsert_setting_value, write_plugin_audit,
+};
+
 use nexus_mcp_client::plugin_storage::{get_json_object, value_to_string_map};
 
 /// Chi puo' gestire un'ISTANZA di plugin: proprietario, o admin su `global`.
@@ -187,14 +183,6 @@ fn plugin_error_message(message: &str) -> String {
     .message
 }
 
-fn sanitize_return_to(value: Option<&str>) -> String {
-    let raw = value.unwrap_or(FIGMA_DEFAULT_RETURN_TO).trim();
-    if raw.starts_with('/') && !raw.starts_with("//") {
-        raw.to_string()
-    } else {
-        FIGMA_DEFAULT_RETURN_TO.to_string()
-    }
-}
 
 fn redirect_with_status(return_to: &str, status: &str, message: Option<&str>) -> Response {
     let mut target = format!("{}{}", frontend_url(), sanitize_return_to(Some(return_to)));
@@ -209,39 +197,7 @@ fn redirect_with_status(return_to: &str, status: &str, message: Option<&str>) ->
     Redirect::temporary(&target).into_response()
 }
 
-fn is_figma_pat(token: &str) -> bool {
-    token.trim().to_lowercase().starts_with("figd_")
-}
 
-async fn upsert_setting_value(
-    db: &PgPool,
-    key: &str,
-    value: &str,
-    category: &str,
-    description: &str,
-    is_secret: bool,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
-        INSERT INTO settings (key, value, category, description, is_secret, updated_at)
-        VALUES ($1, $2, $3, $4, $5, NOW())
-        ON CONFLICT (key) DO UPDATE
-        SET value = EXCLUDED.value,
-            category = EXCLUDED.category,
-            description = EXCLUDED.description,
-            is_secret = EXCLUDED.is_secret,
-            updated_at = NOW()
-        "#,
-    )
-    .bind(key)
-    .bind(value)
-    .bind(category)
-    .bind(description)
-    .bind(is_secret)
-    .execute(db)
-    .await
-    .map(|_| ())
-}
 
 async fn resolve_bool_setting(db: &PgPool, key: &str, default_value: bool) -> bool {
     match get_setting(db, key).await {
@@ -253,44 +209,7 @@ async fn resolve_bool_setting(db: &PgPool, key: &str, default_value: bool) -> bo
     }
 }
 
-async fn resolve_secret_value(db: &PgPool, setting_key: &str) -> Option<String> {
-    sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
-        .bind(setting_key)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
 
-async fn write_plugin_audit(
-    db: &PgPool,
-    plugin_instance_id: Option<Uuid>,
-    user_id: Option<Uuid>,
-    project_id: Option<Uuid>,
-    action: &str,
-    status: &str,
-    message: Option<String>,
-    payload: Value,
-) {
-    let _ = sqlx::query(
-        r#"
-        INSERT INTO plugin_audit_events
-            (plugin_instance_id, user_id, project_id, action, status, message, payload)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        "#,
-    )
-    .bind(plugin_instance_id)
-    .bind(user_id)
-    .bind(project_id)
-    .bind(action)
-    .bind(status)
-    .bind(message)
-    .bind(payload)
-    .execute(db)
-    .await;
-}
 
 async fn find_duplicate_instance_anywhere(
     db: &PgPool,

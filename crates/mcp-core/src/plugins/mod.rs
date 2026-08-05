@@ -154,22 +154,19 @@ pub(super) fn normalize_scope(raw: Option<&str>) -> Result<String, (StatusCode, 
     })
 }
 
-pub(super) fn parse_string_array(raw: &Value) -> Vec<String> {
-    raw.as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
 
 // Tre helper che erano gemelli identici di quelli in `plugin-service`, e che il
 // censimento delle firme ha fatto emergere il 2026-08-05. La definizione vive
 // ora in `nexus_mcp_client::plugin_storage`, lo stesso crate che la Wave C1
 // aveva creato proprio per la duplicazione fra questi due lati.
+// Sei funzioni che vivevano IDENTICHE anche in plugin-service/src/plugins.rs.
+// La definizione e' in nexus_mcp_client::plugin_storage dal 2026-08-05; qui
+// restano i nomi con cui i moduli di `plugins/` le conoscono gia'.
+pub(super) use nexus_mcp_client::plugin_storage::{
+    is_figma_pat, parse_string_array, resolve_secret_value, sanitize_return_to,
+    upsert_setting_value, write_plugin_audit,
+};
+
 pub(super) use nexus_mcp_client::plugin_storage::{get_json_object, value_to_string_map};
 
 /// Chi puo' gestire un'ISTANZA di plugin: proprietario, o admin su `global`.
@@ -196,14 +193,6 @@ pub(super) fn plugin_error_message(message: &str) -> String {
     .message
 }
 
-pub(super) fn sanitize_return_to(value: Option<&str>) -> String {
-    let raw = value.unwrap_or(FIGMA_DEFAULT_RETURN_TO).trim();
-    if raw.starts_with('/') && !raw.starts_with("//") {
-        raw.to_string()
-    } else {
-        FIGMA_DEFAULT_RETURN_TO.to_string()
-    }
-}
 
 pub(super) fn redirect_with_status(
     return_to: &str,
@@ -222,35 +211,6 @@ pub(super) fn redirect_with_status(
     Redirect::temporary(&target).into_response()
 }
 
-pub(super) async fn upsert_setting_value(
-    db: &PgPool,
-    key: &str,
-    value: &str,
-    category: &str,
-    description: &str,
-    is_secret: bool,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
-        INSERT INTO settings (key, value, category, description, is_secret, updated_at)
-        VALUES ($1, $2, $3, $4, $5, NOW())
-        ON CONFLICT (key) DO UPDATE
-        SET value = EXCLUDED.value,
-            category = EXCLUDED.category,
-            description = EXCLUDED.description,
-            is_secret = EXCLUDED.is_secret,
-            updated_at = NOW()
-        "#,
-    )
-    .bind(key)
-    .bind(value)
-    .bind(category)
-    .bind(description)
-    .bind(is_secret)
-    .execute(db)
-    .await
-    .map(|_| ())
-}
 
 pub(super) async fn resolve_bool_setting(db: &PgPool, key: &str, default_value: bool) -> bool {
     match get_setting(db, key).await {
@@ -262,9 +222,6 @@ pub(super) async fn resolve_bool_setting(db: &PgPool, key: &str, default_value: 
     }
 }
 
-pub(super) fn is_figma_pat(token: &str) -> bool {
-    token.trim().to_lowercase().starts_with("figd_")
-}
 
 pub(super) async fn fetch_figma_oauth_discovery() -> Result<FigmaOAuthDiscovery, String> {
     let client = Client::builder()
@@ -771,44 +728,7 @@ pub(crate) fn detect_legacy_catalog_slug(
     None
 }
 
-pub(super) async fn write_plugin_audit(
-    db: &PgPool,
-    plugin_instance_id: Option<Uuid>,
-    user_id: Option<Uuid>,
-    project_id: Option<Uuid>,
-    action: &str,
-    status: &str,
-    message: Option<String>,
-    payload: Value,
-) {
-    let _ = sqlx::query(
-        r#"
-        INSERT INTO plugin_audit_events
-            (plugin_instance_id, user_id, project_id, action, status, message, payload)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        "#,
-    )
-    .bind(plugin_instance_id)
-    .bind(user_id)
-    .bind(project_id)
-    .bind(action)
-    .bind(status)
-    .bind(message)
-    .bind(payload)
-    .execute(db)
-    .await;
-}
 
-pub(super) async fn resolve_secret_value(db: &PgPool, setting_key: &str) -> Option<String> {
-    sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
-        .bind(setting_key)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
 
 /// Campi grezzi della riga `mcp_servers` (join con il catalog) necessari a
 /// costruire la runtime config di un plugin.

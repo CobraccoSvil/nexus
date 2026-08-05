@@ -96,10 +96,12 @@
       "membri": [
         "19 gruppi su plugin-service/plugins.rs",
         "14 su mcp-core/plugins/mod.rs",
-        "stessi NOMI: write_plugin_audit, build_plugin_resolution, apply_figma_http_headers, get_catalog_by_install_request, ..."
+        "stessi NOMI: write_plugin_audit, build_plugin_resolution, apply_figma_http_headers, get_catalog_by_install_request, ...",
+        "12 identiche / 9 divergenti (misurato)",
+        "10 consolidate, 4 restano per dipendenze, 9 da leggere"
       ],
       "verdetto": "da_consolidare",
-      "nota": "Non sono candidati indipendenti: i due file sono GEMELLI. Guardando la distribuzione dei 187 gruppi cross-crate, questi due si ripetono in cima con funzioni che hanno perfino lo stesso nome. La casa esiste gia' — nexus-mcp-client, nato in Wave C1 proprio per la duplicazione fra questi due lati, e dove il 2026-08-05 e' stato aggiunto plugin_storage con le prime quattro funzioni. Il resto e' un lavoro a se': ~19 funzioni, alcune con IO verso il DB, da spostare una alla volta con il gate verde ad ogni passo. REGISTRATO come cluster e non gruppo per gruppo perche' il verdetto e' uno: quei due file vanno fatti convergere, non giudicati diciannove volte."
+      "nota": "PARZIALMENTE CONSOLIDATO 2026-08-05. MISURATO sui due file: 21 nomi in comune, di cui 12 con corpo IDENTICO (a meno della formattazione) e 9 DIVERGUTE — due copie della stessa funzione che si sono allontanate senza che nessuno lo sapesse, e la peggiore e' get_catalog_by_install_request con 3006 caratteri da un lato e 1056 dall'altro. SCESE in nexus_mcp_client::plugin_storage: normalizza_scope, value_to_string_map, get_json_object, puo_gestire, is_figma_pat, parse_string_array, sanitize_return_to, resolve_secret_value, upsert_setting_value, write_plugin_audit (10). RESTANO DOVE SONO, con motivo: redirect_with_status e find_duplicate_instance_anywhere ritornano tipi axum, e questo crate non dipende da un framework web — se serviranno condivise, la forma e' quella di crea_directory (query nel punto unico, traduzione HTTP nel chiamante); figma_oauth_redirect_uri e resolve_bool_setting usano nexus_auth. DA GUARDARE UNA PER UNA: le 9 divergenti. Una divergenza puo' essere intenzionale o drift, e consolidarle senza leggerle sceglierebbe a caso quale delle due versioni sopravvive."
     },
     {
       "firma": "CLUSTER: mcp-core/src/environment.rs <-> admin-service/src/environment.rs",
