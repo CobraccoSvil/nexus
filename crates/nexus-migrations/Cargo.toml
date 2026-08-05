@@ -9,6 +9,12 @@ version.workspace = true
 # compile-time vive in `nexus-migrations-embedded`, che e' solo dev-dependency
 # e dipende da questo.
 [dependencies]
+# sha2 serve solo a COSTRUIRE la variante a fine-riga opposti di cui provare
+# l'hash (src/registro.rs): l'hash canonico non lo calcola mai questo crate, lo
+# prende da sqlx, che e' quello che il migrator confrontera'. La dipendenza e'
+# gia' nel grafo — sqlx la usa per gli stessi checksum — quindi il crate resta
+# minimale come dichiarato sopra.
+sha2.workspace = true
 sqlx.workspace = true
 thiserror = "1.0"
 

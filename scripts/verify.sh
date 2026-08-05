@@ -54,6 +54,12 @@ else
     echo "-- verify: Rust saltato (VERIFY_SKIP_RUST=1)"
 fi
 
+# Fine-riga dichiarati vs materializzati. Sta anche qui e non solo nel
+# pre-commit perche' e' una proprieta' dell'ALBERO, non del commit: un checkout
+# fresco puo' introdurla senza che nessuno committi nulla, e chi esegue il gate
+# completo e' spesso il primo a toccare quell'albero.
+run_phase "fine-riga dichiarati (eol=lf)" bash scripts/check-eol.sh
+
 # Gate ratchet configurazioni: settings morte/fantasma/invisibili possono solo
 # scendere (baseline in scripts/audit-settings-baseline.json). Se il DB live
 # non e' raggiungibile lo script degrada da solo in modalita' --no-db.

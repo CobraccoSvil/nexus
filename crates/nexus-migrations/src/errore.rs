@@ -29,14 +29,15 @@ pub enum ErroreMigrazione {
     /// Il file di una migrazione gia' applicata e' cambiato dopo l'applicazione.
     #[error(
         "la migrazione {versione} del set '{set}' e' cambiata dopo essere stata \
-         applicata{nota_crlf}. Una migrazione applicata e' immutabile: se serve \
+         applicata{nota}. Una migrazione applicata e' immutabile: se serve \
          correggerla, si aggiunge una migrazione nuova."
     )]
     ChecksumDivergente {
         set: Set,
         versione: i64,
-        /// Diagnosi mirata: il caso quasi sempre vero e' il fine-riga.
-        nota_crlf: String,
+        /// Diagnosi mirata: il caso quasi sempre vero e' il fine-riga, e i
+        /// versi in cui puo' presentarsi sono due.
+        nota: String,
     },
 
     /// Lo schema c'e' gia' ma il registro delle migrazioni non lo sa: e' il DB
@@ -126,7 +127,7 @@ pub(crate) fn da_migrate_error(
             ErroreMigrazione::ChecksumDivergente {
                 set,
                 versione,
-                nota_crlf: nota_crlf(set, origine, versione),
+                nota: nota(set, origine, versione),
             }
         }
         sqlx::migrate::MigrateError::ExecuteMigration(sqlx::Error::Database(e), v) => {
@@ -145,13 +146,28 @@ pub(crate) fn da_migrate_error(
     }
 }
 
-/// Se il file della versione ha CRLF, la diagnosi lo dice: e' la causa quasi
-/// sempre vera di un checksum divergente in questo repo, dove `.gitattributes`
-/// dichiara `*.sql text eol=lf` ma un checkout puo' ignorarlo.
+/// Il fine-riga e' la causa quasi sempre vera di un checksum divergente in
+/// questo repo, e si presenta in DUE versi opposti che vogliono cure opposte.
+/// La nota li distingue, perche' indicare la cura sbagliata costa piu' del non
+/// dire nulla.
 ///
-/// Si LEGGE il file invece di ricalcolare l'hash: ricalcolarlo sarebbe una
-/// seconda strada verso lo stesso dato, cioe' il difetto che questo crate chiude.
-fn nota_crlf(set: Set, origine: &crate::OrigineSet, versione: i64) -> String {
+/// Verso A — il file sul disco ha CRLF: il checkout ha ignorato
+/// `.gitattributes`. Si ricrea il file; il registro ha ragione.
+///
+/// Verso B — il file sul disco e' canonico: allora e' il REGISTRO a poter
+/// conservare l'hash di byte CRLF, perche' il database e' stato migrato da un
+/// checkout non conforme. E' il verso realmente accaduto (05/08/2026, migrazioni
+/// 117 e 118), ed e' quello che la diagnosi non copriva: guardava solo il file,
+/// lo trovava a posto e taceva, lasciando "la migrazione e' cambiata" come unica
+/// spiegazione di un albero che nessuno aveva toccato.
+///
+/// Qui non si CLASSIFICA la divergenza: per farlo servirebbe il checksum
+/// registrato, che a questo punto della catena non c'e' (`VersionMismatch`
+/// porta solo la versione). La nota rimanda percio' allo strumento che quel
+/// confronto lo fa davvero — `--check`, che passa da
+/// [`crate::registro::classifica`] — invece di affermare una causa che non ha
+/// misurato.
+fn nota(set: Set, origine: &crate::OrigineSet, versione: i64) -> String {
     let dir = origine.percorso(set);
     let Ok(voci) = std::fs::read_dir(&dir) else {
         return String::new();
@@ -163,16 +179,24 @@ fn nota_crlf(set: Set, origine: &crate::OrigineSet, versione: i64) -> String {
         if !nome.starts_with(&prefisso) || !nome.ends_with(".sql") {
             continue;
         }
-        if let Ok(contenuto) = std::fs::read(v.path()) {
-            if contenuto.windows(2).any(|w| w == b"\r\n") {
-                return format!(
-                    " (il file {nome} sul disco ha fine-riga CRLF: il checkout ha \
-                     ignorato .gitattributes, che per *.sql dichiara eol=lf — e' \
-                     questo a cambiare il checksum, non il contenuto)"
-                );
-            }
+        let Ok(contenuto) = std::fs::read(v.path()) else {
+            break;
+        };
+        if contenuto.windows(2).any(|w| w == b"\r\n") {
+            return format!(
+                " (il file {nome} sul disco ha fine-riga CRLF: il checkout ha \
+                 ignorato .gitattributes, che per *.sql dichiara eol=lf — e' \
+                 questo a cambiare il checksum, non il contenuto. Rimedio: \
+                 rm '{nome}' && git checkout -- '{nome}')"
+            );
         }
-        break;
+        return format!(
+            " (il file {nome} sul disco e' canonico: se il database e' stato \
+             migrato da un checkout che lo materializzava CRLF, e' il registro a \
+             conservare l'hash di quei byte. Per saperlo: cargo run -p xtask -- \
+             migrate --set {set} --check, che distingue il fine-riga da un \
+             contenuto davvero cambiato)"
+        );
     }
     String::new()
 }
@@ -194,6 +218,37 @@ mod tests {
         // Il testo porta la CURA, non solo il sintomo.
         let t = e.to_string();
         assert!(t.contains("dump"), "l'errore deve dire cosa fare: {t}");
+    }
+
+    /// I due versi vogliono due cure, e una nota che le confonde manda a
+    /// riparare la cosa sbagliata.
+    #[test]
+    fn la_nota_distingue_i_due_versi_del_fine_riga() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let set_dir = dir.path().join("db").join("migrations");
+        std::fs::create_dir_all(&set_dir).expect("mkdir");
+        let origine = crate::OrigineSet::esplicita(dir.path());
+        let file = set_dir.join("0117_prova.sql");
+
+        std::fs::write(&file, b"SELECT 1;\r\nSELECT 2;\r\n").expect("write");
+        let crlf = nota(Set::Meta, &origine, 117);
+        assert!(crlf.contains("CRLF"), "{crlf}");
+        assert!(
+            crlf.contains("git checkout --"),
+            "il verso col file sporco manda a ricreare il file: {crlf}"
+        );
+
+        std::fs::write(&file, b"SELECT 1;\nSELECT 2;\n").expect("write");
+        let lf = nota(Set::Meta, &origine, 117);
+        assert!(
+            lf.contains("--check"),
+            "col file canonico la nota deve mandare allo strumento che classifica, \
+             non affermare una causa non misurata: {lf}"
+        );
+        assert!(
+            !lf.contains("git checkout --"),
+            "qui ricreare il file non cambierebbe nulla: {lf}"
+        );
     }
 
     #[test]

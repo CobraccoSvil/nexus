@@ -71,7 +71,8 @@ fn main() -> Result<()> {
                 "  service-manifests [flags]     Manifest di servizio derivati dal catalogo (DB live)"
             );
             eprintln!(
-                "  migrate --set S [flags]       Applica un set di migrazioni (DB live)"
+                "  migrate --set S [flags]       Applica un set di migrazioni, o ne \
+                 censisce/ripara il registro (DB live)"
             );
             Ok(())
         }
