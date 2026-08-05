@@ -21,6 +21,18 @@
 # candidato per sapere cosa c'e' sul disco — passerebbe da 0,75s a una scansione
 # quasi totale. Un gate che costa troppo e' un gate che qualcuno disattiva.
 
+# Script shell: il fine-riga non e' cosmetico. Un `\r` finisce dentro il valore
+# di una variabile letta con `read`, dentro un heredoc, e nello shebang quando
+# lo script viene eseguito direttamente — e su Linux (dove gira la CI) un
+# `#!/usr/bin/env bash\r` e' un "bad interpreter".
+#
+# Misurato il 2026-08-05 su 73 script .sh: 58 corretti, 14 col blob giusto e il
+# DISCO a CRLF, 1 (check-single-source.sh) con CRLF anche nell'INDICE — quindi
+# materializzato CRLF perfino su ubuntu, dove passava per tolleranza di bash e
+# non per correttezza. Fra i quattordici c'erano quasi tutti i gate, incluso
+# check-eol.sh, cioe' il gate dei fine-riga.
+*.sh text eol=lf
+
 # Golden cross-linguaggio: la stessa fixture e' letta da pytest E da cargo test,
 # e Wave 8 dichiara che il drift fra i due lati e' un bug per costruzione. Un
 # fine-riga diverso E' drift: cambia i byte che i due runtime confrontano.
