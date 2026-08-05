@@ -19,6 +19,33 @@
 #   2. Esegui `cargo clippy --workspace --all-targets -- -D warnings` e correggi
 #      le nuove lint NELLO STESSO commit.
 #   3. Un solo file da toccare: CI e locale seguono automaticamente.
+#
+# NIGHTLY PER `-Zthreads`: VALUTATO E SCARTATO (2026-08-05).
+#   Il parallel front-end di rustc (`RUSTFLAGS=-Zthreads=N`) promette fino al
+#   -50% sui crate grandi, e `mcp-core` con le sue ~215k righe sarebbe il
+#   bersaglio ideale. Richiede nightly, e l'obiezione ovvia - "il nightly non e'
+#   deterministico" - NON e' quella giusta: il determinismo si perde con un
+#   canale FLOTTANTE, non col nightly in se', e un `nightly-YYYY-MM-DD` pinnato
+#   a data e' riproducibile quanto questa riga.
+#
+#   L'ostacolo vero e' un altro, ed e' MISURATO (nightly-2026-08-01, cioe' rustc
+#   1.99, su target isolato, 258s): `cargo clippy --workspace --all-targets`
+#   produce 14 lint distinti e ~39 occorrenze che oggi non esistono. Due gruppi
+#   non sono manutenzione ordinaria:
+#     - 27x `result_large_err`: chiede di boxare gli errori, cioe' cambiare
+#       FIRME PUBBLICHE in mezzo workspace;
+#     - 5x "lint expectation is unfulfilled": sono `#[expect(...)]` che su
+#       nightly non scattano piu'. Toglierli rompe stable, tenerli rompe
+#       nightly - i due canali sono in CONFLITTO, non a distanza di qualche fix.
+#
+#   Il ripiego "nightly solo per la fase test" non salva: userebbe un fingerprint
+#   diverso da clippy, quindi due cache invece di una e nessun riuso fra le fasi
+#   del gate - che e' il contrario di cio' che si stava cercando.
+#
+#   Da riaprire se: il parallel front-end arriva su stable, oppure il conteggio
+#   dei lint scende (per esempio dopo aver spezzato mcp-core, che da solo pesa
+#   sui `result_large_err`). Il comando per rifare la misura e' quello sopra, con
+#   `+nightly-<data>` e `CARGO_TARGET_DIR` isolato per non invalidare la cache.
 [toolchain]
 channel = "1.94.1"
 components = ["clippy", "rustfmt"]
