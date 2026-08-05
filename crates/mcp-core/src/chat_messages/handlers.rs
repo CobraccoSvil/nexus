@@ -1309,6 +1309,9 @@ async fn try_resume_interrupted_run(
             system_text: String::new(),
             prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
             initial_msg: resume_prompt,
+            // Il prompt di ripresa non ha contorno da cui separare la richiesta:
+            // e' tutto quel messaggio.
+            bare_task: None,
             // Prompt sintetico di ripresa ("continua"): nessun allegato nuovo.
             attachment_kinds: Vec::new(),
             conversation_history: resume_history,

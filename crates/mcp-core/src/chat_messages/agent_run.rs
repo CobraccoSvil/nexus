@@ -5009,6 +5009,9 @@ pub(crate) async fn spawn_agent_run(
                     // ReflectionNode per attribuire la reflection al template.
                     prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
                     initial_msg: initial_msg_clone.clone(),
+                    // Run principale: il messaggio dell'utente E' la richiesta del
+                    // turno, non c'e' un mandato nudo da separare dal contorno.
+                    bare_task: None,
                     attachment_kinds: attachment_kinds_clone.clone(),
                     conversation_history: recent_history_for_brain.clone(),
                     tools_json: tools_json_for_brain.clone(),
@@ -5322,6 +5325,8 @@ pub(crate) async fn confirm_native_run(
         system_text: String::new(),
         prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
         initial_msg: String::new(),
+        // Resume da checkpoint: il task del turno e' gia' nello stato salvato.
+        bare_task: None,
         // Resume da checkpoint: nessun messaggio nuovo, nessun allegato da rilevare.
         attachment_kinds: Vec::new(),
         conversation_history: Vec::new(),
@@ -5721,6 +5726,8 @@ pub(crate) async fn resume_fanin(
         system_text: String::new(),
         prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
         initial_msg: String::new(),
+        // Resume fan-in da checkpoint: il task del turno e' gia' nello stato salvato.
+        bare_task: None,
         // Resume fan-in da checkpoint: nessun messaggio nuovo, nessun allegato.
         attachment_kinds: Vec::new(),
         conversation_history: Vec::new(),

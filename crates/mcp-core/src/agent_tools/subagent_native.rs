@@ -3530,6 +3530,67 @@ async fn run_single_subagent_inner(
     execute_subagent_run(exec).await
 }
 
+/// Le DUE forme del mandato di un sub-run, prodotte INSIEME (regola Q: i campi,
+/// non una stringa da cui rileggerli): il messaggio che il modello riceve e la
+/// richiesta nuda che il run fissa come proprio oggetto.
+///
+/// Nascono nello stesso punto perche' il disallineamento non sia rappresentabile:
+/// un chiamante che componesse qui il messaggio e prendesse la richiesta altrove
+/// potrebbe consegnarne una diversa da quella decorata, e nessun tipo lo
+/// fermerebbe.
+pub(crate) struct SubagentMandate {
+    /// La richiesta NUDA, senza contorno. E' quella che il run fissa in
+    /// `extra[ORIGINAL_TASK_KEY]` (punto unico
+    /// [`nexus_agent_graph::decisions::turn_task`]) e che il focus del turno
+    /// dichiara al modello come "la richiesta da portare a termine ADESSO".
+    pub bare_task: String,
+    /// Il messaggio consegnato al modello: la richiesta PIU' il contorno che il
+    /// dispatcher le impagina attorno (contesto del chiamante, formato atteso).
+    pub initial_msg: String,
+}
+
+/// Compone il mandato di un sub-run (PUNTO UNICO, regola L): embedding di
+/// contesto e formato atteso nel task (parita' col brain `run_subagent`).
+///
+/// Perche' ritorna DUE campi e non la sola stringa decorata: messaggio e richiesta
+/// rispondono a domande diverse. Il primo e' cio' che il modello legge; la seconda
+/// e' cio' che il run dichiara come proprio oggetto, e da li' la legge il focus del
+/// turno — l'unico dei due consumatori di `turn_task` che un sub-run raggiunga
+/// davvero (il supervisore non gira: le figure partono con `SupervisorMode::None`).
+/// Finche' esisteva la sola stringa,
+/// `build_initial_state` fissava come richiesta l'INTERO blocco: con un mandato
+/// scarno e un contesto lungo, i primi 600 caratteri che il focus mostra erano
+/// l'inizio del CONTORNO, dichiarato al modello con l'autorita' del system prompt.
+/// Il rimedio e' qui e non a valle: il testo si compone DAI campi, non si ripulisce
+/// dopo con una regex che dovrebbe indovinare dove finisce la richiesta (la stessa
+/// premessa gia' rifiutata in [`nexus_agent_graph::decisions::turn_focus`]).
+///
+/// Regola per chi aggiunge una decorazione NUOVA (contesto richiamato per
+/// similarita', promemoria, blocchi di sistema): va appesa a `initial_msg` QUI
+/// dentro — il modello la deve vedere — e mai a `bare_task`, che resta il solo
+/// mandato. Aggiungerla al chiamante rimetterebbe la decorazione fuori dal punto
+/// unico, cioe' esattamente dove stava quando ha prodotto questo difetto.
+pub(crate) fn compose_subagent_mandate(
+    task: &str,
+    context_blob: &str,
+    expected_format: &str,
+) -> SubagentMandate {
+    let bare_task = task.trim().to_string();
+    let mut initial_msg = bare_task.clone();
+    if !context_blob.trim().is_empty() {
+        initial_msg.push_str("\n\n## Contesto aggiuntivo\n");
+        initial_msg.push_str(context_blob.trim());
+    }
+    if !expected_format.trim().is_empty() {
+        initial_msg.push_str("\n\n## Formato output atteso\n");
+        initial_msg.push_str(expected_format.trim());
+    }
+    SubagentMandate {
+        bare_task,
+        initial_msg,
+    }
+}
+
 /// FASE PREPARE di un sub-run (PUNTO UNICO, regola L): guard settings/whitelist/
 /// depth/cost + INSERT `nexus_subagent_runs` (status='running') + `ensure_child_
 /// agent_run`. Tutto SINCRONO e fail-fast: al ritorno `Ok` la row esiste ed e'
@@ -3682,16 +3743,8 @@ async fn prepare_subagent_run(
         None => timeout_s,
     };
 
-    // Embedding del context/expected nel task (parita' col brain `run_subagent`).
-    let mut initial_msg = task.trim().to_string();
-    if !context_blob.trim().is_empty() {
-        initial_msg.push_str("\n\n## Contesto aggiuntivo\n");
-        initial_msg.push_str(context_blob.trim());
-    }
-    if !expected_format.trim().is_empty() {
-        initial_msg.push_str("\n\n## Formato output atteso\n");
-        initial_msg.push_str(expected_format.trim());
-    }
+    // Mandato del sub-run: messaggio decorato + richiesta nuda, dal punto unico.
+    let mandate = compose_subagent_mandate(task, context_blob, expected_format);
 
     // ── Crea row in nexus_subagent_runs (status='running' subito: la catena depth
     //    si basa sui 'running'; il sub-run e' bloccante, non c'e' fase 'pending'
@@ -3758,7 +3811,7 @@ async fn prepare_subagent_run(
         model,
         system_text,
         prompt_key: definition.prompt_key.clone(),
-        initial_msg,
+        mandate,
         tools_json,
         current_depth,
         timeout_s,
@@ -3824,7 +3877,11 @@ struct SubagentExecInputs {
     /// grafo perche' il ReflectionNode attribuisca la reflection al prompt
     /// giusto invece che a quello del run principale.
     prompt_key: String,
-    initial_msg: String,
+    /// Messaggio decorato + richiesta nuda, dal punto unico
+    /// [`compose_subagent_mandate`]. Un solo campo per entrambi: viaggiano
+    /// insieme fino al motore, dove il primo diventa il messaggio del turno e la
+    /// seconda il task che il run dichiara come proprio.
+    mandate: SubagentMandate,
     tools_json: Value,
     current_depth: i64,
     timeout_s: i64,
@@ -3871,7 +3928,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         model,
         system_text,
         prompt_key,
-        initial_msg,
+        mandate,
         tools_json,
         current_depth,
         timeout_s,
@@ -3963,7 +4020,13 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         // reflection sono attribuite al prompt giusto e non a quello del run
         // principale.
         prompt_key: Some(prompt_key.clone()),
-        initial_msg,
+        initial_msg: mandate.initial_msg,
+        // La richiesta NUDA, separata dal contorno che le e' impaginato attorno:
+        // e' lei che il run fissa come proprio oggetto. Senza, il task del turno
+        // era l'intero blocco decorato e il focus ne mostrava i primi 600
+        // caratteri — cioe' il contesto del chiamante — dichiarandoli al modello
+        // come la richiesta da portare a termine.
+        bare_task: Some(mandate.bare_task),
         // Sub-run: il task e' descritto nel prompt, nessun allegato proprio.
         attachment_kinds: Vec::new(),
         // Sub-run isolato: NIENTE history del main (parita' col brain `run_subagent`,
@@ -5633,6 +5696,35 @@ mod tests {
             .collect();
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
+    }
+
+    // ── Mandato del sub-run: messaggio decorato vs richiesta nuda ────────────
+
+    #[test]
+    fn mandato_tiene_separata_la_richiesta_dal_contorno() {
+        let m = compose_subagent_mandate(
+            "  Verifica il gate di login  ",
+            "il coordinatore ha gia' letto auth.rs",
+            "JSON {verdict, evidence}",
+        );
+        // La richiesta e' il solo mandato, trimmato: e' il valore che il run fissa
+        // come proprio oggetto e che il focus del turno dichiara al modello.
+        assert_eq!(m.bare_task, "Verifica il gate di login");
+        // Il messaggio al modello porta invece tutto il contorno.
+        assert!(m.initial_msg.starts_with("Verifica il gate di login"));
+        assert!(m.initial_msg.contains("## Contesto aggiuntivo"));
+        assert!(m.initial_msg.contains("auth.rs"));
+        assert!(m.initial_msg.contains("## Formato output atteso"));
+        assert!(m.initial_msg.contains("JSON {verdict, evidence}"));
+    }
+
+    #[test]
+    fn mandato_senza_contorno_e_le_due_forme_coincidono() {
+        // Senza contesto ne' formato atteso non c'e' nulla da separare: il
+        // messaggio E' la richiesta (nessuna intestazione aggiunta a vuoto).
+        let m = compose_subagent_mandate("Compila il progetto", "   ", "\n");
+        assert_eq!(m.bare_task, "Compila il progetto");
+        assert_eq!(m.initial_msg, "Compila il progetto");
     }
 
     // ── Fan-out: un task per sub-run (difetto D3, incidente 2026-07-15) ──────
