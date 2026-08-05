@@ -5555,6 +5555,7 @@ mod tests {
         crate::native_engine::NativeRunOutcome {
             completed: true,
             awaiting_subagents: false,
+            suspension_origin: None,
             final_answer: None,
             stop_reason: None,
             provider_used: None,
@@ -7094,6 +7095,7 @@ mod tests {
         let outcome = crate::native_engine::NativeRunOutcome {
             completed: true,
             awaiting_subagents: false,
+            suspension_origin: None,
             final_answer: None,
             stop_reason: None,
             provider_used: None,

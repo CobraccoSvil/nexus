@@ -2051,6 +2051,40 @@ if [[ -f "$enforcer_file" ]]; then
   fi
 fi
 
+# ── scadenza-sospensione (2026-08-05) ───────────────────────────────────────
+# «Questa sospensione la sciogliera' qualcuno?» ha UN punto di risposta. Il
+# difetto (rilievo A4): il gate duale sospende in HITL anche in Automatic, dove
+# nessun umano esiste; il run_reaper esclude awaiting_confirmation per contratto
+# e ACTIVE_RUN_STATUSES lo conta fra i run che occupano la sessione, quindi il
+# run notturno restava appeso per sempre.
+#
+# 1. Il CRITERIO (chi e' atteso, e per quanto) vive solo nel punto unico: un
+#    call site che se lo riscrivesse deciderebbe con una seconda idea di quando
+#    una sospensione muore, e la prima a divergere chiuderebbe i run di Confirm
+#    mentre l'utente sta per approvare.
+assert_single "scadenza-sospensione" 'pub fn classify_suspension' \
+  'crates/nexus-agent-graph/src/decisions/suspension_watch.rs' crates
+# 2. La SCRITTURA della scadenza sta in un punto solo, chiamato da entrambi i
+#    percorsi che sospendono (chiusura del run e resume che si risospende): con
+#    due scritture, il percorso dimenticato riproduce la sospensione eterna.
+assert_single "scrittura-sospensione" 'async fn persist_suspension_watch' \
+  'crates/mcp-core/src/chat_messages/agent_run.rs' crates
+# 3. Una sospensione scaduta chiude con l'esito STRUTTURATO, mai come guasto:
+#    `interrupted` direbbe "e' morto qualcosa" di un run che si e' fermato
+#    esattamente dove doveva, e nasconderebbe la causa (regole M/Q).
+reaper_file="crates/mcp-core/src/run_reaper.rs"
+if [[ -f "$reaper_file" ]]; then
+  if grep -q 'fn expire_on_pool' "$reaper_file" \
+    && ! grep -q "blocked_needs_input" "$reaper_file"; then
+    echo "!! scadenza-sospensione: la maturazione non chiude piu' con l'esito strutturato." >&2
+    echo "   Una sospensione scaduta e' un run BLOCCATO con una causa dichiarata," >&2
+    echo "   non un guasto: chiuderlo 'interrupted' perde il perche'." >&2
+    fail=1
+  else
+    echo "OK scadenza-sospensione: la maturazione chiude blocked_needs_input"
+  fi
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

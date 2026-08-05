@@ -122,6 +122,7 @@ pub mod requirement_conformance;
 pub mod reward;
 pub mod scale_reason;
 pub mod supervisor;
+pub mod suspension_watch;
 pub mod switch_reason;
 pub mod text_repetition;
 pub mod tiers;
@@ -209,6 +210,10 @@ pub use supervisor::{
     build_anomaly_block, build_steps_summary, detect_anomalies, should_invoke,
     supervisor_cache_key, validate_supervisor_response, SupervisorAnomalies, SupervisorConfig,
     SupervisorDecision,
+};
+pub use suspension_watch::{
+    classify_suspension, nota_scadenza, SuspensionOrigin, SuspensionWatch,
+    SUSPENSION_ORIGIN_EXTRA_KEY,
 };
 pub use text_repetition::{detect_repetition_collapse, RepetitionHit, RepetitionThresholds};
 pub use tool_dispatch::{

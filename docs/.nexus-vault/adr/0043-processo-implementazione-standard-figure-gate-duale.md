@@ -152,6 +152,35 @@ dell'esecutore.
 - **Sub-run col gate armato**: l'apply del worktree copre solo le mutazioni
   file; uno stop servizi o un kill dentro un sub-run non passa da li', quindi il
   gate deve valere anche dentro i sub-run.
+- **La sospensione in Automatic ha una SCADENZA (rilievo A4, mig 0679 +
+  project 0016).** Sospendere in HITL dove nessun umano esiste e' il punto del
+  requisito, ma nessun apparato raccoglieva quel run: il `run_reaper` esclude
+  `awaiting_confirmation` per contratto (mig 0392: e' resumibile via
+  checkpoint, ucciderlo distruggerebbe lavoro) e `ACTIVE_RUN_STATUSES` lo conta
+  fra i run che OCCUPANO la sessione. Un run notturno con validatori discordi
+  restava appeso per sempre e ingorgava la sessione: al mattino non c'era un
+  esito da leggere, non c'era niente. Ora la sospensione porta un termine, e a
+  termine maturo il run chiude con esito STRUTTURATO `blocked_needs_input` +
+  `blocker` derivato dal kind — mai `interrupted`, che direbbe "e' morto
+  qualcosa" di un run fermatosi esattamente dove doveva.
+  - **Il discriminante e' la MODALITA', non l'origine della sospensione.** Le
+    due sospensioni HITL ordinarie (tool mutativi, approvazione del piano)
+    pretendono entrambe Confirm per nascere, cioe' nascono solo dove un umano
+    e' al terminale; il gate duale e' l'unico che sospende dove non c'e'
+    nessuno. Un criterio scritto sull'origine avrebbe coperto il caso di oggi
+    lasciando scoperta la prossima sospensione che nascesse in Automatic. In
+    Confirm nessuna sospensione scade: una scadenza chiuderebbe un run che
+    l'utente stava per approvare.
+  - **La scadenza non poteva venire dal solo budget residuo del run**, come il
+    piano indicava: `agent.run_time_budget_s` vale `0` per policy dichiarata
+    (mig 0604/0607) — misurato sul DB vivo — quindi per il run PRIMARIO, che e'
+    il caso del difetto, `run_time_remaining_s` ritorna `None`. Un fix derivato
+    solo da li' sarebbe stato reale nel codice e irraggiungibile nei dati. La
+    fonte e' una chiave dedicata; il residuo resta il TETTO dove esiste (i
+    sub-run un budget ce l'hanno).
+  - **La chiusura revoca l'approvazione tardiva**: l'handler `approve` pretende
+    `awaiting_confirmation` e risponde 409 su ogni altro stato, quindi un
+    consenso che arrivi a run chiuso non fa ripartire il passo irreversibile.
 
 ### W4 - Recall del contesto nei mandati (mig 0678)
 
@@ -188,7 +217,9 @@ dell'esecutore.
 
 - Migrazioni META `0674` (blocco processo), `0675` (criteri eseguibili),
   `0676` (approvazione piano + docs DoD + sonda anti-SPA), `0677` (gate duale),
-  `0678` (recall contesto).
+  `0678` (recall contesto), `0679` (sorveglianza delle sospensioni, rilievo A4);
+  migrazione PROJECT `0016` (colonne `suspension_kind` /
+  `suspension_expires_at` su `agent_runs`).
 - Branch `feature/processo-standard-figure`, commit finali `d956fd7c` e
   `0cf02e2c`.
 - Moduli punto unico: `crates/mcp-core/src/prompt_processo.rs`,

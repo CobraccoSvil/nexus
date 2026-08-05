@@ -672,19 +672,41 @@ async fn terminate_stale_tasks(db: &PgPool, agent_channels: &AgentChannels) {
     let reaped = crate::run_reaper::reap_stale_runs(db, stale_seconds).await;
     for run_id in &reaped {
         tracing::warn!("task_watchdog: terminato agent_run orfano id={}", run_id);
-        if let Some(tx) = agent_channels.get(run_id) {
-            let _ = tx.send(AgentStepEvent {
-                run_id: run_id.to_string(),
-                step: None,
-                trace: None,
-                is_final: true,
-                token_delta: None,
-                thinking_delta: None,
-                meta_step: None,
-            });
-        }
-        agent_channels.remove(run_id);
+        sblocca_stream(agent_channels, run_id);
     }
+
+    // Sospensioni MATURATE (rilievo A4, punto unico
+    // run_reaper::expire_matured_suspensions): un run fermo su una decisione
+    // umana che, nella modalita' in cui girava, nessuno poteva prendere. Sweep
+    // separata dal reap perche' il criterio e il contratto di chiusura sono
+    // altri (scadenza scritta sulla riga -> `blocked_needs_input`, non
+    // `interrupted`); qui, come sopra, si sbloccano solo gli stream in ascolto.
+    for run_id in &crate::run_reaper::expire_matured_suspensions(db).await {
+        tracing::warn!(
+            "task_watchdog: sospensione scaduta, run chiuso bloccato id={}",
+            run_id
+        );
+        sblocca_stream(agent_channels, run_id);
+    }
+}
+
+/// Sblocca gli EventSource ancora agganciati a un run che e' stato chiuso da
+/// fuori (reap o scadenza): senza `is_final` il client resta in ascolto di uno
+/// stream che nessuno alimentera' piu'. Estratta perche' le DUE sweep fanno la
+/// stessa identica cosa (regola L) e una copia divergerebbe sul silenzio.
+fn sblocca_stream(agent_channels: &AgentChannels, run_id: &uuid::Uuid) {
+    if let Some(tx) = agent_channels.get(run_id) {
+        let _ = tx.send(AgentStepEvent {
+            run_id: run_id.to_string(),
+            step: None,
+            trace: None,
+            is_final: true,
+            token_delta: None,
+            thinking_delta: None,
+            meta_step: None,
+        });
+    }
+    agent_channels.remove(run_id);
 }
 
 // ── Handler HTTP: GET /api/admin/watchdog-status ─────────────────────────────

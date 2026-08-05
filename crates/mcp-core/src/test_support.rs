@@ -387,3 +387,40 @@ pub(crate) async fn create_ai_price_catalog_table(pool: &PgPool) {
     .await
     .expect("create ai_price_catalog");
 }
+
+/// Fixture della tabella META `settings` con una chiave gia' seminata, per i
+/// test che esercitano codice DB-driven (regola G) su un pool solo.
+///
+/// Stessa natura di [`create_ai_price_catalog_table`]: e' una tabella META, che
+/// il migrator del set `project` non porta. Le colonne sono le tre che
+/// `nexus_auth::get_setting` legge davvero (`key`, `value`) piu' `is_secret`,
+/// che `get_setting_public` interroga: uno specchio minimo e non l'intero
+/// schema, perche' cio' che non viene letto non puo' divergere in silenzio.
+pub(crate) async fn create_settings_table_with(pool: &PgPool, key: &str, value: &str) {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS settings ( \
+             key TEXT PRIMARY KEY, \
+             value TEXT NOT NULL DEFAULT '', \
+             is_secret BOOLEAN NOT NULL DEFAULT false \
+         )",
+    )
+    .execute(pool)
+    .await
+    .expect("create settings");
+    sqlx::query("INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")
+        .bind(key)
+        .bind(value)
+        .execute(pool)
+        .await
+        .expect("seed settings");
+    // La cache dei settings e' un `LazyLock` di PROCESSO chiavato su
+    // (identita' del pool, chiave), e l'identita' comprende il nome del
+    // database: `sqlx::test` riusa i nomi dei database temporanei, quindi due
+    // test dello stesso processo possono ritrovarsi la stessa identita' e
+    // leggersi a vicenda il valore — un esito che dipende dall'ordine di
+    // esecuzione (regola F). L'invalidazione e' precauzionale e non nasce da
+    // un caso osservato: e' cio' che la produzione fa gia' accanto a ogni
+    // scrittura di settings (`update_setting_value`, vedi nexus-auth), quindi
+    // la fixture segue la stessa strada invece di dipendere dal TTL.
+    nexus_auth::invalidate_setting_cache(pool, key);
+}

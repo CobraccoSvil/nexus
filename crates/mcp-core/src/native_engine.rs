@@ -597,6 +597,19 @@ pub struct NativeRunOutcome {
     /// Azioni in attesa di conferma utente (HITL modalita' Conferma), serializzate
     /// dal grafo in `extra.hitl_pending_actions`. Vuoto se nessuna sospensione HITL.
     pub pending_actions: Vec<serde_json::Value>,
+    /// CHI ha prodotto la sospensione, quando il run si ferma in
+    /// `awaiting_confirmation` (rilievo A4). `None` = il run non e' sospeso.
+    ///
+    /// Il discriminante e' la presenza dei verdetti del gate duale in
+    /// `extra.step_gate_verdicts`, scritta SOLO da
+    /// `hitl_suspend_delta_con_validazioni` sul ramo `NeedsHuman`: e' un segnale
+    /// strutturato dello stato, non una rilettura del testo (regola M).
+    ///
+    /// Serve a valle per DUE cose che nessun altro campo sa dire: il `blocker`
+    /// ADR 0034 da dichiarare se la sospensione scade, e la riga di
+    /// `agent_runs.suspension_kind` da cui un run chiuso continua a saper dire
+    /// perche' era fermo.
+    pub suspension_origin: Option<nexus_agent_graph::decisions::SuspensionOrigin>,
     /// Requisiti emessi dal Consiglio delle Competenze per QUESTO run, letti dalla
     /// sintesi pre-run (`extra.pre_run_advisory_synthesis`, campo `requirements`).
     /// Sono l'INPUT della misura di conformita', non il suo esito: li porta
@@ -3512,7 +3525,12 @@ fn build_initial_state(input: &NativeRunInput) -> AgentState {
 
 /// Parsing della modalita' automazione nel enum del grafo. Delega al punto unico
 /// `orchestrator::AutomationMode::try_parse` (identificatori canonici inglesi).
-fn parse_automation_mode(s: &str) -> Option<nexus_agent_graph::AutomationMode> {
+/// Stringa della colonna `automation_mode` -> modalita' del grafo. Punto unico
+/// (regola L/N) della conversione: delega a `orchestrator::AutomationMode::try_parse`
+/// e alla sua mappa verso il grafo. `pub(crate)` perche' la usa anche la
+/// sorveglianza delle sospensioni (rilievo A4), che la stessa domanda —
+/// «questo run attende un umano?» — la pone sulla riga persistita.
+pub(crate) fn parse_automation_mode(s: &str) -> Option<nexus_agent_graph::AutomationMode> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return None;
@@ -4004,6 +4022,25 @@ pub(crate) fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome 
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default(),
+        // CHI ha sospeso (rilievo A4), dalla dichiarazione del nodo che ha
+        // sospeso — mai dedotto dalla presenza di altri dati (regola Q).
+        //
+        // Sotto la guardia `is_awaiting_confirmation`: la chiave resta
+        // nell'`extra` checkpointato anche dopo che la sospensione e' stata
+        // sciolta, e leggerla da sola attribuirebbe un'origine a un run che
+        // ha ripreso a girare.
+        suspension_origin: state.is_awaiting_confirmation().then(|| {
+            state
+                .extra
+                .get(nexus_agent_graph::decisions::SUSPENSION_ORIGIN_EXTRA_KEY)
+                .and_then(|v| v.as_str())
+                .and_then(nexus_agent_graph::decisions::SuspensionOrigin::from_db_str)
+                // Sospeso ma senza dichiarazione: e' un checkpoint scritto da
+                // una versione precedente a questo contratto. La revisione
+                // umana e' la lettura conservativa — non produce scadenze
+                // (`permission`, nessun blocker `safety` inventato).
+                .unwrap_or(nexus_agent_graph::decisions::SuspensionOrigin::HumanReview)
+        }),
         // I requisiti del Consiglio dalla sintesi che il coordinatore ha
         // ricevuto nel prompt: stesso segnale strutturato, letto qui per essere
         // RISCONTRATO a run concluso. Il riscontro (I/O sui file) e' in
@@ -5670,6 +5707,7 @@ mod tests {
         NativeRunOutcome {
             completed: true,
             awaiting_subagents: false,
+            suspension_origin: None,
             final_answer: Some("fatto".to_string()),
             stop_reason: None,
             provider_used: None,
