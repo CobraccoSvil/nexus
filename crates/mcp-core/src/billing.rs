@@ -255,8 +255,26 @@ fn parse_uuid(id: &str) -> Result<Uuid, ApiError> {
     })
 }
 
+/// L'utente della sessione, dal punto unico `nexus_types::parse_user_id`.
+///
+/// Prima passava da `parse_uuid`, e non era solo una copia: rispondeva **400
+/// Bad Request** dove il punto unico risponde **401 Unauthorized**. Il `sub` di
+/// un JWT e' l'identita' di chi ha gia' superato l'autenticazione — se non e' un
+/// UUID valido, e' il TOKEN a non essere valido, non la richiesta del client. Il
+/// 400 incolpava il chiamante di un difetto che non era suo, e a un client che
+/// gestisce il rinnovo della sessione diceva la cosa sbagliata: 400 si corregge
+/// cambiando la richiesta, 401 si corregge riautenticandosi.
+///
+/// Trovata dal censimento delle firme (`xtask signature-census`) come gruppo
+/// cross-crate `(Claims) -> Result<Uuid>`. Il guard `single-source
+/// [parse_user_id]` passava verde: cerca il NOME, e questa copia si chiamava
+/// diversamente.
+///
+/// `parse_uuid` resta per i PARAMETRI (price_id, quota_id, project_id, user_id
+/// da query o body): li' un id malformato arriva davvero dal client, e 400 e'
+/// la risposta giusta.
 fn claims_user_id(claims: &Claims) -> Result<Uuid, ApiError> {
-    parse_uuid(&claims.sub)
+    nexus_types::parse_user_id(claims)
 }
 
 pub async fn list_prices(State(state): State<AppState>) -> ApiResult {

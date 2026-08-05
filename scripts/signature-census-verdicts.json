@@ -80,8 +80,8 @@
         "crates/mcp-core/src/billing.rs:258 claims_user_id",
         "crates/nexus-types/src/lib.rs:84 parse_user_id"
       ],
-      "verdetto": "da_consolidare",
-      "nota": "IL CASO PIU' INTERESSANTE del primo giro. parse_user_id e' un PUNTO UNICO dichiarato nel catalogo di CLAUDE.md, e il guard `single-source [parse_user_id]` passa verde — perche' cerca il NOME, e questa copia si chiama claims_user_id. E' esattamente cio' che un guard testuale non puo' vedere e un censimento semantico si'. Da verificare se claims_user_id faccia davvero solo quello prima di sostituirla."
+      "verdetto": "duplicato",
+      "nota": "CONSOLIDATO 2026-08-05: claims_user_id delega a nexus_types::parse_user_id. NON era solo una copia: rispondeva 400 Bad Request dove il punto unico risponde 401 Unauthorized. Il sub di un JWT e' l'identita' di chi ha gia' superato l'autenticazione — se non e' un UUID valido e' il TOKEN a non essere valido, non la richiesta. A un client che gestisce il rinnovo sessione i due status dicono cose opposte: 400 si corregge cambiando la richiesta, 401 riautenticandosi. parse_uuid resta per i PARAMETRI (price_id, quota_id, project_id, user_id da query/body): li' l'id malformato arriva davvero dal client e 400 e' giusto."
     },
     {
       "firma": "() -> AgentNodeCtx",
@@ -90,6 +90,24 @@
       ],
       "verdetto": "da_consolidare",
       "nota": "Nove helper di test che costruiscono un AgentNodeCtx, uno per nodo. Probabile duplicazione vera, ma il consolidamento va progettato: i nodi differiscono per quali campi del contesto valorizzano, e un costruttore unico troppo generico renderebbe i test meno leggibili di quanto li renda piu' corti. Da riprendere quando si tocca quell'area."
+    },
+    {
+      "firma": "CLUSTER: mcp-core/src/plugins/mod.rs <-> plugin-service/src/plugins.rs",
+      "membri": [
+        "19 gruppi su plugin-service/plugins.rs",
+        "14 su mcp-core/plugins/mod.rs",
+        "stessi NOMI: write_plugin_audit, build_plugin_resolution, apply_figma_http_headers, get_catalog_by_install_request, ..."
+      ],
+      "verdetto": "da_consolidare",
+      "nota": "Non sono candidati indipendenti: i due file sono GEMELLI. Guardando la distribuzione dei 187 gruppi cross-crate, questi due si ripetono in cima con funzioni che hanno perfino lo stesso nome. La casa esiste gia' — nexus-mcp-client, nato in Wave C1 proprio per la duplicazione fra questi due lati, e dove il 2026-08-05 e' stato aggiunto plugin_storage con le prime quattro funzioni. Il resto e' un lavoro a se': ~19 funzioni, alcune con IO verso il DB, da spostare una alla volta con il gate verde ad ogni passo. REGISTRATO come cluster e non gruppo per gruppo perche' il verdetto e' uno: quei due file vanno fatti convergere, non giudicati diciannove volte."
+    },
+    {
+      "firma": "CLUSTER: mcp-core/src/environment.rs <-> admin-service/src/environment.rs",
+      "membri": [
+        "8 gruppi per ciascun file"
+      ],
+      "verdetto": "da_consolidare",
+      "nota": "MISURATO: non sono gemelli completi. mcp-core ha 1797 righe e 56 funzioni, admin-service 539 e 15 — il secondo e' un SOTTOINSIEME. Le 8 firme condivise sono la parte comune, e il consolidamento e' quello: portare cio' che serve a entrambi in un punto raggiungibile, non fondere i due file. Da fare guardando funzione per funzione quali delle 15 di admin-service abbiano davvero un gemello in mcp-core."
     }
   ]
 }
