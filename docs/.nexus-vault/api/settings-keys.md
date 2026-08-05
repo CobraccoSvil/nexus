@@ -520,6 +520,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `orchestrator.subagent_rag_grounding_snippet_max` | `800` | Cap caratteri per snippet del grounding (controllo costi + superficie dati verso il provider). |
 | `orchestrator.subagent_rag_grounding_topk` | `5` | Numero di note recuperate per il grounding del sub-agent. |
 | `orchestrator.subagents_enabled` | `true` | Feature flag globale sub-agents pattern. Off -> dispatch_subagent ritorna errore al main. |
+| `orchestrator.suspension_watch_timeout_s` | `1800` | Secondi dopo i quali una sospensione HITL che nessuno puo' sciogliere (Automatic/Continuous: nessun umano al terminale) matura e chiude il run con esito strutturato blocked_needs_input + blocker derivato dal kind (safety per il gate duale). 0 = sorveglianza spenta. Il residuo della deadline di run resta il tetto dove esiste. Punto unico decisions::suspension_watch (mig 0679, project 0016, rilievo A4). |
 | `orchestrator.todo_reminder_every_n_steps` | `5` | Iniezione system reminder TODO ogni N tool use. |
 | `orchestrator.todo_reminder_min_todos` | `3` | Sotto questa soglia di todos pending nessun reminder iniettato (anti-spam chat brevi). |
 | `orchestrator.understanding_enabled` | `false` | Se true, prima del planner un nodo understanding fa grounding semantico (+ fan-out explore opzionale) per task complessi. |

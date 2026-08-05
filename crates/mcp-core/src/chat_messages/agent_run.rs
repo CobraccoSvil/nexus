@@ -1823,6 +1823,9 @@ pub(crate) async fn native_outcome_to_run_result(
         // sopravvive alla riscrittura di stop_reason nel path resume.
         provider_error_close: outcome.provider_error_close,
         stop_reason,
+        // CHI ha sospeso, dichiarato dal nodo che ha sospeso: da qui nascono
+        // `suspension_kind` e la scadenza (rilievo A4).
+        suspension_origin: outcome.suspension_origin,
         // Intent del turno: pilota la decisione hollow/conversational del
         // finalizzatore (parita' col nexus_task_type del path Python).
         nexus_task_type: outcome.user_intent,
@@ -2144,6 +2147,10 @@ pub(crate) fn native_engine_failure_result(
         status: AgentRunStatus::Failed,
         steps: Vec::new(),
         pending_actions: Vec::new(),
+        // Un fallimento del motore non e' una sospensione: nessuna origine da
+        // dichiarare, e la scrittura AZZERA le colonne di un'eventuale
+        // sospensione precedente dello stesso run.
+        suspension_origin: None,
         final_answer: Some(final_answer),
         provider: provider.to_string(),
         model: model.to_string(),
@@ -3923,6 +3930,7 @@ fn final_answer_for_run_record(
 /// (non azzera un valore eventualmente scritto a monte), cosi' resume e trace
 /// panel la trovano.
 async fn persist_run_outcome(
+    meta_db: &PgPool,
     run_pool: &PgPool,
     run_id: Uuid,
     result: &crate::agent_types::AgentRunResult,
@@ -3975,6 +3983,246 @@ async fn persist_run_outcome(
     .bind(pending_actions_json)
     .execute(run_pool)
     .await;
+
+    // La sospensione e la sua scadenza sono parte dell'esito, non un'aggiunta
+    // del chiamante: scriverle qui dentro impedisce che un percorso di chiusura
+    // le dimentichi e lasci un run sospeso senza termine (rilievo A4).
+    persist_suspension_watch(meta_db, run_pool, run_id, result.suspension_origin).await;
+}
+
+/// Scrive CHI ha sospeso il run e QUANDO quella sospensione smette di valere
+/// (`agent_runs.suspension_kind` / `suspension_expires_at`, mig project 0016).
+///
+/// Punto unico della scrittura, chiamato dai DUE percorsi che possono mettere un
+/// run in `awaiting_confirmation`: la chiusura del run appena eseguito
+/// ([`persist_run_outcome`]) e il RESUME che si risospende su un nuovo interrupt
+/// (`confirm_native_run`). Con due scritture separate, il percorso dimenticato
+/// avrebbe prodotto esattamente la sospensione eterna che questo lavoro chiude.
+///
+/// `origin: None` (run non sospeso) AZZERA entrambe le colonne, come
+/// `pending_actions_json` fa col proprio fossile: un run che ha ripreso e poi e'
+/// finito non deve conservare la scadenza di una sospensione che non esiste
+/// piu' — la maturerebbe il reaper su un run gia' chiuso.
+///
+/// La modalita' si legge dalla RIGA (`automation_mode`), non da un parametro:
+/// e' la fonte persistita che anche il reaper vedra', e un parametro passato
+/// dal chiamante potrebbe divergere da cio' che il run dichiara di essere.
+async fn persist_suspension_watch(
+    meta_db: &PgPool,
+    run_pool: &PgPool,
+    run_id: Uuid,
+    origin: Option<nexus_agent_graph::decisions::SuspensionOrigin>,
+) {
+    let Some(origin) = origin else {
+        let _ = sqlx::query(
+            "UPDATE agent_runs SET suspension_kind = NULL, suspension_expires_at = NULL \
+             WHERE id = $1 AND (suspension_kind IS NOT NULL OR suspension_expires_at IS NOT NULL)",
+        )
+        .bind(run_id)
+        .execute(run_pool)
+        .await;
+        return;
+    };
+
+    let expires_in_s = termine_della_sospensione(meta_db, run_pool, run_id).await;
+
+    let written = sqlx::query(
+        "UPDATE agent_runs SET suspension_kind = $2, \
+             suspension_expires_at = CASE WHEN $3::bigint IS NULL THEN NULL \
+                 ELSE NOW() + make_interval(secs => $3::bigint) END \
+         WHERE id = $1",
+    )
+    .bind(run_id)
+    .bind(origin.as_str())
+    .bind(expires_in_s)
+    .execute(run_pool)
+    .await;
+
+    match written {
+        Ok(_) => tracing::info!(
+            run_id = %run_id,
+            suspension_kind = origin.as_str(),
+            expires_in_s = ?expires_in_s,
+            "sospensione registrata (expires_in_s None = nessuna scadenza: umano atteso o sorveglianza spenta)"
+        ),
+        Err(e) => tracing::warn!(
+            run_id = %run_id, error = %e,
+            "sospensione NON registrata: senza scadenza il run resta appeso finche' un umano non interviene"
+        ),
+    }
+}
+
+/// Fra quanti secondi la sospensione di questo run smette di valere, se un
+/// termine ci sara'. `None` = nessuna scadenza (umano atteso al terminale, o
+/// sorveglianza spenta dall'admin).
+///
+/// Raccoglie i FATTI — modalita' dalla riga, residuo della deadline di run,
+/// sorveglianza dal DB — e delega la decisione al punto unico
+/// [`nexus_agent_graph::decisions::classify_suspension`]: qui non c'e' alcun
+/// criterio, solo l'I/O che il criterio non puo' fare.
+async fn termine_della_sospensione(
+    meta_db: &PgPool,
+    run_pool: &PgPool,
+    run_id: Uuid,
+) -> Option<i64> {
+    let mode: Option<String> =
+        sqlx::query_scalar("SELECT automation_mode FROM agent_runs WHERE id = $1")
+            .bind(run_id)
+            .fetch_optional(run_pool)
+            .await
+            .ok()
+            .flatten();
+    let mode = mode
+        .as_deref()
+        .and_then(crate::native_engine::parse_automation_mode);
+
+    // Tetto: una sospensione non sopravvive al run che la contiene. `None` per
+    // il run primario, dove `agent.run_time_budget_s` vale 0 per policy — ed e'
+    // il motivo per cui la sorveglianza ha una chiave propria (mig 0679).
+    let remaining_s =
+        crate::agent_tools::subagent_native::run_time_remaining_s(meta_db, run_pool, run_id).await;
+    // Chiave assente (migrazione non ancora applicata) -> 0 = sorveglianza
+    // spenta: il comportamento storico, mai una scadenza inventata (regola G).
+    let fallback_s = nexus_auth::get_setting(meta_db, "orchestrator.suspension_watch_timeout_s")
+        .await
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+
+    nexus_agent_graph::decisions::classify_suspension(mode, remaining_s, fallback_s).after_s()
+}
+
+/// La catena della sospensione fino alla COLONNA (rilievo A4).
+///
+/// I test del criterio stanno nel punto unico `decisions::suspension_watch`, e
+/// non bastano: dicono che la decisione e' giusta, non che venga scritta. Qui si
+/// passa per `persist_suspension_watch`, la stessa funzione della produzione,
+/// leggendo la modalita' dalla riga come fa lei (regola O).
+#[cfg(test)]
+mod tests_suspension_watch {
+    use super::*;
+    use nexus_agent_graph::decisions::SuspensionOrigin;
+
+    const CHIAVE: &str = "orchestrator.suspension_watch_timeout_s";
+
+    /// Run sospeso nella modalita' data, con la sorveglianza configurata a
+    /// `timeout` secondi. Meta e project sono lo STESSO pool: `settings` e'
+    /// l'unica tabella meta che questa catena legge.
+    async fn run_sospeso_in(pool: &PgPool, modalita: &str, timeout: &str) -> Uuid {
+        crate::test_support::create_settings_table_with(pool, CHIAVE, timeout).await;
+        // L'altra chiave che la catena legge (il TETTO del residuo di run):
+        // assente qui, come in produzione dove vale 0 ed e' filtrata. Si
+        // invalida per la stessa ragione precauzionale dell'altra (vedi
+        // `create_settings_table_with`): un valore cachato da un test
+        // precedente sullo stesso nome di database darebbe a questo run una
+        // deadline che nessuno gli ha dato.
+        nexus_auth::invalidate_setting_cache(pool, "agent.run_time_budget_s");
+        let project_id = Uuid::new_v4();
+        let session_id = crate::test_support::seed_chat_session(pool, project_id).await;
+        let run_id = crate::test_support::insert_agent_run(
+            pool,
+            session_id,
+            project_id,
+            "awaiting_confirmation",
+        )
+        .await;
+        sqlx::query("UPDATE agent_runs SET automation_mode = $2 WHERE id = $1")
+            .bind(run_id)
+            .bind(modalita)
+            .execute(pool)
+            .await
+            .expect("modalita' impostata");
+        run_id
+    }
+
+    /// Kind e secondi che mancano al termine. La differenza si calcola in Rust
+    /// sul timestamp: `EXTRACT(EPOCH FROM ...)` ritorna `numeric` da PostgreSQL
+    /// 14, che sqlx non decodifica come `f64` — e l'errore si sarebbe visto
+    /// SOLO sulle righe con un termine scritto (su NULL la decodifica non
+    /// avviene affatto), cioe' proprio nei casi che questi test devono provare.
+    async fn sospensione_di(pool: &PgPool, id: Uuid) -> (Option<String>, Option<i64>) {
+        let (kind, scade): (Option<String>, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as(
+                "SELECT suspension_kind, suspension_expires_at FROM agent_runs WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("riga");
+        let fra_secondi = scade.map(|t| (t - chrono::Utc::now()).num_seconds());
+        (kind, fra_secondi)
+    }
+
+    /// IL TEST CHE CONTA sulla scrittura: in Automatic la riga esce dal
+    /// `persist` con un termine. Senza questo, la decisione del punto unico
+    /// resterebbe corretta e senza effetto — il reaper cerca `suspension_expires_at`,
+    /// e una colonna NULL non matura mai.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn in_automatic_la_colonna_riceve_il_termine(pool: PgPool) {
+        let run_id = run_sospeso_in(&pool, "automatic", "1800").await;
+
+        persist_suspension_watch(&pool, &pool, run_id, Some(SuspensionOrigin::StepGate)).await;
+
+        let (kind, fra_secondi) = sospensione_di(&pool, run_id).await;
+        assert_eq!(kind.as_deref(), Some("step_gate"));
+        let fra_secondi = fra_secondi.expect(
+            "senza termine il reaper non la raccoglie mai e il run resta appeso: \
+             e' esattamente il difetto A4",
+        );
+        assert!(
+            (1750..=1800).contains(&fra_secondi),
+            "il termine deve cadere ~1800s nel futuro, non a {fra_secondi}s"
+        );
+    }
+
+    /// L'altro lato: in Confirm l'utente e' al terminale e la colonna resta
+    /// NULL. Mutazione: far ignorare la modalita' al persist -> questo rosseggia,
+    /// e il difetto sarebbe chiudere run che stavano per essere approvati.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn in_confirm_nessun_termine_viene_scritto(pool: PgPool) {
+        let run_id = run_sospeso_in(&pool, "confirm", "1800").await;
+
+        persist_suspension_watch(&pool, &pool, run_id, Some(SuspensionOrigin::HumanReview)).await;
+
+        let (kind, fra_secondi) = sospensione_di(&pool, run_id).await;
+        assert_eq!(
+            kind.as_deref(),
+            Some("human_review"),
+            "l'origine si registra comunque: dice perche' il run e' fermo"
+        );
+        assert_eq!(
+            fra_secondi, None,
+            "in Confirm nessun termine: l'utente e' al terminale"
+        );
+    }
+
+    /// Kill-switch dell'admin: a sorveglianza spenta nessun termine viene
+    /// scritto nemmeno in Automatic (comportamento storico).
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn sorveglianza_spenta_non_scrive_termini(pool: PgPool) {
+        let run_id = run_sospeso_in(&pool, "automatic", "0").await;
+
+        persist_suspension_watch(&pool, &pool, run_id, Some(SuspensionOrigin::StepGate)).await;
+
+        assert_eq!(sospensione_di(&pool, run_id).await.1, None);
+    }
+
+    /// Il run ha ripreso e poi e' finito: la sospensione non esiste piu' e le
+    /// sue colonne vanno CANCELLATE, come si fa col fossile di
+    /// `pending_actions_json`. Senza, il reaper maturerebbe la scadenza di una
+    /// sospensione gia' sciolta e chiuderebbe `blocked` un run completato.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn il_fossile_di_una_sospensione_sciolta_viene_cancellato(pool: PgPool) {
+        let run_id = run_sospeso_in(&pool, "automatic", "1800").await;
+        persist_suspension_watch(&pool, &pool, run_id, Some(SuspensionOrigin::StepGate)).await;
+        assert!(sospensione_di(&pool, run_id).await.1.is_some());
+
+        // Il run riprende e chiude: nessuna origine da dichiarare.
+        persist_suspension_watch(&pool, &pool, run_id, None).await;
+
+        let (kind, fra_secondi) = sospensione_di(&pool, run_id).await;
+        assert_eq!(kind, None, "il kind della sospensione sciolta va via");
+        assert_eq!(fra_secondi, None, "e con lui il termine");
+    }
 }
 
 /// IL LAVORO NON FATTO NON SVANISCE COL RUN.
@@ -5161,6 +5409,7 @@ pub(crate) async fn spawn_agent_run(
             let status_str = status_canonical.as_str();
             let final_answer_db = final_answer_for_run_record(&result, &answer_owned);
             persist_run_outcome(
+                &state_for_finalize.db,
                 &run_pool,
                 run_id,
                 &result,
@@ -5440,6 +5689,11 @@ pub(crate) async fn confirm_native_run(
             // Pool del progetto (separazione DB): agent_runs migrata.
             .execute(&cn_pool)
             .await;
+            // Un resume puo' RI-sospendere il run su un nuovo interrupt: la
+            // scadenza va ricalcolata qui, altrimenti la seconda sospensione
+            // sarebbe eterna anche in Automatic. Stesso punto unico dello
+            // spawn (rilievo A4).
+            persist_suspension_watch(&state.db, &cn_pool, run_id, result.suspension_origin).await;
             enforce_user_cancellation_status(&cn_pool, run_id).await;
             result.status
         }
@@ -7800,6 +8054,7 @@ mod tests_finalize_turn {
             status,
             steps,
             pending_actions: vec![],
+            suspension_origin: None,
             final_answer: final_answer.map(str::to_string),
             provider: "mistral".into(),
             model: "mistral-large".into(),
@@ -8982,6 +9237,7 @@ mod tests_native_mapping {
         crate::native_engine::NativeRunOutcome {
             completed: true,
             awaiting_subagents: false,
+            suspension_origin: None,
             final_answer: Some("fatto".to_string()),
             stop_reason: Some(StopReason::EndTurn),
             provider_used: Some("anthropic".to_string()),

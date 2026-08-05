@@ -27,6 +27,20 @@ const INTERRUPTED_MSG: &str = "L'elaborazione si è interrotta e non è stato \
 /// timeout del task_watchdog, generoso per non uccidere run con tool lunghi.
 const DEFAULT_STALE_SECONDS: i64 = 900;
 
+/// Guardia comune delle risposte inserite da fuori: non si scrive una seconda
+/// assistente per una richiesta che ne ha gia' una.
+///
+/// Frammento SQL condiviso (stesso pattern di
+/// [`crate::agent_types::ACTIVE_RUN_STATUS_SQL`]): la usano ENTRAMBI i percorsi
+/// che rispondono al posto di un run che non parlera' piu' — la chiusura degli
+/// orfani e quella delle sospensioni scadute. Ricopiarla renderebbe possibile
+/// correggerne una e non l'altra, e il difetto sarebbe una doppia risposta in
+/// chat sulla stessa richiesta. Presuppone l'alias `ar` su `agent_runs`.
+const SENZA_RISPOSTA_ASSISTENTE: &str = "NOT EXISTS ( \
+     SELECT 1 FROM chat_messages cm \
+      WHERE cm.request_message_id = ar.run_message_id \
+        AND cm.role = 'assistant' )";
+
 /// Legge `agent.run_recovery.stale_after_seconds` dal DB (regola G), con guard
 /// minima 30s. Usata da entrambi i chiamanti del reaper.
 pub async fn stale_seconds_from_settings(db: &PgPool) -> i64 {
@@ -114,6 +128,171 @@ async fn mark_stale_on_pool(pool: &PgPool, stale_seconds: i64) -> Vec<uuid::Uuid
     .fetch_all(pool)
     .await
     .unwrap_or_default()
+}
+
+/// Chiude i run la cui SOSPENSIONE e' maturata: era in attesa di una decisione
+/// umana che, nella modalita' in cui girava, nessuno poteva prendere.
+///
+/// CAUSA RADICE (rilievo A4, ADR 0043). Il gate duale sui passi critici sospende
+/// in HITL anche in Automatic — e' il punto del requisito — ma li' non c'e'
+/// nessun umano. `mark_stale_on_pool` non poteva raccoglierlo per costruzione
+/// (filtra `status = 'running'`, e l'esclusione degli `awaiting_confirmation` e'
+/// il contratto della mig 0392: sono resumibili via checkpoint), e
+/// `ACTIVE_RUN_STATUSES` li conta fra i run che OCCUPANO la sessione. Il run
+/// notturno restava appeso per sempre e ingorgava la sessione.
+///
+/// PERCHE' UNA FUNZIONE SORELLA e non un ramo del reap. Il criterio e' un altro
+/// (una scadenza scritta sulla riga, non l'assenza di battito) e soprattutto lo
+/// e' il CONTRATTO DI CHIUSURA: `mark_stale_on_pool` marca `interrupted` — "e'
+/// morto qualcosa" — e alza il segnale di stop per il task che gira ancora. Qui
+/// non e' morto niente e non gira niente: il run si e' fermato dove doveva, e
+/// chiude con l'esito STRUTTURATO che descrive il perche' (`blocked_needs_input`
+/// + blocker derivato dal kind, ADR 0034). Chiuderlo `interrupted` avrebbe detto
+/// una cosa falsa con la faccia di un guasto.
+///
+/// Nessun `cancellation_requested`: quel campo e' il segnale al task tokio che
+/// sta ancora girando (vedi [`mark_stale_on_pool`]), e un run sospeso su
+/// checkpoint non ne ha uno. Scriverlo direbbe "qualcuno ha chiesto lo stop" di
+/// una chiusura che nessuno ha chiesto.
+///
+/// Sono toccate SOLO le righe con una scadenza scritta: le sospensioni di
+/// Confirm hanno `suspension_expires_at` NULL (l'utente e' al terminale) e
+/// restano intatte, come i run sospesi prima della mig project 0016.
+pub async fn expire_matured_suspensions(db: &PgPool) -> Vec<uuid::Uuid> {
+    let mut tutti = Vec::new();
+    for project_id in crate::project_db_routes::list_all_project_ids(db).await {
+        let pool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %project_id, error = %e,
+                    "scadenza sospensioni: DB progetto non disponibile, saltato per questo giro"
+                );
+                continue;
+            }
+        };
+        let maturate = expire_on_pool(&pool).await;
+        for (run_id, kind) in maturate {
+            let origin = kind
+                .as_deref()
+                .and_then(nexus_agent_graph::decisions::SuspensionOrigin::from_db_str);
+            tracing::warn!(
+                project_id = %project_id,
+                run_id = %run_id,
+                suspension_kind = kind.as_deref().unwrap_or("(illeggibile)"),
+                blocker = origin
+                    .map(nexus_agent_graph::decisions::SuspensionOrigin::blocker)
+                    .unwrap_or("(non dichiarato)"),
+                "sospensione scaduta: run chiuso blocked_needs_input"
+            );
+            // Il lavoro fatto prima della sospensione entra nella storia di
+            // sessione, come per i run reapati: il run successivo vede cosa era
+            // gia' stato fatto invece di ripartire da zero.
+            if let Err(e) = crate::session_worklog::ingest_from_db_steps(
+                db,
+                &pool,
+                run_id,
+                "bloccato (sospensione scaduta senza decisione umana)",
+            )
+            .await
+            {
+                tracing::warn!(error = %e, run_id = %run_id, "session_worklog: ingest alla scadenza fallito");
+            }
+            insert_blocked_message(&pool, run_id, origin).await;
+            tutti.push(run_id);
+        }
+    }
+    tutti
+}
+
+/// L'UPDATE di maturazione su UN pool. Ritorna `(run_id, suspension_kind)`: il
+/// kind lo porta la RIGA e non una seconda query, cosi' il messaggio dichiara la
+/// causa che era scritta sul run nel momento in cui e' stato chiuso.
+///
+/// `suspension_expires_at < NOW()` e' l'unico criterio temporale: la scadenza e'
+/// stata calcolata a monte dal punto unico `classify_suspension`, che conosceva
+/// modalita' e budget residuo. Ricalcolarla qui sarebbe una seconda idea di
+/// quando una sospensione muore.
+async fn expire_on_pool(pool: &PgPool) -> Vec<(uuid::Uuid, Option<String>)> {
+    sqlx::query_as::<_, (uuid::Uuid, Option<String>)>(
+        r#"
+        UPDATE agent_runs
+        SET status = 'blocked_needs_input',
+            completed_at = NOW()
+        WHERE status = 'awaiting_confirmation'
+          AND completed_at IS NULL
+          AND suspension_expires_at IS NOT NULL
+          AND suspension_expires_at < NOW()
+        RETURNING id, suspension_kind
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_else(|e| {
+        // Non si ingoia (regola H): l'errore atteso e' "colonna inesistente" su
+        // un DB progetto che non ha ancora la mig project 0016, e dura finche'
+        // il provisioning non la applica. Senza questa riga la sweep tacerebbe
+        // per sempre su quel progetto, e il silenzio sarebbe indistinguibile
+        // da "nessuna sospensione da chiudere".
+        tracing::warn!(
+            error = %e,
+            "expire_matured_suspensions: query fallita, sospensioni non raccolte per questo progetto"
+        );
+        Vec::new()
+    })
+}
+
+/// Messaggio in chat del run chiuso per scadenza: e' l'unico modo in cui la
+/// persona che torna al mattino scopre cosa e' successo.
+///
+/// Il testo lo compone il punto unico del vocabolario (`nota_scadenza`), non
+/// questa funzione. Il `metadata` porta l'esito in CAMPI (regola Q) —
+/// `outcome`/`blocker` del vocabolario ADR 0034 — cosi' il frontend non deve
+/// rileggere la prosa per sapere che genere di chiusura sia stata.
+///
+/// `blocker` ASSENTE quando il kind della riga e' illeggibile: un campo mancante
+/// dice "non dichiarato", un `safety` inventato direbbe una causa che nessuno
+/// ha accertato.
+async fn insert_blocked_message(
+    pool: &PgPool,
+    run_id: uuid::Uuid,
+    origin: Option<nexus_agent_graph::decisions::SuspensionOrigin>,
+) {
+    let testo = nexus_agent_graph::decisions::nota_scadenza(origin);
+    let mut metadata = serde_json::json!({
+        "agentRunId": run_id.to_string(),
+        "automationMode": "agent",
+        "outcome": "blocked",
+    });
+    if let Some(o) = origin {
+        metadata["blocker"] = serde_json::Value::String(o.blocker().to_string());
+        metadata["suspensionKind"] = serde_json::Value::String(o.as_str().to_string());
+    }
+    // Stessa guardia del messaggio dei run reapati, dal punto unico
+    // `SENZA_RISPOSTA_ASSISTENTE`: niente doppia risposta in chat.
+    let inserted = sqlx::query(&format!(
+        "INSERT INTO chat_messages \
+(id, session_id, project_id, role, content, metadata, request_message_id, created_at) \
+SELECT gen_random_uuid(), ar.session_id, ar.project_id, 'assistant', $2, $3, \
+ar.run_message_id, NOW() \
+FROM agent_runs ar \
+WHERE ar.id = $1 \
+AND ar.run_message_id IS NOT NULL \
+AND {SENZA_RISPOSTA_ASSISTENTE}"
+    ))
+    .bind(run_id)
+    .bind(&testo)
+    .bind(&metadata)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+    if inserted == 0 {
+        tracing::warn!(
+            run_id = %run_id,
+            "scadenza: nessun messaggio inserito (richiesta senza run_message_id o risposta gia' presente)"
+        );
+    }
 }
 
 /// Bootstrap recovery (regola H, causa radice del "run orfano blocca la sessione"):
@@ -222,35 +401,20 @@ async fn finalize_reaped(meta: &PgPool, db: &PgPool, reaped: Vec<uuid::Uuid>) ->
     }
 
     // Messaggio assistente SOLO per i run appena reapati (completed_at recente),
-    // se hanno un messaggio-richiesta e non hanno gia' un assistente associato.
-    let inserted = sqlx::query(
-        r#"
-        INSERT INTO chat_messages
-            (id, session_id, project_id, role, content, metadata, request_message_id, created_at)
-        SELECT
-            gen_random_uuid(),
-            ar.session_id,
-            ar.project_id,
-            'assistant',
-            $1,
-            jsonb_build_object(
-                'agentRunId', ar.id::text,
-                'automationMode', 'agent',
-                'interrupted', true
-            ),
-            ar.run_message_id,
-            NOW()
-        FROM agent_runs ar
-        WHERE ar.status = 'interrupted'
-          AND ar.run_message_id IS NOT NULL
-          AND ar.completed_at > NOW() - interval '20 seconds'
-          AND NOT EXISTS (
-              SELECT 1 FROM chat_messages cm
-              WHERE cm.request_message_id = ar.run_message_id
-                AND cm.role = 'assistant'
-          )
-        "#,
-    )
+    // se hanno un messaggio-richiesta e non hanno gia' un assistente associato
+    // (guardia condivisa `SENZA_RISPOSTA_ASSISTENTE`).
+    let inserted = sqlx::query(&format!(
+        "INSERT INTO chat_messages \
+(id, session_id, project_id, role, content, metadata, request_message_id, created_at) \
+SELECT gen_random_uuid(), ar.session_id, ar.project_id, 'assistant', $1, \
+jsonb_build_object('agentRunId', ar.id::text, 'automationMode', 'agent', 'interrupted', true), \
+ar.run_message_id, NOW() \
+FROM agent_runs ar \
+WHERE ar.status = 'interrupted' \
+AND ar.run_message_id IS NOT NULL \
+AND ar.completed_at > NOW() - interval '20 seconds' \
+AND {SENZA_RISPOSTA_ASSISTENTE}"
+    ))
     .bind(INTERRUPTED_MSG)
     .execute(db)
     .await
@@ -374,6 +538,235 @@ mod tests {
             reason.as_deref(),
             Some("utente"),
             "il motivo dell'utente resta: e' arrivato prima ed e' piu' informativo"
+        );
+    }
+
+    // ── Scadenza delle sospensioni (rilievo A4) ──────────────────────────────
+
+    /// Run SOSPESO con la scadenza espressa in secondi rispetto a ORA
+    /// (negativi = gia' maturata). `None` = sospensione senza termine, cioe' il
+    /// caso di Confirm, dove l'utente e' al terminale.
+    async fn run_sospeso(
+        pool: &PgPool,
+        kind: &str,
+        scadenza_fra_s: Option<i64>,
+    ) -> uuid::Uuid {
+        let id = crate::test_support::seed_agent_run(pool).await;
+        sqlx::query(
+            "UPDATE agent_runs SET status = 'awaiting_confirmation', \
+                 suspension_kind = $2, \
+                 suspension_expires_at = CASE WHEN $3::bigint IS NULL THEN NULL \
+                     ELSE NOW() + make_interval(secs => $3::bigint) END \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(kind)
+        .bind(scadenza_fra_s)
+        .execute(pool)
+        .await
+        .expect("sospensione seminata");
+        id
+    }
+
+    async fn stato_di(pool: &PgPool, id: uuid::Uuid) -> String {
+        sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("riga")
+    }
+
+    /// IL TEST CHE CONTA: una sospensione del gate duale che nessuno ha sciolto
+    /// matura e chiude il run con l'esito STRUTTURATO, non con un timeout muto.
+    ///
+    /// E' il difetto A4 per intero: prima nessuna sweep raccoglieva questo run
+    /// (il reap filtra `status='running'` per contratto), quindi restava
+    /// `awaiting_confirmation` per sempre e ACTIVE_RUN_STATUSES ingorgava la
+    /// sessione. Mutazione: rimettere `status='running'` nel WHERE di
+    /// `expire_on_pool` -> rosso.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn la_sospensione_maturata_chiude_il_run_bloccato(pool: PgPool) {
+        let id = run_sospeso(&pool, "step_gate", Some(-60)).await;
+
+        let maturate = expire_on_pool(&pool).await;
+
+        assert_eq!(maturate.len(), 1, "la sospensione scaduta deve maturare");
+        assert_eq!(maturate[0].0, id);
+        assert_eq!(
+            maturate[0].1.as_deref(),
+            Some("step_gate"),
+            "il kind viaggia con la riga: e' da li' che si deriva il blocker"
+        );
+        assert_eq!(
+            stato_di(&pool, id).await,
+            "blocked_needs_input",
+            "l'esito e' quello STRUTTURATO del vocabolario (ADR 0034), non 'interrupted': \
+             non e' morto niente, il run si e' fermato dove doveva"
+        );
+        let (completato, stop_richiesto): (
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ) = sqlx::query_as(
+            "SELECT completed_at, cancellation_requested FROM agent_runs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("riga");
+        assert!(completato.is_some(), "il run e' chiuso");
+        assert!(
+            stop_richiesto.is_none(),
+            "nessun segnale di stop: quel campo parla al task tokio che gira, e un \
+             run sospeso su checkpoint non ne ha uno"
+        );
+    }
+
+    /// IL DANNO OPPOSTO, ed e' il piu' grave dei due: una sospensione SENZA
+    /// termine e' quella di Confirm, dove l'utente e' al terminale. Chiuderla
+    /// significherebbe uccidere un run che stava per essere approvato.
+    ///
+    /// Mutazione: togliere `suspension_expires_at IS NOT NULL` dal WHERE (o
+    /// confrontare con `<=` una colonna NULL trattata come passato) -> rosso.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn una_sospensione_senza_termine_non_si_tocca(pool: PgPool) {
+        let confirm = run_sospeso(&pool, "human_review", None).await;
+        let non_ancora = run_sospeso(&pool, "step_gate", Some(3600)).await;
+
+        assert!(
+            expire_on_pool(&pool).await.is_empty(),
+            "nessuna delle due e' matura: una non ha termine, l'altra ha un'ora davanti"
+        );
+        assert_eq!(stato_di(&pool, confirm).await, "awaiting_confirmation");
+        assert_eq!(stato_di(&pool, non_ancora).await, "awaiting_confirmation");
+    }
+
+    /// La sweep guarda le SOSPENSIONI, non i run in esecuzione: un run che sta
+    /// lavorando non viene chiuso nemmeno se porta una scadenza sulla riga
+    /// (puo' portarla: e' stato sospeso e poi ha ripreso).
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn un_run_ripreso_non_viene_chiuso_dalla_vecchia_scadenza(pool: PgPool) {
+        let id = run_sospeso(&pool, "step_gate", Some(-60)).await;
+        sqlx::query("UPDATE agent_runs SET status = 'running' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("il run ha ripreso");
+
+        assert!(
+            expire_on_pool(&pool).await.is_empty(),
+            "il run sta lavorando: la scadenza di una sospensione gia' sciolta non lo chiude"
+        );
+        assert_eq!(stato_di(&pool, id).await, "running");
+    }
+
+    /// Il messaggio che la persona trova al mattino porta l'esito in CAMPI
+    /// (regola Q), non solo nella prosa: `outcome` e `blocker` dal vocabolario
+    /// ADR 0034, derivato dal kind della riga.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn il_messaggio_dichiara_l_esito_nei_campi(pool: PgPool) {
+        let project_id = uuid::Uuid::new_v4();
+        let session_id = crate::test_support::seed_chat_session(&pool, project_id).await;
+        let run_id = crate::test_support::insert_agent_run(
+            &pool,
+            session_id,
+            project_id,
+            "awaiting_confirmation",
+        )
+        .await;
+        let msg_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO chat_messages (id, session_id, project_id, role, content) \
+             VALUES ($1, $2, $3, 'user', 'fai la migrazione')",
+        )
+        .bind(msg_id)
+        .bind(session_id)
+        .bind(project_id)
+        .execute(&pool)
+        .await
+        .expect("messaggio utente");
+        sqlx::query("UPDATE agent_runs SET run_message_id = $2 WHERE id = $1")
+            .bind(run_id)
+            .bind(msg_id)
+            .execute(&pool)
+            .await
+            .expect("richiesta collegata");
+
+        insert_blocked_message(
+            &pool,
+            run_id,
+            Some(nexus_agent_graph::decisions::SuspensionOrigin::StepGate),
+        )
+        .await;
+
+        let (contenuto, metadata): (String, serde_json::Value) = sqlx::query_as(
+            "SELECT content, metadata FROM chat_messages \
+             WHERE role = 'assistant' AND request_message_id = $1",
+        )
+        .bind(msg_id)
+        .fetch_one(&pool)
+        .await
+        .expect("la risposta esiste: senza, la persona non scopre mai perche' il run e' fermo");
+
+        assert_eq!(metadata["outcome"], "blocked");
+        assert_eq!(
+            metadata["blocker"], "safety",
+            "il blocker si deriva dal kind, e per il gate duale e' safety"
+        );
+        assert_eq!(metadata["suspensionKind"], "step_gate");
+        assert!(
+            contenuto.contains("validatori"),
+            "il testo dice la CAUSA, non solo che il tempo e' scaduto"
+        );
+    }
+
+    /// Kind illeggibile (riga manomessa, o scritta da una versione che non
+    /// conosceva questo vocabolario): il run si chiude lo stesso — la scadenza
+    /// e' un fatto — ma nessun blocker viene INVENTATO. Il campo assente dice
+    /// "non dichiarato" (regola Q).
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn kind_illeggibile_non_produce_un_blocker_inventato(pool: PgPool) {
+        let project_id = uuid::Uuid::new_v4();
+        let session_id = crate::test_support::seed_chat_session(&pool, project_id).await;
+        let run_id = crate::test_support::insert_agent_run(
+            &pool,
+            session_id,
+            project_id,
+            "awaiting_confirmation",
+        )
+        .await;
+        let msg_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO chat_messages (id, session_id, project_id, role, content) \
+             VALUES ($1, $2, $3, 'user', 'vai')",
+        )
+        .bind(msg_id)
+        .bind(session_id)
+        .bind(project_id)
+        .execute(&pool)
+        .await
+        .expect("messaggio utente");
+        sqlx::query("UPDATE agent_runs SET run_message_id = $2 WHERE id = $1")
+            .bind(run_id)
+            .bind(msg_id)
+            .execute(&pool)
+            .await
+            .expect("richiesta collegata");
+
+        insert_blocked_message(&pool, run_id, None).await;
+
+        let metadata: serde_json::Value = sqlx::query_scalar(
+            "SELECT metadata FROM chat_messages \
+             WHERE role = 'assistant' AND request_message_id = $1",
+        )
+        .bind(msg_id)
+        .fetch_one(&pool)
+        .await
+        .expect("la risposta esiste comunque");
+        assert_eq!(metadata["outcome"], "blocked");
+        assert!(
+            metadata.get("blocker").is_none(),
+            "senza un kind leggibile la causa non si dichiara: un safety inventato \
+             attribuirebbe al gate duale una chiusura che nessuno ha accertato"
         );
     }
 }

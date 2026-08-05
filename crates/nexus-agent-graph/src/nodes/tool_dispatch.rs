@@ -1199,6 +1199,20 @@ impl ToolDispatchNode {
             HITL_PENDING_ACTIONS_EXTRA_KEY.to_string(),
             Value::Array(actions),
         );
+        // CHI sospende lo DICHIARA (rilievo A4, punto unico
+        // `decisions::suspension_watch`): a valle serve per sapere quale
+        // `blocker` dichiarare se la sospensione scade senza che nessuno la
+        // sciolga. Scritta a OGNI sospensione, cosi' non puo' restare dietro
+        // come fossile di una sospensione gia' risolta.
+        let origin = if step_validations.is_some() {
+            crate::decisions::SuspensionOrigin::StepGate
+        } else {
+            crate::decisions::SuspensionOrigin::HumanReview
+        };
+        extra.insert(
+            crate::decisions::SUSPENSION_ORIGIN_EXTRA_KEY.to_string(),
+            Value::String(origin.as_str().to_string()),
+        );
         if let Some(v) = step_validations {
             extra.insert(
                 crate::decisions::step_gate::STEP_GATE_VERDICTS_EXTRA_KEY.to_string(),
@@ -2974,6 +2988,45 @@ mod tests {
                 .is_some_and(|a| !a.is_empty())
         );
         assert!(steps.steps.lock().unwrap().is_empty(), "nessun tool eseguito");
+
+        // L'ORIGINE della sospensione (rilievo A4): questa e' una revisione
+        // umana ordinaria, e va dichiarata come tale — da lei dipende quale
+        // `blocker` verrebbe dichiarato a una scadenza, e in Confirm dipende
+        // che la scadenza non ci sia affatto.
+        assert_eq!(
+            out.extra
+                .get(crate::decisions::SUSPENSION_ORIGIN_EXTRA_KEY)
+                .and_then(|v| v.as_str()),
+            Some(crate::decisions::SuspensionOrigin::HumanReview.as_str()),
+            "una sospensione HITL ordinaria non e' del gate duale"
+        );
+        // LA TRAPPOLA, blindata: `step_gate_cleared_batch` e' il marker
+        // anti-rivalidazione ed e' scritto su OGNI sospensione, questa
+        // compresa. Chi lo usasse come firma del gate duale darebbe una
+        // scadenza anche alle sospensioni di Confirm — cioe' chiuderebbe come
+        // `blocked` la sessione di un utente seduto davanti alla card. Qui e'
+        // presente e l'origine resta `human_review`.
+        //
+        // NOTA PER CHI FA IL MERGE: su `feature/processo-standard-figure` e'
+        // in corso un fix che toglie al marker il ruolo di PERMESSO (veniva
+        // scritto alla sospensione, e al rientro nel dispatch faceva passare il
+        // batch: un `rm -rf` eseguito 482ms dopo il proprio NeedsHuman, run
+        // 77fcff4a). Il permesso diventa il campo tipizzato
+        // `AgentState::step_gate_human_ok`, scritto dal resume. Se quel fix
+        // smette di scrivere il marker ALLA SOSPENSIONE, questa asserzione va
+        // rimossa: cade il presupposto, non cio' che il test prova — che resta
+        // l'origine `human_review` asserita sopra.
+        assert!(
+            out.extra
+                .contains_key(crate::decisions::step_gate::STEP_GATE_CLEARED_EXTRA_KEY),
+            "il marker di batch c'e' anche su una sospensione ordinaria: e' il presupposto \
+             di questo test, non un dettaglio"
+        );
+        assert!(
+            !out.extra
+                .contains_key(crate::decisions::step_gate::STEP_GATE_VERDICTS_EXTRA_KEY),
+            "nessun verdetto: qui il gate duale non ha deliberato"
+        );
     }
 
     // ── Barriera di scrittura advisory (overlap, mig 0606) ───────────────────

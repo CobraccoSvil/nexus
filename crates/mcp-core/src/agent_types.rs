@@ -406,6 +406,15 @@ pub struct AgentRunResult {
     /// Stop reason finale: end_turn | tool_use | error | loop_detected | timeout.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    /// CHI ha prodotto la sospensione, quando lo status e' `AwaitingConfirmation`
+    /// (rilievo A4). `None` = il run non e' sospeso.
+    ///
+    /// Trasporta fino alla riga DB la dichiarazione del nodo che ha sospeso
+    /// (`NativeRunOutcome::suspension_origin`): da qui nascono
+    /// `agent_runs.suspension_kind` e, se la sospensione scade senza che
+    /// nessuno la sciolga, il `blocker` ADR 0034 con cui il run viene chiuso.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspension_origin: Option<nexus_agent_graph::decisions::SuspensionOrigin>,
     /// Task type rilevato dal router (es. "fix", "code_read", "architecture").
     /// Propagato dal brain Python nell'evento SSE end_turn per popolare
     /// la colonna `nexus_task_type` in agent_runs.
