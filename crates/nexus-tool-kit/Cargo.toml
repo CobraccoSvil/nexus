@@ -27,6 +27,7 @@ urlencoding = "2"
 uuid.workspace = true
 
 [dev-dependencies]
+nexus-test-preconditions = { path = "../nexus-test-preconditions" }
 tempfile = "3"
 
 [lints]

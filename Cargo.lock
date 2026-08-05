@@ -2610,6 +2610,7 @@ name = "nexus-test-preconditions"
 version = "0.1.0"
 dependencies = [
  "sqlx",
+ "tempfile",
  "uuid",
 ]
 
@@ -2626,6 +2627,7 @@ dependencies = [
  "nexus-events",
  "nexus-project-db",
  "nexus-project-pools",
+ "nexus-test-preconditions",
  "rand 0.8.5",
  "regex",
  "reqwest",

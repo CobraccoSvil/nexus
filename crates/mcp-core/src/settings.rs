@@ -17,7 +17,7 @@ use nexus_types::fs_browse::{list_directories, list_root_candidates};
 // Prima `ApiError`/`ApiResult`/`api_error`/`validate_directory_name` erano
 // ri-implementati identici qui e in crates/admin-service/src/settings.rs.
 use nexus_types::{
-    api_error, validate_directory_name_api as validate_directory_name, ApiError, ApiResult,
+    api_error, ApiError, ApiResult,
 };
 
 fn map_create_dir_error(error: std::io::Error) -> ApiError {
@@ -82,28 +82,30 @@ pub async fn browse_directories(Query(query): Query<FsBrowseQuery>) -> ApiResult
 }
 
 /// POST /api/admin/fs/directories/create — create directory on server filesystem (admin only)
+/// La sequenza (risolvi parent, valida nome, crea) vive in
+/// `nexus_types::fs_browse::crea_directory`, accanto a `validate_directory_name`
+/// che la Fase B vi aveva gia' consolidato: `create_directory` era rimasta
+/// indietro in quel giro, ed e' il censimento delle firme a ritrovarla il
+/// 2026-08-05. Qui resta la traduzione in HTTP, che e' l'unica cosa in cui
+/// questa copia e quella di `admin-service` differivano davvero.
 pub async fn create_directory(Json(body): Json<CreateDirectoryRequest>) -> ApiResult {
-    let parent = PathBuf::from(body.parent_path.trim())
-        .canonicalize()
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Percorso directory non valido"))?;
+    use nexus_types::fs_browse::{crea_directory, ErroreCreaDirectory};
 
-    if !parent.is_dir() {
-        return Err(api_error(
+    let target = crea_directory(&body.parent_path, &body.name).map_err(|e| match e {
+        ErroreCreaDirectory::ParentNonRisolvibile => {
+            api_error(StatusCode::BAD_REQUEST, "Percorso directory non valido")
+        }
+        ErroreCreaDirectory::ParentNonDirectory => api_error(
             StatusCode::BAD_REQUEST,
             "Il percorso parent non e' una directory",
-        ));
-    }
-
-    let dir_name = validate_directory_name(&body.name)?;
-    let target = parent.join(dir_name);
-    if target.exists() {
-        return Err(api_error(
+        ),
+        ErroreCreaDirectory::NomeNonValido(motivo) => api_error(StatusCode::BAD_REQUEST, motivo),
+        ErroreCreaDirectory::GiaEsistente => api_error(
             StatusCode::CONFLICT,
             "Esiste gia' una directory con questo nome",
-        ));
-    }
-
-    std::fs::create_dir(&target).map_err(map_create_dir_error)?;
+        ),
+        ErroreCreaDirectory::Io(io) => map_create_dir_error(io),
+    })?;
 
     Ok(Json(json!({
         "ok": true,

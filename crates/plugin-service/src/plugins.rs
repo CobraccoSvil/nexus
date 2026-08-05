@@ -131,15 +131,18 @@ const FIGMA_DISCOVERY_URL: &str = "https://api.figma.com/.well-known/oauth-autho
 
 // -- Helpers --
 
+/// Lo scope validato, con l'errore HTTP di questo servizio.
+///
+/// Vocabolario e normalizzazione in `nexus_mcp_client::plugin_storage`: le
+/// stesse righe stavano in TRE copie (qui e due volte in mcp-core), e il
+/// censimento delle firme le ha fatte emergere il 2026-08-05.
 fn normalize_scope(raw: Option<&str>) -> Result<String, (StatusCode, Json<Value>)> {
-    let scope = raw.unwrap_or("global").trim().to_lowercase();
-    match scope.as_str() {
-        "global" | "project" | "user" => Ok(scope),
-        _ => Err(api_error(
+    nexus_mcp_client::plugin_storage::normalizza_scope(raw).map_err(|_| {
+        api_error(
             StatusCode::BAD_REQUEST,
             "Scope non valido: usa global, project o user",
-        )),
-    }
+        )
+    })
 }
 
 fn parse_string_array(raw: &Value) -> Vec<String> {
@@ -154,26 +157,18 @@ fn parse_string_array(raw: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn get_json_object<'a>(
-    raw: &'a Value,
-    field: &str,
-) -> Option<&'a serde_json::Map<String, Value>> {
-    raw.get(field).and_then(Value::as_object)
-}
+// Gemelli identici di quelli in `mcp-core/src/plugins/mod.rs`, consolidati il
+// 2026-08-05 dopo che il censimento delle firme li ha fatti emergere. Non erano
+// visibili a jscpd: blocchi da 6-10 righe, sotto la sua soglia di 15.
+use nexus_mcp_client::plugin_storage::{get_json_object, value_to_string_map};
 
-fn value_to_string_map(raw: Option<&serde_json::Map<String, Value>>) -> HashMap<String, String> {
-    raw.map(|obj| {
-        obj.iter()
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-            .collect::<HashMap<_, _>>()
-    })
-    .unwrap_or_default()
-}
-
+/// Chi puo' gestire un'ISTANZA di plugin: proprietario, o admin su `global`.
+///
+/// La colonna del proprietario e' un parametro del punto unico perche' e'
+/// l'unica cosa che cambia rispetto ai server MCP (`installed_by_user_id`
+/// contro `user_id`).
 fn can_manage_instance(row: &sqlx::postgres::PgRow, user_id: Uuid, role: &str) -> bool {
-    let scope: String = row.try_get("scope").unwrap_or_else(|_| "user".to_string());
-    let owner: Option<Uuid> = row.try_get("installed_by_user_id").unwrap_or(None);
-    owner == Some(user_id) || (scope == "global" && role == "admin")
+    nexus_mcp_client::plugin_storage::puo_gestire(row, user_id, role, "installed_by_user_id")
 }
 
 /// Messaggio d'errore di un plugin, dal punto unico di presentazione.

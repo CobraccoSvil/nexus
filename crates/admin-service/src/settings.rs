@@ -20,7 +20,7 @@ use nexus_types::fs_browse::{list_directories, list_root_candidates};
 // Prima `ApiError`/`ApiResult`/`api_error`/`validate_directory_name` erano
 // ri-implementati identici qui e in crates/mcp-core/src/settings.rs.
 use nexus_types::{
-    api_error, validate_directory_name_api as validate_directory_name, ApiError, ApiResult,
+    api_error, ApiError, ApiResult,
 };
 
 async fn ensure_required_settings(state: &AppState) {
@@ -54,23 +54,33 @@ pub async fn browse_directories(Query(query): Query<FsBrowseQuery>) -> ApiResult
     })))
 }
 
+/// La sequenza (risolvi parent, valida nome, crea) vive in
+/// `nexus_types::fs_browse::crea_directory`: era duplicata identica in
+/// `mcp-core::settings`, e il censimento delle firme l'ha fatta emergere il
+/// 2026-08-05. Qui resta la traduzione in HTTP — l'unica cosa che le due copie
+/// avevano davvero di diverso.
 pub async fn create_directory(Json(body): Json<CreateDirectoryRequest>) -> ApiResult {
-    let parent = PathBuf::from(body.parent_path.trim())
-        .canonicalize()
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Percorso parent non valido"))?;
-    if !parent.is_dir() { return Err(api_error(StatusCode::BAD_REQUEST, "Il parent non e' una directory")); }
+    use nexus_types::fs_browse::{crea_directory, ErroreCreaDirectory};
 
-    let dir_name = validate_directory_name(&body.name)?;
-    let target = parent.join(dir_name);
-    if target.exists() { return Err(api_error(StatusCode::CONFLICT, "Directory gia' esistente")); }
-
-    std::fs::create_dir(&target).map_err(|e| {
-        let status = match e.kind() {
-            std::io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
-            std::io::ErrorKind::AlreadyExists => StatusCode::CONFLICT,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        api_error(status, e.to_string())
+    let target = crea_directory(&body.parent_path, &body.name).map_err(|e| match e {
+        ErroreCreaDirectory::ParentNonRisolvibile => {
+            api_error(StatusCode::BAD_REQUEST, "Percorso parent non valido")
+        }
+        ErroreCreaDirectory::ParentNonDirectory => {
+            api_error(StatusCode::BAD_REQUEST, "Il parent non e' una directory")
+        }
+        ErroreCreaDirectory::NomeNonValido(motivo) => api_error(StatusCode::BAD_REQUEST, motivo),
+        ErroreCreaDirectory::GiaEsistente => {
+            api_error(StatusCode::CONFLICT, "Directory gia' esistente")
+        }
+        ErroreCreaDirectory::Io(io) => {
+            let status = match io.kind() {
+                std::io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
+                std::io::ErrorKind::AlreadyExists => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            api_error(status, io.to_string())
+        }
     })?;
 
     Ok(Json(json!({ "ok": true, "path": target.to_string_lossy().to_string() })))

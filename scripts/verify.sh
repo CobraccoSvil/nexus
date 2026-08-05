@@ -158,6 +158,19 @@ run_phase "fine-riga dichiarati (eol=lf)" bash scripts/check-eol.sh
 # non e' raggiungibile lo script degrada da solo in modalita' --no-db.
 run_phase "audit settings (gate ratchet)" bash scripts/audit-settings.sh --gate
 
+# Gate ratchet duplicazione (jscpd, baseline in .dup-baseline.json).
+#
+# Fino al 2026-08-05 girava SOLO nel workflow CI, e il risultato era il difetto
+# che il repo aveva gia' imparato per quality_scan: "confinato alla verifica
+# completa, il drift si accumulava invisibile per decine di commit e ricadeva
+# sul primo che eseguiva pnpm verify". Misurato quel giorno: 11 cloni contro una
+# baseline di 9, senza che nessuna esecuzione locale potesse accorgersene.
+#
+# Costa 19s (misurati) su un gate che ne dura oltre 1300: non e' il motivo per
+# cui sta fuori dal pre-commit — li' resta escluso perche' scansiona l'albero
+# intero, e un pre-commit deve guardare cio' che si sta committando.
+run_phase "duplicazione (gate ratchet jscpd)" bash scripts/dup-report.sh
+
 # Gate ratchet qualita codice Rust: findings totali, funzioni >50 righe,
 # complessita >20, security possono solo scendere (baseline in
 # scripts/quality-baseline.json). Saltabile con VERIFY_SKIP_RUST=1.

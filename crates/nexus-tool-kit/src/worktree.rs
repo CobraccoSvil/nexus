@@ -549,40 +549,17 @@ pub async fn gc_orphan_worktrees(project_root: &Path, active_run_ids: &[Uuid]) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     /// Esegue un comando git sincrono nei test (setup del repo temp). Fuori dal
     /// path di produzione: qui `expect` e' ammesso (regola: unwrap/expect solo
     /// nei test).
-    fn git_sync(cwd: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .expect("git spawn");
-        assert!(status.success(), "git {args:?} fallito in {cwd:?}");
-    }
+    // `git_sync` e `temp_repo` erano duplicate identiche in
+    // `mcp-core::session_autocommit`: la definizione vive dal 2026-08-05 in
+    // `nexus-test-preconditions`, insieme a `seed_project_meta`, che vi era
+    // sceso per lo stesso motivo — i crate estratti da mcp-core stanno sotto di
+    // lui e i loro test hanno bisogno degli stessi helper.
+    use nexus_test_preconditions::{git_sync, temp_repo};
 
-    /// Crea un repo git temporaneo con un commit iniziale e un file `README.md`.
-    /// Ritorna il [`tempfile::TempDir`] (da tenere vivo) e il path della root.
-    /// La root e' una sottodir del tempdir cosi' che `worktree_base_dir` (che usa
-    /// il parent) resti confinata nel tempdir (isolata per test).
-    fn temp_repo() -> (tempfile::TempDir, PathBuf) {
-        let td = tempfile::tempdir().expect("tempdir");
-        let root = td.path().join("repo");
-        std::fs::create_dir_all(&root).expect("mkdir repo");
-        git_sync(&root, &["init", "-q"]);
-        git_sync(&root, &["config", "user.name", "nexus-test"]);
-        git_sync(&root, &["config", "user.email", "test@nexus.local"]);
-        // Evita che un default branch nome-dipendente rompa i comandi.
-        git_sync(&root, &["checkout", "-q", "-B", "main"]);
-        std::fs::write(root.join("README.md"), "riga iniziale\n").expect("write README");
-        git_sync(&root, &["add", "-A"]);
-        git_sync(&root, &["commit", "-q", "-m", "commit iniziale"]);
-        (td, root)
-    }
 
     #[tokio::test]
     async fn probe_true_su_repo_git() {

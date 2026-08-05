@@ -319,3 +319,46 @@ pub async fn seed_project_meta(pool: &PgPool) -> uuid::Uuid {
     .expect("seed projects");
     project
 }
+
+/// Esegue un comando git nella directory data, e PRETENDE che riesca.
+///
+/// Sta qui dal 2026-08-05: era duplicata identica in
+/// `mcp-core::session_autocommit` e `nexus-tool-kit::worktree`, entrambe dentro
+/// il proprio `mod tests`. Il censimento delle firme (`xtask signature-census`)
+/// ha segnalato la sua compagna `temp_repo`; questa e' emersa guardando —
+/// la sua firma `(&Path, &[&str]) -> ()` e' troppo comune per distinguersi da
+/// sola, ed e' un limite dichiarato di quello strumento.
+pub fn git_sync(cwd: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git spawn");
+    assert!(status.success(), "git {args:?} fallito in {cwd:?}");
+}
+
+/// Repo git temporaneo con un commit iniziale, cioe' un HEAD risolvibile.
+///
+/// Ritorna il [`tempfile::TempDir`] (da tenere vivo: alla sua caduta l'albero
+/// sparisce) e la root del repo. La root e' una SOTTODIRECTORY del tempdir, non
+/// il tempdir stesso: chi risale al parent — `worktree_base_dir` lo fa — resta
+/// cosi' confinato nel temporaneo invece di finire nella cartella di sistema.
+///
+/// Il branch e' forzato a `main` con `checkout -B`: senza, il default dipende
+/// dalla configurazione di chi esegue i test e i comandi successivi cambiano
+/// comportamento da macchina a macchina.
+pub fn temp_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+    let td = tempfile::tempdir().expect("tempdir");
+    let root = td.path().join("repo");
+    std::fs::create_dir_all(&root).expect("mkdir repo");
+    git_sync(&root, &["init", "-q"]);
+    git_sync(&root, &["config", "user.name", "nexus-test"]);
+    git_sync(&root, &["config", "user.email", "test@nexus.local"]);
+    git_sync(&root, &["checkout", "-q", "-B", "main"]);
+    std::fs::write(root.join("README.md"), "riga iniziale\n").expect("write README");
+    git_sync(&root, &["add", "-A"]);
+    git_sync(&root, &["commit", "-q", "-m", "commit iniziale"]);
+    (td, root)
+}

@@ -139,15 +139,19 @@ pub(super) const FIGMA_DEFAULT_RETURN_TO: &str = "/admin/settings/connectors";
 pub(super) const FIGMA_DISCOVERY_URL: &str =
     "https://api.figma.com/.well-known/oauth-authorization-server";
 
+/// Lo scope validato, con l'errore HTTP di QUESTO endpoint.
+///
+/// Il vocabolario e la normalizzazione vivono in
+/// `nexus_mcp_client::plugin_storage` (le stesse righe stavano in TRE copie —
+/// qui, in `integrate.rs` e in `plugin-service`); qui resta il messaggio, che
+/// nomina il campo e percio' non e' condivisibile.
 pub(super) fn normalize_scope(raw: Option<&str>) -> Result<String, (StatusCode, Json<Value>)> {
-    let scope = raw.unwrap_or("global").trim().to_lowercase();
-    match scope.as_str() {
-        "global" | "project" | "user" => Ok(scope),
-        _ => Err(api_error(
+    nexus_mcp_client::plugin_storage::normalizza_scope(raw).map_err(|_| {
+        api_error(
             StatusCode::BAD_REQUEST,
             "Scope non valido: usa global, project o user",
-        )),
-    }
+        )
+    })
 }
 
 pub(super) fn parse_string_array(raw: &Value) -> Vec<String> {
@@ -162,28 +166,19 @@ pub(super) fn parse_string_array(raw: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub(super) fn get_json_object<'a>(
-    raw: &'a Value,
-    field: &str,
-) -> Option<&'a serde_json::Map<String, Value>> {
-    raw.get(field).and_then(Value::as_object)
-}
+// Tre helper che erano gemelli identici di quelli in `plugin-service`, e che il
+// censimento delle firme ha fatto emergere il 2026-08-05. La definizione vive
+// ora in `nexus_mcp_client::plugin_storage`, lo stesso crate che la Wave C1
+// aveva creato proprio per la duplicazione fra questi due lati.
+pub(super) use nexus_mcp_client::plugin_storage::{get_json_object, value_to_string_map};
 
-pub(super) fn value_to_string_map(
-    raw: Option<&serde_json::Map<String, Value>>,
-) -> HashMap<String, String> {
-    raw.map(|obj| {
-        obj.iter()
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-            .collect::<HashMap<_, _>>()
-    })
-    .unwrap_or_default()
-}
-
+/// Chi puo' gestire un'ISTANZA di plugin: proprietario, o admin su `global`.
+///
+/// La colonna del proprietario e' l'unica cosa che cambia rispetto ai server
+/// MCP (`installed_by_user_id` contro `user_id`), ed e' percio' un parametro del
+/// punto unico invece di due copie della stessa condizione.
 pub(super) fn can_manage_instance(row: &sqlx::postgres::PgRow, user_id: Uuid, role: &str) -> bool {
-    let scope: String = row.try_get("scope").unwrap_or_else(|_| "user".to_string());
-    let owner: Option<Uuid> = row.try_get("installed_by_user_id").unwrap_or(None);
-    owner == Some(user_id) || (scope == "global" && role == "admin")
+    nexus_mcp_client::plugin_storage::puo_gestire(row, user_id, role, "installed_by_user_id")
 }
 
 /// Messaggio d'errore di un plugin, dal punto unico di presentazione.

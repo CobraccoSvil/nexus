@@ -117,15 +117,18 @@ fn normalize_slug(raw: &str) -> String {
         .to_string()
 }
 
+/// Come `plugins::normalize_scope`, ma l'errore nomina `defaultScope` perche'
+/// e' il campo che questo endpoint riceve. Era l'UNICA differenza fra le tre
+/// copie di questa funzione, ed e' la ragione per cui il punto unico
+/// (`nexus_mcp_client::plugin_storage::normalizza_scope`) e' puro e non compone
+/// messaggi.
 fn normalize_scope(raw: Option<&str>) -> Result<String, (StatusCode, Json<Value>)> {
-    let scope = raw.unwrap_or("global").trim().to_lowercase();
-    match scope.as_str() {
-        "global" | "project" | "user" => Ok(scope),
-        _ => Err(api_error(
+    nexus_mcp_client::plugin_storage::normalizza_scope(raw).map_err(|_| {
+        api_error(
             StatusCode::BAD_REQUEST,
             "defaultScope non valido: usa global, project o user",
-        )),
-    }
+        )
+    })
 }
 
 fn build_mcp_config(

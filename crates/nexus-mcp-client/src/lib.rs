@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub mod server_endpoints;
+pub mod plugin_storage;
 pub mod server_storage;
 
 // -- Public types --

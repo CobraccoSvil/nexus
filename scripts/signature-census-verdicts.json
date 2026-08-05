@@ -18,7 +18,7 @@
         "crates/nexus-tool-kit/src/worktree.rs:572 temp_repo"
       ],
       "verdetto": "duplicato",
-      "nota": "IDENTICHE riga per riga (init -q, config user.name/email, checkout -B main, README, add, commit iniziale), a meno di un commento. jscpd non le vedeva: 13 righe di corpo, sotto la sua soglia minLines=15. Da consolidare in nexus-test-preconditions, che dal 2026-08-05 ospita gia' seed_project_meta per lo stesso motivo (i crate estratti da mcp-core stanno sotto di lui e non possono usarne gli helper)."
+      "nota": "CONSOLIDATO 2026-08-05 in nexus-test-preconditions (git_sync + temp_repo). Guardando le due funzioni e' emerso che anche git_sync era duplicata: la sua firma (&Path, &[&str]) -> () e' troppo comune per distinguersi da sola, ed e' un limite dichiarato dello strumento."
     },
     {
       "firma": "() -> 'static Regex",
@@ -53,7 +53,7 @@
         "crates/plugin-service/src/plugins.rs:164 value_to_string_map"
       ],
       "verdetto": "duplicato",
-      "nota": "Stesso NOME, stessa firma, crate diversi. E' il caso che nexus-mcp-client (Wave C1) aveva gia' affrontato per mcp_client.rs fra questi stessi due crate: la conversione dei metadata plugin era rimasta indietro. Candidato a nexus-mcp-client, dove i tipi dei plugin vivono gia'."
+      "nota": "CONSOLIDATO 2026-08-05 in nexus_mcp_client::plugin_storage, insieme a get_json_object e can_manage_instance che erano gemelle nello stesso blocco."
     },
     {
       "firma": "(Option<str>) -> Result<str>",
@@ -63,7 +63,7 @@
         "crates/plugin-service/src/plugins.rs:134 normalize_scope"
       ],
       "verdetto": "duplicato",
-      "nota": "TRE copie con lo stesso nome, due crate. Normalizza lo scope di un plugin: una regola sola, scritta tre volte. Stessa destinazione di value_to_string_map."
+      "nota": "CONSOLIDATO 2026-08-05: normalizza_scope in nexus_mcp_client::plugin_storage. Il punto unico e' PURO e non compone messaggi HTTP — l'unica differenza fra le tre copie era il campo nominato nell'errore ('Scope' contro 'defaultScope'), e portarlo dentro avrebbe richiesto un parametro che esiste solo per fabbricare una stringa."
     },
     {
       "firma": "(Json<CreateDirectoryRequest>) -> ApiResult",
@@ -72,7 +72,7 @@
         "crates/mcp-core/src/settings.rs:85 create_directory"
       ],
       "verdetto": "duplicato",
-      "nota": "Gli STESSI DUE FILE su cui la Fase B aveva consolidato nexus_types::fs_browse (81 righe identiche): create_directory e' rimasta fuori da quel giro. Il consolidamento ha una casa gia' pronta."
+      "nota": "CONSOLIDATO 2026-08-05: la sequenza vive in nexus_types::fs_browse::crea_directory, accanto a validate_directory_name che la Fase B vi aveva gia' messo. Gli handler axum RESTANO nei due crate (come stabilito in Wave C2) e traducono ErroreCreaDirectory nei propri messaggi: era l'unica cosa in cui differivano davvero."
     },
     {
       "firma": "(Claims) -> Result<Uuid>",

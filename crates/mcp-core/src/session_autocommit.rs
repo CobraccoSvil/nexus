@@ -323,16 +323,12 @@ mod tests {
 
     /// git SINCRONO per il setup del repo di prova. Fuori dal path di produzione:
     /// qui `expect` e' ammesso (regola F).
-    fn git_sync(cwd: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("git spawn");
-        assert!(status.success(), "git {args:?} fallito in {cwd:?}");
-    }
+    // `git_sync` e `temp_repo` erano duplicate identiche nel `mod tests` di
+    // `nexus-tool-kit::worktree`. La definizione vive dal 2026-08-05 in
+    // `nexus-test-preconditions`, accanto a `seed_project_meta`: quel crate e'
+    // sotto entrambi nel grafo, ed e' l'unico posto da cui li raggiungono
+    // tutti e due senza invertire una dipendenza.
+    use nexus_test_preconditions::{git_sync, temp_repo};
 
     /// Come [`git_sync`] ma ritorna stdout: serve a INTERROGARE il repo dopo che
     /// la produzione l'ha scritto, invece di dedurne lo stato (regola O).
@@ -350,22 +346,6 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
-    /// Repo git temporaneo con un commit iniziale, cioe' un HEAD risolvibile:
-    /// e' la precondizione di `snapshot_after_mutation` (senza HEAD non c'e'
-    /// base da cui partire ne' parent per il primo commit).
-    fn temp_repo() -> (tempfile::TempDir, PathBuf) {
-        let td = tempfile::tempdir().expect("tempdir");
-        let root = td.path().join("repo");
-        std::fs::create_dir_all(&root).expect("mkdir repo");
-        git_sync(&root, &["init", "-q"]);
-        git_sync(&root, &["config", "user.name", "nexus-test"]);
-        git_sync(&root, &["config", "user.email", "test@nexus.local"]);
-        git_sync(&root, &["checkout", "-q", "-B", "main"]);
-        std::fs::write(root.join("README.md"), "riga iniziale\n").expect("write README");
-        git_sync(&root, &["add", "-A"]);
-        git_sync(&root, &["commit", "-q", "-m", "commit iniziale"]);
-        (td, root)
-    }
 
     /// L'index temporaneo vive in `std::env::temp_dir()`, FUORI dal tempdir del
     /// test: senza questa pulizia ogni esecuzione ne lascerebbe uno.
