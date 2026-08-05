@@ -1142,6 +1142,11 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
             stop_reason: Some(Some(StopReason::ToolUse)),
             since_last_todo_reminder: Some(Some(new_reminder_counter)),
             attachment_read_bytes: Some(Some(new_attachment_read_bytes)),
+            // CONSUMO del permesso umano: vale per il solo batch appena
+            // eseguito. Senza, resterebbe acceso per il resto del run e ogni
+            // batch critico successivo salterebbe il gate — l'approvazione di
+            // UN passo diventerebbe un lasciapassare permanente.
+            step_gate_human_ok: (state.step_gate_human_ok == Some(true)).then_some(Some(false)),
             // SEMPRE scritto (anche []): durata esatta 1 turno (overwrite reducer).
             discovered_tools_next_turn: Some(Some(
                 discovered_next.iter().map(discovered_to_value).collect(),
@@ -1205,15 +1210,14 @@ impl ToolDispatchNode {
                 v,
             );
         }
-        // Il marker del batch deliberato, su OGNI sospensione HITL: al resume
-        // con approvazione umana gli STESSI id non si ri-validano (la
-        // decisione umana e' finale, rilievo A3 — e per il batch arrivato a
-        // 2b il gate aveva gia' deliberato, essendo 2a a monte); un batch con
-        // id nuovi non matcha e riceve validazione fresca.
-        extra.insert(
-            crate::decisions::step_gate::STEP_GATE_CLEARED_EXTRA_KEY.to_string(),
-            ids_del_batch(pending),
-        );
+        // QUI NON si marca nulla come deliberato. Il permesso di eseguire il
+        // batch nasce dalla RISPOSTA dell'umano (campo `step_gate_human_ok`,
+        // scritto dal resume), mai dalla domanda: marcarlo qui significava
+        // dichiarare deliberato un batch nel momento in cui se ne CHIEDEVA la
+        // decisione, e al rientro nel dispatch quel marker faceva saltare la
+        // rivalidazione — misurato in esercizio il 05/08/2026 (run 77fcff4a),
+        // dove un `rm -rf` irreversibile veniva eseguito 482ms dopo il
+        // `NeedsHuman` che avrebbe dovuto fermarlo.
         tracing::info!(
             target: "nexus_agent_graph::tool_dispatch",
             pending_mutators = pending.len(),
@@ -1231,13 +1235,18 @@ impl ToolDispatchNode {
     /// spento, batch sotto soglia, batch gia' deliberato o validatori
     /// unanimi); `Some(delta)` = il turno finisce qui (rimando o sospensione).
     ///
-    /// La decisione umana su un batch e' FINALE (rilievo A3), e il batch e'
-    /// identificato dagli ID (marker [`step_gate::STEP_GATE_CLEARED_EXTRA_KEY`],
-    /// scritto alla sospensione): un batch NUOVO — id nuovi — riceve
-    /// validazione fresca. MAI `state.approved` come corto-circuito: quel flag
-    /// e' seminato a `true` dallo stato iniziale in Automatic/Continuous per
-    /// saltare HITL, e leggerlo qui spegneva il gate proprio nella modalita'
-    /// in cui e' l'unica barriera (review avversaria del 05/08, pre-commit).
+    /// La decisione umana su un batch e' FINALE (rilievo A3): quando l'umano
+    /// approva, il resume scrive [`AgentState::step_gate_human_ok`] e QUEL
+    /// giro del dispatch procede senza riconvocare i validatori (che
+    /// altrimenti ribalterebbero l'approvazione, o la riproporrebbero
+    /// all'infinito). Il permesso vale per UN solo giro e il turno lo consuma.
+    ///
+    /// Due letture SBAGLIATE, entrambe misurate: `state.approved` (seminato a
+    /// `true` in Automatic/Continuous per saltare l'HITL — spegneva il gate
+    /// nella modalita' in cui e' l'unica barriera) e un marker scritto alla
+    /// SOSPENSIONE (dichiarava deliberato il batch mentre se ne chiedeva la
+    /// decisione: il rientro nel dispatch lo faceva passare, e il `rm -rf` del
+    /// run 77fcff4a partiva 482ms dopo il proprio `NeedsHuman`).
     async fn step_gate_barrier(
         &self,
         state: &AgentState,
@@ -1250,10 +1259,8 @@ impl ToolDispatchNode {
         if mode == StepGateMode::Off {
             return None;
         }
-        // Batch gia' deliberato (sospeso e poi approvato dall'umano al
-        // resume): stessi id = stessa decisione, id diversi = batch nuovo.
-        let marker = state.extra.get(step_gate::STEP_GATE_CLEARED_EXTRA_KEY);
-        if marker.is_some() && marker == Some(&ids_del_batch(pending)) {
+        // Permesso umano fresco per QUESTO giro (consumato dal turno).
+        if state.step_gate_human_ok == Some(true) {
             return None;
         }
 
@@ -1287,7 +1294,7 @@ impl ToolDispatchNode {
             ctx.emit.as_ref(),
             self.meta_steps.as_ref(),
             step_gate::STEP_VALIDATION_META_KIND,
-            format!("Gate duale su passo {}: {:?}", level.as_str(), decision),
+            titolo_per_umano(&decision, level, &report),
             payload.clone(),
         )
         .await;
@@ -1344,7 +1351,14 @@ impl ToolDispatchNode {
             ctx.emit.as_ref(),
             self.meta_steps.as_ref(),
             crate::decisions::step_gate::STEP_VALIDATION_META_KIND,
-            format!("Passo {} osservato dal gate duale", level.as_str()),
+            format!(
+                "Passo {} osservato (gate in sola osservazione, nessun blocco)",
+                if level == crate::decisions::step_gate::StepCriticality::Irreversible {
+                    "irreversibile"
+                } else {
+                    "critico"
+                }
+            ),
             json!({
                 "decision": "observed",
                 "level": level.as_str(),
@@ -2265,15 +2279,80 @@ pub fn tool_target_from_input(input: &Value) -> Option<String> {
 /// `__init__.py:4087-4114`). PURO (nessun side-effect): il nodo lo accumula nel
 /// `delta.meta_steps` (canale `add`); l'emissione SSE live + la persistenza DB
 /// sono I/O dell'integrazione (`EventSink`/`MetaStepStore`).
+/// Il titolo del meta_step, scritto per CHI LEGGE nel nastro attivita' e non
+/// per chi ha scritto il codice: e' la sola riga che l'utente vede quando il
+/// run si ferma, e «Gate duale su passo irreversible: NeedsHuman» non gli
+/// dice ne' cosa e' successo ne' cosa deve fare. Composto DAI campi del
+/// report (regola Q punto 3: struttura -> prosa, mai il contrario).
 ///
-/// Gli id di un batch di pending nella forma canonica del marker
-/// anti-rivalidazione (delega a `step_gate::batch_ids` per l'ordinamento).
-fn ids_del_batch(pending: &[Value]) -> Value {
-    let mut ids: Vec<String> = pending
+/// I tre casi che l'utente puo' incontrare sono diversi fra loro e vanno
+/// distinti: nessun giudice disponibile (fatto d'ambiente, oggi il caso piu'
+/// frequente per credito esaurito), giudizi non unanimi, rifiuto motivato.
+fn titolo_per_umano(
+    decision: &crate::decisions::step_gate::StepGateDecision,
+    level: crate::decisions::step_gate::StepCriticality,
+    report: &ports::StepValidationReport,
+) -> String {
+    use crate::decisions::step_gate::{StepGateDecision, StepVerdict};
+    let passo = if level == crate::decisions::step_gate::StepCriticality::Irreversible {
+        "irreversibile"
+    } else {
+        "critico"
+    };
+    match decision {
+        StepGateDecision::Approved => {
+            format!("Passo {passo} approvato dai validatori: l'esecuzione prosegue")
+        }
+        StepGateDecision::Rejected => {
+            let motivo = report
+                .verdicts
+                .iter()
+                .filter(|v| v.verdict == StepVerdict::Reject)
+                .flat_map(|v| v.reasons.iter())
+                .find_map(|r| r.get("description").and_then(Value::as_str))
+                .unwrap_or("motivo non dettagliato");
+            format!("Passo {passo} rifiutato dai validatori: {motivo}")
+        }
+        StepGateDecision::UnavailableDeclared => format!(
+            "Passo {passo}: nessun verdetto utilizzabile, l'esecuzione prosegue dichiarandolo"
+        ),
+        StepGateDecision::NeedsHuman => titolo_serve_conferma(passo, report),
+    }
+}
+
+/// Il caso che l'utente incontra piu' spesso: va detto PERCHE' tocca a lui
+/// decidere, distinguendo l'indisponibilita' dei giudici dal loro disaccordo
+/// (sono due situazioni diverse e portano a due azioni diverse).
+fn titolo_serve_conferma(passo: &str, report: &ports::StepValidationReport) -> String {
+    use crate::decisions::step_gate::StepVerdict;
+    if report.verdicts.is_empty() {
+        let perche = report
+            .degraded
+            .as_deref()
+            .unwrap_or("nessun validatore convocabile");
+        return format!(
+            "Passo {passo}: serve la tua conferma perche' nessun validatore \
+             indipendente ha potuto giudicarlo ({perche})"
+        );
+    }
+    let riassunto: Vec<String> = report
+        .verdicts
         .iter()
-        .filter_map(|p| p.get("id").and_then(Value::as_str).map(str::to_string))
+        .map(|v| match v.verdict {
+            StepVerdict::Abstained => format!(
+                "{} non ha risposto ({})",
+                v.provider,
+                v.abstain_cause.as_deref().unwrap_or("causa non dichiarata")
+            ),
+            StepVerdict::Approve => format!("{} approva", v.provider),
+            StepVerdict::Reject => format!("{} rifiuta", v.provider),
+            StepVerdict::NeedsHuman => format!("{} rimanda a te", v.provider),
+        })
         .collect();
-    crate::decisions::step_gate::batch_ids(&mut ids)
+    format!(
+        "Passo {passo}: serve la tua conferma, i validatori non sono unanimi ({})",
+        riassunto.join(", ")
+    )
 }
 
 /// Un report senza convocati col degrado DICHIARATO (GAP-2: la matrice della
@@ -4438,32 +4517,79 @@ mod tests {
         assert_eq!(tools.seen.lock().unwrap().len(), 1, "tool eseguito dopo l'unanimita'");
     }
 
-    /// Batch gia' deliberato (marker con gli STESSI id, scritto dalla
-    /// sospensione): la porta NON viene riconvocata (rilievo A3: la decisione
-    /// umana e' finale per il batch). Un batch con id NUOVI riceve
-    /// validazione fresca. Mutazione: corto-circuito su `state.approved`
-    /// invece che sul marker -> il caso id-nuovi non riconvoca -> rosso.
+    /// Il permesso umano fresco (scritto dal RESUME) fa procedere QUEL giro
+    /// senza riconvocare, e il turno lo CONSUMA: il batch successivo riceve
+    /// validazione fresca. Mutazione: togliere il consumo dal delta ->
+    /// l'approvazione di un passo diventa un lasciapassare permanente e la
+    /// seconda asserzione cade.
     #[tokio::test]
-    async fn gate_duale_batch_deliberato_non_riconvoca_ma_id_nuovi_si() {
-        let (gate, _tools, n) = scenario_approve();
+    async fn permesso_umano_vale_un_giro_solo_e_viene_consumato() {
+        let (gate, tools, n) = scenario_approve();
         let ctx = ctx_con_gate(gate.clone());
         let mut st = batch_rm_rf();
-        st.extra.insert(
-            crate::decisions::step_gate::STEP_GATE_CLEARED_EXTRA_KEY.to_string(),
-            super::ids_del_batch(&st.pending_tool_uses.clone().unwrap()),
+        st.step_gate_human_ok = Some(true);
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(*gate.chiamate.lock().unwrap(), 0, "permesso fresco: non si ri-valida");
+        assert_eq!(tools.seen.lock().unwrap().len(), 1, "il batch approvato si esegue");
+        assert_eq!(
+            out.step_gate_human_ok,
+            Some(false),
+            "il permesso e' consumato dal turno che lo usa"
         );
-        let _ = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
-        assert_eq!(*gate.chiamate.lock().unwrap(), 0, "stessi id: non si ri-valida");
 
-        // Id nuovi: il marker non matcha, la porta viene convocata.
-        let mut st2 = state_with_pending(vec![pending_tool(
+        // Batch successivo senza permesso: la porta viene convocata.
+        let st2 = state_with_pending(vec![pending_tool(
             "k2",
             "run_command",
             json!({"command": "rm -rf /srv/dati"}),
         )]);
-        st2.extra = st.extra.clone();
         let _ = apply(st2.clone(), n.run(&st2, &ctx).await.expect("run ok"));
-        assert_eq!(*gate.chiamate.lock().unwrap(), 1, "id nuovi: validazione fresca");
+        assert_eq!(*gate.chiamate.lock().unwrap(), 1, "batch nuovo: validazione fresca");
+    }
+
+    /// IL DIFETTO MISURATO IN ESERCIZIO (run 77fcff4a, 05/08/2026): dopo un
+    /// `NeedsHuman` il grafo rientra nel dispatch con gli STESSI pending, e il
+    /// gate deve riconvocare — non trovare un lasciapassare che si era
+    /// scritto da solo sospendendo. Mutazione: far scrivere alla sospensione
+    /// un marker di batch deliberato -> la seconda convocazione sparisce e
+    /// il `rm -rf` passa, esattamente come in produzione.
+    #[tokio::test]
+    async fn dopo_la_sospensione_il_rientro_riconvoca_e_non_esegue() {
+        use crate::decisions::step_gate::StepVerdict;
+        let mut astenuto = verdetto("challenger", StepVerdict::Abstained);
+        astenuto.abstain_cause = Some("billing".into());
+        let gate = Arc::new(StubStepGate {
+            report: ports::StepValidationReport {
+                verdicts: vec![verdetto("gatekeeper", StepVerdict::Approve), astenuto],
+                degraded: None,
+            },
+            chiamate: std::sync::Mutex::new(0),
+        });
+        let tools = Arc::new(MapToolExecutor::new());
+        let (n, _steps, _rc) = node(cfg_gate(), tools.clone());
+        let ctx = ctx_con_gate(gate.clone());
+
+        // Primo giro: il gate sospende.
+        let st = batch_rm_rf();
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(out.awaiting_confirmation, Some(true));
+        assert!(tools.seen.lock().unwrap().is_empty(), "nulla eseguito");
+
+        // Rientro nel dispatch con lo stato PRODOTTO dal giro precedente e gli
+        // stessi pending: nessun permesso umano e' arrivato, quindi il gate
+        // riconvoca e il comando resta fermo.
+        let mut rientro = out.clone();
+        rientro.pending_tool_uses = st.pending_tool_uses.clone();
+        let _ = apply(rientro.clone(), n.run(&rientro, &ctx).await.expect("run ok"));
+        assert_eq!(
+            *gate.chiamate.lock().unwrap(),
+            2,
+            "senza decisione umana il batch si rivalida, non passa"
+        );
+        assert!(
+            tools.seen.lock().unwrap().is_empty(),
+            "il comando irreversibile NON deve essere eseguito"
+        );
     }
 
     /// REGOLA O (il test attraversa il PRODUTTORE dello stato): in Automatic

@@ -329,21 +329,13 @@ pub const STEP_GATE_REJECTIONS_EXTRA_KEY: &str = "step_gate_rejections";
 /// duale: l'umano decide VEDENDO cosa hanno detto i validatori.
 pub const STEP_GATE_VERDICTS_EXTRA_KEY: &str = "step_gate_verdicts";
 
-/// Chiave `extra` degli id del BATCH gia' deliberato dal gate (validato dalle
-/// macchine e/o approvato dall'umano al resume). Il corto-circuito
-/// anti-rivalidazione legge QUESTA, mai `state.approved`: quel flag
-/// conflaziona «l'umano ha approvato questo batch» con «questa modalita'
-/// salta HITL» (in Automatic/Continuous e' seminato a `true` dallo stato
-/// iniziale), e leggerlo spegneva il gate proprio nella modalita' per cui
-/// esiste — trovato dalla review avversaria del 05/08 PRIMA del commit.
-pub const STEP_GATE_CLEARED_EXTRA_KEY: &str = "step_gate_cleared_batch";
-
-/// Gli id di un batch nella forma CANONICA del marker (ordinati: il confronto
-/// e' fra insiemi, l'ordine dei pending non e' parte dell'identita').
-pub fn batch_ids(pending_ids: &mut [String]) -> Value {
-    pending_ids.sort();
-    Value::Array(pending_ids.iter().cloned().map(Value::String).collect())
-}
+// Il permesso di eseguire un batch dopo una sospensione NON e' una chiave
+// `extra`: e' il campo tipizzato `AgentState::step_gate_human_ok`, scritto dal
+// RESUME (la risposta dell'umano) e consumato dal dispatch in un solo giro.
+// Qui c'era un marker con gli id del batch, scritto alla SOSPENSIONE: dichiarava
+// deliberato un batch mentre se ne chiedeva la decisione, e al rientro nel
+// dispatch lo faceva passare senza rivalidazione (run 77fcff4a del 05/08/2026:
+// `rm -rf` eseguito 482ms dopo il proprio `NeedsHuman`).
 
 /// Kind del meta_step di ogni convocazione/osservazione del gate (payload
 /// slim coi validatori: provider, modello, verdetto|astensione+causa, costo).

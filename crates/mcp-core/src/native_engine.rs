@@ -3614,6 +3614,15 @@ fn build_resume_delta(
             ResumeKind::PlanApproval => Some(Some(true)),
             ResumeKind::ToolApproval => None,
         },
+        // Permesso FRESCO per il batch che l'umano ha appena approvato: il
+        // gate duale non riconvoca i validatori su QUEL giro (ribalterebbero
+        // una decisione umana, o la riproporrebbero all'infinito), e il
+        // dispatch lo consuma subito dopo. Solo per l'approvazione dei TOOL:
+        // quella del PIANO non tocca i mutatori concreti (rilievo A2).
+        step_gate_human_ok: match kind {
+            ResumeKind::ToolApproval => Some(Some(true)),
+            ResumeKind::PlanApproval => None,
+        },
         // Ripara automation_mode su checkpoint legacy (None -> HITL spurio).
         automation_mode: parsed_mode.map(Some),
         // Accoda l'approvazione come turno utente: l'executor la rilegge nel

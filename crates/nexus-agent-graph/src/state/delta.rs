@@ -433,6 +433,13 @@ pub struct StateDelta {
         skip_serializing_if = "Option::is_none"
     )]
     pub plan_approved: Option<Option<bool>>,
+    /// Vedi `AgentState::step_gate_human_ok`.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub step_gate_human_ok: Option<Option<bool>>,
     /// Vedi `AgentState::provider_override`.
     #[serde(
         default,

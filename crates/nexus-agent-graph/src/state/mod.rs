@@ -499,6 +499,21 @@ pub struct AgentState {
     /// mutativi concreti — l'utente in Confirm continua a vedere le azioni
     /// reali al primo batch. Un solo flag li avrebbe fusi in silenzio.
     pub plan_approved: Option<bool>,
+    /// L'umano ha appena APPROVATO il batch di tool pendenti, al resume da una
+    /// sospensione HITL. Vale per UN solo giro del dispatch, che lo consuma
+    /// azzerandolo: e' il permesso di eseguire QUEL batch, non uno stato del
+    /// run.
+    ///
+    /// Campo DISTINTO da `approved` perche' quel flag e' seminato a `true`
+    /// dallo stato iniziale in Automatic/Continuous per saltare l'HITL: non
+    /// puo' dire nulla su una decisione presa ADESSO. E scritto dal RESUME,
+    /// mai dalla sospensione: il gate duale segnava il batch come deliberato
+    /// nel momento in cui CHIEDEVA la decisione, e al rientro nel dispatch
+    /// quel marker faceva saltare la rivalidazione — misurato in esercizio il
+    /// 05/08/2026 (run 77fcff4a), dove un `rm -rf` classificato irreversibile
+    /// veniva eseguito 482ms dopo il `NeedsHuman` che avrebbe dovuto
+    /// fermarlo. Una deliberazione nasce dalla risposta, mai dalla domanda.
+    pub step_gate_human_ok: Option<bool>,
     /// Provider forzato dall'esterno (override routing).
     pub provider_override: Option<String>,
     /// Modello forzato dall'esterno (override routing).
