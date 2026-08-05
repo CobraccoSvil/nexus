@@ -1340,11 +1340,18 @@ impl ToolDispatchNode {
                 );
                 None
             }
-            StepGateDecision::NeedsHuman => Some(self.hitl_suspend_delta_con_validazioni(
-                state,
-                pending,
-                Some(payload),
-            )),
+            // IN AUTONOMIA NON SI CHIEDE (regola D): in Automatic/Continuous
+            // l'utente ha scelto di non essere interrotto, e non c'e' nessuno
+            // che sciolga la sospensione — una domanda li' e' un run appeso
+            // fino alla scadenza, non una difesa. Il gate dice NO al passo e
+            // lo rimanda al modello coi motivi: l'agente cambia strada o
+            // chiude `blocked`, che e' l'esito onesto. La sospensione resta
+            // dove qualcuno la puo' sciogliere: Confirm e Studio, dove
+            // `automation_requires_hitl` (punto unico) e' vero.
+            StepGateDecision::NeedsHuman => {
+                self.esito_needs_human(state, pending, report, prior_rejections, run_id, payload)
+                    .await
+            }
             StepGateDecision::Rejected => Some(
                 self.step_gate_reject_delta(state, pending, report, prior_rejections, run_id)
                     .await,
@@ -1484,6 +1491,32 @@ impl ToolDispatchNode {
             Ok(r) => r,
             Err(e) => report_degradato(&format!("porta di validazione in errore: {e}")),
         }
+    }
+
+    /// (2a) Che fare quando il gate rimanda la decisione a un umano: dipende
+    /// da CHI puo' rispondere. In Conferma e Studio l'utente e' al terminale e
+    /// la sospensione ha un destinatario; in Automatic/Continuous ha scelto di
+    /// non essere interrotto (regola D) e nessuno la scioglierebbe — li' il
+    /// gate dice NO al passo e lo rimanda al modello, che cambia strada o
+    /// chiude `blocked`. La domanda «questa modalita' vuole l'umano?» ha gia'
+    /// il suo punto unico: `hitl::automation_requires_hitl`.
+    #[allow(clippy::too_many_arguments)]
+    async fn esito_needs_human(
+        &self,
+        state: &AgentState,
+        pending: &[Value],
+        report: &ports::StepValidationReport,
+        prior_rejections: u32,
+        run_id: &str,
+        payload: Value,
+    ) -> Option<OpaqueDelta> {
+        if crate::decisions::hitl::automation_requires_hitl(state.automation_mode) {
+            return Some(self.hitl_suspend_delta_con_validazioni(state, pending, Some(payload)));
+        }
+        Some(
+            self.step_gate_reject_delta(state, pending, report, prior_rejections, run_id)
+                .await,
+        )
     }
 
     /// Il delta del RIMANDO: nessun tool eseguito, ogni pending riceve un
@@ -2338,7 +2371,6 @@ fn titolo_per_umano(
 /// decidere, distinguendo l'indisponibilita' dei giudici dal loro disaccordo
 /// (sono due situazioni diverse e portano a due azioni diverse).
 fn titolo_serve_conferma(passo: &str, report: &ports::StepValidationReport) -> String {
-    use crate::decisions::step_gate::StepVerdict;
     if report.verdicts.is_empty() {
         let perche = report
             .degraded
@@ -2349,24 +2381,28 @@ fn titolo_serve_conferma(passo: &str, report: &ports::StepValidationReport) -> S
              indipendente ha potuto giudicarlo ({perche})"
         );
     }
-    let riassunto: Vec<String> = report
-        .verdicts
-        .iter()
-        .map(|v| match v.verdict {
-            StepVerdict::Abstained => format!(
-                "{} non ha risposto ({})",
-                v.provider,
-                v.abstain_cause.as_deref().unwrap_or("causa non dichiarata")
-            ),
-            StepVerdict::Approve => format!("{} approva", v.provider),
-            StepVerdict::Reject => format!("{} rifiuta", v.provider),
-            StepVerdict::NeedsHuman => format!("{} rimanda a te", v.provider),
-        })
-        .collect();
+    let riassunto: Vec<String> = report.verdicts.iter().map(riassunto_verdetto).collect();
     format!(
         "Passo {passo}: serve la tua conferma, i validatori non sono unanimi ({})",
         riassunto.join(", ")
     )
+}
+
+/// Come si racconta UN verdetto a chi legge: nome del provider e cosa ha
+/// detto, con la causa quando non ha risposto (un «non ha risposto» senza il
+/// perche' non aiuta a decidere).
+fn riassunto_verdetto(v: &ports::ValidatorVerdict) -> String {
+    use crate::decisions::step_gate::StepVerdict;
+    match v.verdict {
+        StepVerdict::Abstained => format!(
+            "{} non ha risposto ({})",
+            v.provider,
+            v.abstain_cause.as_deref().unwrap_or("causa non dichiarata")
+        ),
+        StepVerdict::Approve => format!("{} approva", v.provider),
+        StepVerdict::Reject => format!("{} rifiuta", v.provider),
+        StepVerdict::NeedsHuman => format!("{} rimanda a te", v.provider),
+    }
 }
 
 /// Un report senza convocati col degrado DICHIARATO (GAP-2: la matrice della
@@ -2416,6 +2452,32 @@ fn payload_convocazione(
     })
 }
 
+/// L'intestazione del rimando dice il motivo VERO: se nessun giudice ha
+/// espresso un verdetto, «rifiutato dai validatori» sarebbe falso e non
+/// aiuterebbe l'agente a cambiare strada. In autonomia questo testo e' tutto
+/// cio' che riceve per decidere cosa fare dopo.
+fn intestazione_rimando(report: &ports::StepValidationReport) -> String {
+    use crate::decisions::step_gate::StepVerdict;
+    let nessun_rifiuto = !report
+        .verdicts
+        .iter()
+        .any(|v| v.verdict == StepVerdict::Reject);
+    if nessun_rifiuto {
+        let perche = report
+            .degraded
+            .as_deref()
+            .unwrap_or("nessun validatore indipendente disponibile");
+        return format!(
+            "Il gate sui passi critici NON ha potuto autorizzare questo batch e \
+             nessun tool e' stato eseguito: {perche}. In modalita' autonoma non \
+             si chiede conferma all'utente, quindi il passo resta non eseguito."
+        );
+    }
+    "Il gate di validazione sui passi critici ha RIFIUTATO questo batch: \
+     nessun tool e' stato eseguito."
+        .to_string()
+}
+
 /// Il testo del rimando del gate duale, composto DAI campi del report (regola
 /// Q, punto 3: renderer struttura->prosa; il consumatore e' il modello).
 fn testo_rimando(report: &ports::StepValidationReport) -> String {
@@ -2432,10 +2494,10 @@ fn testo_rimando(report: &ports::StepValidationReport) -> String {
         }
     }
     let mut testo = format!(
-        "Il gate di validazione sui passi critici ha RIFIUTATO questo batch: \
-         nessun tool e' stato eseguito.\nMotivi:\n{}",
+        "{}\nMotivi:\n{}",
+        intestazione_rimando(report),
         if motivi.is_empty() {
-            "- (nessun motivo dettagliato riportato)".to_string()
+            "- (nessun verdetto espresso dai validatori)".to_string()
         } else {
             motivi
                 .iter()
@@ -4487,8 +4549,47 @@ mod tests {
         );
     }
 
+    /// IN AUTONOMIA NON SI CHIEDE (regola D): con lo stesso disaccordo che in
+    /// Confirm sospende, in Automatic il gate RIFIUTA il passo e lo rimanda al
+    /// modello — nessuna domanda a cui nessuno risponderebbe, nessun run
+    /// appeso. Mutazione: far sospendere anche in Automatic (com'era) ->
+    /// `awaiting_confirmation` torna `Some(true)` e il rimando sparisce.
+    #[tokio::test]
+    async fn in_automatico_il_gate_rifiuta_invece_di_chiedere() {
+        use crate::decisions::step_gate::StepVerdict;
+        let mut astenuto = verdetto("challenger", StepVerdict::Abstained);
+        astenuto.abstain_cause = Some("billing".into());
+        let gate = Arc::new(StubStepGate {
+            report: ports::StepValidationReport {
+                verdicts: vec![verdetto("gatekeeper", StepVerdict::Approve), astenuto],
+                degraded: None,
+            },
+            chiamate: std::sync::Mutex::new(0),
+        });
+        let tools = Arc::new(MapToolExecutor::new());
+        let (n, _steps, _rc) = node(cfg_gate(), tools.clone());
+        let ctx = ctx_con_gate(gate);
+        // `state_with_pending` costruisce gia' un run in Automatic.
+        let st = batch_rm_rf();
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+
+        assert_ne!(
+            out.awaiting_confirmation,
+            Some(true),
+            "in autonomia il gate non mette il run in attesa di un umano"
+        );
+        assert!(tools.seen.lock().unwrap().is_empty(), "il passo resta NON eseguito");
+        let blocks = blocks_of(out.messages.last().expect("msg"));
+        let content = blocks[0]["content"].as_str().unwrap();
+        assert!(
+            content.contains("non si chiede conferma all'utente"),
+            "il rimando dice all'agente perche' il passo non e' passato: {content}"
+        );
+    }
+
     /// NEEDS_HUMAN (approve + astensione, GAP-2: l'astensione non e' un si'):
-    /// sospensione HITL anche in Automatic, verdetti allegati in extra.
+    /// in CONFERMA — dove qualcuno puo' scioglierla — la sospensione resta, coi
+    /// verdetti allegati in extra.
     #[tokio::test]
     async fn gate_duale_astensione_sospende_con_verdetti_allegati() {
         use crate::decisions::step_gate::StepVerdict;
@@ -4504,14 +4605,18 @@ mod tests {
         let tools = Arc::new(MapToolExecutor::new());
         let (n, _steps, _rc) = node(cfg_gate(), tools.clone());
         let ctx = ctx_con_gate(gate);
-        let st = state_with_pending(vec![pending_tool(
+        let mut st = state_with_pending(vec![pending_tool(
             "k1",
             "run_command",
             json!({"command": "rm -rf /srv/dati"}),
         )]);
+        // In CONFERMA la sospensione ha un destinatario: l'utente e' al
+        // terminale e la card gli mostra i verdetti. In Automatic il gate
+        // rifiuta invece di chiedere (test `in_automatico_il_gate_rifiuta`).
+        st.automation_mode = Some(crate::state::AutomationMode::Confirm);
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         assert!(tools.seen.lock().unwrap().is_empty(), "NESSUN tool eseguito");
-        assert_eq!(out.awaiting_confirmation, Some(true), "sospeso anche in Automatic");
+        assert_eq!(out.awaiting_confirmation, Some(true), "sospeso in Conferma");
         let verdetti = out
             .extra
             .get(crate::decisions::step_gate::STEP_GATE_VERDICTS_EXTRA_KEY)
@@ -4608,8 +4713,11 @@ mod tests {
         let (n, _steps, _rc) = node(cfg_gate(), tools.clone());
         let ctx = ctx_con_gate(gate.clone());
 
-        // Primo giro: il gate sospende.
-        let st = batch_rm_rf();
+        // Primo giro: il gate sospende. In CONFERMA, che e' dove la
+        // sospensione esiste — ed e' esattamente li' che il marker scritto
+        // alla sospensione faceva passare il batch al rientro.
+        let mut st = batch_rm_rf();
+        st.automation_mode = Some(crate::state::AutomationMode::Confirm);
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.awaiting_confirmation, Some(true));
         assert!(tools.seen.lock().unwrap().is_empty(), "nulla eseguito");
