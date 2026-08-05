@@ -217,17 +217,7 @@ mod tests {
     /// Imposta un settings applicativo sovrascrivendo l'eventuale riga reale
     /// seminata dalla migrazione (regola O: stesso schema, chiavi deterministiche
     /// per il test).
-    async fn set_setting(pool: &PgPool, key: &str, value: &str) {
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES ($1, $2) \
-             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        )
-        .bind(key)
-        .bind(value)
-        .execute(pool)
-        .await
-        .expect("set setting");
-    }
+    use crate::test_support::seed_setting as set_setting;
 
     #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn context_window_legge_il_max(pool: PgPool) {

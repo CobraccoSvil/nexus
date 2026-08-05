@@ -1570,14 +1570,12 @@ mod tests {
     /// mentre lo stavo introducendo.
     #[sqlx::test]
     async fn il_pavimento_non_alza_mai_il_tier_richiesto(pool: sqlx::PgPool) {
-        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            .execute(&pool)
-            .await
-            .expect("settings");
-        sqlx::query("INSERT INTO settings (key, value) VALUES ('agent.routing.agentic_min_tier', 'medium')")
-            .execute(&pool)
-            .await
-            .expect("seed");
+        crate::test_support::create_settings_table_with(
+            &pool,
+            "agent.routing.agentic_min_tier",
+            "medium",
+        )
+        .await;
 
         // Chi chiede MENO del pavimento resta dov'e': nessuna promozione.
         assert_eq!(purpose_floor(&pool, "light").await, "light");

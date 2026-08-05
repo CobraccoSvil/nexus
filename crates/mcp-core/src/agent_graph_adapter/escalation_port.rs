@@ -962,18 +962,11 @@ mod tests {
 
     /// Marca un provider come disponibile impostando la API key in `settings`.
     /// La mig 0002 semina gia' `openai_api_key`/`anthropic_api_key`/
-    /// `google_api_key` (valore vuoto): ON CONFLICT sovrascrive col valore del
-    /// test invece di fallire sulla PK.
+    /// `google_api_key` (valore vuoto): il punto unico e' upsert, quindi
+    /// sovrascrive col valore del test invece di fallire sulla PK. La `category`
+    /// non entra: nessuna lettura di questo percorso la guarda.
     async fn set_api_key(pool: &PgPool, provider: &str, value: &str) {
-        sqlx::query(
-            "INSERT INTO settings (key, value, category) VALUES ($1, $2, 'providers') \
-             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        )
-        .bind(format!("{provider}_api_key"))
-        .bind(value)
-        .execute(pool)
-        .await
-        .expect("insert api key");
+        crate::test_support::seed_setting(pool, &format!("{provider}_api_key"), value).await;
     }
 
     /// La catena e' DERIVATA dal catalog (vista v_model_escalation_chain): enumera
@@ -1421,14 +1414,12 @@ mod tests {
     #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn per_tier_zero_riporta_al_solo_ripiego_dichiarato(pool: PgPool) {
         scena_catena_intra_al_massimo(&pool).await;
-        sqlx::query(
-            "INSERT INTO settings (key, value, category) \
-             VALUES ('agent.escalation.cross_provider_candidates_per_tier', '0', 'agent') \
-             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        crate::test_support::seed_setting(
+            &pool,
+            "agent.escalation.cross_provider_candidates_per_tier",
+            "0",
         )
-        .execute(&pool)
-        .await
-        .expect("spegni l'insieme");
+        .await;
         let port = PgEscalationPort::new(pool.clone());
         let inputs = port
             .escalation_inputs(

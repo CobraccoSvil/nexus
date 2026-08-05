@@ -4840,27 +4840,7 @@ mod tests {
         let _adapter = GatewayLlmAdapter::new(gw, pool, String::new(), String::new());
     }
 
-    /// Tabella `settings` minimale (key, value) per i test DB-driven delle config.
-    async fn create_settings_table(pool: &sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE settings ( \
-                 key   TEXT PRIMARY KEY, \
-                 value TEXT \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create settings");
-    }
-
-    async fn set_setting(pool: &sqlx::PgPool, key: &str, value: &str) {
-        sqlx::query("INSERT INTO settings (key, value) VALUES ($1, $2)")
-            .bind(key)
-            .bind(value)
-            .execute(pool)
-            .await
-            .expect("insert setting");
-    }
+    use crate::test_support::{create_settings_table, seed_setting as set_setting};
 
     #[sqlx::test]
     async fn planner_config_db_driven_legge_orchestrator_settings(pool: sqlx::PgPool) {
@@ -4950,18 +4930,9 @@ mod tests {
     }
 
     /// Scrive un setting sullo schema REALE (le migrazioni seminano gia' molte
-    /// chiavi: un INSERT nudo andrebbe in conflitto).
-    async fn upsert_setting(pool: &sqlx::PgPool, key: &str, value: &str) {
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES ($1, $2) \
-             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        )
-        .bind(key)
-        .bind(value)
-        .execute(pool)
-        .await
-        .expect("upsert setting");
-    }
+    /// chiavi: un INSERT nudo andrebbe in conflitto). Il punto unico e' upsert
+    /// per questa ragione, e invalida la cache di lettura.
+    use crate::test_support::seed_setting as upsert_setting;
 
     /// Il BLOCCO di config del tool_dispatch arriva dal DB (regola G). Prima
     /// `run_engine` ne risolveva 3 campi su 12 e chiudeva con
@@ -5278,14 +5249,8 @@ mod tests {
         create_settings_table(&pool).await;
         assert_eq!(resolve_tokenizer_kind(&pool).await, TokenizerKind::Chars);
         set_setting(&pool, "agent.context.tokenizer", "cl100k_base").await;
-        // Scrittura diretta: lettura cache-ata, il test invalida esplicitamente.
-        nexus_auth::invalidate_setting_cache(&pool, "agent.context.tokenizer");
         assert_eq!(resolve_tokenizer_kind(&pool).await, TokenizerKind::Cl100k);
-        sqlx::query("UPDATE settings SET value = 'chars' WHERE key = 'agent.context.tokenizer'")
-            .execute(&pool)
-            .await
-            .expect("update setting");
-        nexus_auth::invalidate_setting_cache(&pool, "agent.context.tokenizer");
+        set_setting(&pool, "agent.context.tokenizer", "chars").await;
         assert_eq!(resolve_tokenizer_kind(&pool).await, TokenizerKind::Chars);
     }
 

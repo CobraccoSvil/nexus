@@ -74,31 +74,7 @@ mod tests {
     use super::*;
     use sqlx::PgPool;
 
-    /// Crea la tabella `settings` minimale per i test (stesse colonne della
-    /// migrazione 0002): key/value/category/description/is_secret/updated_at.
-    async fn create_settings_table(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS settings (\
-                key TEXT PRIMARY KEY, \
-                value TEXT NOT NULL DEFAULT '', \
-                category TEXT NOT NULL DEFAULT 'general', \
-                description TEXT NOT NULL DEFAULT '', \
-                is_secret BOOLEAN NOT NULL DEFAULT FALSE, \
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
-        )
-        .execute(pool)
-        .await
-        .expect("create settings");
-    }
-
-    async fn set_flag(pool: &PgPool, key: &str, value: &str) {
-        sqlx::query("INSERT INTO settings (key, value) VALUES ($1, $2)")
-            .bind(key)
-            .bind(value)
-            .execute(pool)
-            .await
-            .expect("insert flag");
-    }
+    use crate::test_support::{create_settings_table, seed_setting as set_flag};
 
     /// Chiave presente e non vuota -> compare nella mappa col suo valore RAW.
     #[sqlx::test]

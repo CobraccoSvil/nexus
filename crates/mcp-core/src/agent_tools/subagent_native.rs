@@ -5686,10 +5686,7 @@ mod tests {
     /// (b152ef0d) conterebbe su un denominatore sbagliato.
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn spawn_fanout_traduce_il_panic_in_esito_strutturato(pool: sqlx::PgPool) {
-        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            .execute(&pool)
-            .await
-            .expect("settings");
+        crate::test_support::create_settings_table(&pool).await;
         // Scope Nested: il test resta ermetico (non tocca il semaforo di
         // processo globale OnceCell, condiviso tra i test).
         let out = spawn_fanout(&pool, 3, FanoutScope::Nested, |i| async move {
@@ -5786,27 +5783,14 @@ mod tests {
     /// Il tetto di concorrenza viene dal DB (regola G) e clampa a >=1.
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn fanout_max_parallel_dal_db(pool: sqlx::PgPool) {
-        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            .execute(&pool)
-            .await
-            .expect("settings");
+        const K: &str = "orchestrator.subagent_fanout_max_parallel";
+        crate::test_support::create_settings_table(&pool).await;
         // Riga assente -> default storico (nessun tetto piu' stretto del
         // fan-out nominale del consiglio).
         assert_eq!(fanout_max_parallel(&pool).await, DEFAULT_FANOUT_MAX_PARALLEL);
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES ('orchestrator.subagent_fanout_max_parallel', '2')",
-        )
-        .execute(&pool)
-        .await
-        .expect("insert");
-        // Scrittura diretta: lettura cache-ata, il test invalida esplicitamente.
-        nexus_auth::invalidate_setting_cache(&pool, "orchestrator.subagent_fanout_max_parallel");
+        crate::test_support::seed_setting(&pool, K, "2").await;
         assert_eq!(fanout_max_parallel(&pool).await, 2, "il DB governa (regola G)");
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'orchestrator.subagent_fanout_max_parallel'")
-            .execute(&pool)
-            .await
-            .expect("update");
-        nexus_auth::invalidate_setting_cache(&pool, "orchestrator.subagent_fanout_max_parallel");
+        crate::test_support::seed_setting(&pool, K, "0").await;
         assert_eq!(
             fanout_max_parallel(&pool).await,
             DEFAULT_FANOUT_MAX_PARALLEL,
@@ -8189,12 +8173,7 @@ mod tests {
     /// Mig 0555: purpose ultracode da settings con fallback a model_purpose.
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn ultracode_purpose_da_settings_con_fallback(pool: sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-        )
-        .execute(&pool)
-        .await
-        .expect("settings");
+        crate::test_support::create_settings_table(&pool).await;
         sqlx::query(
             "CREATE TABLE nexus_purpose_model ( \
                  purpose TEXT PRIMARY KEY, \
@@ -8223,16 +8202,16 @@ mod tests {
             .expect("purpose");
             seed_catalog_row(&pool, provider, model, tier, 1.0).await;
         }
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES \
-             ('orchestrator.ultracode_tier_diversity_enabled', 'true'), \
-             ('orchestrator.ultracode_implement_purpose', 'worker_implement'), \
-             ('orchestrator.ultracode_verify_purpose', 'worker_verify'), \
-             ('orchestrator.ultracode_review_purpose', 'reviewer')",
+        crate::test_support::seed_settings(
+            &pool,
+            &[
+                ("orchestrator.ultracode_tier_diversity_enabled", "true"),
+                ("orchestrator.ultracode_implement_purpose", "worker_implement"),
+                ("orchestrator.ultracode_verify_purpose", "worker_verify"),
+                ("orchestrator.ultracode_review_purpose", "reviewer"),
+            ],
         )
-        .execute(&pool)
-        .await
-        .expect("settings");
+        .await;
         let def = SubagentDefinition {
             prompt_key: "x".to_string(),
             tool_whitelist: vec![],

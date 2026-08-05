@@ -380,18 +380,9 @@ mod tests {
     /// quello di default apposta: se la lettura dal DB non avvenisse, il branch
     /// nascerebbe altrove e `ls-tree` fallirebbe invece di passare in silenzio.
     async fn crea_settings(pool: &PgPool, prefix: &str) {
-        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            .execute(pool)
-            .await
-            .expect("create table settings");
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES \
-             ('agent.autocommit.enabled', 'true'), ('agent.autocommit.branch_prefix', $1)",
-        )
-        .bind(prefix)
-        .execute(pool)
-        .await
-        .expect("seed settings autocommit");
+        crate::test_support::create_settings_table_with(pool, "agent.autocommit.enabled", "true")
+            .await;
+        crate::test_support::seed_setting(pool, "agent.autocommit.branch_prefix", prefix).await;
     }
 
     /// Soppressione FASE 2 (buco B2): con `isolated_subrun=true` la funzione e' un

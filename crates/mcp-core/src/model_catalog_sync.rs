@@ -2651,8 +2651,21 @@ async fn fetch_provider_models(
 mod tests {
     use super::*;
 
-
-
+    /// Soglie del tier relativo che quattro test seminavano con lo STESSO
+    /// `INSERT` multi-riga ricopiato: una sola definizione, e il seed passa dal
+    /// punto unico (che invalida la cache di lettura, chiave per chiave).
+    const SOGLIE_TIER_RELATIVO: &[(&str, &str)] = &[
+        ("catalog.tier_prior.enabled", "true"),
+        ("catalog.tier_relative.frontier_pct", "0.85"),
+        ("catalog.tier_relative.heavy_pct", "0.65"),
+        ("catalog.tier_relative.high_pct", "0.45"),
+        ("catalog.tier_relative.medium_pct", "0.20"),
+        ("catalog.tier_relative.anchor", "54"),
+        ("catalog.tier_relative.anchor_model", "p/leader"),
+        ("catalog.tier_relative.anchor_at", ""),
+        ("catalog.tier_relative.anchor_deadband_pct", "0.03"),
+        ("catalog.agentic_index_sync.max_age_hours", "168"),
+    ];
 
 
     #[test]
@@ -3172,12 +3185,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("pulizia catalog");
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        )
-        .execute(&pool)
-        .await
-        .expect("soglie");
+        crate::test_support::seed_settings(&pool, SOGLIE_TIER_RELATIVO).await;
         // IL CASO REALE: mistral-large-2512 — costa poco ma ha una finestra enorme
         // (il vecchio prior prezzo+finestra diceva 'heavy') e un agentic_index
         // bassissimo. Solo l'indice parla (mig 0608).
@@ -3220,12 +3228,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("pulizia catalog");
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        )
-        .execute(&pool)
-        .await
-        .expect("soglie");
+        crate::test_support::seed_settings(&pool, SOGLIE_TIER_RELATIVO).await;
         // L'indice e' di un mese fa: STANTIO -> non deriva un tier nuovo. Ma il
         // tier gia' presente resta: toglierlo significherebbe togliere il
         // modello dal routing.
@@ -3268,12 +3271,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("pulizia catalog");
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        )
-        .execute(&pool)
-        .await
-        .expect("soglie");
+        crate::test_support::seed_settings(&pool, SOGLIE_TIER_RELATIVO).await;
         sqlx::query(
             "INSERT INTO ai_price_catalog              (provider, model, agentic_index, agentic_index_at, performance_tier, tier_source, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at)              VALUES              ('anthropic', 'opus-fossile', 44.4, NOW(), 'medium', NULL, 1.0, 1.0, 'USD', NOW()),              ('x', 'gia-misurato',  10.0, NOW(), 'frontier', 'measured', 1.0, 1.0, 'USD', NOW()),              ('x', 'senza-indice',  NULL, NULL,  'heavy', NULL, 1.0, 1.0, 'USD', NOW())",
         )
@@ -3326,12 +3324,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("pulizia catalog");
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        )
-        .execute(&pool)
-        .await
-        .expect("soglie");
+        crate::test_support::seed_settings(&pool, SOGLIE_TIER_RELATIVO).await;
         // Tier 'heavy' fossile (fonte ignota) e indice fresco 36.4 -> heavy: il
         // VALORE non cambia, la PROVENIENZA si'.
         sqlx::query(
@@ -3373,10 +3366,7 @@ mod tests {
         .execute(pool)
         .await
         .expect("registry table");
-        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            .execute(pool)
-            .await
-            .expect("settings table");
+        crate::test_support::create_settings_table(pool).await;
     }
 
     /// PEZZO 1 (regola G+L, test via il produttore reale — regola O): la lista
@@ -3402,20 +3392,26 @@ mod tests {
         .execute(&pool)
         .await
         .expect("seed registry");
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES \
-              ('openai_en','true'),('openai_key','sk-1'), \
-              ('google_en','true'),('google_key','g-1'), \
-              ('openrouter_en','true'),('openrouter_key','or-1'), \
-              ('spento_en','false'),('spento_key','sk-2'), \
-              ('senza_key_en','true'),('senza_key_key',''), \
-              ('vllm_ok_url','http://127.0.0.1:8000/v1'), \
-              ('vllm_vuoto_url',''), \
-              ('inattivo_en','true'),('inattivo_key','sk-3')",
+        crate::test_support::seed_settings(
+            &pool,
+            &[
+                ("openai_en", "true"),
+                ("openai_key", "sk-1"),
+                ("google_en", "true"),
+                ("google_key", "g-1"),
+                ("openrouter_en", "true"),
+                ("openrouter_key", "or-1"),
+                ("spento_en", "false"),
+                ("spento_key", "sk-2"),
+                ("senza_key_en", "true"),
+                ("senza_key_key", ""),
+                ("vllm_ok_url", "http://127.0.0.1:8000/v1"),
+                ("vllm_vuoto_url", ""),
+                ("inattivo_en", "true"),
+                ("inattivo_key", "sk-3"),
+            ],
         )
-        .execute(&pool)
-        .await
-        .expect("seed settings");
+        .await;
 
         let got = providers_da_sincronizzare(&pool).await.expect("query");
 

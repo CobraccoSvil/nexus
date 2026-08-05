@@ -792,6 +792,42 @@ else
   fi
 fi
 
+# ── fixture-settings (2026-08-05) ───────────────────────────────────────────
+# Gemello del check sopra per una tabella META: `settings` non e' nel set
+# project, quindi PROJECT_MIGRATOR non la porta e la fixture esplicita resta
+# necessaria — ma UNA sola, in mcp_core::test_support.
+#
+# Il difetto misurato: quattordici `mod tests` di mcp-core la ricreavano a mano,
+# gia' divergenti fra loro (quattro colonne in ui_flags, tre in
+# governance_telemetry, due altrove, e un `value TEXT` NULLABLE in native_engine
+# dove la mig 0002 dice `NOT NULL DEFAULT ''`). Il secondo motivo e' la cache:
+# `nexus_auth::get_setting` legge attraverso una cache di PROCESSO con TTL 60s,
+# quindi un seed scritto con una query propria resta invisibile alla rilettura
+# per piu' della durata dell'intera suite. Quattro moduli l'avevano scoperto da
+# soli e invalidavano a mano; il quinto (agent_tools::testing) se n'era
+# dimenticato. Il punto unico invalida accanto al seed, come fa la produzione in
+# `update_setting_value`.
+#
+# COSA NON COPRE: le scritture diverse dalla creazione (un `UPDATE settings`
+# nudo dentro un test su DB migrato resta possibile). Il check e' sulla forma
+# che si puo' riconoscere senza falsi positivi; il resto lo tiene la fixture,
+# che e' l'unica strada comoda.
+settings_hits="$(grep -rnE 'CREATE TABLE (IF NOT EXISTS )?(public\.)?settings[[:space:](]' \
+  crates/mcp-core --include='*.rs' --exclude-dir=target 2>/dev/null \
+  | grep -v 'src/test_support.rs' | grep -vE ':[0-9]+:\s*(//|/\*|\*)' || true)"
+if [[ -n "$settings_hits" ]]; then
+  echo "!! fixture-settings: tabella 'settings' ricreata a mano in un test di mcp-core:" >&2
+  printf '%s' "$settings_hits" | sed 's/^/     /' >&2
+  echo "   Delega al punto unico (regola L):" >&2
+  echo "     crate::test_support::create_settings_table(&pool).await;" >&2
+  echo "     crate::test_support::seed_setting(&pool, chiave, valore).await;" >&2
+  echo "   Il seed invalida la cache di processo: senza, la rilettura vede il" >&2
+  echo "   valore precedente per 60 secondi (regola F, test indipendenti)." >&2
+  fail=1
+else
+  echo "OK fixture-settings: la tabella settings nasce dal punto unico"
+fi
+
 # ── migrazione-stub ─────────────────────────────────────────────────────────
 # Una migrazione il cui corpo e' solo `SELECT 1;` occupa un numero di versione
 # senza contenerne lo schema: e' informazione distrutta in modo irrecuperabile.

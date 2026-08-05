@@ -415,29 +415,19 @@ impl TodoStore for PgTodoStore {
 mod tests {
     use super::*;
 
-    /// Tabelle META che il set project NON contiene (la config globale vive nel
-    /// meta-DB, regola G) e che quindi restano a carico del test.
-    async fn create_meta_schema(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE settings ( \
-                 key TEXT PRIMARY KEY, \
-                 value TEXT NOT NULL \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create settings");
-    }
-
     /// Preambolo comune: tabelle meta + un run con il suo piano. Ritorna il
     /// `run_id` su cui i todo sono inseribili.
+    ///
+    /// La tabella META `settings` (la config globale vive nel meta-DB, regola G)
+    /// non e' nel set project, quindi resta a carico del test — ma dal punto
+    /// unico, non da un `CREATE TABLE` locale.
     ///
     /// Il piano non e' decorazione: `nexus_agent_todos.run_id` e' vincolato da
     /// una FK verso `nexus_agent_plans(run_id)`, quindi un todo senza piano - che
     /// la vecchia fixture a mano, priva di FK, accettava - in produzione non puo'
     /// esistere.
     async fn setup_run_con_piano(pool: &PgPool) -> Uuid {
-        create_meta_schema(pool).await;
+        crate::test_support::create_settings_table(pool).await;
         let run_id = Uuid::new_v4();
         crate::test_support::seed_plan(pool, run_id, Uuid::new_v4()).await;
         run_id
@@ -691,16 +681,8 @@ mod tests {
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn build_reminder_render_quando_attivo_e_sopra_soglia(pool: PgPool) {
         let run_id = setup_run_con_piano(&pool).await;
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES ('orchestrator.plan_phase_enabled', 'true')",
-        )
-        .execute(&pool)
-        .await
-        .expect("set flag");
-        sqlx::query("INSERT INTO settings (key, value) VALUES ('orchestrator.todo_reminder_min_todos', '3')")
-            .execute(&pool)
-            .await
-            .expect("set soglia");
+        crate::test_support::seed_setting(&pool, "orchestrator.plan_phase_enabled", "true").await;
+        crate::test_support::seed_setting(&pool, "orchestrator.todo_reminder_min_todos", "3").await;
         insert_todo(&pool, run_id, 1, "fatto", "completed", &[]).await;
         insert_todo(&pool, run_id, 2, "in corso", "in_progress", &[]).await;
         insert_todo(&pool, run_id, 3, "da fare", "pending", &[]).await;
