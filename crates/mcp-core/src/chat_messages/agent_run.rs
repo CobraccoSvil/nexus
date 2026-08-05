@@ -4695,7 +4695,7 @@ pub(crate) async fn compose_agent_system_text(
     // non variabili: cambiano quando il distillatore gira o l'utente le corregge,
     // non con la domanda del turno — quindi entrano nel primo gruppo e restano
     // dentro il prefisso riusabile.
-    let apprese = crate::prompt_learned::LearnedInstructions::load(db, project_id)
+    let apprese = nexus_prompt::learned::LearnedInstructions::load(db, project_id)
         .await
         .section(db)
         .await
@@ -4706,10 +4706,10 @@ pub(crate) async fn compose_agent_system_text(
     // template, quindi entra nel primo gruppo e resta nel prefisso riusabile —
     // in coda finirebbe DIETRO il confine di turno appena esiste una parte
     // variabile, fuori dal prefisso e dopo le direttive di turno.
-    let processo = if parts.system_context.contains(crate::prompt_processo::TAG_CHIUSURA) {
+    let processo = if parts.system_context.contains(nexus_prompt::processo::TAG_CHIUSURA) {
         String::new()
     } else {
-        crate::prompt_processo::section(db)
+        nexus_prompt::processo::section(db)
             .await
             .map(|block| format!("\n{block}\n"))
             .unwrap_or_default()
@@ -4753,7 +4753,7 @@ pub(crate) async fn compose_agent_system_text(
     // quindi i piu' esposti a un'indicazione sbagliata sulla piattaforma. Per la
     // chat il fatto e' gia' entrato a monte e la chiamata e' un no-op:
     // `con_ambiente` e' idempotente sul blocco.
-    crate::prompt_ambiente::con_ambiente(db, composto).await
+    nexus_prompt::ambiente::con_ambiente(db, composto).await
 }
 
 /// Logica condivisa: carica progetto, costruisce contesto, avvia AgentLoop in background.
@@ -7786,7 +7786,7 @@ mod tests_prefisso_fra_run {
             compose_agent_system_text(&pool, &recall, project_id, TASK_A, parti_del_progetto())
                 .await;
 
-        let tag = crate::prompt_processo::TAG_APERTURA;
+        let tag = nexus_prompt::processo::TAG_APERTURA;
         assert_eq!(sys.matches(tag).count(), 1, "{sys}");
         // Premessa: la parte variabile esiste (la memoria richiamata e' dietro
         // il confine), altrimenti `parte_stabile` sarebbe l'intero system e la

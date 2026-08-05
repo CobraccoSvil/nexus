@@ -1,0 +1,32 @@
+[package]
+name = "nexus-prompt"
+edition.workspace = true
+version.workspace = true
+
+# Composizione del system prompt: quali blocchi vi entrano e come si rendono.
+#
+# Nasce estraendo da mcp-core i punti unici che il catalogo di CLAUDE.md gia'
+# dichiarava tali. Finche' mcp-core era un binario puro quei moduli non erano
+# richiamabili da nessun altro crate — la regola L chiede che i call site
+# DELEGHINO al punto unico, e fuori da mcp-core non si poteva.
+#
+# Il confine del crate e' il DOMINIO, non la comodita': qui sta cio' che
+# decide il contenuto del prompt. La POSIZIONE dei blocchi resta il punto unico
+# di `nexus-types::system_prompt` (CONFINE_DI_TURNO, parte_stabile), che questo
+# crate usa e non duplica.
+
+[dependencies]
+sqlx.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+nexus-auth = { path = "../nexus-auth" }
+nexus-types = { path = "../nexus-types" }
+nexus-agent-tools = { path = "../nexus-agent-tools" }
+
+[dev-dependencies]
+tokio = { workspace = true }
+nexus-migrations-embedded = { path = "../nexus-migrations-embedded" }
+nexus-test-preconditions = { path = "../nexus-test-preconditions" }
+
+[lints]
+workspace = true

@@ -1813,7 +1813,7 @@ amb_innesto() {
   local file="$1" fn="$2"
   awk -v fn="$fn" '
     index($0, fn) { dentro = 1 }
-    dentro && /prompt_ambiente::con_ambiente/ { print "trovato"; exit }
+    dentro && /nexus_prompt::ambiente::con_ambiente/ { print "trovato"; exit }
     dentro && /^}/ { exit }
   ' "$file" 2>/dev/null
 }
@@ -1848,7 +1848,7 @@ fi
 # 1. La FORMA (tag) vive solo nel modulo: un secondo produttore del tag sarebbe
 #    una seconda autorita' sullo stesso processo.
 assert_single "blocco-processo-prompt" '<processo_implementazione>' \
-  'crates/mcp-core/src/prompt_processo.rs' crates
+  'crates/nexus-prompt/src/processo.rs' crates
 # 2. L'innesto sta DENTRO i tre compositori di system prompt (stessa terna di
 #    `ambiente-dichiarato`): nel chiamante, comporre un prompt di esecuzione
 #    senza processo tornerebbe possibile e la regressione sarebbe invisibile.
@@ -1857,7 +1857,7 @@ proc_innesto() {
   local file="$1" fn="$2"
   awk -v fn="$fn" '
     index($0, fn) { dentro = 1 }
-    dentro && /prompt_processo::/ { print "trovato"; exit }
+    dentro && /nexus_prompt::processo::/ { print "trovato"; exit }
     dentro && /^}/ { exit }
   ' "$file" 2>/dev/null
 }
@@ -1881,7 +1881,7 @@ fi
 #    posto e' la regressione del commit 303e1437 (chi da' pareri trattato come
 #    chi scrive).
 if ! grep -q 'figure_advisory::is_advisory_kind' \
-  crates/mcp-core/src/prompt_processo.rs 2>/dev/null; then
+  crates/nexus-prompt/src/processo.rs 2>/dev/null; then
   echo "!! processo-operativo: prompt_processo non discrimina piu' con is_advisory_kind." >&2
   fail=1
 else
@@ -2031,15 +2031,15 @@ fi
 # secondo lettore che si componesse il blocco per conto proprio riaprirebbe la
 # strada a due idee diverse di "quali regole valgono" e a un ordine non
 # deterministico, che nella parte stabile del system costa il prefisso.
-assert_single "istruzioni-apprese-nel-prompt" 'pub\(crate\) struct LearnedInstructions'   'crates/mcp-core/src/prompt_learned.rs' crates
+assert_single "istruzioni-apprese-nel-prompt" 'pub struct LearnedInstructions'   'crates/nexus-prompt/src/learned.rs' crates
 # La tabella si legge da UN modulo per il prompt: chi la interroga altrove per
 # comporre contesto sta ricreando il punto unico. Restano legittimi il
 # distillatore che la scrive e le rotte admin che la mostrano.
-apprese_fuori="$(grep -rIn -F 'FROM nexus_learned_instructions' --include='*.rs' crates/ 2>/dev/null | grep -v '^crates/mcp-core/src/prompt_learned.rs:' | grep -v '^crates/mcp-core/src/learned_instructions.rs:' || true)"
+apprese_fuori="$(grep -rIn -F 'FROM nexus_learned_instructions' --include='*.rs' crates/ 2>/dev/null | grep -v '^crates/nexus-prompt/src/learned.rs:' | grep -v '^crates/mcp-core/src/learned_instructions.rs:' || true)"
 if [[ -n "$apprese_fuori" ]]; then
   echo "!! istruzioni-apprese-nel-prompt: la tabella e' letta fuori dai due punti ammessi:" >&2
   echo "$apprese_fuori" >&2
-  echo "   Per il PROMPT esiste crates/mcp-core/src/prompt_learned.rs (regola L)." >&2
+  echo "   Per il PROMPT esiste crates/nexus-prompt/src/learned.rs (regola L)." >&2
   fail=1
 else
   echo "OK istruzioni-apprese-nel-prompt: la tabella resta ai due punti ammessi"

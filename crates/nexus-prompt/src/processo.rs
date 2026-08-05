@@ -9,7 +9,7 @@
 //! avrebbe raggiunto solo le figure di OGGI: una figura creata domani dal
 //! FigureWizard (che scrive `subagent.<kind>.base` a runtime) non passa da
 //! nessuna migrazione e nascerebbe senza processo — la stessa lezione di
-//! [`crate::prompt_memories`], dove il consumo su un ramo solo lascio' l'altro
+//! `prompt_memories` (in mcp-core), dove il consumo su un ramo solo lascio' l'altro
 //! percorso scoperto senza che nessuno se ne accorgesse. L'innesto vive quindi
 //! DENTRO i tre compositori di system prompt: la chat
 //! (`chat_messages::handlers::compose_chat_system_context`), il run agentico
@@ -39,14 +39,14 @@ use sqlx::PgPool;
 
 /// Tag di apertura del blocco: la FORMA vive solo qui (guard
 /// `processo-operativo` in check-single-source.sh). Il testo vero e' nel DB.
-pub(crate) const TAG_APERTURA: &str = "<processo_implementazione>";
+pub const TAG_APERTURA: &str = "<processo_implementazione>";
 
 /// Tag di chiusura: e' QUESTO che decide l'idempotenza. Una MENZIONE del
 /// blocco in un template cita l'apertura, mai la coppia completa — decidere
 /// sull'apertura renderebbe una menzione indistinguibile dal blocco vero e il
 /// blocco non entrerebbe (trappola trovata dalla review avversaria del 04/08:
 /// il rimando inciso in agent.coder.base conteneva il tag letterale).
-pub(crate) const TAG_CHIUSURA: &str = "</processo_implementazione>";
+pub const TAG_CHIUSURA: &str = "</processo_implementazione>";
 
 /// Chiave del template (regola G: il testo vive nel DB, qui solo il nome).
 const CHIAVE_TEMPLATE: &str = "system.implementation_process";
@@ -57,7 +57,7 @@ const CHIAVE_MUTATORI: &str = "agent.tools.result_cache_mutators";
 /// Il blocco dal DB. `None` se assente, disattivo o vuoto: una configurazione
 /// assente deve VEDERSI (warn), mai essere supplita da un letterale di ripiego
 /// che nessuno ha scelto (regola G).
-pub(crate) async fn section(db: &PgPool) -> Option<String> {
+pub async fn section(db: &PgPool) -> Option<String> {
     let template: Option<String> = sqlx::query_scalar::<_, String>(
         "SELECT content FROM nexus_prompt_templates \
           WHERE key = $1 AND is_active = true",
@@ -84,7 +84,7 @@ pub(crate) async fn section(db: &PgPool) -> Option<String> {
 /// Per la chat e per ogni testo gia' composto che ripassa di qui (resend): un
 /// system gia' dotato del blocco resta invariato, mai due processi nello
 /// stesso prompt.
-pub(crate) async fn con_processo(db: &PgPool, system: String) -> String {
+pub async fn con_processo(db: &PgPool, system: String) -> String {
     if system.contains(TAG_CHIUSURA) {
         return system;
     }
@@ -114,7 +114,7 @@ pub(crate) async fn con_processo(db: &PgPool, system: String) -> String {
 /// mutatori), che senza vocabolario passerebbe per advisory e resterebbe
 /// senza processo. Il warn dichiara questa perdita; il fail-open resta verso
 /// il processo per tutte le NON-advisory.
-pub(crate) async fn con_processo_figura(
+pub async fn con_processo_figura(
     db: &PgPool,
     system: String,
     tool_whitelist: &[String],

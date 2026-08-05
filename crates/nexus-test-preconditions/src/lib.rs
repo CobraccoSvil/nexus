@@ -273,3 +273,49 @@ pub async fn db_risponde() -> bool {
 pub fn env_presente(nome: &str) -> bool {
     env::var(nome).is_ok_and(|v| !v.is_empty())
 }
+
+/// Semina teams + users + projects nel DB META e ritorna il `project_id`.
+///
+/// Punto unico dei test che girano su `META_MIGRATOR` e hanno bisogno di un
+/// `project_id` valido. La stessa catena viveva ricopiata in almeno cinque
+/// `mod tests` privati (testing.rs, escalation_port.rs, projects/mod.rs,
+/// projects/quality.rs, ...): finche' resta duplicata, il giorno in cui una
+/// migrazione aggiunge una colonna obbligatoria a `projects` fallisce in cinque
+/// posti e ognuno la ripara a modo suo. I moduli esistenti convergono qui man
+/// mano che si toccano; i nuovi partono da qui.
+///
+/// Sta in QUESTO crate e non in `mcp-core::test_support` dal 2026-08-05: i crate
+/// estratti da mcp-core (a partire da `nexus-prompt`) stanno SOTTO di lui nel
+/// grafo, quindi non possono usarne gli helper senza invertire la direzione. Un
+/// seeder duplicato sarebbe stato il difetto che il commento sopra descrive, con
+/// una copia in piu' invece che in meno.
+pub async fn seed_project_meta(pool: &PgPool) -> uuid::Uuid {
+    use uuid::Uuid;
+    let team = Uuid::new_v4();
+    let user = Uuid::new_v4();
+    let project = Uuid::new_v4();
+    sqlx::query("INSERT INTO teams (id, name, slug) VALUES ($1, 'team di prova', $2)")
+        .bind(team)
+        .bind(team.to_string())
+        .execute(pool)
+        .await
+        .expect("seed teams");
+    sqlx::query("INSERT INTO users (id, email, display_name) VALUES ($1, $2, 'utente di prova')")
+        .bind(user)
+        .bind(format!("{user}@prova.local"))
+        .execute(pool)
+        .await
+        .expect("seed users");
+    sqlx::query(
+        "INSERT INTO projects (id, team_id, name, slug, owner_user_id) \
+         VALUES ($1, $2, 'progetto di prova', $3, $4)",
+    )
+    .bind(project)
+    .bind(team)
+    .bind(project.to_string())
+    .bind(user)
+    .execute(pool)
+    .await
+    .expect("seed projects");
+    project
+}

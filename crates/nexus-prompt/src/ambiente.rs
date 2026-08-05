@@ -36,7 +36,7 @@
 //! (`chat_messages::handlers::compose_chat_system_context`) e il sub-run
 //! (`agent_tools::subagent_native::resolve_system_text`). L'innesto vive dentro
 //! quelle funzioni, non nei loro chiamanti: e' la lezione di
-//! [`crate::prompt_memories`] — finche' il consumo stava sul ramo di un
+//! `prompt_memories` (in mcp-core) — finche' il consumo stava sul ramo di un
 //! chiamante solo, l'altro percorso restava scoperto e nessuno se ne accorgeva.
 //!
 //! ## Costo sul prefisso riusabile: nessuno
@@ -66,7 +66,7 @@ const TAG_PRIVILEGI_CHIUSURA: &str = "</privilegi_sistema>";
 /// Non fallisce mai verso l'alto: un DB irraggiungibile lascia il vocabolario
 /// vuoto e il blocco dichiara comunque sistema operativo e shell, che sono la
 /// parte che non dipende da nessuna configurazione.
-pub(crate) async fn con_ambiente(db: &PgPool, system: String) -> String {
+pub async fn con_ambiente(db: &PgPool, system: String) -> String {
     let ambiente = ambiente::rileva(db).await;
     // La direttiva si toglie solo su un'assenza ACCERTATA. `NonInterrogabile`
     // (PATH illeggibile, gestore fuori vocabolario, presupposto non dichiarato)
@@ -74,7 +74,7 @@ pub(crate) async fn con_ambiente(db: &PgPool, system: String) -> String {
     // sarebbe decidere su un'ignoranza.
     let mut testo = match ambiente::gestore_privilegiato(db).await {
         Some(nome) if ambiente.stato_di(&nome) == Disponibilita::Assente => {
-            crate::prompt_templates::strip_block_between(
+            crate::blocchi::strip_block_between(
                 &system,
                 TAG_PRIVILEGI_APERTURA,
                 TAG_PRIVILEGI_CHIUSURA,
@@ -125,7 +125,7 @@ Puoi installare dipendenze di SISTEMA con run_command:
     /// test lo esercita per la strada della produzione (regola O): quello che
     /// verifica e' il comportamento REALE su un testo nella forma del template.
     fn strip(system: &str) -> String {
-        crate::prompt_templates::strip_block_between(
+        crate::blocchi::strip_block_between(
             system,
             TAG_PRIVILEGI_APERTURA,
             TAG_PRIVILEGI_CHIUSURA,

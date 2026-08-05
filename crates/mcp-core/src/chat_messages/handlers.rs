@@ -598,13 +598,13 @@ async fn compose_chat_system_context(
     // Il processo operativo standard (mig 0674): sta dentro il compositore per
     // la stessa ragione dell'ambiente, e PRIMA del blocco KB perche' e' testo
     // stabile che deve restare nel prefisso riusabile.
-    let ctx = crate::prompt_processo::con_processo(db, ctx).await;
+    let ctx = nexus_prompt::processo::con_processo(db, ctx).await;
     // L'host su cui i comandi gireranno DAVVERO, dichiarato invece che indovinato
     // — e la direttiva sui privilegi tolta se presuppone un gestore che qui non
     // esiste. Sta dentro il compositore, non nel chiamante: un system prompt di
     // esecuzione non deve essere componibile senza (vedi `crate::prompt_ambiente`).
     // PRIMA del blocco KB: e' un fatto stabile e deve restare nel prefisso.
-    let stabile = crate::prompt_ambiente::con_ambiente(db, ctx).await;
+    let stabile = nexus_prompt::ambiente::con_ambiente(db, ctx).await;
     // Iniezione Knowledge Base (top-K note semanticamente rilevanti), gia'
     // risolta dal chiamante. Failsafe: se brain down o KB vuota il flusso
     // prosegue senza contesto KB — e senza confine, perche' un blocco vuoto e'
@@ -3119,7 +3119,7 @@ mod tests_system_prompt_della_chat {
             compose_chat_system_context(&pool, &cache, TASK, AutomationMode::Study, None, kb)
                 .await;
 
-        let tag = crate::prompt_processo::TAG_APERTURA;
+        let tag = nexus_prompt::processo::TAG_APERTURA;
         assert_eq!(system.matches(tag).count(), 1, "{system}");
         let stabile = nexus_types::system_prompt::parte_stabile(&system);
         assert!(
@@ -3164,7 +3164,7 @@ mod tests_system_prompt_della_chat {
         // riga in DB, che e' la prova di provenienza (aggiornato con la 0674:
         // il cambio di comportamento e' intenzionale e questa e' la sua forma).
         let (prima_del_processo, resto) = system
-            .split_once(crate::prompt_processo::TAG_APERTURA)
+            .split_once(nexus_prompt::processo::TAG_APERTURA)
             .expect("il processo operativo non e' entrato nel system della chat");
         assert_eq!(prima_del_processo.trim_end(), TEMPLATE);
         let processo_in_db: String = sqlx::query_scalar(
@@ -3268,7 +3268,7 @@ mod tests_system_prompt_della_chat {
         // gemello sopra per il perche' nessuno dei due e' «codice che parla per
         // conto suo»).
         let (prima_del_processo, _) = system
-            .split_once(crate::prompt_processo::TAG_APERTURA)
+            .split_once(nexus_prompt::processo::TAG_APERTURA)
             .expect("il processo operativo non e' entrato nel system della chat");
         assert_eq!(prima_del_processo.trim_end(), BASE);
         assert!(!system.contains(SUFFISSO), "{system}");

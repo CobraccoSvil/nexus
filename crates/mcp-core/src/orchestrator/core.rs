@@ -1520,7 +1520,7 @@ impl Orchestrator {
         // Regole durature del progetto, dallo STESSO punto unico che usa il
         // percorso agentico (`crate::prompt_learned`): il distillatore le
         // scriveva e nessuno le leggeva.
-        let apprese = crate::prompt_learned::LearnedInstructions::load(db, project_uuid)
+        let apprese = nexus_prompt::learned::LearnedInstructions::load(db, project_uuid)
             .await
             .section(db)
             .await;

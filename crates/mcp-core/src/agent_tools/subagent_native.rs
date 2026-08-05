@@ -284,7 +284,7 @@ async fn resolve_system_text(
     // la whitelist e' il discriminante (punto unico is_advisory_kind), e la
     // decisione vive dentro `prompt_processo`, non qui.
     let mut registro =
-        crate::prompt_processo::con_processo_figura(&ctx.core.db, registro, tool_whitelist)
+        nexus_prompt::processo::con_processo_figura(&ctx.core.db, registro, tool_whitelist)
             .await;
     // Direttiva <recupero_contesto> (W4), SOLO se la whitelist ha tool
     // semantici: stabile per kind, quindi ammessa nel system (cache intatta).
@@ -295,7 +295,7 @@ async fn resolve_system_text(
         registro.push_str("\n\n");
         registro.push_str(&direttiva);
     }
-    crate::prompt_ambiente::con_ambiente(&ctx.core.db, registro).await
+    nexus_prompt::ambiente::con_ambiente(&ctx.core.db, registro).await
 }
 
 /// Costruisce l'array tools del sub-run filtrando lo schema REALE

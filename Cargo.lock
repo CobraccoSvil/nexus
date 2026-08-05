@@ -2046,6 +2046,7 @@ dependencies = [
  "nexus-pricing",
  "nexus-project-db",
  "nexus-project-pools",
+ "nexus-prompt",
  "nexus-service-catalog",
  "nexus-test-preconditions",
  "nexus-tool-kit",
@@ -2566,6 +2567,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-prompt"
+version = "0.1.0"
+dependencies = [
+ "nexus-agent-tools",
+ "nexus-auth",
+ "nexus-migrations-embedded",
+ "nexus-test-preconditions",
+ "nexus-types",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "nexus-service-catalog"
 version = "0.1.0"
 dependencies = [
@@ -2594,6 +2610,7 @@ name = "nexus-test-preconditions"
 version = "0.1.0"
 dependencies = [
  "sqlx",
+ "uuid",
 ]
 
 [[package]]

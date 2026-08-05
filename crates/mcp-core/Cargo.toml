@@ -56,6 +56,7 @@ nexus-migrations = { path = "../nexus-migrations" }
 nexus-build-graph = { path = "../nexus-build-graph" }
 nexus-tool-kit = { path = "../nexus-tool-kit" }
 nexus-agent-tools = { path = "../nexus-agent-tools" }
+nexus-prompt = { path = "../nexus-prompt" }
 nexus-orchestrator = { path = "../nexus-orchestrator" }
 nexus-events = { path = "../nexus-events" }
 nexus-graph = { path = "../nexus-graph" }

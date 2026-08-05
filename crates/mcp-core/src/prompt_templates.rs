@@ -43,20 +43,14 @@ pub fn strip_council_directive(prompt: &str) -> String {
 /// dei privilegi di sistema, delimitata dai propri tag — chiedono la stessa cosa
 /// con marcatori diversi. Con due implementazioni, la prossima correzione sui
 /// bordi (gli `\n` orfani, un marcatore ripetuto) verrebbe fatta in una sola.
-pub fn strip_block_between(prompt: &str, inizio: &str, fine: &str) -> String {
-    let Some(start) = prompt.find(inizio) else {
-        return prompt.to_string();
-    };
-    let Some(end_rel) = prompt[start..].find(fine) else {
-        return prompt.to_string();
-    };
-    let end = start + end_rel + fine.len();
-    let head = prompt[..start].trim_end_matches('\n');
-    let mut out = String::with_capacity(head.len() + prompt.len().saturating_sub(end));
-    out.push_str(head);
-    out.push_str(&prompt[end..]);
-    out
-}
+///
+/// La DEFINIZIONE e' migrata in `nexus_prompt::blocchi` il 2026-08-05, insieme
+/// al suo unico altro consumatore (`prompt_ambiente`, ora
+/// `nexus_prompt::ambiente`): lasciarla qui avrebbe costretto il crate estratto
+/// a dipendere da mcp-core, cioe' il verso opposto a quello che l'estrazione
+/// serve a ottenere. Qui resta il nome con cui i chiamanti di questo modulo la
+/// conoscono.
+pub use nexus_prompt::blocchi::strip_block_between;
 
 /// Conta quante keyword di AMBITO SENSIBILE il testo tocca (case-insensitive,
 /// substring). PURA. Il consiglio serve sui task a rischio di DOMINIO — auth/

@@ -25,7 +25,7 @@
 //!
 //! I compositori sono due (`Orchestrator::compose_prompt` per il turno singolo,
 //! `compose_agent_system_text` per il run agentico) ed e' la stessa lezione di
-//! [`crate::prompt_memories`]: un consumo scritto in un ramo solo non entra
+//! `prompt_memories` (in mcp-core): un consumo scritto in un ramo solo non entra
 //! nell'altro, e in modalita' Conferma/Automatico l'handler dispatcha al run
 //! agentico prima ancora di arrivare al primo.
 //!
@@ -67,7 +67,7 @@ const CHIAVE_TEMPLATE: &str = "system.learned_instructions_block";
 const SEGNAPOSTO_REGOLE: &str = "{{rules}}";
 
 /// Le istruzioni apprese ATTIVE di un progetto, pronte per il prompt.
-pub(crate) struct LearnedInstructions {
+pub struct LearnedInstructions {
     regole: Vec<String>,
 }
 
@@ -78,7 +78,7 @@ impl LearnedInstructions {
     /// turno valido, un turno rotto perche' una SELECT non e' andata no. Il DB
     /// e' quello META (la tabella e' li', condivisa fra i progetti e filtrata
     /// per `project_id`).
-    pub(crate) async fn load(db: &PgPool, project_id: Uuid) -> Self {
+    pub async fn load(db: &PgPool, project_id: Uuid) -> Self {
         let sql = format!(
             "SELECT rule_text FROM nexus_learned_instructions \
               WHERE project_id = $1 AND status = 'active' \
@@ -113,7 +113,7 @@ impl LearnedInstructions {
     /// si compone da un letterale di ripiego — una configurazione assente deve
     /// vedersi, non essere supplita in silenzio con parole che nessuno ha
     /// scelto.
-    pub(crate) async fn section(&self, db: &PgPool) -> Option<String> {
+    pub async fn section(&self, db: &PgPool) -> Option<String> {
         if self.regole.is_empty() {
             return None;
         }
@@ -147,6 +147,13 @@ impl LearnedInstructions {
         Some(template.replace(SEGNAPOSTO_REGOLE, &elenco).trim().to_string())
     }
 
+    /// Quante regole sono entrate. Esiste SOLO nei test, ed e' la forma onesta:
+    /// il log di questo modulo usa `self.regole.len()` direttamente e nessuno la
+    /// chiama da fuori. Lasciarla `pub` avrebbe attirato `len_without_is_empty`,
+    /// cioe' la richiesta di aggiungere un `is_empty` che nessuno usa; lasciarla
+    /// `pub(crate)` la rendeva dead code. Prima dell'estrazione il lint non si
+    /// vedeva perche' l'intero modulo era interno a mcp-core.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.regole.len()
     }
@@ -156,7 +163,7 @@ impl LearnedInstructions {
 mod tests {
     use super::*;
 
-    use crate::test_support::seed_project_meta;
+    use nexus_test_preconditions::seed_project_meta;
 
     async fn inserisci(pool: &PgPool, project_id: Uuid, testo: &str, conf: f64, status: &str) {
         sqlx::query(

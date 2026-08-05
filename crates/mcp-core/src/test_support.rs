@@ -92,42 +92,20 @@ pub(crate) fn ctx_di_tool_test(root: std::path::PathBuf) -> crate::agent_tools::
 /// Semina un progetto sul DB META, con la catena di FK che lo schema reale
 /// pretende: `teams` -> `users` -> `projects`.
 ///
-/// Punto unico dei test che girano su `META_MIGRATOR` e hanno bisogno di un
-/// `project_id` valido. La stessa catena viveva ricopiata in almeno cinque
-/// `mod tests` privati (testing.rs, escalation_port.rs, projects/mod.rs,
-/// projects/quality.rs, ...): finche' resta duplicata, il giorno in cui una
-/// migrazione aggiunge una colonna obbligatoria a `projects` fallisce in cinque
-/// posti e ognuno la ripara a modo suo. I moduli esistenti convergono qui man
-/// mano che si toccano; i nuovi partono da qui.
-pub(crate) async fn seed_project_meta(pool: &PgPool) -> Uuid {
-    let team = Uuid::new_v4();
-    let user = Uuid::new_v4();
-    let project = Uuid::new_v4();
-    sqlx::query("INSERT INTO teams (id, name, slug) VALUES ($1, 'team di prova', $2)")
-        .bind(team)
-        .bind(team.to_string())
-        .execute(pool)
-        .await
-        .expect("seed teams");
-    sqlx::query("INSERT INTO users (id, email, display_name) VALUES ($1, $2, 'utente di prova')")
-        .bind(user)
-        .bind(format!("{user}@prova.local"))
-        .execute(pool)
-        .await
-        .expect("seed users");
-    sqlx::query(
-        "INSERT INTO projects (id, team_id, name, slug, owner_user_id) \
-         VALUES ($1, $2, 'progetto di prova', $3, $4)",
-    )
-    .bind(project)
-    .bind(team)
-    .bind(project.to_string())
-    .bind(user)
-    .execute(pool)
-    .await
-    .expect("seed projects");
-    project
-}
+// `seed_project_meta` NON e' piu' qui: la definizione vive in
+// `nexus_test_preconditions` dal 2026-08-05, e si importa da li'
+// (`use nexus_test_preconditions::seed_project_meta;`).
+//
+// Perche' si e' spostata IN BASSO invece di restare: i crate estratti da
+// mcp-core — `nexus-prompt` e i prossimi — stanno SOTTO di lui nel grafo, e i
+// loro test hanno bisogno dello stesso seeder. Tenerlo qui avrebbe lasciato
+// una sola strada, duplicarlo; ed e' precisamente il difetto che il commento
+// originale descriveva ("viveva ricopiata in almeno cinque `mod tests`"), con
+// una copia in piu' invece che in meno.
+//
+// Non e' rimasto un `pub use` di cortesia: sarebbe stato un import inutilizzato
+// finche' nessun test di QUESTO crate lo chiama, e un `allow(unused)` per
+// tenerlo in vita e' debito che nessuno riscuote.
 
 /// Semina una sessione chat (`chat_sessions`, mig project 0001) e ne ritorna l'id.
 ///
