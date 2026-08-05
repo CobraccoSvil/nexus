@@ -91,6 +91,8 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.exploration_loop.ttl_seconds` | `60` | TTL cache loop detector esplorazione (H-27 a) |
 | `agent.fallback.soft_failure_enabled` | `true` | Abilita detection soft failure (M4) |
 | `agent.figma.min_string_len` | `4` | Min char stringa estratta da figma (H-71) |
+| `agent.final_gate.docs_criterion_enabled` | `true` | Criterio strutturale docs-nel-DoD del final_gate: riscontro claim-vs-fatti fra `task_complete.docs_updated` e i file doc toccati (mig 0676, W2 processo standard). |
+| `agent.final_gate.docs_globs` | `README*;docs/**` | Glob (separati da `;`) dei file considerati documentazione per il criterio docs del final_gate (mig 0676). |
 | `agent.final_gate.enabled` | `true` | Abilita il final gate generale fail-closed (anti-placeholder) per i task software senza plan_phase. |
 | `agent.final_gate.max_cycles` | `2` | Numero massimo di cicli di retry del final gate prima di chiudere comunque (no loop infinito). |
 | `agent.final_gate.software_intents` | `code,debug,scaffold,implement,build,frontend,fix,refactor` | CSV degli intent considerati task software per cui il final gate si attiva. |
@@ -128,7 +130,9 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.reasoning_bank.plan_reward_threshold` | `0.85` | Soglia reward per accettare un plan in reasoning_bank (H-53) |
 | `agent.reflection_cfg_ttl_seconds` | `60` | TTL cache reflection_config (H-52) |
 | `agent_router_enabled` | `true` | Abilita il server gRPC AgentRouter (porta 50072) che espone il router Q-Learning di nexus-orchestrator al brain Python. Quando attivo, il router_node consulta il Q-Learning per scegliere il profilo agente ottimale (es. coder, cloud_architect, tech_writer) in base alla cronologia dei reward osservati. Se disabilitato il brain usa il routing di fallback basato solo sull'intent. Richiede riavvio di mcp-core per applicare la modifica. |
+| `agent.subagent.context_recall_enabled` | `true` | Interruttore UNICO del recall vettoriale W4: blocco `<contesto_richiamato>` nel mandato delle figure + direttiva `<recupero_contesto>` nel system dei kind con tool semantici. Fail-open (mig 0678). |
 | `agent.subagent.default_max_iterations` | `25` | Max iterations default per subagent (H-50, era in yaml loader) |
+| `agent.subagent.mandate_recall_kinds` | `kb,code` | Kind interrogati dal recall del mandato (CSV; parse via SourceKind::parse, policy ammette kb/code/attachment/meta_doc) (mig 0678). |
 | `agent.sudo.audit_excerpt_max_bytes` | `4096` | Limite (bytes) di stdout/stderr troncati salvati in nexus_sudo_audit_log. Default 4096. |
 | `agent.sudo.manager_enabled` | `true` | Se true, mcp-core puo' invocare sudo_manager::execute per i purpose nella whitelist. Disattiva (false) per smoke test o ambienti dove sudoers.d non e' configurato. |
 | `agent.sudo.runner_path` | `/usr/local/bin/nexus-sudo-runner` | Path assoluto del binary nexus-sudo-runner. Modificabile se installato in path diverso (utili per multi-tenant). Configurato in /etc/sudoers.d/nexus-runner. |
@@ -491,6 +495,13 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `orchestrator.meta_steps.plan_enabled` | `true` | Pubblica il piano del planner_node come meta_step kind=plan. |
 | `orchestrator.meta_steps.reflection_enabled` | `false` | Pubblica la riflessione post-hoc come meta_step kind=reflection. Off di default (costo LLM extra). |
 | `orchestrator.meta_steps.routing_enabled` | `true` | Pubblica la decisione di routing/profile come meta_step kind=routing. |
+| `orchestrator.critical_step_cost_cap_usd` | `1.00` | Cap di spesa DICHIARATO (WARN oltre soglia) per una convocazione del gate duale sui passi critici (mig 0677). |
+| `orchestrator.critical_step_gate_mode` | `enforce_irreversible` | Gate duale sui passi critici: off / observe / enforce_irreversible / enforce. Parse unico in decisions::step_gate::StepGateMode; il passaggio a enforce avviene SOLO via migrazione dedicata (mig 0677, W3 processo standard). |
+| `orchestrator.critical_step_gate_timeout_s` | `90` | Timeout di OGNI chiamata di validazione del gate duale: allo scadere il validatore diventa astensione strutturata, mai sparizione dal denominatore (mig 0677). |
+| `orchestrator.critical_step_max_rejections` | `2` | Rimandi massimi del gate duale in un run prima di degradare a NeedsHuman (cap anti ping-pong, mig 0677). |
+| `orchestrator.critical_step_rules` | JSON array | Vocabolario di criticita' del gate duale ({matcher_kind, pattern, level, category}); matcher command_token sulla riga SCOMPOSTA in token fuori-quote. Editabile dall'admin: dati, non varianti a codice (mig 0677). |
+| `orchestrator.plan_approval_gate_enabled` | `true` | Gate di approvazione umana del piano in Confirm: sospensione su pending action plan_approval PRIMA di qualunque scrittura (mig 0676, W2 processo standard). |
+| `orchestrator.plan_approval_min_complexity` | `medium` | Complessita' minima (TaskComplexity) da cui il gate di approvazione piano scatta in Confirm (mig 0676). |
 | `orchestrator.plan_behavior_modes` | `bilanciata,approfondita,veloce,economica` | CSV dei behavior_mode che attivano il flusso plan/act/verify. |
 | `orchestrator.plan_intents` | `code,implement,fix,refactor,scaffold_app,architecture` | CSV degli intent eleggibili per il planner. |
 | `orchestrator.plan_min_token_budget` | `1500` | Sotto questa soglia di token_budget il planner viene saltato (chat brevi). |
@@ -725,4 +736,4 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 ---
 
-**Totale chiavi**: 521
+**Totale chiavi**: 532
