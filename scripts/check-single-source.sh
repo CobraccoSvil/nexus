@@ -1481,6 +1481,16 @@ assert_single "task-del-turno" 'fn current_turn_task' \
 assert_single "chiave-task-del-turno" '"original_task"' \
   'crates/nexus-agent-graph/src/decisions/turn_task.rs' crates
 
+# La stessa domanda per un SUB-run: il suo messaggio e' il mandato PIU' il
+# contorno (contesto del chiamante, formato atteso), e fissare tutto il blocco
+# come "la richiesta" era vero per il run principale e falso per ogni figura
+# convocata — col focus che ne mostra i primi 600 caratteri, cioe' l'inizio del
+# contorno, dichiarandoli al modello come il compito da svolgere. Le due forme
+# nascono INSIEME qui: chi ricompone la decorazione altrove puo' consegnare una
+# richiesta diversa da quella decorata, e nessun tipo lo fermerebbe.
+assert_single "mandato-subagente" 'fn compose_subagent_mandate' \
+  'crates/mcp-core/src/agent_tools/subagent_native.rs' crates
+
 # Il guard che conta: il focus del turno NON torna a leggere la cronologia.
 #
 # Il ruolo `user` sul canale interno significa "questo lo legge il modello",

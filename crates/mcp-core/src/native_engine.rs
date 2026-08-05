@@ -232,6 +232,30 @@ pub struct NativeRunInput {
     pub prompt_key: Option<String>,
     /// Messaggio iniziale dell'utente (con blocco allegati gia' inline).
     pub initial_msg: String,
+    /// La richiesta NUDA di questo run, quando `initial_msg` la porta insieme al
+    /// contorno che il call site vi ha impaginato attorno. `None` = il messaggio
+    /// E' la richiesta (run principale: quello che l'utente ha scritto).
+    ///
+    /// E' il dato che `build_initial_state` fissa in `extra[ORIGINAL_TASK_KEY]`,
+    /// cioe' cio' che il punto unico [`nexus_agent_graph::decisions::turn_task`]
+    /// dichiara "la richiesta dell'utente per QUESTO turno". Dei suoi due
+    /// consumatori, sul percorso SUB-RUN ne e' raggiunto uno solo — il focus del
+    /// turno, che la AFFERMA al modello con l'autorita' del system prompt. Il
+    /// supervisore no: le figure partono con `SupervisorMode::None` cablato e il
+    /// nodo esce su `SupervisorResolved` prima di `extract_original_task`. La
+    /// misura del difetto e' quindi tutta nel focus, non nei "due consumatori".
+    ///
+    /// Perche' esiste. Per un sub-run `initial_msg` e' il mandato PIU' il contesto
+    /// del chiamante e il formato atteso (vedi
+    /// `subagent_native::compose_subagent_mandate`): fissarlo per intero come "la
+    /// richiesta" era vero per il run principale e falso per ogni figura
+    /// convocata. La conseguenza era attiva, non teorica — il focus tronca ai
+    /// primi 600 caratteri, quindi con un mandato scarno e un contesto lungo la
+    /// directive nominava il CONTORNO e non il compito. Il campo fissa il dato all'ORIGINE invece di ripulirlo a valle:
+    /// una regex che tolga il contorno dovrebbe indovinare dove finisce la
+    /// richiesta, ed e' la premessa gia' rifiutata nella doc di `turn_focus`
+    /// (regola M).
+    pub bare_task: Option<String>,
     /// Kind REALE (magic byte, `attachment_inspector::detect_kind`) di ciascun
     /// allegato di QUESTO messaggio, calcolato da `build_initial_msg_with_attachments`
     /// sugli stessi file gia' letti per il blocco `<allegati>`. Alimenta il gate
@@ -3415,9 +3439,23 @@ fn build_initial_state(input: &NativeRunInput) -> AgentState {
     // spesso un auto-debug di crash iniettato dall'observer — invece del task reale
     // (incidente Chat 11 Beaty-Book: 60 iterazioni sul crash frontend al posto del
     // task di sicurezza auth).
+    //
+    // La richiesta e' `bare_task` quando il call site la porta separata dal
+    // contorno (sub-run: mandato + contesto del chiamante + formato atteso),
+    // altrimenti l'intero messaggio — che per il run principale E' la richiesta.
+    // Un mandato di soli spazi non e' una richiesta: si ricade sul messaggio,
+    // stesso criterio con cui `current_turn_task` scarta il vuoto.
     extra.insert(
         nexus_agent_graph::decisions::ORIGINAL_TASK_KEY.to_string(),
-        serde_json::Value::String(input.initial_msg.clone()),
+        serde_json::Value::String(
+            input
+                .bare_task
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(input.initial_msg.as_str())
+                .to_string(),
+        ),
     );
     let mut declared_outcome = None;
     let mut stop_reason = None;
@@ -4241,6 +4279,9 @@ mod tests {
             system_text: "sei un assistente".to_string(),
             prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
             initial_msg: "Scrivi src/main.rs".to_string(),
+            // Run principale di test: il messaggio E' la richiesta. I test del
+            // mandato di un sub-run lo sovrascrivono esplicitamente.
+            bare_task: None,
             attachment_kinds: Vec::new(),
             conversation_history: vec![serde_json::json!({
                 "role": "user",
@@ -4323,6 +4364,92 @@ mod tests {
         assert_eq!(
             state.user_intent, None,
             "primario: user_intent non forzato (decide il RouterNode)"
+        );
+    }
+
+    #[test]
+    fn initial_state_task_del_turno_e_il_messaggio_quando_non_c_e_mandato_nudo() {
+        // Run principale: quello che l'utente ha scritto E' la richiesta, e resta
+        // il valore fissato in extra[ORIGINAL_TASK_KEY] (comportamento invariato).
+        let state = build_initial_state(&sample_input());
+        assert_eq!(
+            nexus_agent_graph::decisions::current_turn_task(&state),
+            Some("Scrivi src/main.rs")
+        );
+    }
+
+    #[test]
+    fn initial_state_task_del_turno_di_un_sub_run_e_il_mandato_nudo_non_il_contorno() {
+        // Il messaggio del sub-run lo compone il PRODUTTORE reale (regola O: non
+        // si ricostruisce qui a mano la decorazione, altrimenti il test fisserebbe
+        // proprio l'assunto da verificare). Il tipo lega le due forme: da qui esce
+        // sia il messaggio decorato sia la richiesta nuda, e il call site non puo'
+        // disallinearle.
+        const MANDATO: &str = "Verifica che il login rifiuti le credenziali scadute";
+        let mandate = crate::agent_tools::subagent_native::compose_subagent_mandate(
+            MANDATO,
+            // Contesto del chiamante ben oltre i 600 caratteri del troncamento del
+            // focus: e' la misura del difetto reale (mandato scarno + contorno
+            // lungo), non un contorno simbolico che passerebbe comunque.
+            &format!(
+                "Il coordinatore ha gia' letto i file del modulo auth.\n{}",
+                "dettaglio irrilevante per il mandato; ".repeat(60)
+            ),
+            "JSON con i campi verdict ed evidence",
+        );
+        let mut input = sample_input();
+        input.initial_msg = mandate.initial_msg.clone();
+        input.bare_task = Some(mandate.bare_task.clone());
+
+        let state = build_initial_state(&input);
+
+        // Al MODELLO va il messaggio intero: il contorno serve, non si perde.
+        match state.messages.last().expect("almeno un messaggio") {
+            Message::Human { content } => {
+                assert_eq!(content.flatten_text(), mandate.initial_msg);
+                assert!(content.flatten_text().contains("## Contesto aggiuntivo"));
+            }
+            other => panic!("atteso Human in coda, trovato {other:?}"),
+        }
+
+        // Ma la RICHIESTA del turno e' il solo mandato.
+        assert_eq!(
+            nexus_agent_graph::decisions::current_turn_task(&state),
+            Some(MANDATO),
+            "il task del turno deve essere il mandato nudo, non il blocco decorato"
+        );
+
+        // CONSEGUENZA, non la stringa (regola O): la directive che AFFERMA al
+        // modello "la richiesta da portare a termine ADESSO" nomina il mandato e
+        // non il contorno. Col difetto (task del turno = initial_msg) i primi 600
+        // caratteri mostrati qui arrivavano dentro il contesto del chiamante.
+        let focus = nexus_agent_graph::decisions::build_turn_focus_directive(&state, false)
+            .expect("focus del turno costruito");
+        assert!(focus.contains(MANDATO), "focus senza il mandato: {focus}");
+        assert!(
+            !focus.contains("## Contesto aggiuntivo"),
+            "focus contaminato dal contorno: {focus}"
+        );
+        assert!(
+            !focus.contains("dettaglio irrilevante"),
+            "focus contaminato dal contesto del chiamante: {focus}"
+        );
+        assert!(
+            !focus.contains("## Formato output atteso"),
+            "focus contaminato dal formato atteso: {focus}"
+        );
+    }
+
+    #[test]
+    fn initial_state_mandato_di_soli_spazi_ricade_sul_messaggio() {
+        // Un mandato vuoto non e' una richiesta: si ricade sul messaggio invece di
+        // fissare come task del turno una stringa che `current_turn_task` scarta.
+        let mut input = sample_input();
+        input.bare_task = Some("   \n\t".to_string());
+        let state = build_initial_state(&input);
+        assert_eq!(
+            nexus_agent_graph::decisions::current_turn_task(&state),
+            Some("Scrivi src/main.rs")
         );
     }
 
