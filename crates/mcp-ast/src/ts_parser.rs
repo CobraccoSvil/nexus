@@ -50,6 +50,81 @@ fn node_name(node: Node, src: &[u8]) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// I TIPI dei parametri e il tipo di ritorno, dal nodo di una funzione.
+///
+/// Estrae i tipi e **non** i nomi: la domanda a cui la firma serve a rispondere
+/// e' "queste due funzioni accettano e restituiscono le stesse cose?", e i nomi
+/// dei parametri sono rumore per quella domanda — due funzioni identiche che
+/// chiamano `db` e `pool` lo stesso argomento devono risultare confrontabili.
+///
+/// Il campo `type` esiste per costruzione nei linguaggi tipizzati (Rust, Go, TS
+/// annotato). Dove manca — Python senza annotazioni, JS — si ripiega sul testo
+/// del nodo, che li' e' il nome del parametro: e' meno informativo e va saputo,
+/// ma non e' sbagliato, perche' in quei linguaggi non esiste un tipo da leggere.
+///
+/// `self` e `&self` diventano la stringa `self`: distinguerli per riferimento e
+/// mutabilita' separerebbe metodi che rispondono alla stessa domanda.
+fn node_signature(node: Node, src: &[u8]) -> (Vec<String>, Option<String>) {
+    let mut params = Vec::new();
+    if let Some(lista) = node
+        .child_by_field_name("parameters")
+        .or_else(|| node.child_by_field_name("parameter_list"))
+    {
+        let mut cur = lista.walk();
+        for figlio in lista.named_children(&mut cur) {
+            let kind = figlio.kind();
+            if kind == "self_parameter" {
+                params.push("self".to_string());
+                continue;
+            }
+            // Nodi di servizio (commenti, attributi) non sono parametri.
+            if kind == "line_comment" || kind == "block_comment" || kind == "attribute_item" {
+                continue;
+            }
+            let testo = figlio
+                .child_by_field_name("type")
+                .or_else(|| figlio.child_by_field_name("type_annotation"))
+                .and_then(|t| t.utf8_text(src).ok())
+                .or_else(|| figlio.utf8_text(src).ok())
+                .unwrap_or("")
+                .trim()
+                .trim_start_matches(':')
+                .trim();
+            if !testo.is_empty() {
+                params.push(normalizza_spazi(testo));
+            }
+        }
+    }
+    let ret = node
+        .child_by_field_name("return_type")
+        .or_else(|| node.child_by_field_name("result"))
+        .and_then(|t| t.utf8_text(src).ok())
+        .map(|s| normalizza_spazi(s.trim().trim_start_matches("->").trim()));
+    (params, ret)
+}
+
+/// Collassa gli spazi interni: `Result < T , E >` e `Result<T, E>` sono lo
+/// stesso tipo scritto da due formattatori diversi, e devono confrontarsi uguali.
+fn normalizza_spazi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut spazio = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            spazio = true;
+            continue;
+        }
+        if spazio && !out.is_empty() && !matches!(c, ',' | '>' | ')') {
+            let ultimo = out.chars().last().unwrap_or(' ');
+            if !matches!(ultimo, '<' | '(' | '&' | ':') {
+                out.push(' ');
+            }
+        }
+        spazio = false;
+        out.push(c);
+    }
+    out
+}
+
 fn call_callee(node: Node, src: &[u8]) -> Option<String> {
     // call_expression -> field "function"; method_invocation (java) -> "name".
     let target = node
@@ -131,11 +206,21 @@ fn walk(
                 visibility = Visibility::Private;
             }
             let is_callable = matches!(sk, SymbolKind::Function | SymbolKind::Method);
+            // La firma si estrae solo per cio' che si puo' chiamare: su una
+            // struct i campi `parameters`/`return_type` non esistono, e cercarli
+            // sarebbe lavoro a vuoto su ogni tipo del sorgente.
+            let (params, ret) = if is_callable {
+                node_signature(node, src)
+            } else {
+                (Vec::new(), None)
+            };
             symbols.push(Symbol {
                 name: name.clone(),
                 kind: sk,
                 line,
                 visibility,
+                params,
+                ret,
             });
             if is_callable {
                 callers.push(name);

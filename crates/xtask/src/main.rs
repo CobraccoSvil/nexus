@@ -23,6 +23,7 @@ mod battery_explain;
 mod migrate;
 mod premessa;
 mod quality_scan;
+mod signature_census;
 mod service_manifests;
 
 use std::process::Command;
@@ -41,6 +42,10 @@ fn main() -> Result<()> {
         }
         "audit-settings" => {
             let code = audit_settings::run(&args[2..])?;
+            std::process::exit(code);
+        }
+        "signature-census" => {
+            let code = signature_census::run(&args[2..])?;
             std::process::exit(code);
         }
         "quality-scan" => {

@@ -1,0 +1,95 @@
+{
+  "_perche": [
+    "Registro dei verdetti di `cargo run -p xtask -- signature-census`.",
+    "",
+    "La firma NON prova la semantica: lo strumento produce candidati, il verdetto",
+    "lo da' una lettura. Qui resta, cosi' non si rilegge due volte lo stesso",
+    "gruppo — che e' il motivo per cui i censimenti manuali si esauriscono dopo",
+    "due esecuzioni.",
+    "",
+    "Il campo `motivo` di un `distinto` non e' burocrazia: e' cio' che evita alla",
+    "prossima persona di rifare la lettura che tu hai gia' fatto."
+  ],
+  "voci": [
+    {
+      "firma": "() -> (tempfile::TempDir, PathBuf)",
+      "membri": [
+        "crates/mcp-core/src/session_autocommit.rs:356 temp_repo",
+        "crates/nexus-tool-kit/src/worktree.rs:572 temp_repo"
+      ],
+      "verdetto": "duplicato",
+      "nota": "IDENTICHE riga per riga (init -q, config user.name/email, checkout -B main, README, add, commit iniziale), a meno di un commento. jscpd non le vedeva: 13 righe di corpo, sotto la sua soglia minLines=15. Da consolidare in nexus-test-preconditions, che dal 2026-08-05 ospita gia' seed_project_meta per lo stesso motivo (i crate estratti da mcp-core stanno sotto di lui e non possono usarne gli helper)."
+    },
+    {
+      "firma": "() -> 'static Regex",
+      "membri": [
+        "crates/admin-service/src/figures.rs:120 kind_regex",
+        "crates/mcp-core/src/provider_error_classifier.rs:148 billing_re (+5)",
+        "crates/nexus-wiki/src/code_graph.rs:52 rust_use_re (+5)"
+      ],
+      "verdetto": "distinto",
+      "motivo": "Accessori di LazyLock<Regex>: la firma identica e' un artefatto del pattern, non un indizio. Ogni funzione ritorna una regex DIVERSA, su un dominio diverso (kind delle figure, errori provider, import del code-graph). Consolidarle non avrebbe senso: non c'e' una domanda comune, c'e' un idioma comune."
+    },
+    {
+      "firma": "() -> (StatusCode, Json<Value>)",
+      "membri": [
+        "crates/mcp-core/src/wiki/redirects.rs:193 gone_meta_docs_ingest_commit (+12)"
+      ],
+      "verdetto": "distinto",
+      "motivo": "Handler axum di 410 Gone, uno per ciascuna rotta ritirata (ADR 0017 v2). La firma e' quella imposta da axum; il corpo differisce per il messaggio che nomina la rotta. Un handler generico perderebbe proprio l'informazione utile a chi riceve il 410."
+    },
+    {
+      "firma": "('static str, 'static str) -> Self",
+      "membri": [
+        "crates/nexus-tool-kit/src/db_helper.rs:57 text (+3: text_opt, int, float)"
+      ],
+      "verdetto": "distinto",
+      "motivo": "Costruttori tipizzati dello stesso builder: ognuno fissa un tipo di colonna diverso. E' l'API che si vuole - un unico costruttore con un parametro 'tipo' sposterebbe l'errore dal compilatore al runtime."
+    },
+    {
+      "firma": "(Option<serde_json::Map<String, Value>>) -> HashMap<String, String>",
+      "membri": [
+        "crates/mcp-core/src/plugins/mod.rs:172 value_to_string_map",
+        "crates/plugin-service/src/plugins.rs:164 value_to_string_map"
+      ],
+      "verdetto": "duplicato",
+      "nota": "Stesso NOME, stessa firma, crate diversi. E' il caso che nexus-mcp-client (Wave C1) aveva gia' affrontato per mcp_client.rs fra questi stessi due crate: la conversione dei metadata plugin era rimasta indietro. Candidato a nexus-mcp-client, dove i tipi dei plugin vivono gia'."
+    },
+    {
+      "firma": "(Option<str>) -> Result<str>",
+      "membri": [
+        "crates/mcp-core/src/plugins/integrate.rs:120 normalize_scope",
+        "crates/mcp-core/src/plugins/mod.rs:142 normalize_scope",
+        "crates/plugin-service/src/plugins.rs:134 normalize_scope"
+      ],
+      "verdetto": "duplicato",
+      "nota": "TRE copie con lo stesso nome, due crate. Normalizza lo scope di un plugin: una regola sola, scritta tre volte. Stessa destinazione di value_to_string_map."
+    },
+    {
+      "firma": "(Json<CreateDirectoryRequest>) -> ApiResult",
+      "membri": [
+        "crates/admin-service/src/settings.rs:57 create_directory",
+        "crates/mcp-core/src/settings.rs:85 create_directory"
+      ],
+      "verdetto": "duplicato",
+      "nota": "Gli STESSI DUE FILE su cui la Fase B aveva consolidato nexus_types::fs_browse (81 righe identiche): create_directory e' rimasta fuori da quel giro. Il consolidamento ha una casa gia' pronta."
+    },
+    {
+      "firma": "(Claims) -> Result<Uuid>",
+      "membri": [
+        "crates/mcp-core/src/billing.rs:258 claims_user_id",
+        "crates/nexus-types/src/lib.rs:84 parse_user_id"
+      ],
+      "verdetto": "da_consolidare",
+      "nota": "IL CASO PIU' INTERESSANTE del primo giro. parse_user_id e' un PUNTO UNICO dichiarato nel catalogo di CLAUDE.md, e il guard `single-source [parse_user_id]` passa verde — perche' cerca il NOME, e questa copia si chiama claims_user_id. E' esattamente cio' che un guard testuale non puo' vedere e un censimento semantico si'. Da verificare se claims_user_id faccia davvero solo quello prima di sostituirla."
+    },
+    {
+      "firma": "() -> AgentNodeCtx",
+      "membri": [
+        "crates/nexus-agent-graph/src/nodes/final_gate.rs:1494 ctx_with (+8 nei nodi fratelli)"
+      ],
+      "verdetto": "da_consolidare",
+      "nota": "Nove helper di test che costruiscono un AgentNodeCtx, uno per nodo. Probabile duplicazione vera, ma il consolidamento va progettato: i nodi differiscono per quali campi del contesto valorizzano, e un costruttore unico troppo generico renderebbe i test meno leggibili di quanto li renda piu' corti. Da riprendere quando si tocca quell'area."
+    }
+  ]
+}

@@ -11,6 +11,7 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
+mcp-ast = { path = "../mcp-ast" }
 anyhow = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }

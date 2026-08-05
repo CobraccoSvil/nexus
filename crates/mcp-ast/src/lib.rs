@@ -77,6 +77,21 @@ pub struct Symbol {
     pub kind: SymbolKind,
     pub line: usize,
     pub visibility: Visibility,
+    /// I tipi dei parametri, nell'ordine in cui compaiono. **I nomi NON ci
+    /// sono**: due funzioni che accettano le stesse cose sono confrontabili
+    /// anche se le chiamano diversamente, ed e' questa la domanda a cui la
+    /// firma serve a rispondere (`xtask signature-census`).
+    ///
+    /// Popolata dal solo parser tree-sitter: il fallback regex legge una riga
+    /// per volta e una firma puo' stare su piu' righe. Vuota non significa
+    /// "nessun parametro" ma "non misurata" — chi la consuma deve distinguere,
+    /// e per questo il censimento scarta i file non `precise`.
+    #[serde(default)]
+    pub params: Vec<String>,
+    /// Il tipo di ritorno come scritto nel sorgente, senza la freccia.
+    /// `None` quando la funzione non ne dichiara uno (o non e' una funzione).
+    #[serde(default)]
+    pub ret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -253,6 +268,8 @@ fn extract_ts_symbols(lines: &[&str]) -> Vec<Symbol> {
                 kind: SymbolKind::Function,
                 line: i + 1,
                 visibility: vis,
+                params: Vec::new(),
+                ret: None,
             });
         } else if let Some(cap) = RE_TS_FN.captures(trimmed) {
             symbols.push(Symbol {
@@ -260,6 +277,8 @@ fn extract_ts_symbols(lines: &[&str]) -> Vec<Symbol> {
                 kind: SymbolKind::Function,
                 line: i + 1,
                 visibility: vis,
+                params: Vec::new(),
+                ret: None,
             });
         } else if let Some(cap) = RE_TS_CLASS.captures(trimmed) {
             symbols.push(Symbol {
@@ -267,6 +286,8 @@ fn extract_ts_symbols(lines: &[&str]) -> Vec<Symbol> {
                 kind: SymbolKind::Class,
                 line: i + 1,
                 visibility: vis,
+                params: Vec::new(),
+                ret: None,
             });
         } else if let Some(cap) = RE_TS_IFACE.captures(trimmed) {
             symbols.push(Symbol {
@@ -274,6 +295,8 @@ fn extract_ts_symbols(lines: &[&str]) -> Vec<Symbol> {
                 kind: SymbolKind::Interface,
                 line: i + 1,
                 visibility: vis,
+                params: Vec::new(),
+                ret: None,
             });
         } else if let Some(cap) = RE_TS_CONST.captures(trimmed) {
             symbols.push(Symbol {
@@ -281,6 +304,8 @@ fn extract_ts_symbols(lines: &[&str]) -> Vec<Symbol> {
                 kind: SymbolKind::Constant,
                 line: i + 1,
                 visibility: vis,
+                params: Vec::new(),
+                ret: None,
             });
         }
     }
@@ -303,6 +328,8 @@ fn extract_rust_symbols(lines: &[&str]) -> Vec<Symbol> {
                 kind: SymbolKind::Function,
                 line: i + 1,
                 visibility: vis,
+                params: Vec::new(),
+                ret: None,
             });
         } else if let Some(cap) = RE_RS_STRUCT.captures(trimmed) {
             symbols.push(Symbol {
@@ -310,6 +337,8 @@ fn extract_rust_symbols(lines: &[&str]) -> Vec<Symbol> {
                 kind: SymbolKind::Struct,
                 line: i + 1,
                 visibility: vis,
+                params: Vec::new(),
+                ret: None,
             });
         } else if let Some(cap) = RE_RS_ENUM.captures(trimmed) {
             symbols.push(Symbol {
@@ -317,6 +346,8 @@ fn extract_rust_symbols(lines: &[&str]) -> Vec<Symbol> {
                 kind: SymbolKind::Enum,
                 line: i + 1,
                 visibility: vis,
+                params: Vec::new(),
+                ret: None,
             });
         } else if let Some(cap) = RE_RS_IMPL.captures(trimmed) {
             if !trimmed.starts_with("//") {
@@ -325,6 +356,8 @@ fn extract_rust_symbols(lines: &[&str]) -> Vec<Symbol> {
                     kind: SymbolKind::Class,
                     line: i + 1,
                     visibility: Visibility::Unknown,
+                    params: Vec::new(),
+                    ret: None,
                 });
             }
         }
@@ -341,6 +374,8 @@ fn extract_python_symbols(lines: &[&str]) -> Vec<Symbol> {
                 kind: SymbolKind::Class,
                 line: i + 1,
                 visibility: Visibility::Public,
+                params: Vec::new(),
+                ret: None,
             });
         } else if let Some(cap) = RE_PY_DEF.captures(line) {
             let indent = cap[1].len();
@@ -359,6 +394,8 @@ fn extract_python_symbols(lines: &[&str]) -> Vec<Symbol> {
                 kind,
                 line: i + 1,
                 visibility: vis,
+                params: Vec::new(),
+                ret: None,
             });
         }
     }
@@ -390,7 +427,7 @@ fn extract_generic_symbols(lines: &[&str]) -> Vec<Symbol> {
                 return;
             }
             if seen.insert((name.to_string(), i + 1)) {
-                syms.push(Symbol { name: name.to_string(), kind, line: i + 1, visibility: vis.clone() });
+                syms.push(Symbol { name: name.to_string(), kind, line: i + 1, visibility: vis.clone(), params: Vec::new(), ret: None });
             }
         };
 
@@ -596,5 +633,55 @@ def main():
             .symbols
             .iter()
             .any(|s| s.name == "_internal" && s.visibility == Visibility::Private));
+    }
+
+    /// La firma si estrae davvero, e sono i TIPI a finirci — non i nomi.
+    ///
+    /// Test di conseguenza (regola O): non verifica che `node_signature` esista,
+    /// verifica che `index_source` — la strada della produzione — produca una
+    /// firma confrontabile. Con l'estrazione rotta questi assert rosseggiano.
+    #[test]
+    fn la_firma_rust_porta_i_tipi_non_i_nomi() {
+        let source = r#"
+pub fn carica(db: &PgPool, project_id: Uuid) -> Result<String, Error> {
+    todo!()
+}
+pub fn gemella(pool: &PgPool, progetto: Uuid) -> Result<String, Error> {
+    todo!()
+}
+"#;
+        let index = index_source("x.rs", source);
+        // Se tree-sitter non ha lavorato, la firma non e' misurata e il test non
+        // proverebbe nulla: lo si dichiara invece di lasciarlo passare in silenzio.
+        assert!(index.precise, "serve il parser AST: la firma non e' misurabile a regex");
+
+        let a = index.symbols.iter().find(|s| s.name == "carica").expect("carica");
+        assert_eq!(a.params, vec!["&PgPool".to_string(), "Uuid".to_string()]);
+        assert_eq!(a.ret.as_deref(), Some("Result<String, Error>"));
+
+        // I due nomi di parametro sono diversi (db/project_id vs pool/progetto):
+        // la firma deve risultare IDENTICA lo stesso, altrimenti il censimento
+        // non riconoscerebbe due funzioni che rispondono alla stessa domanda.
+        let b = index.symbols.iter().find(|s| s.name == "gemella").expect("gemella");
+        assert_eq!(a.params, b.params, "i nomi dei parametri non devono contare");
+        assert_eq!(a.ret, b.ret);
+    }
+
+    /// `self` non porta con se' riferimento e mutabilita': due metodi che
+    /// rispondono alla stessa domanda non devono separarsi per un `&mut`.
+    #[test]
+    fn il_ricevitore_si_normalizza_a_self() {
+        let source = r#"
+impl T {
+    pub fn a(&self, x: u32) -> bool { true }
+    pub fn b(&mut self, y: u32) -> bool { true }
+}
+"#;
+        let index = index_source("y.rs", source);
+        assert!(index.precise);
+        let a = index.symbols.iter().find(|s| s.name == "a").expect("a");
+        let b = index.symbols.iter().find(|s| s.name == "b").expect("b");
+        assert_eq!(a.params, vec!["self".to_string(), "u32".to_string()]);
+        assert_eq!(a.params, b.params);
     }
 }
