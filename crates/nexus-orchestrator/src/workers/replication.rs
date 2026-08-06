@@ -48,6 +48,18 @@ pub const REPLICATION_PENDING_PREFIX: &str = "replication:pending:";
 /// in memoria durante l'aggiornamento.
 pub const REPLICATION_PENDING_LEGACY_KEY: &str = "replication:pending";
 
+/// Questa chiave e' un batch accodato da questo stesso worker?
+///
+/// I batch sono un artefatto di TRASPORTO — il consumatore
+/// (`nexus_bridge::flush_replication_pending`) li legge e li rimuove — non un
+/// dato di dominio, quindi non rientrano mai in un batch successivo. Il
+/// discriminante sta qui e non fra i [`PRIORITY_PREFIXES`]: quella lista
+/// risponde a un'altra domanda ("cosa replicare per primo"), e una chiave che
+/// non vi figura finisce comunque nel ramo delle rimanenti.
+fn is_replication_artifact(key: &str) -> bool {
+    key.starts_with(REPLICATION_PENDING_PREFIX) || key == REPLICATION_PENDING_LEGACY_KEY
+}
+
 /// Batch serializzato da replicare
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReplicationBatch {
@@ -125,8 +137,22 @@ impl LearningWorker for ReplicationWorker {
             }
         };
 
-        // Seleziona le chiavi da replicare (priorità: prefissi noti, poi resto)
-        let all_keys = ns.keys();
+        // Seleziona le chiavi da replicare (priorità: prefissi noti, poi resto).
+        // I batch gia' accodati sono ESCLUSI: `replication:pending:` non figura
+        // fra i PRIORITY_PREFIXES e cadeva nel ramo delle chiavi rimanenti, cosi'
+        // ogni giro inglobava i batch dei giri precedenti — che a loro volta
+        // contenevano i loro. Con intervallo 180s e TTL 600s ne convivono 3-4
+        // generazioni, ognuna copia delle altre: la crescita e' geometrica, e
+        // `max_batch_size` non la ferma perche' limita il NUMERO di entry, non la
+        // loro dimensione. Misurato il 06/08/2026 su mcp-core vivo da 2,7h: 21,9
+        // GB di picco, un core al 100% dentro `serde_json::value::clone` (ogni
+        // `ns.get` clona l'intero Value, `namespace.rs`) e 176.342 regioni
+        // private frammentate.
+        let all_keys: Vec<String> = ns
+            .keys()
+            .into_iter()
+            .filter(|k| !is_replication_artifact(k))
+            .collect();
         let mut priority_keys: Vec<String> = all_keys
             .iter()
             .filter(|k| PRIORITY_PREFIXES.iter().any(|p| k.starts_with(p)))
@@ -251,6 +277,47 @@ mod tests {
             .collect();
         k.sort();
         k
+    }
+
+    #[tokio::test]
+    async fn un_batch_accodato_non_rientra_in_quelli_successivi() {
+        // IL difetto: `replication:pending:` non era fra i PRIORITY_PREFIXES,
+        // quindi cadeva nel ramo delle chiavi rimanenti e ogni giro inglobava i
+        // batch precedenti, che contenevano i loro. Con intervallo 180s e TTL
+        // 600s ne convivono 3-4 generazioni, ognuna copia delle altre: crescita
+        // geometrica. Misurato il 06/08/2026 su mcp-core, 21,9 GB di picco con un
+        // core al 100% in clonazione ricorsiva di `serde_json::Value`.
+        let ns = Arc::new(MemoryNamespace::new("auto-inclusione"));
+        let worker = ReplicationWorker::new();
+        let ctx = LearningContext::new().with_namespace(ns.clone());
+
+        ns.set("pattern:dato", serde_json::json!({"giro": 1}), "ul");
+        assert!(worker.run(&ctx).await.success);
+        assert!(worker.run(&ctx).await.success);
+
+        let keys = pending_keys(&ns);
+        assert_eq!(keys.len(), 2, "due giri, due batch: {keys:?}");
+
+        for k in &keys {
+            let batch: ReplicationBatch =
+                serde_json::from_value(ns.get(k).unwrap().value).unwrap();
+            let inglobati: Vec<&str> = batch
+                .entries
+                .iter()
+                .map(|e| e.key.as_str())
+                .filter(|k| is_replication_artifact(k))
+                .collect();
+            assert!(
+                inglobati.is_empty(),
+                "il batch {k} non deve contenere batch precedenti: {inglobati:?}"
+            );
+            assert_eq!(
+                batch.entry_count,
+                1,
+                "solo il dato vero in {k}: {:?}",
+                batch.entries.iter().map(|e| &e.key).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[tokio::test]
