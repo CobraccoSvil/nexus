@@ -633,75 +633,56 @@ pub async fn get_session_usage(
         }
     }
 
-    // Aggregate da assistant messages. Distinzione semantica:
-    // - total_tokens: solo messaggi VIVI (deleted_at IS NULL) -> usato per il
-    //   context window % della TokenUsageBar, che dopo un compact deve scendere.
-    // - total_cost: TUTTI i messaggi, inclusi i soft-deleted dalla compattazione
-    //   -> il costo e' CUMULATIVO (gia' speso/pagato) e non deve mai azzerarsi
-    //   compattando la chat. Bug storico: il filtro deleted_at azzerava anche il
-    //   costo dopo un compact.
-    let summary_row = sqlx::query(
-        r#"
-        SELECT
-            COALESCE(SUM((metadata->>'totalTokens')::bigint)
-                     FILTER (WHERE deleted_at IS NULL), 0)::bigint AS total_tokens,
-            COALESCE(SUM((metadata->>'totalCost')::float8), 0.0)::float8 AS total_cost
-        FROM chat_messages
-        WHERE session_id = $1
-          AND role = 'assistant'
-          AND metadata->>'totalTokens' IS NOT NULL
-        "#,
-    )
-    .bind(session_id)
-    .fetch_one(&session_pool)
-    .await
-    .map_err(|e| {
+    // La contabilita' di una sessione la porta il LEDGER, non i metadata dei
+    // messaggi (regola L: `ai_usage_ledger` e' la fonte autoritativa, crate
+    // `nexus-ledger`). I metadata di un messaggio assistant portano il costo del
+    // RUN PRINCIPALE di quel turno; il lavoro DELEGATO — Consiglio, review
+    // panel, ogni figura convocata — gira su sub-run che hanno un run_id
+    // proprio, quindi righe di ledger proprie, e da quella somma restava fuori.
+    //
+    // MISURATO il 06/08/2026 sui due progetti vivi: agenda-medica dichiarava
+    // $0.9394 dai metadata contro $3.4741 nel ledger (57 sub-run per $2.50: il
+    // 72% del lavoro non compariva), biblioteca-scolastica $1.6410 contro
+    // $2.0207. La differenza non e' un errore di arrotondamento: e' il costo di
+    // tutto cio' che l'orchestrazione delega, cioe' esattamente la parte che
+    // l'utente non puo' stimare a occhio.
+    //
+    // I sub-run si raccolgono senza dover risalire la discendenza: la gemella
+    // `agent_runs` del figlio porta la `session_id` del padre (verificato: 57 su
+    // 57). Chiedere alla sessione i suoi run e' quindi la domanda completa.
+    let run_ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM agent_runs WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_all(&session_pool)
+            .await
+            .unwrap_or_default();
+
+    // La somma e la sua ripartizione le fa il punto unico (`nexus-ledger`): qui
+    // si stabilisce SU CHE COSA sommare, non come.
+    let errore_lettura = |e: anyhow::Error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
         )
-    })?;
+    };
+    let totale = nexus_ledger::usage_for_runs(&state.db, &run_ids)
+        .await
+        .map_err(errore_lettura)?;
+    let per_modello = nexus_ledger::usage_by_model_for_runs(&state.db, &run_ids)
+        .await
+        .map_err(errore_lettura)?;
 
-    let breakdown_rows = sqlx::query(
-        r#"
-        SELECT
-            COALESCE(metadata->>'model', 'unknown') AS model,
-            COALESCE(SUM((metadata->>'totalTokens')::bigint), 0)::bigint AS tokens,
-            COALESCE(SUM((metadata->>'totalCost')::float8), 0.0)::float8 AS cost_usd
-        FROM chat_messages
-        WHERE session_id = $1
-          AND role = 'assistant'
-          AND deleted_at IS NULL
-          AND metadata->>'totalTokens' IS NOT NULL
-        GROUP BY metadata->>'model'
-        ORDER BY tokens DESC
-        "#,
-    )
-    .bind(session_id)
-    .fetch_all(&session_pool)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-    })?;
-
-    let breakdown: Vec<Value> = breakdown_rows
+    let breakdown: Vec<Value> = per_modello
         .into_iter()
-        .map(|row| {
-            json!({
-                "model": row.get::<String, _>("model"),
-                "tokens": row.get::<i64, _>("tokens"),
-                "cost_usd": row.get::<f64, _>("cost_usd"),
-            })
+        .map(|(modello, c)| {
+            json!({ "model": modello, "tokens": c.tokens, "cost_usd": c.cost })
         })
         .collect();
 
     Ok(Json(json!({
         "session_id": session_id,
-        "total_tokens": summary_row.get::<i64, _>("total_tokens"),
-        "total_cost_usd": summary_row.get::<f64, _>("total_cost"),
+        "total_tokens": totale.tokens,
+        "total_cost_usd": totale.cost,
         "breakdown": breakdown,
     })))
 }

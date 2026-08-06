@@ -200,50 +200,11 @@ pub async fn observed_cache_hit_rates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::identita;
     use crate::Identity;
     use nexus_pricing::TokenUsage;
     use serde_json::json;
     use sqlx::PgPool;
-    use uuid::Uuid;
-
-    /// Identita' REALE: le due colonne del ledger portano una FK, quindi utente e
-    /// progetto devono esistere davvero. Senza questo il seed passerebbe solo
-    /// perche' il vincolo NOT NULL scatta prima della FK — un verde che non
-    /// dimostra nulla sullo schema vero.
-    async fn identita(pool: &PgPool) -> Identity {
-        let team = Uuid::new_v4();
-        let user = Uuid::new_v4();
-        let project = Uuid::new_v4();
-        sqlx::query("INSERT INTO teams (id, name, slug) VALUES ($1, 'T', $2)")
-            .bind(team)
-            .bind(team.to_string())
-            .execute(pool)
-            .await
-            .expect("insert team");
-        sqlx::query(
-            "INSERT INTO users (id, email, display_name) VALUES ($1, $2, 'U')",
-        )
-        .bind(user)
-        .bind(format!("{user}@test.local"))
-        .execute(pool)
-        .await
-        .expect("insert user");
-        sqlx::query(
-            "INSERT INTO projects (id, team_id, name, slug, owner_user_id) \
-             VALUES ($1, $2, 'P', $3, $4)",
-        )
-        .bind(project)
-        .bind(team)
-        .bind(project.to_string())
-        .bind(user)
-        .execute(pool)
-        .await
-        .expect("insert project");
-        Identity {
-            user_id: user,
-            project_id: project,
-        }
-    }
 
     /// Righe FINALIZED scritte dal produttore reale ([`crate::record_tokens`]),
     /// non da un INSERT che ricopia le colonne a mano (regola O): e' la stessa

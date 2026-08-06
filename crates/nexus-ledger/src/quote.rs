@@ -328,6 +328,82 @@ where
     Ok(consumi.into_iter().next().unwrap_or_default())
 }
 
+/// Quanto e' costato un INSIEME di run: la contabilita' di una conversazione.
+///
+/// Sta qui, e non in una query dell'endpoint che la mostra, perche' e' la stessa
+/// domanda delle quote — «quanto e' stato consumato» — posta su un altro
+/// perimetro. L'endpoint di sessione la rispondeva sommando i metadata dei
+/// messaggi, che portano il costo del RUN PRINCIPALE del turno: tutto il lavoro
+/// DELEGATO (Consiglio, review panel, ogni figura convocata) gira su sub-run con
+/// run_id propri e restava fuori. MISURATO il 06/08/2026: $0.9394 dichiarati
+/// contro $3.4741 reali su agenda-medica, cioe' il 72% del lavoro invisibile.
+///
+/// Solo `finalized`: una prenotazione aperta e' una stima, non spesa.
+///
+/// Elenco vuoto -> `Consumption::default()` senza interrogare il DB: `= ANY('{}')`
+/// e' una somma su zero righe, e chiederla e' un giro inutile.
+pub async fn usage_for_runs<'e, E>(exec: E, run_ids: &[Uuid]) -> Result<Consumption>
+where
+    E: PgExecutor<'e>,
+{
+    if run_ids.is_empty() {
+        return Ok(Consumption::default());
+    }
+    let row = sqlx::query(
+        "SELECT COALESCE(SUM(total_tokens), 0)::bigint AS tokens, \
+                COALESCE(SUM(total_cost), 0.0)::float8 AS cost \
+           FROM ai_usage_ledger \
+          WHERE run_id = ANY($1) AND status = 'finalized'",
+    )
+    .bind(run_ids)
+    .fetch_one(exec)
+    .await?;
+    Ok(Consumption {
+        tokens: row.get::<i64, _>("tokens"),
+        cost: row.get::<f64, _>("cost"),
+    })
+}
+
+/// Il consumo di [`usage_for_runs`] ripartito per modello, dal piu' usato.
+///
+/// Stessa fonte e stesso filtro del totale: due query con criteri diversi
+/// darebbero una ripartizione che non somma al totale che le sta sopra.
+pub async fn usage_by_model_for_runs<'e, E>(
+    exec: E,
+    run_ids: &[Uuid],
+) -> Result<Vec<(String, Consumption)>>
+where
+    E: PgExecutor<'e>,
+{
+    if run_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        "SELECT provider || '/' || model AS etichetta, \
+                COALESCE(SUM(total_tokens), 0)::bigint AS tokens, \
+                COALESCE(SUM(total_cost), 0.0)::float8 AS cost \
+           FROM ai_usage_ledger \
+          WHERE run_id = ANY($1) AND status = 'finalized' \
+          GROUP BY provider, model \
+          ORDER BY tokens DESC",
+    )
+    .bind(run_ids)
+    .fetch_all(exec)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("etichetta"),
+                Consumption {
+                    tokens: r.get::<i64, _>("tokens"),
+                    cost: r.get::<f64, _>("cost"),
+                },
+            )
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,5 +481,117 @@ mod tests {
                 "senza il cast la lettura di una quota di COSTO fallisce a runtime"
             );
         }
+    }
+
+    use crate::test_support::identita;
+
+    /// Una chiamata contabilizzata su un run, dalla strada VERA
+    /// (`reserve` -> `finalize`): e' il solo percorso che valorizza `run_id`,
+    /// e ricopiarne la INSERT a mano misurerebbe un'imitazione (regola O).
+    async fn chiamata_su_run(
+        pool: &PgPool,
+        id: Identity,
+        run_id: Uuid,
+        provider: &str,
+        model: &str,
+        prompt: i64,
+        completion: i64,
+    ) {
+        let r = crate::reserve(
+            pool,
+            id,
+            provider,
+            model,
+            prompt as i32,
+            completion as i32,
+            serde_json::json!({}),
+        )
+        .await
+        .expect("prenotazione");
+        let usage = crate::LedgerUsage::derived(nexus_pricing::TokenUsage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        });
+        crate::finalize(pool, &r, run_id, &usage)
+            .await
+            .expect("finalizzazione");
+    }
+
+    /// IL difetto: il lavoro delegato conta. Un padre e due figli (i sub-run
+    /// delle figure convocate) devono sommare tutti e tre.
+    ///
+    /// MUTAZIONE: passare al totale i soli run principali -> 1000 invece di 3000,
+    /// che e' la forma esatta dello scarto misurato in produzione ($0.94
+    /// dichiarati su $3.47 reali).
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_lavoro_dei_sub_run_entra_nel_totale(pool: PgPool) {
+        let id = identita(&pool).await;
+        let padre = Uuid::new_v4();
+        let figlio_a = Uuid::new_v4();
+        let figlio_b = Uuid::new_v4();
+        chiamata_su_run(&pool, id, padre, "mistral", "m1", 900, 100).await;
+        chiamata_su_run(&pool, id, figlio_a, "deepseek", "d1", 900, 100).await;
+        chiamata_su_run(&pool, id, figlio_b, "openrouter", "o1", 900, 100).await;
+
+        let solo_padre = usage_for_runs(&pool, &[padre]).await.expect("lettura");
+        assert_eq!(solo_padre.tokens, 1000, "il padre da solo");
+
+        let tutti = usage_for_runs(&pool, &[padre, figlio_a, figlio_b])
+            .await
+            .expect("lettura");
+        assert_eq!(tutti.tokens, 3000, "il lavoro delegato non e' entrato");
+    }
+
+    /// Una prenotazione APERTA non e' spesa: entra solo cio' che e' finalizzato.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn una_prenotazione_aperta_non_e_spesa(pool: PgPool) {
+        let id = identita(&pool).await;
+        let run = Uuid::new_v4();
+        crate::reserve(&pool, id, "mistral", "m1", 5000, 500, serde_json::json!({}))
+            .await
+            .expect("prenotazione mai chiusa");
+        assert_eq!(
+            usage_for_runs(&pool, &[run]).await.expect("lettura").tokens,
+            0
+        );
+    }
+
+    /// La ripartizione somma al totale che le sta sopra, e nomina i modelli usati
+    /// SOLO dai figli — quelli che dai metadata del messaggio non comparivano.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_ripartizione_nomina_anche_i_modelli_dei_figli(pool: PgPool) {
+        let id = identita(&pool).await;
+        let padre = Uuid::new_v4();
+        let figlio = Uuid::new_v4();
+        chiamata_su_run(&pool, id, padre, "mistral", "m1", 1800, 200).await;
+        chiamata_su_run(&pool, id, figlio, "deepseek", "d1", 450, 50).await;
+
+        let per_modello = usage_by_model_for_runs(&pool, &[padre, figlio])
+            .await
+            .expect("lettura");
+        assert_eq!(per_modello.len(), 2);
+        assert_eq!(per_modello[0].0, "mistral/m1", "ordine per token DESC");
+        assert_eq!(per_modello[1].0, "deepseek/d1");
+        let somma: i64 = per_modello.iter().map(|(_, c)| c.tokens).sum();
+        let totale = usage_for_runs(&pool, &[padre, figlio])
+            .await
+            .expect("lettura")
+            .tokens;
+        assert_eq!(somma, totale, "la ripartizione non somma al totale");
+    }
+
+    /// Nessun run: zero senza interrogare il DB (e senza `ANY('{}')`).
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn senza_run_il_consumo_e_zero(pool: PgPool) {
+        assert_eq!(
+            usage_for_runs(&pool, &[]).await.expect("lettura"),
+            Consumption::default()
+        );
+        assert!(usage_by_model_for_runs(&pool, &[])
+            .await
+            .expect("lettura")
+            .is_empty());
     }
 }

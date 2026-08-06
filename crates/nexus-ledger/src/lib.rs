@@ -60,13 +60,15 @@ use uuid::Uuid;
 mod cache_hitrate;
 mod quote;
 mod scrittura;
+#[cfg(test)]
+mod test_support;
 
 pub use cache_hitrate::{
     observed_cache_hit_rates, HitRateWindow, MIN_SAMPLES_SETTING, WINDOW_SETTING,
 };
 pub use quote::{
-    active_quotas, check_quota, usage_for_quotas, usage_for_scope, Consumption, QuotaLock,
-    QuotaPolicy,
+    active_quotas, check_quota, usage_by_model_for_runs, usage_for_quotas, usage_for_runs,
+    usage_for_scope, Consumption, QuotaLock, QuotaPolicy,
 };
 pub use scrittura::{
     finalize, insert_marker, record_media, record_tokens, release, reserve, settle,

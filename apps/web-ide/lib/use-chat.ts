@@ -595,16 +595,15 @@ export function useChat(
                 const syntheticMsg = createTerminalMessage(finalRun, projectId, streamingTokenRef.current);
                 setMessages((current) => upsertSyntheticAssistantMessage(current, syntheticMsg));
                 try {
-                  const usage = await refreshSessionUsage(sid);
-                  if (usage && usage.totalTokens > 0 && syntheticMsg) {
-                    setMessages((current) =>
-                      current.map((m) =>
-                        m.id === syntheticMsg.id
-                          ? { ...m, totalTokens: usage.totalTokens, totalCost: usage.totalCostUsd }
-                          : m,
-                      ),
-                    );
-                  }
+                  // Aggiorna la BARRA di sessione (totale cumulativo). Il
+                  // messaggio terminale NON viene piu' patchato con questi
+                  // totali: `createTerminalMessage` porta gia' quelli del suo
+                  // run, e sovrascriverli col cumulativo di sessione faceva
+                  // dichiarare a un singolo turno la spesa dell'intera chat.
+                  // Era una toppa alla contabilita' che mancava sul run (i run
+                  // chiusi da fuori restavano a zero), causa chiusa a monte dal
+                  // punto unico `run_totals` lato backend.
+                  await refreshSessionUsage(sid);
                 } catch {}
                 // Tracce dal DB: il run e' chiuso, quindi anche i suoi sub-run
                 // hanno finito di scrivere. E' il momento in cui la ripartizione
