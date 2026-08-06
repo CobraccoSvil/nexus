@@ -541,12 +541,17 @@ pub async fn link_allocation_to_service_unit(
     project_id: Uuid,
     label: &str,
     service_unit: &str,
-) {
+) -> LegameUnit {
     let label = label.trim();
     let service_unit = service_unit.trim();
     if label.is_empty() || service_unit.is_empty() {
-        return;
+        return LegameUnit::NonScritto;
     }
+
+    // Chi ALTRI ha gia' quella unit. Si guarda PRIMA di scrivere: dopo, la
+    // propria riga sarebbe indistinguibile dalle altre.
+    let altre = altre_label_sulla_unit(db, project_id, label, service_unit).await;
+
     if let Err(e) = sqlx::query(
         "UPDATE nexus_port_allocations SET service_unit = $1, updated_at = NOW() \
          WHERE project_id = $2 AND label = $3",
@@ -563,7 +568,76 @@ pub async fn link_allocation_to_service_unit(
             service_unit,
             e
         );
+        return LegameUnit::NonScritto;
     }
+
+    if altre.is_empty() {
+        return LegameUnit::Solo;
+    }
+    dichiara_unit_condivisa(project_id, label, service_unit, &altre);
+    LegameUnit::Condiviso { altre }
+}
+
+/// Le altre label dello stesso progetto gia' legate a questa unit.
+///
+/// L'unit si costruisce DALLA label (`service_unit_name` -> `{slug}-{label}`),
+/// quindi due label diverse sulla stessa unit non sono un caso d'uso: sono la
+/// traccia che una delle due e' stata riscritta dopo. Errore di lettura -> lista
+/// vuota: non si inventa un difetto che non si e' potuto osservare.
+async fn altre_label_sulla_unit(
+    db: &PgPool,
+    project_id: Uuid,
+    label: &str,
+    service_unit: &str,
+) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT label FROM nexus_port_allocations \
+         WHERE project_id = $1 AND service_unit = $2 AND label <> $3 ORDER BY label",
+    )
+    .bind(project_id)
+    .bind(service_unit)
+    .bind(label)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+}
+
+/// Non si rifiuta — la riga altrui esiste gia' e bloccare l'avvio non la
+/// toglierebbe — ma non passa piu' in silenzio: era proprio il silenzio a rendere
+/// invisibile il furto d'identita' finche' qualcuno non guardava la tabella a
+/// mano (ADR 0042, misura su agenda-medica del 2026-08-06).
+fn dichiara_unit_condivisa(project_id: Uuid, label: &str, service_unit: &str, altre: &[String]) {
+    tracing::warn!(
+        unit = %service_unit,
+        label = %label,
+        altre_label = %altre.join(", "),
+        project_id = %project_id,
+        "unit di servizio legata a piu' di una label: una di queste allocazioni \
+         non incontrera' mai il proprio servizio"
+    );
+    crate::security::record_audit(
+        crate::security::AuditEntry::allowed(project_id, "service_unit_shared", "port")
+            .with_resource(service_unit.to_string())
+            .with_details(serde_json::json!({
+                "service_unit": service_unit,
+                "label": label,
+                "altre_label": altre,
+            })),
+    );
+}
+
+/// Esito del legame allocazione -> unit. Tipizzato (regola Q) perche' il caso che
+/// conta — la unit gia' presa da un'altra label — non e' un errore e non e' un
+/// successo pulito: e' un fatto che qualcuno deve poter osservare, a partire dai
+/// test che lo riproducono.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegameUnit {
+    /// Scritto, e quella unit e' di questa sola label.
+    Solo,
+    /// Scritto, ma la stessa unit e' gia' legata alle label elencate.
+    Condiviso { altre: Vec<String> },
+    /// Niente da scrivere (label o unit vuote) o UPDATE fallito.
+    NonScritto,
 }
 
 /// Quanto si attende che la porta del servizio torni bindabile dopo lo stop che
@@ -611,7 +685,12 @@ pub async fn web_service_port_env(
     // qui sopra dice di voler evitare. Meglio non avviare che avviare su una
     // porta che sparira'.
     match super::services::project_service_unit(db, project_id, label).await {
-        Some(unit) => link_allocation_to_service_unit(db, project_id, label, &unit).await,
+        Some(unit) => {
+            // L'esito lo dichiara e lo audita il punto unico: qui l'avvio prosegue
+            // comunque, perche' una unit gia' condivisa e' un difetto di registro
+            // preesistente e non una ragione per lasciare a terra questo servizio.
+            let _ = link_allocation_to_service_unit(db, project_id, label, &unit).await;
+        }
         None => {
             tracing::warn!(
                 label = %label,
@@ -1229,6 +1308,77 @@ mod tests {
             lookup_service_unit(&pool, proj, "frontend").await,
             None,
             "input vuoto (unit o label) non deve toccare service_unit"
+        );
+    }
+
+    /// DUE LABEL SULLA STESSA UNIT: il registro lo dichiara invece di lasciarlo
+    /// accadere in silenzio.
+    ///
+    /// E' la coda dell'incidente `agenda-medica` (2026-08-06): dopo che la riga
+    /// 31926 era stata riscritta a `Service`, la `find_or_allocate("backend")`
+    /// successiva ha creato 31927 e vi ha legato la STESSA
+    /// `agenda-medica-backend.service`. Due porte, una unit, e nessuna traccia:
+    /// il difetto e' rimasto invisibile finche' qualcuno non ha guardato la
+    /// tabella a mano.
+    ///
+    /// L'unit si costruisce DALLA label, quindi il caso non e' legittimo per
+    /// costruzione. Non si rifiuta — la riga altrui esiste gia' — ma l'esito e'
+    /// un valore osservabile (regola Q).
+    ///
+    /// MUTAZIONE che rende rosso: far ritornare sempre `Solo` (cioe' togliere la
+    /// SELECT delle altre label, com'era prima) — la prima asserzione fallisce.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn una_unit_legata_a_due_label_viene_dichiarata(pool: sqlx::PgPool) {
+        let (_utente, proj) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let unit = "agenda-medica-backend.service";
+
+        // La vittima del furto: label riscritta, unit rimasta quella del backend.
+        sqlx::query(
+            "INSERT INTO nexus_port_allocations \
+             (project_id, port, label, service_unit, allocation_mode) \
+             VALUES ($1, 31926, 'Service', $2, 'adopted')",
+        )
+        .bind(proj)
+        .bind(unit)
+        .execute(&pool)
+        .await
+        .expect("riga riscritta");
+
+        // Il backend, che non trovava piu' la propria label, ne alloca un'altra.
+        sqlx::query(
+            "INSERT INTO nexus_port_allocations (project_id, port, label, allocation_mode) \
+             VALUES ($1, 31927, 'backend', 'adopted')",
+        )
+        .bind(proj)
+        .execute(&pool)
+        .await
+        .expect("riga nuova del backend");
+
+        assert_eq!(
+            super::link_allocation_to_service_unit(&pool, proj, "backend", unit).await,
+            super::LegameUnit::Condiviso {
+                altre: vec!["Service".to_string()]
+            },
+            "la unit era gia' di un'altra label: il legame non puo' essere muto"
+        );
+
+        // Il legame si scrive comunque: rifiutarlo lascerebbe la riga nuova senza
+        // unit, cioe' esposta al GC, senza togliere quella vecchia.
+        assert_eq!(
+            lookup_service_unit(&pool, proj, "backend").await,
+            Some(unit.to_string())
+        );
+
+        // Il caso sano resta silenzioso.
+        assert_eq!(
+            super::link_allocation_to_service_unit(
+                &pool,
+                proj,
+                "Service",
+                "agenda-medica-Service.service"
+            )
+            .await,
+            super::LegameUnit::Solo
         );
     }
 }

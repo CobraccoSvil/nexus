@@ -110,6 +110,62 @@ difetto di logica: e' un difetto di **modello**. La label — cioe' l'identita' 
 servizio — e' un attributo della riga *porta*, quindi la porta puo' cambiare
 identita' al servizio.
 
+#### Riprodotto il 2026-08-06, e chiuso alla fonte in attesa del piano
+
+Il difetto ha continuato a produrre: `agenda-medica`
+(`75feee9a-a06c-47ce-9f94-e3d11cbe27cc`), progetto creato lo stesso giorno alle
+11:15 e costruito da Nexus in autonomia. Al termine, due righe:
+
+| porta | label | service_unit | nata | aggiornata |
+|---|---|---|---|---|
+| 31926 | `Service` | `agenda-medica-backend.service` | 11:29:42 | 12:11:41 |
+| 31927 | `backend` | `agenda-medica-backend.service` | 12:12:28 | 12:22:36 |
+
+La cronologia chiude il cerchio senza ipotesi: il log di mcp-core mostra la 31926
+nascere alle 11:29:42 con `label=backend` (`web_service_port_env`, mode
+`dynamic`), l'evento `PortAllocated` a 12:11:41.544 — 0,4 ms dopo l'`updated_at`
+della riga, cioe' `register_detected_port` — e la nuova allocazione 46 secondi
+dopo. Il chiamante era un **task**, non un servizio: l'avvio a 12:11:36.474 piu'
+i 5 secondi esatti del ramo `porta_attesa = None` di `tool_run_service` danno
+proprio 12:11:41.5.
+
+E qui c'e' la parte che il testo sopra non poteva prevedere: **la label rubante
+non era una regressione**. Il ripiego `unwrap_or("Service")` era stato rimosso il
+2026-07-28 (`dc428ce4`) e non e' tornato. `Service` e' `LABEL_NON_SERVIZIO`
+(`agent_tools/service.rs`), l'identita' che `ServiceIdentity::NonServizio`
+assegna deliberatamente ai task one-shot — legittima dentro `agent_processes`,
+dove serve appunto a non combaciare con nessun servizio vero. Il difetto e' che
+`report_started_service` la portava fino al registro delle porte, che e' l'unico
+posto dove non poteva significare niente. Un task non ha una porta: quella che
+compare nel suo output (un `curl` verso il backend, un test che stampa l'URL su
+cui punta) e' di qualcun altro.
+
+Il piano di questa ADR resta quello descritto sotto. Nel frattempo, il 2026-08-06,
+sono stati chiusi i tre anelli che rendevano il furto possibile e invisibile —
+tutti nella direzione del piano, nessuno da disfare quando P1..P8 arriveranno:
+
+1. **La porta non e' piu' una chiave d'identita'.** `classify_port_claim`
+   (`nexus-tool-kit/src/ports.rs`, punto unico) risponde a «di chi e' questa
+   porta nel registro?» con `Registrabile | GiaSua | DiUnAltro{project_id,label}`;
+   `register_detected_port` scrive solo nei primi due casi e sul terzo audita
+   `port_identity_conflict` senza toccare nulla. Il `DO UPDATE` e' diventato
+   `DO NOTHING`, e un guard testuale (`identita-allocazione-porta` in
+   `scripts/check-single-source.sh`) impedisce che la forma rientri.
+2. **Chi non e' un servizio non registra porte.** Il criterio e'
+   `registra_le_proprie_porte(kind)`, cioe' il `kind` gia' risolto da
+   `declassa_se_non_e_un_servizio` — non un secondo giudizio sul comando.
+3. **Una unit legata a due label si dichiara.**
+   `link_allocation_to_service_unit` ritorna
+   `LegameUnit{Solo | Condiviso{altre} | NonScritto}` e audita
+   `service_unit_shared`. Non rifiuta (la riga altrui esiste gia', e bloccare
+   l'avvio non la toglie) ma non tace: era il silenzio a rendere il furto
+   scopribile solo leggendo la tabella a mano.
+
+Le prove di mutazione sono state eseguite: reintroducendo i tre difetti, i
+quattro test rosseggiano coi valori reali (`left: Registrabile` /
+`right: DiUnAltro { label: "backend" }`, `left: Solo` /
+`right: Condiviso { altre: ["Service"] }`).
+
 ### L'accumulo (le unit con lo slug doppio)
 
 Le due unit `bacheca-attivita-bacheca-attivita-*` hanno lo slug ripetuto e

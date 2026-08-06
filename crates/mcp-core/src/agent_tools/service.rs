@@ -208,7 +208,7 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
             None
         }
     };
-    report_started_service(ctx, &label, process_id, ascolto).await
+    report_started_service(ctx, &label, &kind, process_id, ascolto).await
 }
 
 /// Gate pre-avvio di `tool_run_service`: dedup+cleanup porte, poi refuse per
@@ -856,6 +856,7 @@ async fn spawn_service_process(
 async fn report_started_service(
     ctx: &AgentToolContext,
     label: &str,
+    kind: &str,
     process_id: Uuid,
     ascolto: Option<(u16, bool)>,
 ) -> String {
@@ -876,7 +877,7 @@ async fn report_started_service(
         }
     };
 
-    let detected_port = registra_o_audita_porta_rilevata(ctx, label, &info).await;
+    let detected_port = registra_o_audita_porta_rilevata(ctx, label, kind, &info).await;
     // Dispatcher: notifica avvio servizio → pannello Servizi aggiorna LED.
     // Se la porta attesa non e' mai entrata in ascolto il servizio NON e' su:
     // emettere l'avvio accenderebbe un LED verde su un servizio morto, cioe'
@@ -912,8 +913,21 @@ async fn report_started_service(
 async fn registra_o_audita_porta_rilevata(
     ctx: &AgentToolContext,
     label: &str,
+    kind: &str,
     info: &crate::agent_processes::ProcessOutput,
 ) -> Option<i32> {
+    // Chi non e' un servizio di progetto non registra porte, e non e' una cautela:
+    // e' che non ne ha nessuna. `declassa_se_non_e_un_servizio` porta a `task`
+    // ogni comando che non avvia un server, e la sua identita' e'
+    // `LABEL_NON_SERVIZIO` — generica per costruzione. Una porta che compare
+    // nell'output di un task e' percio' di QUALCUN ALTRO (un `curl` verso il
+    // backend, un test che stampa l'URL su cui punta), e registrarla significa
+    // scriverne nel registro l'identita' che il sistema stesso dichiara priva di
+    // significato. E' la strada da cui la label `Service` e' entrata in
+    // `nexus_port_allocations` su agenda-medica il 2026-08-06.
+    if !registra_le_proprie_porte(kind) {
+        return None;
+    }
     match detect_port_from_output(&ctx.project_id, &info.stdout, &info.stderr) {
         Some(r) if r.esito == nexus_tool_kit::ports::PortRegistrability::Registrable => {
             register_detected_port(ctx, label, r.port as i32, info.pid).await;
@@ -925,6 +939,15 @@ async fn registra_o_audita_porta_rilevata(
         }
         None => None,
     }
+}
+
+/// Solo un servizio di progetto registra la porta che il proprio output dichiara.
+///
+/// Il criterio e' il `kind` gia' risolto da `declassa_se_non_e_un_servizio` +
+/// `ServiceIdentity::classifica`, non un secondo giudizio sul comando: due
+/// discriminanti per la stessa domanda divergerebbero al primo ritocco (regola L).
+fn registra_le_proprie_porte(kind: &str) -> bool {
+    kind == "service"
 }
 
 /// Una porta rilevata FUORI dal bucket del progetto NON viene registrata. La
@@ -963,21 +986,30 @@ fn audita_porta_fuori_bucket(
         reason = rilevata.esito.reason(),
         "porta del servizio fuori dal bucket del progetto: non registrata come allocazione"
     );
-    let mut entry = crate::security::AuditEntry::blocked(
-        ctx.project_id,
-        "port_out_of_bucket_detected".to_string(),
-        "port",
-    )
-    .with_resource(rilevata.port.to_string())
-    .with_details(serde_json::json!({
-        "port": rilevata.port,
-        "label": label,
-        "pid": pid,
-        "bucket_start": bucket_start,
-        "bucket_end": bucket_end,
-        "reason": rilevata.esito.reason(),
-    }))
-    .with_actor_user(ctx.user_id);
+    registra_audit_del_contesto(
+        ctx,
+        crate::security::AuditEntry::blocked(
+            ctx.project_id,
+            "port_out_of_bucket_detected".to_string(),
+            "port",
+        )
+        .with_resource(rilevata.port.to_string())
+        .with_details(serde_json::json!({
+            "port": rilevata.port,
+            "label": label,
+            "pid": pid,
+            "bucket_start": bucket_start,
+            "bucket_end": bucket_end,
+            "reason": rilevata.esito.reason(),
+        })),
+    );
+}
+
+/// Chi ha fatto l'azione lo sa il contesto, non il chiamante: qui l'attore si
+/// attacca una volta sola. La sessione e' `Option` — un audit nato fuori da una
+/// chat non ne ha una, e inventarla direbbe il falso su chi ha agito.
+fn registra_audit_del_contesto(ctx: &AgentToolContext, entry: crate::security::AuditEntry) {
+    let mut entry = entry.with_actor_user(ctx.user_id);
     if let Some(s) = ctx.session_id {
         entry = entry.with_actor_session(s);
     }
@@ -989,17 +1021,17 @@ fn audita_porta_fuori_bucket(
 /// sia registrabile sta nel chiamante, che ha il verdetto di
 /// `detect_port_from_output`: qui non si ri-classifica, altrimenti la stessa
 /// domanda avrebbe due risposte possibili (regola L).
+///
+/// A CHI la porta appartenga gia' lo decide il punto unico
+/// [`nexus_tool_kit::ports::classify_port_claim`]. L'evento si emette SOLO quando
+/// una riga e' davvero stata scritta: un `PortAllocated` su una porta di un altro
+/// direbbe al pannello che il servizio ha un indirizzo che non ha.
 async fn register_detected_port(ctx: &AgentToolContext, label: &str, port: i32, pid: Option<i32>) {
-    let _ = sqlx::query(
-        "INSERT INTO nexus_port_allocations (project_id, port, label, allocation_mode) \
-         VALUES ($1, $2, $3, 'auto') ON CONFLICT (port) DO UPDATE SET \
-         project_id = $1, label = $3, updated_at = NOW()",
-    )
-    .bind(ctx.project_id)
-    .bind(port)
-    .bind(label)
-    .execute(&*ctx.db)
-    .await;
+    let claim = registra_porta_rilevata(&ctx.db, ctx.project_id, label, port).await;
+    if matches!(claim, nexus_tool_kit::ports::PortClaim::DiUnAltro { .. }) {
+        audita_conflitto_identita(ctx, label, port, pid, &claim);
+        return;
+    }
     nexus_events::dispatcher::emit(
         &ctx.project_channels,
         ctx.project_id,
@@ -1009,6 +1041,108 @@ async fn register_detected_port(ctx: &AgentToolContext, label: &str, port: i32, 
             pid,
         },
     );
+}
+
+/// La porta dichiarata era gia' di un altro: si lascia com'e' e lo si scrive.
+/// L'audit nomina ENTRAMBE le identita' — senza il derubato, "conflitto" non dice
+/// con chi, e la riga di log non basta a ricostruire il caso.
+fn audita_conflitto_identita(
+    ctx: &AgentToolContext,
+    label: &str,
+    port: i32,
+    pid: Option<i32>,
+    claim: &nexus_tool_kit::ports::PortClaim,
+) {
+    let nexus_tool_kit::ports::PortClaim::DiUnAltro {
+        project_id,
+        label: proprietaria,
+    } = claim
+    else {
+        return;
+    };
+    tracing::warn!(
+        port,
+        richiedente = %label,
+        proprietaria = %proprietaria,
+        proprietario_project = %project_id,
+        "porta rilevata gia' registrata a un'altra identita': non riscrivo l'allocazione"
+    );
+    registra_audit_del_contesto(
+        ctx,
+        crate::security::AuditEntry::blocked(
+            ctx.project_id,
+            "port_identity_conflict".to_string(),
+            "port",
+        )
+        .with_resource(port.to_string())
+        .with_details(serde_json::json!({
+            "port": port,
+            "richiedente": label,
+            "registrata_a": proprietaria,
+            "registrata_al_progetto": project_id,
+            "pid": pid,
+            "reason": claim.reason(),
+        })),
+    );
+}
+
+/// La sola parte con il DB della registrazione porta-da-output, separata perche'
+/// la si possa provare contro lo schema vero senza costruire un
+/// [`AgentToolContext`] (regola O).
+///
+/// La riga si identifica da `(project_id, label)`, e il conflitto sulla PORTA non
+/// e' piu' un permesso di riscrittura: `ON CONFLICT (port) DO NOTHING` chiude
+/// anche la corsa fra la lettura e la scrittura — chi arriva secondo non scrive,
+/// che e' l'esito giusto in entrambe le direzioni.
+async fn registra_porta_rilevata(
+    db: &sqlx::PgPool,
+    project_id: uuid::Uuid,
+    label: &str,
+    port: i32,
+) -> nexus_tool_kit::ports::PortClaim {
+    use nexus_tool_kit::ports::{classify_port_claim, PortClaim};
+
+    let registrata: Option<(uuid::Uuid, String)> = sqlx::query_as(
+        "SELECT project_id, label FROM nexus_port_allocations WHERE port = $1",
+    )
+    .bind(port)
+    .fetch_optional(db)
+    .await
+    .unwrap_or(None);
+
+    let claim = classify_port_claim(
+        &project_id,
+        label,
+        registrata.as_ref().map(|(p, l)| (*p, l.as_str())),
+    );
+
+    match claim {
+        PortClaim::Registrabile => {
+            let _ = sqlx::query(
+                "INSERT INTO nexus_port_allocations (project_id, port, label, allocation_mode) \
+                 VALUES ($1, $2, $3, 'auto') ON CONFLICT (port) DO NOTHING",
+            )
+            .bind(project_id)
+            .bind(port)
+            .bind(label)
+            .execute(db)
+            .await;
+        }
+        PortClaim::GiaSua => {
+            // Conferma: la riga e' gia' quella giusta, si aggiorna solo quando e'
+            // stata vista viva l'ultima volta.
+            let _ = sqlx::query(
+                "UPDATE nexus_port_allocations SET updated_at = NOW() \
+                 WHERE port = $1 AND project_id = $2",
+            )
+            .bind(port)
+            .bind(project_id)
+            .execute(db)
+            .await;
+        }
+        PortClaim::DiUnAltro { .. } => {}
+    }
+    claim
 }
 
 /// Compone il messaggio testuale di avvio servizio (header + STDOUT/STDERR).
@@ -1923,8 +2057,9 @@ mod tests {
     use super::{
         classifica_ascolto_altrove, declassa_se_non_e_un_servizio, derive_kind_hint,
         detect_port_from_output, existing_service_action, format_started_message,
-        looks_like_web_service, resolve_service_label, resolve_service_work_dir, scope_dir,
-        tool_run_service, AscoltoAltrove, ExistingServiceAction, PortaRilevata, Uuid,
+        looks_like_web_service, registra_le_proprie_porte, resolve_service_label,
+        resolve_service_work_dir, scope_dir, tool_run_service, AscoltoAltrove,
+        ExistingServiceAction, PortaRilevata, Uuid, LABEL_NON_SERVIZIO,
     };
     use crate::agent_processes::{is_generic_service_label, similar_service_labels};
     use crate::project_workspace::services::{project_service_slug, service_unit_name};
@@ -2827,5 +2962,152 @@ mod tests {
             out.contains("[run_playwright_tests] Playwright non trovato nel progetto"),
             "la suite deve passare dall'esecutore unico, output: {out}"
         );
+    }
+
+    /// IL FURTO DI IDENTITA', contro lo schema VERO (regola O: schema dalla
+    /// migrazione meta, non da un `CREATE TABLE` ricopiato).
+    ///
+    /// Riproduce la coppia misurata su `agenda-medica` il 2026-08-06: la porta
+    /// 31926 e' registrata a `backend` con la sua unit, e un altro processo la
+    /// dichiara nel proprio output presentandosi con un'altra identita'. La riga
+    /// deve restare di `backend`, e non deve nascerne una seconda.
+    ///
+    /// MUTAZIONE che rende rosso (eseguita il 2026-08-06): far collassare
+    /// `PortClaim::DiUnAltro` in `Registrabile` — cioe' tornare a trattare la
+    /// porta come chiave d'identita' — e rimettere in `registra_porta_rilevata`
+    /// la vecchia `ON CONFLICT (port) DO UPDATE SET project_id = $1, label = $3`.
+    /// Le due mutazioni vanno INSIEME, ed e' la forma stessa del fix: con la sola
+    /// query mutata il verdetto ferma comunque la scrittura, con la sola
+    /// classificazione mutata la scrittura non riscrive nulla. Il test fallisce
+    /// sul verdetto, che nomina il derubato (`label: "backend"`).
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn una_porta_rilevata_non_ruba_la_riga_di_un_altro_servizio(pool: sqlx::PgPool) {
+        let (_utente, progetto) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let porta = 31926i32;
+
+        sqlx::query(
+            "INSERT INTO nexus_port_allocations \
+             (project_id, port, label, service_unit, allocation_mode) \
+             VALUES ($1, $2, 'backend', 'agenda-medica-backend.service', 'adopted')",
+        )
+        .bind(progetto)
+        .bind(porta)
+        .execute(&pool)
+        .await
+        .expect("allocazione del backend");
+
+        let claim = super::registra_porta_rilevata(&pool, progetto, "Service", porta).await;
+        assert!(
+            matches!(
+                claim,
+                nexus_tool_kit::ports::PortClaim::DiUnAltro { ref label, .. } if label == "backend"
+            ),
+            "la porta e' di 'backend': il verdetto deve nominarlo, {claim:?}"
+        );
+
+        let (label, unit): (String, Option<String>) =
+            sqlx::query_as("SELECT label, service_unit FROM nexus_port_allocations WHERE port = $1")
+                .bind(porta)
+                .fetch_one(&pool)
+                .await
+                .expect("la riga esiste ancora");
+        assert_eq!(label, "backend", "l'identita' della riga non si riscrive");
+        assert_eq!(unit.as_deref(), Some("agenda-medica-backend.service"));
+
+        // La seconda riga (31927 nel caso reale) nasceva perche' la
+        // `find_or_allocate("backend")` successiva non trovava piu' la sua label.
+        // Qui la trova: il registro resta a una riga per servizio.
+        let righe: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM nexus_port_allocations WHERE project_id = $1",
+        )
+        .bind(progetto)
+        .fetch_one(&pool)
+        .await
+        .expect("conteggio");
+        assert_eq!(righe, 1, "nessuna riga in piu' e nessuna in meno");
+    }
+
+    /// I due casi in cui si scrive davvero, sempre contro lo schema vero: la
+    /// porta libera nasce col richiedente, e la porta gia' propria si conferma
+    /// senza duplicarsi.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn una_porta_libera_o_gia_propria_si_registra(pool: sqlx::PgPool) {
+        let (_utente, progetto) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let porta = 31904i32;
+
+        assert_eq!(
+            super::registra_porta_rilevata(&pool, progetto, "frontend", porta).await,
+            nexus_tool_kit::ports::PortClaim::Registrabile
+        );
+        let label: String =
+            sqlx::query_scalar("SELECT label FROM nexus_port_allocations WHERE port = $1")
+                .bind(porta)
+                .fetch_one(&pool)
+                .await
+                .expect("la riga e' stata creata");
+        assert_eq!(label, "frontend");
+
+        assert_eq!(
+            super::registra_porta_rilevata(&pool, progetto, "frontend", porta).await,
+            nexus_tool_kit::ports::PortClaim::GiaSua,
+            "il secondo giro dello stesso servizio e' una conferma, non un conflitto"
+        );
+        let righe: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM nexus_port_allocations WHERE project_id = $1",
+        )
+        .bind(progetto)
+        .fetch_one(&pool)
+        .await
+        .expect("conteggio");
+        assert_eq!(righe, 1);
+    }
+
+    /// CHI puo' registrare una porta, attraversando il produttore dell'identita'
+    /// invece di fissare il `kind` a mano (regola O).
+    ///
+    /// Un comando one-shot riceve `kind='task'` e la label priva di scopo: e'
+    /// legittimo come processo, ma quella label non ha nessun titolo per entrare
+    /// nel registro delle porte — la porta che compare nel suo output e' di un
+    /// altro.
+    ///
+    /// MUTAZIONE che rende rosso: far ritornare `true` a
+    /// `registra_le_proprie_porte` per qualunque kind (com'era prima, quando
+    /// `registra_o_audita_porta_rilevata` non guardava affatto il kind).
+    #[test]
+    fn un_task_non_registra_porte() {
+        let root = std::path::Path::new("/progetti/agenda-medica");
+        let (kind, label) = resolve_service_label(
+            &serde_json::json!({}),
+            "curl -s http://localhost:31926/api/appuntamenti",
+            "service",
+            root,
+            root,
+            uuid::Uuid::nil(),
+            Some("agenda-medica".to_string()),
+        )
+        .classifica("service");
+
+        assert_eq!(kind, "task", "un curl non e' un servizio di progetto");
+        assert_eq!(
+            label, LABEL_NON_SERVIZIO,
+            "senza ruolo, l'identita' e' quella dichiarata priva di scopo"
+        );
+        assert!(
+            !registra_le_proprie_porte(&kind),
+            "la porta nell'output di un task e' di qualcun altro: registrarla \
+             scriverebbe nel registro un'identita' senza significato"
+        );
+        // Il servizio vero, per contrasto: e' l'unico che registra.
+        let (kind_servizio, _) = resolve_service_label(
+            &serde_json::json!({"label": "backend"}),
+            "npm run start",
+            "service",
+            root,
+            root,
+            uuid::Uuid::nil(),
+            Some("agenda-medica".to_string()),
+        )
+        .classifica("service");
+        assert!(registra_le_proprie_porte(&kind_servizio));
     }
 }
