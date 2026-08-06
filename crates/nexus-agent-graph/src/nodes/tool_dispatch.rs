@@ -1304,14 +1304,8 @@ impl ToolDispatchNode {
             prior_rejections,
             cap_raggiunto,
         );
-        crate::nodes::emit_phase_meta(
-            ctx.emit.as_ref(),
-            self.meta_steps.as_ref(),
-            step_gate::STEP_VALIDATION_META_KIND,
-            titolo_per_umano(&decision, level, &report),
-            payload.clone(),
-        )
-        .await;
+        self.emetti_meta_validazione(ctx, state, &decision, level, &report, payload.clone())
+            .await;
 
         self.esito_decisione(decision, state, pending, &report, prior_rejections, run_id, payload)
             .await
@@ -1491,6 +1485,30 @@ impl ToolDispatchNode {
             Ok(r) => r,
             Err(e) => report_degradato(&format!("porta di validazione in errore: {e}")),
         }
+    }
+
+    /// (2a) Il meta_step della validazione, con il titolo che l'utente legge
+    /// nel nastro. Il titolo dipende anche da CHI potra' rispondere: la stessa
+    /// decisione «serve un umano» diventa una domanda in Conferma e un rifiuto
+    /// in autonomia, e la riga deve dire quella che accadra' davvero.
+    async fn emetti_meta_validazione(
+        &self,
+        ctx: &AgentNodeCtx,
+        state: &AgentState,
+        decision: &crate::decisions::step_gate::StepGateDecision,
+        level: crate::decisions::step_gate::StepCriticality,
+        report: &ports::StepValidationReport,
+        payload: Value,
+    ) {
+        let interpella = crate::decisions::hitl::automation_requires_hitl(state.automation_mode);
+        crate::nodes::emit_phase_meta(
+            ctx.emit.as_ref(),
+            self.meta_steps.as_ref(),
+            crate::decisions::step_gate::STEP_VALIDATION_META_KIND,
+            titolo_per_umano(decision, level, report, interpella),
+            payload,
+        )
+        .await;
     }
 
     /// (2a) Che fare quando il gate rimanda la decisione a un umano: dipende
@@ -2339,8 +2357,9 @@ fn titolo_per_umano(
     decision: &crate::decisions::step_gate::StepGateDecision,
     level: crate::decisions::step_gate::StepCriticality,
     report: &ports::StepValidationReport,
+    interpella_umano: bool,
 ) -> String {
-    use crate::decisions::step_gate::{StepGateDecision, StepVerdict};
+    use crate::decisions::step_gate::StepGateDecision;
     let passo = if level == crate::decisions::step_gate::StepCriticality::Irreversible {
         "irreversibile"
     } else {
@@ -2351,20 +2370,59 @@ fn titolo_per_umano(
             format!("Passo {passo} approvato dai validatori: l'esecuzione prosegue")
         }
         StepGateDecision::Rejected => {
-            let motivo = report
-                .verdicts
-                .iter()
-                .filter(|v| v.verdict == StepVerdict::Reject)
-                .flat_map(|v| v.reasons.iter())
-                .find_map(|r| r.get("description").and_then(Value::as_str))
-                .unwrap_or("motivo non dettagliato");
-            format!("Passo {passo} rifiutato dai validatori: {motivo}")
+            format!(
+                "Passo {passo} rifiutato dai validatori: {}",
+                primo_motivo_di_rifiuto(report)
+            )
         }
         StepGateDecision::UnavailableDeclared => format!(
             "Passo {passo}: nessun verdetto utilizzabile, l'esecuzione prosegue dichiarandolo"
         ),
-        StepGateDecision::NeedsHuman => titolo_serve_conferma(passo, report),
+        // Stessa decisione, due esiti diversi: in Conferma la domanda viene
+        // posta, in autonomia no. Il titolo e' l'unica riga che l'utente legge
+        // nel nastro: dirgli «serve la tua conferma» dove nessuna conferma
+        // verra' mai chiesta lo manderebbe a cercare una card che non esiste.
+        StepGateDecision::NeedsHuman if interpella_umano => {
+            titolo_serve_conferma(passo, report)
+        }
+        StepGateDecision::NeedsHuman => titolo_non_autorizzato(passo, report),
     }
+}
+
+/// Il primo motivo dichiarato da chi ha rifiutato: e' quello che l'utente
+/// legge nel nastro, quindi viene dai CAMPI del verdetto (regola Q), mai da
+/// una parafrasi.
+fn primo_motivo_di_rifiuto(report: &ports::StepValidationReport) -> &str {
+    use crate::decisions::step_gate::StepVerdict;
+    report
+        .verdicts
+        .iter()
+        .filter(|v| v.verdict == StepVerdict::Reject)
+        .flat_map(|v| v.reasons.iter())
+        .find_map(|r| r.get("description").and_then(Value::as_str))
+        .unwrap_or("motivo non dettagliato")
+}
+
+/// In autonomia il gate non chiede: dichiara che il passo NON e' stato
+/// autorizzato e perche', cosi' chi legge il nastro sa che il run e' andato
+/// avanti senza eseguirlo (e non sta aspettando lui).
+fn titolo_non_autorizzato(passo: &str, report: &ports::StepValidationReport) -> String {
+    if report.verdicts.is_empty() {
+        let perche = report
+            .degraded
+            .as_deref()
+            .unwrap_or("nessun validatore convocabile");
+        return format!(
+            "Passo {passo} NON autorizzato: nessun validatore indipendente ha \
+             potuto giudicarlo ({perche}); in autonomia non si chiede conferma"
+        );
+    }
+    let riassunto: Vec<String> = report.verdicts.iter().map(riassunto_verdetto).collect();
+    format!(
+        "Passo {passo} NON autorizzato: i validatori non sono unanimi ({}); \
+         in autonomia non si chiede conferma",
+        riassunto.join(", ")
+    )
 }
 
 /// Il caso che l'utente incontra piu' spesso: va detto PERCHE' tocca a lui
@@ -4546,6 +4604,46 @@ mod tests {
                 .and_then(Value::as_u64),
             Some(1),
             "il contatore dei rimandi sale nello stato"
+        );
+    }
+
+    /// Il titolo del meta_step e' l'unica riga che l'utente legge nel nastro,
+    /// e la stessa decisione produce due esiti diversi: dirgli «serve la tua
+    /// conferma» dove nessuna conferma verra' chiesta lo manda a cercare una
+    /// card che non esiste. MISURATO in esercizio il 06/08 (run b761e46b): i
+    /// tre meta_step dicevano «serve la tua conferma» mentre il run proseguiva
+    /// da solo. Mutazione: ignorare `interpella_umano` -> una delle due
+    /// asserzioni cade.
+    #[test]
+    fn il_titolo_dice_cio_che_accadra_davvero() {
+        use crate::decisions::step_gate::{StepCriticality, StepGateDecision, StepVerdict};
+        let mut astenuto = verdetto("challenger", StepVerdict::Abstained);
+        astenuto.abstain_cause = Some("billing".into());
+        let report = ports::StepValidationReport {
+            verdicts: vec![verdetto("gatekeeper", StepVerdict::Approve), astenuto],
+            degraded: None,
+        };
+        let con_umano = titolo_per_umano(
+            &StepGateDecision::NeedsHuman,
+            StepCriticality::Irreversible,
+            &report,
+            true,
+        );
+        assert!(
+            con_umano.contains("serve la tua conferma"),
+            "in Conferma la domanda viene posta davvero: {con_umano}"
+        );
+        let in_autonomia = titolo_per_umano(
+            &StepGateDecision::NeedsHuman,
+            StepCriticality::Irreversible,
+            &report,
+            false,
+        );
+        assert!(
+            in_autonomia.contains("NON autorizzato")
+                && !in_autonomia.contains("serve la tua conferma"),
+            "in autonomia il titolo dichiara il passo non autorizzato, non una \
+             conferma che nessuno chiedera': {in_autonomia}"
         );
     }
 
