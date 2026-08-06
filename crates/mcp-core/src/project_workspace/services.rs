@@ -394,9 +394,27 @@ pub(crate) async fn project_service_unit(
 /// - per ogni label conta la riga PIU' RECENTE (stato corrente del servizio);
 /// - una label running/starting e' sempre visibile (va potuta fermare);
 /// - una label MORTA e' nascosta se generica ("Service": tentativo storico,
-///   non un servizio) o se superseded da una label simile con storia piu'
-///   recente ("frontend-dev" morta dopo che "frontend" l'ha sostituita).
+///   non un servizio), se e' l'identita' di ANCORAGGIO del progetto, o se
+///   superseded da una label simile con storia piu' recente ("frontend-dev"
+///   morta dopo che "frontend" l'ha sostituita).
 /// Ritorna (label, running) ordinate per label.
+///
+/// L'ancoraggio (`service-{uuid[..8]}`) va nominato a parte perche' il
+/// vocabolario delle label generiche non lo riconosce, e non e' un difetto di
+/// quel vocabolario: `significant_service_words` scarta la parola "service" ma
+/// tiene il frammento di uuid, che come parola e' significativa: `service-75feee9a`
+/// risulta percio' una label con uno scopo. MISURATO su agenda-medica il
+/// 2026-08-06: il processo di ancoraggio nasce alle 13:35:50 e muore entro le
+/// 13:38:46 (la sua porta 31949 viene regolarmente rilasciata dal cleanup), ma la
+/// voce resta a schermo come terza riga inattiva accanto a backend e frontend.
+/// Non e' un'allocazione appesa — quella e' un altro difetto, chiuso in `ddab105b`
+/// — e' il filtro delle label morte che non incontra questa forma.
+///
+/// Il criterio non e' una regex sulla forma del nome: si confronta con cio' che
+/// il PRODUTTORE emetterebbe per questo progetto
+/// ([`crate::agent_tools::service::label_di_solo_ancoraggio`]), come gia' fa il
+/// censimento del registro porte. Due formule separate divergerebbero al primo
+/// cambio di taglio dell'uuid, e il pannello tornerebbe a mostrare la voce.
 /// `pub(crate)` e non `pub(super)`: la stessa domanda («quali servizi esistono
 /// ancora?») se la pone anche il GC delle porte (`port_registry`), che prima la
 /// risolveva guardando l'intera storia append-only di `agent_processes` e
@@ -405,7 +423,9 @@ pub(crate) async fn project_service_unit(
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn visible_windows_services(
     rows: &[(String, String, chrono::DateTime<chrono::Utc>)],
+    project_id: Uuid,
 ) -> Vec<(String, bool)> {
+    let ancoraggio = crate::agent_tools::service::label_di_solo_ancoraggio(project_id);
     // Riga piu' recente per label: rows e' gia' ordinata (label, created_at DESC),
     // quindi la prima occorrenza di ogni label e' la sua riga piu' recente.
     let mut seen = std::collections::HashSet::new();
@@ -423,7 +443,7 @@ pub(crate) fn visible_windows_services(
             if *running {
                 return true;
             }
-            if crate::agent_processes::is_generic_service_label(label) {
+            if crate::agent_processes::is_generic_service_label(label) || **label == *ancoraggio {
                 return false;
             }
             !latest.iter().any(|(other, _, other_created)| {
@@ -561,7 +581,7 @@ pub(super) async fn list_services_windows(
         );
     }
 
-    visible_windows_services(&reconciled)
+    visible_windows_services(&reconciled, project_id)
         .into_iter()
         .map(|(label, running)| {
             json!({
@@ -3897,6 +3917,71 @@ mod tests {
         )
     }
 
+    /// Il progetto su cui la voce fantasma e' stata vista a schermo
+    /// (agenda-medica, 2026-08-06): la label di ancoraggio si costruisce dal suo
+    /// uuid, quindi il test la prende dal produttore e non da una stringa.
+    fn progetto_di_prova() -> Uuid {
+        Uuid::parse_str("75feee9a-a06c-47ce-9f94-e3d11cbe27cc").expect("uuid")
+    }
+
+    /// LA VOCE FANTASMA DEL PANNELLO: l'identita' di ancoraggio, morta, non e'
+    /// un servizio da mostrare.
+    ///
+    /// Il filtro delle label morte esisteva ed era corretto: semplicemente non
+    /// incontrava questa forma, perche' `is_generic_service_label` scarta la
+    /// parola "service" ma tiene il frammento di uuid, e una label con una parola
+    /// significativa non e' generica. Misurato su agenda-medica: `service-75feee9a`
+    /// restava a schermo come terza riga inattiva accanto a backend e frontend.
+    ///
+    /// MUTAZIONE che rende rosso: togliere il confronto con `ancoraggio` dal
+    /// filtro (cioe' affidarsi al solo vocabolario delle generiche) — la prima
+    /// asserzione ritrova la voce fantasma nell'elenco.
+    #[test]
+    fn ancoraggio_morto_nascosto_vivo_visibile() {
+        let progetto = progetto_di_prova();
+        let ancoraggio = crate::agent_tools::service::label_di_solo_ancoraggio(progetto);
+        assert_eq!(ancoraggio, "service-75feee9a");
+        // Premessa del test (regola O): senza questa asserzione, il caso
+        // sembrerebbe gia' coperto dal filtro delle generiche.
+        assert!(
+            !crate::agent_processes::is_generic_service_label(&ancoraggio),
+            "il vocabolario delle generiche non riconosce l'ancoraggio: e' la \
+             ragione per cui serve il confronto col produttore"
+        );
+
+        let rows = vec![
+            riga(&ancoraggio, "stopped", 30),
+            riga("backend", "running", 10),
+            riga("frontend", "running", 5),
+        ];
+        assert_eq!(
+            super::visible_windows_services(&rows, progetto),
+            vec![
+                ("backend".to_string(), true),
+                ("frontend".to_string(), true)
+            ],
+            "un ancoraggio morto non e' un servizio: niente terza voce"
+        );
+
+        // Finche' GIRA resta visibile, come per le generiche: va potuto fermare.
+        let rows = vec![riga(&ancoraggio, "running", 30)];
+        assert_eq!(
+            super::visible_windows_services(&rows, progetto),
+            vec![(ancoraggio.clone(), true)]
+        );
+
+        // L'ancoraggio di un ALTRO progetto non e' l'ancoraggio di questo: la
+        // label resta una voce legittima (nessuna regex sulla forma del nome).
+        let altrui = crate::agent_tools::service::label_di_solo_ancoraggio(
+            Uuid::parse_str("66f4bf72-3975-4bb0-bc38-5e1107bf1d94").expect("uuid"),
+        );
+        let rows = vec![riga(&altrui, "stopped", 30)];
+        assert_eq!(
+            super::visible_windows_services(&rows, progetto),
+            vec![(altrui, false)]
+        );
+    }
+
     #[test]
     fn voce_generica_morta_nascosta_running_visibile() {
         // Regressione "Service" fantasma: tentativo storico fallito, non un
@@ -3905,11 +3990,11 @@ mod tests {
             riga("Service", "failed", 60),
             riga("backend", "running", 10),
         ];
-        let visible = super::visible_windows_services(&rows);
+        let visible = super::visible_windows_services(&rows, progetto_di_prova());
         assert_eq!(visible, vec![("backend".to_string(), true)]);
 
         let rows = vec![riga("Service", "running", 60)];
-        let visible = super::visible_windows_services(&rows);
+        let visible = super::visible_windows_services(&rows, progetto_di_prova());
         assert_eq!(visible, vec![("Service".to_string(), true)]);
     }
 
@@ -3921,7 +4006,7 @@ mod tests {
             riga("frontend", "running", 5),
             riga("frontend-dev", "stopped", 30),
         ];
-        let visible = super::visible_windows_services(&rows);
+        let visible = super::visible_windows_services(&rows, progetto_di_prova());
         assert_eq!(visible, vec![("frontend".to_string(), true)]);
     }
 
@@ -3932,7 +4017,7 @@ mod tests {
             riga("frontend", "running", 5),
             riga("frontend-dev", "running", 30),
         ];
-        let visible = super::visible_windows_services(&rows);
+        let visible = super::visible_windows_services(&rows, progetto_di_prova());
         assert_eq!(
             visible,
             vec![
@@ -3951,7 +4036,7 @@ mod tests {
             riga("backend", "running", 60),
             riga("frontend", "running", 5),
         ];
-        let visible = super::visible_windows_services(&rows);
+        let visible = super::visible_windows_services(&rows, progetto_di_prova());
         assert_eq!(
             visible,
             vec![
