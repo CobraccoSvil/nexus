@@ -460,12 +460,43 @@ pub(crate) fn terminal_consumer_key(user_id: Uuid, project_id: Uuid) -> String {
 // Punto unico path-safety workspace: nexus_types::workspace_paths (regola L).
 pub(crate) use nexus_types::workspace_paths::path_within;
 
-pub(crate) fn to_relative(root: &Path, target: &Path) -> String {
-    target
-        .strip_prefix(root)
-        .unwrap_or(target)
-        .to_string_lossy()
-        .replace('\\', "/")
+/// Il percorso di `target` RELATIVO a `root`, con separatori `/`.
+///
+/// `None` quando `target` non sta sotto `root`. E' un fatto, non un percorso, e
+/// il tipo lo dice (regola Q): il ripiego che restituiva l'ASSOLUTO al suo posto
+/// e' il difetto che questa firma chiude.
+///
+/// COSA ACCADEVA. Le due forme di uno stesso percorso non erano confrontabili:
+/// `get_project_tree` risolve il target con `resolve_relative_path`, che
+/// CANONICALIZZA (su Windows produce la forma verbatim `\\?\D:\...`), mentre la
+/// root arriva dal DB nella forma piana. `strip_prefix` falliva, il ripiego
+/// restituiva il percorso assoluto verbatim, e il `replace` lo rendeva
+/// `//?/D:/...` — il componente `?` fantasma che il doc di
+/// `strip_windows_verbatim` gia' descriveva come rischio.
+///
+/// MISURATO il 06/08/2026 sull'API viva di agenda-medica: `/tree` dava
+/// `["backend","e2e","frontend"]` (corretto, li' target E root sono la stessa
+/// cosa e lo strip riesce), `/tree?path=frontend` dava
+/// `//?/D:/IDEAI-projects/agenda-medica/frontend/e2e`. Il client rimandava quel
+/// percorso al server, che lo rifiutava con 403 «Percorso fuori dalla root del
+/// progetto»: **nessun file del progetto era apribile dall'editor oltre il primo
+/// livello dell'albero**.
+///
+/// Il rimedio e' alla causa: entrambi i lati passano dal punto unico
+/// [`nexus_types::workspace_paths::strip_windows_verbatim`], che il repo
+/// dichiara come l'unica normalizzazione testuale dei percorsi. Toglierlo dal
+/// solo lato del target non basterebbe — la domanda e' se le due forme si
+/// possano confrontare, e la risposta deve valere per entrambe.
+pub(crate) fn to_relative(root: &Path, target: &Path) -> Option<String> {
+    let normalizza = |p: &Path| {
+        PathBuf::from(
+            nexus_types::workspace_paths::strip_windows_verbatim(&p.to_string_lossy()).into_owned(),
+        )
+    };
+    normalizza(target)
+        .strip_prefix(normalizza(root))
+        .ok()
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
 }
 
 pub(crate) async fn load_projects_base_root(db: &PgPool) -> Result<PathBuf, ApiError> {
@@ -597,6 +628,50 @@ mod tests_resolve_relative_dup_root {
         );
         // 4. assoluto fuori dalla root -> errore (non risolve fuori progetto).
         assert!(resolve_relative_path(&root, "/etc/hostname").is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// IL difetto dell'Explorer, preso dove nasce: la root arriva dal DB nella
+    /// forma piana, il target da `resolve_relative_path` che CANONICALIZZA (su
+    /// Windows: forma verbatim `\\?\D:\...`). Il percorso relativo deve venire
+    /// fuori lo stesso — e' lo stesso percorso scritto in due modi.
+    ///
+    /// Il test attraversa il produttore VERO (`resolve_relative_path`, la stessa
+    /// funzione che `get_project_tree` usa per il target) invece di fabbricare a
+    /// mano una stringa verbatim: cosi' misura la coppia che la produzione mette
+    /// davvero in gioco (regola O).
+    ///
+    /// MUTAZIONE: reintrodurre `unwrap_or(target)` in `to_relative` -> qui il
+    /// confronto fallisce con l'assoluto `//?/...`, che e' esattamente il valore
+    /// che il 06/08/2026 l'API restituiva e il client si vedeva rifiutare con
+    /// 403 al giro successivo.
+    #[test]
+    fn il_relativo_regge_la_root_piana_contro_il_target_canonicalizzato() {
+        use super::to_relative;
+        let base = std::env::temp_dir().join(format!("nexus_rel_{}", std::process::id()));
+        let root = base.join("agenda-medica");
+        let dir = root.join("frontend");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("index.html");
+        std::fs::write(&file, b"<html>").unwrap();
+
+        // Le due forme, come le ha la produzione: root PIANA (dal DB),
+        // target CANONICALIZZATO (dal resolver).
+        let target = resolve_relative_path(&root, "frontend/index.html").expect("risolve");
+        assert_eq!(
+            to_relative(&root, &target).as_deref(),
+            Some("frontend/index.html"),
+            "root piana + target canonicalizzato devono dare il relativo"
+        );
+
+        // Anche la directory intermedia, che e' il caso in cui l'albero si
+        // rompeva (il primo livello funzionava perche' target == root).
+        let sub = resolve_relative_path(&root, "frontend").expect("risolve");
+        assert_eq!(to_relative(&root, &sub).as_deref(), Some("frontend"));
+
+        // Fuori dalla root: NON un percorso, e il tipo lo dice.
+        assert_eq!(to_relative(&root, std::path::Path::new("/etc/hostname")), None);
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1090,6 +1165,52 @@ pub(crate) async fn upsert_open_session(
     Ok(())
 }
 
+/// Una voce di directory come nodo dell'albero, oppure `None` se non e'
+/// rappresentabile.
+///
+/// Sono DUE i motivi per cui una voce si scarta, e restano distinti nel log:
+/// i metadati illeggibili (una voce sparita fra la `read_dir` e la `metadata`),
+/// e la voce fuori dalla root — quest'ultima non e' rappresentabile perche' il
+/// client rimanderebbe quel percorso al server, che lo rifiuterebbe. Meglio non
+/// offrirla che offrirne una che nessuno puo' aprire.
+fn nodo_albero(root: &Path, entry: &std::fs::DirEntry) -> Option<WorkspaceTreeNode> {
+    let path = entry.path();
+    let metadata = entry.metadata().ok()?;
+    let kind = if metadata.is_dir() {
+        "directory"
+    } else {
+        "file"
+    };
+    let has_children = metadata.is_dir()
+        && std::fs::read_dir(&path)
+            .ok()
+            .map(|entries| {
+                entries.filter_map(|item| item.ok()).any(|item| {
+                    let name = item.file_name().to_string_lossy().to_string();
+                    !EXCLUDED_NAMES.contains(&name.as_str())
+                })
+            })
+            .unwrap_or(false);
+
+    let rel = match to_relative(root, &path) {
+        Some(rel) => rel,
+        None => {
+            tracing::warn!(
+                root = %root.display(),
+                voce = %path.display(),
+                "albero progetto: voce fuori dalla root, esclusa dall'elenco"
+            );
+            return None;
+        }
+    };
+    Some(WorkspaceTreeNode {
+        name: entry.file_name().to_string_lossy().to_string(),
+        path: rel,
+        kind: kind.to_string(),
+        has_children,
+    })
+}
+
 pub(crate) fn list_directory_nodes(
     root: &Path,
     target: &Path,
@@ -1103,35 +1224,7 @@ pub(crate) fn list_directory_nodes(
             let name = entry.file_name().to_string_lossy().to_string();
             !EXCLUDED_NAMES.contains(&name.as_str())
         })
-        .filter_map(|entry| {
-            let path = entry.path();
-            let metadata = entry.metadata().ok()?;
-            let kind = if metadata.is_dir() {
-                "directory"
-            } else {
-                "file"
-            };
-            let has_children = if metadata.is_dir() {
-                std::fs::read_dir(&path)
-                    .ok()
-                    .map(|entries| {
-                        entries.filter_map(|item| item.ok()).any(|item| {
-                            let name = item.file_name().to_string_lossy().to_string();
-                            !EXCLUDED_NAMES.contains(&name.as_str())
-                        })
-                    })
-                    .unwrap_or(false)
-            } else {
-                false
-            };
-
-            Some(WorkspaceTreeNode {
-                name: entry.file_name().to_string_lossy().to_string(),
-                path: to_relative(root, &path),
-                kind: kind.to_string(),
-                has_children,
-            })
-        })
+        .filter_map(|entry| nodo_albero(root, &entry))
         .collect::<Vec<_>>();
 
     nodes.sort_by(|left, right| left.kind.cmp(&right.kind).then(left.name.cmp(&right.name)));

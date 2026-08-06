@@ -18,6 +18,88 @@ use crate::{auth::Claims, AppState};
 type ApiError = (StatusCode, Json<Value>);
 type ApiResult = Result<Json<Value>, ApiError>;
 
+/// Chi ha scritto, per le mutazioni salvate dall'EDITOR.
+///
+/// La colonna `file_mutations.tool_name` porta finora i soli nomi dei tool
+/// agente (`write_file`, `edit_file`). Una modifica umana non viene da un tool,
+/// e spacciarla per uno renderebbe indistinguibile cio' che l'agente ha fatto da
+/// cio' che ha fatto la persona — proprio la domanda a cui quel pannello serve a
+/// rispondere. Identificatore canonico in inglese (regola N), un solo punto di
+/// scrittura.
+const TOOL_EDITOR: &str = "editor";
+
+/// Registra nel pannello Modifiche una scrittura fatta dall'EDITOR.
+///
+/// Il pannello registrava le sole scritture dei TOOL AGENTE: una modifica
+/// salvata dall'utente non compariva, non aveva un diff e non era
+/// ripristinabile. MISURATO il 06/08/2026 su agenda-medica — salvato
+/// `frontend/index.html` alle 20:32, e l'ultima riga di `file_mutations`
+/// restava quella dell'agente delle 13:16.
+///
+/// `run_id`/`session_id` restano `None`, e non e' un'omissione: nessun run sta
+/// scrivendo. E' anche cio' che tiene queste righe FUORI dalla misura del
+/// progresso di correzione (`MutationProgressPort` filtra per run), dove una
+/// modifica umana verrebbe contata come lavoro dell'agente.
+///
+/// `ScopeAudit::none()`: nessun piano dichiara lo scope di una modifica
+/// manuale, e la colonna NULL dice «misura non effettuata», distinta da
+/// «nessuno scope dichiarato».
+///
+/// Best-effort: il file e' gia' scritto quando si arriva qui, e un errore di
+/// tracciamento non deve far credere all'utente che il salvataggio sia fallito.
+/// Mai muto, pero': senza il WARN la modifica sparirebbe dal pannello senza che
+/// nessuno sappia perche'.
+async fn traccia_scrittura_da_editor(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+    user_id: Uuid,
+    relativo: &str,
+    prima: Option<&str>,
+    dopo: &str,
+) {
+    if let Err(e) = crate::file_mutations::record_mutation(
+        db,
+        project_id,
+        None,
+        None,
+        Some(user_id),
+        relativo,
+        TOOL_EDITOR,
+        prima,
+        Some(dopo),
+        crate::file_mutations::ScopeAudit::none(),
+    )
+    .await
+    {
+        tracing::warn!(
+            project_id = %project_id, path = %relativo, error = %e,
+            "salvataggio da editor: mutazione non registrata (il file e' comunque scritto)"
+        );
+    }
+}
+
+/// Il percorso relativo da restituire al client, oppure l'errore che dichiara
+/// l'incoerenza.
+///
+/// Chi chiama passa un `file` uscito da `resolve_relative_path`, che ne
+/// garantisce la discendenza dalla root: un `None` qui significa che le due
+/// forme dello stesso percorso non sono confrontabili, ed e' un guasto INTERNO
+/// da dire. Il ripiego storico rispondeva invece il percorso assoluto, che il
+/// client rimandava al giro successivo e il server rifiutava con 403 — un
+/// errore che si manifestava a due chiamate di distanza dalla sua causa.
+fn relativo_o_errore(root: &std::path::Path, file: &std::path::Path) -> Result<String, ApiError> {
+    to_relative(root, file).ok_or_else(|| {
+        tracing::error!(
+            root = %root.display(), file = %file.display(),
+            "percorso risolto fuori dalla root del progetto: forme non confrontabili"
+        );
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Percorso del file non riconducibile alla root del progetto",
+        )
+    })
+}
+
 pub async fn get_project_tree(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -85,13 +167,13 @@ pub async fn get_project_file(
         &state.db,
         user_id,
         &context,
-        &[to_relative(&context.root_path, &file_path)],
+        &[relativo_o_errore(&context.root_path, &file_path)?],
         context.details.root_path.as_deref(),
     )
     .await?;
 
     Ok(Json(json!({
-        "path": to_relative(&context.root_path, &file_path),
+        "path": relativo_o_errore(&context.root_path, &file_path)?,
         "content": content,
     })))
 }
@@ -114,22 +196,38 @@ pub async fn save_project_file(
     }
 
     let file_path = resolve_relative_path(&context.root_path, &body.path)?;
+    let relativo = relativo_o_errore(&context.root_path, &file_path)?;
+    // Il contenuto PRECEDENTE va letto prima di sovrascrivere: e' l'unico
+    // momento in cui esiste, ed e' cio' che rende possibili il diff e il
+    // ripristino nel pannello Modifiche. `None` per un file nuovo.
+    let prima = fs::read_to_string(&file_path).await.ok();
+
     fs::write(&file_path, &body.content)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    traccia_scrittura_da_editor(
+        &state.db,
+        project_id,
+        user_id,
+        &relativo,
+        prima.as_deref(),
+        &body.content,
+    )
+    .await;
 
     upsert_open_session(
         &state.db,
         user_id,
         &context,
-        &[to_relative(&context.root_path, &file_path)],
+        std::slice::from_ref(&relativo),
         context.details.root_path.as_deref(),
     )
     .await?;
 
     Ok(Json(json!({
         "saved": true,
-        "path": to_relative(&context.root_path, &file_path),
+        "path": relativo,
     })))
 }
 
@@ -372,7 +470,12 @@ pub async fn search_project(
                 // Permette di cercare "function_report.txt" e trovare il file
                 // anche se il contenuto non contiene quella stringa. Match
                 // case-insensitive sia sul basename che sul path relativo.
-                let rel_path = to_relative(&root_path, &child_path);
+                // Un risultato fuori dalla root non e' apribile dal client: si
+                // salta invece di offrirlo. Non e' un errore della ricerca —
+                // il file c'e' — quindi qui non si interrompe nulla.
+                let Some(rel_path) = to_relative(&root_path, &child_path) else {
+                    continue;
+                };
                 let name_lower = name.to_lowercase();
                 let rel_lower = rel_path.to_lowercase();
                 let name_match =
