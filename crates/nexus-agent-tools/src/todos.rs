@@ -283,6 +283,8 @@ async fn create_plan(
         return err(&format!("commit tx fallita: {e}"));
     }
 
+    persisti_meta_piano(ctx, run_id).await;
+
     json!({
         "ok": true,
         "action": "create",
@@ -370,6 +372,8 @@ async fn add_todos(
     if let Err(e) = tx.commit().await {
         return err(&format!("commit tx fallita: {e}"));
     }
+    persisti_meta_piano(ctx, run_id).await;
+
     json!({
         "ok": true,
         "action": "add",
@@ -496,12 +500,97 @@ async fn update_status(
         }
     }
 
+    persisti_meta_piano(ctx, run_id).await;
+
     json!({
         "ok": true,
         "action": if check_mode { "check" } else { "update" },
         "affected": affected,
     })
     .to_string()
+}
+
+/// Scrive (o riscrive) il meta_step `plan` del run con lo stato ATTUALE dei
+/// todo, cosi' il piano resta visibile in chat dopo un refresh.
+///
+/// Perche' serve QUI e non solo nel nodo planner: il piano nasce da DUE
+/// percorsi — il `PlannerNode`, che il suo meta_step lo emette gia'
+/// (`make_plan_meta` + `emit_phase_meta`), e questo tool, chiamato
+/// dall'executor, che finora emetteva solo eventi LIVE (`TodoUpdated`,
+/// `PlanUpdated`). Gli eventi live non sopravvivono al reload: la card del
+/// piano si vedeva mentre l'agente lavorava e spariva al refresh, mentre
+/// Consiglio e multi-provider — che un meta_step lo persistono — restavano.
+/// MISURATO il 06/08/2026 su agenda-medica: 1 piano e 16 todo nel DB, e ZERO
+/// meta_step di kind `plan`.
+///
+/// RISCRIVE invece di accodare: il payload porta lo stato dei todo, e al
+/// replay deve valere l'ultimo, non quello del momento in cui il piano
+/// nacque (altrimenti dopo il refresh le spunte tornerebbero indietro).
+/// Best-effort: un errore qui non fa fallire la scrittura dei todo, che e' il
+/// lavoro vero del tool.
+async fn persisti_meta_piano(ctx: &ToolContextCore, run_id: Uuid) {
+    let Some(payload) = payload_del_piano(ctx, run_id).await else {
+        return;
+    };
+    let totale = payload
+        .get("n")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let titolo = format!("Piano — {totale} step");
+    // Una riga per run: si aggiorna se c'e', si crea se manca.
+    let aggiornate = sqlx::query(
+        "UPDATE nexus_agent_meta_steps SET payload = $2, title = $3 \
+         WHERE run_id = $1 AND kind = 'plan'",
+    )
+    .bind(run_id)
+    .bind(&payload)
+    .bind(&titolo)
+    .execute(&*ctx.run_db)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+    if aggiornate == 0 {
+        let _ = sqlx::query(
+            "INSERT INTO nexus_agent_meta_steps (run_id, kind, title, payload) \
+             VALUES ($1, 'plan', $2, $3)",
+        )
+        .bind(run_id)
+        .bind(&titolo)
+        .bind(&payload)
+        .execute(&*ctx.run_db)
+        .await;
+    }
+}
+
+/// I todo del run nella forma che la card del piano si aspetta. `None` quando
+/// non ci sono todo o il DB non risponde: senza voci non c'e' piano da
+/// mostrare, e un payload vuoto renderebbe una card vuota.
+async fn payload_del_piano(ctx: &ToolContextCore, run_id: Uuid) -> Option<Value> {
+    let righe = sqlx::query(
+        "SELECT id, seq, content, status, priority FROM nexus_agent_todos \
+         WHERE run_id = $1 ORDER BY seq",
+    )
+    .bind(run_id)
+    .fetch_all(&*ctx.run_db)
+    .await
+    .ok()?;
+    if righe.is_empty() {
+        return None;
+    }
+    let todos: Vec<Value> = righe
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.try_get::<Uuid, _>("id").ok().map(|v| v.to_string()),
+                "seq": r.try_get::<i32, _>("seq").ok(),
+                "content": r.try_get::<String, _>("content").ok(),
+                "status": r.try_get::<String, _>("status").ok(),
+                "priority": r.try_get::<String, _>("priority").ok(),
+            })
+        })
+        .collect();
+    let n = todos.len();
+    Some(json!({ "todos": todos, "n": n }))
 }
 
 fn err(msg: &str) -> String {

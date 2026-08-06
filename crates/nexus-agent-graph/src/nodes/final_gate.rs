@@ -677,12 +677,26 @@ impl FinalGateNode {
         //      Senza origine frontend il criterio non nasce: un progetto
         //      senza interfaccia non ha questo dialogo da misurare.
         if self.cfg.browser_dialogue_enabled {
-            criteria.extend(crate::decisions::browser_dialogue::criterio_dialogo(
+            let criterio = crate::decisions::browser_dialogue::criterio_dialogo(
                 self.cfg.origine_frontend.as_deref(),
                 self.cfg.endpoint_timeout_s,
                 &self.cfg.browser_third_parties,
                 self.cfg.browser_settle_ms,
-            ));
+            );
+            // Un criterio ACCESO che non nasce e' indistinguibile, nei fatti,
+            // da uno spento: e' la forma di difetto che questo criterio esiste
+            // per chiudere, e non deve valere per lui stesso. Se manca
+            // l'origine si dichiara PERCHE' — l'operatore vede che il gate ha
+            // rinunciato a guardare, invece di un silenzio che somiglia a un
+            // «tutto a posto».
+            if criterio.is_none() {
+                tracing::info!(
+                    target: "nexus_agent_graph::final_gate",
+                    "dialogo browser non misurato: il progetto non ha un servizio \
+                     frontend con porta allocata (nessuna origine da caricare)"
+                );
+            }
+            criteria.extend(criterio);
         }
 
         // (6) design_verify (P5): per i task figma l'agente non puo' chiudere con
