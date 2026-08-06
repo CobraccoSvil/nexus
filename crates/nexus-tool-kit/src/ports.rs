@@ -52,6 +52,47 @@ pub const NEXUS_RESERVED_PORTS: &[u16] = &[
     16686, // Jaeger UI
 ];
 
+/// Fra le porte riservate, quelle che sono APPLICAZIONI di Nexus: un progetto
+/// utente che vi punta non sta usando un servizio condiviso, sta chiamando
+/// l'interfaccia o l'API di Nexus al posto della propria.
+///
+/// La distinzione dai datastore ([`NEXUS_RESERVED_PORTS`] li contiene entrambi)
+/// e' l'unica che rende il controllo utilizzabile su un file di configurazione:
+/// `DATABASE_URL=postgresql://...localhost:5432/...` in un `.env` di progetto e'
+/// LEGITTIMO — ci si connette come client — mentre
+/// `VITE_API_URL=http://localhost:3000` non lo e' mai, perche' 3000 e' la
+/// web-ide di Nexus. MISURATO il 06/08/2026 sul progetto agenda-medica: il
+/// frontend generato puntava esattamente li', e avrebbe chiesto i propri dati
+/// all'interfaccia di Nexus.
+///
+/// Vietare l'intero elenco riservato avrebbe rotto ogni backend; non guardare
+/// affatto i `.env` lasciava passare il difetto. La partizione e' cio' che
+/// permette di rifiutare il secondo caso senza toccare il primo.
+pub const NEXUS_APP_PORTS: &[u16] = &[
+    3000,  // web-ide (attuale)
+    3001,  // Grafana
+    4000,  // mcp-core HTTP
+    4001,  // web-ide (target migrazione)
+    4010,  // admin-service
+    4030,  // doc-service
+    4050,  // plugin-service
+    4055,  // browser-bridge-mcp
+    4060,  // nexus-gateway
+    4070,  // neural-core REST (target)
+    4100, 4110, 4120, 4130, // gRPC interni (target migrazione)
+    8001,  // neural-core REST (attuale)
+    9090,  // Prometheus
+    16686, // Jaeger UI
+    50051, 50052, 50500, 50501, // gRPC attuali
+];
+
+/// L'indirizzo punta a un'APPLICAZIONE di Nexus? I datastore condivisi
+/// (Postgres, Redis, Qdrant) non contano: un progetto vi si connette come
+/// client, ed e' il modo previsto.
+pub fn is_nexus_app_port(port: u16) -> bool {
+    NEXUS_APP_PORTS.contains(&port)
+}
+
 /// Range dedicato ai servizi dei progetti gestiti (deve evitare conflitti con Nexus e con servizi host comuni).
 /// Scelta conservativa: porte alte non privilegiate, fuori dal range Nexus e fuori dai DB.
 pub const PROJECT_PORT_RANGE_START: u16 = 20000;

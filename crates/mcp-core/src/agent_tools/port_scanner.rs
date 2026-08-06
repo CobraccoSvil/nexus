@@ -76,8 +76,104 @@ static PORT_REGEXES: Lazy<Vec<Regex>> = Lazy::new(|| {
     ]
 });
 
+/// La porta dentro un URL (`http://localhost:3000`, `ws://127.0.0.1:8080`).
+///
+/// Sta FUORI da [`PORT_REGEXES`] perche' alimenta un controllo diverso, e la
+/// differenza e' quella che rende il riconoscimento utilizzabile: dentro un
+/// `.env` un URL con porta e' spesso LEGITTIMO (`DATABASE_URL=...:5432/db` e'
+/// il modo previsto di connettersi al Postgres), quindi non puo' entrare nel
+/// criterio "deve essere allocata al progetto" senza rompere ogni backend.
+/// Quello che non e' mai legittimo e' puntare a un'APPLICAZIONE di Nexus:
+/// e' il solo giudizio che questa cattura alimenta.
+///
+/// MISURATO il 06/08/2026 (agenda-medica): il frontend generato aveva
+/// `VITE_API_URL=http://localhost:3000` — la web-ide di Nexus — e nessuna
+/// delle regex esistenti poteva vederlo, perche' cercano tutte una porta
+/// preceduta da `PORT=`, `.listen(`, `port:` o simili. La politica sui `.env`
+/// era gia' corretta (vedi `ports_needing_allocation`, che cita un incidente
+/// del 22/07 con la stessa porta): mancava la RILEVAZIONE.
+static URL_PORT_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)://[^/\s:@]+:(\d{2,5})\b").unwrap());
+
 static RANGE_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)\brange\s+(\d{2,5})\s*-\s*(\d{2,5})\b").unwrap());
+
+/// Porte di APPLICAZIONI Nexus citate nel contenuto, da qualunque forma le si
+/// scriva (URL o dichiarazione). Un progetto utente non deve mai puntarci:
+/// chiederebbe i propri dati all'interfaccia o all'API di Nexus.
+///
+/// Vale anche nei `.env`, che sono esenti dagli altri controlli: li' e' il
+/// posto giusto per una configurazione, ma non per QUESTO valore.
+pub fn collect_nexus_app_ports(content: &str) -> Vec<PortFinding> {
+    // Le forme DICHIARATE passano dal punto unico di parsing (regola L), che
+    // porta con se' whitelist, hint env e dedup gia' verificati.
+    let mut findings = collect_ports(content, |p| {
+        u16::try_from(p).is_ok_and(nexus_tool_kit::ports::is_nexus_app_port)
+    });
+    // Gli URL no: nessuna regex esistente li vede, ed e' la forma da cui il
+    // difetto e' passato.
+    for (idx, raw_line) in content.lines().enumerate() {
+        for caps in URL_PORT_REGEX.captures_iter(raw_line) {
+            let Some(port) = caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok()) else {
+                continue;
+            };
+            if u16::try_from(port).is_ok_and(nexus_tool_kit::ports::is_nexus_app_port) {
+                findings.push(PortFinding {
+                    line: idx + 1,
+                    port,
+                    snippet: raw_line.chars().take(200).collect(),
+                    origin: PortOrigin::Literal,
+                });
+            }
+        }
+    }
+    findings.sort_by_key(|f| (f.line, f.port));
+    findings.dedup_by_key(|f| (f.line, f.port));
+    findings
+}
+
+/// Il messaggio di rifiuto: dice QUALE servizio di Nexus e' stato preso di
+/// mira, perche' «porta non ammessa» non aiuta a correggere.
+fn format_nexus_app_message(path: &str, findings: &[PortFinding]) -> String {
+    let mut msg = format!(
+        "\u{274C} [Errore: scrittura su '{}' rifiutata. L'indirizzo punta a un servizio di NEXUS, \
+         non a un servizio di questo progetto.]\n\n\
+         Un'applicazione del progetto non deve mai chiamare le porte dell'infrastruttura: \
+         chiederebbe i propri dati all'interfaccia o all'API di Nexus invece che al proprio backend.\n\n\
+         Dettaglio:\n",
+        path
+    );
+    for f in findings.iter().take(10) {
+        msg.push_str(&format!(
+            "  - riga {}: porta {} ({}) | {}\n",
+            f.line,
+            f.port,
+            descrizione_porta_nexus(f.port),
+            f.snippet.trim()
+        ));
+    }
+    msg.push_str(
+        "\nAzione richiesta:\n\
+         1. Chiama `request_port(label=\"backend\")` (o il servizio che ti serve) e usa il numero ritornato.\n\
+         2. Nei file di configurazione scrivi quell'indirizzo, non una porta scelta a mano.\n",
+    );
+    msg
+}
+
+/// A quale servizio Nexus appartiene la porta, per il messaggio di rifiuto.
+fn descrizione_porta_nexus(port: u32) -> &'static str {
+    match port {
+        3000 | 4001 => "interfaccia web di Nexus",
+        4000 => "API di mcp-core",
+        4010 => "admin-service",
+        4030 => "doc-service",
+        4050 => "plugin-service",
+        4060 => "gateway AI",
+        3001 => "Grafana",
+        9090 => "Prometheus",
+        _ => "servizio interno di Nexus",
+    }
+}
 
 /// Default di variabile in stile shell/Docker Compose: `${VAR:-NNNN}`. Il valore
 /// dopo `:-` e' una porta EFFETTIVA (usata quando la variabile non e' impostata,
@@ -465,8 +561,15 @@ pub async fn enforce_write_ports(
     if !is_enforcement_enabled(ctx.db.as_ref()).await {
         return None;
     }
-    let rejection: Option<String> =
-        if let PortScanOutcome::Reject(findings) = scan_content(path, content) {
+    // PRIMO controllo, e vale anche nei `.env` (esenti dagli altri): puntare a
+    // un'applicazione di Nexus non e' mai una configurazione legittima, mentre
+    // una porta di datastore nello stesso file lo e'. Precede gli altri perche'
+    // il messaggio e' piu' specifico: dice QUALE servizio si sta chiamando.
+    let app_nexus = collect_nexus_app_ports(content);
+    let rejection: Option<String> = if !app_nexus.is_empty() {
+        audit_port_rejection(ctx, "port_nexus_app_rejected", tool_name, path, &app_nexus);
+        Some(format_nexus_app_message(path, &app_nexus))
+    } else if let PortScanOutcome::Reject(findings) = scan_content(path, content) {
             audit_port_rejection(ctx, "port_hardcode_rejected", tool_name, path, &findings);
             Some(format_reject_message(path, &findings))
         } else if let Some(unalloc) =
@@ -1106,5 +1209,54 @@ mod tests {
         // lo lascia passare (l'allocazione e' verificata altrove).
         let res = scan_content("docker-compose.yml", "      - \"${PORT:-25000}:3000\"\n");
         assert!(matches!(res, PortScanOutcome::Allowed));
+    }
+
+    /// IL DIFETTO MISURATO il 06/08/2026 (agenda-medica): il frontend generato
+    /// aveva `VITE_API_URL=http://localhost:3000` — la web-ide di Nexus —
+    /// nel proprio `.env`, e avrebbe chiesto i propri dati all'interfaccia di
+    /// Nexus invece che al proprio backend (che era sulla 31926).
+    ///
+    /// Nessun controllo lo vedeva, per DUE ragioni sovrapposte: i `.env` sono
+    /// esenti dallo scan degli hardcode (giustamente: e' il posto dove le
+    /// configurazioni vanno dichiarate), e nessuna regex riconosce una porta
+    /// dentro un URL — le esistenti cercano tutte `PORT=`, `.listen(`, `port:`.
+    ///
+    /// Mutazione: togliere URL_PORT_REGEX da collect_nexus_app_ports -> il
+    /// primo caso torna vuoto e il test rosseggia.
+    #[test]
+    fn la_porta_di_un_servizio_nexus_dentro_un_url_viene_vista() {
+        let trovate = collect_nexus_app_ports("VITE_API_URL=http://localhost:3000\n");
+        assert_eq!(trovate.len(), 1, "la porta nell'URL deve essere rilevata");
+        assert_eq!(trovate[0].port, 3000);
+        // Il messaggio nomina il servizio: «porta non ammessa» non aiuta.
+        let msg = format_nexus_app_message("frontend/.env", &trovate);
+        assert!(msg.contains("interfaccia web di Nexus"), "{msg}");
+    }
+
+    /// IL CONFINE, ed e' la ragione per cui il criterio guarda le sole
+    /// applicazioni: un `.env` di progetto contiene LEGITTIMAMENTE la porta di
+    /// un datastore condiviso, e vietarla romperebbe ogni backend. Misurato su
+    /// biblioteca-scolastica, che ha esattamente questa riga.
+    ///
+    /// Mutazione: usare NEXUS_RESERVED_PORTS (che include 5432) al posto delle
+    /// sole app -> questo test rosseggia.
+    #[test]
+    fn la_porta_di_un_datastore_condiviso_resta_legittima() {
+        let env = "DATABASE_URL=postgresql://postgres:pwd@localhost:5432/agenda?schema=public\n";
+        assert!(
+            collect_nexus_app_ports(env).is_empty(),
+            "connettersi al Postgres e' il modo previsto, non un difetto"
+        );
+        // E nemmeno un servizio esterno qualunque (MySQL) e' un'app di Nexus.
+        assert!(collect_nexus_app_ports("DB_URL=mysql://root@localhost:3306/x\n").is_empty());
+    }
+
+    /// La forma DICHIARATA resta coperta dal punto unico di parsing: il
+    /// criterio non vale solo per gli URL.
+    #[test]
+    fn anche_una_porta_nexus_dichiarata_viene_vista() {
+        let trovate = collect_nexus_app_ports("PORT=4000\n");
+        assert_eq!(trovate.len(), 1);
+        assert_eq!(trovate[0].port, 4000);
     }
 }

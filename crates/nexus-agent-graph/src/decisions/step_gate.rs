@@ -156,13 +156,48 @@ pub struct StepClassification {
 /// di convocazione, non un giudizio — un innesco che si aggira cambiando il
 /// case non e' un innesco.
 fn pattern_nei_token(tokens: &[String], pattern: &str) -> bool {
-    let attesi: Vec<&str> = pattern.split_whitespace().collect();
+    let attesi: Vec<String> = pattern
+        .split_whitespace()
+        .map(token_confrontabile)
+        .collect();
     if attesi.is_empty() || tokens.len() < attesi.len() {
         return false;
     }
-    tokens
+    let osservati: Vec<String> = tokens.iter().map(|t| token_confrontabile(t)).collect();
+    osservati
         .windows(attesi.len())
         .any(|w| w.iter().zip(&attesi).all(|(t, a)| t.eq_ignore_ascii_case(a)))
+}
+
+/// La forma di un token su cui il confronto ha senso.
+///
+/// Toglie la DOPPIA barra iniziale dei flag Windows scritti da una shell in
+/// stile MSYS: li' `taskkill //F //IM` e' il modo di scrivere `taskkill /F
+/// /IM` senza che Git Bash converta l'argomento in un path. Sono lo stesso
+/// comando, e per il gate devono essere lo stesso token.
+///
+/// MISURATO il 06/08/2026 su agenda-medica, ed e' il caso peggiore possibile:
+/// non un aggiramento che fa passare un ignoto, ma un DECLASSAMENTO. Il gate
+/// aveva gia' rifiutato `taskkill /F /IM node.exe` (regola irreversible, e in
+/// `enforce_irreversible` significa bloccato); riscritto `taskkill //F //IM
+/// node.exe` quei token non matchavano piu' la regola irreversible e restava
+/// solo la regola generica `taskkill`, che e' `critical` — quindi in quella
+/// modalita' veniva soltanto OSSERVATO. Il comando e' passato e ha ucciso
+/// tutti i processi node della macchina, web-ide di Nexus compresa.
+///
+/// Il rimedio sta QUI e non in una riga di regole in piu' per ogni variante:
+/// inseguire le forme di scrittura a colpi di pattern e' la toppa che la
+/// regola H vieta, e la prossima variante non sarebbe coperta. La barra e' una
+/// convenzione di scrittura della shell, non parte dell'identita' del flag.
+fn token_confrontabile(token: &str) -> String {
+    match token.strip_prefix("//") {
+        // Solo se cio' che segue e' un flag (lettere), mai un path di rete
+        // `//server/share` ne' un URL `//host:porta`.
+        Some(resto) if !resto.is_empty() && resto.chars().all(|c| c.is_ascii_alphanumeric()) => {
+            format!("/{resto}")
+        }
+        _ => token.to_string(),
+    }
 }
 
 /// I tool il cui input porta una riga ESEGUITA (il matcher `command_token`
@@ -464,6 +499,49 @@ mod tests {
             StepCriticality::Mutating,
             "rm/-rf sono bersaglio di redirezione e argomento, non un rm eseguito"
         );
+    }
+
+    /// IL DECLASSAMENTO MISURATO il 06/08/2026 (agenda-medica). Il gate aveva
+    /// gia' rifiutato `taskkill /F /IM node.exe`; riscritto con le doppie
+    /// barre di una shell MSYS non matchava piu' la regola irreversible e
+    /// restava solo quella generica `taskkill`, che e' `critical` — in
+    /// `enforce_irreversible` viene soltanto osservata. Il comando e' passato
+    /// e ha ucciso tutti i processi node della macchina, web-ide compresa.
+    ///
+    /// Mutazione: togliere `token_confrontabile` dal matcher -> la seconda
+    /// asserzione torna `Critical` e il test rosseggia.
+    #[test]
+    fn la_doppia_barra_non_declassa_un_comando_irreversibile() {
+        let regole = vec![
+            CriticalityRule {
+                matcher_kind: MatcherKind::CommandToken,
+                pattern: "taskkill /F /IM".into(),
+                level: StepCriticality::Irreversible,
+                category: "kill_ad_ampio_raggio".into(),
+            },
+            CriticalityRule {
+                matcher_kind: MatcherKind::CommandToken,
+                pattern: "taskkill".into(),
+                level: StepCriticality::Critical,
+                category: "kill_mirato".into(),
+            },
+        ];
+        let livello = |cmd: &str| {
+            classify_step("run_command", &json!({ "command": cmd }), &mutatori(), &regole).level
+        };
+        assert_eq!(
+            livello("taskkill /F /IM node.exe"),
+            StepCriticality::Irreversible
+        );
+        assert_eq!(
+            livello("taskkill //F //IM node.exe"),
+            StepCriticality::Irreversible,
+            "la stessa azione scritta per una shell MSYS non puo' valere meno"
+        );
+        // Il confine: `//` davanti a qualcosa che NON e' un flag resta com'e'
+        // (path di rete, URL), altrimenti si romperebbe la scomposizione.
+        assert_eq!(token_confrontabile("//server/share"), "//server/share");
+        assert_eq!(token_confrontabile("//IM"), "/IM");
     }
 
     /// Il livello base viene dal vocabolario mutatori ESISTENTE (consumato,
