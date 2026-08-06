@@ -591,6 +591,12 @@ impl FinalGateCriteriaRunnerAdapter {
                 self.attesa_bersaglio_http(&c.spec).await;
                 self.check_browser_dialogue(&c.spec, timeout_s).await
             }
+            // Lo STILE dichiarato dai sorgenti ha una fonte che lo applica?
+            // Nessuna attesa di readiness: la risposta sta nei file, non in un
+            // servizio — questo criterio e' vero o falso a servizi spenti.
+            t if t == nexus_agent_tools::ui_styling::CRITERION_TYPE => {
+                self.check_ui_styling().await
+            }
             "file_exists" => {
                 self.check_file_exists(&c.spec, &c.expected, timeout_s)
                     .await
@@ -1142,6 +1148,56 @@ task_complete (outcome + summary)"
         };
         let verdetto = browser_dialogue::classifica_dialogo(&prove, &terze_parti);
         esito_dialogo(url, &prove, verdetto)
+    }
+
+    /// Lo stile dichiarato dal codice e' applicato? Il criterio e' il punto
+    /// unico [`nexus_agent_tools::ui_styling::classify_styling`]: qui SOLO l'I/O
+    /// (radice, vocabolario dal DB, raccolta prove) e la traduzione dell'esito.
+    ///
+    /// Le varianti NON bloccanti restano tutte `Passed`, e non e' indulgenza:
+    /// «nessuno stile dichiarato» e' codice onesto, «non applicabile» e' un
+    /// progetto senza interfaccia, e «vocabolario assente» / «non concludente»
+    /// sono cio' che il modulo dichiara quando NON ha potuto rispondere. Bocciare
+    /// su un non-verdetto sarebbe il falso positivo che riporta i rimandi a
+    /// vuoto: la lente distingue quei casi apposta, e il gate deve rispettarli.
+    /// Solo `StileDichiaratoNonApplicato` fallisce — e' l'unico difetto.
+    async fn check_ui_styling(&self) -> (CriterionOutcome, Value) {
+        use nexus_agent_tools::ui_styling;
+        let Some(root) = self.run_root.clone() else {
+            return (
+                CriterionOutcome::Inconclusive,
+                json!({ "skipped_reason": "nessuna radice di progetto: stile non osservabile" }),
+            );
+        };
+        // Il vocabolario e' CONFIGURAZIONE, quindi sta nel META — non in
+        // `self.db`, che e' il pool del progetto (vi si leggono gli
+        // `agent_steps`). Chiedendolo al pool sbagliato la lente risponderebbe
+        // `VocabolarioAssente` per QUALUNQUE progetto, cioe' un criterio sempre
+        // inconcludente: un gate inerte, che e' il difetto che questo criterio
+        // esiste per chiudere.
+        let Some((meta_db, _)) = self.progetto.clone() else {
+            return (
+                CriterionOutcome::Inconclusive,
+                json!({ "skipped_reason": "sessione senza progetto: vocabolario di stile non leggibile" }),
+            );
+        };
+        let voc = ui_styling::load_vocabulary(&meta_db).await;
+        let ev = ui_styling::collect_evidence(&root, &voc).await;
+        let verdetto = ui_styling::classify_styling(&ev, &voc);
+        let esito = if verdetto.e_bloccante() {
+            CriterionOutcome::Failed
+        } else if matches!(
+            verdetto,
+            ui_styling::StylingVerdict::VocabolarioAssente
+                | ui_styling::StylingVerdict::NonConcludente { .. }
+        ) {
+            // «Non ho potuto guardare» non e' «va bene»: il run chiude
+            // `completed_unverified`, non `passed`.
+            CriterionOutcome::Inconclusive
+        } else {
+            CriterionOutcome::Passed
+        };
+        (esito, ui_styling::evidenza_criterio(&verdetto, &ev))
     }
 
     /// ASSENTE, il criterio falliva, il gate bocciava e apriva un ciclo di
@@ -3099,6 +3155,138 @@ mod tests {
             .expect("ok");
         assert!(res[0].failed(), "file assente -> il criterio fallisce");
         assert_eq!(res[0].evidence["exists"], json!(false));
+    }
+
+    /// Un frontend come quelli che Nexus consegnava: classi Tailwind nei
+    /// componenti, `tailwindcss` in `package.json` — e nessuna configurazione,
+    /// nessun foglio. Il vocabolario e' quello REALE della mig 0655, portato dal
+    /// META_MIGRATOR: nessuna fixture ricopiata (regola O).
+    fn frontend_con_tailwind_non_configurato(dir: &std::path::Path, con_config: bool) {
+        std::fs::create_dir_all(dir.join("src")).expect("src");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"app","devDependencies":{"tailwindcss":"^3.4.1"}}"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            dir.join("src/App.tsx"),
+            r#"export default function App() {
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <nav className="bg-white shadow-sm">
+        <div className="max-w-7xl mx-auto px-4">
+          <div className="flex justify-between h-16 items-center">
+            <span className="text-xl font-bold text-gray-900">Agenda</span>
+          </div>
+        </div>
+      </nav>
+      <main className="py-10 space-y-4"><p className="text-sm">ciao</p></main>
+    </div>
+  );
+}
+"#,
+        )
+        .expect("sorgente");
+        if con_config {
+            // Cio' che MANCAVA: senza questo file le utility non vengono
+            // generate, e la dipendenza in package.json fa da alibi.
+            std::fs::write(
+                dir.join("tailwind.config.js"),
+                "module.exports = { content: ['./src/**/*.tsx'] };",
+            )
+            .expect("config");
+            std::fs::write(dir.join("src/index.css"), "@tailwind utilities;").expect("foglio");
+            std::fs::write(
+                dir.join("src/main.tsx"),
+                "import './index.css';\nexport const x = 1;\n",
+            )
+            .expect("import del foglio");
+        }
+    }
+
+    /// IL difetto misurato il 06/08/2026 su agenda-medica: il gate lo boccia.
+    ///
+    /// MUTAZIONE: rendere `e_bloccante` sempre falso, oppure togliere il braccio
+    /// dal dispatch -> il criterio passa (o degrada a inconcludente) e l'app
+    /// grezza chiude «completata», che e' esattamente cio' che accadeva.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn lo_stile_dichiarato_e_mai_applicato_boccia_il_gate(pool: PgPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        frontend_con_tailwind_non_configurato(dir.path(), false);
+        let runner = FinalGateCriteriaRunnerAdapter::new(
+            FakeToolExecutor::with(&[]),
+            pool.clone(),
+            Some(dir.path().to_path_buf()),
+        )
+        .con_progetto(pool, Uuid::new_v4());
+        let res = runner
+            .run(vec![spec(
+                nexus_agent_tools::ui_styling::CRITERION_TYPE,
+                json!({}),
+                json!({}),
+            )])
+            .await
+            .expect("ok");
+        assert!(
+            res[0].failed(),
+            "classi scritte e nessuna fonte che le produca -> difetto, non un pass: {:?}",
+            res[0].evidence
+        );
+        assert_eq!(
+            res[0].evidence["verdict"],
+            json!("stile_dichiarato_non_applicato")
+        );
+        // La CAUSA distingue "niente del tutto" da "installato e non
+        // configurato": e' cio' che dice all'agente quale correzione fare.
+        assert_eq!(
+            res[0].evidence["causa"]["causa"],
+            json!("framework_non_configurato")
+        );
+    }
+
+    /// Lo stesso progetto CON la configurazione e il foglio importato: passa.
+    /// Senza questo, il test sopra sarebbe compatibile con un criterio che
+    /// boccia qualunque cosa.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn lo_stesso_progetto_configurato_passa(pool: PgPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        frontend_con_tailwind_non_configurato(dir.path(), true);
+        let runner = FinalGateCriteriaRunnerAdapter::new(
+            FakeToolExecutor::with(&[]),
+            pool.clone(),
+            Some(dir.path().to_path_buf()),
+        )
+        .con_progetto(pool, Uuid::new_v4());
+        let res = runner
+            .run(vec![spec(
+                nexus_agent_tools::ui_styling::CRITERION_TYPE,
+                json!({}),
+                json!({}),
+            )])
+            .await
+            .expect("ok");
+        assert!(
+            res[0].passed(),
+            "framework installato E configurato -> nessun difetto: {:?}",
+            res[0].evidence
+        );
+    }
+
+    /// Senza radice non si guarda, e non si finge di aver guardato: il run
+    /// chiude `completed_unverified`, mai bocciato su un non-verdetto.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn senza_radice_lo_stile_e_inconcludente(pool: PgPool) {
+        let runner = FinalGateCriteriaRunnerAdapter::new(FakeToolExecutor::with(&[]), pool, None);
+        let res = runner
+            .run(vec![spec(
+                nexus_agent_tools::ui_styling::CRITERION_TYPE,
+                json!({}),
+                json!({}),
+            )])
+            .await
+            .expect("ok");
+        assert!(!res[0].failed(), "non aver guardato non e' un difetto");
+        assert!(res[0].evidence["skipped_reason"].is_string());
     }
 
     #[sqlx::test]

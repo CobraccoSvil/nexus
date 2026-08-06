@@ -317,6 +317,25 @@ impl StylingVerdict {
     }
 }
 
+/// Il nome del criterio con cui il final gate interroga questa lente.
+///
+/// La costante vive QUI, accanto al criterio che nomina, e non nel nodo che la
+/// consuma: il tipo di un criterio e la logica che lo giudica sono la stessa
+/// cosa vista da due lati, e due letterali uguali in due crate divergono al
+/// primo rinominamento (regola L).
+///
+/// PERCHE' UN CRITERIO DI GATE e non solo un tool. Questa lente esisteva gia',
+/// completa e testata, ed era senza effetto sulla chiusura di un run: era
+/// offerta come tool a due figure, e nessun nodo del grafo la interrogava.
+/// MISURATO il 06/08/2026 su agenda-medica, e il tool era perfino stato CHIAMATO
+/// dall'agente nel run: i componenti scrivevano `min-h-screen bg-gray-50`,
+/// `max-w-7xl mx-auto`, `tailwindcss` era in `package.json` — e non esisteva
+/// alcuna `tailwind.config`, nessun file `.css`, nessun import di foglio. La
+/// pagina servita era HTML grezzo (verificata dal browser), e il run si e'
+/// chiuso «completato». Una misura che nessun gate interroga si e' costruita,
+/// non e' entrata in esercizio.
+pub const CRITERION_TYPE: &str = "ui_styling";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Il criterio: funzione PURA
 // ─────────────────────────────────────────────────────────────────────────────
@@ -998,6 +1017,22 @@ pub async fn tool_ui_styling_audit(ctx: &ToolContextCore, input: &Value) -> Stri
 /// Serializza verdetto ed evidenza. Il campo `next_step` non e' cortesia: e'
 /// cio' che trasforma un rilievo in una correzione, ed e' la ragione per cui il
 /// verdetto porta la CAUSA e non solo l'esito.
+/// La stessa evidenza di [`render`], come `Value` per il final gate.
+///
+/// Delega invece di ricomporre il payload: il gate e il tool devono dire la
+/// STESSA cosa dello stesso progetto — con due composizioni, l'agente leggerebbe
+/// dal tool una diagnosi e dal rimando del gate un'altra, e non saprebbe quale
+/// delle due correggere. `target_dir` e' la radice del run, che qui e' sempre
+/// quella: il gate non ha un sotto-albero da nominare.
+pub fn evidenza_criterio(verdict: &StylingVerdict, ev: &StylingEvidence) -> Value {
+    serde_json::from_str(&render(verdict, ev, ".")).unwrap_or_else(|_| {
+        // Irraggiungibile: `render` compone un oggetto JSON. Se mai accadesse,
+        // l'esito del criterio resta quello gia' deciso e qui si perde solo il
+        // dettaglio, dichiarandolo.
+        json!({ "verdict": verdict.key(), "evidenza": "non serializzabile" })
+    })
+}
+
 fn render(verdict: &StylingVerdict, ev: &StylingEvidence, target_rel: &str) -> String {
     let mut out = json!({
         "verdict": verdict.key(),

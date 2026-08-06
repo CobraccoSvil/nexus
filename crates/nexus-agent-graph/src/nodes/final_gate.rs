@@ -227,6 +227,15 @@ pub struct FinalGateConfig {
     /// pagina che non ha ancora chiesto nulla
     /// (`agent.final_gate.browser_settle_ms`).
     pub browser_settle_ms: u64,
+    /// Criterio «lo stile che il codice DICHIARA e' applicato?», gia' costruito
+    /// dal motore. `None` = criterio spento o progetto senza radice: non nasce.
+    ///
+    /// Arriva PRONTO invece di essere costruito qui perche' il criterio puro
+    /// vive in `nexus-agent-tools` (`ui_styling`), che questo crate non vede: e'
+    /// lo stesso trattamento di `endpoint_criteria`, risolti a monte. Riscriverne
+    /// una copia qui per soddisfare il grafo delle dipendenze sarebbe la seconda
+    /// definizione dello stesso criterio (regola L).
+    pub ui_styling_criterion: Option<crate::runtime::ports::CriterionSpec>,
     /// ADR 0036: catena di verifica PER-AMBIENTE risolta a monte (profilo
     /// inferito da LLM in `project_verify_profiles`, step marcati gate=true).
     /// Un criterio `run_command` per step, nell'ordine del profilo (es.
@@ -308,6 +317,9 @@ impl Default for FinalGateConfig {
             browser_dialogue_enabled: false,
             browser_third_parties: Vec::new(),
             browser_settle_ms: 2000,
+            // Nessun criterio a DB muto: lo costruisce il motore quando la
+            // chiave e' accesa e il progetto ha una radice.
+            ui_styling_criterion: None,
             verify_steps: Vec::new(),
             verify_profile_missing: false,
             origine_frontend: None,
@@ -698,6 +710,18 @@ impl FinalGateNode {
             }
             criteria.extend(criterio);
         }
+
+        // (5d) Lo STILE dichiarato dal codice ha una fonte che lo applica?
+        //      Non e' un giudizio di gusto — «bello» non e' un criterio — ma un
+        //      fatto: o esiste qualcosa che rende quelle classi, o non esiste.
+        //      La lente c'era gia', completa e con i suoi test, e non toccava la
+        //      chiusura di un run: era un tool offerto a due figure. MISURATO il
+        //      06/08/2026 su agenda-medica, dove il tool era perfino stato
+        //      CHIAMATO — Tailwind scritto nei componenti, in package.json, e
+        //      nessuna config, nessun .css, nessun import: pagina grezza, run
+        //      «completato». Interrogarla qui e' la differenza fra una misura
+        //      costruita e una in esercizio.
+        criteria.extend(self.cfg.ui_styling_criterion.clone());
 
         // (6) design_verify (P5): per i task figma l'agente non puo' chiudere con
         //     una resa visiva sotto soglia che HA GIA' misurato con nexus_visual_compare.

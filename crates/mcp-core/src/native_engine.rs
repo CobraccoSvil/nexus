@@ -1320,6 +1320,12 @@ async fn load_final_gate_config(db: &PgPool, project_id: Option<Uuid>) -> FinalG
             .await
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(d.browser_settle_ms),
+        // Stile dichiarato ma non applicato (mig 0682). Il criterio si costruisce
+        // qui perche' la lente sta in `nexus-agent-tools`, che il grafo non vede.
+        ui_styling_criterion: criterio_stile(
+            setting_bool(db, "agent.final_gate.ui_styling_enabled", false).await,
+            endpoint_timeout_s,
+        ),
         // Escalation su non-convergenza del gate (mig 0577): al cap di max_cycles con
         // criteri oggettivi ancora falliti, cede il turno all'executor per promuovere
         // un modello piu' capace invece di chiudere secco. `max_escalations` RIUSA la
@@ -1360,6 +1366,32 @@ async fn load_final_gate_config(db: &PgPool, project_id: Option<Uuid>) -> FinalG
 /// `None` quando non c'e' un frontend, o quando il DB non risponde: senza una
 /// porta non si prova nulla. Un host indovinato darebbe un rosso che parla di
 /// un servizio inesistente, cioe' peggio del silenzio.
+/// Il criterio dello stile applicato, quando la chiave lo accende.
+///
+/// Non prende una radice: la conosce il runner, che gira gia' dentro il
+/// progetto (`run_root`). Passargliela da qui vorrebbe dire risolverla due volte
+/// e rischiare due risposte diverse su quale albero si stia misurando — la
+/// forma di difetto che la regola O descrive.
+///
+/// La spec e' vuota per costruzione: questo criterio non ha parametri, ha una
+/// domanda sola. Il vocabolario che la risponde e' nel DB e lo legge la lente.
+fn criterio_stile(
+    abilitato: bool,
+    timeout_s: f64,
+) -> Option<nexus_agent_graph::runtime::ports::CriterionSpec> {
+    use nexus_agent_graph::runtime::ports::{CriterionProvenance, CriterionSpec};
+    if !abilitato {
+        return None;
+    }
+    Some(CriterionSpec {
+        criterion_type: nexus_agent_tools::ui_styling::CRITERION_TYPE.to_string(),
+        provenance: CriterionProvenance::Gate,
+        spec: serde_json::json!({}),
+        expected: serde_json::json!({}),
+        timeout_s: Some(timeout_s),
+    })
+}
+
 async fn load_origine_frontend(db: &PgPool, project_id: Uuid) -> Option<String> {
     let righe: Vec<(i32, String)> = sqlx::query_as(
         "SELECT port, label FROM nexus_port_allocations WHERE project_id = $1",
