@@ -33,6 +33,37 @@ import type { AgentStep, AITraceEvent } from "../../lib/api/agent";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
+/** Accento del piano: lo stesso viola usato dalla checklist nel nastro. */
+const PLAN_ACCENT = "#8b5cf6";
+/** Glifo del piano: lo stesso che il nastro usa per l'evento `plan`
+ *  (EVENT_KIND_ICON in activity-stream.tsx) — collassato ed espanso devono
+ *  parlare la stessa lingua visiva. Fuori dai range emoji vietati (regola A). */
+const PLAN_GLYPH = "□";
+
+/**
+ * Avanzamento del piano del turno, letto dal meta step `plan`.
+ *
+ * `undefined` quando il turno non aveva un piano: l'indicatore non compare, e
+ * un turno senza piano non deve mostrare "0/0" come se ne avesse uno vuoto.
+ *
+ * Conta dal payload servito, che l'API aggiorna gia' con lo stato CORRENTE dei
+ * todo (non la fotografia della creazione): qui non si ricalcola nulla, si
+ * legge il dato che il nastro espanso userebbe comunque.
+ */
+function avanzamentoPiano(
+  metaSteps: MetaStepEntry[],
+): { fatti: number; totale: number } | undefined {
+  const plan = [...metaSteps].reverse().find((m) => m.kind === "plan");
+  if (!plan) return undefined;
+  const payload = plan.payload as { todos?: Array<{ status?: string }> } | undefined;
+  const todos = payload?.todos;
+  if (!Array.isArray(todos) || todos.length === 0) return undefined;
+  return {
+    fatti: todos.filter((t) => t?.status === "completed").length,
+    totale: todos.length,
+  };
+}
+
 /** Esito sintetico del turno storico (ok/errore) dallo stato del run. */
 function statusTone(runStatus: string | undefined): "ok" | "err" | "neutral" {
   if (!runStatus) return "neutral";
@@ -139,6 +170,15 @@ export function ActivityHistoryRow({
 
   const toneColor = tone === "ok" ? "#22c55e" : tone === "err" ? tc.error : tc.textMuted;
   const toneGlyph = tone === "ok" ? "✓" : tone === "err" ? "✗" : "•";
+  // Avanzamento del piano, se il turno ne aveva uno. Sta nell'intestazione e
+  // non solo dentro il nastro espanso perche' il piano e' lo STATO DEL LAVORO,
+  // non l'evento di un turno: quando il turno invecchia diventa una riga
+  // compatta e il piano spariva dalla vista, mentre Consiglio e multi-provider
+  // restavano visibili solo perche' appartenevano al turno piu' recente.
+  // Segnalato dall'utente il 06/08/2026 su agenda-medica: il piano (16 voci, 9
+  // fatte) era nel primo run della sessione e dopo un refresh non si vedeva
+  // piu', pur essendo integro nel database.
+  const piano = avanzamentoPiano(metaSteps);
 
   return (
     <div
@@ -191,6 +231,31 @@ export function ActivityHistoryRow({
           {toneGlyph}
           <span>{statusLabel(runStatus)}</span>
         </span>
+        {/* Piano: visibile senza espandere, con l'avanzamento reale. */}
+        {piano && (
+          <span
+            title={`Piano: ${piano.fatti} di ${piano.totale} voci completate`}
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 4,
+              fontSize: 11,
+              fontWeight: 700,
+              color: PLAN_ACCENT,
+              background: `${PLAN_ACCENT}1f`,
+              border: `1px solid ${PLAN_ACCENT}66`,
+              borderRadius: 6,
+              padding: "1px 7px",
+              flexShrink: 0,
+              whiteSpace: "nowrap",
+            }}
+          >
+            <span aria-hidden>{PLAN_GLYPH}</span>
+            <span>
+              Piano {piano.fatti}/{piano.totale}
+            </span>
+          </span>
+        )}
         {/* Testo del turno (cede per primo) */}
         {query && (
           <span
