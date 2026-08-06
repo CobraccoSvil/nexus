@@ -249,6 +249,70 @@ pub async fn port_authorized_for_project(db: &sqlx::PgPool, project_id: &Uuid, p
     .unwrap_or(false)
 }
 
+/// A CHI appartiene, nel registro, la porta che un servizio dichiara di usare.
+///
+/// Enum chiuso e non `bool` (regola Q): «nessuno la tiene» e «la tiene un altro»
+/// portano a due azioni opposte — registrare, oppure non toccare niente e
+/// segnalare — e un booleano le farebbe collassare proprio dove la differenza
+/// vale l'identita' di un servizio.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortClaim {
+    /// Nessuna riga per quella porta: si puo' registrare a chi la dichiara.
+    Registrabile,
+    /// La riga e' gia' di chi la dichiara: si conferma, non si riscrive nulla.
+    GiaSua,
+    /// La riga e' di un'ALTRA identita'. Porta chi la tiene, che e' il valore del
+    /// difetto: senza, il messaggio direbbe «conflitto» e nessuno saprebbe con chi.
+    DiUnAltro { project_id: Uuid, label: String },
+}
+
+impl PortClaim {
+    /// Motivo in forma breve e stabile, per log e audit (mai per decidere).
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Registrabile => "free",
+            Self::GiaSua => "already_own",
+            Self::DiUnAltro { .. } => "held_by_other",
+        }
+    }
+}
+
+/// PUNTO UNICO (regola L) della domanda «la porta che questo servizio dichiara
+/// posso registrargliela?», data la riga che il registro ha gia' per quella porta.
+///
+/// L'identita' di un'allocazione e' la coppia `(project_id, label)`, MAI il numero
+/// di porta: la porta e' cio' che il servizio usa, non cio' che il servizio E'.
+/// Fino al 2026-08-06 il rilevamento porta-da-output risolveva il conflitto con
+/// `ON CONFLICT (port) DO UPDATE SET project_id, label`, cioe' trattava la porta
+/// come chiave d'identita': chiunque stampasse quel numero nel proprio stdout
+/// rinominava l'allocazione di un altro servizio, e `service_unit` — che dalla
+/// label DISCENDE — restava quella di prima. MISURATO su `agenda-medica` il
+/// 2026-08-06: la riga 31926 (`backend`, unit `agenda-medica-backend.service`)
+/// e' diventata `Service` alle 12:11:41, e 46 secondi dopo la
+/// `find_or_allocate("backend")` successiva, non trovando piu' nessuna riga con
+/// quella label, ne ha creata un'altra — 31927, con la STESSA unit. Stessa firma
+/// gia' documentata su `bacheca-attivita` (ADR 0042).
+///
+/// Il confronto e' sulla stringa TRIMMATA: e' la stessa forma con cui la label
+/// entra nelle query di `find_or_allocate` e di `link_allocation_to_service_unit`,
+/// e due normalizzazioni diverse darebbero due idee diverse di «e' la mia».
+pub fn classify_port_claim(
+    richiedente: &Uuid,
+    label_richiedente: &str,
+    registrata: Option<(Uuid, &str)>,
+) -> PortClaim {
+    let Some((proprietario, label_registrata)) = registrata else {
+        return PortClaim::Registrabile;
+    };
+    if proprietario == *richiedente && label_registrata.trim() == label_richiedente.trim() {
+        return PortClaim::GiaSua;
+    }
+    PortClaim::DiUnAltro {
+        project_id: proprietario,
+        label: label_registrata.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +435,61 @@ mod tests {
                 "la porta {port} non puo' appartenere a entrambi"
             );
         }
+    }
+
+    /// IL FURTO DI IDENTITA', coi valori misurati su `agenda-medica` il
+    /// 2026-08-06: la porta 31926 era registrata a `backend`, e un altro processo
+    /// l'ha dichiarata nel proprio output presentandosi come `Service`.
+    ///
+    /// MUTAZIONE che rende rosso (regola O): far ritornare `Registrabile` quando
+    /// la riga esiste ma la label differisce — cioe' il comportamento della
+    /// vecchia `ON CONFLICT (port) DO UPDATE SET label` — e questo test fallisce
+    /// col nome del derubato, non con un errore generico.
+    #[test]
+    fn una_porta_gia_registrata_a_un_altro_non_e_registrabile() {
+        let progetto = progetto_gestione_spese();
+        assert_eq!(
+            classify_port_claim(&progetto, "Service", Some((progetto, "backend"))),
+            PortClaim::DiUnAltro {
+                project_id: progetto,
+                label: "backend".to_string()
+            },
+            "la porta non e' l'identita' del servizio: chi la dichiara non puo' \
+             prendersi la riga di un altro"
+        );
+        // Anche fra due servizi VERI dello stesso progetto: il difetto non
+        // riguarda solo le label generiche.
+        assert!(matches!(
+            classify_port_claim(&progetto, "frontend", Some((progetto, "backend"))),
+            PortClaim::DiUnAltro { .. }
+        ));
+        // Un altro PROGETTO sulla stessa porta e' comunque un altro.
+        let altro = Uuid::parse_str("00000000-0000-4000-8000-000000000000").unwrap();
+        assert!(matches!(
+            classify_port_claim(&progetto, "backend", Some((altro, "backend"))),
+            PortClaim::DiUnAltro { .. }
+        ));
+    }
+
+    /// I due casi in cui si scrive: la riga non c'e', oppure e' gia' sua (e
+    /// allora si conferma, non si riscrive un'identita' che era gia' quella).
+    #[test]
+    fn la_porta_libera_o_gia_propria_si_registra() {
+        let progetto = progetto_gestione_spese();
+        assert_eq!(
+            classify_port_claim(&progetto, "backend", None),
+            PortClaim::Registrabile
+        );
+        assert_eq!(
+            classify_port_claim(&progetto, "backend", Some((progetto, "backend"))),
+            PortClaim::GiaSua
+        );
+        // Lo spazio ai bordi non fa di una label la label di un altro: e' la
+        // stessa forma trimmata con cui entra nelle query di allocazione.
+        assert_eq!(
+            classify_port_claim(&progetto, " backend ", Some((progetto, "backend"))),
+            PortClaim::GiaSua
+        );
     }
 }
 

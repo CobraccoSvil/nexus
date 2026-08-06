@@ -2131,6 +2131,37 @@ if [[ -f "$reaper_file" ]]; then
   fi
 fi
 
+# ── identita-allocazione-porta (2026-08-06) ─────────────────────────────────
+# «Di CHI e' questa porta nel registro?» ha UN punto di risposta, e la risposta
+# non e' mai il numero di porta: l'identita' di un'allocazione e' la coppia
+# (project_id, label).
+#
+# Il difetto, MISURATO su agenda-medica il 2026-08-06 e gia' documentato su
+# bacheca-attivita (ADR 0042): il rilevamento porta-da-output risolveva il
+# conflitto con `ON CONFLICT (port) DO UPDATE SET label`, cioe' chiunque
+# stampasse quel numero nel proprio stdout rinominava l'allocazione di un altro
+# servizio. `service_unit`, che dalla label DISCENDE, restava quella di prima:
+# la riga 31926 e' passata da `backend` a `Service` conservando
+# `agenda-medica-backend.service`, e 46 secondi dopo il backend — che non
+# trovava piu' la propria label — ne ha allocata un'altra sulla stessa unit.
+assert_single "identita-allocazione-porta" 'pub fn classify_port_claim' \
+  'crates/nexus-tool-kit/src/ports.rs' crates
+# La forma SQL che lo produceva non deve poter rientrare da nessuna parte: e' un
+# UPDATE dell'identita' chiavato sulla porta. I commenti che la citano come
+# difetto storico restano leciti (`grep` sulle sole righe non di commento).
+ruba_identita="$(grep -rn --include='*.rs' --exclude-dir=target \
+  -E 'ON CONFLICT \(port\) DO UPDATE' crates 2>/dev/null \
+  | grep -vE ':[[:space:]]*(///|//|\*)' || true)"
+if [[ -n "$ruba_identita" ]]; then
+  echo "!! identita-allocazione-porta: un UPSERT chiavato sulla PORTA riscrive l'identita'" >&2
+  echo "   di un'allocazione altrui (regola L, ADR 0042). Classifica con" >&2
+  echo "   nexus_tool_kit::ports::classify_port_claim e non scrivere su DiUnAltro:" >&2
+  printf '%s\n' "$ruba_identita" >&2
+  fail=1
+else
+  echo "OK identita-allocazione-porta: nessun upsert chiavato sulla porta"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

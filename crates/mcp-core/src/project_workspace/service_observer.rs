@@ -327,7 +327,7 @@ async fn windows_visible_service_rows(
         .map(|(label, status, created_at, ..)| (label.clone(), status.clone(), *created_at))
         .collect();
     let visible: std::collections::HashSet<String> =
-        super::services::visible_windows_services(&visible_proj)
+        super::services::visible_windows_services(&visible_proj, project_id)
             .into_iter()
             .map(|(label, _running)| label)
             .collect();

@@ -551,10 +551,11 @@ async fn windows_service_unit_still_exists(db: &PgPool, project_id: Uuid, unit: 
         Ok(r) => r,
         Err(_) => return true, // pool PROGETTO transitorio: preserva la riserva
     };
-    let vive: Vec<String> = crate::project_workspace::services::visible_windows_services(&righe)
-        .into_iter()
-        .map(|(label, _running)| label)
-        .collect();
+    let vive: Vec<String> =
+        crate::project_workspace::services::visible_windows_services(&righe, project_id)
+            .into_iter()
+            .map(|(label, _running)| label)
+            .collect();
     windows_unit_backed_by_label(&slug, unit, &vive)
 }
 
@@ -1261,7 +1262,7 @@ mod tests {
             ("Frontend (Vite)".to_string(), "stopped".to_string(), t0),
             ("frontend".to_string(), "running".to_string(), t1),
         ];
-        let vive: Vec<String> = visible_windows_services(&storia)
+        let vive: Vec<String> = visible_windows_services(&storia, uuid::Uuid::new_v4())
             .into_iter()
             .map(|(l, _)| l)
             .collect();
