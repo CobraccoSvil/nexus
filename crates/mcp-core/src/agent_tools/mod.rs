@@ -28,6 +28,7 @@ pub use nexus_agent_tools::*;
 // «Questa riga di shell avvia un server?» (punto unico, regola L): la domanda
 // posta sulla riga SCOMPOSTA, non sul testo grezzo.
 pub(crate) mod avvio_server;
+pub(crate) mod natura_comando;
 pub(crate) mod command;
 pub(crate) mod context;
 pub(crate) mod dispatch;
@@ -78,8 +79,7 @@ pub(crate) use uuid::Uuid;
 pub(crate) use crate::projects::resolve_relative_path;
 
 pub(crate) use helpers::{
-    classify_command_error, format_process_output, is_long_oneshot,
-    looks_like_long_running_command,
+    classify_command_error, format_process_output,
 };
 
 #[cfg(test)]

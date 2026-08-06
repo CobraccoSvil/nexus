@@ -242,15 +242,15 @@ async fn migration_only_block(ctx: &AgentToolContext, command: &str) -> Option<S
     None
 }
 
-/// Instrada il comando a run_service se richiesto esplicitamente (`background`)
-/// oppure se riconosciuto come long-running/web-service (Livelli 1-2). Ritorna
-/// `Some(messaggio)` se instradato, `None` se il comando va eseguito in-line.
-/// Estratto da `tool_run_command` (behavior-preserving).
-async fn maybe_route_to_service(
-    ctx: &AgentToolContext,
-    input: &Value,
-    command: &str,
-) -> Option<String> {
+/// Instrada il comando a `run_service` SOLO se chi lancia lo ha dichiarato
+/// (`background: true`). Ritorna `Some(messaggio)` se instradato, `None` se il
+/// comando va eseguito in-line.
+///
+/// Non prende piu' il testo del comando, e l'assenza di quel parametro E' il
+/// contratto: qui non si guarda cosa c'e' scritto, si guarda cosa e' stato
+/// dichiarato. Finche' lo prendeva, qualcuno poteva rimetterci un
+/// riconoscimento sul nome senza cambiare la firma.
+async fn maybe_route_to_service(ctx: &AgentToolContext, input: &Value) -> Option<String> {
     let explicit_bg = input
         .get("background")
         .and_then(Value::as_bool)
@@ -269,22 +269,18 @@ async fn maybe_route_to_service(
         ));
     }
 
-    // One-shot lunghi (build/install/test): esecuzione sincrona, non run_service.
-    if is_long_oneshot(command) {
-        return None;
-    }
-
-    // ── Livello 2: lista hardcoded di comandi noti ──
-    if looks_like_long_running_command(command, &ctx.long_running_patterns)
-        || service::looks_like_web_service(command)
-    {
-        let routed = service::tool_run_service(ctx, input, "service").await;
-        return Some(nexus_types::tool_outcome::prepend_preserving_failure(
-            "[Auto-routing] Comando long-running/web-service rilevato: avviato come servizio \
-             server-side (PORT allocata nel bucket del progetto).",
-            &routed,
-        ));
-    }
+    // NESSUN livello 2. La natura di un comando non si indovina dal suo testo:
+    // la DICHIARA chi lancia, scegliendo il tool (`run_service`) o il parametro
+    // (`background`). Qui c'era un riconoscimento su vocabolario
+    // (`is_long_oneshot` per escludere, `looks_like_long_running_command` +
+    // `looks_like_web_service` per instradare) che ha promosso a servizio un
+    // `curl`, un `npm run lint`, un `npx eslint` e sette `create-next-app` —
+    // zero server su 12 promozioni misurate il 06/08/2026, mentre i server veri
+    // passavano gia' da `run_service` esplicito 26 volte.
+    //
+    // Un comando che non termina non viene piu' promosso: fallisce dichiarando
+    // COSA stava facendo (`timeout_con_diagnosi`, che lo osserva vivo). Se era
+    // davvero un servizio, l'agente riceve la porta e il nome del tool giusto.
     None
 }
 
@@ -402,7 +398,7 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> R
         Err(msg) => return RispostaTool::fallito(msg),
     };
 
-    run_command_probe(ctx, input, &command, child, &hints_prefix).await
+    run_command_probe(ctx, &command, child, &hints_prefix).await
 }
 
 /// Calcola il prefisso hint DB-driven e applica le guardie di routing
@@ -470,7 +466,7 @@ async fn command_hints_and_routing(
 
     // ── Livelli 1-2: routing a run_service (background esplicito o comando noto
     // long-running/web-service). Se instradato ritorna il messaggio; None = prosegue. ──
-    if let Some(msg) = maybe_route_to_service(ctx, input, command).await {
+    if let Some(msg) = maybe_route_to_service(ctx, input).await {
         return Err(inoltro_legacy(msg));
     }
 
@@ -483,9 +479,23 @@ async fn command_hints_and_routing(
 /// segnala il timeout. Drena stdout/stderr in parallelo a `wait()` per evitare
 /// il deadlock della pipe (~64KB). Estratto da `tool_run_command`
 /// (behavior-preserving).
+/// La natura del figlio, o l'ignoto dichiarato se il pid non c'e' piu'.
+///
+/// Estratta perche' i due punti che la interrogano (dopo l'attesa breve e alla
+/// scadenza del tetto lungo) devono porre la STESSA domanda: due formulazioni
+/// diverse dello stesso quesito sono il modo in cui un instradamento diventa
+/// incoerente con se stesso.
+async fn natura_comando_del_figlio(pid: Option<u32>) -> natura_comando::NaturaOsservata {
+    match pid {
+        Some(pid) => natura_comando::natura_osservata(pid).await,
+        None => natura_comando::NaturaOsservata::NonOsservabile {
+            motivo: "pid del processo non disponibile".to_string(),
+        },
+    }
+}
+
 async fn run_command_probe(
     ctx: &AgentToolContext,
-    input: &Value,
     command: &str,
     mut child: tokio::process::Child,
     hints_prefix: &str,
@@ -493,18 +503,31 @@ async fn run_command_probe(
     // Drain stdout/stderr IN PARALLELO con child.wait() (evita deadlock pipe ~64KB).
     let (stdout_task, stderr_task) = spawn_output_drainers(&mut child);
 
-    // Probe: per gli one-shot LUNGHI (install/build) attesa sincrona lunga; per gli
-    // altri 10s, poi re-route a run_service (server long-running tipo dev/serve).
-    let is_oneshot = is_long_oneshot(command);
-    let probe_secs = if is_oneshot {
-        LONG_ONESHOT_PROBE_SECS
-    } else {
-        RUN_COMMAND_PROBE_SECS
-    };
-    let probe =
-        tokio::time::timeout(std::time::Duration::from_secs(probe_secs), child.wait()).await;
+    // Il pid serve per CHIEDERE al sistema operativo cosa sta facendo il
+    // processo. Assente solo se il child e' gia' stato atteso, il che qui non
+    // e' ancora accaduto.
+    let pid_figlio = child.id();
 
-    match probe {
+    // CONTRATTO RIGIDO: `run_command` esegue un comando che TERMINA. Non
+    // promuove nulla a servizio — quella decisione la dichiara chi lancia,
+    // scegliendo `run_service`, e non si indovina qui.
+    //
+    // MISURATO il 06/08/2026 su tre progetti: l'auto-promozione e' intervenuta
+    // 12 volte e in NESSUN caso su un server. Aveva promosso a servizio un
+    // `curl`, un `npm run lint`, un `npx eslint`, uno script di generazione
+    // Prisma, e sette volte `npx create-next-app` — queste ultime tutte
+    // fallite, perche' promuovere significa UCCIDERE e RILANCIARE: lo
+    // scaffolder ripartiva su una directory che la prima esecuzione aveva gia'
+    // riempito a meta', e non poteva che rifiutarsi. Nello stesso periodo i
+    // server veri sono stati lanciati con `run_service` esplicito 26 volte.
+    // Precisione dell'euristica: zero. Danno: un run morto in 600 secondi.
+    let atteso = tokio::time::timeout(
+        std::time::Duration::from_secs(LONG_ONESHOT_PROBE_SECS),
+        child.wait(),
+    )
+    .await;
+
+    match atteso {
         Ok(Ok(exit_status)) => {
             // Il processo è terminato entro il probe — leggi l'output drainato dai task paralleli
             let exit_code = exit_status.code().unwrap_or(-1);
@@ -520,7 +543,10 @@ async fn run_command_probe(
             RispostaTool::fallito(format!("[Errore attesa comando '{}': {}]", command, e))
         }
         Err(_) => {
-            // Probe timeout.
+            // Si GUARDA prima di uccidere: dopo, la tabella dei listener non
+            // dice piu' nulla di questo processo, e la diagnosi che l'agente
+            // riceve sarebbe un «timeout» muto.
+            let natura = natura_comando_del_figlio(pid_figlio).await;
             let _ = child.kill().await;
             // I due drainer vanno ABORTITI, non lasciati cadere: in tokio
             // droppare un `JoinHandle` STACCA il task, non lo annulla. Restavano
@@ -532,8 +558,7 @@ async fn run_command_probe(
             // entrambi.
             stdout_task.abort();
             stderr_task.abort();
-            command_probe_timeout_result(ctx, input, command, is_oneshot, probe_secs, hints_prefix)
-                .await
+            timeout_con_diagnosi(command, pid_figlio, natura).await
         }
     }
 }
@@ -669,58 +694,55 @@ fn command_result_hint(exit_code: i32, stdout: &str, stderr: &str, command: &str
     }
 }
 
-/// Gestisce il timeout del probe di `run_command`: gli one-shot (install/build)
-/// segnalano il timeout perche' NON sono server long-running; gli altri vengono
-/// re-instradati a run_service.
+/// Il timeout di `run_command`, con la DIAGNOSI di cio' che il processo stava
+/// facendo.
 ///
-/// Nessuno dei due rami ha un exit code da riportare — il processo e' stato
-/// UCCISO, uno stato d'uscita non e' mai esistito — e la differenza fra loro sta
-/// nell'esito, non nel testo:
+/// L'esito e' sempre un FALLIMENTO: `run_command` esegue comandi che
+/// terminano, e uno che non termina non ha fatto il suo lavoro. Prima questo
+/// ramo promuoveva a servizio cio' che sembrava long-running, e la misura del
+/// 06/08/2026 dice che in 12 promozioni non ne ha azzeccata una (vedi il
+/// commento nel probe).
 ///
-/// - il timeout di un one-shot e' un FALLIMENTO dichiarato: il build/install non
-///   e' arrivato in fondo, e il gate deve poterlo bocciare. Finche' questo ramo
-///   non dichiarava nulla, un criterio di verifica che sforava il probe risultava
-///   "non misurato", cioe' ASSOLVEVA un build mai terminato;
-/// - il re-instradamento a servizio e' invece riuscito se il servizio e' partito:
-///   il comando non ha un esito perche' non doveva averne uno, e un criterio
-///   costruito su un dev-server resta onestamente NON misurato. Se pero'
-///   `run_service` fallisce, quel fallimento e' del tool e deve arrivare a valle
-///   — prima la premessa "[Auto-probe] ..." lo spingeva fuori dalla testa della
-///   stringa e nessuno lo vedeva piu'.
-async fn command_probe_timeout_result(
-    ctx: &AgentToolContext,
-    input: &Value,
+/// Cio' che cambia e' il MOTIVO, e viene da un fatto osservato mentre il
+/// processo era ancora vivo, non dal suo nome:
+///
+/// - ascolta su una porta -> e' un servizio lanciato col tool sbagliato, e la
+///   risposta lo dice con la porta in mano: l'agente ha un rimedio preciso
+///   invece di un timeout da interpretare;
+/// - non ascolta -> stava lavorando e non e' arrivato in fondo: il rimedio e'
+///   spezzarlo, non cambiare tool;
+/// - non osservabile -> si dichiara di non sapere, e si danno entrambe le
+///   strade. «Non ho potuto guardare» non diventa una diagnosi inventata.
+async fn timeout_con_diagnosi(
     command: &str,
-    is_oneshot: bool,
-    probe_secs: u64,
-    hints_prefix: &str,
+    pid: Option<u32>,
+    natura: natura_comando::NaturaOsservata,
 ) -> RispostaTool {
-    if is_oneshot {
-        // One-shot (install/build) che non finisce nemmeno in probe_secs:
-        // NON è un server long-running -> NON instradare a run_service
-        // (semantica errata + su Windows il wizard setsid/nohup è rotto).
-        // Segnala il timeout così l'agente può spezzare il comando.
-        RispostaTool::fallito(con_hint(
-            hints_prefix,
-            format!(
-                "[Timeout] Il comando '{}' non è terminato in {}s ed è stato interrotto. \
-                 Se è un build/install legittimo molto lungo, eseguilo per passi.",
-                command.chars().take(120).collect::<String>(),
-                probe_secs
-            ),
-        ))
-    } else {
-        // Long-running non-one-shot (dev server, watcher) → run_service.
-        let routed = service::tool_run_service(ctx, input, "service").await;
-        inoltro_legacy(nexus_types::tool_outcome::prepend_preserving_failure(
-            format!(
-                "[Auto-probe] Il comando non è terminato in {}s — rilevato come long-running.\n\
-                 Processo server-side terminato e ri-lanciato come servizio.",
-                probe_secs
-            ),
-            &routed,
-        ))
-    }
+    let breve: String = command.chars().take(120).collect();
+    let rimedio = match &natura {
+        natura_comando::NaturaOsservata::Serve { porte } => format!(
+            "Il processo era in ascolto su {}: e' un SERVIZIO, non un comando che termina.              Rilancialo con run_service (riceve una porta allocata e resta vivo).",
+            porte
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        natura_comando::NaturaOsservata::NonServe => {
+            "Il processo non era in ascolto su alcuna porta: stava lavorando e non e' arrivato              in fondo. Eseguilo per passi piu' piccoli."
+                .to_string()
+        }
+        natura_comando::NaturaOsservata::NonOsservabile { motivo } => format!(
+            "Non e' stato possibile osservare se fosse un servizio ({motivo}). Se e' un server              usa run_service; se e' un build/install lungo, eseguilo per passi."
+        ),
+    };
+    tracing::debug!(
+        %breve, pid = ?pid, esito = %natura.descrizione(),
+        "run_command: tempo scaduto, nessuna promozione a servizio"
+    );
+    RispostaTool::fallito(format!(
+        "[Timeout] Il comando '{breve}' non e' terminato in {LONG_ONESHOT_PROBE_SECS}s ed e'          stato interrotto. {rimedio}"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,8 +1413,8 @@ mod tests {
     /// `esito_misurato = exit_code.is_some() || is_error` — falso, cioe'
     /// "criterio NON misurato", che nel gate non boccia nulla.
     ///
-    /// Si passa dal PRODUTTORE del ramo (`command_probe_timeout_result`, quello
-    /// che `run_command_probe` chiama allo scadere) e dall'adapter REALE che
+    /// Si passa dal PRODUTTORE del ramo (`timeout_con_diagnosi`, quello che
+    /// `run_command_probe` chiama allo scadere) e dall'adapter REALE che
     /// alimenta il gate (`map_result_to_outcome`): un timeout vero costerebbe
     /// `LONG_ONESHOT_PROBE_SECS` secondi di attesa, e ricostruire a mano la
     /// risposta fisserebbe proprio l'assunto da verificare.
@@ -1403,13 +1425,11 @@ mod tests {
     async fn timeout_del_probe_e_un_fallimento_misurato_senza_exit_code() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = crate::test_support::ctx_di_tool_test(dir.path().to_path_buf());
-        let risposta = command_probe_timeout_result(
-            &ctx,
-            &serde_json::json!({"command": "npm install"}),
+        let _ = &ctx;
+        let risposta = timeout_con_diagnosi(
             "npm install",
-            true,
-            LONG_ONESHOT_PROBE_SECS,
-            "",
+            Some(4242),
+            natura_comando::NaturaOsservata::NonServe,
         )
         .await;
 
@@ -1435,6 +1455,57 @@ mod tests {
             "il testo resta la guida per l'agente: {:?}",
             outcome.content
         );
+    }
+
+    /// Un SERVIZIO lanciato con `run_command` non viene piu' promosso di
+    /// nascosto: fallisce, e la risposta dice cosa fare NOMINANDO la porta su
+    /// cui il processo era in ascolto.
+    ///
+    /// E' la differenza fra il vecchio comportamento e questo. Prima il tool
+    /// promuoveva a servizio tutto cio' che sembrava long-running e nel farlo
+    /// UCCIDEVA e RILANCIAVA il processo: misurate 12 promozioni, zero server
+    /// (un `curl`, un `npm run lint`, sette `create-next-app` distrutti a
+    /// meta' scaffolding). Ora la decisione resta a chi lancia, e cio' che il
+    /// tool aggiunge e' un FATTO osservato, non un'ipotesi sul nome.
+    ///
+    /// MUTAZIONE: far tornare `timeout_con_diagnosi` allo stesso testo per
+    /// tutte le nature -> il test rosseggia, perche' la porta sparisce dal
+    /// rimedio e l'agente resta senza il dato che gli serve.
+    #[tokio::test]
+    async fn un_servizio_lanciato_come_comando_riceve_la_porta_nel_rimedio() {
+        let serve = timeout_con_diagnosi(
+            "next dev",
+            Some(1234),
+            natura_comando::NaturaOsservata::Serve { porte: vec![31904] },
+        )
+        .await;
+        let testo = serve.testo.clone();
+        assert_eq!(
+            serve.esito,
+            nexus_types::tool_outcome::EsitoTool::Fallito,
+            "un comando che non termina e' un fallimento"
+        );
+        assert!(testo.contains("31904"), "la porta osservata va nominata: {testo}");
+        assert!(testo.contains("run_service"), "il rimedio va nominato: {testo}");
+
+        // Il caso opposto NON deve suggerire run_service: stava lavorando.
+        let lavora =
+            timeout_con_diagnosi("npm install", Some(1234), natura_comando::NaturaOsservata::NonServe)
+                .await;
+        assert!(
+            !lavora.testo.contains("run_service"),
+            "un build lento non e' un servizio: {}",
+            lavora.testo
+        );
+
+        // E cio' che non si e' potuto osservare non diventa una diagnosi.
+        let ignoto = timeout_con_diagnosi(
+            "qualcosa",
+            None,
+            natura_comando::NaturaOsservata::NonOsservabile { motivo: "test".into() },
+        )
+        .await;
+        assert!(ignoto.testo.contains("Non e' stato possibile osservare"));
     }
 
     /// Lo stato d'uscita sta nel CAMPO, e il testo non puo' contraddirlo.

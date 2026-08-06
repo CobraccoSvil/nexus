@@ -4,27 +4,13 @@
 //! Estratto da mod.rs (refactor god-file). Visibilita pub(super) perche i
 //! sottomoduli che fanno use super::* continuano a vederli via re-export in mod.rs.
 
-/// True se il comando e' un one-shot LUNGO che TERMINA (install/build/compile/
-/// test/migrate) — da attendere in sincrono, non da instradare a run_service.
-/// PUNTO UNICO (regola L): usato dal probe di `run_command` e dal declassamento
-/// kind service->task in `tool_run_service`.
-pub(crate) fn is_long_oneshot(command: &str) -> bool {
-    let c = command.to_lowercase();
-    c.contains("install")
-        || c.contains("npm ci")
-        || c.contains(" build")
-        || c.contains("tsc")
-        || c.contains("cargo build")
-        || c.contains("cargo check")
-        || c.contains("cargo test")
-        || c.contains("compile")
-        || c.contains("migrate")
-        || c.contains("prisma generate")
-        || c.contains("playwright test")
-        || c.contains("npm add")
-        || c.contains("pnpm add")
-        || c.contains("yarn add")
-}
+// RIMOSSA `is_long_oneshot`: era la lista di sottostringhe con cui il probe di
+// `run_command` decideva se un comando fosse un server. La natura di un comando
+// non si indovina dal testo — la dichiara chi lancia, scegliendo `run_command`
+// (termina) o `run_service` (resta vivo). Misurato il 06/08/2026: l'euristica
+// che la consumava aveva promosso a servizio 12 comandi e nessuno era un server
+// (un `curl`, un `npm run lint`, un `npx eslint`, sette `create-next-app`).
+// Vedi `agent_tools::natura_comando` e il probe in `agent_tools::command`.
 
 /// Exit code di un processo ucciso da SIGPIPE (128 + 13).
 ///
@@ -112,49 +98,6 @@ pub(crate) fn is_package_manager_mutation(command: &str) -> bool {
         })
 }
 
-/// Controlla se il comando corrisponde a uno dei pattern long-running caricati dal DB.
-/// Ogni pattern è una sequenza di token (es. "npm run dev") che viene cercata
-/// come sottosequenza contigua nei token del comando.
-pub(crate) fn looks_like_long_running_command(command: &str, patterns: &[String]) -> bool {
-    let lower = command.to_lowercase();
-    let normalized = lower
-        .replace("&&", " ")
-        .replace("||", " ")
-        .replace([';', '|', '(', ')'], " ");
-    let tokens: Vec<&str> = normalized.split_whitespace().collect();
-
-    for pattern in patterns {
-        let pat_tokens: Vec<&str> = pattern.split_whitespace().collect();
-        if pat_tokens.is_empty() {
-            continue;
-        }
-        // Pattern singolo token: match anche come primo token (es. "vite", "nodemon", "uvicorn")
-        if pat_tokens.len() == 1 {
-            if tokens.contains(&pat_tokens[0].to_lowercase().as_str())
-                || tokens.first().copied() == Some(pat_tokens[0])
-            {
-                return true;
-            }
-            // Match case-insensitive su tutti i token
-            let pat_lower = pat_tokens[0].to_lowercase();
-            if tokens.contains(&pat_lower.as_str()) {
-                return true;
-            }
-        } else {
-            // Multi-token: match come sottosequenza contigua
-            let pat_lower: Vec<String> = pat_tokens.iter().map(|t| t.to_lowercase()).collect();
-            let pat_refs: Vec<&str> = pat_lower.iter().map(|s| s.as_str()).collect();
-            if tokens.len() >= pat_refs.len()
-                && tokens
-                    .windows(pat_refs.len())
-                    .any(|w| w == pat_refs.as_slice())
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
 
 pub(crate) fn format_process_output(info: &crate::agent_processes::ProcessOutput) -> String {
     let mut msg = format!(
@@ -347,20 +290,11 @@ pub(crate) fn windows_shell_hint(_command: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn is_long_oneshot_riconosce_install_test_add() {
-        // Regressione pannello Servizi: questi comandi venivano registrati
-        // come kind='service' e restavano per sempre nella lista servizi.
-        assert!(is_long_oneshot("pnpm install"));
-        assert!(is_long_oneshot("npx playwright test --project=chromium"));
-        assert!(is_long_oneshot("pnpm add -D @playwright/test"));
-        assert!(is_long_oneshot("npm run build"));
-        assert!(is_long_oneshot("npx vite build"));
-        // I server long-running NON sono one-shot.
-        assert!(!is_long_oneshot("node server.js"));
-        assert!(!is_long_oneshot("npm run dev"));
-        assert!(!is_long_oneshot("npm start"));
-    }
+    // Il test di `is_long_oneshot` e' stato rimosso con la funzione: verificava
+    // che un vocabolario riconoscesse i nomi che gli erano stati insegnati, cioe'
+    // esattamente cio' che non prova nulla su un comando mai visto. La domanda
+    // che ha preso il suo posto ha i propri test in `agent_tools::natura_comando`,
+    // e misura un FATTO (l'albero del processo e' in ascolto?) invece di un nome.
 
     #[test]
     fn classify_tsc_build_failure_emette_guida_build() {
