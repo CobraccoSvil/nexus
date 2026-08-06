@@ -382,6 +382,16 @@ async fn reap_all_at_boot_enabled(db: &PgPool) -> bool {
 /// gli id reapati cosi' il chiamante puo' sbloccare gli EventSource in ascolto.
 /// `meta` = meta-DB (settings worklog); `db` = pool del DB progetto reapato.
 async fn finalize_reaped(meta: &PgPool, db: &PgPool, reaped: Vec<uuid::Uuid>) -> Vec<uuid::Uuid> {
+    // Totali del run dai FATTI persistiti (punto unico `run_totals`). Chi muore
+    // da fuori non passa dal finalizzatore, quindi la sua riga resta ai valori
+    // iniziali: MISURATO su agenda-medica il 06/08/2026, un run `interrupted`
+    // con 107 passi e 87 righe di ledger finalizzate (4.899.738 token, $0.0363)
+    // si presentava all'utente come "0 tok - $0.000". Nessuna stima: si scrive
+    // solo cio' che il ledger e gli step DICONO, e solo dove la riga e' a zero.
+    for rid in &reaped {
+        crate::run_totals::consolida_run(meta, db, *rid).await;
+    }
+
     // Worklog di sessione (mig 0411): anche il lavoro dei run interrotti
     // (crash/stallo) entra nella storia di lavoro — gli agent_steps sono gia'
     // in DB grazie alla persistenza incrementale del brain (M68). Il run

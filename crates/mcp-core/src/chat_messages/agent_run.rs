@@ -3402,9 +3402,9 @@ async fn execute_native_run(
 /// decine di iterazioni fatte e un rimando in correzione pendente, e
 /// presentati all'utente come un motore che non era mai partito.
 ///
-/// Le iterazioni si risolvono dai fatti persistiti con la STESSA inversa del
-/// punto unico (`MAX(step_index) / STEP_INDEX_STRIDE`, come `mark_run` per i
-/// sub-run morti senza outcome). `stop_reason = "recursion_limit"`
+/// Le iterazioni si risolvono dai fatti persistiti delegando al punto unico
+/// [`crate::run_totals::iterazioni_persistite`] (la stessa inversa che chiude i
+/// sub-run morti senza outcome e i run reapati). `stop_reason = "recursion_limit"`
 /// (identificatore canonico, regola N) distingue questa chiusura dall'"error"
 /// generico: chi legge i dati puo' chiedersi se il tetto e' dimensionato bene,
 /// domanda che con una parola sola per tutti i guasti resta al buio.
@@ -3421,18 +3421,9 @@ async fn native_recursion_limit_result(
     )
     .await
     {
-        Ok(steps_pool) => {
-            let sql = format!(
-                "SELECT COALESCE(MAX(step_index) / {stride}, 0)::int8 \
-                   FROM agent_steps WHERE run_id = $1",
-                stride = nexus_agent_graph::runtime::ports::STEP_INDEX_STRIDE,
-            );
-            sqlx::query_scalar(&sql)
-                .bind(run_id)
-                .fetch_one(&steps_pool)
-                .await
-                .unwrap_or(0)
-        }
+        Ok(steps_pool) => crate::run_totals::iterazioni_persistite(&steps_pool, run_id)
+            .await
+            .unwrap_or(0),
         // DB progetto irraggiungibile: 0 qui e' "non ho potuto guardare", e il
         // WARN lo dichiara invece di lasciarlo indistinguibile da "zero lavoro".
         Err(e) => {

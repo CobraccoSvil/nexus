@@ -5145,10 +5145,12 @@ fn terminal_verdict(verdict: &str, error_class: &str, causa: Option<&CausaTimeou
 ///
 /// Iterazioni: `Some(n)` (conteggio del grafo) e' autoritativo e si scrive
 /// tal quale; `None` (run morto senza outcome: timeout, errore del motore) si
-/// risolve QUI, nel punto unico della chiusura (regola L), dai fatti gia'
-/// persistiti: `MAX(step_index) / STEP_INDEX_STRIDE` su `agent_steps` =
-/// l'ultima iterazione che ha lasciato un passo (premessa dichiarata, regola
-/// O). Senza step persistiti il derivato e' 0, che stavolta e' vero.
+/// risolve dai fatti gia' persistiti — l'ultima iterazione che ha lasciato un
+/// passo su `agent_steps` (premessa dichiarata, regola O). La formula viene dal
+/// punto unico [`crate::run_totals::sql_ultima_iterazione`] come FRAMMENTO, non
+/// come funzione, per non spezzare l'atomicita' della CTE: qui le due tabelle
+/// vanno aggiornate in una statement sola. Senza step persistiti il derivato e'
+/// 0, che stavolta e' vero.
 ///
 /// Best-effort per i chiamanti (la finalizzazione non deve fallire per un
 /// errore di persistenza) ma MAI muto: l'UPDATE respinto lascerebbe la riga
@@ -5162,11 +5164,7 @@ async fn mark_run(
     let compact = c.summary.chars().take(4000).collect::<String>();
     let sql = format!(
         "WITH iters AS (
-            SELECT COALESCE(
-                $3::int4,
-                (SELECT COALESCE(MAX(step_index) / {stride}, 0)::int4
-                   FROM agent_steps WHERE run_id = $7)
-            ) AS n
+            SELECT COALESCE($3::int4, {inversa}::int4) AS n
         ), sub AS (
             UPDATE nexus_subagent_runs SET
                 status = $1, final_summary = $2, iterations = (SELECT n FROM iters),
@@ -5179,7 +5177,7 @@ async fn mark_run(
             prompt_tokens = $4, completion_tokens = $5,
             total_tokens = $4 + $5, total_cost = $6, completed_at = NOW()
          WHERE id = $7",
-        stride = nexus_agent_graph::runtime::ports::STEP_INDEX_STRIDE,
+        inversa = crate::run_totals::sql_ultima_iterazione("$7"),
     );
     let res = sqlx::query(&sql)
     .bind(c.status)
