@@ -95,6 +95,7 @@
 
 pub mod adversarial_review;
 pub mod advisory_panel;
+pub mod browser_dialogue;
 pub mod clarify_signature;
 pub mod context_reduction;
 pub mod correction_progress;

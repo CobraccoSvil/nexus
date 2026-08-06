@@ -56,6 +56,7 @@ pub(crate) mod testing;
 pub(crate) mod tool_not_found;
 // Catena di verifica post-modifica nexus_verify_change (ADR 0019 L3).
 pub(crate) mod verify;
+pub(crate) mod browser_probe;
 pub(crate) mod visual_compare;
 
 // ── API pubblica del package (call site esterni: invariata) ─────────────────

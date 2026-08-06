@@ -48,6 +48,7 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use nexus_agent_graph::decisions::browser_dialogue;
 use nexus_agent_graph::runtime::ports::{
     CriteriaRunner, CriterionOutcome, CriterionProvenance, CriterionResult, CriterionSpec,
     PortError, ToolCall, ToolExecutor, ToolOutcome,
@@ -579,6 +580,17 @@ impl FinalGateCriteriaRunnerAdapter {
                 self.attesa_bersaglio_http(&c.spec).await;
                 misurato(self.check_http(&c.spec, &c.expected, timeout_s).await)
             }
+            // Il DIALOGO della pagina coi propri dati, osservato da un browser
+            // reale. Accanto al braccio "http" e non dentro: quello chiede «il
+            // server risponde?», questo «il browser ci arriva?», e la prima
+            // risposta non implica la seconda (CORS e URL costruito a runtime
+            // sono invisibili a reqwest per costruzione). Stessa attesa di
+            // readiness del braccio http: una pagina caricata su un servizio
+            // ancora freddo non ha chiamate da osservare.
+            t if t == browser_dialogue::CRITERION_TYPE => {
+                self.attesa_bersaglio_http(&c.spec).await;
+                self.check_browser_dialogue(&c.spec, timeout_s).await
+            }
             "file_exists" => {
                 self.check_file_exists(&c.spec, &c.expected, timeout_s)
                     .await
@@ -1071,6 +1083,67 @@ task_complete (outcome + summary)"
     /// scriveva `non trovata`) e se il file ci fosse (match del basename come
     /// token isolato su una riga di elenco). La seconda deduzione era cieca ai
     /// dotfile, che quell'elenco NON mostra: un `.env` scritto dal run risultava
+    /// Osserva la pagina con un browser reale e giudica col punto unico puro
+    /// [`browser_dialogue::classifica_dialogo`]: qui SOLO l'I/O e la
+    /// traduzione dell'esito, mai il criterio.
+    ///
+    /// Un guasto dello STRUMENTO (Chromium assente, node assente, timeout) e'
+    /// `Inconclusive`, mai `Failed`: bocciare un progetto perche' la macchina
+    /// non sa guardarlo sarebbe la forma peggiore di falso positivo — e il
+    /// gate ha gia' il canale giusto per dirlo (un run con inconcludenti
+    /// chiude `completed_unverified`, non `passed`).
+    async fn check_browser_dialogue(
+        &self,
+        spec: &Value,
+        timeout_s: f64,
+    ) -> (CriterionOutcome, Value) {
+        let url = spec.get("url").and_then(Value::as_str).unwrap_or("");
+        if url.is_empty() {
+            return (
+                CriterionOutcome::Inconclusive,
+                json!({ "skipped_reason": "nessuna origine frontend da osservare" }),
+            );
+        }
+        // La radice serve solo come working dir del processo node: senza un
+        // progetto mappato si usa la CWD del servizio, dove vive la
+        // node_modules di Nexus (il progetto osservato non deve avere nulla).
+        let radice = self
+            .run_root
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let attesa_ms = spec
+            .get(browser_dialogue::CHIAVE_ATTESA_MS)
+            .and_then(Value::as_u64)
+            .unwrap_or(2000);
+        let terze_parti: Vec<String> = spec
+            .get(browser_dialogue::CHIAVE_TERZE_PARTI)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let prove = match crate::agent_tools::browser_probe::osserva_pagina(
+            &radice,
+            url,
+            attesa_ms,
+            timeout_s.max(1.0) as u64,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    CriterionOutcome::Inconclusive,
+                    json!({ "skipped_reason": format!("osservazione non riuscita: {e}"), "url": url }),
+                );
+            }
+        };
+        let verdetto = browser_dialogue::classifica_dialogo(&prove, &terze_parti);
+        esito_dialogo(url, &prove, verdetto)
+    }
+
     /// ASSENTE, il criterio falliva, il gate bocciava e apriva un ciclo di
     /// correzione su un lavoro gia' fatto.
     ///
@@ -1267,6 +1340,47 @@ fn log_bersaglio_non_pronto(porta: i32, causa: Option<String>) {
             %causa,
             "sonda http: bersaglio non pronto a fine finestra, si sonda comunque"
         );
+    }
+}
+
+/// Traduce il verdetto del punto unico nell'esito del criterio e nella sua
+/// evidence. Separata dalla raccolta perche' e' la parte che si legge nel
+/// pannello: l'errore NOMINA gli URL falliti, perche' un rilievo che dica solo
+/// «il frontend non funziona» e' un rimando a vuoto.
+fn esito_dialogo(
+    url: &str,
+    prove: &nexus_agent_graph::decisions::browser_dialogue::ProveBrowser,
+    verdetto: nexus_agent_graph::decisions::browser_dialogue::VerdettoDialogo,
+) -> (CriterionOutcome, Value) {
+    use browser_dialogue::VerdettoDialogo;
+    let osservate = prove.richieste.len();
+    match verdetto {
+        VerdettoDialogo::Dialoga {
+            richieste_osservate,
+        } => (
+            CriterionOutcome::Passed,
+            json!({ "url": url, "requests_observed": osservate, "ok_requests": richieste_osservate }),
+        ),
+        VerdettoDialogo::NonConcludente { motivo } => (
+            CriterionOutcome::Inconclusive,
+            json!({ "url": url, "requests_observed": osservate, "skipped_reason": motivo }),
+        ),
+        VerdettoDialogo::Rotto { cause } => {
+            let descrizioni: Vec<String> = cause.iter().take(5).map(|c| c.descrizione()).collect();
+            (
+                CriterionOutcome::Failed,
+                json!({
+                    "url": url,
+                    "requests_observed": osservate,
+                    "error": format!(
+                        "il frontend non ottiene i propri dati: {}",
+                        descrizioni.join("; ")
+                    ),
+                    "failed_requests": descrizioni,
+                    "console_errors": prove.errori_console.iter().take(3).collect::<Vec<_>>(),
+                }),
+            )
+        }
     }
 }
 

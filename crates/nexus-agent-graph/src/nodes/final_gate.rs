@@ -213,6 +213,20 @@ pub struct FinalGateConfig {
     /// separatore `;`, es. `README*;docs/**`): il claim `updated` pretende
     /// almeno un file toccato che vi corrisponda.
     pub docs_globs: Vec<String>,
+    /// Osservazione del dialogo frontend<->backend da browser reale
+    /// (`agent.final_gate.browser_dialogue_enabled`, mig 0681). Default Rust
+    /// FALSE: a DB muto un criterio nuovo non boccia (stesso rollout di
+    /// `docs_criterion_enabled`).
+    pub browser_dialogue_enabled: bool,
+    /// Prefissi di URL esterni al progetto (CDN, font, telemetria) che non
+    /// contano come difetto d'integrazione
+    /// (`agent.final_gate.browser_third_parties`, separatore `;`).
+    pub browser_third_parties: Vec<String>,
+    /// Millisecondi di attesa che la rete si calmi dopo il primo render: le
+    /// chiamate dati partono dopo, e osservare troppo presto vedrebbe una
+    /// pagina che non ha ancora chiesto nulla
+    /// (`agent.final_gate.browser_settle_ms`).
+    pub browser_settle_ms: u64,
     /// ADR 0036: catena di verifica PER-AMBIENTE risolta a monte (profilo
     /// inferito da LLM in `project_verify_profiles`, step marcati gate=true).
     /// Un criterio `run_command` per step, nell'ordine del profilo (es.
@@ -290,6 +304,10 @@ impl Default for FinalGateConfig {
             // FALSE a DB muto: il seed (mig 0676) lo accende.
             docs_criterion_enabled: false,
             docs_globs: vec!["README*".to_string(), "docs/**".to_string()],
+            // FALSE a DB muto, come sopra: il seed (mig 0681) lo accende.
+            browser_dialogue_enabled: false,
+            browser_third_parties: Vec::new(),
+            browser_settle_ms: 2000,
             verify_steps: Vec::new(),
             verify_profile_missing: false,
             origine_frontend: None,
@@ -645,6 +663,26 @@ impl FinalGateNode {
                     self.cfg.endpoint_timeout_s,
                 ),
             );
+        }
+
+        // (5c) Il DIALOGO osservato da un browser reale. Non duplica la prova
+        //      d'integrazione qui sopra: quella chiede al server, con reqwest,
+        //      gli endpoint che l'agente ha DICHIARATO; questa carica la pagina
+        //      e guarda cosa chiede DAVVERO. La differenza non e' di grado —
+        //      reqwest non manda `Origin` e non esegue JS, quindi CORS assente
+        //      e URL costruito male gli sono invisibili per costruzione. Sono
+        //      le due cause che hanno fatto dichiarare completa quattro volte
+        //      un'app in cui nel browser falliva ogni chiamata
+        //      (biblioteca-scolastica, misurato il 06/08/2026).
+        //      Senza origine frontend il criterio non nasce: un progetto
+        //      senza interfaccia non ha questo dialogo da misurare.
+        if self.cfg.browser_dialogue_enabled {
+            criteria.extend(crate::decisions::browser_dialogue::criterio_dialogo(
+                self.cfg.origine_frontend.as_deref(),
+                self.cfg.endpoint_timeout_s,
+                &self.cfg.browser_third_parties,
+                self.cfg.browser_settle_ms,
+            ));
         }
 
         // (6) design_verify (P5): per i task figma l'agente non puo' chiudere con
@@ -2352,6 +2390,56 @@ mod tests {
             .expect("tool_capability");
         assert_eq!(tc.spec["tools_count"], json!(0));
         assert_eq!(tc.spec["has_tool_calls"], json!(true));
+    }
+
+    /// L'ANELLO CHE CONTA: il criterio del dialogo deve NASCERE nel gate. In
+    /// questo repo esiste gia' una lente corretta e mai interrogata da nessun
+    /// nodo (`ui_styling`), e il risultato misurato e' che l'app dell'incidente
+    /// aveva Tailwind dichiarato, installato e non configurato senza che
+    /// nessuno se ne accorgesse: una misura che nessun gate interroga si e'
+    /// costruita, non e' entrata in esercizio.
+    ///
+    /// Mutazione: togliere l'`extend` da build_criteria (o lasciare il flag
+    /// spento con l'origine presente) -> il criterio sparisce e questo test
+    /// rosseggia. Senza il flag, invece, non deve nascere affatto: un criterio
+    /// nuovo a DB muto non boccia.
+    #[test]
+    fn il_criterio_del_dialogo_nasce_nel_gate_solo_se_acceso() {
+        use crate::decisions::browser_dialogue::CRITERION_TYPE;
+        let con_frontend = |acceso: bool| FinalGateConfig {
+            browser_dialogue_enabled: acceso,
+            origine_frontend: Some("http://localhost:35954".to_string()),
+            browser_third_parties: vec!["https://fonts.googleapis.com".to_string()],
+            browser_settle_ms: 2500,
+            ..FinalGateConfig::default()
+        };
+        let cerca = |cfg: FinalGateConfig| {
+            let node = node_with(cfg, Arc::new(StubCriteriaRunner::with_results(vec![])));
+            node.build_criteria(&software_state())
+                .into_iter()
+                .find(|c| c.criterion_type == CRITERION_TYPE)
+        };
+
+        let c = cerca(con_frontend(true)).expect("acceso con un frontend: il criterio nasce");
+        assert_eq!(c.spec["url"], "http://localhost:35954");
+        assert_eq!(c.spec["third_parties"][0], "https://fonts.googleapis.com");
+        assert_eq!(c.spec["settle_ms"], 2500);
+
+        assert!(
+            cerca(con_frontend(false)).is_none(),
+            "a flag spento un criterio nuovo non boccia"
+        );
+        // Senza frontend non c'e' dialogo da misurare: niente criterio, e
+        // nessun Failed per un progetto che non ha interfaccia.
+        assert!(
+            cerca(FinalGateConfig {
+                browser_dialogue_enabled: true,
+                origine_frontend: None,
+                ..FinalGateConfig::default()
+            })
+            .is_none(),
+            "senza origine frontend il criterio non deve nascere"
+        );
     }
 
     // ── count_build_errors ────────────────────────────────────────────────────────

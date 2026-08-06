@@ -22,10 +22,30 @@
 
 use std::path::{Path, PathBuf};
 
-/// Nome della subdir che contiene il Chromium COMPLETO (headed) dentro una dir
-/// di revisione `chromium-<rev>`. E' il path REALE corrente delle build
+/// Sotto-percorsi del Chromium COMPLETO (headed) dentro una dir di revisione
+/// `chromium-<rev>`, uno per piattaforma. Sono i path REALI delle build
 /// Playwright (le vecchie `chrome-linux/chrome` non esistono piu').
-const CHROME_FULL_SUBPATH: &str = "chrome-linux64/chrome";
+///
+/// Perche' un ELENCO e non una costante: la stessa cache ha layout diversi per
+/// sistema operativo, e conoscerne uno solo rendeva il punto unico cieco
+/// sull'ambiente di sviluppo canonico di questo repo. MISURATO il 06/08/2026:
+/// su Windows i browser erano installati e funzionanti in
+/// `%LOCALAPPDATA%\ms-playwright\chromium-1234\chrome-win64\chrome.exe`, ma la
+/// risoluzione cercava solo `chrome-linux64/chrome` sotto `$HOME/.cache` e
+/// ritornava «nessun Chromium trovato» — quindi `visual_compare` non poteva
+/// produrre uno screenshot su Windows, e nessun test se ne accorgeva perche'
+/// l'unica prova era su una dir fittizia costruita col layout Linux (regola O:
+/// lo strumento misurava la propria imitazione).
+///
+/// Si prova nell'ordine: il primo che esiste vince. Non e' un fallback che
+/// nasconde un errore — sono le sedi legittime dello stesso binario, e
+/// l'assenza di TUTTE resta un `Err` azionabile.
+const CHROME_FULL_SUBPATHS: &[&str] = &[
+    "chrome-linux64/chrome",
+    "chrome-win64/chrome.exe",
+    "chrome-win/chrome.exe",
+    "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+];
 
 /// Comando suggerito all'utente quando il Chromium completo manca: e' lo stesso
 /// flusso usato altrove nel codice per installare i browser Playwright.
@@ -65,8 +85,7 @@ pub fn resolve_chromium_executable(cache_root: &Path) -> Result<PathBuf, String>
         let Ok(rev) = rev_str.parse::<u64>() else {
             continue;
         };
-        let exe = entry.path().join(CHROME_FULL_SUBPATH);
-        if exe.is_file() {
+        if let Some(exe) = eseguibile_nella_revisione(&entry.path()) {
             candidates.push((rev, exe));
         }
     }
@@ -75,10 +94,21 @@ pub fn resolve_chromium_executable(cache_root: &Path) -> Result<PathBuf, String>
     match candidates.into_iter().next() {
         Some((_, exe)) => Ok(exe),
         None => Err(format!(
-            "nessun Chromium completo ({CHROME_FULL_SUBPATH}) trovato in {}: {INSTALL_HINT}",
+            "nessun Chromium completo ({}) trovato in {}: {INSTALL_HINT}",
+            CHROME_FULL_SUBPATHS.join(" | "),
             cache_root.display()
         )),
     }
+}
+
+/// L'eseguibile dentro UNA dir di revisione, nel layout della piattaforma su
+/// cui e' stato installato. `None` = la revisione non porta un browser
+/// completo (es. la sola headless shell).
+fn eseguibile_nella_revisione(dir_revisione: &Path) -> Option<PathBuf> {
+    CHROME_FULL_SUBPATHS
+        .iter()
+        .map(|sub| dir_revisione.join(sub))
+        .find(|exe| exe.is_file())
 }
 
 /// Ritorna il path della cache Playwright derivato dall'ambiente.
@@ -93,9 +123,22 @@ pub fn default_cache_root() -> Result<PathBuf, String> {
             return Ok(PathBuf::from(trimmed));
         }
     }
-    let home = std::env::var("HOME").map_err(|_| {
-        "variabile HOME non impostata: impossibile localizzare la cache Playwright".to_string()
-    })?;
+    // Sede per piattaforma, come la sceglie Playwright stesso: su Windows
+    // `%LOCALAPPDATA%\ms-playwright`, altrove `$HOME/.cache/ms-playwright`.
+    // Prima si guardava solo la seconda, e su Windows la risoluzione falliva
+    // con browser regolarmente installati (misurato il 06/08/2026).
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let radice = PathBuf::from(local.trim()).join("ms-playwright");
+        if radice.is_dir() {
+            return Ok(radice);
+        }
+    }
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| {
+            "ne' HOME ne' USERPROFILE impostate: impossibile localizzare la cache Playwright"
+                .to_string()
+        })?;
     Ok(PathBuf::from(home).join(".cache").join("ms-playwright"))
 }
 
@@ -179,6 +222,47 @@ mod tests {
             "scelto: {exe:?}"
         );
 
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// IL DIFETTO MISURATO il 06/08/2026: su Windows i browser erano
+    /// installati e funzionanti in `chromium-<rev>\chrome-win64\chrome.exe`,
+    /// ma la risoluzione conosceva il solo layout Linux e rispondeva «nessun
+    /// Chromium trovato» — quindi `visual_compare` non poteva produrre uno
+    /// screenshot sull'ambiente di sviluppo canonico di questo repo, e nessun
+    /// test se ne accorgeva perche' tutte le prove costruivano la cache col
+    /// layout Linux (regola O: lo strumento misurava la propria imitazione).
+    ///
+    /// Mutazione: rimettere il solo `chrome-linux64/chrome` in
+    /// CHROME_FULL_SUBPATHS -> questo test rosseggia.
+    #[test]
+    fn trova_il_chromium_anche_col_layout_windows() {
+        let tmp = std::env::temp_dir().join(format!("nexus_pw_win_{}", uuid::Uuid::new_v4()));
+        let exe_dir = tmp.join("chromium-1234").join("chrome-win64");
+        fs::create_dir_all(&exe_dir).unwrap();
+        fs::write(exe_dir.join("chrome.exe"), b"MZ").unwrap();
+
+        let exe = resolve_chromium_executable(&tmp).expect("il layout Windows e' una sede valida");
+        assert!(
+            exe.ends_with("chrome-win64/chrome.exe") || exe.ends_with("chrome-win64\\chrome.exe"),
+            "scelto: {exe:?}"
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Le due sedi convivono: la revisione piu' alta vince a prescindere dal
+    /// layout in cui si presenta.
+    #[test]
+    fn la_revisione_piu_alta_vince_fra_layout_diversi() {
+        let tmp = std::env::temp_dir().join(format!("nexus_pw_mix_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        make_chromium_rev(&tmp, 1100, true); // layout linux
+        let win = tmp.join("chromium-1300").join("chrome-win64");
+        fs::create_dir_all(&win).unwrap();
+        fs::write(win.join("chrome.exe"), b"MZ").unwrap();
+
+        let exe = resolve_chromium_executable(&tmp).expect("trova");
+        assert!(exe.to_string_lossy().contains("chromium-1300"), "scelto: {exe:?}");
         fs::remove_dir_all(&tmp).ok();
     }
 

@@ -1296,6 +1296,30 @@ async fn load_final_gate_config(db: &PgPool, project_id: Option<Uuid>) -> FinalG
                     .collect()
             })
             .unwrap_or(d.docs_globs),
+        // Dialogo frontend<->backend osservato da browser (mig 0681).
+        browser_dialogue_enabled: setting_bool(
+            db,
+            "agent.final_gate.browser_dialogue_enabled",
+            d.browser_dialogue_enabled,
+        )
+        .await,
+        // Stesso separatore `;` dei glob docs: un URL puo' contenere virgole.
+        browser_third_parties: nexus_auth::get_setting(
+            db,
+            "agent.final_gate.browser_third_parties",
+        )
+        .await
+        .map(|v| {
+            v.split(';')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or(d.browser_third_parties),
+        browser_settle_ms: nexus_auth::get_setting(db, "agent.final_gate.browser_settle_ms")
+            .await
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(d.browser_settle_ms),
         // Escalation su non-convergenza del gate (mig 0577): al cap di max_cycles con
         // criteri oggettivi ancora falliti, cede il turno all'executor per promuovere
         // un modello piu' capace invece di chiudere secco. `max_escalations` RIUSA la
