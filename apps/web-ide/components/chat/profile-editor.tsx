@@ -3,6 +3,7 @@
 import { useState } from "react";
 import type { CreateProfilePayload, UpdateProfilePayload, UserProfile } from "../../lib/api-client";
 import { generateSystemPrompt } from "../../lib/api-client";
+import { useI18n } from "../../lib/i18n";
 import { useThemeColors } from "../../lib/theme";
 import { useGlobalDialog } from "../global-dialog-provider";
 import { usePricingCatalog, providerLabel } from "./provider-badge";
@@ -40,6 +41,7 @@ export function ProfileEditor({
   onClose,
 }: ProfileEditorProps) {
   const tc = useThemeColors();
+  const { t } = useI18n();
   const { confirmDialog } = useGlobalDialog();
   const isEdit = Boolean(profile);
 
@@ -124,7 +126,7 @@ export function ProfileEditor({
       message: "Eliminare il profilo?",
       danger: true,
       confirmLabel: "Elimina",
-      cancelLabel: "Annulla",
+      cancelLabel: t("chat.profile.cancel"),
     });
     if (!ok) return;
     setIsDeleting(true);
@@ -205,7 +207,7 @@ export function ProfileEditor({
           {/* Nome + Emoji */}
           <div style={{ display: "flex", gap: 8 }}>
             <div style={{ flex: "0 0 60px" }}>
-              <label style={labelStyle}>Icona</label>
+              <label style={labelStyle}>{t("chat.profile.icon")}</label>
               <input
                 value={emoji}
                 onChange={(e) => setEmoji(e.target.value)}
@@ -215,12 +217,12 @@ export function ProfileEditor({
               />
             </div>
             <div style={{ flex: 1 }}>
-              <label style={labelStyle}>Nome *</label>
+              <label style={labelStyle}>{t("chat.profile.name")}</label>
               <input
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 style={inputStyle}
-                placeholder="Es: Assistente C#, Code Reviewer..."
+                placeholder={t("chat.profile.namePlaceholder")}
                 required
               />
             </div>
@@ -228,24 +230,24 @@ export function ProfileEditor({
 
           {/* Descrizione */}
           <div>
-            <label style={labelStyle}>Descrizione</label>
+            <label style={labelStyle}>{t("chat.profile.description")}</label>
             <input
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               style={inputStyle}
-              placeholder="Breve descrizione del profilo"
+              placeholder={t("chat.profile.descPlaceholder")}
             />
           </div>
 
           {/* System Prompt */}
           <div>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
-              <label style={{ ...labelStyle, marginBottom: 0 }}>System Prompt</label>
+              <label style={{ ...labelStyle, marginBottom: 0 }}>{t("chat.profile.systemPrompt")}</label>
               <button
                 type="button"
                 onClick={handleGeneratePrompt}
                 disabled={isGenerating}
-                title="Genera system prompt con AI in base al nome e descrizione"
+                title={t("chat.profile.generateHint")}
                 style={{
                   background: isGenerating ? tc.bgInput : `${tc.accent}18`,
                   border: `1px solid ${tc.accent}60`,
@@ -264,7 +266,7 @@ export function ProfileEditor({
                 {isGenerating ? (
                   <>
                     <span style={{ display: "inline-block", animation: "spin 1s linear infinite" }}>⟳</span>
-                    Generando...
+                    {t("chat.profile.generating")}
                   </>
                 ) : (
                   <>✨ Genera con AI</>
@@ -285,7 +287,7 @@ export function ProfileEditor({
           {/* Provider e Modello */}
           <div style={{ display: "flex", gap: 8 }}>
             <div style={{ flex: 1 }}>
-              <label style={labelStyle}>Provider predefinito</label>
+              <label style={labelStyle}>{t("chat.profile.defaultProvider")}</label>
               <select
                 value={defaultProvider}
                 onChange={(e) => handleProviderChange(e.target.value)}
@@ -297,14 +299,14 @@ export function ProfileEditor({
               </select>
             </div>
             <div style={{ flex: 1 }}>
-              <label style={labelStyle}>Modello predefinito</label>
+              <label style={labelStyle}>{t("chat.profile.defaultModel")}</label>
               {availableModels.length > 0 ? (
                 <select
                   value={defaultModel}
                   onChange={(e) => setDefaultModel(e.target.value)}
                   style={{ ...inputStyle, cursor: "pointer" }}
                 >
-                  <option value="">Modello auto</option>
+                  <option value="">{t("chat.profile.autoModel")}</option>
                   {availableModels.map((m) => (
                     <option key={m} value={m}>{m}</option>
                   ))}
@@ -314,7 +316,7 @@ export function ProfileEditor({
                   value={defaultModel}
                   onChange={(e) => setDefaultModel(e.target.value)}
                   style={inputStyle}
-                  placeholder="Modello auto"
+                  placeholder={t("chat.profile.autoModel")}
                 />
               )}
             </div>
@@ -322,7 +324,7 @@ export function ProfileEditor({
 
           {/* Automation mode */}
           <div>
-            <label style={labelStyle}>Modalita' automazione</label>
+            <label style={labelStyle}>{t("chat.profile.automationMode")}</label>
             <select
               value={defaultAutomation}
               onChange={(e) => setDefaultAutomation(e.target.value)}
@@ -359,7 +361,7 @@ export function ProfileEditor({
                   onClick={async () => { await onSetDefault?.(); onClose(); }}
                   style={{ padding: "6px 14px", borderRadius: 6, border: `1px solid ${tc.border}`, background: "none", color: tc.textSecondary, fontSize: 12, cursor: "pointer" }}
                 >
-                  Imposta default
+                  {t("chat.profile.setDefault")}
                 </button>
               )}
             </div>
@@ -369,7 +371,7 @@ export function ProfileEditor({
                 onClick={onClose}
                 style={{ padding: "6px 14px", borderRadius: 6, border: `1px solid ${tc.border}`, background: "none", color: tc.textSecondary, fontSize: 12, cursor: "pointer" }}
               >
-                Annulla
+                {t("chat.profile.cancel")}
               </button>
               <button
                 type="submit"

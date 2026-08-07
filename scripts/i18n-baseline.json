@@ -1,9 +1,9 @@
 {
-  "totale": 842,
+  "totale": 790,
   "perArea": {
     "admin": 105,
     "radice": 67,
-    "chat": 136,
+    "chat": 84,
     "editor": 13,
     "git": 81,
     "knowledge": 9,

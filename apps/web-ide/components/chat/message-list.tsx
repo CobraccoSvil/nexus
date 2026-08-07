@@ -151,7 +151,7 @@ function SourcesPanel({ citations }: { citations: string[] }) {
   );
 }
 
-function ThinkingPanel({ thinking }: { thinking: string }) {
+function ThinkingPanel({ thinking, t }: { thinking: string; t: (key: string) => string }) {
   const [open, setOpen] = useState(false);
   return (
     <div style={{
@@ -180,7 +180,7 @@ function ThinkingPanel({ thinking }: { thinking: string }) {
         }}
       >
         <span>{open ? "▾" : "▸"}</span>
-        <span>Ragionamento interno</span>
+        <span>{t("chat.msg.internalReasoning")}</span>
         {!open && (
           <span style={{ color: "#8b5cf699", fontWeight: 400, fontSize: 10, marginLeft: 4 }}>
             ({Math.ceil(thinking.length / 5)} parole ca.)
@@ -569,10 +569,12 @@ function MessageNextActions({
   runId,
   liveChoices,
   tc,
+  t,
 }: {
   runId: string;
   liveChoices?: NextActionChoice[];
   tc: ThemeColors;
+  t: (key: string) => string;
 }) {
   const [choices, setChoices] = useState<NextActionChoice[]>(liveChoices ?? []);
 
@@ -619,7 +621,7 @@ function MessageNextActions({
  * sono esclusi (resi come pulsanti da MessageNextActions). Best-effort: se non
  * ci sono decisioni non rende nulla.
  */
-function MessageMetaSteps({ steps, tc }: { steps: MetaStepEntry[]; tc: ThemeColors }) {
+function MessageMetaSteps({ steps, tc, t }: { steps: MetaStepEntry[]; tc: ThemeColors; t: (key: string) => string }) {
   // Esclusi i next_actions (resi come pulsanti) e i kind TECNICI del canale
   // SSE (usage_snapshot/end_turn): comparivano come card "Step" senza titolo.
   const decisionSteps = steps.filter(
@@ -708,7 +710,7 @@ function groupConsecutiveSteps(steps: AgentStep[]): StepGroup[] {
   return groups;
 }
 
-function AgentRunStepsInline({ runId, tc }: { runId: string; tc: ThemeColors }) {
+function AgentRunStepsInline({ runId, tc, t }: { runId: string; tc: ThemeColors; t: (key: string) => string }) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [runInfo, setRunInfo] = useState<AgentRunInfo | null>(null);
@@ -931,7 +933,7 @@ function AgentRunStepsInline({ runId, tc }: { runId: string; tc: ThemeColors }) 
 
       {open && runInfo && steps.length === 0 && (
         <div style={{ fontSize: 11, color: tc.textMuted, marginTop: 4, fontStyle: "italic" }}>
-          Nessuno step registrato per questo run.
+          {t("chat.msg.noSteps")}
         </div>
       )}
     </div>
@@ -953,9 +955,11 @@ function formatBytes(size: number): string {
 function AttachmentChips({
   attachments,
   tc,
+  t,
 }: {
   attachments: SavedChatAttachment[];
   tc: ThemeColors;
+  t: (key: string) => string;
 }) {
   if (!attachments?.length) return null;
 
@@ -1019,8 +1023,8 @@ function AttachmentChips({
               </span>
               {isIndexed && (
                 <span
-                  aria-label="Indicizzato in Knowledge Base"
-                  title="Indicizzato in Knowledge Base"
+                  aria-label={t("chat.msg.indexedKb")}
+                  title={t("chat.msg.indexedKb")}
                   style={{ color: tc.success, fontWeight: 700, fontSize: 10 }}
                 >
                   ⌘ KB
@@ -1051,8 +1055,8 @@ function AttachmentChips({
               </span>
               {isIndexed && (
                 <span
-                  aria-label="Indicizzato in Knowledge Base"
-                  title="Indicizzato in Knowledge Base"
+                  aria-label={t("chat.msg.indexedKb")}
+                  title={t("chat.msg.indexedKb")}
                   style={{ color: tc.success, fontWeight: 700, fontSize: 10 }}
                 >
                   ⌘ KB
@@ -1077,8 +1081,8 @@ function AttachmentChips({
             </span>
             {isIndexed && (
               <span
-                aria-label="Indicizzato in Knowledge Base"
-                title="Indicizzato in Knowledge Base"
+                aria-label={t("chat.msg.indexedKb")}
+                title={t("chat.msg.indexedKb")}
                 style={{ color: tc.success, fontWeight: 700, fontSize: 10 }}
               >
                 KB
@@ -1322,8 +1326,8 @@ export function MessageList({
                       borderRadius: 6,
                       padding: "1px 6px",
                     }}
-                    title="Messaggio reinviato"
-                    aria-label="Messaggio reinviato"
+                    title={t("chat.msg.resent")}
+                    aria-label={t("chat.msg.resent")}
                   >
                     Reinvio
                   </span>
@@ -1363,8 +1367,8 @@ export function MessageList({
                     disabled={Boolean(busyAction)}
                     onClick={() => onResend(message.id)}
                     style={messageActionIconStyle(tc, Boolean(busyAction))}
-                    title="Reinvia richiesta"
-                    aria-label="Reinvia richiesta"
+                    title={t("chat.msg.resend")}
+                    aria-label={t("chat.msg.resend")}
                   >
                     {busyAction === "resend" ? "…" : "↻"}
                   </button>
@@ -1397,7 +1401,7 @@ export function MessageList({
                                     ? "Feedback positivo gia' inviato"
                                     : "Risposta corretta (rinforza apprendimento)"
                                 }
-                                aria-label="Feedback positivo"
+                                aria-label={t("chat.msg.feedbackPositive")}
                               >
                                 {busyAction === "feedback-positive"
                                   ? "…"
@@ -1412,8 +1416,8 @@ export function MessageList({
                             disabled={Boolean(busyAction)}
                             onClick={() => onFeedback(message.id, message.content ?? "")}
                             style={messageActionIconStyle(tc, Boolean(busyAction))}
-                            title="Segnala errore"
-                            aria-label="Segnala errore"
+                            title={t("chat.msg.reportError")}
+                            aria-label={t("chat.msg.reportError")}
                           >
                             {busyAction === "feedback" ? "…" : "⚠"}
                           </button>
@@ -1427,8 +1431,8 @@ export function MessageList({
                   disabled={Boolean(busyAction)}
                   onClick={() => onDelete(message.id)}
                   style={messageActionIconStyle(tc, Boolean(busyAction))}
-                  title="Cancella"
-                  aria-label="Cancella"
+                  title={t("chat.msg.delete")}
+                  aria-label={t("chat.msg.delete")}
                 >
                   {busyAction === "delete" ? "…" : "\uD83D\uDDD1"}
                 </button>
@@ -1445,7 +1449,7 @@ export function MessageList({
                 // riassunti lunghi. L'esito reale resta visibile; il dettaglio e' a un clic.
                 <details style={{ opacity: 0.7, fontSize: 13 }}>
                   <summary style={{ cursor: "pointer", fontStyle: "italic", userSelect: "none" }}>
-                    Riassunto della compattazione precedente — clic per espandere
+                    {t("chat.msg.compactSummary")}
                   </summary>
                   <div style={{ marginTop: 8 }}>
                     <MarkdownBlock content={message.content} projectId={projectId} />
@@ -1463,7 +1467,7 @@ export function MessageList({
                 const { toolUses, cleanText } = extractToolUseBlocks(text);
                 return (
                   <>
-                    {reasoning && <ThinkingPanel thinking={reasoning} />}
+                    {reasoning && <ThinkingPanel thinking={reasoning} t={t} />}
                     {cleanText.trim() && <MarkdownBlock content={cleanText} projectId={projectId} />}
                     {message.citations && message.citations.length > 0 && (
                       <SourcesPanel citations={message.citations} />
@@ -1636,6 +1640,7 @@ export function MessageList({
               <MessageMetaSteps
                 steps={metaStepsMap.get(message.runId)!}
                 tc={tc}
+                t={t}
               />
             )}
 
@@ -1651,12 +1656,13 @@ export function MessageList({
                   nextActions?.runId === message.runId ? nextActions.choices : undefined
                 }
                 tc={tc}
+                t={t}
               />
             )}
 
             {/* Chip allegati salvati: cliccabili (immagini -> tab raw, testo/binario -> editor). */}
             {isUser && message.attachments && message.attachments.length > 0 && (
-              <AttachmentChips attachments={message.attachments} tc={tc} />
+              <AttachmentChips attachments={message.attachments} tc={tc} t={t} />
             )}
 
             {/* Pannello step agente (caricamento lazy dal DB): mostrato per
@@ -1665,7 +1671,7 @@ export function MessageList({
                 Con flag ON gli step sono gia' nel nastro attivita': lo nascondo
                 per non duplicare. */}
             {!isUser && !activityStreamEnabled && message.runId && (
-              <AgentRunStepsInline runId={message.runId} tc={tc} />
+              <AgentRunStepsInline runId={message.runId} tc={tc} t={t} />
             )}
 
             {/* Usage badge per messaggi assistant con dati token */}

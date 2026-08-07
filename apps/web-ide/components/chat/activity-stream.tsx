@@ -19,6 +19,7 @@
 // Stile: inline + useThemeColors, niente Tailwind, niente emoji nei sorgenti.
 
 import { useState } from "react";
+import { useI18n, type TranslationKey } from "../../lib/i18n";
 import { useThemeColors } from "../../lib/theme";
 import { withAlpha } from "../../lib/color";
 import { ProviderBadge, providerBaseColor } from "./provider-badge";
@@ -278,12 +279,14 @@ function EventRow({
   event,
   segColor,
   tc,
+  t,
   runId,
   continuaSubagente,
 }: {
   event: Exclude<ActivityEvent, SwitchEvent>;
   segColor: string;
   tc: ThemeColors;
+  t: (key: TranslationKey) => string;
   /** run del nastro: scopa l'id DOM dell'evento per il deep-link (undefined nel
    *  percorso storico, che non e' bersaglio della campanella). */
   runId?: string;
@@ -402,6 +405,7 @@ function EventRow({
         event={event}
         segColor={segColor}
         tc={tc}
+        t={t}
         continuaSubagente={continuaSubagente}
       />
     </div>
@@ -415,11 +419,13 @@ function ToolEventBody({
   event,
   segColor,
   tc,
+  t,
   showProviderIcon = false,
 }: {
   event: ToolEvent;
   segColor: string;
   tc: ThemeColors;
+  t: (key: TranslationKey) => string;
   /** true quando reso DENTRO un folded (non passa da EventRow, che gia' mostra
    *  l'icona): allora la mostra nell'header per non perderla. Default false. */
   showProviderIcon?: boolean;
@@ -494,7 +500,7 @@ function ToolEventBody({
         >
           {hasInput && (
             <div>
-              <div style={detailLabelStyle(tc)}>Parametri</div>
+              <div style={detailLabelStyle(tc)}>{t("chat.common.params")}</div>
               <InlineTruncated text={formatStepInput(event.input!)} maxLen={400} tc={tc} mono />
             </div>
           )}
@@ -532,10 +538,12 @@ function FoldedToolsBody({
   event,
   segColor,
   tc,
+  t,
 }: {
   event: FoldedToolsEvent;
   segColor: string;
   tc: ThemeColors;
+  t: (key: TranslationKey) => string;
 }) {
   const [expanded, setExpanded] = useState(false);
   const range =
@@ -582,7 +590,7 @@ function FoldedToolsBody({
               dall'intestazione. Ripeterlo a ogni passo aggiunge una colonna di
               icone identiche che compete con il contenuto vero (il tool). */}
           {event.tools.map((tool, i) => (
-            <ToolEventBody key={`folded-tool-${i}`} event={tool} segColor={segColor} tc={tc} />
+            <ToolEventBody key={`folded-tool-${i}`} event={tool} segColor={segColor} tc={tc} t={t} />
           ))}
         </div>
       )}
@@ -606,11 +614,13 @@ function EventBody({
   event,
   segColor,
   tc,
+  t,
   continuaSubagente,
 }: {
   event: Exclude<ActivityEvent, SwitchEvent>;
   segColor: string;
   tc: ThemeColors;
+  t: (key: TranslationKey) => string;
   /** La riga precedente e' dello STESSO sub-run: l'intestazione e' gia' a
    *  schermo poche righe sopra, qui si mostra solo il contenuto. */
   continuaSubagente?: boolean;
@@ -648,9 +658,9 @@ function EventBody({
     case "thought":
       return <ThoughtBlock text={event.text} tc={tc} />;
     case "tool":
-      return <ToolEventBody event={event} segColor={segColor} tc={tc} />;
+      return <ToolEventBody event={event} segColor={segColor} tc={tc} t={t} />;
     case "folded_tools":
-      return <FoldedToolsBody event={event} segColor={segColor} tc={tc} />;
+      return <FoldedToolsBody event={event} segColor={segColor} tc={tc} t={t} />;
     case "verify":
       return (
         <div style={rowStyle}>
@@ -1028,13 +1038,13 @@ function AdvisorySection({
 
 /** Corpo completo del parere di una figura: requisiti, rischi (per severita'),
  *  raccomandazioni, osservazioni. */
-function AdvisoryBody({ advisory, tc }: { advisory: FigureAdvisory; tc: ThemeColors }) {
+function AdvisoryBody({ advisory, tc, t }: { advisory: FigureAdvisory; tc: ThemeColors; t: (key: TranslationKey) => string }) {
   return (
     <>
-      <AdvisorySection title="Requisiti" items={advisory.requirements} tc={tc} />
+      <AdvisorySection title={t("chat.stream.requirements")} items={advisory.requirements} tc={tc} />
       {advisory.risks && advisory.risks.length > 0 ? (
         <div style={{ marginTop: 4 }}>
-          <div style={{ fontWeight: 600, color: tc.text, fontSize: 10.5 }}>Rischi</div>
+          <div style={{ fontWeight: 600, color: tc.text, fontSize: 10.5 }}>{t("chat.stream.risks")}</div>
           <ul style={{ margin: "2px 0 0", paddingLeft: 14, listStyle: "disc" }}>
             {advisory.risks.map((risk, i) => {
               const { severity, description } = riskParts(risk);
@@ -1052,8 +1062,8 @@ function AdvisoryBody({ advisory, tc }: { advisory: FigureAdvisory; tc: ThemeCol
           </ul>
         </div>
       ) : null}
-      <AdvisorySection title="Raccomandazioni" items={advisory.recommendations} tc={tc} />
-      <AdvisorySection title="Osservazioni" items={advisory.concerns} tc={tc} />
+      <AdvisorySection title={t("chat.stream.recommendations")} items={advisory.recommendations} tc={tc} />
+      <AdvisorySection title={t("chat.stream.observations")} items={advisory.concerns} tc={tc} />
     </>
   );
 }
@@ -1073,6 +1083,10 @@ export function FigureReportRow({
    *  provider, non per kind) e non ripete il chip provider. */
   titleByProvider?: boolean;
 }) {
+  // Hook e non prop: questo componente e' esportato e riusato dal centro
+  // notifiche del run, e allargarne l'interfaccia obbligherebbe ogni chiamante
+  // a procurarsi il traduttore per una stringa che riguarda solo questa riga.
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const advisory = report.advisory;
   const vd = figureVerdictDisplay(report);
@@ -1154,7 +1168,7 @@ export function FigureReportRow({
               {report.detail_message}
             </div>
           ) : null}
-          {advisory ? <AdvisoryBody advisory={advisory} tc={tc} /> : null}
+          {advisory ? <AdvisoryBody advisory={advisory} tc={tc} t={t} /> : null}
         </div>
       ) : null}
     </li>
@@ -1202,12 +1216,14 @@ function GruppoSubagenteView({
   espansoDiDefault,
   segColor,
   tc,
+  t,
   runId,
 }: {
   gruppo: GruppoSubagente;
   espansoDiDefault: boolean;
   segColor: string;
   tc: ThemeColors;
+  t: (key: TranslationKey) => string;
   runId?: string;
 }) {
   const [override, setOverride] = useState<boolean | null>(null);
@@ -1219,6 +1235,7 @@ function GruppoSubagenteView({
         event={prima.ev}
         segColor={segColor}
         tc={tc}
+              t={t}
         runId={runId}
         continuaSubagente={false}
       />
@@ -1266,6 +1283,7 @@ function GruppoSubagenteView({
                   event={r.ev}
                   segColor={segColor}
                   tc={tc}
+              t={t}
                   runId={runId}
                   continuaSubagente
                 />
@@ -1282,10 +1300,12 @@ function GruppoSubagenteView({
 function SegmentView({
   segment,
   tc,
+  t,
   runId,
 }: {
   segment: ActivitySegment;
   tc: ThemeColors;
+  t: (key: TranslationKey) => string;
   runId?: string;
 }) {
   const segColor = providerBaseColor(segment.provider);
@@ -1337,6 +1357,7 @@ function SegmentView({
               event={b.ev}
               segColor={segColor}
               tc={tc}
+              t={t}
               runId={runId}
               continuaSubagente={false}
             />
@@ -1347,6 +1368,7 @@ function SegmentView({
               espansoDiDefault={b.indice === indiceGruppoPiuRecente}
               segColor={segColor}
               tc={tc}
+              t={t}
               runId={runId}
             />
           ),
@@ -1380,6 +1402,7 @@ export function ActivityStreamView({
    *  solo dal nastro LIVE (AgentStepsPanel); lo storico lo omette. */
   runId?: string;
 }) {
+  const { t } = useI18n();
   const [showAll, setShowAll] = useState(false);
   if (stream.empty) return null;
 
@@ -1431,7 +1454,8 @@ export function ActivityStreamView({
         </button>
       )}
       {renderStream.segments.map((seg, i) => (
-        <SegmentView key={`seg-${i}`} segment={seg} tc={tc} runId={runId} />
+        <SegmentView
+              t={t} key={`seg-${i}`} segment={seg} tc={tc} runId={runId} />
       ))}
     </div>
   );

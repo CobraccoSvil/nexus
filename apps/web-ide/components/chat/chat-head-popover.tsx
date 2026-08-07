@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import type { UserProfile } from "../../lib/api-client";
 import type { Theme } from "../../lib/theme";
+import { useI18n } from "../../lib/i18n";
 import { iconButton } from "../../lib/icon-button-style";
 import { ModalPortal } from "../modal-portal";
 import { useDismissOnOutside } from "../../hooks/use-dismiss-on-outside";
@@ -12,7 +13,9 @@ import { useDismissOnOutside } from "../../hooks/use-dismiss-on-outside";
 // bundle dell'header, che e' sempre montato. Qui il selettore si carica solo
 // all'apertura del pannello.
 const ProfileSelector = dynamic(() => import("./profile-selector.lazy"), {
-  loading: () => <div style={{ fontSize: 12, opacity: 0.6 }}>Caricamento…</div>,
+  // Fuori da React: nessun traduttore in scope. Tre puntini invece di una
+  // parola, cosi' non c'e' lingua da sbagliare.
+  loading: () => <div style={{ fontSize: 12, opacity: 0.6 }}>…</div>,
   ssr: false,
 });
 
@@ -69,6 +72,7 @@ export function ChatHeadPopover({
   onCompactSession,
   ctxPct,
 }: ChatHeadPopoverProps) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [coord, setCoord] = useState<{ top: number; left: number } | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -196,7 +200,7 @@ export function ChatHeadPopover({
             }}
           >
             <div>
-              <div style={titoloSezione}>Profilo</div>
+              <div style={titoloSezione}>{t("chat.head.profile")}</div>
               <ProfileSelector
                 profiles={profiles}
                 selectedProfileId={selectedProfileId}
@@ -207,7 +211,7 @@ export function ChatHeadPopover({
             </div>
 
             <div>
-              <div style={titoloSezione}>Sessione</div>
+              <div style={titoloSezione}>{t("chat.head.session")}</div>
               {/* Tendina come quella del profilo: l'elenco a pulsanti cresceva
                   con le sessioni e sbilanciava il pannello. `boxSizing` non e'
                   decorativo qui: con width 100% il padding si sommerebbe e il
@@ -219,8 +223,8 @@ export function ChatHeadPopover({
                   if (id) onSelectSession(id);
                 }}
                 disabled={sessions.length === 0}
-                title="Seleziona sessione chat"
-                aria-label="Seleziona sessione chat"
+                title={t("chat.head.selectSession")}
+                aria-label={t("chat.head.selectSession")}
                 style={{
                   width: "100%",
                   minWidth: 0,
@@ -236,7 +240,7 @@ export function ChatHeadPopover({
                 }}
               >
                 {sessions.length === 0 ? (
-                  <option value="">Nessuna chat</option>
+                  <option value="">{t("chat.head.noChat")}</option>
                 ) : (
                   sessions.map((s) => (
                     <option key={s.id} value={s.id}>
@@ -248,7 +252,7 @@ export function ChatHeadPopover({
             </div>
 
             <div>
-              <div style={titoloSezione}>Azioni</div>
+              <div style={titoloSezione}>{t("chat.head.actions")}</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
                 {vociMenu.map((v) => (
                   <button

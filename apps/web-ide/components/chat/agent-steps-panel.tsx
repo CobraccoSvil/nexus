@@ -316,7 +316,7 @@ function SingleRunPanel({
             <span style={{ fontSize: 10, opacity: 0.7 }}>
               {expandedMetrics ? "▼" : "▶"}
             </span>
-            <span>Metriche estese</span>
+            <span>{t("chat.steps.extendedMetrics")}</span>
           </div>
 
           {expandedMetrics && (
@@ -336,7 +336,7 @@ function SingleRunPanel({
               {/* Token totali */}
               {metrics.totalTokens > 0 && (
                 <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                  <span style={{ opacity: 0.6 }}>Token totali:</span>
+                  <span style={{ opacity: 0.6 }}>{t("chat.steps.totalTokens")}</span>
                   <span style={{ fontFamily: "var(--font-mono)", fontWeight: 600, color: tc.text }}>
                     {metrics.totalTokens.toLocaleString()}
                   </span>
@@ -346,7 +346,7 @@ function SingleRunPanel({
               {/* Costo totale */}
               {metrics.totalCost > 0 && (
                 <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                  <span style={{ opacity: 0.6 }}>Costo:</span>
+                  <span style={{ opacity: 0.6 }}>{t("chat.steps.cost")}</span>
                   <span style={{ fontFamily: "var(--font-mono)", fontWeight: 600, color: tc.text }}>
                     ${metrics.totalCost.toFixed(6)}
                   </span>
@@ -356,7 +356,7 @@ function SingleRunPanel({
               {/* Cache hit rate */}
               {metrics.cacheHitRate > 0 && (
                 <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                  <span style={{ opacity: 0.6 }}>Hit cache:</span>
+                  <span style={{ opacity: 0.6 }}>{t("chat.steps.cacheHit")}</span>
                   <span style={{ fontFamily: "var(--font-mono)", fontWeight: 600, color: "#22c55e" }}>
                     {metrics.cacheHitRate.toFixed(1)}%
                   </span>
@@ -366,7 +366,7 @@ function SingleRunPanel({
               {/* Timestamp */}
               {run.createdAt && (
                 <div style={{ display: "flex", alignItems: "center", gap: 4, gridColumn: "1 / -1" }}>
-                  <span style={{ opacity: 0.6 }}>Inizio:</span>
+                  <span style={{ opacity: 0.6 }}>{t("chat.steps.start")}</span>
                   <span style={{ fontFamily: "var(--font-mono)", fontWeight: 500, color: tc.textMuted, fontSize: 10 }}>
                     {new Date(run.createdAt).toLocaleTimeString()}
                   </span>
@@ -376,7 +376,7 @@ function SingleRunPanel({
               {/* Timestamp fine */}
               {run.completedAt && (
                 <div style={{ display: "flex", alignItems: "center", gap: 4, gridColumn: "1 / -1" }}>
-                  <span style={{ opacity: 0.6 }}>Fine:</span>
+                  <span style={{ opacity: 0.6 }}>{t("chat.steps.end")}</span>
                   <span style={{ fontFamily: "var(--font-mono)", fontWeight: 500, color: tc.textMuted, fontSize: 10 }}>
                     {new Date(run.completedAt).toLocaleTimeString()}
                   </span>
@@ -591,7 +591,7 @@ function SingleRunPanel({
                           per-step sono state rimosse, FIX D2). */}
                       {step.createdAt && (
                         <div style={{ display: "flex", gap: 4, alignItems: "center", fontSize: 10, paddingTop: 4, borderTop: `1px solid ${tc.border}30` }}>
-                          <span style={{ opacity: 0.6 }}>Eseguito:</span>
+                          <span style={{ opacity: 0.6 }}>{t("chat.steps.executed")}</span>
                           <span style={{ fontFamily: "var(--font-mono)", color: tc.textMuted }}>
                             {new Date(step.createdAt).toLocaleTimeString()}
                           </span>
