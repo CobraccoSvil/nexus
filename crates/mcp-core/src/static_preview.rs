@@ -190,26 +190,78 @@ async fn serve_preview_inner(
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
-/// Rileva se il progetto e' un sito statico servibile e quale file usare come
-/// entry. Preferisce `index.html`/`index.htm`; se assenti, ripiega su un altro
-/// nome comune (`home.html`, `main.html`) e infine sul primo file `.html`/`.htm`
-/// in ordine alfabetico nella root. Questo rende la feature utile anche per i
-/// siti che non seguono la convenzione index.html (es. progetti generati
-/// dall'agente con pagine flotta.html/prenota.html ma senza index).
+/// Le entry canoniche di un sito, in ordine di preferenza.
+const ENTRY_CANONICHE: [&str; 4] = ["index.html", "index.htm", "home.html", "main.html"];
+
+/// Cartelle che non contengono mai il sito da mostrare: dipendenze, cache di
+/// build, metadati di VCS. `dist` e `build` NON sono qui — sono proprio i posti
+/// in cui un sito costruito finisce.
+const CARTELLE_ESCLUSE: [&str; 6] = [
+    "node_modules",
+    ".git",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    "target",
+];
+
+/// Rileva se il progetto contiene un sito statico servibile, e quale file usare
+/// come entry. Ritorna il percorso RELATIVO alla root (es. `index.html` oppure
+/// `landing/index.html`), che e' anche cio' che il proxy `/preview` si aspetta.
+///
+/// PERCHE' GUARDA ANCHE NELLE SOTTOCARTELLE. Prima cercava solo in root, con la
+/// motivazione «l'entry di un sito sta in root». E' vero quando il progetto E'
+/// un sito; e' falso quando il sito e' una PARTE del progetto — ed e' il caso
+/// che l'agente produce piu' spesso, perche' e' quello che gli si chiede.
+///
+/// MISURATO il 07/08/2026 su gestione-corsi: l'agente ha generato in autonomia
+/// `landing/index.html` (pagina statica completa, 6 corsi, filtro JS, nessuna
+/// dipendenza esterna), il pannello Servizi non l'ha rilevata e non c'era modo
+/// di aprirla da Nexus. Il proxy sapeva gia' servirla: `serve_preview` accetta
+/// un percorso relativo arbitrario con confinamento nella root. Mancava solo
+/// chi glielo dicesse.
+///
+/// L'ordine e' deterministico e mette la ROOT davanti a tutto: un progetto che
+/// e' un sito continua a comportarsi esattamente come prima.
 pub async fn detect_static_entry(root: &str) -> Option<String> {
-    // 1) Entry canoniche, in ordine di preferenza.
-    for entry in ["index.html", "index.htm", "home.html", "main.html"] {
-        if tokio::fs::metadata(format!("{}/{}", root, entry))
-            .await
-            .map(|m| m.is_file())
-            .unwrap_or(false)
-        {
+    // 1) Entry canoniche nella root: il caso "il progetto e' un sito".
+    for entry in ENTRY_CANONICHE {
+        if e_un_file(&format!("{root}/{entry}")).await {
             return Some(entry.to_string());
         }
     }
 
-    // 2) Fallback: primo file .html/.htm nella root (solo top-level, niente
-    //    ricorsione: l'entry di un sito sta in root).
+    // 2) Entry canoniche in una sottocartella di primo livello: il caso "il
+    //    sito e' una parte del progetto". Profondita' UNO e non ricorsione
+    //    piena: piu' in fondo si troverebbero le pagine di esempio delle
+    //    dipendenze, non il sito del progetto.
+    let mut candidati: Vec<String> = Vec::new();
+    if let Ok(mut dir) = tokio::fs::read_dir(root).await {
+        while let Ok(Some(e)) = dir.next_entry().await {
+            let nome = e.file_name().to_string_lossy().to_string();
+            if nome.starts_with('.') || CARTELLE_ESCLUSE.contains(&nome.as_str()) {
+                continue;
+            }
+            if !e.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            for entry in ENTRY_CANONICHE {
+                if e_un_file(&format!("{root}/{nome}/{entry}")).await {
+                    candidati.push(format!("{nome}/{entry}"));
+                    break;
+                }
+            }
+        }
+    }
+    if !candidati.is_empty() {
+        // Ordine alfabetico: con due siti la scelta dev'essere la stessa a ogni
+        // chiamata, o il pulsante cambierebbe bersaglio da un refresh all'altro.
+        candidati.sort();
+        return candidati.into_iter().next();
+    }
+
+    // 3) Ripiego: primo file .html/.htm nella root, per i siti che non seguono
+    //    la convenzione index (es. pagine flotta.html/prenota.html senza index).
     let mut html_files: Vec<String> = Vec::new();
     if let Ok(mut dir) = tokio::fs::read_dir(root).await {
         while let Ok(Some(e)) = dir.next_entry().await {
@@ -224,6 +276,13 @@ pub async fn detect_static_entry(root: &str) -> Option<String> {
     }
     html_files.sort();
     html_files.into_iter().next()
+}
+
+async fn e_un_file(percorso: &str) -> bool {
+    tokio::fs::metadata(percorso)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false)
 }
 
 /// Handler protetto: `GET /api/projects/:id/static-site`.
@@ -252,5 +311,88 @@ pub async fn static_site_info(
             "url": format!("/preview/{}/{}", project_id, entry),
         }))),
         None => Ok(Json(json!({ "detected": false }))),
+    }
+}
+
+#[cfg(test)]
+mod tests_rilevamento_entry {
+    use super::detect_static_entry;
+
+    fn radice() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
+    fn scrivi(dir: &std::path::Path, rel: &str) {
+        let p = dir.join(rel);
+        if let Some(genitore) = p.parent() {
+            std::fs::create_dir_all(genitore).expect("mkdir");
+        }
+        std::fs::write(p, "<html></html>").expect("write");
+    }
+
+    /// Il caso storico non cambia: se il progetto E' un sito, l'entry e' in root.
+    #[tokio::test]
+    async fn la_root_ha_la_precedenza() {
+        let d = radice();
+        scrivi(d.path(), "index.html");
+        scrivi(d.path(), "landing/index.html");
+        assert_eq!(
+            detect_static_entry(&d.path().to_string_lossy()).await,
+            Some("index.html".to_string()),
+            "un sito in root non deve essere scavalcato da una sottocartella"
+        );
+    }
+
+    /// IL caso che mancava: il sito e' una PARTE del progetto.
+    ///
+    /// MUTAZIONE: togliendo la ricerca a profondita' uno, questo test torna
+    /// `None` — ed e' esattamente cio' che l'utente vedeva, cioe' niente.
+    #[tokio::test]
+    async fn una_sottocartella_viene_trovata() {
+        let d = radice();
+        scrivi(d.path(), "landing/index.html");
+        scrivi(d.path(), "backend/Program.cs");
+        assert_eq!(
+            detect_static_entry(&d.path().to_string_lossy()).await,
+            Some("landing/index.html".to_string())
+        );
+    }
+
+    /// Le dipendenze contengono pagine di esempio a migliaia: nessuna di quelle
+    /// e' il sito del progetto.
+    #[tokio::test]
+    async fn le_cartelle_di_dipendenze_sono_escluse() {
+        let d = radice();
+        scrivi(d.path(), "node_modules/pacchetto/index.html");
+        scrivi(d.path(), ".next/server/index.html");
+        assert_eq!(
+            detect_static_entry(&d.path().to_string_lossy()).await,
+            None,
+            "nessun sito del progetto: non si deve offrire quello di una dipendenza"
+        );
+    }
+
+    /// Con due candidati la scelta e' STABILE: un pulsante che cambia bersaglio
+    /// a ogni refresh e' peggio di un pulsante assente.
+    #[tokio::test]
+    async fn con_due_siti_la_scelta_e_deterministica() {
+        let d = radice();
+        scrivi(d.path(), "zeta/index.html");
+        scrivi(d.path(), "alfa/index.html");
+        let primo = detect_static_entry(&d.path().to_string_lossy()).await;
+        let secondo = detect_static_entry(&d.path().to_string_lossy()).await;
+        assert_eq!(primo, Some("alfa/index.html".to_string()));
+        assert_eq!(primo, secondo);
+    }
+
+    /// `dist` e `build` NON sono escluse: e' li' che finisce un sito costruito.
+    #[tokio::test]
+    async fn la_cartella_di_build_non_e_esclusa() {
+        let d = radice();
+        scrivi(d.path(), "dist/index.html");
+        assert_eq!(
+            detect_static_entry(&d.path().to_string_lossy()).await,
+            Some("dist/index.html".to_string())
+        );
     }
 }

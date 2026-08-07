@@ -69,6 +69,7 @@ async fn esegui_tool_migrato(
         // file troppo grande sono entrambi rimediabili dall'agente, e il
         // messaggio dice come.
         "read_file" => Some(files::tool_read_file(ctx, input).await),
+        "write_file" => Some(files::tool_write_file(ctx, input).await),
         _ => None,
     }
 }
@@ -82,7 +83,6 @@ async fn esegui_tool_legacy(
 ) -> nexus_types::tool_outcome::RispostaTool {
     let testo = match name {
         "read_file_lines" => files::tool_read_file_lines(ctx, input).await,
-        "write_file" => files::tool_write_file(ctx, input).await,
         "list_files" => files::tool_list_files(ctx, input).await,
         "search_in_files" => files::tool_search_in_files(ctx, input).await,
         "git_status" => git::tool_git_status(ctx).await,

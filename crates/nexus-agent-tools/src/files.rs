@@ -632,34 +632,44 @@ async fn prepare_write_and_track(
 /// Preambolo di `write_file`: permesso di scrittura, path presente e non
 /// protetto, parametro `content` presente. Ritorna `(path_str, content)` o il
 /// messaggio d'errore. Estratto da `tool_write_file`.
-fn read_write_params<'a>(
+fn read_write_params(
     ctx: &ToolContextCore,
-    input: &'a Value,
-) -> Result<(&'a str, &'a str), String> {
+    input: &Value,
+) -> Result<crate::input_contract::WriteFileInput, nexus_types::tool_outcome::RispostaTool> {
+    use crate::input_contract::{InputTool, WriteFileInput};
+    use nexus_types::tool_outcome::RispostaTool;
+
     if !ctx.can_write {
-        return Err("\u{274C} [Errore: permesso di scrittura non concesso su questo progetto]".to_string());
+        // Del sistema, come in `read_edit_params`: il permesso e' una decisione
+        // del progetto e ritentare non lo cambia.
+        return Err(RispostaTool::fallito_di_sistema(
+            "[Errore: permesso di scrittura non concesso su questo progetto]",
+        ));
     }
-    let path_str = input
-        .get("path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "\u{274C} [Errore: parametro 'path' mancante]".to_string())?;
+    let params = WriteFileInput::leggi(input)?;
     if !ctx.is_nexus_operator {
-        if let Some(pattern) = is_protected_path(path_str) {
-            return Err(format!("\u{274C} [Errore: il file '{}' è protetto (pattern: '{}') e non può essere modificato dall'agente. Modifica manualmente se necessario.]", path_str, pattern));
+        if let Some(pattern) = is_protected_path(&params.path) {
+            return Err(RispostaTool::fallito_rimediabile(format!(
+                "[Errore: il file '{}' è protetto (pattern: '{}') e non può essere modificato dall'agente. Modifica manualmente se necessario.]",
+                params.path, pattern
+            )));
         }
     }
-    let content = input
-        .get("content")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "\u{274C} [Errore: parametro 'content' mancante]".to_string())?;
-    Ok((path_str, content))
+    Ok(params)
 }
 
-pub async fn tool_write_file(ctx: &ToolContextCore, input: &Value) -> String {
-    let (path_str, content) = match read_write_params(ctx, input) {
-        Ok(pair) => pair,
-        Err(msg) => return msg,
+/// Scrive un file. MIGRATO al contratto d'ingresso e a `RispostaTool`.
+pub async fn tool_write_file(
+    ctx: &ToolContextCore,
+    input: &Value,
+) -> nexus_types::tool_outcome::RispostaTool {
+    use nexus_types::tool_outcome::RispostaTool;
+
+    let params = match read_write_params(ctx, input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
+    let (path_str, content) = (params.path.as_str(), params.content.as_str());
 
     // Governance risorse in scrittura (porte ADR 0010 + URL interni), punto
     // unico con audit: su violazione registra in nexus_resource_audit e
@@ -669,12 +679,15 @@ pub async fn tool_write_file(ctx: &ToolContextCore, input: &Value) -> String {
         .enforce_on_write(ctx, "write_file", path_str, content)
         .await
     {
-        return msg;
+        // Il rifiuto dice QUALE risorsa e come chiederla: l'agente corregge.
+        return RispostaTool::fallito_rimediabile(msg);
     }
 
     // Preflight build graph (ADR 0020): blocca file generati, avvisa OOG.
     let bg_warning = match run_build_graph_preflight(ctx, path_str).await {
-        BuildGraphPreflight::Block(msg) => return format!("\u{274C} [Errore: {}]", msg),
+        BuildGraphPreflight::Block(msg) => {
+            return RispostaTool::fallito_rimediabile(format!("[Errore: {msg}]"))
+        }
         BuildGraphPreflight::Warn(msg) => Some(msg),
         BuildGraphPreflight::Allow => None,
     };
@@ -684,16 +697,16 @@ pub async fn tool_write_file(ctx: &ToolContextCore, input: &Value) -> String {
     // (assoluto o relativo) viene normalizzato a relativo prima del join.
     let target = match resolve_write_target(&ctx.root_path, path_str) {
         Ok(p) => p,
-        Err(e) => return format!("\u{274C} [Errore: {e}]"),
+        Err(e) => return RispostaTool::fallito_rimediabile(format!("[Errore: {e}]")),
     };
 
     let (existed_before, unchanged) =
         match prepare_write_and_track(ctx, &target, path_str, content).await {
             Ok(esito) => esito,
-            Err(msg) => return msg,
+            Err(msg) => return RispostaTool::fallito_rimediabile(msg),
         };
     match tokio::fs::write(&target, content).await {
-        Ok(()) => on_write_success(
+        Ok(()) => RispostaTool::riuscito(on_write_success(
             ctx,
             &target,
             path_str,
@@ -701,8 +714,10 @@ pub async fn tool_write_file(ctx: &ToolContextCore, input: &Value) -> String {
             existed_before,
             unchanged,
             bg_warning,
-        ),
-        Err(e) => format!("\u{274C} [Errore scrittura '{}': {}]", path_str, e),
+        )),
+        Err(e) => {
+            RispostaTool::fallito_rimediabile(format!("[Errore scrittura '{path_str}': {e}]"))
+        }
     }
 }
 
@@ -2327,7 +2342,14 @@ mod tests {
         )
         .await;
 
-        assert!(out.contains("successo"), "scrittura non riuscita: {out}");
+        // Il test guarda i CAMPI: e' il contratto che `write_file` ha adottato.
+        assert_eq!(
+            out.esito,
+            nexus_types::tool_outcome::EsitoTool::Riuscito,
+            "scrittura non riuscita: {}",
+            out.testo
+        );
+        assert!(out.testo.contains("successo"), "testo: {}", out.testo);
         assert_eq!(
             hooks.eventi(),
             vec![
@@ -2418,7 +2440,22 @@ mod tests {
         )
         .await;
 
-        assert_eq!(out, "\u{274C} [Errore: porta hardcoded]");
+        // Il testo arriva dall'hook `enforce_on_write`, che NON e' ancora
+        // migrato e porta il marker: `write_file` lo inoltra invariato invece
+        // di riscriverlo, perche' riscrivere il messaggio di un altro
+        // significherebbe interpretarlo. Il marker sparira' quando l'hook avra'
+        // il suo contratto — l'esito, intanto, e' gia' nei campi.
+        assert_eq!(out.testo, "\u{274C} [Errore: porta hardcoded]");
+        assert_eq!(
+            out.esito,
+            nexus_types::tool_outcome::EsitoTool::Fallito,
+            "il rifiuto del gate e' un fallimento dichiarato nel campo"
+        );
+        assert_eq!(
+            out.natura,
+            Some(nexus_types::tool_outcome::NaturaFallimento::Rimediabile),
+            "l'agente puo' chiedere una porta allocata e riprovare"
+        );
         assert_eq!(hooks.eventi(), vec!["enforce:write_file:note.txt".to_string()]);
         assert!(
             !dir.path().join("note.txt").exists(),
