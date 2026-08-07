@@ -23,6 +23,7 @@ pub mod attachments;
 pub mod audio_tools;
 pub mod command_hints;
 pub mod context_core;
+pub mod input_contract;
 pub mod dev_diagnostics;
 pub mod dispatcher;
 pub mod document_tools;

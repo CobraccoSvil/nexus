@@ -1721,31 +1721,35 @@ fn build_old_string_not_found_message(
 /// protetto, parametri `old_string`/`new_string` presenti. Ritorna la tripla
 /// `(path_str, old_string, new_string)` o il messaggio d'errore. Estratto da
 /// `tool_edit_file`.
-fn read_edit_params<'a>(
+fn read_edit_params(
     ctx: &ToolContextCore,
-    input: &'a Value,
-) -> Result<(&'a str, &'a str, &'a str), String> {
+    input: &Value,
+) -> Result<crate::input_contract::EditFileInput, nexus_types::tool_outcome::RispostaTool> {
+    use crate::input_contract::{EditFileInput, InputTool};
+    use nexus_types::tool_outcome::RispostaTool;
+
     if !ctx.can_write {
-        return Err("\u{274C} [Errore: permesso di scrittura non concesso su questo progetto]".to_string());
+        // NON rimediabile dall'agente: il permesso e' una decisione del
+        // progetto, e riprovare non lo cambia. E' il primo posto in cui la
+        // distinzione fra le nature paga davvero.
+        return Err(RispostaTool::fallito_di_sistema(
+            "[Errore: permesso di scrittura non concesso su questo progetto]",
+        ));
     }
-    let path_str = input
-        .get("path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "\u{274C} [Errore: parametro 'path' mancante]".to_string())?;
+    // I tre parametri arrivano dal CONTRATTO (`tool_input!`), cioe' dalla stessa
+    // dichiarazione da cui nasce lo schema che il modello ha letto: non possono
+    // divergere. Prima erano tre `input.get(...).ok_or_else(...)` con tre
+    // messaggi scritti a mano — uno dei 52 tool che lo facevano.
+    let params = EditFileInput::leggi(input)?;
     if !ctx.is_nexus_operator {
-        if let Some(pattern) = is_protected_path(path_str) {
-            return Err(format!("\u{274C} [Errore: il file '{}' è protetto (pattern: '{}') e non può essere modificato dall'agente.]", path_str, pattern));
+        if let Some(pattern) = is_protected_path(&params.path) {
+            return Err(RispostaTool::fallito_rimediabile(format!(
+                "[Errore: il file '{}' è protetto (pattern: '{}') e non può essere modificato dall'agente.]",
+                params.path, pattern
+            )));
         }
     }
-    let old_string = input
-        .get("old_string")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "\u{274C} [Errore: parametro 'old_string' mancante]".to_string())?;
-    let new_string = input
-        .get("new_string")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "\u{274C} [Errore: parametro 'new_string' mancante]".to_string())?;
-    Ok((path_str, old_string, new_string))
+    Ok(params)
 }
 
 /// L'editor chirurgico. MIGRATO alla regola Q: l'esito e la sua NATURA sono
@@ -1763,10 +1767,19 @@ pub async fn tool_edit_file(
     input: &Value,
 ) -> nexus_types::tool_outcome::RispostaTool {
     use nexus_types::tool_outcome::RispostaTool;
-    let (path_str, old_string, new_string) = match read_edit_params(ctx, input) {
-        Ok(triple) => triple,
-        Err(msg) => return RispostaTool::fallito_rimediabile(msg),
+    // La natura del fallimento la sceglie `read_edit_params`, che sa
+    // distinguere un parametro sbagliato (rimediabile) da un permesso negato
+    // dal progetto (del sistema): appiattirli qui rimetterebbe l'agente a
+    // ritentare cio' che non puo' cambiare.
+    let params = match read_edit_params(ctx, input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
+    let (path_str, old_string, new_string) = (
+        params.path.as_str(),
+        params.old_string.as_str(),
+        params.new_string.as_str(),
+    );
 
     // Governance risorse in scrittura (porte + URL interni), punto unico con
     // audit: scansiona la nuova porzione e registra l'eventuale violazione.
