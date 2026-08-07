@@ -1,4 +1,5 @@
 "use client";
+import { useI18n } from "../../lib/i18n";
 
 /**
  * Banner sticky di stato connessione SSE. Mostra "Connessione persa /
@@ -15,6 +16,7 @@ export function ConnectionStatusBanner({
   reconnectSuccess: boolean;
   tc: Record<string, string>;
 }) {
+  const { t } = useI18n();
   return (
     <>
       {isReconnecting && (
@@ -34,7 +36,7 @@ export function ConnectionStatusBanner({
           }}
         >
           <span style={{ animation: "spin 1s linear infinite", fontSize: 16 }}>↻</span>
-          <strong>Connessione persa</strong>
+          <strong>{t("chat.connessionePersa")}</strong>
           <span style={{ color: tc.textMuted, fontSize: 12 }}>
             — Riconnessione al server in corso, attendere…
           </span>
@@ -57,7 +59,7 @@ export function ConnectionStatusBanner({
           }}
         >
           <span style={{ fontSize: 16 }}>✓</span>
-          <strong>Connessione ripristinata</strong>
+          <strong>{t("chat.connessioneRipristinata")}</strong>
         </div>
       )}
     </>

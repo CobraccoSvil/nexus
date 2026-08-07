@@ -4,12 +4,14 @@ import { useEffect, useRef, useState } from "react";
 import type { AgentStep } from "../../lib/api-client";
 import { toolLabel, stepLabel } from "./tool-labels";
 import { MarkdownBlock } from "./markdown-renderer";
+import { useI18n } from "../../lib/i18n";
 
 /* ------------------------------------------------------------------ */
 /* AgentPreparingBubble  (P1)                                          */
 /* ------------------------------------------------------------------ */
 
 export function AgentPreparingBubble({ tc }: { tc: Record<string, string> }) {
+  const { t } = useI18n();
   const [seconds, setSeconds] = useState(0);
   useEffect(() => {
     const id = setInterval(() => setSeconds((s) => s + 1), 1000);
@@ -40,7 +42,7 @@ export function AgentPreparingBubble({ tc }: { tc: Record<string, string> }) {
         }}
       />
       <span style={{ color: tc.textMuted, fontSize: 13, fontStyle: "italic" }}>
-        Nexus sta preparando l&apos;esecuzione&hellip;
+        {t("chat.nexusStaPreparandoL")}
       </span>
       <span style={{ color: tc.textMuted, fontSize: 11, opacity: 0.7 }}>
         {seconds}s
@@ -54,6 +56,7 @@ export function AgentPreparingBubble({ tc }: { tc: Record<string, string> }) {
 /* ------------------------------------------------------------------ */
 
 export function ThinkingBlock({ text, tc }: { text: string; tc: Record<string, string> }) {
+  const { t } = useI18n();
   const [expanded, setExpanded] = useState(false);
   // Scroll automatico a fondo quando arriva una nuova riga di thinking.
   // Garantisce che il pannello mostri sempre l-ultimo pensiero, sia con il
@@ -103,7 +106,7 @@ export function ThinkingBlock({ text, tc }: { text: string; tc: Record<string, s
           }}
         />
         <span style={{ color: tc.textMuted, fontSize: 12, fontWeight: 600 }}>
-          Ragionamento Nexus
+          {t("chat.ragionamentoNexus")}
         </span>
         <span style={{ color: tc.textMuted, fontSize: 11, opacity: 0.6 }}>
           {expanded ? "▲" : "▼"}
@@ -159,6 +162,7 @@ export function AgentProgressInline({
   tc: Record<string, string>;
   steps: AgentStep[];
 }) {
+  const { t } = useI18n();
   // Tempo dall'inizio del run (mount del componente). NON resettiamo ad ogni
   // step nuovo: con agenti che fanno step rapidi (<1s ognuno), il counter
   // restava bloccato a 0s confondendo l'utente. Ora avanza monotonicamente
@@ -226,7 +230,7 @@ export function AgentProgressInline({
           }}
         />
         <span style={{ fontWeight: 600, color: tc.text }}>
-          Nexus sta lavorando&hellip;
+          {t("chat.nexusStaLavorandoHellip")}
         </span>
         <span style={{ color: tc.textMuted }}>
           {toolLabel(currentStep?.toolName || "...")}

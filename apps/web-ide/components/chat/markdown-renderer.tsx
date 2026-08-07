@@ -8,6 +8,7 @@ import { ExecutableCodeBlock } from "./executable-code-block";
 import { normalizeContent } from "./markdown-normalize";
 import { MermaidDiagram } from "../common/mermaid-diagram";
 import { slugify, transformWikilinks } from "../wiki/markdown-wiki-extras";
+import { useI18n } from "../../lib/i18n";
 
 
 
@@ -376,6 +377,7 @@ export const MarkdownBlock = React.memo(function MarkdownBlock({
 // SOLO dal pannello SQL. Mostrare il risultato qui scavalcherebbe quella
 // logica.
 function SqlChatBlock({ code, tc }: { code: string; tc: ReturnType<typeof useThemeColors> }) {
+  const { t } = useI18n();
   const trimmed = code.trim();
   const isDdl = React.useMemo(() => {
     const t = trimmed.toLowerCase();
@@ -422,7 +424,7 @@ function SqlChatBlock({ code, tc }: { code: string; tc: ReturnType<typeof useThe
         <span style={{ fontWeight: 600, color: tc.accent }}>SQL</span>
         {isDdl && (
           <span
-            title="DDL: dopo l'esecuzione viene archiviata in Knowledge Base e come file migration."
+            title={t("chat.ddlDopoLEsecuzione")}
             style={{
               padding: "1px 6px",
               background: "#7a5b00",
@@ -447,9 +449,9 @@ function SqlChatBlock({ code, tc }: { code: string; tc: ReturnType<typeof useThe
             cursor: "pointer",
             fontSize: 11,
           }}
-          title="Apri nel pannello SQL (non esegue automaticamente)"
+          title={t("chat.apriNelPannelloSql")}
         >
-          Apri nel pannello SQL
+          {t("chat.apriNelPannelloSql2")}
         </button>
         <button
           type="button"
@@ -463,9 +465,9 @@ function SqlChatBlock({ code, tc }: { code: string; tc: ReturnType<typeof useThe
             cursor: "pointer",
             fontSize: 11,
           }}
-          title="Apre il pannello SQL ed esegue subito la query"
+          title={t("chat.apreIlPannelloSql")}
         >
-          Esegui
+          {t("chat.esegui")}
         </button>
       </div>
       <pre

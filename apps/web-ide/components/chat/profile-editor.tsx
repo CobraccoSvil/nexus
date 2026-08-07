@@ -277,7 +277,7 @@ export function ProfileEditor({
               value={systemPrompt}
               onChange={(e) => setSystemPrompt(e.target.value)}
               style={{ ...inputStyle, minHeight: 120, resize: "vertical" }}
-              placeholder="Sei un esperto di C# e .NET. Preferisci pattern SOLID e Clean Architecture. Rispondi sempre con esempi di codice..."
+              placeholder={t("chat.seiUnEspertoDi")}
             />
             <div style={{ fontSize: 10, color: tc.textSecondary, marginTop: 3 }}>
               Questo testo viene iniettato all'inizio di ogni conversazione con questo profilo.

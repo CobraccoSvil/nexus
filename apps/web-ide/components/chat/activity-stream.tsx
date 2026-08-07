@@ -139,6 +139,7 @@ function tagStyle(color: string): React.CSSProperties {
 /** Ragionamento inline clampabile (clamp via classe @container, "espandi" a
  *  larghezze strette). */
 function ThoughtBlock({ text, tc }: { text: string; tc: ThemeColors }) {
+  const { t } = useI18n();
   const [expanded, setExpanded] = useState(false);
   const think = "#a78bfa";
   return (
@@ -164,7 +165,7 @@ function ThoughtBlock({ text, tc }: { text: string; tc: ThemeColors }) {
           marginBottom: 2,
         }}
       >
-        Ragionamento
+        {t("chat.ragionamento")}
       </div>
       <div
         className={expanded ? undefined : "nx-as-thought-body"}
@@ -899,7 +900,7 @@ function EventBody({
                   letterSpacing: 0.3,
                 }}
               >
-                Pareri delle figure
+                {t("chat.pareriDelleFigure")}
               </div>
               <ul style={{ margin: "3px 0 0", padding: 0, listStyle: "none" }}>
                 {event.figureReports.map((r) => (
@@ -951,7 +952,7 @@ function EventBody({
                   letterSpacing: 0.3,
                 }}
               >
-                Analisi per provider
+                {t("chat.analisiPerProvider")}
               </div>
               <ul style={{ margin: "3px 0 0", padding: 0, listStyle: "none" }}>
                 {event.providerReports.map((r, i) => (
@@ -1156,7 +1157,7 @@ export function FigureReportRow({
         <div style={{ padding: "1px 0 5px 16px", fontSize: 11, color: tc.textMuted }}>
           {report.provider ? (
             <div style={{ marginBottom: 4, fontSize: 10.5, fontFamily: "var(--font-mono)" }}>
-              <span style={{ color: tc.textMuted }}>Provider: </span>
+              <span style={{ color: tc.textMuted }}>{t("chat.provider")} </span>
               <span style={{ color: providerBaseColor(report.provider) }}>
                 {report.provider}
                 {report.model ? ` / ${report.model}` : ""}

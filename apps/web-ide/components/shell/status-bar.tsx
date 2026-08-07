@@ -4,6 +4,7 @@ import type { useThemeColors } from "../../lib/theme";
 import type { WorkbenchLayoutMode } from "../../lib/api-client";
 import { StatusDot } from "./shell-helpers";
 import { FooterToastCenter } from "./footer-toast-center";
+import { useI18n } from "../../lib/i18n";
 
 type LiveHealth = {
   database: boolean;
@@ -30,6 +31,7 @@ export function StatusBar({
   problemCount: number;
   liveHealth: LiveHealth;
 }) {
+  const { t } = useI18n();
   return (
     <footer
       style={{
@@ -64,7 +66,7 @@ export function StatusBar({
         </span>
         <span title={liveHealth.redis ? "Redis online" : "Redis offline"} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
           <StatusDot ok={liveHealth.redis} />
-          Redis
+          {t("shell.redis")}
         </span>
         <span title={
           liveHealth.neural_core
@@ -72,11 +74,11 @@ export function StatusBar({
             : "Core (mcp-core :4000) offline — chat e agent run non funzioneranno"
         } style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
           <StatusDot ok={liveHealth.neural_core} />
-          Core
+          {t("shell.core")}
         </span>
         <span title={liveHealth.tools_grpc ? "MCP Tools (gRPC :50071) online" : "MCP Tools offline — l'AI non potrà eseguire tool (read_file, str_replace, ecc.)"} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
           <StatusDot ok={!!liveHealth.tools_grpc} />
-          Tools
+          {t("shell.tools")}
         </span>
       </div>
     </footer>

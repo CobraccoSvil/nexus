@@ -8,6 +8,7 @@
 import * as React from "react";
 import { useThemeColors } from "../../lib/theme";
 import type { WikiRevision } from "../../lib/api-client";
+import { useI18n } from "../../lib/i18n";
 
 interface Props {
   revisions: WikiRevision[];
@@ -30,6 +31,7 @@ export function WikiHistory({
   onCompare,
   onRestore,
 }: Props) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   return (
     <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
@@ -43,13 +45,13 @@ export function WikiHistory({
       >
         <thead>
           <tr style={{ borderBottom: `1px solid ${tc.border}` }}>
-            <th style={{ textAlign: "left", padding: 6 }}>Versione</th>
-            <th style={{ textAlign: "left", padding: 6 }}>Data</th>
-            <th style={{ textAlign: "left", padding: 6 }}>Origine</th>
-            <th style={{ textAlign: "left", padding: 6 }}>Autore</th>
-            <th style={{ textAlign: "left", padding: 6 }}>From</th>
+            <th style={{ textAlign: "left", padding: 6 }}>{t("wiki.versione")}</th>
+            <th style={{ textAlign: "left", padding: 6 }}>{t("wiki.data")}</th>
+            <th style={{ textAlign: "left", padding: 6 }}>{t("wiki.origine")}</th>
+            <th style={{ textAlign: "left", padding: 6 }}>{t("wiki.autore")}</th>
+            <th style={{ textAlign: "left", padding: 6 }}>{t("wiki.from")}</th>
             <th style={{ textAlign: "left", padding: 6 }}>To</th>
-            <th style={{ textAlign: "left", padding: 6 }}>Azione</th>
+            <th style={{ textAlign: "left", padding: 6 }}>{t("wiki.azione")}</th>
           </tr>
         </thead>
         <tbody>
@@ -96,7 +98,7 @@ export function WikiHistory({
                     borderRadius: 3,
                   }}
                 >
-                  Ripristina
+                  {t("wiki.ripristina")}
                 </button>
               </td>
             </tr>

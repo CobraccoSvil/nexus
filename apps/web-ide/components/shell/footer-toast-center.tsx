@@ -4,6 +4,7 @@ import type { CSSProperties } from "react";
 import type { useThemeColors } from "../../lib/theme";
 import { selectToasts, useProjectStore } from "../../lib/project-dispatcher";
 import { useActionFeedback } from "../global-action-feedback-provider";
+import { useI18n } from "../../lib/i18n";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
@@ -18,6 +19,7 @@ type ThemeColors = ReturnType<typeof useThemeColors>;
  *      programmatico + esiti delle mutazioni intercettate dal feedback globale).
  */
 export function FooterToastCenter({ tc }: { tc: ThemeColors }) {
+  const { t } = useI18n();
   const toasts = useProjectStore(selectToasts);
   const dismiss = useProjectStore((s) => s.dismissToast);
   const { pendingCount, pendingLabel } = useActionFeedback();
@@ -65,7 +67,7 @@ export function FooterToastCenter({ tc }: { tc: ThemeColors }) {
       <button
         type="button"
         onClick={() => dismiss(last.id)}
-        aria-label="Chiudi notifica"
+        aria-label={t("shell.chiudiNotifica")}
         style={dismissBtnStyle}
       >
         ×

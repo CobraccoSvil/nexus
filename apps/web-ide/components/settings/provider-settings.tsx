@@ -301,7 +301,7 @@ export function ProviderSettings({
                         letterSpacing: "0.03em",
                       }}
                     >
-                      DISABILITATO
+                      {t("badge.disabilitato")}
                     </span>
                   )}
                 </div>

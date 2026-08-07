@@ -4,6 +4,7 @@ import { useState } from "react";
 import type { UserProfile } from "../../lib/api-client";
 import { DEFAULT_PROFILE_ID } from "../../lib/use-profiles";
 import { AutoWidthSelect, type AutoWidthSelectItem } from "../auto-width-select";
+import { useI18n } from "../../lib/i18n";
 
 interface ProfileSelectorProps {
   profiles: UserProfile[];
@@ -33,6 +34,7 @@ export function ProfileSelector({
   onForkProfile,
   style,
 }: ProfileSelectorProps) {
+  const { t } = useI18n();
   const [expanded, setExpanded] = useState(false);
   const [editingPrompt, setEditingPrompt] = useState<string | null>(null);
   const [savingDefault, setSavingDefault] = useState(false);
@@ -151,7 +153,7 @@ export function ProfileSelector({
           options={profileOptions}
           onChange={(id) => { onSelect(id); setExpanded(false); setEditingPrompt(null); }}
           style={selectStyle}
-          title="Seleziona profilo"
+          title={t("chat.selezionaProfilo")}
         />
 
         {/* Bottone espandi editor (solo profili utente) */}
@@ -176,7 +178,7 @@ export function ProfileSelector({
             onClick={() => void handleFork()}
             disabled={forking}
             style={{ ...btnStyle, opacity: forking ? 0.4 : 0.8 }}
-            title="Crea una copia personale modificabile di questo profilo"
+            title={t("chat.creaUnaCopiaPersonale")}
           >
             {forking ? "…" : "⑂"}
           </button>
@@ -203,7 +205,7 @@ export function ProfileSelector({
         <button
           type="button"
           onClick={onCreateNew}
-          title="Crea o gestisci profili"
+          title={t("chat.creaOGestisciProfili")}
           style={btnStyle}
         >
           +
@@ -249,7 +251,7 @@ export function ProfileSelector({
               onClick={() => { setExpanded(false); setEditingPrompt(null); }}
               style={{ ...btnStyle, fontSize: 11 }}
             >
-              Annulla
+              {t("chat.annulla")}
             </button>
             <button
               type="button"

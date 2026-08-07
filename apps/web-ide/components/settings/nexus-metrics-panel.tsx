@@ -147,7 +147,7 @@ export function NexusMetricsPanel() {
             borderRadius: 6,
             padding: "1px 7px",
           }}>
-            LIVE
+            {t("badge.live")}
           </span>
         )}
         {!loading && error && (
@@ -160,7 +160,7 @@ export function NexusMetricsPanel() {
             borderRadius: 6,
             padding: "1px 7px",
           }}>
-            OFFLINE
+            {t("badge.offline")}
           </span>
         )}
       </div>

@@ -2,6 +2,7 @@
 
 import { useThemeColors } from "../../lib/theme";
 import type { SimilarHit } from "../../lib/api-client";
+import { useI18n } from "../../lib/i18n";
 
 interface Props {
   hits: SimilarHit[];
@@ -11,6 +12,7 @@ interface Props {
 }
 
 export function SimilarRequestBanner({ hits, onProceed, onOpenNote, onDismiss }: Props) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   if (hits.length === 0) return null;
 
@@ -52,7 +54,7 @@ export function SimilarRequestBanner({ hits, onProceed, onOpenNote, onDismiss }:
             lineHeight: 1,
             padding: "0 2px",
           }}
-          aria-label="Chiudi"
+          aria-label={t("knowledge.chiudi")}
         >
           x
         </button>
@@ -85,7 +87,7 @@ export function SimilarRequestBanner({ hits, onProceed, onOpenNote, onDismiss }:
       </ul>
       {implementedHit && (
         <div style={{ color: tc.text ?? "#171717", fontSize: 12, marginBottom: 8 }}>
-          Questa richiesta sembra <strong>gia' completata</strong>
+          {t("knowledge.questaRichiestaSembra")} <strong>gia' completata</strong>
           {implementedHit.runCompletedAt ? ` (${fmtDate(implementedHit.runCompletedAt)})` : ""}.
           Procedi solo se vuoi rifarla o aggiornarla.
         </div>

@@ -8,6 +8,7 @@ import type { EditorGroupState, EditorTabState, ProblemItem, UserProjectDetails 
 import { expandProblemMarkers } from "../../lib/api/workspace";
 import type * as Monaco from "monaco-editor";
 import { MarkdownBlock } from "../chat/markdown-renderer";
+import { useI18n } from "../../lib/i18n";
 
 function isMarkdownPath(path: string): boolean {
   const lower = path.toLowerCase();
@@ -118,6 +119,7 @@ export function EditorArea({
   onDeleteActive,
   onConfirmCloseTab,
 }: EditorAreaProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const { resolved } = useTheme();
   const monacoRef = useRef<typeof Monaco | null>(null);
@@ -322,7 +324,7 @@ export function EditorArea({
                     }),
                   )
                 }
-                title="Apri la documentazione (Code Wiki) di questo file"
+                title={t("editor.apriLaDocumentazioneCode")}
                 style={{
                   padding: "3px 10px",
                   fontSize: 11,
@@ -333,7 +335,7 @@ export function EditorArea({
                   cursor: "pointer",
                 }}
               >
-                Doc
+                {t("editor.doc")}
               </button>
               {isMarkdownPath(activeTab.path) &&
                 (["source", "preview"] as const).map((mode) => {
@@ -452,7 +454,7 @@ export function EditorArea({
             )
           ) : (
             <div style={{ padding: 20, color: tc.textMuted, fontSize: 13 }}>
-              Apri un file per iniziare.
+              {t("editor.apriUnFilePer")}
             </div>
           )}
         </div>
@@ -487,8 +489,8 @@ export function EditorArea({
           <button
             type="button"
             onClick={handleFormatActive}
-            title="Formatta documento"
-            aria-label="Formatta documento"
+            title={t("editor.formattaDocumento")}
+            aria-label={t("editor.formattaDocumento")}
             style={iconButton(tc, !activeEditorTab)}
           >
             ↹
@@ -496,8 +498,8 @@ export function EditorArea({
           <button
             type="button"
             onClick={onSaveActive}
-            title="Salva file attivo"
-            aria-label="Salva file attivo"
+            title={t("editor.salvaFileAttivo")}
+            aria-label={t("editor.salvaFileAttivo")}
             style={iconButton(
               tc,
               !activeEditorTab ||
@@ -510,8 +512,8 @@ export function EditorArea({
           <button
             type="button"
             onClick={onRenameActive}
-            title="Rinomina file attivo"
-            aria-label="Rinomina file attivo"
+            title={t("editor.rinominaFileAttivo")}
+            aria-label={t("editor.rinominaFileAttivo")}
             style={iconButton(tc, !activeEditorTab || !activeProject?.canWrite)}
           >
             ✎
@@ -519,8 +521,8 @@ export function EditorArea({
           <button
             type="button"
             onClick={onDeleteActive}
-            title="Elimina file attivo"
-            aria-label="Elimina file attivo"
+            title={t("editor.eliminaFileAttivo")}
+            aria-label={t("editor.eliminaFileAttivo")}
             style={iconButton(tc, !activeEditorTab || !activeProject?.canWrite)}
           >
             🗑

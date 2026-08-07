@@ -7,6 +7,7 @@ import { ProviderBadge, providerBaseColor } from "./provider-badge";
 import { toolLabel } from "./tool-labels";
 import { MarkdownBlock } from "./markdown-renderer";
 import { switchCauseLabel } from "../../lib/use-chat/activity-stream";
+import { useI18n } from "../../lib/i18n";
 
 /**
  * Card collassabile per visualizzare i meta-step semantici pubblicati dal
@@ -101,6 +102,7 @@ export function NextActionsButtons({
   choices: NextActionChoice[];
   onChoice?: (prompt: string) => void;
 }) {
+  const { t } = useI18n();
   if (!choices.length) return null;
   return (
     <div style={{ display: "flex", flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
@@ -298,11 +300,12 @@ function FailedCriteriaList({
   items: FailedCriterionPayload[];
   tc: ReturnType<typeof useThemeColors>;
 }) {
+  const { t } = useI18n();
   if (!items.length) return null;
   return (
     <div style={{ marginTop: 6 }}>
       <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4, color: tc.textMuted }}>
-        Criteri non superati
+        {t("chat.criteriNonSuperati")}
       </div>
       <ul style={{ margin: 0, paddingLeft: 16, fontSize: 11, lineHeight: 1.45 }}>
         {items.map((c, i) => (
@@ -327,6 +330,7 @@ type PlanTodo = { id?: string; seq?: number; content?: string; status?: string; 
 // nastro attivita' (activity-stream.tsx) per non duplicare la logica di
 // aggiornamento TodoUpdated via SSE.
 export function PlanChecklist({ todos }: { todos: PlanTodo[] }) {
+  const { t } = useI18n();
   // Gli status aggiornati arrivano dallo store del dispatcher, non da uno stato
   // locale: questo componente si smonta di continuo durante un run (la card
   // `plan` nasce chiusa, la finestra live del nastro tiene solo gli ultimi
@@ -335,7 +339,7 @@ export function PlanChecklist({ todos }: { todos: PlanTodo[] }) {
   // TodoUpdated arrivato a componente smontato era perso per sempre e i marker
   // restavano a [ ] fino al refresh, che li rileggeva dal backend.
   const overrides = useProjectStore(selectTodoStatuses);
-  if (!todos.length) return <em style={{ fontSize: 11, opacity: 0.7 }}>Nessun todo</em>;
+  if (!todos.length) return <em style={{ fontSize: 11, opacity: 0.7 }}>{t("chat.nessunTodo")}</em>;
   const MARK: Record<string, string> = {
     completed: "[x]", in_progress: "[~]", blocked: "[!]", skipped: "[-]", pending: "[ ]",
   };
@@ -404,9 +408,10 @@ function renderPayload(
   onChoice: (prompt: string) => void,
   tc: ReturnType<typeof useThemeColors>,
 ) {
+  const { t } = useI18n();
   if (kind === "next_actions") {
     const choices = (payload.choices ?? []) as NextActionChoice[];
-    if (!choices.length) return <em style={{ fontSize: 11, opacity: 0.7 }}>Nessuna scelta</em>;
+    if (!choices.length) return <em style={{ fontSize: 11, opacity: 0.7 }}>{t("chat.nessunaScelta")}</em>;
     return <NextActionsButtons choices={choices} onChoice={onChoice} />;
   }
   if (kind === "plan") {
@@ -534,7 +539,7 @@ function renderPayload(
   // il dato raw resta disponibile agli sviluppatori via API/DB).
   const entries = Object.entries(payload ?? {}).filter(([, v]) => v !== null && v !== undefined);
   if (!entries.length) {
-    return <em style={{ fontSize: 11, opacity: 0.7 }}>Nessun dettaglio aggiuntivo</em>;
+    return <em style={{ fontSize: 11, opacity: 0.7 }}>{t("chat.nessunDettaglioAggiuntivo")}</em>;
   }
   return (
     <div style={grid}>

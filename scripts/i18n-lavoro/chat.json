@@ -1,0 +1,478 @@
+[
+  {
+    "chiave": "chat.annulla",
+    "it": "Annulla",
+    "en": "Cancel",
+    "es": "Cancelar",
+    "occorrenze": 3
+  },
+  {
+    "chiave": "chat.parametri",
+    "it": "Parametri",
+    "en": "Parameters",
+    "es": "Parametros",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "chat.nuovaChat",
+    "it": "Nuova chat",
+    "en": "New chat",
+    "es": "Nuevo chat",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "chat.rinominaChat",
+    "it": "Rinomina chat",
+    "en": "Rename chat",
+    "es": "Renombrar el chat",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "chat.eliminaChat",
+    "it": "Elimina chat",
+    "en": "Delete chat",
+    "es": "Eliminar el chat",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "chat.aggiungiContesto",
+    "it": "Aggiungi contesto",
+    "en": "Add context",
+    "es": "Anadir contexto",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "chat.notificheDelRun",
+    "it": "Notifiche del run",
+    "en": "Run notifications",
+    "es": "Notificaciones de la ejecucion",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "chat.ragionamento",
+    "it": "Ragionamento",
+    "en": "Reasoning",
+    "es": "Razonamiento",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.pareriDelleFigure",
+    "it": "Pareri delle figure",
+    "en": "Advisor opinions",
+    "es": "Opiniones de las figuras",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.analisiPerProvider",
+    "it": "Analisi per provider",
+    "en": "Per-provider analysis",
+    "es": "Analisis por proveedor",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.provider",
+    "it": "Provider:",
+    "en": "Provider:",
+    "es": "Proveedor:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.tempoTrascorsoDallAvvio",
+    "it": "Tempo trascorso dall'avvio del run",
+    "en": "Time since the run started",
+    "es": "Tiempo transcurrido desde el inicio",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.criteriNonSuperati",
+    "it": "Criteri non superati",
+    "en": "Failed criteria",
+    "es": "Criterios no superados",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.nessunTodo",
+    "it": "Nessun todo",
+    "en": "No to-do",
+    "es": "Ninguna tarea",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.nessunaScelta",
+    "it": "Nessuna scelta",
+    "en": "No choice",
+    "es": "Ninguna opcion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.nessunDettaglioAggiuntivo",
+    "it": "Nessun dettaglio aggiuntivo",
+    "en": "No further detail",
+    "es": "Sin detalles adicionales",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.nexusStaPreparandoL",
+    "it": "Nexus sta preparando l&apos;esecuzione&hellip;",
+    "en": "Nexus is preparing the run&hellip;",
+    "es": "Nexus esta preparando la ejecucion&hellip;",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.ragionamentoNexus",
+    "it": "Ragionamento Nexus",
+    "en": "Nexus reasoning",
+    "es": "Razonamiento de Nexus",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.nexusStaLavorandoHellip",
+    "it": "Nexus sta lavorando&hellip;",
+    "en": "Nexus is working&hellip;",
+    "es": "Nexus esta trabajando&hellip;",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.inAttesaDiRisultato",
+    "it": "In attesa di risultato...",
+    "en": "Waiting for result...",
+    "es": "Esperando resultado...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.azioniInAttesaDi",
+    "it": "Azioni in attesa di conferma:",
+    "en": "Actions awaiting confirmation:",
+    "es": "Acciones pendientes de confirmacion:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.indicizzazioneAllegatiNellaKnowledge",
+    "it": "Indicizzazione allegati nella Knowledge Base",
+    "en": "Indexing attachments into the knowledge base",
+    "es": "Indexando adjuntos en la base de conocimiento",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.indicizzareNellaKnowledgeBase",
+    "it": "Indicizzare nella Knowledge Base?",
+    "en": "Index into the knowledge base?",
+    "es": "Indexar en la base de conocimiento?",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.saltaTutto",
+    "it": "Salta tutto",
+    "en": "Skip all",
+    "es": "Omitir todo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.selezionaSessioneChat",
+    "it": "Seleziona sessione chat",
+    "en": "Select chat session",
+    "es": "Selecciona la sesion de chat",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.caricamento",
+    "it": "Caricamento…",
+    "en": "Loading…",
+    "es": "Cargando…",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.testataChatProfiloSessioni",
+    "it": "Testata chat: profilo, sessioni e azioni",
+    "en": "Chat header: profile, sessions and actions",
+    "es": "Cabecera del chat: perfil, sesiones y acciones",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.testataChat",
+    "it": "Testata chat",
+    "en": "Chat header",
+    "es": "Cabecera del chat",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.ilRunInCorso",
+    "it": "Il run in corso non sta rispettando il pin. Cause tipiche: e' partito prima che tu pinnassi questo provider, oppure il modello pinnato non era disponibile.",
+    "en": "The running job is not honouring the pin. Typical causes: it started before you pinned this provider, or the pinned model was unavailable.",
+    "es": "La ejecucion en curso no respeta el pin. Causas tipicas: empezo antes de que fijaras este proveedor, o el modelo fijado no estaba disponible.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.supervisoreAiMonitoraE",
+    "it": "Supervisore AI (monitora e corregge l'agente). Non sostituisce Conferma/Automatico: per saltare le approvazioni usa Automatico.",
+    "en": "AI supervisor (monitors and corrects the agent). It does not replace Confirm/Automatic: to skip approvals use Automatic.",
+    "es": "Supervisor de IA (vigila y corrige al agente). No sustituye a Confirmar/Automatico: para saltar las aprobaciones usa Automatico.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.interrompiAgente",
+    "it": "Interrompi agente",
+    "en": "Stop the agent",
+    "es": "Detener el agente",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.connessionePersa",
+    "it": "Connessione persa",
+    "en": "Connection lost",
+    "es": "Conexion perdida",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.connessioneRipristinata",
+    "it": "Connessione ripristinata",
+    "en": "Connection restored",
+    "es": "Conexion restablecida",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.copiaComando",
+    "it": "Copia comando",
+    "en": "Copy command",
+    "es": "Copiar el comando",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.traceAi",
+    "it": "Trace AI",
+    "en": "AI trace",
+    "es": "Traza de IA",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.ddlDopoLEsecuzione",
+    "it": "DDL: dopo l'esecuzione viene archiviata in Knowledge Base e come file migration.",
+    "en": "DDL: after running it is archived in the knowledge base and as a migration file.",
+    "es": "DDL: tras ejecutarse se archiva en la base de conocimiento y como archivo de migracion.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.apriNelPannelloSql",
+    "it": "Apri nel pannello SQL (non esegue automaticamente)",
+    "en": "Open in the SQL panel (does not run automatically)",
+    "es": "Abrir en el panel SQL (no se ejecuta automaticamente)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.apreIlPannelloSql",
+    "it": "Apre il pannello SQL ed esegue subito la query",
+    "en": "Open the SQL panel and run the query right away",
+    "es": "Abre el panel SQL y ejecuta la consulta de inmediato",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.apriNelPannelloSql2",
+    "it": "Apri nel pannello SQL",
+    "en": "Open in the SQL panel",
+    "es": "Abrir en el panel SQL",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.esegui",
+    "it": "Esegui",
+    "en": "Run",
+    "es": "Ejecutar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.caricamento2",
+    "it": "Caricamento...",
+    "en": "Loading...",
+    "es": "Cargando...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.nessunaMemoriaSalvata",
+    "it": "Nessuna memoria salvata.",
+    "en": "No memory saved.",
+    "es": "Ninguna memoria guardada.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.scegliComeProseguire",
+    "it": "Scegli come proseguire",
+    "en": "Choose how to continue",
+    "es": "Elige como continuar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.decisioniDelTurno",
+    "it": "Decisioni del turno",
+    "en": "Decisions in this turn",
+    "es": "Decisiones del turno",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.reinvio",
+    "it": "Reinvio",
+    "en": "Resending",
+    "es": "Reenviando",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.riattiva",
+    "it": "Riattiva",
+    "en": "Resume",
+    "es": "Reactivar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.controlloOrtografiaEContesto",
+    "it": "Controllo ortografia e contesto…",
+    "en": "Checking spelling and context…",
+    "es": "Comprobando ortografia y contexto…",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.testoCorretto",
+    "it": "Testo corretto",
+    "en": "Corrected text",
+    "es": "Texto corregido",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.usaTestoCorretto",
+    "it": "Usa testo corretto",
+    "en": "Use the corrected text",
+    "es": "Usar el texto corregido",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.inviaComunque",
+    "it": "Invia comunque",
+    "en": "Send anyway",
+    "es": "Enviar de todos modos",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.seiUnEspertoDi",
+    "it": "Sei un esperto di C# e .NET. Preferisci pattern SOLID e Clean Architecture. Rispondi sempre con esempi di codice...",
+    "en": "You are a C# and .NET expert. You prefer SOLID patterns and Clean Architecture. Always answer with code examples...",
+    "es": "Eres experto en C# y .NET. Prefieres patrones SOLID y Clean Architecture. Responde siempre con ejemplos de codigo...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.selezionaProfilo",
+    "it": "Seleziona profilo",
+    "en": "Select profile",
+    "es": "Selecciona el perfil",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.creaUnaCopiaPersonale",
+    "it": "Crea una copia personale modificabile di questo profilo",
+    "en": "Create your own editable copy of this profile",
+    "es": "Crea una copia personal editable de este perfil",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.creaOGestisciProfili",
+    "it": "Crea o gestisci profili",
+    "en": "Create or manage profiles",
+    "es": "Crear o gestionar perfiles",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.nessunProviderAiDisponibile",
+    "it": "Nessun provider AI disponibile",
+    "en": "No AI provider available",
+    "es": "Ningun proveedor de IA disponible",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.configurazioneProvider",
+    "it": "Configurazione provider",
+    "en": "Provider configuration",
+    "es": "Configuracion del proveedor",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.centroNotificheDelRun",
+    "it": "Centro notifiche del run",
+    "en": "Run notification centre",
+    "es": "Centro de notificaciones de la ejecucion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.chiudiNotifiche",
+    "it": "Chiudi notifiche",
+    "en": "Close notifications",
+    "es": "Cerrar las notificaciones",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.apriNellEditor",
+    "it": "Apri nell'editor",
+    "en": "Open in the editor",
+    "es": "Abrir en el editor",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.azioniInAttesa",
+    "it": "Azioni in attesa:",
+    "en": "Pending actions:",
+    "es": "Acciones pendientes:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.apriIlFile",
+    "it": "Apri il file",
+    "en": "Open the file",
+    "es": "Abrir el archivo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.nessunaAttivitaRegistrataIn",
+    "it": "Nessuna attivita' registrata in questa sessione.",
+    "en": "No activity recorded in this session.",
+    "es": "Ninguna actividad registrada en esta sesion.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.aggiorna",
+    "it": "Aggiorna",
+    "en": "Refresh",
+    "es": "Actualizar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.dettaglioSessione",
+    "it": "Dettaglio sessione",
+    "en": "Session details",
+    "es": "Detalle de la sesion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.tokenTotali",
+    "it": "Token totali",
+    "en": "Total tokens",
+    "es": "Tokens totales",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.costoTotale",
+    "it": "Costo totale",
+    "en": "Total cost",
+    "es": "Coste total",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.budget",
+    "it": "Budget",
+    "en": "Budget",
+    "es": "Presupuesto",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "chat.ultimoInput",
+    "it": "Ultimo input",
+    "en": "Last input",
+    "es": "Ultima entrada",
+    "occorrenze": 1
+  }
+]

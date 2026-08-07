@@ -560,7 +560,7 @@ export function Composer({
           )}
           {(showOverrideMismatch || showModelMismatch) && (
             <span
-              title="Il run in corso non sta rispettando il pin. Cause tipiche: e' partito prima che tu pinnassi questo provider, oppure il modello pinnato non era disponibile."
+              title={t("chat.ilRunInCorso")}
               style={{
                 ...selectStyle,
                 border: "1px solid #ef4444",
@@ -600,7 +600,7 @@ export function Composer({
             value={supervisorMode}
             options={SUPERVISOR_OPTIONS}
             onChange={(value) => onSupervisorModeChange(value as "none" | "anomaly" | "interleaved" | "continuous")}
-            title="Supervisore AI (monitora e corregge l'agente). Non sostituisce Conferma/Automatico: per saltare le approvazioni usa Automatico."
+            title={t("chat.supervisoreAiMonitoraE")}
             ariaLabel="Supervisore"
             breve={barraCompatta}
             style={{
@@ -659,7 +659,7 @@ export function Composer({
               <button
                 type="button"
                 onClick={onStopAgent}
-                title="Interrompi agente"
+                title={t("chat.interrompiAgente")}
                 style={{
                   border: `1px solid ${tc.error}88`,
                   background: `${tc.error}1a`,

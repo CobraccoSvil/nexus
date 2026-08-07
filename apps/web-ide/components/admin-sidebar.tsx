@@ -212,7 +212,7 @@ export function AdminSidebar({
             }}
           >
             <span style={{ fontSize: 10 }}>{advancedCatsOpen ? "▾" : "▸"}</span>
-            <span style={{ flex: 1 }}>Configurazione avanzata</span>
+            <span style={{ flex: 1 }}>{t("radice.configurazioneAvanzata")}</span>
             <span style={{ fontSize: 10, marginRight: 6 }}>{advancedCategories.length}</span>
           </button>
           {advancedCatsOpen && (

@@ -546,7 +546,7 @@ function SingleRunPanel({
                       {hasToolDetail && (
                         <div>
                           <div style={{ fontWeight: 600, marginBottom: 4, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.05em", opacity: 0.7 }}>
-                            Parametri
+                            {t("chat.parametri")}
                           </div>
                           <TruncatedContent
                             content={formatToolInput(step.toolInput)}
@@ -583,7 +583,7 @@ function SingleRunPanel({
                       {/* Placeholder per step in corso */}
                       {step.status === "running" && !hasToolResult && (
                         <div style={{ fontStyle: "italic", fontSize: 11, opacity: 0.6 }}>
-                          In attesa di risultato...
+                          {t("chat.inAttesaDiRisultato")}
                         </div>
                       )}
 
@@ -624,7 +624,7 @@ function SingleRunPanel({
       {run.status === "awaiting_confirmation" && run.pendingActions.length > 0 && (
         <div>
           <div style={{ color: tc.text, marginBottom: 6, fontWeight: 500, fontSize: 12 }}>
-            Azioni in attesa di conferma:
+            {t("chat.azioniInAttesaDi")}
           </div>
           {run.pendingActions.map((action) => (
             <div
@@ -675,7 +675,7 @@ function SingleRunPanel({
                 fontSize: 12,
               }}
             >
-              Annulla
+              {t("chat.annulla")}
             </button>
           </div>
         </div>

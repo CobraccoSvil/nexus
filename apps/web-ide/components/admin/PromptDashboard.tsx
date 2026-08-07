@@ -273,7 +273,7 @@ function PromptRow({
                 fontWeight: 500,
               }}
             >
-              SPERIM.
+              {t("badge.sperim")}
             </span>
           )}
         </div>

@@ -1,19 +1,4 @@
 {
-  "totale": 280,
-  "perArea": {
-    "admin": 1,
-    "radice": 67,
-    "chat": 84,
-    "editor": 13,
-    "git": 21,
-    "knowledge": 9,
-    "landing": 4,
-    "panels": 2,
-    "project-db": 2,
-    "settings": 16,
-    "shell": 25,
-    "sidebar": 4,
-    "sql": 5,
-    "wiki": 27
-  }
+  "totale": 0,
+  "perArea": {}
 }

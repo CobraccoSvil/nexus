@@ -1,0 +1,52 @@
+[
+  {
+    "chiave": "editor.formattaDocumento",
+    "it": "Formatta documento",
+    "en": "Format document",
+    "es": "Formatear el documento",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "editor.salvaFileAttivo",
+    "it": "Salva file attivo",
+    "en": "Save the active file",
+    "es": "Guardar el archivo activo",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "editor.rinominaFileAttivo",
+    "it": "Rinomina file attivo",
+    "en": "Rename the active file",
+    "es": "Renombrar el archivo activo",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "editor.eliminaFileAttivo",
+    "it": "Elimina file attivo",
+    "en": "Delete the active file",
+    "es": "Eliminar el archivo activo",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "editor.apriLaDocumentazioneCode",
+    "it": "Apri la documentazione (Code Wiki) di questo file",
+    "en": "Open this file's documentation (code wiki)",
+    "es": "Abre la documentacion (code wiki) de este archivo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "editor.doc",
+    "it": "Doc",
+    "en": "Doc",
+    "es": "Doc",
+    "occorrenze": 1,
+    "neutro": true
+  },
+  {
+    "chiave": "editor.apriUnFilePer",
+    "it": "Apri un file per iniziare.",
+    "en": "Open a file to get started.",
+    "es": "Abre un archivo para empezar.",
+    "occorrenze": 1
+  }
+]

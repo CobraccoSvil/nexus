@@ -601,7 +601,7 @@ export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
             type="button"
             onClick={() => setDrawerTree(true)}
             style={iconBtn(tc)}
-            aria-label="tree"
+            aria-label={t("wiki.tree")}
           >
             ☰
           </button>
@@ -681,7 +681,7 @@ export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
             type="button"
             onClick={() => setDrawerRail(true)}
             style={iconBtn(tc)}
-            aria-label="rail"
+            aria-label={t("wiki.rail")}
           >
             ☷
           </button>
@@ -838,7 +838,7 @@ export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
           onMouseDown={(e) =>
             startPaneDrag(e, treeWidth, setTreeWidth, "right", PANE_MIN_TREE)
           }
-          title="Trascina per ridimensionare la sidebar"
+          title={t("wiki.trascinaPerRidimensionareLa")}
         />
       )}
       {isTablet && treeColumn}
@@ -854,7 +854,7 @@ export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
           onMouseDown={(e) =>
             startPaneDrag(e, railWidth, setRailWidth, "left", PANE_MIN_RAIL)
           }
-          title="Trascina per ridimensionare il pannello dettagli"
+          title={t("wiki.trascinaPerRidimensionareIl")}
         />
       )}
       {isDesktop && tab !== "triples" && tab !== "graph" && rail}

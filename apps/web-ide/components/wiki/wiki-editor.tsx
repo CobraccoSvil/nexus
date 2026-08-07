@@ -6,6 +6,7 @@
 import * as React from "react";
 import { MarkdownBlock } from "../chat/markdown-renderer";
 import { useThemeColors } from "../../lib/theme";
+import { useI18n } from "../../lib/i18n";
 
 interface Props {
   draftTitle: string;
@@ -26,6 +27,7 @@ export function WikiEditor({
   setDraftBody,
   onWikiLink,
 }: Props) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
@@ -46,7 +48,7 @@ export function WikiEditor({
             color: tc.textSecondary,
           }}
         >
-          Titolo
+          {t("wiki.titolo")}
           <input
             value={draftTitle}
             onChange={(e) => setDraftTitle(e.target.value)}
@@ -72,7 +74,7 @@ export function WikiEditor({
             color: tc.textSecondary,
           }}
         >
-          Tag (separati da virgola)
+          {t("wiki.tagSeparatiDaVirgola")}
           <input
             value={draftTags}
             onChange={(e) => setDraftTags(e.target.value)}
@@ -118,7 +120,7 @@ export function WikiEditor({
           }}
         >
           <div style={{ fontSize: 11, color: tc.textSecondary, marginBottom: 6 }}>
-            Anteprima live
+            {t("wiki.anteprimaLive")}
           </div>
           <MarkdownBlock
             content={draftBody}

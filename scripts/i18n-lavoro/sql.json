@@ -1,0 +1,37 @@
+[
+  {
+    "chiave": "sql.eseguiCtrlEnter",
+    "it": "Esegui (Ctrl+Enter)",
+    "en": "Run (Ctrl+Enter)",
+    "es": "Ejecutar (Ctrl+Enter)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sql.leQueryDdlCreate",
+    "it": "Le query DDL (CREATE/ALTER/DROP) verranno archiviate automaticamente in Knowledge Base e come file migration nel progetto.",
+    "en": "DDL queries (CREATE/ALTER/DROP) are archived automatically in the knowledge base and as a migration file in the project.",
+    "es": "Las consultas DDL (CREATE/ALTER/DROP) se archivan automaticamente en la base de conocimiento y como archivo de migracion en el proyecto.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sql.clickPerRicaricareNell",
+    "it": "Click per ricaricare nell'editor",
+    "en": "Click to load it back into the editor",
+    "es": "Haz clic para volver a cargarla en el editor",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sql.eseguiUnaQueryCtrl",
+    "it": "Esegui una query (Ctrl+Enter) per vedere i risultati qui.",
+    "en": "Run a query (Ctrl+Enter) to see the results here.",
+    "es": "Ejecuta una consulta (Ctrl+Enter) para ver los resultados aqui.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sql.cronologiaQuestaSessione",
+    "it": "Cronologia (questa sessione)",
+    "en": "History (this session)",
+    "es": "Historial (esta sesion)",
+    "occorrenze": 1
+  }
+]

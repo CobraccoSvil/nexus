@@ -1,6 +1,7 @@
 "use client";
 
 import type { AgentStep } from "../../lib/api-client";
+import { useI18n } from "../../lib/i18n";
 
 /**
  * Banner "Nessun provider AI disponibile": appare quando il routing Rust ha
@@ -19,6 +20,7 @@ export function ProviderUnavailableBanner({
   providersInCooldown: string[];
   tc: Record<string, string>;
 }) {
+  const { t } = useI18n();
   return (
     <div style={{
       background: "rgba(239,68,68,0.10)",
@@ -36,7 +38,7 @@ export function ProviderUnavailableBanner({
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <span style={{ fontSize: 16 }}>⚠</span>
         <span style={{ fontWeight: 700, color: "#ef4444" }}>
-          Nessun provider AI disponibile
+          {t("chat.nessunProviderAiDisponibile")}
         </span>
       </div>
       <div style={{ lineHeight: 1.5 }}>
@@ -66,7 +68,7 @@ export function ProviderUnavailableBanner({
             fontWeight: 600,
           }}
         >
-          Configurazione provider
+          {t("chat.configurazioneProvider")}
         </button>
       </div>
     </div>

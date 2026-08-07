@@ -7,6 +7,7 @@ import type { PanelTab } from "../panels/bottom-panel-manager";
 import { QuotaBadge } from "../panels/quota-badge";
 import { iconButton, panelTabs } from "./shell-helpers";
 import { PanelTabButton } from "./panel-tabs";
+import { useI18n } from "../../lib/i18n";
 
 export function BottomPanelHeader({
   tc,
@@ -21,6 +22,7 @@ export function BottomPanelHeader({
   activeProject: UserProjectDetails | null;
   onSelectTab: (tab: PanelTab) => void;
 }) {
+  const { t } = useI18n();
   const scorrevoleRef = useRef<HTMLDivElement>(null);
   const [scorribile, setScorribile] = useState({ sinistra: false, destra: false });
 
@@ -107,8 +109,8 @@ export function BottomPanelHeader({
             type="button"
             onClick={() => scorri(-1)}
             disabled={!scorribile.sinistra}
-            title="Tab precedenti"
-            aria-label="Tab precedenti"
+            title={t("shell.tabPrecedenti")}
+            aria-label={t("shell.tabPrecedenti")}
             style={frecciaStyle(scorribile.sinistra)}
           >
             ‹
@@ -117,8 +119,8 @@ export function BottomPanelHeader({
             type="button"
             onClick={() => scorri(1)}
             disabled={!scorribile.destra}
-            title="Tab successivi"
-            aria-label="Tab successivi"
+            title={t("shell.tabSuccessivi")}
+            aria-label={t("shell.tabSuccessivi")}
             style={frecciaStyle(scorribile.destra)}
           >
             ›

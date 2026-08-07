@@ -4,10 +4,11 @@ import dynamic from "next/dynamic";
 import { AutoWidthSelect } from "../auto-width-select";
 import { iconButton } from "../../lib/icon-button-style";
 import type { ChatHeadPopoverProps } from "./chat-head-popover";
+import { useI18n } from "../../lib/i18n";
 
 // Stesso chunk lazy del popover: Next lo deduplica, si carica una volta sola.
 const ProfileSelector = dynamic(() => import("./profile-selector.lazy"), {
-  loading: () => <div style={{ fontSize: 12, opacity: 0.6 }}>Caricamento…</div>,
+  loading: () => <div style={{ fontSize: 12, opacity: 0.6 }}>…</div>,
   ssr: false,
 });
 
@@ -39,6 +40,7 @@ export function ChatHeadInline({
   onCompactSession,
   ctxPct,
 }: ChatHeadPopoverProps) {
+  const { t } = useI18n();
   const coloreCtx =
     ctxPct == null ? tc.textMuted : ctxPct >= 90 ? tc.error : ctxPct >= 70 ? tc.warning : tc.textMuted;
 
@@ -62,7 +64,7 @@ export function ChatHeadInline({
           if (id) onSelectSession(id);
         }}
         disabled={sessions.length === 0}
-        title="Seleziona sessione chat"
+        title={t("chat.selezionaSessioneChat")}
         ariaLabel="Seleziona sessione chat"
         style={{
           borderRadius: 999,
@@ -81,8 +83,8 @@ export function ChatHeadInline({
       <button
         type="button"
         onClick={onNewSession}
-        title="Nuova chat"
-        aria-label="Nuova chat"
+        title={t("chat.nuovaChat")}
+        aria-label={t("chat.nuovaChat")}
         style={iconButton(tc)}
       >
         ＋
@@ -91,8 +93,8 @@ export function ChatHeadInline({
         type="button"
         disabled={!activeSessionId}
         onClick={onRenameSession}
-        title="Rinomina chat"
-        aria-label="Rinomina chat"
+        title={t("chat.rinominaChat")}
+        aria-label={t("chat.rinominaChat")}
         style={iconButton(tc, !activeSessionId)}
       >
         ✎
@@ -101,8 +103,8 @@ export function ChatHeadInline({
         type="button"
         disabled={!activeSessionId}
         onClick={onDeleteSession}
-        title="Elimina chat"
-        aria-label="Elimina chat"
+        title={t("chat.eliminaChat")}
+        aria-label={t("chat.eliminaChat")}
         style={iconButton(tc, !activeSessionId)}
       >
         🗑

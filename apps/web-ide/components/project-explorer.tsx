@@ -13,6 +13,7 @@ import {
 import { useThemeColors } from "../lib/theme";
 import { shortenAbsolutePath } from "../lib/format";
 import { ModalPortal } from "./modal-portal";
+import { useI18n } from "../lib/i18n";
 
 type TreeMap = Record<string, WorkspaceTreeNode[]>;
 
@@ -71,6 +72,7 @@ export function ProjectExplorer({
   /** Chiamato dopo rename: il parent aggiorna eventuali tab aperti (oldPath -> newPath). */
   onFileRenamed?: (oldPath: string, newPath: string) => void;
 }) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [nodesByPath, setNodesByPath] = useState<TreeMap>({});
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
@@ -523,7 +525,7 @@ export function ProjectExplorer({
             <div>
               {loadingPaths[node.path] && (
                 <div style={{ paddingLeft: 24 + depth * 14, color: tc.textMuted, fontSize: 12 }}>
-                  Caricamento...
+                  {t("radice.caricamento")}
                 </div>
               )}
               {renderNodes(node.path, depth + 1)}
@@ -640,6 +642,7 @@ function ExplorerContextMenu({
   onNewFileInDir: (n: WorkspaceTreeNode) => void | Promise<void>;
   onNewDirInDir: (n: WorkspaceTreeNode) => void | Promise<void>;
 }) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -694,7 +697,7 @@ function ExplorerContextMenu({
     >
       {!isDirectory && (
         <button style={itemStyle} onClick={() => void onOpen(node)} role="menuitem">
-          Apri
+          {t("radice.apri")}
         </button>
       )}
       {isDirectory && (
@@ -705,7 +708,7 @@ function ExplorerContextMenu({
             role="menuitem"
             disabled={!canWrite}
           >
-            Nuovo file qui...
+            {t("radice.nuovoFileQui")}
           </button>
           <button
             style={canWrite ? itemStyle : { ...itemStyle, opacity: 0.5, cursor: "not-allowed" }}
@@ -713,7 +716,7 @@ function ExplorerContextMenu({
             role="menuitem"
             disabled={!canWrite}
           >
-            Nuova cartella qui...
+            {t("radice.nuovaCartellaQui")}
           </button>
           <div style={separatorStyle} />
         </>
@@ -724,7 +727,7 @@ function ExplorerContextMenu({
         role="menuitem"
         disabled={!canWrite}
       >
-        Rinomina...
+        {t("radice.rinomina")}
       </button>
       <button
         style={canWrite ? itemStyle : { ...itemStyle, opacity: 0.5, cursor: "not-allowed" }}
@@ -732,7 +735,7 @@ function ExplorerContextMenu({
         role="menuitem"
         disabled={!canWrite}
       >
-        Sposta...
+        {t("radice.sposta")}
       </button>
       {!isDirectory && (
         <button
@@ -741,12 +744,12 @@ function ExplorerContextMenu({
           role="menuitem"
           disabled={!canWrite}
         >
-          Duplica
+          {t("radice.duplica")}
         </button>
       )}
       <div style={separatorStyle} />
       <button style={itemStyle} onClick={() => void onCopyPath(node)} role="menuitem">
-        Copia path
+        {t("radice.copiaPath")}
       </button>
       <div style={separatorStyle} />
       <button
@@ -755,7 +758,7 @@ function ExplorerContextMenu({
         role="menuitem"
         disabled={!canWrite}
       >
-        Cancella
+        {t("radice.cancella")}
       </button>
     </div>
   );
@@ -783,6 +786,7 @@ function ExplorerModal({
   onResolveConfirm: (value: boolean) => void;
   onResolvePrompt: (value: string | null) => void;
 }) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const inputRef = useRef<HTMLInputElement>(null);
   const okButtonRef = useRef<HTMLButtonElement>(null);
@@ -939,7 +943,7 @@ function ExplorerModal({
                 cursor: "pointer",
               }}
             >
-              Annulla
+              {t("radice.annulla")}
             </button>
           )}
           <button
@@ -987,6 +991,7 @@ function ExplorerBreadcrumb({
   currentPath: string;
   onNavigate: (path: string) => void;
 }) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   // Calcola i segmenti: ogni parte del path con il path cumulativo.
   const segments = currentPath
@@ -1039,7 +1044,7 @@ function ExplorerBreadcrumb({
         paddingBottom: 8,
         borderBottom: `1px solid ${tc.border ?? "transparent"}`,
       }}
-      aria-label="Path corrente"
+      aria-label={t("radice.pathCorrente")}
       title={currentPath ? `${rootTitle}/${currentPath}` : rootTitle}
     >
       <button

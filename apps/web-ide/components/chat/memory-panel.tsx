@@ -12,6 +12,7 @@ import {
   toggleProjectMemory,
   type ProjectMemory,
 } from "../../lib/api-client";
+import { useI18n } from "../../lib/i18n";
 
 interface MemoryPanelProps {
   projectId: string;
@@ -19,6 +20,7 @@ interface MemoryPanelProps {
 }
 
 export function MemoryPanel({ projectId, onClose }: MemoryPanelProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [memories, setMemories] = useState<ProjectMemory[]>([]);
   const [loading, setLoading] = useState(true);
@@ -132,7 +134,7 @@ export function MemoryPanel({ projectId, onClose }: MemoryPanelProps) {
         <div style={{ flex: 1, overflowY: "auto", padding: "12px 20px 20px" }}>
           {loading && (
             <div style={{ textAlign: "center", padding: 30, color: tc.textMuted, fontSize: 12 }}>
-              Caricamento...
+              {t("chat.caricamento2")}
             </div>
           )}
           {!loading && memories.length === 0 && (
@@ -141,7 +143,7 @@ export function MemoryPanel({ projectId, onClose }: MemoryPanelProps) {
               color: tc.textMuted, fontSize: 13,
             }}>
               <div style={{ fontSize: 28, marginBottom: 10 }}>🔮</div>
-              Nessuna memoria salvata.<br />
+              {t("chat.nessunaMemoriaSalvata")}<br />
               <span style={{ fontSize: 11 }}>
                 Usa &quot;Compatta e salva in memoria&quot; dal menu di una chat per salvare un riassunto.
               </span>

@@ -3,6 +3,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import type { CSSProperties } from "react";
 import { executeProjectCommand } from "../../lib/api-client";
+import { useI18n } from "../../lib/i18n";
 
 type ExecState = "idle" | "running" | "success" | "error" | "blocked";
 
@@ -88,6 +89,7 @@ const stateLabels: Record<ExecState, string> = {
 };
 
 export function ExecutableCodeBlock({ code, language, projectId, tc }: Props) {
+  const { t } = useI18n();
   const ck = cacheKey(projectId, code);
   const cached = execCache.get(ck);
 
@@ -215,7 +217,7 @@ export function ExecutableCodeBlock({ code, language, projectId, tc }: Props) {
           )}
           <button
             type="button"
-            title="Copia comando"
+            title={t("chat.copiaComando")}
             onClick={handleCopy}
             style={btnStyle(tc.textSecondary)}
             onMouseEnter={(e) => { e.currentTarget.style.background = tc.bgHover ?? "#f3f3f3"; }}
@@ -284,7 +286,7 @@ export function ExecutableCodeBlock({ code, language, projectId, tc }: Props) {
               letterSpacing: 0.3,
             }}
           >
-            OUTPUT
+            {t("badge.output")}
           </button>
           <pre
             style={{

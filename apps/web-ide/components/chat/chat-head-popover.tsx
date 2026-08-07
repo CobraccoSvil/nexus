@@ -134,7 +134,7 @@ export function ChatHeadPopover({
         ref={triggerRef}
         type="button"
         onClick={() => setOpen((v) => !v)}
-        title="Testata chat: profilo, sessioni e azioni"
+        title={t("chat.testataChatProfiloSessioni")}
         aria-haspopup="dialog"
         aria-expanded={open}
         style={{
@@ -175,7 +175,7 @@ export function ChatHeadPopover({
           <div
             ref={pannelloRef}
             role="dialog"
-            aria-label="Testata chat"
+            aria-label={t("chat.testataChat")}
             style={{
               position: "fixed",
               top: coord.top,

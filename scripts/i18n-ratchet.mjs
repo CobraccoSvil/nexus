@@ -36,12 +36,20 @@ import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { NEUTRI } from "./i18n-neutri.mjs";
+
 const RADICE = join(fileURLToPath(new URL(".", import.meta.url)), "..");
 const COMPONENTI = join(RADICE, "apps", "web-ide", "components");
 const BASELINE = join(RADICE, "scripts", "i18n-baseline.json");
 
 const ATTR = /(?:title|placeholder|aria-label)=(?:"([^"]{3,})"|\{"([^"]{3,})"\})/g;
-const JSX = />\s*([A-ZÀ-Ù][^<>{}\n]{3,60}?)\s*</g;
+// Il `>` di apertura non deve essere quello di una FRECCIA: `=> Promise<void>`
+// in una firma di funzione dava «Promise» come testo visibile, e cosi' erano
+// contate decine di firme in tutta la web-ide. Un ratchet che conta il CODICE
+// non misura il testo, e la sua baseline si gonfia di cio' che nessuno leggera'
+// mai a schermo — misurato: 73 residue di cui la grande maggioranza erano
+// `=> Promise<`.
+const JSX = /(?<!=)>\s*([A-ZÀ-Ù][^<>{}\n]{3,60}?)\s*</g;
 
 function* tsx(dir) {
   for (const voce of readdirSync(dir)) {
@@ -56,8 +64,15 @@ function conta() {
   let totale = 0;
   for (const file of tsx(COMPONENTI)) {
     const sorgente = readFileSync(file, "utf8");
-    const n =
-      (sorgente.match(ATTR) ?? []).length + (sorgente.match(JSX) ?? []).length;
+    // Le voci NEUTRE non sono debito: lo strumento di estrazione si rifiuta
+    // di proporle, quindi contarle qui darebbe un residuo che nessuno puo'
+    // ripagare. Punto unico della lista: `i18n-neutri.mjs`.
+    const nonNeutre = (re) =>
+      [...sorgente.matchAll(re)].filter((m) => {
+        const testo = (m[2] ?? m[3] ?? m[1] ?? "").trim();
+        return testo && !NEUTRI.has(testo);
+      }).length;
+    const n = nonNeutre(ATTR) + nonNeutre(JSX);
     if (!n) continue;
     const rel = relative(COMPONENTI, file).split(/[\\/]/);
     const area = rel.length > 1 ? rel[0] : "radice";

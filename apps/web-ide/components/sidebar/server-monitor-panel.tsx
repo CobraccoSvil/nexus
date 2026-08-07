@@ -188,7 +188,7 @@ export function ServerMonitorPanel() {
         overflowX: "auto",
       }}>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 36px 30px", color: tc.textMuted, marginBottom: 2, gap: 4 }}>
-          <span>COMANDO</span><span style={{ textAlign: "right" }}>CPU%</span><span style={{ textAlign: "right" }}>MEM%</span>
+          <span>{t("badge.comando")}</span><span style={{ textAlign: "right" }}>CPU%</span><span style={{ textAlign: "right" }}>MEM%</span>
         </div>
         {processes.slice(0, 12).map((p) => (
           <div key={p.pid} style={{ display: "grid", gridTemplateColumns: "1fr 36px 30px", gap: 4, lineHeight: 1.7 }}>

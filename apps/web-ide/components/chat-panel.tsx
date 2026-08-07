@@ -1224,12 +1224,12 @@ export function ChatPanel({
                 background: `${tc.warning}18`,
               }}
             >
-              Seleziona o registra un progetto per usare la chat AI.
+              {t("radice.selezionaORegistraUn")}
             </div>
           )}
 
           {hasProject && !isReady && (
-            <div className="text-xs" style={{ color: tc.textMuted }}>Caricamento sessione chat...</div>
+            <div className="text-xs" style={{ color: tc.textMuted }}>{t("radice.caricamentoSessioneChat")}</div>
           )}
 
           {messages.length === 0 && hasProject && isReady && (
@@ -1304,7 +1304,7 @@ export function ChatPanel({
                   whiteSpace: "nowrap",
                 }}
               >
-                Tu (reinvio in corso)
+                {t("radice.tuReinvioInCorso")}
               </div>
               <p style={{ margin: 0, whiteSpace: "pre-wrap", color: tc.text }}>
                 {resendPreview.content}

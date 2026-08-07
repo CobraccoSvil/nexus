@@ -443,6 +443,7 @@ function Th({
   onResizeStart?: (ev: React.MouseEvent) => void;
   tc?: ThemeColors;
 }) {
+  const { t } = useI18n();
   return (
     <th
       style={{
@@ -469,7 +470,7 @@ function Th({
           onMouseDown={onResizeStart}
           // Doppio-click resetta a "auto-fit" approssimato (200px), utile come
           // scorciatoia. Spiegato nel title.
-          title="Trascina per ridimensionare la colonna"
+          title={t("wiki.trascinaPerRidimensionareLa2")}
           style={{
             position: "absolute",
             top: 0,

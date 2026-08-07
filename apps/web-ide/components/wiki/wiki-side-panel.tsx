@@ -7,6 +7,7 @@ import * as React from "react";
 import { useThemeColors } from "../../lib/theme";
 import type { WikiBacklink } from "./wiki-scope";
 import type { Heading } from "./markdown-wiki-extras";
+import { useI18n } from "../../lib/i18n";
 
 interface Props {
   headings: Heading[];
@@ -21,6 +22,7 @@ export function WikiSidePanel({
   outgoing,
   onNavigate,
 }: Props) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   return (
     <aside
@@ -34,10 +36,10 @@ export function WikiSidePanel({
         fontSize: 12,
       }}
     >
-      <div style={{ fontWeight: 700, marginBottom: 6 }}>Sommario</div>
+      <div style={{ fontWeight: 700, marginBottom: 6 }}>{t("wiki.sommario")}</div>
       {headings.length === 0 && (
         <div style={{ color: tc.textSecondary, fontStyle: "italic" }}>
-          Nessun titolo
+          {t("wiki.nessunTitolo")}
         </div>
       )}
       {headings.map((h, idx) => (
@@ -88,6 +90,7 @@ function LinksSection({
   links: WikiBacklink[];
   onNavigate: (id: string) => void;
 }) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   return (
     <>
@@ -96,7 +99,7 @@ function LinksSection({
       </div>
       {links.length === 0 && (
         <div style={{ color: tc.textSecondary, fontStyle: "italic" }}>
-          Nessuno
+          {t("wiki.nessuno")}
         </div>
       )}
       {links.map((b, idx) => (

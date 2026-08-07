@@ -169,11 +169,11 @@ export function ProviderBudgetRow({
           {compact ? "Budget mensile" : it.provider}
           {exhausted ? (
             <span style={{ marginLeft: 8, fontSize: 11, padding: "2px 8px", borderRadius: 4, background: "rgba(239,68,68,0.15)", color: "#c00" }}>
-              ESAURITO
+              {t("badge.esaurito")}
             </span>
           ) : !hasBudget ? (
             <span style={{ marginLeft: 8, fontSize: 11, padding: "2px 8px", borderRadius: 4, background: "var(--color-border)", color: "var(--color-textMuted)" }}>
-              NON IMPOSTATO
+              {t("badge.nonImpostato")}
             </span>
           ) : null}
         </div>

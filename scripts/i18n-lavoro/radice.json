@@ -1,0 +1,345 @@
+[
+  {
+    "chiave": "radice.annulla",
+    "it": "Annulla",
+    "en": "Cancel",
+    "es": "Cancelar",
+    "occorrenze": 3
+  },
+  {
+    "chiave": "radice.segnalaErrore",
+    "it": "Segnala errore",
+    "en": "Report an error",
+    "es": "Informar de un error",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "radice.selettoreProgetto",
+    "it": "Selettore progetto",
+    "en": "Project selector",
+    "es": "Selector de proyecto",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "radice.gestisciProgetti",
+    "it": "Gestisci progetti",
+    "en": "Manage projects",
+    "es": "Gestionar proyectos",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "radice.eliminaProgetto",
+    "it": "Elimina progetto",
+    "en": "Delete project",
+    "es": "Eliminar el proyecto",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "radice.apriAreaAdmin",
+    "it": "Apri area Admin",
+    "en": "Open the admin area",
+    "es": "Abrir el area de administracion",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "radice.apriIde",
+    "it": "Apri IDE",
+    "en": "Open the IDE",
+    "es": "Abrir el IDE",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "radice.admin",
+    "it": "Admin",
+    "en": "Admin",
+    "es": "Administracion",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "radice.configurazioneAvanzata",
+    "it": "Configurazione avanzata",
+    "en": "Advanced configuration",
+    "es": "Configuracion avanzada",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.selezionaORegistraUn",
+    "it": "Seleziona o registra un progetto per usare la chat AI.",
+    "en": "Select or register a project to use the AI chat.",
+    "es": "Selecciona o registra un proyecto para usar el chat de IA.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.caricamentoSessioneChat",
+    "it": "Caricamento sessione chat...",
+    "en": "Loading chat session...",
+    "es": "Cargando la sesion de chat...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.tuReinvioInCorso",
+    "it": "Tu (reinvio in corso)",
+    "en": "You (resending)",
+    "es": "Tu (reenviando)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.esLaRispostaHa",
+    "it": "Es: La risposta ha identificato erroneamente un pattern JSX come N+1 query…",
+    "en": "E.g. The answer wrongly identified a JSX pattern as an N+1 query…",
+    "es": "P. ej. La respuesta identifico erroneamente un patron JSX como consulta N+1…",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.lasciaCheLAi",
+    "it": "Lascia che l'AI analizzi la risposta e suggerisca una descrizione",
+    "en": "Let the AI analyse the answer and suggest a description",
+    "es": "Deja que la IA analice la respuesta y sugiera una descripcion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.descriviLAposErrore",
+    "it": "Descrivi l&apos;errore della risposta AI:",
+    "en": "Describe what is wrong with the AI answer:",
+    "es": "Describe el error de la respuesta de la IA:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.ctrlEnterPerConfermare",
+    "it": "Ctrl+Enter per confermare · Esc per annullare",
+    "en": "Ctrl+Enter to confirm - Esc to cancel",
+    "es": "Ctrl+Enter para confirmar - Esc para cancelar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.loading",
+    "it": "Loading...",
+    "en": "Loading...",
+    "es": "Cargando...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.aiWorkspace",
+    "it": "AI Workspace",
+    "en": "AI workspace",
+    "es": "Espacio de trabajo de IA",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.caricamentoChat",
+    "it": "Caricamento chat...",
+    "en": "Loading chat...",
+    "es": "Cargando el chat...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.riprova",
+    "it": "Riprova",
+    "en": "Retry",
+    "es": "Reintentar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.pathCorrente",
+    "it": "Path corrente",
+    "en": "Current path",
+    "es": "Ruta actual",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.caricamento",
+    "it": "Caricamento...",
+    "en": "Loading...",
+    "es": "Cargando...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.apri",
+    "it": "Apri",
+    "en": "Open",
+    "es": "Abrir",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.nuovoFileQui",
+    "it": "Nuovo file qui...",
+    "en": "New file here...",
+    "es": "Nuevo archivo aqui...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.nuovaCartellaQui",
+    "it": "Nuova cartella qui...",
+    "en": "New folder here...",
+    "es": "Nueva carpeta aqui...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.rinomina",
+    "it": "Rinomina...",
+    "en": "Rename...",
+    "es": "Renombrar...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.sposta",
+    "it": "Sposta...",
+    "en": "Move...",
+    "es": "Mover...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.duplica",
+    "it": "Duplica",
+    "en": "Duplicate",
+    "es": "Duplicar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.copiaPath",
+    "it": "Copia path",
+    "en": "Copy path",
+    "es": "Copiar la ruta",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.cancella",
+    "it": "Cancella",
+    "en": "Delete",
+    "es": "Eliminar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.apriInNuovaScheda",
+    "it": "Apri in nuova scheda",
+    "en": "Open in a new tab",
+    "es": "Abrir en una pestana nueva",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.mioProgetto",
+    "it": "mio-progetto",
+    "en": "my-project",
+    "es": "mi-proyecto",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.httpsGithubComUtente",
+    "it": "https://github.com/utente/repository.git",
+    "en": "https://github.com/user/repository.git",
+    "es": "https://github.com/usuario/repositorio.git",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.nomeProgettoOpzionale",
+    "it": "Nome progetto (opzionale)",
+    "en": "Project name (optional)",
+    "es": "Nombre del proyecto (opcional)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.selezionaProgetto",
+    "it": "Seleziona progetto",
+    "en": "Select project",
+    "es": "Selecciona el proyecto",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.progetti",
+    "it": "Progetti",
+    "en": "Projects",
+    "es": "Proyectos",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.nessunProgettoClonaUn",
+    "it": "Nessun progetto. Clona un repository per iniziare.",
+    "en": "No project. Clone a repository to get started.",
+    "es": "Ningun proyecto. Clona un repositorio para empezar.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.nuovoProgettoLocale",
+    "it": "Nuovo progetto locale",
+    "en": "New local project",
+    "es": "Nuevo proyecto local",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.registrazioneProgettoInCorso",
+    "it": "Registrazione progetto in corso…",
+    "en": "Registering the project…",
+    "es": "Registrando el proyecto…",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.cloneDaGithub",
+    "it": "Clone da GitHub",
+    "en": "Clone from GitHub",
+    "es": "Clonar desde GitHub",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.nessunRepositoryTrovatoNell",
+    "it": "Nessun repository trovato nell&apos;account GitHub.",
+    "en": "No repository found in the GitHub account.",
+    "es": "No se ha encontrado ningun repositorio en la cuenta de GitHub.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.oppureInserisciUnUrl",
+    "it": "Oppure inserisci un URL manualmente:",
+    "en": "Or enter a URL manually:",
+    "es": "O introduce una URL manualmente:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.cloneInCorsoAttendere",
+    "it": "Clone in corso, attendere…",
+    "en": "Cloning, please wait…",
+    "es": "Clonando, espera…",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.lAposOperazioneNon",
+    "it": "L&apos;operazione non è reversibile.",
+    "en": "This operation cannot be undone.",
+    "es": "Esta operacion no se puede deshacer.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.ciSono",
+    "it": "Ci sono",
+    "en": "There are",
+    "es": "Hay",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.vuoiProcedereUgualmenteLe",
+    "it": "Vuoi procedere ugualmente? Le modifiche andranno",
+    "en": "Do you want to proceed anyway? The changes will be",
+    "es": "Quieres continuar igualmente? Los cambios se",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.eliminaComunque",
+    "it": "Elimina comunque",
+    "en": "Delete anyway",
+    "es": "Eliminar de todos modos",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.nuovoTerminale",
+    "it": "Nuovo terminale",
+    "en": "New terminal",
+    "es": "Nueva terminal",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "radice.pannelloAdmin",
+    "it": "Pannello Admin",
+    "en": "Admin panel",
+    "es": "Panel de administracion",
+    "occorrenze": 1
+  }
+]

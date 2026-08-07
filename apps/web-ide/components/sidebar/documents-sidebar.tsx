@@ -277,7 +277,7 @@ export function DocumentsSidebar({ project, onOpenInEditor }: DocumentsSidebarPr
           }}
         >
           <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 8, fontWeight: 600 }}>
-            GENERA DOCUMENTO
+            {t("badge.generaDoc")}
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
             {DOC_TYPES.map((docType) => (

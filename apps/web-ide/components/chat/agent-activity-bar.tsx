@@ -8,6 +8,7 @@ import {
   formatDuration,
   interruptButtonView,
 } from "./interrupt-button-logic";
+import { useI18n } from "../../lib/i18n";
 
 /**
  * Barra di stato "AI in esecuzione": riassume lo stato del run agente in corso
@@ -69,6 +70,7 @@ export function AgentActivityBar({
    *  durata del run, quindi ospitarlo non costa altezza. */
   trailing?: ReactNode;
 }) {
+  const { t } = useI18n();
   const interrupt = interruptButtonView({
     runElapsedSeconds,
     secondsSinceLastStep,
@@ -157,7 +159,7 @@ export function AgentActivityBar({
         ) : null}
         {isAgentRunning && (
           <span
-            title="Tempo trascorso dall'avvio del run"
+            title={t("chat.tempoTrascorsoDallAvvio")}
             style={{
               fontSize: 10,
               // Neutro: il cronometro dice il TEMPO, non un giudizio. Sopra i

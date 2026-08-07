@@ -12,6 +12,7 @@ import {
 } from "../lib/api-client";
 import { useThemeColors } from "../lib/theme";
 import { shortenAbsolutePath } from "../lib/format";
+import { useI18n } from "../lib/i18n";
 
 function iconButtonStyle(
   tc: ReturnType<typeof useThemeColors>,
@@ -53,6 +54,7 @@ type ProjectSwitcherProps = {
 };
 
 export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefreshProjects, compact = false }: ProjectSwitcherProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [isPending, startTransition] = useTransition();
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -171,8 +173,8 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
             if (!next) return;
             startTransition(() => { void onSelect(next); });
           }}
-          title="Selettore progetto"
-          aria-label="Selettore progetto"
+          title={t("radice.selettoreProgetto")}
+          aria-label={t("radice.selettoreProgetto")}
           style={{
             minWidth: compact ? 140 : 220,
             maxWidth: compact ? 220 : 360,
@@ -185,7 +187,7 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
             width: "100%",
           }}
         >
-          <option value="">Seleziona progetto</option>
+          <option value="">{t("radice.selezionaProgetto")}</option>
           {projects.map((project) => (
             <option key={project.id} value={project.id}>
               {project.name}{project.isShared ? " [shared]" : ""}
@@ -196,8 +198,8 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
         <button
           type="button"
           onClick={() => setIsModalOpen(true)}
-          title="Gestisci progetti"
-          aria-label="Gestisci progetti"
+          title={t("radice.gestisciProgetti")}
+          aria-label={t("radice.gestisciProgetti")}
           style={{
             ...iconButtonStyle(tc, false, isModalOpen),
             width: compact ? 28 : 32,
@@ -241,7 +243,7 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
           >
             {/* Header */}
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <div style={{ color: tc.text, fontWeight: 700, fontSize: 14 }}>Progetti</div>
+              <div style={{ color: tc.text, fontWeight: 700, fontSize: 14 }}>{t("radice.progetti")}</div>
               <button
                 type="button"
                 onClick={() => setIsModalOpen(false)}
@@ -255,7 +257,7 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
             <div style={{ display: "flex", flexDirection: "column", gap: 2, maxHeight: 280, overflowY: "auto" }}>
               {projects.length === 0 && (
                 <div style={{ fontSize: 12, color: tc.textMuted, padding: "8px 0" }}>
-                  Nessun progetto. Clona un repository per iniziare.
+                  {t("radice.nessunProgettoClonaUn")}
                 </div>
               )}
               {projects.map((project) => {
@@ -306,7 +308,7 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
                     <button
                       type="button"
                       onClick={() => { window.open("/?project=" + project.id, "_blank"); }}
-                      title="Apri in nuova scheda"
+                      title={t("radice.apriInNuovaScheda")}
                       style={iconButtonStyle(tc)}
                     >
                       ⧉
@@ -317,7 +319,7 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
                       type="button"
                       disabled={isDeleting}
                       onClick={() => requestDelete(project)}
-                      title="Elimina progetto"
+                      title={t("radice.eliminaProgetto")}
                       style={iconButtonStyle(tc, isDeleting, false, true)}
                     >
                       {isDeleting ? "…" : "🗑"}
@@ -336,7 +338,7 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
             {/* Nuovo progetto locale: solo nome cartella (risolto contro projects_base_root). */}
             <div style={{ borderTop: `1px solid ${tc.border}`, paddingTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
               <div style={{ color: tc.textSecondary, fontSize: 12, fontWeight: 600 }}>
-                Nuovo progetto locale
+                {t("radice.nuovoProgettoLocale")}
               </div>
               <div style={{ fontSize: 11, color: tc.textMuted }}>
                 Indica il nome della cartella. Verra&apos; creata (se non esiste) dentro la directory progetti configurata e registrata come progetto Nexus.
@@ -347,7 +349,7 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
                   value={importFolder}
                   onChange={(e) => setImportFolder(e.target.value)}
                   onKeyDown={(e) => { if (e.key === "Enter" && !importBusy) void handleImport(); }}
-                  placeholder="mio-progetto"
+                  placeholder={t("radice.mioProgetto")}
                   disabled={importBusy}
                   style={{
                     flex: 1,
@@ -383,13 +385,13 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
                 </button>
               </div>
               {importError && <div style={{ fontSize: 12, color: tc.error }}>{importError}</div>}
-              {importBusy && <div style={{ fontSize: 12, color: tc.textMuted, fontStyle: "italic" }}>Registrazione progetto in corso…</div>}
+              {importBusy && <div style={{ fontSize: 12, color: tc.textMuted, fontStyle: "italic" }}>{t("radice.registrazioneProgettoInCorso")}</div>}
             </div>
 
             {/* Clone from GitHub */}
             <div style={{ borderTop: `1px solid ${tc.border}`, paddingTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
               <div style={{ color: tc.textSecondary, fontSize: 12, fontWeight: 600 }}>
-                Clone da GitHub
+                {t("radice.cloneDaGithub")}
               </div>
 
               {/* GitHub repo list (shown when connected) */}
@@ -462,11 +464,11 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
                   )}
                   {!reposLoading && githubRepos.length === 0 && (
                     <div style={{ fontSize: 11, color: tc.textMuted, padding: "4px 2px" }}>
-                      Nessun repository trovato nell&apos;account GitHub.
+                      {t("radice.nessunRepositoryTrovatoNell")}
                     </div>
                   )}
                   <div style={{ fontSize: 11, color: tc.textMuted }}>
-                    Oppure inserisci un URL manualmente:
+                    {t("radice.oppureInserisciUnUrl")}
                   </div>
                 </div>
               )}
@@ -477,7 +479,7 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
                 value={cloneUrl}
                 onChange={(e) => setCloneUrl(e.target.value)}
                 onKeyDown={(e) => { if (e.key === "Enter" && !cloneBusy) void handleClone(); }}
-                placeholder="https://github.com/utente/repository.git"
+                placeholder={t("radice.httpsGithubComUtente")}
                 disabled={cloneBusy}
                 style={{
                   width: "100%",
@@ -495,7 +497,7 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
                   type="text"
                   value={cloneName}
                   onChange={(e) => setCloneName(e.target.value)}
-                  placeholder="Nome progetto (opzionale)"
+                  placeholder={t("radice.nomeProgettoOpzionale")}
                   disabled={cloneBusy}
                   style={{
                     flex: 1,
@@ -530,7 +532,7 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
                 </button>
               </div>
               {cloneError && <div style={{ fontSize: 12, color: tc.error }}>{cloneError}</div>}
-              {cloneBusy && <div style={{ fontSize: 12, color: tc.textMuted, fontStyle: "italic" }}>Clone in corso, attendere…</div>}
+              {cloneBusy && <div style={{ fontSize: 12, color: tc.textMuted, fontStyle: "italic" }}>{t("radice.cloneInCorsoAttendere")}</div>}
             </div>
           </div>
         </div>
@@ -582,13 +584,13 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
               <div style={{ fontSize: 13, color: tc.textSecondary, lineHeight: 1.5 }}>
                 Questa operazione eliminerà il progetto dal database e rimuoverà
                 la directory locale in modo <strong>permanente</strong>.<br />
-                L&apos;operazione non è reversibile.
+                {t("radice.lAposOperazioneNon")}
               </div>
             )}
 
             {ds.phase === "dirty" && (
               <div style={{ fontSize: 13, color: tc.textSecondary, lineHeight: 1.5 }}>
-                Ci sono <strong>{ds.dirtyCount} file non committati</strong> in{" "}
+                {t("radice.ciSono")} <strong>{ds.dirtyCount} file non committati</strong> in{" "}
                 <code
                   style={{ fontSize: 11, background: tc.bgInput, padding: "1px 4px", borderRadius: 4 }}
                   title={ds.rootPath}
@@ -597,7 +599,7 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
                   {shortenAbsolutePath(ds.rootPath)}
                 </code>
                 .<br /><br />
-                Vuoi procedere ugualmente? Le modifiche andranno <strong>perse definitivamente</strong>.
+                {t("radice.vuoiProcedereUgualmenteLe")} <strong>perse definitivamente</strong>.
               </div>
             )}
 
@@ -615,7 +617,7 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
                   fontSize: 13,
                 }}
               >
-                Annulla
+                {t("radice.annulla")}
               </button>
 
               {ds.phase === "dirty" && (
@@ -633,7 +635,7 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
                     fontWeight: 600,
                   }}
                 >
-                  Elimina comunque
+                  {t("radice.eliminaComunque")}
                 </button>
               )}
 
@@ -652,7 +654,7 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
                     fontWeight: 600,
                   }}
                 >
-                  Elimina progetto
+                  {t("radice.eliminaProgetto")}
                 </button>
               )}
             </div>

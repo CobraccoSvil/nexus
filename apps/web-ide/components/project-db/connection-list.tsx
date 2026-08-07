@@ -119,7 +119,7 @@ export function ConnectionList({
                     fontWeight: 600,
                   }}
                 >
-                  PRIMARY
+                  {t("badge.primary")}
                 </span>
               )}
             </div>

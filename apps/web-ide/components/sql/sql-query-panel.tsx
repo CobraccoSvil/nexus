@@ -11,6 +11,7 @@ import {
   type UserProjectDetails,
 } from "../../lib/api-client";
 import { AutoWidthSelect } from "../auto-width-select";
+import { useI18n } from "../../lib/i18n";
 
 const MonacoEditor = dynamic(
   async () => (await import("@monaco-editor/react")).default,
@@ -33,6 +34,7 @@ interface HistoryEntry {
 const PLACEHOLDER_SQL = "-- Scrivi una query SQL ed esegui con Ctrl+Enter\n-- Esempio: SELECT * FROM users LIMIT 10;\n\n";
 
 export function SqlQueryPanel({ project }: SqlQueryPanelProps) {
+  const { t } = useI18n();
   const { resolved } = useTheme();
   const tc = useThemeColors();
   const [sql, setSql] = useState<string>(PLACEHOLDER_SQL);
@@ -266,7 +268,7 @@ export function SqlQueryPanel({ project }: SqlQueryPanelProps) {
             flexShrink: 0,
             whiteSpace: "nowrap",
           }}
-          title="Esegui (Ctrl+Enter)"
+          title={t("sql.eseguiCtrlEnter")}
         >
           {loading ? "Eseguo…" : "Esegui (Ctrl+Enter)"}
         </button>
@@ -285,7 +287,7 @@ export function SqlQueryPanel({ project }: SqlQueryPanelProps) {
               textOverflow: "ellipsis",
               whiteSpace: "nowrap",
             }}
-            title="Le query DDL (CREATE/ALTER/DROP) verranno archiviate automaticamente in Knowledge Base e come file migration nel progetto."
+            title={t("sql.leQueryDdlCreate")}
           >
             schema-change → KB + migration
           </span>
@@ -350,21 +352,21 @@ export function SqlQueryPanel({ project }: SqlQueryPanelProps) {
 
         {!error && !result && (
           <div style={{ color: tc.textMuted, padding: 8 }}>
-            Esegui una query (Ctrl+Enter) per vedere i risultati qui.
+            {t("sql.eseguiUnaQueryCtrl")}
           </div>
         )}
 
         {history.length > 0 && (
           <div style={{ marginTop: 12, borderTop: `1px solid ${tc.border}`, paddingTop: 8 }}>
             <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 4 }}>
-              Cronologia (questa sessione)
+              {t("sql.cronologiaQuestaSessione")}
             </div>
             {history.map((h) => (
               <button
                 type="button"
                 key={h.id}
                 onClick={() => setSql(h.sql)}
-                title="Click per ricaricare nell'editor"
+                title={t("sql.clickPerRicaricareNell")}
                 style={{
                   display: "block",
                   width: "100%",

@@ -1,6 +1,7 @@
 "use client";
 
 import type { useThemeColors } from "../../lib/theme";
+import { useI18n } from "../../lib/i18n";
 
 type LiveHealth = {
   // Stato di mcp-core (porta 4000). Dopo l'eliminazione del brain Python la chat
@@ -19,6 +20,7 @@ export function ShellOverlays({
   projectError: string | null;
   liveHealth: LiveHealth;
 }) {
+  const { t } = useI18n();
   return (
     <>
       {projectBusy && (
@@ -35,7 +37,7 @@ export function ShellOverlays({
             fontSize: 12,
           }}
         >
-          Caricamento progetto...
+          {t("shell.caricamentoProgetto")}
         </div>
       )}
 

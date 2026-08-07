@@ -91,7 +91,7 @@ export function HeroSplit() {
             fontWeight: 500,
           }}
         >
-          Nexus IDE Preview
+          {t("landing.nexusIdePreview")}
         </div>
       </div>
     </div>

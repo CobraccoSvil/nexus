@@ -45,18 +45,18 @@ export function UserHeader() {
       {user.role === "admin" && !isAdminArea && (
         <a
           href="/admin"
-          title="Apri area Admin"
-          aria-label="Apri area Admin"
+          title={t("radice.apriAreaAdmin")}
+          aria-label={t("radice.apriAreaAdmin")}
           style={stili.admin}
         >
-          Admin
+          {t("radice.admin")}
         </a>
       )}
       {user.role === "admin" && isAdminArea && (
         <a
           href="/"
-          title="Apri IDE"
-          aria-label="Apri IDE"
+          title={t("radice.apriIde")}
+          aria-label={t("radice.apriIde")}
           style={stili.ide}
         >
           IDE
@@ -206,7 +206,7 @@ export function UserSidebarMenu({
                   textTransform: "uppercase",
                   letterSpacing: "0.06em",
                 }}>
-                  Admin
+                  {t("radice.admin")}
                 </span>
               )}
             </div>
@@ -215,7 +215,7 @@ export function UserSidebarMenu({
           {/* Voci menu */}
           {user.role === "admin" && (
             <MenuLink href="/admin" tc={tc} onClick={() => setOpen(false)}>
-              Pannello Admin
+              {t("radice.pannelloAdmin")}
             </MenuLink>
           )}
           <MenuLink href="/?site" tc={tc} onClick={() => setOpen(false)}>

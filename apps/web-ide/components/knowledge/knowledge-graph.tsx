@@ -21,6 +21,7 @@ import {
   type KnowledgeGraphData,
   type MetaDocsGraphData,
 } from "../../lib/api-client";
+import { useI18n } from "../../lib/i18n";
 
 cytoscape.use(coseBilkent);
 
@@ -57,6 +58,7 @@ const INTENT_COLOR: Record<string, string> = {
 };
 
 export function KnowledgeGraph(props: Props) {
+  const { t } = useI18n();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cyRef = useRef<Core | null>(null);
   const [data, setData] = useState<KnowledgeGraphData | MetaDocsGraphData | null>(null);
@@ -301,12 +303,12 @@ export function KnowledgeGraph(props: Props) {
               checked={hideAutoLinks}
               onChange={(e) => setHideAutoLinks(e.target.checked)}
             />
-            Nascondi link automatici
+            {t("knowledge.nascondiLinkAutomatici")}
           </label>
 
           {props.mode === "project" && (
             <label style={{ fontSize: 12, color: "#525252", display: "flex", alignItems: "center", gap: 4 }}>
-              Confidence min:
+              {t("knowledge.confidenceMin")}
               <input
                 type="range"
                 min={0}
@@ -331,7 +333,7 @@ export function KnowledgeGraph(props: Props) {
               cursor: "pointer",
             }}
           >
-            Aggiorna
+            {t("knowledge.aggiorna")}
           </button>
           <button
             onClick={props.onClose}
@@ -345,7 +347,7 @@ export function KnowledgeGraph(props: Props) {
               cursor: "pointer",
             }}
           >
-            Chiudi
+            {t("knowledge.chiudi")}
           </button>
         </div>
 
@@ -366,12 +368,12 @@ export function KnowledgeGraph(props: Props) {
         <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
           {loading && !data && (
             <div style={{ padding: 32, textAlign: "center", color: "#a3a3a3", fontSize: 13 }}>
-              Caricamento grafo...
+              {t("knowledge.caricamentoGrafo")}
             </div>
           )}
           {!loading && data && data.nodes.length === 0 && (
             <div style={{ padding: 32, textAlign: "center", color: "#a3a3a3", fontSize: 13 }}>
-              Nessuna nota nel vault. Aggiungi note per popolare il grafo.
+              {t("knowledge.nessunaNotaNelVault")}
             </div>
           )}
           <div
@@ -395,7 +397,7 @@ export function KnowledgeGraph(props: Props) {
             <span>Nodi: {data.stats.nodes_count}</span>
             <span>Edge: {data.stats.edges_count}</span>
             <span style={{ marginLeft: "auto" }}>
-              Scroll = zoom, drag = pan, click = seleziona nodo
+              {t("knowledge.scrollZoomDragPan")}
             </span>
           </div>
         )}

@@ -4,6 +4,7 @@ import { useState } from "react";
 import type { SavedChatAttachment } from "../../lib/api-client";
 import { useThemeColors } from "../../lib/theme";
 import { ModalPortal } from "../modal-portal";
+import { useI18n } from "../../lib/i18n";
 
 /* ------------------------------------------------------------------ */
 /* AttachmentIndexDialog                                              */
@@ -25,6 +26,7 @@ export function AttachmentIndexDialog({
   onConfirm: (attachmentIds: string[]) => void | Promise<void>;
   tc: ReturnType<typeof useThemeColors>;
 }) {
+  const { t } = useI18n();
   // Stato di selezione: default = solo i 'text' pre-spuntati.
   // Gli 'binary' restano disabilitati (backend rifiuta comunque).
   const initialSelected = new Set<string>(
@@ -59,7 +61,7 @@ export function AttachmentIndexDialog({
     <div
       role="dialog"
       aria-modal="true"
-      aria-label="Indicizzazione allegati nella Knowledge Base"
+      aria-label={t("chat.indicizzazioneAllegatiNellaKnowledge")}
       style={{
         position: "fixed",
         inset: 0,
@@ -91,7 +93,7 @@ export function AttachmentIndexDialog({
         }}
       >
         <div style={{ color: tc.text, fontWeight: 700, fontSize: 15 }}>
-          Indicizzare nella Knowledge Base?
+          {t("chat.indicizzareNellaKnowledgeBase")}
         </div>
         <div style={{ color: tc.textSecondary, fontSize: 12 }}>
           Gli allegati salvati possono essere aggiunti alla KB del progetto come
@@ -186,7 +188,7 @@ export function AttachmentIndexDialog({
               fontFamily: "inherit",
             }}
           >
-            Salta tutto
+            {t("chat.saltaTutto")}
           </button>
           <button
             type="button"

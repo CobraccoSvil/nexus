@@ -1,4 +1,5 @@
 "use client";
+import { useI18n } from "../../lib/i18n";
 
 interface PricingTierProps {
   name: string;
@@ -17,6 +18,7 @@ export function PricingTier({
   highlighted = false,
   currency = "€",
 }: PricingTierProps) {
+  const { t } = useI18n();
   return (
     <div
       style={{
@@ -49,7 +51,7 @@ export function PricingTier({
             letterSpacing: "0.05em",
           }}
         >
-          Popular
+          {t("landing.popular")}
         </div>
       )}
 

@@ -6,6 +6,7 @@ import { useThemeColors } from "../../lib/theme";
 import type { AITraceEvent } from "../../lib/api-client";
 import { formatCostUsd as formatCost, traceCost } from "../../lib/model-catalog";
 import { usePricingCatalog, type ModelPricingEntry } from "./provider-badge";
+import { useI18n } from "../../lib/i18n";
 
 // Il costo di una trace lo calcola `traceCost` (lib/model-catalog.ts), dove un
 // test puo' raggiungerlo: scritto qui dentro nessuno lo misurerebbe, perche' il
@@ -228,6 +229,7 @@ function CompactTraceCard({
 
 // Componente principale — header collassabile + lista trace
 export function InlineTracePanel({ traces }: { traces: AITraceEvent[] }) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [open, setOpen] = useState(false);
   // Hook PRIMA dell'early return: le regole degli hook non ammettono rami.
@@ -279,7 +281,7 @@ export function InlineTracePanel({ traces }: { traces: AITraceEvent[] }) {
           textAlign: "left",
         }}
       >
-        <span style={{ color: tc.textMuted }}>Trace AI</span>
+        <span style={{ color: tc.textMuted }}>{t("chat.traceAi")}</span>
         <span style={{ fontFamily: 'var(--font-mono)', color: tc.textMuted }}>
           {traces.length} iter · ↑{totalInput} ↓{totalOutput}
           {totalCache > 0 && <span style={{ color: tc.success }}> ⚡{totalCache}</span>}

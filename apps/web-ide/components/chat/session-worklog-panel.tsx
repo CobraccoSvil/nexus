@@ -4,6 +4,7 @@ import { useCallback, useState } from "react";
 
 import { getSessionWorklog } from "../../lib/api/chat";
 import { useThemeColors } from "../../lib/theme";
+import { useI18n } from "../../lib/i18n";
 
 /** Pannello collassabile "Cosa e' stato fatto in questa sessione": mostra il
     digest provider-neutro della storia di lavoro (mig 0411) — file toccati,
@@ -12,6 +13,7 @@ import { useThemeColors } from "../../lib/theme";
     l'LLM, reso visibile all'utente per chiudere il "non si capisce cosa e' stato
     fatto". */
 export function SessionWorklogPanel({ sessionId }: { sessionId: string | null }) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -107,7 +109,7 @@ export function SessionWorklogPanel({ sessionId }: { sessionId: string | null })
             </pre>
           ) : (
             <div style={{ color: tc.textMuted, fontSize: 12 }}>
-              Nessuna attivita' registrata in questa sessione.
+              {t("chat.nessunaAttivitaRegistrataIn")}
             </div>
           )}
           <button
@@ -125,7 +127,7 @@ export function SessionWorklogPanel({ sessionId }: { sessionId: string | null })
               fontFamily: "inherit",
             }}
           >
-            Aggiorna
+            {t("chat.aggiorna")}
           </button>
         </div>
       ) : null}

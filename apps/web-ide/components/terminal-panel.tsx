@@ -15,6 +15,7 @@ import {
   messaggioErroreTerminale,
   ritardoRiconnessioneMs,
 } from "./terminal-reconnect-logic";
+import { useI18n } from "../lib/i18n";
 
 interface TerminalTab {
   id: string;
@@ -407,6 +408,7 @@ export function TerminalPanel({
   // es. il BottomPanelManager che alimenta il pannello Debug.
   onOutput?: (chunk: string) => void;
 }) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const { resolved } = useTheme();
   const isDark = resolved === "dark";
@@ -643,7 +645,7 @@ export function TerminalPanel({
         ))}
         <button
           onClick={addTab}
-          title="Nuovo terminale"
+          title={t("radice.nuovoTerminale")}
           style={{
             background: "none",
             border: "none",

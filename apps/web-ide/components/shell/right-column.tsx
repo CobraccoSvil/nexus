@@ -5,6 +5,7 @@ import type { ReactNode } from "react";
 import type { useThemeColors } from "../../lib/theme";
 import type { UserProjectDetails } from "../../lib/api-client";
 import { RightViewTabs } from "./panel-tabs";
+import { useI18n } from "../../lib/i18n";
 
 // Stesso dynamic import che viveva in ide-shell: il pannello SQL e' pesante e va
 // caricato solo quando la linguetta lo seleziona, non nel bundle dello shell.
@@ -13,7 +14,7 @@ const SqlQueryPanel = dynamic(
   {
     loading: () => (
       <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12 }}>
-        Caricamento pannello SQL…
+        …
       </div>
     ),
     ssr: false,
@@ -44,6 +45,7 @@ export function RightColumn({
   project: UserProjectDetails | null;
   editor: ReactNode;
 }) {
+  const { t } = useI18n();
   return (
     <div
       style={{

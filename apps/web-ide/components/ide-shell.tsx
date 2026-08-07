@@ -93,6 +93,7 @@ import {
   mainAreaAvailableWidth,
   rightSidebarBounds,
 } from "./shell/panel-sizing-logic";
+import { useI18n } from "../lib/i18n";
 
 // Dynamic imports per componenti pesanti IDE
 const ChatPanel = dynamic(() => import("./chat-panel.lazy"), {
@@ -116,12 +117,13 @@ const BottomPanelManager = dynamic(() => import("./panels/bottom-panel-manager.l
 });
 
 const ProfileEditor = dynamic(() => import("./chat/profile-editor.lazy"), {
-  loading: () => <div>Loading...</div>,
+  loading: () => <div>…</div>,
   ssr: false,
 });
 
 
 export function IdeShell({ dashboard, initialProjectId }: { dashboard: DashboardSnapshot; initialProjectId?: string }) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const { promptDialog, confirmDialog, alertDialog } = useGlobalDialog();
   // Polling client-side dello health: il prop `dashboard` è uno snapshot SSR
@@ -1370,7 +1372,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
             flexShrink: 8,
           }}
         >
-          AI Workspace
+          {t("radice.aiWorkspace")}
         </div>
         {/* Testata della chat: distesa in riga quando i controlli ci stanno,
             raccolta nel popover (l'hamburger) quando non ci stanno. ChatHead
@@ -1459,7 +1461,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               fontSize: 13,
             }}
           >
-            Caricamento chat...
+            {t("radice.caricamentoChat")}
           </div>
         ) : null}
         {!multiChat.activeTabId && !multiChat.isLoading && multiChat.error ? (
@@ -1491,7 +1493,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
                 cursor: "pointer",
               }}
             >
-              Riprova
+              {t("radice.riprova")}
             </button>
           </div>
         ) : null}

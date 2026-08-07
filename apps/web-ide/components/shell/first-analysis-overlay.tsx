@@ -1,6 +1,7 @@
 "use client";
 
 import type { useThemeColors } from "../../lib/theme";
+import { useI18n } from "../../lib/i18n";
 
 export function FirstAnalysisOverlay({
   tc,
@@ -15,6 +16,7 @@ export function FirstAnalysisOverlay({
   onAnalyze: () => void;
   onSkip: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <div
       style={{
@@ -85,7 +87,7 @@ export function FirstAnalysisOverlay({
               fontFamily: "inherit",
             }}
           >
-            Analizza progetto
+            {t("shell.analizzaProgetto")}
           </button>
         )}
         {!analysisInProgress && (
@@ -103,7 +105,7 @@ export function FirstAnalysisOverlay({
                 fontFamily: "inherit",
               }}
             >
-              Salta e continua senza analisi
+              {t("shell.saltaEContinuaSenza")}
             </button>
           </div>
         )}

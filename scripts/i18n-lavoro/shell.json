@@ -1,0 +1,108 @@
+[
+  {
+    "chiave": "shell.statoProviderAi",
+    "it": "Stato provider AI",
+    "en": "AI provider status",
+    "es": "Estado de los proveedores de IA",
+    "occorrenze": 3
+  },
+  {
+    "chiave": "shell.tabPrecedenti",
+    "it": "Tab precedenti",
+    "en": "Previous tabs",
+    "es": "Pestanas anteriores",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "shell.tabSuccessivi",
+    "it": "Tab successivi",
+    "en": "Next tabs",
+    "es": "Pestanas siguientes",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "shell.analizzaProgetto",
+    "it": "Analizza progetto",
+    "en": "Analyse the project",
+    "es": "Analizar el proyecto",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "shell.saltaEContinuaSenza",
+    "it": "Salta e continua senza analisi",
+    "en": "Skip and continue without analysis",
+    "es": "Omitir y continuar sin analisis",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "shell.chiudiNotifica",
+    "it": "Chiudi notifica",
+    "en": "Close the notification",
+    "es": "Cerrar la notificacion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "shell.caricamentoPannelloSql",
+    "it": "Caricamento pannello SQL…",
+    "en": "Loading the SQL panel…",
+    "es": "Cargando el panel SQL…",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "shell.caricamentoProgetto",
+    "it": "Caricamento progetto...",
+    "en": "Loading project...",
+    "es": "Cargando el proyecto...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "shell.redis",
+    "it": "Redis",
+    "en": "Redis",
+    "es": "Redis",
+    "occorrenze": 1,
+    "neutro": true
+  },
+  {
+    "chiave": "shell.core",
+    "it": "Core",
+    "en": "Core",
+    "es": "Nucleo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "shell.tools",
+    "it": "Tools",
+    "en": "Tools",
+    "es": "Herramientas",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "shell.dettaglioStatoProviderAi",
+    "it": "Dettaglio stato provider AI",
+    "en": "AI provider status details",
+    "es": "Detalle del estado de los proveedores de IA",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "shell.vediSito",
+    "it": "Vedi sito",
+    "en": "View site",
+    "es": "Ver el sitio",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "shell.providerAi",
+    "it": "Provider AI",
+    "en": "AI providers",
+    "es": "Proveedores de IA",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "shell.editorNascosto",
+    "it": "Editor nascosto",
+    "en": "Editor hidden",
+    "es": "Editor oculto",
+    "occorrenze": 1
+  }
+]

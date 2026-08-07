@@ -1,0 +1,58 @@
+[
+  {
+    "chiave": "knowledge.chiudi",
+    "it": "Chiudi",
+    "en": "Close",
+    "es": "Cerrar",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "knowledge.nascondiLinkAutomatici",
+    "it": "Nascondi link automatici",
+    "en": "Hide automatic links",
+    "es": "Ocultar los enlaces automaticos",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "knowledge.confidenceMin",
+    "it": "Confidence min:",
+    "en": "Min confidence:",
+    "es": "Confianza min.:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "knowledge.aggiorna",
+    "it": "Aggiorna",
+    "en": "Refresh",
+    "es": "Actualizar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "knowledge.caricamentoGrafo",
+    "it": "Caricamento grafo...",
+    "en": "Loading the graph...",
+    "es": "Cargando el grafo...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "knowledge.nessunaNotaNelVault",
+    "it": "Nessuna nota nel vault. Aggiungi note per popolare il grafo.",
+    "en": "No note in the vault. Add notes to populate the graph.",
+    "es": "Ninguna nota en el vault. Anade notas para poblar el grafo.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "knowledge.scrollZoomDragPan",
+    "it": "Scroll = zoom, drag = pan, click = seleziona nodo",
+    "en": "Scroll = zoom, drag = pan, click = select node",
+    "es": "Rueda = zoom, arrastrar = desplazar, clic = seleccionar nodo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "knowledge.questaRichiestaSembra",
+    "it": "Questa richiesta sembra",
+    "en": "This request looks",
+    "es": "Esta solicitud parece",
+    "occorrenze": 1
+  }
+]

@@ -35,6 +35,7 @@ import {
 import { FigureReportRow } from "./activity-stream";
 import type { ActivityStream, FigureAdvisoryReport } from "../../lib/use-chat/activity-stream";
 import type { AgentPendingAction } from "../../lib/api/agent";
+import { useI18n } from "../../lib/i18n";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
@@ -71,6 +72,7 @@ export function RunNotifications({
   isConfirming?: boolean;
   tc: ThemeColors;
 }) {
+  const { t } = useI18n();
   const notifications = useMemo(
     () => deriveRunNotifications(stream, runStatus, tc),
     [stream, runStatus, tc],
@@ -253,7 +255,7 @@ export function RunNotifications({
         ref={bellRef}
         type="button"
         onClick={() => setOpen((v) => !v)}
-        title="Centro notifiche del run"
+        title={t("chat.centroNotificheDelRun")}
         aria-label={`Notifiche del run (${count}${unread > 0 ? `, ${unread} nuove` : ""})`}
         aria-expanded={open}
         style={{
@@ -300,7 +302,7 @@ export function RunNotifications({
         <div
           ref={panelRef}
           role="dialog"
-          aria-label="Notifiche del run"
+          aria-label={t("chat.notificheDelRun")}
           style={{
             // `fixed` DENTRO il portal: la barra di stato che ospita la
             // campanella e' alta 48px con overflow:hidden, e ritagliava il
@@ -346,12 +348,12 @@ export function RunNotifications({
                 fontWeight: 700,
               }}
             >
-              Notifiche del run
+              {t("chat.notificheDelRun")}
             </div>
             <button
               type="button"
               onClick={() => setOpen(false)}
-              aria-label="Chiudi notifiche"
+              aria-label={t("chat.chiudiNotifiche")}
               style={{
                 border: "none",
                 background: "transparent",
@@ -504,7 +506,7 @@ export function RunNotifications({
                         title={filePath}
                         style={{ ...smallBtnStyle, color: tc.accent, borderColor: tc.accent }}
                       >
-                        Apri nell'editor
+                        {t("chat.apriNellEditor")}
                       </button>
                     )}
                   </div>
@@ -561,7 +563,7 @@ export function RunNotifications({
               }}
             >
               <div style={{ fontSize: 10.5, fontWeight: 600, color: tc.textSecondary }}>
-                Azioni in attesa:
+                {t("chat.azioniInAttesa")}
               </div>
               {pendingActions!.map((action, idx) => {
                 // Approvazione del PIANO (mig 0676): la pending action porta le
@@ -617,7 +619,7 @@ export function RunNotifications({
                         title={path}
                         style={{ ...smallBtnStyle, alignSelf: "flex-start", color: tc.accent, borderColor: tc.accent }}
                       >
-                        Apri il file
+                        {t("chat.apriIlFile")}
                       </button>
                     )}
                   </div>
@@ -664,7 +666,7 @@ export function RunNotifications({
                     fontSize: 11,
                   }}
                 >
-                  Annulla
+                  {t("chat.annulla")}
                 </button>
               </div>
             </div>

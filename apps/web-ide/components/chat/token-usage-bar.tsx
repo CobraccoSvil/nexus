@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { useThemeColors } from "../../lib/theme";
+import { useI18n } from "../../lib/i18n";
 
 export interface TokenUsageBarProps {
   sessionId?: string;
@@ -24,6 +25,7 @@ export function TokenUsageBar({
   lastInputTokens,
   modelLabel,
 }: TokenUsageBarProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [expanded, setExpanded] = useState(false);
 
@@ -152,26 +154,26 @@ export function TokenUsageBar({
           }}
         >
           <div style={{ fontWeight: 600, marginBottom: 6, color: tc.textMuted }}>
-            Dettaglio sessione
+            {t("chat.dettaglioSessione")}
           </div>
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
-            <span>Token totali</span>
+            <span>{t("chat.tokenTotali")}</span>
             <span style={{ color: barColor }}>{totalTokens.toLocaleString()}</span>
           </div>
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
-            <span>Costo totale</span>
+            <span>{t("chat.costoTotale")}</span>
             <span style={{ color: barColor }}>{costLabel}</span>
           </div>
           {hasBudget && (
             <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <span>Budget</span>
+              <span>{t("chat.budget")}</span>
               <span>${budgetUsd!.toFixed(2)}</span>
             </div>
           )}
           {hasContext && (
             <>
               <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
-                <span>Ultimo input</span>
+                <span>{t("chat.ultimoInput")}</span>
                 <span style={{ color: barColor }}>
                   {lastInputTokens!.toLocaleString()} token
                 </span>

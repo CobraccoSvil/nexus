@@ -21,6 +21,7 @@ import { WikiTreeNodeView } from "./wiki-tree";
 import { WikiEditor } from "./wiki-editor";
 import { WikiHistory } from "./wiki-history";
 import { WikiSidePanel } from "./wiki-side-panel";
+import { useI18n } from "../../lib/i18n";
 
 interface WikiShellProps {
   scope: WikiScope;
@@ -33,6 +34,7 @@ interface WikiShellProps {
 type ViewMode = "view" | "edit" | "history";
 
 export function WikiShell({ scope, title, toolbar }: WikiShellProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const dialog = useGlobalDialog();
 
@@ -278,7 +280,7 @@ export function WikiShell({ scope, title, toolbar }: WikiShellProps) {
           <input
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
-            placeholder="Filtra documenti..."
+            placeholder={t("wiki.filtraDocumenti")}
             style={{
               width: "100%",
               padding: "6px 8px",
@@ -296,7 +298,7 @@ export function WikiShell({ scope, title, toolbar }: WikiShellProps) {
         </div>
         <div style={{ flex: 1, overflowY: "auto", padding: "6px 0" }}>
           {loadingList ? (
-            <div style={{ padding: 12, color: tc.textSecondary }}>Caricamento...</div>
+            <div style={{ padding: 12, color: tc.textSecondary }}>{t("wiki.caricamento")}</div>
           ) : (
             <WikiTreeNodeView
               node={tree}
@@ -334,7 +336,7 @@ export function WikiShell({ scope, title, toolbar }: WikiShellProps) {
           }}
         >
           {loadingDetail && (
-            <div style={{ color: tc.textSecondary }}>Caricamento...</div>
+            <div style={{ color: tc.textSecondary }}>{t("wiki.caricamento")}</div>
           )}
           {!selected && !loadingDetail && (
             <div style={{ color: tc.textSecondary }}>
@@ -406,6 +408,7 @@ function ContentHeader({
   onCloseHistory: () => void;
   toolbar?: React.ReactNode;
 }) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   return (
     <header
@@ -427,8 +430,8 @@ function ContentHeader({
           <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
             {view === "view" && (
               <>
-                <ToolbarBtn onClick={onEdit}>Modifica</ToolbarBtn>
-                <ToolbarBtn onClick={onHistory}>Cronologia</ToolbarBtn>
+                <ToolbarBtn onClick={onEdit}>{t("wiki.modifica")}</ToolbarBtn>
+                <ToolbarBtn onClick={onHistory}>{t("wiki.cronologia")}</ToolbarBtn>
               </>
             )}
             {view === "edit" && (
@@ -437,18 +440,18 @@ function ContentHeader({
                   {saving ? "Salvataggio..." : dirty ? "Salva" : "Salvato"}
                 </ToolbarBtn>
                 <ToolbarBtn onClick={onCancelEdit} disabled={saving}>
-                  Annulla
+                  {t("wiki.annulla")}
                 </ToolbarBtn>
               </>
             )}
             {view === "history" && (
-              <ToolbarBtn onClick={onCloseHistory}>Chiudi</ToolbarBtn>
+              <ToolbarBtn onClick={onCloseHistory}>{t("wiki.chiudi")}</ToolbarBtn>
             )}
           </div>
         </>
       ) : (
         <div style={{ color: tc.textSecondary }}>
-          Seleziona un documento dall&apos;albero
+          {t("wiki.selezionaUnDocumentoDall")}
         </div>
       )}
       {toolbar && <div style={{ width: "100%" }}>{toolbar}</div>}
@@ -463,6 +466,7 @@ function DocViewer({
   doc: WikiDocDetail;
   onWikiLink: (target: string) => void;
 }) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   return (
     <div>
@@ -489,7 +493,7 @@ function DocViewer({
               border: `1px solid ${tc.border}`,
               borderRadius: 10,
             }}
-            title="Generato dai generatori automatici. Le modifiche manuali sono protette dalla rigenerazione."
+            title={t("wiki.generatoDaiGeneratoriAutomatici")}
           >
             auto-generato
           </span>

@@ -27,9 +27,7 @@ const LAVORO = join(RADICE, "scripts", "i18n-lavoro");
 const ATTR = /(title|placeholder|aria-label)=(?:"([^"]{3,})"|\{"([^"]{3,})"\})/g;
 const JSX = />(\s*)([A-ZÀ-Ù][^<>{}\n]{2,60}?)(\s*)</g;
 
-// Testo che NON e' lingua: sigle, nomi propri, unita'. Tradurli sarebbe
-// peggio che lasciarli — "AI" resta "AI" ovunque.
-const NEUTRI = new Set(["AI", "API", "URL", "ID", "SQL", "DB", "UTF-8", "JSON", "HTTP", "HTTPS", "Nexus", "Promise", "Git", "GitHub"]);
+import { NEUTRI } from "./i18n-neutri.mjs";
 
 function* tsx(dir) {
   for (const v of readdirSync(dir)) {

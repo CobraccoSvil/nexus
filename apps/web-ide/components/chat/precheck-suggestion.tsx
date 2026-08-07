@@ -1,6 +1,7 @@
 "use client";
 
 import type { PrecheckResult } from "../../lib/api-client";
+import { useI18n } from "../../lib/i18n";
 
 /**
  * Widget di suggerimento precheck: mostra il testo corretto, l'eventuale
@@ -24,6 +25,7 @@ export function PrecheckSuggestion({
   onSend: (text: string) => void;
   tc: Record<string, string>;
 }) {
+  const { t } = useI18n();
   return (
     <>
       {precheckPending && (
@@ -40,7 +42,7 @@ export function PrecheckSuggestion({
           gap: 8,
         }}>
           <span style={{ animation: "spin 1s linear infinite", display: "inline-block" }}>⟳</span>
-          Controllo ortografia e contesto…
+          {t("chat.controlloOrtografiaEContesto")}
         </div>
       )}
       {precheckResult && !precheckPending && (
@@ -75,7 +77,7 @@ export function PrecheckSuggestion({
             {precheckResult.correctedText && (
               <div>
                 <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.04em" }}>
-                  Testo corretto
+                  {t("chat.testoCorretto")}
                 </div>
                 <div style={{
                   padding: "6px 8px",
@@ -94,7 +96,7 @@ export function PrecheckSuggestion({
             {precheckResult.contextSuggestion && (
               <div>
                 <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.04em" }}>
-                  Aggiungi contesto
+                  {t("chat.aggiungiContesto")}
                 </div>
                 <div style={{
                   padding: "6px 8px",
@@ -132,7 +134,7 @@ export function PrecheckSuggestion({
                     cursor: "pointer", fontSize: 11, fontWeight: 600,
                   }}
                 >
-                  Usa testo corretto
+                  {t("chat.usaTestoCorretto")}
                 </button>
               )}
               {precheckResult.contextSuggestion && (
@@ -148,7 +150,7 @@ export function PrecheckSuggestion({
                     cursor: "pointer", fontSize: 11,
                   }}
                 >
-                  Aggiungi contesto
+                  {t("chat.aggiungiContesto")}
                 </button>
               )}
               <button
@@ -160,7 +162,7 @@ export function PrecheckSuggestion({
                   cursor: "pointer", fontSize: 11,
                 }}
               >
-                Invia comunque
+                {t("chat.inviaComunque")}
               </button>
             </div>
           </div>

@@ -16,6 +16,7 @@ import {
   summarizeProviderReason,
   type ProviderHealthState,
 } from "./shell-helpers";
+import { useI18n } from "../../lib/i18n";
 
 type ProviderStatusMap = Record<string, ProviderHealthState>;
 
@@ -31,6 +32,7 @@ function ProviderStatusIndicator({
   tc: ReturnType<typeof useThemeColors>;
   providerStatus: ProviderStatusMap;
 }) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -67,8 +69,8 @@ function ProviderStatusIndicator({
       <button
         type="button"
         onClick={() => setOpen((prev) => !prev)}
-        title="Stato provider AI"
-        aria-label="Stato provider AI"
+        title={t("shell.statoProviderAi")}
+        aria-label={t("shell.statoProviderAi")}
         aria-expanded={open}
         style={{
           display: "inline-flex",
@@ -95,7 +97,7 @@ function ProviderStatusIndicator({
       {open && (
         <div
           role="dialog"
-          aria-label="Dettaglio stato provider AI"
+          aria-label={t("shell.dettaglioStatoProviderAi")}
           style={{
             position: "absolute",
             top: "calc(100% + 6px)",
@@ -127,7 +129,7 @@ function ProviderStatusIndicator({
               padding: "2px 6px 6px",
             }}
           >
-            Provider AI
+            {t("shell.providerAi")}
           </div>
           {names.map((name) => {
             const label = providerDisplayLabel(name);
@@ -209,6 +211,7 @@ export function TopBar({
   onRegisterProject: (absolutePath: string, name?: string) => Promise<void>;
   onRefreshProjects: () => Promise<void>;
 }) {
+  const { t } = useI18n();
   return (
     <header
       style={{
@@ -225,7 +228,7 @@ export function TopBar({
     >
       <a
         href="/?site"
-        title="Vedi sito"
+        title={t("shell.vediSito")}
         style={{
           fontSize: 13,
           letterSpacing: "0.08em",
@@ -309,7 +312,7 @@ export function TopBar({
           }}
         >
           <span aria-hidden="true">◫</span>
-          {!isNarrowViewport && <span>Editor nascosto</span>}
+          {!isNarrowViewport && <span>{t("shell.editorNascosto")}</span>}
         </button>
       )}
       <button
@@ -343,7 +346,7 @@ export function TopBar({
           rowGap: isMobileViewport ? 6 : 0,
           whiteSpace: "nowrap",
         }}
-        aria-label="Stato provider AI"
+        aria-label={t("shell.statoProviderAi")}
       >
         <ConnectionStatusBadge compact={isNarrowViewport} />
         <ProviderStatusIndicator tc={tc} providerStatus={providerStatus} />

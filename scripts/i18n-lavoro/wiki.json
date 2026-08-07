@@ -1,0 +1,184 @@
+[
+  {
+    "chiave": "wiki.caricamento",
+    "it": "Caricamento...",
+    "en": "Loading...",
+    "es": "Cargando...",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "wiki.tree",
+    "it": "tree",
+    "en": "tree",
+    "es": "arbol",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.rail",
+    "it": "rail",
+    "en": "rail",
+    "es": "carril",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.trascinaPerRidimensionareLa",
+    "it": "Trascina per ridimensionare la sidebar",
+    "en": "Drag to resize the sidebar",
+    "es": "Arrastra para redimensionar la barra lateral",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.trascinaPerRidimensionareIl",
+    "it": "Trascina per ridimensionare il pannello dettagli",
+    "en": "Drag to resize the details panel",
+    "es": "Arrastra para redimensionar el panel de detalles",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.trascinaPerRidimensionareLa2",
+    "it": "Trascina per ridimensionare la colonna",
+    "en": "Drag to resize the column",
+    "es": "Arrastra para redimensionar la columna",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.titolo",
+    "it": "Titolo",
+    "en": "Title",
+    "es": "Titulo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.tagSeparatiDaVirgola",
+    "it": "Tag (separati da virgola)",
+    "en": "Tags (comma separated)",
+    "es": "Etiquetas (separadas por comas)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.anteprimaLive",
+    "it": "Anteprima live",
+    "en": "Live preview",
+    "es": "Vista previa en vivo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.versione",
+    "it": "Versione",
+    "en": "Version",
+    "es": "Version",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.data",
+    "it": "Data",
+    "en": "Date",
+    "es": "Fecha",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.origine",
+    "it": "Origine",
+    "en": "Source",
+    "es": "Origen",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.autore",
+    "it": "Autore",
+    "en": "Author",
+    "es": "Autor",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.from",
+    "it": "From",
+    "en": "From",
+    "es": "Desde",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.azione",
+    "it": "Azione",
+    "en": "Action",
+    "es": "Accion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.ripristina",
+    "it": "Ripristina",
+    "en": "Restore",
+    "es": "Restaurar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.filtraDocumenti",
+    "it": "Filtra documenti...",
+    "en": "Filter documents...",
+    "es": "Filtrar documentos...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.generatoDaiGeneratoriAutomatici",
+    "it": "Generato dai generatori automatici. Le modifiche manuali sono protette dalla rigenerazione.",
+    "en": "Produced by the automatic generators. Manual edits are protected from regeneration.",
+    "es": "Generado por los generadores automaticos. Las ediciones manuales estan protegidas de la regeneracion.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.modifica",
+    "it": "Modifica",
+    "en": "Edit",
+    "es": "Editar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.cronologia",
+    "it": "Cronologia",
+    "en": "History",
+    "es": "Historial",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.annulla",
+    "it": "Annulla",
+    "en": "Cancel",
+    "es": "Cancelar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.chiudi",
+    "it": "Chiudi",
+    "en": "Close",
+    "es": "Cerrar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.selezionaUnDocumentoDall",
+    "it": "Seleziona un documento dall&apos;albero",
+    "en": "Select a document from the tree",
+    "es": "Selecciona un documento del arbol",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.sommario",
+    "it": "Sommario",
+    "en": "Contents",
+    "es": "Indice",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.nessunTitolo",
+    "it": "Nessun titolo",
+    "en": "No title",
+    "es": "Sin titulo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "wiki.nessuno",
+    "it": "Nessuno",
+    "en": "None",
+    "es": "Ninguno",
+    "occorrenze": 1
+  }
+]

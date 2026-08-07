@@ -605,7 +605,7 @@ function MessageNextActions({
   return (
     <div style={{ marginTop: 8 }} data-testid="chat-next-actions">
       <div style={{ fontSize: 11, fontWeight: 600, color: tc.textMuted, marginBottom: 4 }}>
-        Scegli come proseguire
+        {t("chat.scegliComeProseguire")}
       </div>
       <NextActionsButtons choices={choices} />
     </div>
@@ -640,7 +640,7 @@ function MessageMetaSteps({ steps, tc, t }: { steps: MetaStepEntry[]; tc: ThemeC
       data-testid="message-meta-steps"
     >
       <div style={{ fontSize: 11, fontWeight: 600, color: tc.textMuted, marginBottom: 4 }}>
-        Decisioni del turno
+        {t("chat.decisioniDelTurno")}
       </div>
       {decisionSteps.map((m, idx) => (
         <AgentMetaStepCard key={`meta-${m.kind}-${m.createdAt}-${idx}`} data={m} />
@@ -873,7 +873,7 @@ function AgentRunStepsInline({ runId, tc, t }: { runId: string; tc: ThemeColors;
                       {hasInput && (
                         <div>
                           <div style={{ fontWeight: 600, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.05em", opacity: 0.6, marginBottom: 3 }}>
-                            Parametri
+                            {t("chat.parametri")}
                           </div>
                           <InlineTruncated text={formatStepInput(step.toolInput)} tc={tc} />
                         </div>
@@ -1329,7 +1329,7 @@ export function MessageList({
                     title={t("chat.msg.resent")}
                     aria-label={t("chat.msg.resent")}
                   >
-                    Reinvio
+                    {t("chat.reinvio")}
                   </span>
                 )}
                 {(message.provider || message.model) && (
@@ -1547,7 +1547,7 @@ export function MessageList({
                       cursor: "pointer",
                     }}
                   >
-                    Riattiva
+                    {t("chat.riattiva")}
                   </button>
                 </div>
               )}

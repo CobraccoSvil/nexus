@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useThemeColors } from "../lib/theme";
 import { feedbackAssist } from "../lib/api-client";
 import { ModalPortal } from "./modal-portal";
+import { useI18n } from "../lib/i18n";
 
 interface FeedbackErrorDialogProps {
   /** Contenuto della risposta AI problematica */
@@ -17,6 +18,7 @@ export function FeedbackErrorDialog({
   onConfirm,
   onCancel,
 }: FeedbackErrorDialogProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [description, setDescription] = useState("");
   const [aiLoading, setAiLoading] = useState(false);
@@ -88,7 +90,7 @@ export function FeedbackErrorDialog({
       <div
         role="dialog"
         aria-modal="true"
-        aria-label="Segnala errore"
+        aria-label={t("radice.segnalaErrore")}
         style={{
           width: 520,
           maxWidth: "95vw",
@@ -105,7 +107,7 @@ export function FeedbackErrorDialog({
       >
         {/* Titolo */}
         <div style={{ color: tc.text, fontWeight: 700, fontSize: 14 }}>
-          Segnala errore
+          {t("radice.segnalaErrore")}
         </div>
 
         {/* Anteprima risposta AI */}
@@ -133,7 +135,7 @@ export function FeedbackErrorDialog({
 
         {/* Label */}
         <div style={{ color: tc.textSecondary, fontSize: 13 }}>
-          Descrivi l&apos;errore della risposta AI:
+          {t("radice.descriviLAposErrore")}
         </div>
 
         {/* Textarea ridimensionabile */}
@@ -142,7 +144,7 @@ export function FeedbackErrorDialog({
           value={description}
           onChange={(e) => setDescription(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="Es: La risposta ha identificato erroneamente un pattern JSX come N+1 query…"
+          placeholder={t("radice.esLaRispostaHa")}
           rows={4}
           style={{
             width: "100%",
@@ -188,7 +190,7 @@ export function FeedbackErrorDialog({
             type="button"
             disabled={aiLoading}
             onClick={handleAiAssist}
-            title="Lascia che l'AI analizzi la risposta e suggerisca una descrizione"
+            title={t("radice.lasciaCheLAi")}
             style={{
               display: "flex",
               alignItems: "center",
@@ -216,7 +218,7 @@ export function FeedbackErrorDialog({
               onClick={onCancel}
               style={btnStyle(tc, false)}
             >
-              Annulla
+              {t("radice.annulla")}
             </button>
             <button
               type="button"
@@ -244,7 +246,7 @@ export function FeedbackErrorDialog({
             textAlign: "right",
           }}
         >
-          Ctrl+Enter per confermare · Esc per annullare
+          {t("radice.ctrlEnterPerConfermare")}
         </div>
       </div>
     </div>
