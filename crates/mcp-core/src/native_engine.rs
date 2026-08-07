@@ -922,26 +922,20 @@ async fn resolve_purpose(db: &PgPool, purpose: &str) -> (String, String) {
     }
 }
 
-// ── Coercizione setting tipizzati (parita' 1:1 con `_coerce` del brain) ───────
+// ── Coercizione setting tipizzati: viste locali del punto unico ──────────────
 //
-// Il brain (`orchestrator_config.py::_coerce`) converte il `value` testuale del DB
-// nel tipo del default: bool da `{true,1,yes,on}` (case-insensitive); CSV ->
-// `list[str]` con strip + scarto dei vuoti; int/float con parse e fallback al
-// default. Replichiamo qui la STESSA semantica perche' le config nodi Rust devono
-// coincidere coi valori che il brain calcola dalle medesime chiavi. `get_setting`
-// (punto unico, regola L) gia' fa trim + scarto dei vuoti -> una chiave
-// assente/vuota torna `None` e si usa il default.
+// Le conversioni vivono in `nexus_auth` accanto a `get_setting`, che e' gia' il
+// punto unico della lettura (regola L). Qui restano cinque nomi brevi perche'
+// questo modulo li usa 141 volte, ma NON reimplementano nulla: delegano.
+//
+// Prima erano una copia autonoma, e il commento che la giustificava — "parita'
+// 1:1 con `orchestrator_config.py::_coerce` del brain" — descriveva un accordo
+// con un interlocutore che non esiste piu': il porting a zero-Python e'
+// completo, `brain/` non e' nel repo e `_coerce` non ha piu' occorrenze. Era
+// quel vincolo, ormai fossile, a tenere in vita la semantica divergente che
+// altre tre copie del repo NON condividevano (misurato il 07/08/2026).
 
-/// `value` -> bool con la semantica `_coerce` del brain (`{true,1,yes,on}` truthy).
-fn coerce_bool(raw: &str) -> bool {
-    matches!(
-        raw.trim().to_ascii_lowercase().as_str(),
-        "true" | "1" | "yes" | "on"
-    )
-}
-
-/// `value` CSV -> `Vec<String>` (strip per elemento + scarto dei vuoti), come
-/// `_coerce` sui default di tipo `list`.
+/// `value` CSV -> `Vec<String>` (strip per elemento + scarto dei vuoti).
 fn coerce_csv(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(|s| s.trim().to_string())
@@ -949,37 +943,24 @@ fn coerce_csv(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// Legge un setting bool dal DB (chiave `key`) col fallback al `default` se
-/// assente/vuoto (safe-default identico al brain). Punto unico `get_setting`.
+/// Vista locale di [`nexus_auth::get_bool_setting`].
 async fn setting_bool(db: &PgPool, key: &str, default: bool) -> bool {
-    match nexus_auth::get_setting(db, key).await {
-        Some(raw) => coerce_bool(&raw),
-        None => default,
-    }
+    nexus_auth::get_bool_setting_or(db, key, default).await
 }
 
-/// Legge un setting i64 dal DB col fallback al `default` (parse tollerante: un
-/// valore non parsabile cade sul default, come `_coerce`).
+/// Vista locale di [`nexus_auth::get_i64_setting`].
 async fn setting_i64(db: &PgPool, key: &str, default: i64) -> i64 {
-    nexus_auth::get_setting(db, key)
-        .await
-        .and_then(|raw| raw.trim().parse::<i64>().ok())
-        .unwrap_or(default)
+    nexus_auth::get_i64_setting_or(db, key, default).await
 }
 
-/// Legge un setting f64 dal DB col fallback al `default`.
+/// Vista locale di [`nexus_auth::get_f64_setting`].
 async fn setting_f64(db: &PgPool, key: &str, default: f64) -> f64 {
-    nexus_auth::get_setting(db, key)
-        .await
-        .and_then(|raw| raw.trim().parse::<f64>().ok())
-        .unwrap_or(default)
+    nexus_auth::get_f64_setting_or(db, key, default).await
 }
 
-/// Come [`setting_i64`] per una misura che non puo' essere negativa (byte,
-/// caratteri): un valore negativo in tabella vale zero, che per queste soglie
-/// significa "nessun limite" ed e' una scelta esplicita dell'operatore.
+/// Vista locale di [`nexus_auth::get_usize_setting`].
 async fn setting_usize(db: &PgPool, key: &str, default: usize) -> usize {
-    setting_i64(db, key, default as i64).await.max(0) as usize
+    nexus_auth::get_usize_setting_or(db, key, default).await
 }
 
 /// Legge un setting CSV dal DB col fallback al `default` (lista) se assente/vuoto.

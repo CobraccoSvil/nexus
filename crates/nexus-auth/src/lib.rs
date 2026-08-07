@@ -232,6 +232,76 @@ pub async fn get_csv_setting(db: &PgPool, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Il vocabolario booleano dei settings: PUNTO UNICO (regola L).
+///
+/// `None` non e' un fallimento, e' la terza risposta. `"maybe"` non e' ne'
+/// acceso ne' spento: appartiene a un altro dominio, e degradarlo a uno dei due
+/// significa indovinare. Chi legge riceve `None` e applica la propria
+/// intenzione — la stessa che applicherebbe se la chiave non esistesse, perche'
+/// un valore illeggibile e una chiave assente dicono la stessa cosa: nessuno ha
+/// configurato niente. E' anche la ragione per cui il tipo e' `Option<bool>` e
+/// non `bool` con un default: il default appartiene al chiamante, il
+/// vocabolario a questo modulo.
+///
+/// PERCHE' `off` E' NELLA LISTA. `on` era gia' fra i veri, e la sua simmetrica
+/// non era da nessuna parte. La sua assenza NON era neutra, perche' le copie
+/// sparse per il repo la risolvevano in due modi OPPOSTI (misurato il
+/// 07/08/2026: cinque copie in quattro file, piu' questa):
+///
+///   allowlist  `true|1|yes|on`   -> `off` non e' fra i veri  -> SPENTO
+///   denylist   `false|0|no`      -> `off` non e' fra i falsi -> ACCESO
+///
+/// Le due meta' del sistema leggevano lo stesso valore in modo contrario, e le
+/// chiavi coinvolte sono interruttori di worker (`optimizer_auto_promote`,
+/// `alignment_enabled`): un operatore che avesse scritto `off` per spegnere la
+/// promozione automatica dei prompt se la sarebbe ritrovata accesa. Nessun test
+/// poteva accorgersene, perche' ogni copia era coerente con se stessa — ed e'
+/// la firma di questa classe di difetti: non c'e' un lato sbagliato, manca la
+/// giunzione.
+///
+/// Misurato prima di dichiararlo attivo: al 07/08/2026 nessuna chiave del DB
+/// vivo porta un valore booleano ambiguo — tutte usano `true`/`false`. Era una
+/// trappola armata, non una che stava scattando.
+pub fn parse_setting_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Legge un setting BOOLEANO col `default` gia' applicato. Vista comoda di
+/// [`get_bool_setting`] per i chiamanti che non hanno nulla da dire sull'errore
+/// DB: chiave assente, valore vuoto o fuori vocabolario -> `default`.
+pub async fn get_bool_setting_or(db: &PgPool, key: &str, default: bool) -> bool {
+    get_bool_setting(db, key).await.ok().flatten().unwrap_or(default)
+}
+
+/// Legge un setting INTERO col `default` applicato. Chiave assente o valore non
+/// parsabile -> `default`.
+pub async fn get_i64_setting_or(db: &PgPool, key: &str, default: i64) -> i64 {
+    get_setting(db, key)
+        .await
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
+/// Legge un setting REALE col `default` applicato.
+pub async fn get_f64_setting_or(db: &PgPool, key: &str, default: f64) -> f64 {
+    get_setting(db, key)
+        .await
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .unwrap_or(default)
+}
+
+/// Come [`get_i64_setting_or`] per una misura che non puo' essere negativa
+/// (byte, caratteri, conteggi): un valore negativo in tabella vale zero, che
+/// per queste soglie significa "nessun limite" ed e' una scelta esplicita
+/// dell'operatore, non un errore da respingere.
+pub async fn get_usize_setting_or(db: &PgPool, key: &str, default: usize) -> usize {
+    get_i64_setting_or(db, key, default as i64).await.max(0) as usize
+}
+
 // Scrittura settings: punto unico (regola L / ADR 0026), accanto alla lettura.
 // Prima la stessa logica viveva duplicata in `mcp-core::settings::update_setting`
 // e `admin-service::settings::update_setting`.
@@ -308,11 +378,20 @@ pub async fn update_setting_value(
     Ok(())
 }
 
-/// Legge una setting booleana (`true`/`1`/`yes`/`on` => true). Propaga l'errore DB.
+/// Legge una setting booleana. Propaga l'errore DB.
+///
+/// `None` significa «nessuno ha configurato un booleano leggibile»: chiave
+/// assente, valore vuoto, oppure valore fuori dal vocabolario di
+/// [`parse_setting_bool`]. I trenta chiamanti applicano gia' il proprio
+/// `unwrap_or(default)` su quel `None`, ed e' la ragione per cui il fuori
+/// vocabolario NON viene appiattito a `Some(false)`: appiattirlo significava
+/// dire «l'operatore ha scritto: spento» quando l'operatore aveva scritto
+/// qualcosa che nessuno ha capito, e toglieva al chiamante l'unica occasione
+/// di applicare la propria intenzione.
 pub async fn get_bool_setting(db: &PgPool, key: &str) -> anyhow::Result<Option<bool>> {
     Ok(get_setting_nonempty(db, key)
         .await?
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")))
+        .and_then(|v| parse_setting_bool(&v)))
 }
 
 /// Legge una setting intera. Propaga l'errore DB; valore non numerico => errore.
@@ -1110,6 +1189,56 @@ mod tests {
             Err(StatusCode::INTERNAL_SERVER_ERROR) => {}
             Err(other) => panic!("S90: atteso 500, ricevuto {other}"),
             Ok(v) => panic!("S90: atteso Err(500), ricevuto Ok({v}) - regressione!"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_vocabolario_booleano {
+    use super::parse_setting_bool;
+
+    /// Il caso che ha motivato il punto unico: `off` e' la simmetrica di `on`,
+    /// e le copie sparse la risolvevano in modo OPPOSTO.
+    ///
+    /// MUTAZIONE: togliendo `"off"` dal ramo dei falsi, questo test rosseggia
+    /// col valore del difetto reale — `None` invece di `Some(false)`, cioe' un
+    /// interruttore che ricade sul default del chiamante (spesso "acceso")
+    /// quando l'operatore ha scritto la parola con cui si spegne.
+    #[test]
+    fn off_e_un_falso_dichiarato_non_un_ignoto() {
+        assert_eq!(parse_setting_bool("off"), Some(false));
+        assert_eq!(parse_setting_bool("OFF"), Some(false));
+        assert_eq!(parse_setting_bool("  Off  "), Some(false));
+    }
+
+    /// La simmetria completa del vocabolario.
+    #[test]
+    fn ogni_forma_del_vero_e_del_falso() {
+        for vero in ["true", "1", "yes", "on", "TRUE", " Yes "] {
+            assert_eq!(parse_setting_bool(vero), Some(true), "'{vero}' e' un vero");
+        }
+        for falso in ["false", "0", "no", "off", "FALSE", " No "] {
+            assert_eq!(parse_setting_bool(falso), Some(false), "'{falso}' e' un falso");
+        }
+    }
+
+    /// Cio' che non appartiene al vocabolario non viene indovinato: il
+    /// chiamante ricevera' `None` e applichera' la propria intenzione. E' il
+    /// comportamento che distingue questo punto unico da ENTRAMBE le forme che
+    /// ha sostituito — l'allowlist rispondeva "spento", la denylist "acceso", e
+    /// nessuna delle due sapeva di star tirando a indovinare.
+    ///
+    /// MUTAZIONE: sostituendo `_ => None` con `_ => Some(false)`, questo test
+    /// rosseggia — ed e' esattamente la forma che aveva la vecchia
+    /// `get_bool_setting`, che appiattiva il fuori vocabolario a `Some(false)`.
+    #[test]
+    fn fuori_vocabolario_non_e_ne_acceso_ne_spento() {
+        for ignoto in ["maybe", "disabilitato", "", "  ", "2", "vero"] {
+            assert_eq!(
+                parse_setting_bool(ignoto),
+                None,
+                "'{ignoto}' non appartiene al vocabolario: non si indovina"
+            );
         }
     }
 }

@@ -303,15 +303,7 @@ impl PgMetaReasonerPort {
     /// che accenda una feature). PUNTO UNICO dei 3 kill-switch del meta-reasoner
     /// (`agent.{stall_recovery,orchestration,scale}.enabled`, regola L).
     async fn setting_enabled(&self, key: &str) -> bool {
-        nexus_auth::get_setting(&self.db, key)
-            .await
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "true" | "1" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false)
+        nexus_auth::get_bool_setting_or(&self.db, key, false).await
     }
 
     /// Timeout (s) del setting `key` clampato in `[5, 300]`. Setting assente /

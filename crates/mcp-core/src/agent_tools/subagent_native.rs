@@ -124,9 +124,10 @@ async fn read_subagent_settings(ctx: &AgentToolContext) -> Result<SubagentSettin
     Ok(s)
 }
 
-/// Flag booleano nel formato accettato dalla tabella `settings`.
+/// Flag booleano nel formato accettato dalla tabella `settings`. Vista locale
+/// del vocabolario unico: un valore fuori vocabolario NON accende una soglia.
 fn settings_flag(v: &str) -> bool {
-    matches!(v.to_lowercase().as_str(), "true" | "1" | "yes" | "on")
+    nexus_auth::parse_setting_bool(v).unwrap_or(false)
 }
 
 /// Applica UNA riga di `settings` alle soglie sub-agent (chiave ignota: no-op).

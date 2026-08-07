@@ -282,10 +282,11 @@ pub async fn is_enforcement_enabled(db: &PgPool) -> bool {
     .fetch_optional(db)
     .await
     {
-        Ok(Some(raw)) => {
-            let normalized = raw.trim().to_lowercase();
-            matches!(normalized.as_str(), "true" | "1" | "yes" | "on")
-        }
+        // Vocabolario unico (`nexus_auth::parse_setting_bool`). Il `None` che
+        // ne esce — valore fuori vocabolario — ricade sullo stesso default
+        // fail-closed della chiave assente: un gate di sicurezza non si spegne
+        // perche' qualcuno ha scritto una parola che nessuno ha capito.
+        Ok(Some(raw)) => nexus_auth::parse_setting_bool(&raw).unwrap_or(true),
         Ok(None) => true,
         Err(err) => {
             tracing::warn!(

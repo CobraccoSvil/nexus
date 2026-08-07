@@ -87,6 +87,43 @@ pub struct ServiceEntry {
     pub managed_by: &'static str,
 }
 
+/// Traduce la shape JSON dei primitivi `services::list_*` in una [`ServiceEntry`].
+///
+/// PUNTO DI LETTURA UNICO di quella shape (regola L): i due backend — Windows e
+/// systemd — leggevano gli stessi quattro campi con lo stesso `unwrap_or_default`
+/// ricopiato, e quel JSON e' un contratto senza tipo. Con due letture, bastava
+/// che un primitivo rinominasse `short` in `name` perche' un backend mostrasse
+/// etichette vuote e l'altro no, senza che niente fallisse.
+///
+/// `managed_by_default` e' il gestore da attribuire quando il primitivo non lo
+/// dichiara: su Windows i servizi vengono tutti da li', mentre il ramo systemd
+/// distingue `detached` da `docker-compose` leggendolo dal JSON.
+fn voce_da_json(v: &serde_json::Value, managed_by_default: &'static str) -> ServiceEntry {
+    let stringa = |campo: &str| {
+        v.get(campo)
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let managed_by = match v.get("managed_by").and_then(|s| s.as_str()) {
+        Some("docker-compose") => "docker-compose",
+        Some("detached") => "detached",
+        Some("windows") => "windows",
+        Some("systemd") => "systemd",
+        _ => managed_by_default,
+    };
+    ServiceEntry {
+        id: stringa("unit"),
+        label: stringa("short"),
+        state: ServiceState::normalize_from(
+            v.get("state").and_then(|s| s.as_str()).unwrap_or(""),
+            v.get("sub").and_then(|s| s.as_str()).unwrap_or(""),
+        ),
+        main_pid: None,
+        managed_by,
+    }
+}
+
 /// Esito di un'azione start/stop/restart.
 ///
 /// `acted` e' `true` SOLO se l'operazione ha realmente agito sul servizio
@@ -275,28 +312,8 @@ impl ServiceBackend for WindowsProcessBackend {
         // tipi neutri.
         super::services::list_services_windows(ctx.db, ctx.project_id, ctx.slug)
             .await
-            .into_iter()
-            .map(|v| {
-                let short = v
-                    .get("short")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let unit = v
-                    .get("unit")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let active = v.get("state").and_then(|s| s.as_str()).unwrap_or("");
-                let sub = v.get("sub").and_then(|s| s.as_str()).unwrap_or("");
-                ServiceEntry {
-                    id: unit,
-                    label: short,
-                    state: ServiceState::normalize_from(active, sub),
-                    main_pid: None,
-                    managed_by: "windows",
-                }
-            })
+            .iter()
+            .map(|v| voce_da_json(v, "windows"))
             .collect()
     }
 
@@ -509,33 +526,8 @@ impl ServiceBackend for SystemdUserBackend {
         // compito di una wave successiva. Qui usiamo la fonte robusta.
         super::services::list_services_fallback(ctx.slug, ctx.project_root)
             .await
-            .into_iter()
-            .map(|v| {
-                let short = v
-                    .get("short")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let unit = v
-                    .get("unit")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let active = v.get("state").and_then(|s| s.as_str()).unwrap_or("");
-                let sub = v.get("sub").and_then(|s| s.as_str()).unwrap_or("");
-                // managed_by dal primitivo: "detached" o "docker-compose".
-                let managed_by = match v.get("managed_by").and_then(|s| s.as_str()) {
-                    Some("docker-compose") => "docker-compose",
-                    _ => "detached",
-                };
-                ServiceEntry {
-                    id: unit,
-                    label: short,
-                    state: ServiceState::normalize_from(active, sub),
-                    main_pid: None,
-                    managed_by,
-                }
-            })
+            .iter()
+            .map(|v| voce_da_json(v, "detached"))
             .collect()
     }
 

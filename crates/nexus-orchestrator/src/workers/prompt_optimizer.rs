@@ -57,33 +57,6 @@ impl PromptOptimizerWorker {
     }
 
     /// Legge un setting dalla tabella `settings`. Restituisce il valore grezzo o una stringa vuota.
-    async fn read_setting(&self, key: &str) -> String {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT value FROM settings WHERE key = $1"
-        )
-        .bind(key)
-        .fetch_optional(self.pool.as_ref())
-        .await
-        .unwrap_or(None);
-        row.map(|(v,)| v).unwrap_or_default()
-    }
-
-    async fn read_setting_bool(&self, key: &str, default: bool) -> bool {
-        let raw = self.read_setting(key).await;
-        if raw.is_empty() { return default; }
-        !matches!(raw.trim().to_lowercase().as_str(), "false" | "0" | "no")
-    }
-
-    async fn read_setting_f64(&self, key: &str, default: f64) -> f64 {
-        let raw = self.read_setting(key).await;
-        raw.trim().parse::<f64>().unwrap_or(default)
-    }
-
-    async fn read_setting_i64(&self, key: &str, default: i64) -> i64 {
-        let raw = self.read_setting(key).await;
-        raw.trim().parse::<i64>().unwrap_or(default)
-    }
-
     /// Raccoglie le metriche aggregate per tutti i prompt agente.
     async fn aggregate_metrics(
         &self,
@@ -445,17 +418,20 @@ impl LearningWorker for PromptOptimizerWorker {
         let start = Instant::now();
 
         // ── Legge configurazione dal DB ──────────────────────────────────
-        let enabled = self.read_setting_bool("optimizer_enabled", true).await;
+        let db = self.pool.as_ref();
+        let enabled = nexus_auth::get_bool_setting_or(db, "optimizer_enabled", true).await;
         if !enabled {
             debug!("prompt_optimizer: disabilitato (optimizer_enabled=false)");
             return WorkerOutcome::ok(self.name(), start.elapsed().as_millis() as u64);
         }
 
-        let auto_promote = self.read_setting_bool("optimizer_auto_promote", false).await;
-        let min_runs = self.read_setting_i64("optimizer_min_runs", 30).await;
-        let reflection_threshold = self.read_setting_f64("optimizer_reflection_threshold", 0.65).await;
-        let max_concurrent = self.read_setting_i64("optimizer_max_concurrent_experiments", 3).await;
-        let traffic_pct = self.read_setting_i64("optimizer_canary_traffic_pct", 10).await;
+        let auto_promote = nexus_auth::get_bool_setting_or(db, "optimizer_auto_promote", false).await;
+        let min_runs = nexus_auth::get_i64_setting_or(db, "optimizer_min_runs", 30).await;
+        let reflection_threshold =
+            nexus_auth::get_f64_setting_or(db, "optimizer_reflection_threshold", 0.65).await;
+        let max_concurrent =
+            nexus_auth::get_i64_setting_or(db, "optimizer_max_concurrent_experiments", 3).await;
+        let traffic_pct = nexus_auth::get_i64_setting_or(db, "optimizer_canary_traffic_pct", 10).await;
 
         info!(
             "prompt_optimizer: avvio (auto_promote={} min_runs={} threshold={:.2})",

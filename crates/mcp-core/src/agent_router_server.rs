@@ -23,38 +23,10 @@ use tonic::{transport::Server, Request, Response, Status};
 
 use crate::nexus_bridge::NexusBridge;
 
-/// Converte un nome "brain-style" (snake_case, es. "coder", "github_pr_manager")
-/// nel nome PascalCase atteso da `AgentType::from_name`. Idempotente: se il
-/// nome e' gia' PascalCase viene restituito invariato.
+/// Vista locale del punto unico [`nexus_orchestrator::agent_types::snake_to_pascal`],
+/// che vive accanto all'enum di cui riconosce la grafia.
 fn snake_to_pascal(name: &str) -> String {
-    if name.chars().next().map(char::is_uppercase).unwrap_or(false) && !name.contains('_') {
-        return name.to_string();
-    }
-    let mut out = String::with_capacity(name.len());
-    let mut capitalize_next = true;
-    for ch in name.chars() {
-        if ch == '_' {
-            capitalize_next = true;
-        } else if capitalize_next {
-            out.extend(ch.to_uppercase());
-            capitalize_next = false;
-        } else {
-            out.push(ch);
-        }
-    }
-    // Casi speciali per sigle note: "github" -> "GitHub", "sre" -> "SRE",
-    // "api" -> "API", "ml" -> "ML", "qa" -> "QA", "ui" -> "UI".
-    // La normalizzazione base capitalizza solo la prima lettera di ogni
-    // segmento; il registry Rust ha varianti enum gia' allineate (es.
-    // "GitHubPRManager"): qui applichiamo override minimi.
-    out.replace("Github", "GitHub")
-        .replace("Sre", "SRE")
-        .replace("Api", "API")
-        .replace("Ml", "ML")
-        .replace("Qa", "QA")
-        .replace("Ui", "UI")
-        .replace("Etl", "ETL")
-        .replace("PrManager", "PRManager")
+    nexus_orchestrator::agent_types::snake_to_pascal(name)
 }
 
 /// Converte un nome PascalCase (AgentType::name()) in snake_case per il

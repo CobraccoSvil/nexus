@@ -62,18 +62,13 @@ pub async fn governance_enabled(db: &PgPool) -> bool {
     setting_bool(db, GOVERNANCE_ENABLED_SETTING).await
 }
 
-/// Legge un setting booleano (`true`/`1`/`yes`/`on` = true), default `false`.
-/// Punto unico locale (regola L) della lettura bool della governance.
+/// Legge un setting booleano della governance, default `false`.
+///
+/// Vista locale di [`nexus_auth::get_bool_setting`] col default gia' fissato:
+/// nessuna funzione della governance si accende da sola. Il vocabolario
+/// (`on`/`off` compresi) vive nel punto unico.
 pub(crate) async fn setting_bool(db: &PgPool, key: &str) -> bool {
-    nexus_auth::get_setting(db, key)
-        .await
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "true" | "1" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    nexus_auth::get_bool_setting_or(db, key, false).await
 }
 
 /// Costruisce la [`GovernancePolicy`] dai settings DB (regola G). Ogni valore
@@ -118,6 +113,13 @@ async fn recent_window(db: &PgPool) -> i64 {
         .unwrap_or(RECENT_WINDOW_DEFAULT)
         .clamp(1, 100)
 }
+
+// Queste due NON delegano a `get_f64_setting`/`get_i64_setting`, e la
+// differenza non e' stilistica: quelle applicano il default subito, queste
+// ritornano `Option` perche' i chiamanti VALIDANO l'intervallo prima di
+// decidere (una `exclude_error_rate` fuori da [0,1] deve cadere sul default
+// della policy, non essere usata). Col default applicato a monte, un valore
+// fuori intervallo sarebbe indistinguibile da uno assente.
 
 async fn setting_f64(db: &PgPool, key: &str) -> Option<f64> {
     nexus_auth::get_setting(db, key)

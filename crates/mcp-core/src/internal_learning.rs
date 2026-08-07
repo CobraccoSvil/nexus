@@ -128,25 +128,12 @@ pub async fn submit_feedback(
     }))
 }
 
-/// Conversione snake_case → PascalCase. Duplica il helper privato in
-/// `agent_router_server.rs::snake_to_pascal` perche' quello e' privato al
-/// modulo gRPC. Manteniamo la logica identica per coerenza tra i due path
-/// (gRPC legacy + REST nuovo).
+/// Vista locale del punto unico [`nexus_orchestrator::agent_types::snake_to_pascal`].
+///
+/// Era una COPIA, giustificata da «quello e' privato al modulo gRPC» — una
+/// ragione di visibilita', che si risolve spostando la funzione, non
+/// ricopiandola. La copia conosceva la sola sigla `GitHub` e perdeva le altre
+/// sette: la storia completa sta sul punto unico.
 pub(crate) fn snake_to_pascal(name: &str) -> String {
-    if name.chars().next().map(char::is_uppercase).unwrap_or(false) && !name.contains('_') {
-        return name.to_string();
-    }
-    let mut out = String::with_capacity(name.len());
-    let mut capitalize_next = true;
-    for ch in name.chars() {
-        if ch == '_' {
-            capitalize_next = true;
-        } else if capitalize_next {
-            out.extend(ch.to_uppercase());
-            capitalize_next = false;
-        } else {
-            out.push(ch);
-        }
-    }
-    out.replace("Github", "GitHub")
+    nexus_orchestrator::agent_types::snake_to_pascal(name)
 }

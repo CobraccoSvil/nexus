@@ -2162,6 +2162,48 @@ else
   echo "OK identita-allocazione-porta: nessun upsert chiavato sulla porta"
 fi
 
+# -- vocabolario-booleano-settings (2026-08-07) -------------------------------
+#
+# Il vocabolario che decide se una setting e' accesa o spenta vive in UN posto.
+# Prima girava in cinque copie su quattro file, con DUE semantiche opposte: una
+# allowlist (`true|1|yes|on`) e una denylist (`false|0|no`). Su `off` — la
+# simmetrica di `on`, che nessuna delle due elencava — davano risposte
+# CONTRARIE, e le chiavi coinvolte erano interruttori di worker: chi avesse
+# scritto `off` per spegnere `optimizer_auto_promote` se la sarebbe ritrovata
+# accesa. Nessun test poteva vederlo, perche' ogni copia era coerente con se
+# stessa.
+assert_single "vocabolario-booleano-settings" 'pub fn parse_setting_bool' 'crates/nexus-auth/src/lib.rs' crates
+vocabolario_bool_sparso="$(grep -rIn -E '"true"[[:space:]]*\|[[:space:]]*"1"[[:space:]]*\|[[:space:]]*"yes"' --include='*.rs' crates/ 2>/dev/null | grep -v '^crates/nexus-auth/src/lib.rs:' || true)"
+if [[ -n "$vocabolario_bool_sparso" ]]; then
+  echo "!! vocabolario-booleano-settings: il vocabolario e' ricopiato fuori dal punto unico:" >&2
+  echo "$vocabolario_bool_sparso" >&2
+  echo "   Usare nexus_auth::parse_setting_bool (o get_bool_setting/_or)." >&2
+  fail=1
+else
+  echo "OK vocabolario-booleano-settings: un solo vocabolario acceso/spento"
+fi
+
+# -- nome-agente-snake-to-pascal (2026-08-07) --------------------------------
+#
+# La conversione snake->Pascal dei nomi agente vive accanto all'enum di cui
+# riconosce la grafia: le sigle (SRE, API, ML, QA, UI, ETL, PRManager, GitHub)
+# NON sono una lista arbitraria, sono le varianti di AgentType. Separarle
+# dall'enum e' cio' che aveva permesso a due copie di divergere — una con otto
+# sigle, una con una sola — mentre il commento dichiarava «logica identica».
+# Chi usava la povera otteneva Custom("SreEngineer") al posto di SREEngineer,
+# senza che niente fallisse.
+# Il pattern cerca il CORPO, non la firma: le viste locali che DELEGANO hanno la
+# stessa firma e sono legittime — e' la reimplementazione che va fermata.
+assert_single "nome-agente-snake-to-pascal" 'let mut capitalize_next = true;' 'crates/nexus-orchestrator/src/agent_types.rs' crates
+sigle_sparse="$(grep -rIn -F '.replace("Sre", "SRE")' --include='*.rs' crates/ 2>/dev/null | grep -v '^crates/nexus-orchestrator/src/agent_types.rs:' || true)"
+if [[ -n "$sigle_sparse" ]]; then
+  echo "!! nome-agente-snake-to-pascal: le sigle dell'enum sono riallineate fuori dal punto unico:" >&2
+  echo "$sigle_sparse" >&2
+  fail=1
+else
+  echo "OK nome-agente-snake-to-pascal: le sigle restano accanto all'enum"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

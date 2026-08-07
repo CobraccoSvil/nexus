@@ -1209,16 +1209,11 @@ fn parse_usize_or(opt: Option<String>, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// Interpreta un `Option<String>` (valore setting) come booleano ("true"/"1"/"yes"/"on"),
-/// con default se assente.
+/// Interpreta un `Option<String>` (valore setting) come booleano, col `default`
+/// quando il valore e' assente o fuori dal vocabolario unico.
 fn parse_bool_or(opt: Option<String>, default: bool) -> bool {
-    opt.map(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "true" | "1" | "yes" | "on"
-        )
-    })
-    .unwrap_or(default)
+    opt.and_then(|v| nexus_auth::parse_setting_bool(&v))
+        .unwrap_or(default)
 }
 
 /// Applica il single-instance guard (Unix: flock esclusivo per porta; su Windows

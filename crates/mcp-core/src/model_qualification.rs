@@ -2242,12 +2242,7 @@ async fn apply_derived(
 /// (enabled + tool_use). Claim CAS `FOR UPDATE SKIP LOCKED`: niente doppio
 /// probe tra worker concorrenti.
 pub(crate) async fn run_qualification_round(orchestrator: &Orchestrator, db: &PgPool) -> usize {
-    let enabled = crate::settings::get_setting(db, KEY_ROUND_ENABLED)
-        .await
-        .ok()
-        .flatten()
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes" | "on"))
-        .unwrap_or(false);
+    let enabled = nexus_auth::get_bool_setting_or(db, KEY_ROUND_ENABLED, false).await;
     if !enabled {
         return 0;
     }

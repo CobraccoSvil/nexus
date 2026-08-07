@@ -81,15 +81,7 @@ fn output_excerpt(raw: &str, max_chars: usize) -> (String, bool) {
 
 pub(super) async fn tool_nexus_verify_change(ctx: &AgentToolContext, input: &Value) -> String {
     // Kill-switch DB-driven.
-    let enabled = nexus_auth::get_setting(&ctx.db, "agent.verify.enabled")
-        .await
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "true" | "1" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false);
+    let enabled = nexus_auth::get_bool_setting_or(&ctx.db, "agent.verify.enabled", false).await;
     if !enabled {
         return verify_failure(serde_json::json!({
             "error": "verify_disabled",

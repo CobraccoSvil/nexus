@@ -86,6 +86,58 @@ pub enum AgentType {
     Custom(String),
 }
 
+/// Converte un nome snake_case (`coder`, `github_pr_manager`, `sre_engineer`)
+/// nel PascalCase che [`AgentType::from_name`] si aspetta. Idempotente: un nome
+/// gia' PascalCase torna invariato.
+///
+/// PUNTO UNICO (regola L), e sta QUI perche' le sigle che riconosce — `SRE`,
+/// `API`, `ML`, `QA`, `UI`, `ETL`, `PRManager`, `GitHub` — non sono una lista
+/// arbitraria: sono la grafia esatta delle varianti dell'enum qui sopra.
+/// Separarle dall'enum e' cio' che ha permesso la divergenza.
+///
+/// COSA E' ACCADUTO (misurato il 07/08/2026). La funzione esisteva in DUE copie:
+/// una privata in `mcp-core::agent_router_server` con tutte le sigle, una
+/// `pub(crate)` in `mcp-core::internal_learning` che conosceva solo `GitHub`.
+/// Il commento sopra la seconda dichiarava: «Manteniamo la logica identica per
+/// coerenza tra i due path» — e non lo erano piu'. Chi usava la copia povera
+/// (la chat e `force_agent_type_from_hint`) otteneva da `sre_engineer` il nome
+/// `SreEngineer`, che `from_name` non riconosce e che ricade su
+/// `Custom("SreEngineer")`: un tipo agente DIVERSO da `SREEngineer`, senza che
+/// niente fallisca — il prompt di sistema risulta vuoto e il premio del bandit
+/// si accumula su un tipo fantasma.
+///
+/// Verificato prima di dichiararlo attivo: in `nexus_q_values` non esiste una
+/// sola chiave malformata e gli unici hint interni sono `"debugger"`. Era una
+/// trappola armata, che sarebbe scattata al primo `sre_engineer` passato
+/// dall'API.
+pub fn snake_to_pascal(name: &str) -> String {
+    if name.chars().next().map(char::is_uppercase).unwrap_or(false) && !name.contains('_') {
+        return name.to_string();
+    }
+    let mut out = String::with_capacity(name.len());
+    let mut capitalize_next = true;
+    for ch in name.chars() {
+        if ch == '_' {
+            capitalize_next = true;
+        } else if capitalize_next {
+            out.extend(ch.to_uppercase());
+            capitalize_next = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    // La capitalizzazione base rende "SreEngineer": qui si riallineano le sigle
+    // alla grafia delle varianti.
+    out.replace("Github", "GitHub")
+        .replace("Sre", "SRE")
+        .replace("Api", "API")
+        .replace("Ml", "ML")
+        .replace("Qa", "QA")
+        .replace("Ui", "UI")
+        .replace("Etl", "ETL")
+        .replace("PrManager", "PRManager")
+}
+
 impl AgentType {
     /// Converte un nome stringa (es. "Coder", "GitHubPRManager") in `AgentType`.
     /// Per nomi non riconosciuti ritorna `Custom(name)`.
@@ -238,5 +290,49 @@ mod tests {
         assert_eq!(t, AgentType::Architect);
         let u = AgentType::from_name("SomethingUnknown");
         assert!(matches!(u, AgentType::Custom(_)));
+    }
+}
+
+#[cfg(test)]
+mod tests_snake_to_pascal {
+    use super::{snake_to_pascal, AgentType};
+
+    /// Il test arriva alla CONSEGUENZA, non alla stringa (regola O): quel nome
+    /// serve a `from_name`, e cio' che conta e' che ne esca la variante giusta
+    /// e non un `Custom` che le somiglia.
+    ///
+    /// MUTAZIONE: togliendo una qualunque delle sigle dal punto unico, il caso
+    /// corrispondente rosseggia con `Custom("SreEngineer")` al posto di
+    /// `SREEngineer` — esattamente il difetto che la copia povera produceva.
+    #[test]
+    fn le_sigle_producono_la_variante_e_non_un_custom() {
+        let casi = [
+            ("sre_engineer", AgentType::SREEngineer),
+            ("api_designer", AgentType::APIDesigner),
+            ("ml_engineer", AgentType::MLEngineer),
+            ("github_pr_manager", AgentType::GitHubPRManager),
+            ("coder", AgentType::Coder),
+            ("tech_lead", AgentType::TechLead),
+        ];
+        for (snake, atteso) in casi {
+            let ottenuto = AgentType::from_name(&snake_to_pascal(snake));
+            assert_eq!(
+                ottenuto, atteso,
+                "'{snake}' deve dare la variante, non un Custom che le somiglia"
+            );
+            assert!(
+                !matches!(ottenuto, AgentType::Custom(_)),
+                "'{snake}' e' finito in Custom: la sigla non e' stata riallineata"
+            );
+        }
+    }
+
+    /// Idempotenza: un nome gia' PascalCase attraversa la funzione intatto.
+    /// Senza, una seconda conversione dello stesso valore lo corromperebbe.
+    #[test]
+    fn un_nome_gia_pascal_resta_invariato() {
+        for gia_pascal in ["Coder", "SREEngineer", "GitHubPRManager"] {
+            assert_eq!(snake_to_pascal(gia_pascal), gia_pascal);
+        }
     }
 }

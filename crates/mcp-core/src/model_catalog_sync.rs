@@ -2082,12 +2082,8 @@ pub(crate) fn parse_agentic_index_payload(
 ///
 /// Ritorna quanti modelli hanno ricevuto un indice.
 pub async fn sync_agentic_index(db: &PgPool) -> Result<u64, String> {
-    let on = crate::settings::get_setting(db, "catalog.agentic_index_sync.enabled")
-        .await
-        .ok()
-        .flatten()
-        .map(|v| matches!(v.trim(), "true" | "1" | "yes" | "on"))
-        .unwrap_or(false);
+    let on =
+        nexus_auth::get_bool_setting_or(db, "catalog.agentic_index_sync.enabled", false).await;
     if !on {
         return Ok(0);
     }
@@ -2166,12 +2162,7 @@ pub async fn sync_agentic_index(db: &PgPool) -> Result<u64, String> {
 pub(crate) async fn tier_prior_bands(
     db: &PgPool,
 ) -> Option<crate::orchestrator::model_service::RelativeBands> {
-    let on = crate::settings::get_setting(db, "catalog.tier_prior.enabled")
-        .await
-        .ok()
-        .flatten()
-        .map(|v| matches!(v.trim(), "true" | "1" | "yes" | "on"))
-        .unwrap_or(false);
+    let on = nexus_auth::get_bool_setting_or(db, "catalog.tier_prior.enabled", false).await;
     if !on {
         return None;
     }

@@ -593,11 +593,9 @@ async fn setting_u64(db: &PgPool, chiave: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Vista locale di [`nexus_auth::get_f64_setting`].
 async fn setting_f64(db: &PgPool, chiave: &str, default: f64) -> f64 {
-    nexus_auth::get_setting(db, chiave)
-        .await
-        .and_then(|raw| raw.trim().parse::<f64>().ok())
-        .unwrap_or(default)
+    nexus_auth::get_f64_setting_or(db, chiave, default).await
 }
 
 #[cfg(test)]

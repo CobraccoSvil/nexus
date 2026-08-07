@@ -371,15 +371,8 @@ async fn ensure_profile_locked(
     project_id: Uuid,
     root: &Path,
 ) -> Vec<VerifyProfileStep> {
-    let enabled = nexus_auth::get_setting(meta_db, "agent.verify_infer.enabled")
-        .await
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "true" | "1" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false);
+    let enabled =
+        nexus_auth::get_bool_setting_or(meta_db, "agent.verify_infer.enabled", false).await;
     if !enabled {
         return Vec::new();
     }

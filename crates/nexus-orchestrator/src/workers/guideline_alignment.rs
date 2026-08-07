@@ -55,35 +55,6 @@ impl GuidelineAlignmentWorker {
         Self { pool }
     }
 
-    /// Legge un setting dalla tabella `settings`. Valore grezzo o stringa vuota.
-    async fn read_setting(&self, key: &str) -> String {
-        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM settings WHERE key = $1")
-            .bind(key)
-            .fetch_optional(self.pool.as_ref())
-            .await
-            .ok()
-            .flatten();
-        row.map(|(v,)| v).unwrap_or_default()
-    }
-
-    async fn read_setting_bool(&self, key: &str, default: bool) -> bool {
-        let raw = self.read_setting(key).await;
-        if raw.is_empty() {
-            return default;
-        }
-        !matches!(raw.trim().to_lowercase().as_str(), "false" | "0" | "no")
-    }
-
-    async fn read_setting_f64(&self, key: &str, default: f64) -> f64 {
-        let raw = self.read_setting(key).await;
-        raw.trim().parse::<f64>().unwrap_or(default)
-    }
-
-    async fn read_setting_i64(&self, key: &str, default: i64) -> i64 {
-        let raw = self.read_setting(key).await;
-        raw.trim().parse::<i64>().unwrap_or(default)
-    }
-
     /// SHA-256 esadecimale di una stringa.
     fn sha256_hex(input: &str) -> String {
         let mut hasher = Sha256::new();
@@ -301,20 +272,20 @@ impl LearningWorker for GuidelineAlignmentWorker {
         let start = Instant::now();
 
         // ── Configurazione dal DB ────────────────────────────────────────────
-        let enabled = self.read_setting_bool("alignment_enabled", false).await;
+        let db = self.pool.as_ref();
+        let enabled = nexus_auth::get_bool_setting_or(db, "alignment_enabled", false).await;
         if !enabled {
             debug!("guideline_alignment: disabilitato (alignment_enabled=false)");
             return WorkerOutcome::ok(self.name(), start.elapsed().as_millis() as u64);
         }
 
-        let threshold = self
-            .read_setting_f64("alignment_conformance_threshold", 0.75)
-            .await;
-        let interval_hours = self.read_setting_i64("alignment_check_interval_hours", 24).await;
-        let max_checks = self.read_setting_i64("alignment_max_checks_per_tick", 20).await;
-        let autovariant = self
-            .read_setting_bool("alignment_autovariant_enabled", false)
-            .await;
+        let threshold =
+            nexus_auth::get_f64_setting_or(db, "alignment_conformance_threshold", 0.75).await;
+        let interval_hours =
+            nexus_auth::get_i64_setting_or(db, "alignment_check_interval_hours", 24).await;
+        let max_checks = nexus_auth::get_i64_setting_or(db, "alignment_max_checks_per_tick", 20).await;
+        let autovariant =
+            nexus_auth::get_bool_setting_or(db, "alignment_autovariant_enabled", false).await;
 
         info!(
             "guideline_alignment: avvio (threshold={:.2} interval_h={} max_checks={} autovariant={})",
@@ -497,7 +468,9 @@ impl LearningWorker for GuidelineAlignmentWorker {
                 }
 
                 // Traffic canary allineato al default optimizer (10%).
-                let traffic_pct = self.read_setting_i64("optimizer_canary_traffic_pct", 10).await;
+                let traffic_pct =
+                    nexus_auth::get_i64_setting_or(self.pool.as_ref(), "optimizer_canary_traffic_pct", 10)
+                        .await;
                 match prompt_variants::insert_variant_and_experiment(
                     self.pool.as_ref(),
                     &tpl.key,
