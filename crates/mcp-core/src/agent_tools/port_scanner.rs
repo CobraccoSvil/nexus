@@ -5,20 +5,14 @@
 //! un messaggio di rifiuto che istruisce l'uso di `request_port(label=...)`.
 //!
 //! Il flag globale e' letto dalla tabella `settings` (chiave
-//! `agent.enforce_port_allocation`), con cache 60s.
+//! `agent.enforce_port_allocation`) tramite `nexus_auth::get_bool_setting`, che
+//! e' anche il posto in cui vive la cache (TTL 60s, chiavata sul pool).
 //!
 //! Vedi ADR 0010 per il contesto della decisione.
-
-use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
 use regex::Regex;
 use sqlx::PgPool;
-use tokio::sync::RwLock;
-
-const ENFORCEMENT_CACHE_TTL: Duration = Duration::from_secs(60);
-
-static ENFORCEMENT_CACHE: Lazy<RwLock<Option<(bool, Instant)>>> = Lazy::new(|| RwLock::new(None));
 
 const NEXUS_PORT_MIN: u32 = 20000;
 const NEXUS_PORT_MAX: u32 = 40000;
@@ -266,46 +260,32 @@ pub struct PortFinding {
     pub origin: PortOrigin,
 }
 
+/// Il flag `agent.enforce_port_allocation` (regola I). L'enforcement e'
+/// fail-closed: ricade su `true` in tutti e TRE i casi in cui non c'e' un
+/// booleano da leggere — chiave assente, DB irraggiungibile, valore fuori dal
+/// vocabolario di `nexus_auth::parse_setting_bool`. Un controllo di sicurezza
+/// non si spegne perche' qualcuno ha scritto una parola che nessuno ha capito.
+///
+/// La lettura passa dal punto unico `nexus_auth` (regola L), che possiede la
+/// query e la cache — TTL 60s, chiavata su `pool_identity`. La cache locale che
+/// stava qui era un secondo TTL identico, sopra la stessa tabella, ma GLOBALE:
+/// col pool di un progetto avrebbe servito il valore del meta, che e' l'errore
+/// documentato da `pool_identity`.
+///
+/// L'errore DB resta LOGGATO: `get_bool_setting` lo propaga, e qui e' l'unico
+/// punto che sa distinguere «flag assente» (silenzio legittimo) da «non ho
+/// potuto leggere» (regola M). Prima del ripiego, quindi, il warn.
 pub async fn is_enforcement_enabled(db: &PgPool) -> bool {
-    {
-        let guard = ENFORCEMENT_CACHE.read().await;
-        if let Some((value, expires_at)) = *guard {
-            if Instant::now() < expires_at {
-                return value;
-            }
-        }
-    }
-
-    let value: bool = match sqlx::query_scalar::<_, String>(
-        "SELECT value FROM settings WHERE key = 'agent.enforce_port_allocation'",
-    )
-    .fetch_optional(db)
-    .await
-    {
-        // Vocabolario unico (`nexus_auth::parse_setting_bool`). Il `None` che
-        // ne esce — valore fuori vocabolario — ricade sullo stesso default
-        // fail-closed della chiave assente: un gate di sicurezza non si spegne
-        // perche' qualcuno ha scritto una parola che nessuno ha capito.
-        Ok(Some(raw)) => nexus_auth::parse_setting_bool(&raw).unwrap_or(true),
-        Ok(None) => true,
-        Err(err) => {
+    nexus_auth::get_bool_setting(db, "agent.enforce_port_allocation")
+        .await
+        .unwrap_or_else(|err| {
             tracing::warn!(
                 error = %err,
                 "port_scanner: lettura setting agent.enforce_port_allocation fallita, default=true"
             );
-            true
-        }
-    };
-
-    let mut guard = ENFORCEMENT_CACHE.write().await;
-    *guard = Some((value, Instant::now() + ENFORCEMENT_CACHE_TTL));
-    value
-}
-
-#[cfg(test)]
-pub async fn _reset_cache_for_tests() {
-    let mut guard = ENFORCEMENT_CACHE.write().await;
-    *guard = None;
+            None
+        })
+        .unwrap_or(true)
 }
 
 fn should_skip_path(path: &str) -> bool {
