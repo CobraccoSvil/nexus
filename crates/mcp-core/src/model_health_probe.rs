@@ -41,7 +41,7 @@ use tokio::time::sleep;
 
 use crate::orchestrator::Orchestrator;
 use crate::provider_cooldown::{
-    is_provider_in_cooldown, put_provider_in_long_cooldown, put_provider_in_short_cooldown,
+    put_provider_in_long_cooldown,
 };
 
 /// Prompt minimale. Stesso usato da `provider_health_probe`.
@@ -211,7 +211,10 @@ async fn probe_model_round(
     // Salta se il provider e' in cooldown lungo: faremmo solo rumore
     // (tutte le probe ritornerebbero errore di quota/billing che e'
     // gia' noto al sistema).
-    if is_provider_in_cooldown(&pm.provider) {
+    // La domanda e' sulla COPPIA: un rate limit del modello lo esclude, un
+    // cooldown di account esclude tutti i modelli del fornitore. Chiedere del
+    // solo fornitore renderebbe invisibile il primo dei due.
+    if crate::provider_cooldown::is_model_in_cooldown(&pm.provider, &pm.model) {
         stats.skipped_provider_cooldown += 1;
         return;
     }
@@ -311,7 +314,7 @@ async fn run_reprobe_phase(orchestrator: &Orchestrator, db: &PgPool, stats: &mut
             for cand in candidates {
                 // Provider in cooldown lungo: inutile re-probare (errori billing/
                 // quota gia' noti). Riprovato quando il provider torna su.
-                if is_provider_in_cooldown(&cand.provider) {
+                if crate::provider_cooldown::is_model_in_cooldown(&cand.provider, &cand.model) {
                     continue;
                 }
                 match reprobe_one_candidate(orchestrator, db, &cand, backoff_min).await {
@@ -1514,28 +1517,61 @@ async fn apply_provider_wide_cooldown(provider: &str, model: &str, kind: &str) {
     };
     // Transienti -> short cooldown (messaggio + timing dedicati).
     let timings = crate::provider_cooldown::provider_health_timings();
+    // La PORTATA del cooldown transitorio segue la natura dell'errore, e il
+    // modello e' gia' qui — veniva ignorato.
+    //
+    //   rate_limit        -> il tetto e' del MODELLO (token/minuto per modello):
+    //                        gli altri dello stesso fornitore hanno quota propria
+    //   connection_error  -> il fornitore non risponde: riguarda tutti i suoi
+    //
+    // MISURATO nella notte fra il 6 e il 7/08/2026: 479 cooldown brevi, di cui
+    // 205 per rate limit distribuiti su google (45), openai (44), mistral (41),
+    // deepseek (38) e openrouter (37) — cioe' su TUTTI i fornitori rimasti dopo
+    // che tre erano gia' fuori per credito esaurito. Ogni 429 su un modello ne
+    // escludeva uno intero per 60s, il carico si riversava sui restanti e li
+    // faceva sforare a loro volta. In un solo run: 22 failover su 39 escalation,
+    // tutti con motivo `cooldown`, su fornitori che nel DB non avevano alcun
+    // cooldown persistente. Segnalato dall'utente cosi': «molti cambi di
+    // provider per cooldown, e poco dopo rifunzionavano» — poco dopo erano i 60
+    // secondi, perche' il fornitore non era mai stato guasto.
     let short = match kind {
-        "rate_limit" => Some(("Rate limit raggiunto", timings.slow_cooldown_s)),
-        "connection_error" => Some(("Provider non raggiungibile", timings.cooldown_default_s)),
+        "rate_limit" => Some((
+            "Rate limit raggiunto",
+            timings.slow_cooldown_s,
+            Some(model),
+        )),
+        "connection_error" => Some((
+            "Provider non raggiungibile",
+            timings.cooldown_default_s,
+            None,
+        )),
         _ => None,
     };
-    let known = if let Some(msg) = long_msg {
+    // Il log nomina la PORTATA effettiva. Con la riga fissa «provider messo in
+    // cooldown» il fatto nuovo sarebbe invisibile proprio in esercizio, cioe'
+    // dove serve leggerlo: chi guarda i log vedrebbe la stessa frase di prima e
+    // concluderebbe che nulla e' cambiato.
+    let escluso = if let Some(msg) = long_msg {
+        // Credito, quota di account e credenziali sono dell'ACCOUNT: valgono per
+        // ogni modello del fornitore, e il cooldown resta suo.
         put_provider_in_long_cooldown(provider, msg);
-        true
-    } else if let Some((msg, secs)) = short {
-        put_provider_in_short_cooldown(provider, msg, secs);
-        true
+        Some(provider.to_string())
+    } else if let Some((msg, secs, portata)) = short {
+        crate::provider_cooldown::metti_in_cooldown_breve(provider, portata, msg, secs);
+        Some(match portata {
+            Some(m) => format!("{provider}/{m}"),
+            None => provider.to_string(),
+        })
     } else {
-        false
+        None
     };
-    if known {
-        tracing::info!(
-            "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
-        );
-    } else {
-        tracing::debug!(
+    match escluso {
+        Some(bersaglio) => tracing::info!(
+            "model_health_probe: {bersaglio} messo in cooldown per {kind} (rilevato in probe model {model})"
+        ),
+        None => tracing::debug!(
             "model_health_probe: provider {provider} errore provider-wide '{kind}' senza cooldown automatico (rilevato in probe model {model})"
-        );
+        ),
     }
 }
 

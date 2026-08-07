@@ -157,10 +157,57 @@ fn should_reprobe_cooldown(provider: &str, interval: std::time::Duration) -> boo
     }
 }
 
+/// La chiave sotto cui vive un cooldown.
+///
+/// PERCHE' DUE FORME. Un rate limit e' del MODELLO: i tetti token-al-minuto
+/// sono per singolo modello, e `gemini-2.5-flash` ha la sua quota anche mentre
+/// `gemini-2.5-pro` e' saturo. Il credito esaurito e le credenziali non valide
+/// sono invece dell'ACCOUNT: riguardano ogni modello di quel fornitore.
+///
+/// Finche' la chiave era una sola — il fornitore — un 429 su un modello
+/// escludeva tutti gli altri dello stesso fornitore per 60 secondi. MISURATO
+/// nella notte fra il 6 e il 7/08/2026: 479 cooldown brevi (picchi di 88
+/// all'ora), 22 failover su 39 escalation di un solo run, tutti con motivo
+/// `cooldown`, su fornitori che nel DB non avevano alcun cooldown persistente.
+/// L'utente lo ha descritto cosi': «molti cambi di provider per cooldown, e
+/// poco dopo rifunzionavano» — poco dopo erano i 60 secondi, perche' il
+/// fornitore non era mai stato guasto.
+///
+/// L'effetto era cumulativo: con tre fornitori gia' fuori per credito, ogni
+/// esclusione di troppo riversava il carico sui rimanenti, che andavano in
+/// rate limit a loro volta.
+fn chiave_cooldown(provider: &str, model: Option<&str>) -> String {
+    match model {
+        Some(m) if !m.trim().is_empty() => {
+            format!("{}\u{1}{}", provider.to_lowercase(), m.trim().to_lowercase())
+        }
+        _ => provider.to_lowercase(),
+    }
+}
+
+/// Il FORNITORE e' escluso? Vero solo per i cooldown di account (credito, auth,
+/// budget): un limite su un singolo modello non risponde si' a questa domanda.
+///
+/// Chi deve scegliere una coppia fornitore+modello usa
+/// [`is_model_in_cooldown`], che e' la domanda completa.
 pub fn is_provider_in_cooldown(provider: &str) -> bool {
+    scaduto_o_attivo(&chiave_cooldown(provider, None))
+}
+
+/// Questa COPPIA e' utilizzabile adesso?
+///
+/// Vero se il fornitore e' escluso come account, oppure se lo e' questo modello
+/// in particolare. E' la domanda che si pone chi sta per instradare una
+/// richiesta: entrambe le esclusioni la impediscono, ma per ragioni diverse e
+/// con durate diverse.
+pub fn is_model_in_cooldown(provider: &str, model: &str) -> bool {
+    is_provider_in_cooldown(provider) || scaduto_o_attivo(&chiave_cooldown(provider, Some(model)))
+}
+
+fn scaduto_o_attivo(chiave: &str) -> bool {
     let store = PROVIDER_COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(map) = store.lock() {
-        if let Some(&until) = map.get(&provider.to_lowercase()) {
+        if let Some(&until) = map.get(chiave) {
             return std::time::Instant::now() < until;
         }
     }
@@ -592,21 +639,45 @@ pub fn put_provider_in_long_cooldown(provider: &str, reason: &str) {
 /// escluderlo per ore. Solo in-memory: non persistito su Redis perche' il valore di
 /// 60s e' minore del tempo medio di restart del processo.
 pub fn put_provider_in_short_cooldown(provider: &str, reason: &str, duration_secs: u64) {
+    metti_in_cooldown_breve(provider, None, reason, duration_secs);
+}
+
+/// Cooldown breve sulla COPPIA fornitore+modello: la forma giusta per un rate
+/// limit, che e' un tetto del modello e non dell'account.
+///
+/// `model: None` ricade sul fornitore intero, ed e' il caso di chi non sa quale
+/// modello fosse in gioco — resta possibile, ma va chiamato sapendo che esclude
+/// tutto. Il chiamante che il modello lo conosce deve passarlo: un 429 su
+/// `gemini-2.5-pro` non ha nulla da dire su `gemini-2.5-flash`.
+pub fn metti_in_cooldown_breve(
+    provider: &str,
+    model: Option<&str>,
+    reason: &str,
+    duration_secs: u64,
+) {
+    let chiave = chiave_cooldown(provider, model);
     let store = PROVIDER_COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = store.lock() {
         let until = std::time::Instant::now() + std::time::Duration::from_secs(duration_secs);
-        map.insert(provider.to_lowercase(), until);
-        tracing::warn!(
-            "Provider '{}' in COOLDOWN BREVE ({}s) per: {}",
-            provider,
-            duration_secs,
-            reason
-        );
+        map.insert(chiave.clone(), until);
+        match model {
+            Some(m) => tracing::warn!(
+                "Modello '{}/{}' in COOLDOWN BREVE ({}s) per: {} (gli altri modelli di '{}' restano disponibili)",
+                provider, m, duration_secs, reason, provider
+            ),
+            None => tracing::warn!(
+                "Provider '{}' in COOLDOWN BREVE ({}s) per: {}",
+                provider, duration_secs, reason
+            ),
+        }
     }
     let reasons = PROVIDER_COOLDOWN_REASONS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = reasons.lock() {
-        map.insert(provider.to_lowercase(), reason.to_string());
+        map.insert(chiave, reason.to_string());
     }
+    // La severita' resta registrata sul FORNITORE: la usa il recovery loop, che
+    // ragiona per account (chi ri-probare, con quale cadenza). Un cooldown di
+    // modello non cambia la natura del fornitore.
     set_cooldown_severity(provider, CooldownSeverity::Short);
 }
 
@@ -1033,5 +1104,64 @@ mod tests {
         reset_provider_failures(p);
         // Il cooldown attivo rimane finche' non scade naturalmente, ma il
         // contatore failures e' stato resettato (verifica indiretta: assenza panic)
+    }
+}
+
+#[cfg(test)]
+mod tests_portata_cooldown {
+    use super::*;
+
+    /// IL difetto: un tetto token/minuto e' del MODELLO, e il cooldown escludeva
+    /// il FORNITORE. Gli altri modelli, che hanno quota propria, sparivano per
+    /// 60 secondi insieme a lui.
+    ///
+    /// MISURATO nella notte fra il 6 e il 7/08/2026: 479 cooldown brevi, 205 dei
+    /// quali per rate limit su TUTTI i fornitori rimasti; in un run solo, 22
+    /// failover su 39 escalation con motivo `cooldown` su fornitori che nel DB
+    /// non ne avevano alcuno.
+    ///
+    /// MUTAZIONE: rimettere la chiave a solo-fornitore (togliere il ramo
+    /// `Some(m)` di `chiave_cooldown`) -> il secondo assert rosseggia, perche'
+    /// il modello sano risulta escluso.
+    #[test]
+    fn un_limite_di_un_modello_non_esclude_gli_altri_del_fornitore() {
+        metti_in_cooldown_breve("prova-google", Some("gemini-pro"), "Rate limit raggiunto", 60);
+
+        assert!(
+            is_model_in_cooldown("prova-google", "gemini-pro"),
+            "il modello che ha sforato e' escluso"
+        );
+        assert!(
+            !is_model_in_cooldown("prova-google", "gemini-flash"),
+            "un altro modello dello stesso fornitore ha quota propria e resta usabile"
+        );
+        assert!(
+            !is_provider_in_cooldown("prova-google"),
+            "il FORNITORE non e' in cooldown: non e' lui ad avere un problema"
+        );
+    }
+
+    /// Il contrappunto, senza il quale il test sopra sarebbe compatibile con
+    /// «non escludere mai niente»: il credito e' dell'ACCOUNT, e vale per ogni
+    /// modello.
+    #[test]
+    fn il_credito_esaurito_esclude_tutti_i_modelli_del_fornitore() {
+        metti_in_cooldown_breve("prova-openai", None, "Provider non raggiungibile", 60);
+
+        assert!(is_provider_in_cooldown("prova-openai"));
+        assert!(is_model_in_cooldown("prova-openai", "gpt-qualsiasi"));
+        assert!(is_model_in_cooldown("prova-openai", "un-altro-modello"));
+    }
+
+    /// Le due portate non si confondono fra loro: due fornitori distinti, e un
+    /// modello con lo stesso NOME sotto entrambi.
+    #[test]
+    fn la_chiave_distingue_fornitore_e_modello() {
+        metti_in_cooldown_breve("prova-a", Some("stesso-nome"), "Rate limit raggiunto", 60);
+        assert!(is_model_in_cooldown("prova-a", "stesso-nome"));
+        assert!(
+            !is_model_in_cooldown("prova-b", "stesso-nome"),
+            "lo stesso nome di modello sotto un ALTRO fornitore e' un'altra cosa"
+        );
     }
 }

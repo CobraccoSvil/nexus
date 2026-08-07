@@ -2091,3 +2091,41 @@ mod tests {
         assert!(classify_provider_error(Some("boh_mai_visto"), "rate limit reached").is_some());
     }
 }
+
+#[cfg(test)]
+mod tests_cooldown_empty_completion {
+    use super::*;
+
+    /// Una risposta VUOTA e' un difetto del MODELLO, non del fornitore: il
+    /// provider ha risposto 200 e ha fatto il suo lavoro. Metterlo in cooldown
+    /// lo esclude per 60 secondi mentre e' sano.
+    ///
+    /// MISURATO il 07/08/2026 su gestione-corsi: 22 failover su 39 escalation,
+    /// tutti con motivo `cooldown`, su openrouter/deepseek/mistral/google — che
+    /// nel DB non avevano ALCUN cooldown di billing. L'utente lo ha descritto
+    /// cosi': «molti cambi di provider per cooldown, e poco dopo rifunzionavano».
+    /// Poco dopo = i 60 secondi del cooldown breve.
+    #[test]
+    fn una_risposta_vuota_non_mette_il_fornitore_in_cooldown() {
+        // Il gateway riporta la degenerazione come 500 (non ha un altro codice
+        // HTTP per dire «200 ma vuoto»), e la classe strutturata la dichiara.
+        let esito = classify_provider_error(
+            Some("empty_completion"),
+            "Nexus Gateway 500 Internal Server Error: {\"error\":\"PROVIDER_ERROR\"}",
+        );
+        assert!(
+            esito.is_none(),
+            "empty_completion e' del modello: nessun cooldown al fornitore, invece: {esito:?}"
+        );
+    }
+
+    /// Il contrappunto: un 5xx VERO resta un cooldown breve. Senza questo, il
+    /// test sopra sarebbe compatibile con «non mettere mai nessuno in cooldown».
+    #[test]
+    fn un_errore_vero_del_fornitore_resta_in_cooldown() {
+        let esito = classify_provider_error(Some("service_unavailable"), "503");
+        assert!(matches!(esito, Some((_, CooldownKind::Short, _))));
+        let billing = classify_provider_error(Some("billing_error"), "402");
+        assert!(matches!(billing, Some((_, CooldownKind::Long, _))));
+    }
+}
