@@ -171,6 +171,14 @@ run_phase "audit settings (gate ratchet)" bash scripts/audit-settings.sh --gate
 # intero, e un pre-commit deve guardare cio' che si sta committando.
 run_phase "duplicazione (gate ratchet jscpd)" bash scripts/dup-report.sh
 
+# Gate ratchet testo non tradotto della web-ide (baseline in
+# scripts/i18n-baseline.json). La UI e' bilingue a meta': 391 chiavi passano dal
+# traduttore, 797 stringhe visibili sono letterali dentro i componenti, e due
+# frasi adiacenti possono parlare lingue diverse. L'estrazione richiede piu'
+# ondate; questo gate impedisce che il debito CRESCA nel frattempo, e la
+# baseline si riallinea al ribasso dopo ognuna.
+run_phase "testo non tradotto (gate ratchet i18n)" node scripts/i18n-ratchet.mjs
+
 # Gate ratchet qualita codice Rust: findings totali, funzioni >50 righe,
 # complessita >20, security possono solo scendere (baseline in
 # scripts/quality-baseline.json). Saltabile con VERIFY_SKIP_RUST=1.
