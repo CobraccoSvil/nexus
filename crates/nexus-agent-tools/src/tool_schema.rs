@@ -1593,7 +1593,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
     "input_schema": {
       "type": "object",
       "properties": {
-        "format": {"type": "string", "enum": ["json", "mermaid", "dot"], "description": "Formato: json (node-link {nodes,edges}), mermaid (flowchart), dot (graphviz)"},
+        "format": {"type": "string", "enum": ["json"], "description": "Formato: json (node-link {nodes,edges}). Mermaid e DOT non sono ancora supportati dall'importatore: erano dichiarati qui e rifiutati all'esecuzione."},
         "content": {"type": "string", "description": "Contenuto del grafo nel formato indicato"},
         "source_id": {"type": "string", "description": "Identificatore della sorgente (opzionale, per tracciare l'origine)"}
       },

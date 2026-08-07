@@ -2204,6 +2204,62 @@ else
   echo "OK nome-agente-snake-to-pascal: le sigle restano accanto all'enum"
 fi
 
+# -- enum-dichiarato-e-accettato (2026-08-07) ---------------------------------
+#
+# Un `enum` nello schema di un tool E' un contratto: promette al modello che
+# quei valori sono accettati. Se l'esecutore ne rifiuta uno, il modello sbaglia
+# SEGUENDO le regole — e l'errore che riceve lo accusa di un errore che non ha
+# commesso.
+#
+# MISURATO il 07/08/2026: lo schema di `nexus_verify_change` dichiarava
+# `["quick","full","typecheck","build","lint","test"]`, il profilo di verifica
+# del progetto aveva `lint-frontend` / `typecheck-backend` / `build-frontend`,
+# e un agente che chiedeva `lint` — uno dei valori PROMESSI — otteneva
+# `invalid_scope`. Il profilo e' inferito per progetto: un enum statico non
+# poteva che mentire.
+#
+# Il rimedio strutturale c'era gia' nel repo (l'enum `kind` di
+# dispatch_subagent, generato a runtime dal registry DB): questo guard chiede
+# che i tool i cui valori dipendono dal PROGETTO passino di li'.
+verify_scope_statico="$(grep -n '"scope"' apps/../crates/nexus-agent-tools/src/tool_schema.rs 2>/dev/null | grep -E '"(typecheck|lint|build|test)"' || true)"
+if [[ -n "$verify_scope_statico" ]]; then
+  if ! grep -q 'apply_verify_scope_enum' crates/mcp-core/src/agent_turn_setup.rs 2>/dev/null; then
+    echo "!! enum-dichiarato-e-accettato: lo scope di nexus_verify_change e' statico e nessuno lo rigenera dal profilo:" >&2
+    echo "$verify_scope_statico" >&2
+    echo "   Il profilo di verifica e' per-progetto: l'enum va generato a runtime (apply_verify_scope_enum)." >&2
+    fail=1
+  else
+    echo "OK enum-dichiarato-e-accettato: lo scope viene rigenerato dal profilo del progetto"
+  fi
+fi
+# Un valore che l'esecutore rifiuta perche' NON IMPLEMENTATO non deve stare
+# nell'enum: promette una capacita' che non esiste. MISURATO il 07/08/2026 con
+# un censimento di tutti i 95 tool (33 enum): `knowledge_import_graph.format`
+# dichiarava `mermaid` e `dot` mentre l'handler rispondeva «non supportato in
+# questa versione ... non ancora portato». Due difetti su 33 enum, entrambi
+# della stessa forma — lo schema promette, l'esecutore rifiuta.
+importatore="crates/nexus-agent-tools/src/knowledge.rs"
+schema_tool="crates/nexus-agent-tools/src/tool_schema.rs"
+if [[ -f "$importatore" && -f "$schema_tool" ]]; then
+  if grep -q 'formato .* non supportato in questa versione' "$importatore" 2>/dev/null; then
+    if grep -q '"format": {"type": "string", "enum": \["json", "mermaid"' "$schema_tool" 2>/dev/null; then
+      echo "!! enum-dichiarato-e-accettato: knowledge_import_graph promette mermaid/dot che l'handler rifiuta" >&2
+      fail=1
+    else
+      echo "OK enum-dichiarato-e-accettato: l'importatore grafi non promette formati che rifiuta"
+    fi
+  fi
+fi
+
+# L'esecutore che rifiuta un valore DEVE elencare quelli accettati: senza,
+# l'errore non e' rimediabile nemmeno quando lo dichiara.
+for rifiuto in $(grep -rln '"invalid_scope"' --include='*.rs' crates/ 2>/dev/null); do
+  if ! grep -q 'available_steps' "$rifiuto"; then
+    echo "!! enum-dichiarato-e-accettato: $rifiuto rifiuta un valore senza elencare gli accettati" >&2
+    fail=1
+  fi
+done
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

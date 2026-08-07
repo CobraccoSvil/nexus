@@ -221,6 +221,7 @@ pub fn classify_step(
     tool_input: &Value,
     fs_mutator_tools: &[String],
     rules: &[CriticalityRule],
+    artefatti_rigenerabili: &[String],
 ) -> StepClassification {
     let base_mutatore = super::hitl::is_mutator_tool_name(tool_name, fs_mutator_tools);
     let mut migliore: Option<(&CriticalityRule, StepCriticality)> = None;
@@ -233,7 +234,7 @@ pub fn classify_step(
     }
     match migliore {
         Some((r, level)) => StepClassification {
-            level,
+            level: declassa_se_rigenerabile(level, tool_name, tool_input, artefatti_rigenerabili),
             matched_category: Some(r.category.clone()),
         },
         None if base_mutatore => StepClassification {
@@ -245,6 +246,111 @@ pub fn classify_step(
             matched_category: None,
         },
     }
+}
+
+/// Un `Irreversible` che colpisce SOLO artefatti rigenerabili scende a
+/// `Critical`: resta sorvegliato, ma non fail-closed.
+///
+/// PERCHE'. Le regole guardano il VERBO (`rm -rf`), non l'OGGETTO. E' giusto
+/// come innesco — il verdetto e' comunque agentico — ma «irreversibile» e' una
+/// affermazione sull'OGGETTO: dice che cio' che sparisce non torna. Su
+/// `node_modules`, `.next`, `dist`, `target` e' falso per costruzione: quei
+/// percorsi sono OUTPUT di un comando che il progetto sa rieseguire, e
+/// cancellarli e' il gesto piu' ordinario di un ciclo di sviluppo.
+///
+/// MISURATO il 07/08/2026 su gestione-corsi: `cd school-courses-fe && rm -rf
+/// .next node_modules/.cache` — una pulizia di cache dentro il progetto — e'
+/// stato classificato irreversibile, il gate non ha trovato due giudici (tre
+/// fornitori erano in cooldown di credito) e in modalita' autonoma non c'e'
+/// nessuno a cui chiedere: il passo e' rimasto non eseguito e l'agente lo ha
+/// riproposto al giro dopo. Un gate di sicurezza che blocca la pulizia della
+/// cache di build non protegge nulla e ferma tutto.
+///
+/// I DUE CRITERI, entrambi necessari:
+///
+/// - ogni bersaglio e' nel vocabolario DB degli artefatti rigenerabili (regola
+///   G: mai una lista nel codice — il nome della cartella di build cambia col
+///   framework, e inseguirlo a codice e' la toppa della regola H);
+/// - ogni bersaglio e' RELATIVO e non risale (`..`): `rm -rf /node_modules` o
+///   `rm -rf ../node_modules` escono dal progetto, e li' il nome non dice piu'
+///   di chi sia quella cartella.
+///
+/// Un solo bersaglio che non li soddisfa tiene l'intero comando irreversibile:
+/// `rm -rf .next src` cancella anche i sorgenti, e la presenza di un artefatto
+/// rigenerabile nella stessa riga non lo rende meno definitivo.
+fn declassa_se_rigenerabile(
+    level: StepCriticality,
+    tool_name: &str,
+    tool_input: &Value,
+    artefatti_rigenerabili: &[String],
+) -> StepCriticality {
+    if level != StepCriticality::Irreversible
+        || artefatti_rigenerabili.is_empty()
+        || !TOOL_CON_COMANDO.contains(&tool_name)
+    {
+        return level;
+    }
+    let Some(riga) = comando_del_passo(tool_input) else {
+        return level;
+    };
+    let bersagli = bersagli_di_cancellazione(&riga);
+    // Nessun bersaglio riconosciuto: non si declassa. L'assenza di prova non e'
+    // prova d'innocenza, e qui l'errore costa la cancellazione di un sorgente.
+    if bersagli.is_empty() {
+        return level;
+    }
+    let tutti_rigenerabili = bersagli
+        .iter()
+        .all(|b| bersaglio_rigenerabile(b, artefatti_rigenerabili));
+    if tutti_rigenerabili {
+        StepCriticality::Critical
+    } else {
+        level
+    }
+}
+
+/// Le parole-bersaglio dei comandi di cancellazione presenti nella riga
+/// (opzioni escluse). Delega la scomposizione al punto unico
+/// [`super::shell_command::comandi`], come il matcher: una seconda idea di
+/// «cosa sono le parole di questo comando» darebbe due risposte diverse sulla
+/// stessa riga.
+fn bersagli_di_cancellazione(riga: &str) -> Vec<String> {
+    const CANCELLATORI: &[&str] = &["rm", "del", "rmdir", "remove-item"];
+    let mut out = Vec::new();
+    for c in super::shell_command::comandi(riga) {
+        let Some(programma) = c.parole.first() else {
+            continue;
+        };
+        let programma = programma.rsplit(['/', '\\']).next().unwrap_or(programma);
+        if !CANCELLATORI.contains(&programma.to_lowercase().trim_end_matches(".exe")) {
+            continue;
+        }
+        out.extend(
+            c.parole
+                .iter()
+                .skip(1)
+                .filter(|p| !p.starts_with('-') && !p.starts_with('/'))
+                .cloned(),
+        );
+    }
+    out
+}
+
+/// Il bersaglio e' un artefatto rigenerabile DENTRO il progetto?
+fn bersaglio_rigenerabile(bersaglio: &str, artefatti: &[String]) -> bool {
+    let b = bersaglio.replace('\\', "/");
+    let b = b.trim_start_matches("./");
+    // Assoluto (unix o windows) o che risale: fuori dal perimetro in cui il
+    // nome della cartella basta a identificarla.
+    if b.starts_with('/') || b.contains("../") || b == ".." || b.contains(':') {
+        return false;
+    }
+    // Basta che UN segmento del percorso sia un artefatto noto: `node_modules/.cache`
+    // e' dentro `node_modules`, e cancellarlo e' rigenerabile quanto cancellare
+    // tutta la cartella.
+    b.split('/')
+        .filter(|s| !s.is_empty())
+        .any(|seg| artefatti.iter().any(|a| a.eq_ignore_ascii_case(seg)))
 }
 
 /// UNA regola contro UN passo (il ramo per matcher_kind, fuori dal ciclo).
@@ -463,6 +569,7 @@ mod tests {
                 &json!({ "command": cmd }),
                 &mutatori(),
                 &regole(),
+                &[],
             )
         };
         assert_eq!(classify("echo 'rm -rf tutto'").level, StepCriticality::Mutating);
@@ -527,7 +634,7 @@ mod tests {
             },
         ];
         let livello = |cmd: &str| {
-            classify_step("run_command", &json!({ "command": cmd }), &mutatori(), &regole).level
+            classify_step("run_command", &json!({ "command": cmd }), &mutatori(), &regole, &[]).level
         };
         assert_eq!(
             livello("taskkill /F /IM node.exe"),
@@ -549,12 +656,12 @@ mod tests {
     /// -> Mutating, tool_name in regola -> il suo livello.
     #[test]
     fn base_dal_vocabolario_mutatori_e_tool_name() {
-        let c = classify_step("read_file", &json!({"path": "a"}), &mutatori(), &regole());
+        let c = classify_step("read_file", &json!({"path": "a"}), &mutatori(), &regole(), &[]);
         assert_eq!(c.level, StepCriticality::ReadOnly);
-        let c = classify_step("write_file", &json!({"path": "a"}), &mutatori(), &regole());
+        let c = classify_step("write_file", &json!({"path": "a"}), &mutatori(), &regole(), &[]);
         assert_eq!(c.level, StepCriticality::Mutating);
         assert_eq!(c.matched_category, None);
-        let c = classify_step("stop_service", &json!({}), &mutatori(), &regole());
+        let c = classify_step("stop_service", &json!({}), &mutatori(), &regole(), &[]);
         assert_eq!(c.level, StepCriticality::Critical);
         assert_eq!(c.matched_category.as_deref(), Some("service_stop"));
     }
@@ -604,5 +711,129 @@ mod tests {
         );
         assert_eq!(rules.len(), 1);
         assert_eq!(parse_rules("non-json").len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod tests_artefatti_rigenerabili {
+    use super::*;
+    use serde_json::json;
+
+    fn artefatti() -> Vec<String> {
+        ["node_modules", ".next", "dist", "target", ".cache"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn regole_rm() -> Vec<CriticalityRule> {
+        parse_rules(
+            r#"[{"matcher_kind":"command_token","pattern":"rm -rf","level":"irreversible","category":"destructive_fs"}]"#,
+        )
+    }
+
+    fn livello(cmd: &str, artefatti: &[String]) -> StepCriticality {
+        classify_step(
+            "run_command",
+            &json!({ "command": cmd }),
+            &[],
+            &regole_rm(),
+            artefatti,
+        )
+        .level
+    }
+
+    /// IL caso misurato: la pulizia della cache di build non e' irreversibile.
+    ///
+    /// MUTAZIONE: togliendo la chiamata a `declassa_se_rigenerabile` in
+    /// `classify_step`, questo rosseggia con `Irreversible` — cioe' col passo
+    /// che il gate ha bloccato in autonomia senza poter chiedere a nessuno.
+    #[test]
+    fn la_pulizia_della_cache_non_e_irreversibile() {
+        let a = artefatti();
+        assert_eq!(
+            livello("rm -rf .next node_modules/.cache", &a),
+            StepCriticality::Critical,
+            "artefatti rigenerabili dentro il progetto: sorvegliato, non fail-closed"
+        );
+        assert_eq!(livello("rm -rf dist", &a), StepCriticality::Critical);
+        assert_eq!(livello("rm -rf target", &a), StepCriticality::Critical);
+    }
+
+    /// Cio' che NON deve cambiare, ed e' la meta' importante del fix: un
+    /// bersaglio non rigenerabile tiene l'intero comando irreversibile, anche
+    /// se sulla stessa riga c'e' un artefatto.
+    #[test]
+    fn un_solo_bersaglio_non_rigenerabile_tiene_tutto_irreversibile() {
+        let a = artefatti();
+        assert_eq!(
+            livello("rm -rf .next src", &a),
+            StepCriticality::Irreversible,
+            "`src` non si rigenera: la presenza di `.next` sulla stessa riga non assolve"
+        );
+        assert_eq!(livello("rm -rf .", &a), StepCriticality::Irreversible);
+        assert_eq!(livello("rm -rf backend", &a), StepCriticality::Irreversible);
+    }
+
+    /// Fuori dal progetto il NOME di una cartella non dice piu' di chi sia:
+    /// path assoluti, risalite e unita' Windows restano irreversibili anche se
+    /// nominano un artefatto.
+    #[test]
+    fn fuori_dal_progetto_il_nome_non_basta() {
+        let a = artefatti();
+        for cmd in [
+            "rm -rf /node_modules",
+            "rm -rf ../node_modules",
+            "rm -rf ../../dist",
+            "rm -rf C:/progetti/altro/node_modules",
+            "rm -rf /",
+        ] {
+            assert_eq!(
+                livello(cmd, &a),
+                StepCriticality::Irreversible,
+                "'{cmd}' esce dal progetto: deve restare irreversibile"
+            );
+        }
+    }
+
+    /// Vocabolario vuoto = comportamento di prima. E' anche il rollback della
+    /// migrazione 0684.
+    #[test]
+    fn senza_vocabolario_nessun_declassamento() {
+        assert_eq!(
+            livello("rm -rf .next", &[]),
+            StepCriticality::Irreversible
+        );
+    }
+
+    /// Il declassamento vale SOLO per gli irreversibili da cancellazione: un
+    /// `DROP TABLE` non ha bersagli di filesystem e non deve passare di qui.
+    #[test]
+    fn non_tocca_gli_irreversibili_che_non_cancellano_file() {
+        let regole = parse_rules(
+            r#"[{"matcher_kind":"command_token","pattern":"DROP TABLE","level":"irreversible","category":"destructive_db"}]"#,
+        );
+        let c = classify_step(
+            "nexus_db_query",
+            &json!({ "sql": "DROP TABLE utenti" }),
+            &[],
+            &regole,
+            &artefatti(),
+        );
+        assert_eq!(c.level, StepCriticality::Irreversible);
+    }
+
+    /// La menzione non e' esecuzione, e il declassamento non deve aprire una
+    /// falla: un comando che NOMINA un artefatto senza cancellarlo non e'
+    /// nemmeno un `rm`.
+    #[test]
+    fn la_menzione_di_un_artefatto_non_declassa_altro() {
+        let a = artefatti();
+        // `rm` con bersaglio pericoloso preceduto da un `cd`: il declassamento
+        // guarda i bersagli del rm, non l'intera riga.
+        assert_eq!(
+            livello("cd frontend && rm -rf ../backend", &a),
+            StepCriticality::Irreversible
+        );
     }
 }

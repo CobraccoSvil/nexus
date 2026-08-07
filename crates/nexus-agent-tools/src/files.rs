@@ -1363,6 +1363,104 @@ fn anchor_prefix(line: &str) -> &str {
     line[..safe].trim_end()
 }
 
+/// Dove nel file si ADDENSANO di piu' le righe di `old_string`.
+///
+/// PERCHE' NON BASTA IL PRIMO TOKEN. L'ancora precedente prendeva la prima riga
+/// non vuota di `old_string`, la troncava al primo `{`/`=`/`:`/`,`/`;`
+/// ([`anchor_prefix`]) e restituiva la PRIMA riga del file che la contenesse.
+/// Su codice con firme uniche (Rust, Python) funziona; su JSX/HTML/YAML e'
+/// sistematicamente sbagliato, e per due ragioni che si sommano:
+///
+/// 1. il taglio al `=` butta via proprio cio' che distingue la riga
+///    (`<div className="mt-4">` diventa `<div className`), tenendo la parte che
+///    in quei file e' identica ovunque;
+/// 2. `position()` prende la PRIMA occorrenza, non la migliore.
+///
+/// MISURATO il 07/08/2026 su biblioteca-scolastica: `App.jsx` ha 374 righe e
+/// QUATTORDICI contengono `<div className`. L'agente cercava un blocco che
+/// stava in fondo, l'ancora puntava alla riga 11, e l'errore gli mostrava le
+/// righe 1..26 — il 7% del file, la parte sbagliata — con scritto «il contenuto
+/// del file e' gia' incluso qui sotto». Ripeteva lo stesso `old_string` perche'
+/// in quell'estratto non c'era nulla da cui correggersi: iterazioni 26 e 28
+/// dello stesso run hanno `old_string` con la STESSA impronta md5. Su 144 edit
+/// dei tre progetti vivi, 16 fallivano cosi' (11%).
+///
+/// IL CRITERIO. Si scorre il file con una finestra alta quanto `old_string` e
+/// si conta quante sue righe (trimmate, non vuote) vi compaiono. Vince la
+/// finestra col conteggio piu' alto. E' robusto per costruzione: non dipende da
+/// separatori, quindi non ha un linguaggio preferito; tollera righe modificate,
+/// perche' misura una sovrapposizione e non una corrispondenza esatta; e con
+/// `old_string` di una sola riga degrada a «trova quella riga», che e' la
+/// risposta giusta.
+///
+/// `None` quando NESSUNA riga di `old_string` compare nel file: li' non c'e'
+/// una zona da mostrare, e il chiamante ripiega — il file e' probabilmente
+/// diverso da quello che l'agente immaginava, ed e' un'informazione a sua volta.
+fn ancora_per_sovrapposizione(lines: &[&str], old_string_lf: &str) -> Option<usize> {
+    /// Tetto sulle righe di `old_string` considerate: oltre, il costo cresce
+    /// senza migliorare l'ancora (le prime righe bastano a localizzare).
+    const MAX_RIGHE_OLD: usize = 24;
+
+    let old_righe: Vec<String> = old_string_lf
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .take(MAX_RIGHE_OLD)
+        .map(|l| l.to_lowercase())
+        .collect();
+    if old_righe.is_empty() || lines.is_empty() {
+        return None;
+    }
+
+    // Finestra alta quanto old_string (piu' un margine per le righe vuote che
+    // abbiamo scartato), scorsa su tutto il file.
+    let altezza = (old_righe.len() * 2).max(4).min(lines.len());
+    let normalizzate: Vec<String> = lines.iter().map(|l| l.trim().to_lowercase()).collect();
+
+    let mut migliore: Option<(usize, usize)> = None; // (punteggio, indice)
+    for start in 0..normalizzate.len() {
+        let end = (start + altezza).min(normalizzate.len());
+        let finestra = &normalizzate[start..end];
+        let punteggio = old_righe
+            .iter()
+            .filter(|o| finestra.iter().any(|f| f == *o))
+            .count();
+        if punteggio == 0 {
+            continue;
+        }
+        // L'ancora e' la prima riga della finestra che appartiene DAVVERO a
+        // `old_string`, non l'inizio della finestra: quella e' solo il punto da
+        // cui abbiamo guardato, e puntarci sposta l'estratto di qualche riga
+        // sopra il blocco cercato senza motivo.
+        let Some(offset) = finestra.iter().position(|f| old_righe.contains(f)) else {
+            continue;
+        };
+        // A parita' di punteggio vince la finestra piu' in ALTO (la prima che
+        // lo raggiunge): senza questo, un file con blocchi ripetuti sceglierebbe
+        // l'ultimo, che e' arbitrario quanto il primo ma meno prevedibile.
+        if migliore.is_none_or(|(p, _)| punteggio > p) {
+            migliore = Some((punteggio, start + offset));
+        }
+    }
+    migliore.map(|(_, i)| i)
+}
+
+/// Ripiego: la riga che contiene il prefisso-ancora, scegliendo l'occorrenza
+/// col contesto piu' promettente invece della prima.
+///
+/// Serve quando `old_string` non condivide NESSUNA riga intera col file — il
+/// caso per cui [`anchor_prefix`] era nato: firma di funzione invariata, corpo
+/// riscritto. Li' la sovrapposizione e' zero e il prefisso e' l'unico segnale.
+fn ancora_da_prefisso(lines: &[&str], first_token: &str) -> Option<usize> {
+    if first_token.is_empty() {
+        return None;
+    }
+    let token = first_token.to_lowercase();
+    lines
+        .iter()
+        .position(|l| l.to_lowercase().contains(&token))
+}
+
 /// Render NUMERATO di una finestra di righe `[start, end)` con cap per byte.
 ///
 /// PUNTO UNICO (regola L) del rendering "estratto numerato del file reale":
@@ -1551,14 +1649,11 @@ fn build_old_string_not_found_message(
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
 
-    let similar_line_idx: Option<usize> = if !first_token.is_empty() {
-        let first_token_lower = first_token.to_lowercase();
-        lines
-            .iter()
-            .position(|l| l.to_lowercase().contains(&first_token_lower))
-    } else {
-        None
-    };
+    // L'ancora viene da QUANTO SI SOMIGLIANO old_string e file, non dal primo
+    // token: e' `ancora_per_sovrapposizione` a deciderlo. Il prefisso resta
+    // solo come ultimo ripiego, e anche li' sceglie l'occorrenza MIGLIORE.
+    let similar_line_idx: Option<usize> = ancora_per_sovrapposizione(&lines, old_string_lf)
+        .or_else(|| ancora_da_prefisso(&lines, first_token));
 
     let approx_hint = if first_token.is_empty() {
         String::new()
@@ -1653,10 +1748,24 @@ fn read_edit_params<'a>(
     Ok((path_str, old_string, new_string))
 }
 
-pub async fn tool_edit_file(ctx: &ToolContextCore, input: &Value) -> String {
+/// L'editor chirurgico. MIGRATO alla regola Q: l'esito e la sua NATURA sono
+/// campi, e il testo resta testo.
+///
+/// Ogni fallimento di questo tool e' [`NaturaFallimento::Rimediabile`], e non
+/// per comodita': un `old_string` che non combacia, un blocco ambiguo, un
+/// percorso protetto sono tutti errori che l'agente puo' correggere DA SOLO col
+/// contenuto del messaggio — che infatti porta l'estratto numerato del file
+/// reale. E' anche un impegno verificabile in senso stretto: se un ramo di
+/// questo tool dichiarasse «rimediabile» senza dire come, la dichiarazione
+/// sarebbe falsa.
+pub async fn tool_edit_file(
+    ctx: &ToolContextCore,
+    input: &Value,
+) -> nexus_types::tool_outcome::RispostaTool {
+    use nexus_types::tool_outcome::RispostaTool;
     let (path_str, old_string, new_string) = match read_edit_params(ctx, input) {
         Ok(triple) => triple,
-        Err(msg) => return msg,
+        Err(msg) => return RispostaTool::fallito_rimediabile(msg),
     };
 
     // Governance risorse in scrittura (porte + URL interni), punto unico con
@@ -1666,12 +1775,17 @@ pub async fn tool_edit_file(ctx: &ToolContextCore, input: &Value) -> String {
         .enforce_on_write(ctx, "edit_file", path_str, new_string)
         .await
     {
-        return msg;
+        // Il rifiuto dice QUALE porta e come chiederne una: e' l'agente a
+        // doverla correggere.
+        return RispostaTool::fallito_rimediabile(msg);
     }
 
     // Preflight build graph (ADR 0020).
     let bg_warning = match run_build_graph_preflight(ctx, path_str).await {
-        BuildGraphPreflight::Block(msg) => return format!("\u{274C} [Errore: {}]", msg),
+        // Il marker in testa non serve piu': l'esito e' nel campo.
+        BuildGraphPreflight::Block(msg) => {
+            return RispostaTool::fallito_rimediabile(format!("[Errore: {msg}]"))
+        }
         BuildGraphPreflight::Warn(msg) => Some(msg),
         BuildGraphPreflight::Allow => None,
     };
@@ -1679,10 +1793,10 @@ pub async fn tool_edit_file(ctx: &ToolContextCore, input: &Value) -> String {
     let target = match resolve_relative_path(&ctx.root_path, path_str) {
         Ok(p) => p,
         Err(e) => {
-            return format!(
-                "\u{274C} [Errore percorso: {}]",
+            return RispostaTool::fallito_rimediabile(format!(
+                "[Errore percorso: {}]",
                 e.1["error"].as_str().unwrap_or("path error")
-            )
+            ))
         }
     };
 
@@ -1693,6 +1807,12 @@ pub async fn tool_edit_file(ctx: &ToolContextCore, input: &Value) -> String {
 /// numero di occorrenze di `old_string`, ritorna il messaggio di errore
 /// (0 = non trovato, N>1 = ambiguo) o applica la sostituzione univoca. Estratto
 /// da `tool_edit_file`.
+/// I tre esiti dell'incontro fra `old_string` e il contenuto reale: nessuna
+/// corrispondenza, piu' d'una, esattamente una.
+///
+/// I primi due sono fallimenti RIMEDIABILI, e il messaggio mantiene la
+/// promessa: porta l'estratto numerato del file vero, ancorato alla zona dove
+/// l'agente stava cercando. Il terzo applica la modifica.
 async fn edit_matched_content(
     ctx: &ToolContextCore,
     target: &Path,
@@ -1700,10 +1820,13 @@ async fn edit_matched_content(
     old_string: &str,
     new_string: &str,
     bg_warning: Option<String>,
-) -> String {
+) -> nexus_types::tool_outcome::RispostaTool {
+    use nexus_types::tool_outcome::RispostaTool;
     let raw_content = match tokio::fs::read_to_string(target).await {
         Ok(c) => c,
-        Err(e) => return format!("\u{274C} [Errore lettura '{}': {}]", path_str, e),
+        Err(e) => {
+            return RispostaTool::fallito_rimediabile(format!("[Errore lettura '{path_str}': {e}]"))
+        }
     };
 
     // Normalizza CRLF → LF per matching consistente (il code block nel prompt è sempre LF).
@@ -1718,9 +1841,21 @@ async fn edit_matched_content(
 
     let count = content.matches(old_string_lf.as_str()).count();
     match count {
-        0 => build_old_string_not_found_message(&content, &old_string_lf, path_str),
-        n if n > 1 => build_old_string_ambiguous_message(&content, &old_string_lf, path_str, n),
-        _ => {
+        // Entrambi i messaggi portano l'estratto numerato del file reale: e'
+        // cio' che rende la dichiarazione «rimediabile» una promessa mantenuta
+        // e non un'etichetta.
+        0 => RispostaTool::fallito_rimediabile(build_old_string_not_found_message(
+            &content,
+            &old_string_lf,
+            path_str,
+        )),
+        n if n > 1 => RispostaTool::fallito_rimediabile(build_old_string_ambiguous_message(
+            &content,
+            &old_string_lf,
+            path_str,
+            n,
+        )),
+        _ => RispostaTool::riuscito(
             apply_edit_and_persist(
                 ctx,
                 target,
@@ -1734,8 +1869,8 @@ async fn edit_matched_content(
                     bg_warning,
                 },
             )
-            .await
-        }
+            .await,
+        ),
     }
 }
 
@@ -2262,6 +2397,51 @@ mod tests {
     /// `spawn_edit_reindex`, due gemelli ricopiati. Mutazione che rende rosso:
     /// passare `Some(...)` anche dal ramo edit (l'hook M2 ricreerebbe il
     /// documento da un contenuto parziale).
+    /// Il fallimento di `edit_file` DICHIARA di essere rimediabile, e mantiene
+    /// la promessa: il testo porta l'estratto numerato con cui correggersi.
+    ///
+    /// Attraversa il TOOL vero (regola O), non il tipo: e' l'unico modo di
+    /// provare che la dichiarazione arriva da dove serve. Un test sul solo
+    /// `RispostaTool::fallito_rimediabile` proverebbe la libreria, non l'uso.
+    ///
+    /// MUTAZIONE: riportando quel ramo a `RispostaTool::fallito(...)`, l'assert
+    /// sulla natura rosseggia — e con essa sparisce la direttiva che il modello
+    /// riceve al confine.
+    #[tokio::test]
+    async fn un_old_string_sbagliato_e_un_fallimento_rimediabile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("note.txt"), "alfa
+beta
+gamma
+").expect("seed");
+        let hooks = Arc::new(HookRegistranti::default());
+        let ctx = ctx_di_prova(dir.path().to_path_buf(), hooks.clone());
+
+        let out = super::tool_edit_file(
+            &ctx,
+            &serde_json::json!({
+                "path": "note.txt",
+                "old_string": "questo testo non c'e'",
+                "new_string": "x",
+            }),
+        )
+        .await;
+
+        assert_eq!(out.esito, nexus_types::tool_outcome::EsitoTool::Fallito);
+        assert_eq!(
+            out.natura,
+            Some(nexus_types::tool_outcome::NaturaFallimento::Rimediabile),
+            "l'agente puo' correggere da solo: va dichiarato"
+        );
+        // La promessa: «rimediabile» senza l'informazione per rimediare sarebbe
+        // un'etichetta. L'estratto numerato del file reale e' quell'informazione.
+        assert!(
+            out.testo.contains("alfa"),
+            "il messaggio deve portare il contenuto reale: {}",
+            out.testo
+        );
+    }
+
     #[tokio::test]
     async fn edit_file_usa_lo_stesso_hook_post_scrittura_senza_contenuto() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2279,7 +2459,20 @@ mod tests {
         )
         .await;
 
-        assert!(out.contains("modificato con successo"), "edit fallito: {out}");
+        // Il test guarda i CAMPI, non il testo: e' il contratto che `edit_file`
+        // ha appena adottato (regola Q).
+        assert_eq!(
+            out.esito,
+            nexus_types::tool_outcome::EsitoTool::Riuscito,
+            "edit fallito: {}",
+            out.testo
+        );
+        assert_eq!(out.natura, None, "un successo non ha nulla da imputare");
+        assert!(
+            out.testo.contains("modificato con successo"),
+            "testo inatteso: {}",
+            out.testo
+        );
         assert_eq!(
             hooks.eventi(),
             vec![
@@ -2604,5 +2797,150 @@ mod tests {
             "etichetta occorrenza 2 mancante: {}",
             msg
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_ancora_estratto {
+    use super::{ancora_da_prefisso, ancora_per_sovrapposizione};
+
+    /// Il file che ha prodotto il difetto, ridotto: JSX con `<div className=`
+    /// ripetuto. L'old_string sta in FONDO.
+    pub(super) fn file_jsx() -> Vec<&'static str> {
+        vec![
+            "import { useState } from 'react';",          // 0
+            "",                                            // 1
+            "function App() {",                            // 2
+            "  return (",                                  // 3
+            "    <div className=\"min-h-screen bg-gray-50\">",  // 4  <- prima occorrenza
+            "      <header className=\"bg-blue-600\">",         // 5
+            "        <h1>Biblioteca</h1>",                  // 6
+            "      </header>",                              // 7
+            "      <div className=\"container\">",             // 8  <- seconda
+            "        <BookCatalog />",                      // 9
+            "      </div>",                                 // 10
+            "    </div>",                                   // 11
+            "  );",                                         // 12
+            "}",                                            // 13
+            "",                                             // 14
+            "function BookCatalog() {",                     // 15
+            "  return (",                                   // 16
+            "    <div className=\"mt-4\">",                   // 17 <- QUI sta l'old_string
+            "      <h3>Elenco Libri</h3>",                   // 18
+            "      <ul className=\"space-y-2\">",             // 19
+            "        {books.map((book) => (",                // 20
+            "          <li key={book.id}>{book.title}</li>", // 21
+            "        ))}",                                   // 22
+            "      </ul>",                                   // 23
+            "    </div>",                                    // 24
+            "  );",                                          // 25
+            "}",                                             // 26
+        ]
+    }
+
+    /// MUTAZIONE: ripristinando l'ancora al primo-token (cioe' facendo tornare
+    /// `ancora_per_sovrapposizione` a `None` e lasciando decidere il prefisso),
+    /// questo test rosseggia con l'indice 4 al posto del 17 — esattamente il
+    /// difetto misurato: l'estratto mostrava la testa del file mentre
+    /// l'old_string stava in fondo.
+    #[test]
+    fn ancora_la_zona_giusta_anche_se_la_prima_riga_e_ambigua() {
+        let lines = file_jsx();
+        let old = "    <div className=\"mt-4\">
+      <h3>Elenco Libri</h3>
+      <ul className=\"space-y-2\">
+";
+        let i = ancora_per_sovrapposizione(&lines, old).expect("almeno una riga in comune");
+        assert!(
+            (16..=18).contains(&i),
+            "l'ancora deve cadere sul blocco di BookCatalog (~riga 17), non sulla              prima <div className> del file: ottenuto {i}"
+        );
+
+        // E si dimostra che il criterio VECCHIO sbagliava, sullo stesso input.
+        let vecchia = ancora_da_prefisso(&lines, "<div className");
+        assert_eq!(
+            vecchia,
+            Some(4),
+            "il prefisso da solo prende la PRIMA delle tre <div className>:              e' la ragione per cui l'agente riceveva la parte sbagliata del file"
+        );
+    }
+
+    /// LO STESSO CASO, ma attraverso il PRODUTTORE REALE del messaggio
+    /// (regola O): i test qui sopra chiamano la funzione d'ancoraggio in
+    /// isolamento, quindi restano verdi anche se qualcuno la scollega dal call
+    /// site — verificato provandolo. Questo test parte da dove parte la
+    /// produzione, cioe' dal testo che l'agente si vede arrivare.
+    ///
+    /// MUTAZIONE: sostituendo il criterio con il solo prefisso nel call site di
+    /// `build_old_string_not_found_message`, questo rosseggia perche' l'estratto
+    /// mostra l'intestazione del file al posto del blocco cercato.
+    #[test]
+    fn il_messaggio_mostra_la_zona_dove_cercava_l_agente() {
+        let contenuto = super::super::files::tests_ancora_estratto::file_jsx().join("
+");
+        let old = "    <div className=\"mt-4\">
+      <h3>Elenco Libri</h3>
+      <ul className=\"space-y-2\">
+";
+        let msg = super::build_old_string_not_found_message(&contenuto, old, "frontend/src/App.jsx");
+
+        assert!(
+            msg.contains("Elenco Libri"),
+            "l'estratto deve contenere la zona che l'agente cercava.
+--- messaggio ---
+{msg}"
+        );
+        assert!(
+            !msg.contains("import { useState }"),
+            "l'estratto NON deve essere l'intestazione del file: e' cio' che              l'agente riceveva mentre cercava un blocco in fondo.
+--- messaggio ---
+{msg}"
+        );
+    }
+
+    /// Il caso per cui `anchor_prefix` era nato: firma invariata, corpo
+    /// riscritto. Nessuna riga in comune -> il ripiego deve restare utile.
+    #[test]
+    fn senza_righe_in_comune_ripiega_sul_prefisso() {
+        let lines = vec![
+            "fn altra() {}",
+            "pub fn target_function(arg: u32) -> u32 {",
+            "    arg + 1",
+            "}",
+        ];
+        // old_string col corpo diverso: nessuna riga coincide interamente.
+        let old = "pub fn target_function(arg: u32) -> u32 {
+    arg + 999
+}
+";
+        let per_sovrapposizione = ancora_per_sovrapposizione(&lines, old);
+        // La graffa di chiusura `}` coincide: la sovrapposizione la trova ed e'
+        // gia' la zona giusta.
+        assert!(per_sovrapposizione.is_some());
+        // Il ripiego, se servisse, punta comunque alla firma.
+        assert_eq!(ancora_da_prefisso(&lines, "pub fn target_function(arg"), Some(1));
+    }
+
+    /// Nessuna riga in comune e nessun prefisso: si dichiara l'assenza invece
+    /// di indicare una zona a caso. Chi legge l'errore deve poter capire che il
+    /// file e' diverso da quello che immaginava.
+    #[test]
+    fn file_del_tutto_diverso_non_inventa_un_ancora() {
+        let lines = vec!["alpha", "beta", "gamma"];
+        assert_eq!(ancora_per_sovrapposizione(&lines, "delta
+epsilon
+"), None);
+        assert_eq!(ancora_da_prefisso(&lines, ""), None);
+    }
+
+    /// A parita' di sovrapposizione vince la finestra piu' in alto: due blocchi
+    /// identici non devono dare un'ancora che cambia da un'esecuzione all'altra.
+    #[test]
+    fn a_parita_di_punteggio_vince_la_prima_finestra() {
+        let lines = vec!["a", "x", "y", "b", "x", "y", "c"];
+        let i = ancora_per_sovrapposizione(&lines, "x
+y
+").expect("righe in comune");
+        assert!(i <= 2, "atteso il primo blocco, ottenuto {i}");
     }
 }

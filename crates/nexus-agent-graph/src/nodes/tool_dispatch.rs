@@ -330,6 +330,11 @@ pub struct ToolDispatchConfig {
     /// (`orchestrator.critical_step_rules`, JSON in settings; le voci rotte
     /// sono gia' state scartate una a una con WARN da `parse_rules`).
     pub step_gate_rules: Vec<crate::decisions::step_gate::CriticalityRule>,
+    /// Nomi di cartelle che un progetto sa RIGENERARE
+    /// (`orchestrator.rebuildable_artifacts`). Servono a distinguere una
+    /// pulizia di cache da una cancellazione definitiva: vedi
+    /// `step_gate::declassa_se_rigenerabile`. Vuoto = nessun declassamento.
+    pub rebuildable_artifacts: Vec<String>,
     /// Rimandi massimi del gate duale prima di degradare a NeedsHuman
     /// (`orchestrator.critical_step_max_rejections`): il cap anti ping-pong
     /// fra modello e validatori.
@@ -361,6 +366,7 @@ impl Default for ToolDispatchConfig {
             // Gate duale spento di default: si accende SOLO dal DB (mig 0677).
             step_gate_mode: crate::decisions::step_gate::StepGateMode::Off,
             step_gate_rules: Vec::new(),
+            rebuildable_artifacts: Vec::new(),
             step_gate_max_rejections: 2,
         }
     }
@@ -1404,6 +1410,7 @@ impl ToolDispatchNode {
                     p.get("input").unwrap_or(&Value::Null),
                     &self.cfg.fs_mutator_tools,
                     &self.cfg.step_gate_rules,
+                    &self.cfg.rebuildable_artifacts,
                 )
             })
             .collect();
@@ -4555,6 +4562,7 @@ mod tests {
         ToolDispatchConfig {
             step_gate_mode: crate::decisions::step_gate::StepGateMode::EnforceIrreversible,
             step_gate_rules: regole_kill(),
+            rebuildable_artifacts: Vec::new(),
             ..ToolDispatchConfig::default()
         }
     }
@@ -5035,6 +5043,7 @@ mod golden {
             // passo 2a inerte, dispatch bit-identico ai fixture).
             step_gate_mode: d.step_gate_mode,
             step_gate_rules: d.step_gate_rules,
+            rebuildable_artifacts: d.rebuildable_artifacts,
             step_gate_max_rejections: d.step_gate_max_rejections,
         }
     }

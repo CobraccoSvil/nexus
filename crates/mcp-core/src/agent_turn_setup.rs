@@ -408,6 +408,38 @@ fn apply_dispatch_kinds_enum(tools: &mut Value, kinds: &[String]) {
     }
 }
 
+/// Gli scope ammessi da `nexus_verify_change`, nel catalogo che vede QUESTO
+/// progetto: `quick`/`full` piu' gli step del suo profilo di verifica.
+///
+/// Stesso motivo dell'enum `kind` qui sopra, ma il difetto era peggiore: li'
+/// il seed statico era un ripiego ragionevole, qui l'enum statico
+/// (`typecheck|build|lint|test`) PROMETTEVA valori che l'esecutore rifiuta.
+/// Il profilo e' inferito per progetto e i suoi step portano il nome del
+/// pacchetto — `lint-frontend`, `typecheck-backend` — quindi un agente che
+/// chiedeva `lint`, cioe' esattamente uno dei valori dichiarati nello schema,
+/// otteneva `invalid_scope`. Non era il modello a indovinare: era il contratto
+/// a mentire, e il modello a credergli (regola Q: lo schema E' il contratto).
+///
+/// Profilo vuoto (progetto nuovo, DB irraggiungibile) -> resta il SEED, come
+/// per i kind: meglio un enum generico che nessuno scope.
+fn apply_verify_scope_enum(tools: &mut Value, steps: &[String]) {
+    if steps.is_empty() {
+        return;
+    }
+    let mut scopes = vec![Value::String("quick".into()), Value::String("full".into())];
+    scopes.extend(steps.iter().map(|s| Value::String(s.clone())));
+    let Some(arr) = tools.as_array_mut() else {
+        return;
+    };
+    for t in arr.iter_mut() {
+        if t.get("name").and_then(Value::as_str) == Some("nexus_verify_change") {
+            if let Some(e) = t.pointer_mut("/input_schema/properties/scope/enum") {
+                *e = Value::Array(scopes.clone());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod dispatch_kinds_enum_tests {
     use super::*;
@@ -433,6 +465,69 @@ mod dispatch_kinds_enum_tests {
         );
         // Tool non-dispatch intatto.
         assert!(tools[2]["input_schema"]["properties"].get("kind").is_none());
+    }
+
+    /// Lo scope che il catalogo DICHIARA deve essere uno che l'esecutore
+    /// ACCETTA. Il difetto reale: l'enum statico prometteva `lint`, il profilo
+    /// del progetto aveva `lint-frontend`, e l'agente che sceglieva un valore
+    /// dichiarato riceveva `invalid_scope`.
+    ///
+    /// MUTAZIONE: se `apply_verify_scope_enum` non viene chiamato (o non trova
+    /// il tool), l'enum resta quello statico e questo test rosseggia
+    /// mostrando `lint` al posto di `lint-frontend`.
+    #[test]
+    fn lo_scope_dichiarato_e_quello_del_profilo_del_progetto() {
+        let mut tools = json!([
+            {"name": "nexus_verify_change", "input_schema": {"properties": {
+                "scope": {"type": "string", "enum": ["quick", "full", "typecheck", "build", "lint", "test"]}
+            }}},
+            {"name": "read_file", "input_schema": {"properties": {}}}
+        ]);
+        apply_verify_scope_enum(
+            &mut tools,
+            &[
+                "typecheck-backend".to_string(),
+                "lint-frontend".to_string(),
+                "build-frontend".to_string(),
+            ],
+        );
+        assert_eq!(
+            tools[0]["input_schema"]["properties"]["scope"]["enum"],
+            json!(["quick", "full", "typecheck-backend", "lint-frontend", "build-frontend"]),
+            "l'enum deve elencare gli step REALI del profilo, non quelli generici"
+        );
+        // Gli scope generici restano: non sono step del profilo, li risolve il
+        // tool stesso.
+        let dichiarati = tools[0]["input_schema"]["properties"]["scope"]["enum"].clone();
+        for generico in ["quick", "full"] {
+            assert!(
+                dichiarati.as_array().unwrap().iter().any(|v| v == generico),
+                "'{generico}' deve restare ammesso"
+            );
+        }
+        // Un valore che l'esecutore rifiuterebbe non deve piu' essere promesso.
+        assert!(
+            !dichiarati.as_array().unwrap().iter().any(|v| v == "lint"),
+            "'lint' non e' uno step di questo profilo: promuoverlo e' cio' che              produceva invalid_scope"
+        );
+        // Tool non coinvolto intatto.
+        assert!(tools[1]["input_schema"]["properties"].get("scope").is_none());
+    }
+
+    /// Profilo vuoto (progetto nuovo, DB muto): resta il seed. Meglio un enum
+    /// generico che nessuno scope — e' la stessa scelta dei kind.
+    #[test]
+    fn profilo_vuoto_mantiene_il_seed() {
+        let mut tools = json!([
+            {"name": "nexus_verify_change", "input_schema": {"properties": {
+                "scope": {"enum": ["quick", "full"]}
+            }}}
+        ]);
+        apply_verify_scope_enum(&mut tools, &[]);
+        assert_eq!(
+            tools[0]["input_schema"]["properties"]["scope"]["enum"],
+            json!(["quick", "full"])
+        );
     }
 
     #[test]
@@ -507,6 +602,17 @@ pub async fn build_tools_json_for_agent(
     apply_dispatch_kinds_enum(
         &mut base_tools,
         &crate::agent_tools::subagent_native::convocable_kinds(db).await,
+    );
+    // Stessa regola per gli scope di `nexus_verify_change`, che pero' sono
+    // per-PROGETTO: il profilo di verifica e' inferito dall'albero, e i suoi
+    // step portano il nome del pacchetto.
+    apply_verify_scope_enum(
+        &mut base_tools,
+        &crate::verify_profile::profile_steps(db, project_id)
+            .await
+            .into_iter()
+            .map(|s| s.step)
+            .collect::<Vec<_>>(),
     );
     let full_tools = assemble_full_tools(
         db,

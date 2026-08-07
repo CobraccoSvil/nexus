@@ -60,6 +60,11 @@ async fn esegui_tool_migrato(
         // vive in `esito`. Un marker in testa alla prosa qui sarebbe tornato a
         // essere un campo travestito.
         "list_active_services" => Some(service::tool_list_active_services(ctx, input).await),
+        // Ogni suo fallimento e' RIMEDIABILE e lo dichiara nel campo `natura`:
+        // e' il primo tool a farlo, ed e' quello su cui la mancanza si
+        // misurava (11% di `old_string non trovato` seguiti da una ripetizione
+        // identica, 07/08/2026).
+        "edit_file" => Some(files::tool_edit_file(ctx, input).await),
         _ => None,
     }
 }
@@ -115,7 +120,6 @@ async fn esegui_tool_legacy(
         "format_file" => testing::tool_format_file(ctx, input).await,
         "delete_file" => files::tool_delete_file(ctx, input).await,
         "rename_file" => files::tool_rename_file(ctx, input).await,
-        "edit_file" => files::tool_edit_file(ctx, input).await,
         // Catena di verifica post-modifica (ADR 0019 L3): typecheck -> build ->
         // lint -> test con fail-fast e VerifyReport strutturato.
         "nexus_verify_change" => verify::tool_nexus_verify_change(ctx, input).await,

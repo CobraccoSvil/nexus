@@ -169,9 +169,22 @@ pub(crate) fn map_result_to_outcome(
     risposta: nexus_types::tool_outcome::RispostaTool,
 ) -> ToolOutcome {
     let is_error = risposta.esito.e_fallito();
+    // La NATURA del fallimento diventa una riga di testo QUI, perche' qui e' il
+    // confine col modello — che e' l'unico consumatore di quella frase (regola
+    // Q, punto 3: si compone il testo dai campi, mai il contrario). Nessun
+    // codice di Nexus la rilegge: chi deve decidere guarda `risposta.natura`.
+    //
+    // Senza, il campo resterebbe una decorazione: il modello vedrebbe lo stesso
+    // «errore» indistinto di prima e continuerebbe a scegliere la strategia a
+    // caso — ripetere un passo bloccato dal sistema, o rinunciare a un retry
+    // legittimo su un avvio lento.
+    let content = match risposta.natura {
+        Some(n) => format!("{}\n\n{}", risposta.testo, n.direttiva()),
+        None => risposta.testo,
+    };
     ToolOutcome {
         tool_call_id: tool_call_id.to_string(),
-        content: Value::String(risposta.testo),
+        content: Value::String(content),
         is_error,
         exit_code: risposta.exit_code.map(i64::from),
         is_infrastructure: false,
@@ -288,5 +301,82 @@ mod tests {
         );
         assert!(!out.is_error);
         assert_eq!(out.exit_code, None, "tool non-comando -> exit_code None");
+    }
+}
+
+#[cfg(test)]
+mod tests_natura_al_modello {
+    use super::map_result_to_outcome;
+    use nexus_types::tool_outcome::{NaturaFallimento, RispostaTool};
+
+    use nexus_agent_graph::runtime::ports::ToolOutcome;
+
+    fn testo(out: &ToolOutcome) -> String {
+        out.content.as_str().unwrap_or_default().to_string()
+    }
+
+    /// La natura raggiunge il MODELLO, non resta un campo che nessuno legge.
+    ///
+    /// E' il test che distingue un meccanismo vivo da una struttura inerte: il
+    /// campo esiste da questo commit, e se non attraversasse questo confine
+    /// l'agente vedrebbe lo stesso «errore» indistinto di prima.
+    ///
+    /// MUTAZIONE: rimettendo `content: Value::String(risposta.testo)` in
+    /// `map_result_to_outcome`, tutti e tre i casi rosseggiano.
+    #[test]
+    fn la_direttiva_arriva_nel_testo_per_il_modello() {
+        let casi = [
+            (NaturaFallimento::Rimediabile, "non ripetere"),
+            (NaturaFallimento::Transitorio, "ritentare"),
+            (NaturaFallimento::DelSistema, "cambia strada"),
+        ];
+        for (natura, atteso) in casi {
+            let out = map_result_to_outcome("c", RispostaTool::fallito("x").con_natura(natura));
+            let t = testo(&out);
+            assert!(
+                t.contains(atteso),
+                "la direttiva di {:?} deve raggiungere il modello, testo: {t}",
+                natura
+            );
+            assert!(t.starts_with('x'), "il testo originale resta in testa: {t}");
+            assert!(out.is_error, "resta un fallimento");
+        }
+    }
+
+    /// Le tre direttive sono DIVERSE fra loro. Senza questo, tre varianti che
+    /// producono lo stesso testo passerebbero il test sopra pur non dicendo
+    /// nulla di distinto al modello.
+    #[test]
+    fn le_tre_direttive_non_si_confondono() {
+        let d: Vec<&str> = [
+            NaturaFallimento::Rimediabile,
+            NaturaFallimento::Transitorio,
+            NaturaFallimento::DelSistema,
+        ]
+        .iter()
+        .map(|n| n.direttiva())
+        .collect();
+        assert_ne!(d[0], d[1]);
+        assert_ne!(d[1], d[2]);
+        assert_ne!(d[0], d[2]);
+    }
+
+    /// Un fallimento senza natura dichiarata (tool legacy) NON riceve una
+    /// direttiva inventata: il testo resta esattamente quello del tool.
+    #[test]
+    fn senza_natura_il_testo_resta_intatto() {
+        let out = map_result_to_outcome("c", RispostaTool::fallito("solo questo"));
+        assert_eq!(testo(&out), "solo questo");
+    }
+
+    /// Un successo non ha natura, e `con_natura` su un successo e' un no-op
+    /// deliberato: non esiste un esito riuscito da imputare a qualcuno.
+    #[test]
+    fn un_successo_non_riceve_direttive() {
+        let r = RispostaTool::riuscito("fatto").con_natura(NaturaFallimento::DelSistema);
+        assert_eq!(r.natura, None);
+        let out = map_result_to_outcome("c", r);
+        assert_eq!(testo(&out), "fatto");
+        assert!(!out.is_error);
     }
 }

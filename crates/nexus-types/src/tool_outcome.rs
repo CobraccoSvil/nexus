@@ -72,6 +72,81 @@ impl EsitoTool {
     }
 }
 
+/// DI CHI e' il problema, e quindi che cosa ha senso fare dopo.
+///
+/// PERCHE' NON BASTA SAPERE CHE E' FALLITO. [`EsitoTool`] dice «e' andata
+/// male»; questo dice se il modello puo' farci qualcosa. Sono due domande
+/// diverse, e la seconda e' quella che determina la strategia: correggere,
+/// riprovare, o cambiare strada. Oggi arrivano tutte come «errore» indistinto,
+/// e l'agente sceglie a caso.
+///
+/// MISURATO il 07/08/2026 sui tre progetti vivi: su 111 fallimenti, 17 sono
+/// seguiti dalla ripetizione IDENTICA dello stesso input nello stesso run
+/// (`run_command` 19%, `edit_file` 11%, `read_file`/`write_file` 0% — lo zero
+/// e' il controllo che rende leggibile il resto: dove l'errore e' chiaro,
+/// nessuno ripete). Guardando i casi, le ripetizioni si spiegano tutte con la
+/// natura del fallimento, mai con la bravura del modello:
+///
+/// - `Servizio 'frontend' NON avviato: nessun ascolto entro 20 secondi` ->
+///   ripetere e' CORRETTO, un avvio lento e' transitorio;
+/// - `nessun provider candidato distinto dall'esecutore` -> ripetere e'
+///   INUTILE, e il messaggio suggeriva pure «proponi una variante piu' sicura»,
+///   cioe' mandava a rimediare un passo che non era il problema;
+/// - `old_string non trovato` -> rimediabile, ma solo se l'errore porta
+///   l'informazione per correggere (e per mesi ha mostrato la zona sbagliata
+///   del file).
+///
+/// Chi PRODUCE l'errore sa a quale famiglia appartiene; chi lo riceve no, e
+/// finora non aveva modo di chiederlo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NaturaFallimento {
+    /// L'agente puo' correggere da solo. Il testo DEVE portare l'informazione
+    /// per farlo: dire «rimediabile» senza dire come e' una promessa non
+    /// mantenuta.
+    Rimediabile,
+    /// Condizione temporanea dell'ambiente (avvio lento, rete, risorsa occupata).
+    /// Riprovare la STESSA cosa e' la strategia giusta, e una ripetizione qui
+    /// non e' uno stallo.
+    Transitorio,
+    /// Il problema e' del sistema o della sua configurazione, fuori dalla
+    /// portata dell'agente: fornitori esauriti, gate senza giudici, permesso
+    /// negato dalla policy. Ripetere non cambia nulla — serve un'altra strada,
+    /// o fermarsi dichiarandolo.
+    DelSistema,
+}
+
+impl NaturaFallimento {
+    /// La riga da aggiungere al testo per il modello. PUNTO UNICO (regola L):
+    /// composta DAI campi, mai un marker che qualcuno dovra' poi rileggere
+    /// (regola Q, punto 3 — qui il consumatore e' il modello, e nessun codice
+    /// di Nexus analizza questa frase per decidere).
+    pub fn direttiva(self) -> &'static str {
+        match self {
+            Self::Rimediabile => {
+                "Puoi correggere da solo: usa le informazioni qui sopra, non ripetere \
+                 la stessa chiamata identica."
+            }
+            Self::Transitorio => {
+                "Condizione temporanea: ritentare la stessa operazione e' legittimo, \
+                 dopo una breve attesa."
+            }
+            Self::DelSistema => {
+                "Questo NON dipende dalla tua richiesta e ripeterla non cambiera' \
+                 l'esito: cambia strada, oppure fermati dichiarando il blocco."
+            }
+        }
+    }
+
+    /// Vocabolario canonico (regola N) per log e telemetria.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rimediabile => "actionable",
+            Self::Transitorio => "transient",
+            Self::DelSistema => "system",
+        }
+    }
+}
+
 /// Cio' che un tool agente restituisce: l'esito in un campo, il testo per
 /// l'umano e per il modello in un altro, lo stato d'uscita del processo in un
 /// terzo quando il tool ne ha eseguito uno.
@@ -90,6 +165,13 @@ pub struct RispostaTool {
     /// distinzione che il final_gate usa per non assolvere un criterio la cui
     /// invocazione e' stata negata.
     pub exit_code: Option<i32>,
+    /// Di che natura e' il fallimento (vedi [`NaturaFallimento`]).
+    ///
+    /// `None` significa «il produttore non l'ha dichiarata», ed e' distinto da
+    /// ogni valore: un tool non ancora migrato non deve sembrare uno che ha
+    /// detto «rimediabile». Sui `Riuscito` e' sempre `None` — li' non c'e'
+    /// niente da imputare.
+    pub natura: Option<NaturaFallimento>,
 }
 
 impl RispostaTool {
@@ -100,6 +182,7 @@ impl RispostaTool {
             testo: testo.to_string(),
             esito: EsitoTool::Riuscito,
             exit_code: None,
+            natura: None,
         }
     }
 
@@ -111,7 +194,36 @@ impl RispostaTool {
             testo: testo.to_string(),
             esito: EsitoTool::Fallito,
             exit_code: None,
+            natura: None,
         }
+    }
+
+    /// Fallimento che l'agente PUO' correggere. Il testo deve portare
+    /// l'informazione per farlo.
+    pub fn fallito_rimediabile(testo: impl Display) -> Self {
+        Self::fallito(testo).con_natura(NaturaFallimento::Rimediabile)
+    }
+
+    /// Fallimento TRANSITORIO: ritentare identico e' la strategia corretta.
+    pub fn fallito_transitorio(testo: impl Display) -> Self {
+        Self::fallito(testo).con_natura(NaturaFallimento::Transitorio)
+    }
+
+    /// Fallimento fuori dalla portata dell'agente: ripetere non serve.
+    pub fn fallito_di_sistema(testo: impl Display) -> Self {
+        Self::fallito(testo).con_natura(NaturaFallimento::DelSistema)
+    }
+
+    /// Dichiara la natura di un fallimento gia' costruito.
+    ///
+    /// Su un `Riuscito` e' un NO-OP deliberato: non esiste un successo da
+    /// imputare a qualcuno, e accettarlo silenziosamente renderebbe il campo
+    /// una decorazione invece di un dato.
+    pub fn con_natura(mut self, natura: NaturaFallimento) -> Self {
+        if self.esito.e_fallito() {
+            self.natura = Some(natura);
+        }
+        self
     }
 
     /// Il tool ha ESEGUITO un comando e ne riporta lo stato d'uscita.
@@ -129,6 +241,7 @@ impl RispostaTool {
             testo: testo.to_string(),
             esito: EsitoTool::Riuscito,
             exit_code: Some(exit_code),
+            natura: None,
         }
     }
 
@@ -150,6 +263,10 @@ impl RispostaTool {
             exit_code: exit_code_legacy(&testo),
             esito,
             testo,
+            // Il ponte NON indovina la natura: un tool legacy non l'ha
+            // dichiarata, e attribuirgliene una qui sarebbe inventare il dato
+            // che questo tipo esiste per NON inventare.
+            natura: None,
         }
     }
 }

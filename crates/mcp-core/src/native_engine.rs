@@ -2336,7 +2336,7 @@ async fn load_tool_dispatch_config(
     fs_mutator_tools: Vec<String>,
 ) -> ToolDispatchConfig {
     let d = ToolDispatchConfig::default();
-    let (step_gate_mode, step_gate_rules, step_gate_max_rejections) =
+    let (step_gate_mode, step_gate_rules, step_gate_max_rejections, rebuildable_artifacts) =
         load_step_gate_dispatch(db, d.step_gate_max_rejections).await;
     let (tool_result_max_chars, attachment_budget_bytes) =
         load_dispatch_limits(db, provider, model, &d).await;
@@ -2408,6 +2408,7 @@ async fn load_tool_dispatch_config(
         step_gate_mode,
         step_gate_rules,
         step_gate_max_rejections,
+        rebuildable_artifacts,
     }
 }
 
@@ -2441,6 +2442,7 @@ async fn load_step_gate_dispatch(
     nexus_agent_graph::decisions::step_gate::StepGateMode,
     Vec<nexus_agent_graph::decisions::step_gate::CriticalityRule>,
     u32,
+    Vec<String>,
 ) {
     let mode = crate::agent_graph_adapter::step_validation::load_mode(db).await;
     let rules = nexus_agent_graph::decisions::step_gate::parse_rules(
@@ -2455,7 +2457,11 @@ async fn load_step_gate_dispatch(
     )
     .await
     .max(0) as u32;
-    (mode, rules, max_rejections)
+    // Vocabolario DB (regola G): il nome della cartella di build cambia col
+    // framework, e un elenco nel codice sarebbe da rincorrere a ogni novita'.
+    // Vuoto = nessun declassamento, cioe' il comportamento di prima.
+    let rebuildable = nexus_auth::get_csv_setting(db, "orchestrator.rebuildable_artifacts").await;
+    (mode, rules, max_rejections, rebuildable)
 }
 
 /// Costruisce la [`ClarifyConfig`] DB-driven (regola G, prefisso `clarify.`).
