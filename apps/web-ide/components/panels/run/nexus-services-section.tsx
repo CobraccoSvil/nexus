@@ -3,6 +3,7 @@
 import type { useThemeColors } from "../../../lib/theme";
 import type { NexusServiceInfo } from "../../../lib/api-client";
 import { stateColor, stateLabel, actBtnStyle, hdrStyle } from "./shared";
+import { useI18n } from "../../../lib/i18n";
 
 interface NexusServicesSectionProps {
   tc: ReturnType<typeof useThemeColors>;
@@ -25,6 +26,7 @@ export function NexusServicesSection({
   fetchNexusServices,
   handleNexusAction,
 }: NexusServicesSectionProps) {
+  const { t } = useI18n();
   return (
     <>
       {/* ════════════════════════════════ 0: SERVIZI NEXUS ═════════════════ */}
@@ -34,7 +36,7 @@ export function NexusServicesSection({
       >
         <span style={{ display:"flex", alignItems:"center", gap:5, flex:1, minWidth:0 }}>
           <span style={{ fontSize:9, color:tc.textMuted, transition:"transform 0.15s", display:"inline-block", transform: nexusCollapsed ? "rotate(-90deg)" : "rotate(0deg)" }}>▼</span>
-          <span>Servizi Nexus</span>
+          <span>{t("panels.serviziNexus")}</span>
           {/* Indicatore di stato — visibile anche con sezione compressa */}
           {nexusSvcs.length > 0 && (() => {
             const attivi = nexusSvcs.filter(s => s.state === "active" || s.port_alive).length;
@@ -56,7 +58,7 @@ export function NexusServicesSection({
         </span>
         <button
           onClick={e => { e.stopPropagation(); fetchNexusServices(); }}
-          title="Aggiorna stato"
+          title={t("panels.aggiornaStato")}
           style={{ background:"none",border:`1px solid ${tc.border}`,borderRadius:3,color:tc.textMuted,cursor:"pointer",padding:"1px 8px",fontSize:10 }}
         >↺</button>
       </div>
@@ -70,7 +72,7 @@ export function NexusServicesSection({
       {!nexusCollapsed && <div style={{ display:"flex", flexDirection:"column", gap:0, borderBottom:`1px solid ${tc.border}` }}>
         {nexusSvcs.length === 0 && (
           <div style={{ padding:"8px 12px", fontSize:11, color:tc.textMuted }}>
-            Caricamento servizi…
+            {t("panels.caricamentoServizi")}
           </div>
         )}
         {nexusSvcs.map(svc => {
@@ -110,7 +112,7 @@ export function NexusServicesSection({
                   </span>
                 )}
                 {isPortOnly && (
-                  <span title="Processo avviato direttamente (fuori da systemd)" style={{
+                  <span title={t("panels.processoAvviatoDirettamenteFuori")} style={{
                     fontSize:9, color:"#94a3b8", background:"rgba(148,163,184,0.1)",
                     border:"1px solid rgba(148,163,184,0.25)", borderRadius:3,
                     padding:"1px 4px", marginLeft:6, fontFamily:'var(--font-mono)',

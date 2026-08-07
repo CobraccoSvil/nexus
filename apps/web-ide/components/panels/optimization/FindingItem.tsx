@@ -4,6 +4,7 @@ import { TruncatedText } from "../../truncated-text";
 import type { QualityFinding } from "../../../lib/api-client";
 import { SEVERITY_COLOR } from "./types";
 import type { Tc } from "./types";
+import { useI18n } from "../../../lib/i18n";
 
 interface FindingItemProps {
   tc: Tc;
@@ -26,6 +27,7 @@ export function FindingItem({
   handleMarkFixed,
   markFalsePositive,
 }: FindingItemProps) {
+  const { t } = useI18n();
   return (
     <div
       style={{
@@ -78,7 +80,7 @@ export function FindingItem({
                 padding: "2px 8px", fontSize: 10, cursor: "pointer",
               }}
             >
-              Fix
+              {t("panels.fix")}
             </button>
           )}
           <button
@@ -87,12 +89,12 @@ export function FindingItem({
               background: "none", border: `1px solid ${tc.border}`, borderRadius: 4,
               padding: "2px 6px", fontSize: 10, cursor: "pointer", color: tc.textMuted,
             }}
-            title="Segna come risolto"
+            title={t("panels.segnaComeRisolto")}
           >
             ✓
           </button>
           <button
-            title="Segna come falso positivo"
+            title={t("panels.segnaComeFalsoPositivo")}
             onClick={(e) => { e.stopPropagation(); markFalsePositive(finding.id, finding.rule_key || finding.category); }}
             style={{
               background: "none", border: "none", borderRadius: 4,

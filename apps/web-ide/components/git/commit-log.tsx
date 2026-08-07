@@ -3,19 +3,21 @@
 import { useState } from "react";
 import { type GitLogEntry } from "../../lib/api-client";
 import { useThemeColors } from "../../lib/theme";
+import { useI18n } from "../../lib/i18n";
 
 interface CommitLogProps {
   logEntries: GitLogEntry[];
 }
 
 export function CommitLog({ logEntries }: CommitLogProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [expandedCommit, setExpandedCommit] = useState<string | null>(null);
 
   return (
     <div>
       <div style={{ fontSize: 10, fontWeight: 700, color: tc.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", padding: "2px 6px", marginBottom: 2 }}>
-        Log recente
+        {t("git.logRecente")}
       </div>
       {logEntries.slice(0, 12).map((entry) => {
         const dateStr = entry.date

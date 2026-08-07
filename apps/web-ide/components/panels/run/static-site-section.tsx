@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import type { useThemeColors } from "../../../lib/theme";
 import { hdrStyle } from "./shared";
+import { useI18n } from "../../../lib/i18n";
 
 // Risposta dell'endpoint protetto mcp-core GET /api/projects/:id/static-site.
 // Quando detected e' true, entry e url sono valorizzati.
@@ -22,6 +23,7 @@ interface StaticSiteSectionProps {
 // Il sito viene servito da mcp-core via la route pubblica /preview, proxata
 // same-origin da apps/web-ide/app/preview/[projectId]/[[...path]]/route.ts.
 export function StaticSiteSection({ tc, projectId }: StaticSiteSectionProps) {
+  const { t } = useI18n();
   const [site, setSite] = useState<StaticSiteResponse | null>(null);
 
   useEffect(() => {
@@ -53,9 +55,9 @@ export function StaticSiteSection({ tc, projectId }: StaticSiteSectionProps) {
     <>
       <div
         style={hdrStyle(tc)}
-        title="Sito statico HTML rilevato nella cartella del progetto, servito dal server integrato di Nexus."
+        title={t("panels.sitoStaticoHtmlRilevato")}
       >
-        <span>Sito statico HTML</span>
+        <span>{t("panels.sitoStaticoHtml")}</span>
       </div>
       <div style={{ padding: "8px 12px", borderBottom: `1px solid ${tc.border}` }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
@@ -78,7 +80,7 @@ export function StaticSiteSection({ tc, projectId }: StaticSiteSectionProps) {
           <button
             type="button"
             onClick={openInBrowser}
-            title="Apri il sito statico in una nuova scheda del browser"
+            title={t("panels.apriIlSitoStatico")}
             style={{
               flexShrink: 0,
               background: "#22c55e",
@@ -91,7 +93,7 @@ export function StaticSiteSection({ tc, projectId }: StaticSiteSectionProps) {
               cursor: "pointer",
             }}
           >
-            Apri nel browser
+            {t("panels.apriNelBrowser")}
           </button>
         </div>
       </div>

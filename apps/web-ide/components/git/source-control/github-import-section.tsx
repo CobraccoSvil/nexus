@@ -8,6 +8,7 @@ import type {
 import { useThemeColors } from "../../../lib/theme";
 import { cardStyle, inputStyle, sectionTitleStyle, smallButtonStyle } from "./styles";
 import { CreateGithubRepoForm } from "./create-github-repo-form";
+import { useI18n } from "../../../lib/i18n";
 
 interface GitHubImportSectionProps {
   project: UserProjectDetails;
@@ -70,6 +71,7 @@ export function GitHubImportSection({
   onLoadRepositories,
   onCloneSelectedRepository,
 }: GitHubImportSectionProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
 
   return (
@@ -79,7 +81,7 @@ export function GitHubImportSection({
           l'utente e' connesso a GitHub. */}
       {githubAccount?.connected ? (
         <div style={cardStyle(tc)}>
-          <div style={sectionTitleStyle(tc)}>Pubblica progetto su GitHub</div>
+          <div style={sectionTitleStyle(tc)}>{t("git.pubblicaProgettoSuGithub")}</div>
           <div style={{ color: tc.textMuted, fontSize: 12 }}>
             Il progetto non e' ancora versionato. Nexus puo' inizializzare git,
             creare un repository su <strong>github.com/{githubAccount.username ?? "..."}</strong>{" "}
@@ -94,7 +96,7 @@ export function GitHubImportSection({
               }}
               style={smallButtonStyle(tc, createRepoBusy || githubBusy || busy)}
             >
-              Pubblica su GitHub
+              {t("git.pubblicaSuGithub")}
             </button>
           ) : (
             <CreateGithubRepoForm
@@ -117,7 +119,7 @@ export function GitHubImportSection({
         </div>
       ) : null}
       <div style={cardStyle(tc)}>
-        <div style={sectionTitleStyle(tc)}>Importa Repository GitHub</div>
+        <div style={sectionTitleStyle(tc)}>{t("git.importaRepositoryGithub")}</div>
         <div style={{ color: tc.textMuted, fontSize: 12 }}>
           La directory selezionata non e' un repository Git. Per clonare in questo progetto la cartella deve essere vuota; altrimenti crea un nuovo progetto/cartella e riprova.
         </div>
@@ -127,7 +129,7 @@ export function GitHubImportSection({
               <input
                 value={repoQuery}
                 onChange={(event) => setRepoQuery(event.target.value)}
-                placeholder="Cerca repository..."
+                placeholder={t("git.cercaRepository")}
                 style={inputStyle(tc)}
               />
               <button
@@ -135,7 +137,7 @@ export function GitHubImportSection({
                 onClick={() => void onLoadRepositories()}
                 style={smallButtonStyle(tc, githubBusy || busy)}
               >
-                Aggiorna lista
+                {t("git.aggiornaLista")}
               </button>
             </div>
             <select
@@ -144,7 +146,7 @@ export function GitHubImportSection({
               style={inputStyle(tc)}
             >
               {filteredRepositories.length === 0 ? (
-                <option value="">Nessun repository disponibile</option>
+                <option value="">{t("git.nessunRepositoryDisponibile")}</option>
               ) : (
                 filteredRepositories.map((repo) => (
                   <option key={repo.id} value={repo.cloneUrl}>
@@ -170,16 +172,16 @@ export function GitHubImportSection({
                 onClick={() => void onCloneSelectedRepository()}
                 style={smallButtonStyle(tc, !canCloneSelected)}
               >
-                Clona repository nel progetto
+                {t("git.clonaRepositoryNelProgetto")}
               </button>
             </div>
           </>
         ) : (
           <div style={{ color: tc.warning, fontSize: 12 }}>
-            Collega GitHub per visualizzare i repository disponibili.
+            {t("git.collegaGithubPerVisualizzare")}
           </div>
         )}
-        {githubLoading ? <div style={{ color: tc.textMuted }}>Aggiornamento stato GitHub...</div> : null}
+        {githubLoading ? <div style={{ color: tc.textMuted }}>{t("git.aggiornamentoStatoGithub")}</div> : null}
         {githubMessage ? <div style={{ color: tc.success }}>{githubMessage}</div> : null}
         {githubError ? <div style={{ color: tc.error }}>{githubError}</div> : null}
       </div>

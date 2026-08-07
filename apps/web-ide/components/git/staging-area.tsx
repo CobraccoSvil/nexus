@@ -16,6 +16,7 @@ import {
   renderSplitDiff,
   renderUnifiedDiff,
 } from "./diff-utils";
+import { useI18n } from "../../lib/i18n";
 
 function buttonStyle(tc: ReturnType<typeof useThemeColors>, disabled: boolean) {
   return {
@@ -145,6 +146,7 @@ export function StagingArea({
   runAction,
   onOpenFileAtLine,
 }: StagingAreaProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [selectedDiff, setSelectedDiff] = useState<{ path: string; staged: boolean } | null>(null);
   const [diffPreview, setDiffPreview] = useState("");
@@ -264,12 +266,12 @@ export function StagingArea({
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12, minWidth: 0, width: "100%" }}>
       <div style={{ minWidth: 0 }}>
-        <div style={{ color: tc.textSecondary, marginBottom: 6, fontSize: 11, fontWeight: 600 }}>Modifiche</div>
+        <div style={{ color: tc.textSecondary, marginBottom: 6, fontSize: 11, fontWeight: 600 }}>{t("git.modifiche")}</div>
         {renderChanges("Staged", staged, tc, project, busy, runAction, true, loadDiff, selectedDiff?.path)}
         {renderChanges("Unstaged", unstaged, tc, project, busy, runAction, false, loadDiff, selectedDiff?.path)}
         {renderChanges("Untracked", untracked, tc, project, busy, runAction, false, loadDiff, selectedDiff?.path)}
         {staged.length === 0 && unstaged.length === 0 && untracked.length === 0 && (
-          <div style={{ color: tc.textMuted, fontSize: 12, padding: "4px 6px" }}>Nessuna modifica</div>
+          <div style={{ color: tc.textMuted, fontSize: 12, padding: "4px 6px" }}>{t("git.nessunaModifica")}</div>
         )}
       </div>
 
@@ -305,7 +307,7 @@ export function StagingArea({
           <button
             disabled={diffBusy || hunks.length === 0 || activeHunk <= 0}
             onClick={goPrevHunk}
-            title="Hunk precedente"
+            title={t("git.hunkPrecedente")}
             style={{
               ...buttonStyle(tc, diffBusy || hunks.length === 0 || activeHunk <= 0),
               padding: "5px 8px",
@@ -317,7 +319,7 @@ export function StagingArea({
           <button
             disabled={diffBusy || hunks.length === 0 || activeHunk >= hunks.length - 1}
             onClick={goNextHunk}
-            title="Hunk successivo"
+            title={t("git.hunkSuccessivo")}
             style={{
               ...buttonStyle(tc, diffBusy || hunks.length === 0 || activeHunk >= hunks.length - 1),
               padding: "5px 8px",
@@ -329,7 +331,7 @@ export function StagingArea({
           <button
             disabled={diffBusy || !selectedDiff}
             onClick={() => setDiffViewMode("split")}
-            title="Vista split — colonne affiancate"
+            title={t("git.vistaSplitColonneAffiancate")}
             style={{
               ...buttonStyle(tc, diffBusy || !selectedDiff),
               background: diffViewMode === "split" ? tc.accentBg : tc.bgCard,
@@ -342,7 +344,7 @@ export function StagingArea({
           <button
             disabled={diffBusy || !selectedDiff}
             onClick={() => setDiffViewMode("unified")}
-            title="Vista unificata — sequenziale"
+            title={t("git.vistaUnificataSequenziale")}
             style={{
               ...buttonStyle(tc, diffBusy || !selectedDiff),
               background: diffViewMode === "unified" ? tc.accentBg : tc.bgCard,

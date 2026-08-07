@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useThemeColors } from "../../lib/theme";
 import { useHealthSnapshot } from "../../lib/hooks/use-health-snapshot";
+import { useI18n } from "../../lib/i18n";
 
 interface SystemMetrics {
   cpu: {
@@ -52,6 +53,7 @@ function Bar({ pct }: { pct: number }) {
 }
 
 export function ServerMonitorPanel() {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [metrics, setMetrics] = useState<SystemMetrics | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -104,13 +106,13 @@ export function ServerMonitorPanel() {
       <div style={{ padding: "12px 10px", fontSize: 11, color: tc.error }}>
         Errore: {error}
         <br />
-        <span className="text-muted">In attesa di /nexus/system-metrics…</span>
+        <span className="text-muted">{t("sidebar.inAttesaDiNexus")}</span>
       </div>
     );
   }
 
   if (!metrics) {
-    return <div style={{ padding: "12px 10px", fontSize: 11, color: tc.textMuted }}>Caricamento…</div>;
+    return <div style={{ padding: "12px 10px", fontSize: 11, color: tc.textMuted }}>{t("sidebar.caricamento2")}</div>;
   }
 
   const { cpu, memory, disks, network, processes, uptime } = metrics;
@@ -126,7 +128,7 @@ export function ServerMonitorPanel() {
       {/* CPU */}
       <div style={label}>CPU</div>
       <div style={row}>
-        <span>Utilizzo</span>
+        <span>{t("sidebar.utilizzo")}</span>
         <span style={val}>{cpu.usagePercent}%</span>
       </div>
       <Bar pct={cpu.usagePercent} />
@@ -139,7 +141,7 @@ export function ServerMonitorPanel() {
       {/* RAM */}
       <div style={label}>RAM</div>
       <div style={row}>
-        <span>Utilizzo</span>
+        <span>{t("sidebar.utilizzo")}</span>
         <span style={val}>{memory.usedPercent}%</span>
       </div>
       <Bar pct={memory.usedPercent} />
@@ -150,7 +152,7 @@ export function ServerMonitorPanel() {
       </div>
 
       {/* Rete */}
-      <div style={label}>Rete</div>
+      <div style={label}>{t("sidebar.rete")}</div>
       <div style={row}>
         <span>↓ rx</span>
         <span style={val}>{network.rxBytesPerSec === 0 ? "—" : fmtBytes(network.rxBytesPerSec)}</span>
@@ -161,7 +163,7 @@ export function ServerMonitorPanel() {
       </div>
 
       {/* Disco */}
-      <div style={label}>Disco</div>
+      <div style={label}>{t("sidebar.disco")}</div>
       {disks.slice(0, 4).map((d) => (
         <div key={d.mountPoint} style={{ marginBottom: 4 }}>
           <div style={row}>
@@ -176,7 +178,7 @@ export function ServerMonitorPanel() {
       ))}
 
       {/* Processi */}
-      <div style={label}>Processi top CPU</div>
+      <div style={label}>{t("sidebar.processiTopCpu")}</div>
       <div style={{
         fontFamily: "var(--font-mono)",
         fontSize: 10,

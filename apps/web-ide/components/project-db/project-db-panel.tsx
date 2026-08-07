@@ -40,12 +40,14 @@ import { DetectConfig } from "./detect-config";
 import { ConnectionList } from "./connection-list";
 import { MigrationsSection } from "./migrations-section";
 import { RecentQueriesSection } from "./recent-queries-section";
+import { useI18n } from "../../lib/i18n";
 
 interface Props {
   project: UserProjectDetails | null;
 }
 
 export function ProjectDbPanel({ project }: Props) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const { confirmDialog } = useGlobalDialog();
   const projectId = project?.id ?? "";
@@ -619,7 +621,7 @@ export function ProjectDbPanel({ project }: Props) {
   if (!project) {
     return (
       <div style={{ padding: 16, color: tc.textMuted, fontSize: 12 }}>
-        Apri un progetto per gestirne il database.
+        {t("project-db.apriUnProgettoPer")}
       </div>
     );
   }
@@ -646,7 +648,7 @@ export function ProjectDbPanel({ project }: Props) {
               letterSpacing: "0.06em",
             }}
           >
-            Database progetto
+            {t("project-db.databaseProgetto")}
           </div>
           <div style={{ fontSize: 11, color: tc.textMuted, marginTop: 2 }}>
             {project.name ?? projectId}
@@ -655,8 +657,8 @@ export function ProjectDbPanel({ project }: Props) {
         <button
           type="button"
           onClick={() => void load()}
-          title="Aggiorna"
-          aria-label="Aggiorna"
+          title={t("project-db.aggiorna")}
+          aria-label={t("project-db.aggiorna")}
           style={{
             width: 28,
             height: 28,
@@ -716,7 +718,7 @@ export function ProjectDbPanel({ project }: Props) {
                   fontWeight: 700,
                 }}
               >
-                Crea database
+                {t("project-db.creaDatabase")}
               </button>
               <button
                 type="button"
@@ -749,7 +751,7 @@ export function ProjectDbPanel({ project }: Props) {
                   fontWeight: 600,
                 }}
               >
-                Configura manualmente
+                {t("project-db.configuraManualmente")}
               </button>
             </div>
           </div>

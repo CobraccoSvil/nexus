@@ -2,6 +2,7 @@
 
 import type { Theme } from "../../lib/theme";
 import type { ConnFields } from "./db-helpers";
+import { useI18n } from "../../lib/i18n";
 
 /** Stile input compatto del wizard (regola L, S26): prima ripetuto inline su 8+ input. */
 function fieldInputStyle(tc: Theme): React.CSSProperties {
@@ -89,6 +90,7 @@ export function CreateDbWizard({
   onClose,
   onProvision,
 }: Props) {
+  const { t } = useI18n();
   return (
     <div
       style={{
@@ -120,7 +122,7 @@ export function CreateDbWizard({
         }}
       >
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <div style={{ fontSize: 14, fontWeight: 700, color: tc.text }}>Crea database</div>
+          <div style={{ fontSize: 14, fontWeight: 700, color: tc.text }}>{t("project-db.creaDatabase")}</div>
           <button
             type="button"
             onClick={() => { if (!provBusy) onClose(); }}
@@ -151,7 +153,7 @@ export function CreateDbWizard({
                 cursor: "pointer",
               }}
             >
-              <div style={{ fontSize: 12, fontWeight: 700 }}>Container dedicato (Nexus)</div>
+              <div style={{ fontSize: 12, fontWeight: 700 }}>{t("project-db.containerDedicatoNexus")}</div>
               <div style={{ fontSize: 11, color: tc.textSecondary, marginTop: 4 }}>
                 Nexus crea un PostgreSQL isolato per questo progetto nel cluster dedicato.
                 Nessuna credenziale richiesta: il database e separato da quelli degli altri progetti.
@@ -170,7 +172,7 @@ export function CreateDbWizard({
                 cursor: "pointer",
               }}
             >
-              <div style={{ fontSize: 12, fontWeight: 700 }}>Database esterno</div>
+              <div style={{ fontSize: 12, fontWeight: 700 }}>{t("project-db.databaseEsterno")}</div>
               <div style={{ fontSize: 11, color: tc.textSecondary, marginTop: 4 }}>
                 Usa un database gia esistente fornendo host, porta e credenziali.
                 La connessione viene testata prima di essere registrata.
@@ -186,7 +188,7 @@ export function CreateDbWizard({
               label="Nome connessione logica"
               value={provName}
               onChange={setProvName}
-              placeholder="primary"
+              placeholder={t("project-db.primary")}
             />
 
             {provMode === "internal" && (
@@ -204,9 +206,9 @@ export function CreateDbWizard({
                   </div>
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                  <label style={{ fontSize: 10, color: tc.textMuted }}>Engine</label>
+                  <label style={{ fontSize: 10, color: tc.textMuted }}>{t("project-db.engine")}</label>
                   <select value="postgres" disabled style={fieldInputStyle(tc)}>
-                    <option value="postgres">PostgreSQL</option>
+                    <option value="postgres">{t("project-db.postgresql")}</option>
                   </select>
                 </div>
               </>
@@ -215,16 +217,16 @@ export function CreateDbWizard({
             {provMode === "external" && (
               <>
                 <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                  <label style={{ fontSize: 10, color: tc.textMuted }}>Engine</label>
+                  <label style={{ fontSize: 10, color: tc.textMuted }}>{t("project-db.engine")}</label>
                   <select
                     value={provEngine}
                     onChange={(e) => setProvEngine(e.target.value)}
                     style={fieldInputStyle(tc)}
                   >
-                    <option value="postgres">PostgreSQL</option>
-                    <option value="mysql">MySQL</option>
-                    <option value="sqlserver">SQL Server</option>
-                    <option value="sqlite">SQLite</option>
+                    <option value="postgres">{t("project-db.postgresql")}</option>
+                    <option value="mysql">{t("project-db.mysql")}</option>
+                    <option value="sqlserver">{t("project-db.sqlServer")}</option>
+                    <option value="sqlite">{t("project-db.sqlite")}</option>
                   </select>
                 </div>
                 {provEngine !== "sqlite" && (
@@ -307,7 +309,7 @@ export function CreateDbWizard({
                 fontWeight: 700,
               }}
             >
-              Avanti
+              {t("project-db.avanti")}
             </button>
           ) : (
             <button

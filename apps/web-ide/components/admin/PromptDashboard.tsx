@@ -17,6 +17,7 @@ import {
   type PromptDashboardData,
   type PromptDashboardEntry,
 } from "../../lib/api-client";
+import { useI18n } from "../../lib/i18n";
 
 function ScoreBadge({ score }: { score?: number }) {
   if (score === undefined || score === null) {
@@ -57,6 +58,7 @@ function MiniBar({ value, max = 1 }: { value?: number; max?: number }) {
 }
 
 export default function PromptDashboard() {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [data, setData] = useState<PromptDashboardData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -129,7 +131,7 @@ export default function PromptDashboard() {
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 16 }}>
         <div style={cardStyle}>
           <div style={{ fontSize: 11, color: tc.textSecondary, textTransform: "uppercase", letterSpacing: "0.05em" }}>
-            Prompt attivi
+            {t("admin.promptAttivi")}
           </div>
           <div style={{ fontSize: 24, fontWeight: 700, marginTop: 4, color: tc.text }}>
             {data?.total_prompts ?? "--"}
@@ -137,7 +139,7 @@ export default function PromptDashboard() {
         </div>
         <div style={cardStyle}>
           <div style={{ fontSize: 11, color: tc.textSecondary, textTransform: "uppercase", letterSpacing: "0.05em" }}>
-            Reflection score medio (7gg)
+            {t("admin.reflectionScoreMedio7gg")}
           </div>
           <div style={{ fontSize: 24, fontWeight: 700, marginTop: 4 }}>
             <ScoreBadge score={globalAvg} />
@@ -145,7 +147,7 @@ export default function PromptDashboard() {
         </div>
         <div style={cardStyle}>
           <div style={{ fontSize: 11, color: tc.textSecondary, textTransform: "uppercase", letterSpacing: "0.05em" }}>
-            Esperimenti running
+            {t("admin.esperimentiRunning")}
           </div>
           <div style={{ fontSize: 24, fontWeight: 700, marginTop: 4, color: tc.accent }}>
             {data?.running_experiments ?? "--"}
@@ -153,7 +155,7 @@ export default function PromptDashboard() {
         </div>
         <div style={cardStyle}>
           <div style={{ fontSize: 11, color: tc.textSecondary, textTransform: "uppercase", letterSpacing: "0.05em" }}>
-            Schema XML v2
+            {t("admin.schemaXmlV2")}
           </div>
           <div style={{ fontSize: 24, fontWeight: 700, marginTop: 4, color: "#a855f7" }}>
             {prompts.filter((p) => p.schema_type === "xml").length}
@@ -211,25 +213,25 @@ export default function PromptDashboard() {
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
           <thead>
             <tr style={{ background: tc.bgHeader }}>
-              <th style={thStyle}>Chiave</th>
-              <th style={thStyle}>Versione</th>
-              <th style={thStyle}>Schema</th>
-              <th style={thStyle}>Reflection (7gg)</th>
-              <th style={thStyle}>Feedback +</th>
-              <th style={thStyle}>Run</th>
+              <th style={thStyle}>{t("admin.chiave")}</th>
+              <th style={thStyle}>{t("admin.versione")}</th>
+              <th style={thStyle}>{t("admin.schema")}</th>
+              <th style={thStyle}>{t("admin.reflection7gg")}</th>
+              <th style={thStyle}>{t("admin.feedback")}</th>
+              <th style={thStyle}>{t("admin.run")}</th>
             </tr>
           </thead>
           <tbody>
             {loading && filtered.length === 0 ? (
               <tr>
                 <td colSpan={6} style={{ ...tdStyle, textAlign: "center", padding: "32px 14px", color: tc.textSecondary }}>
-                  Caricamento...
+                  {t("admin.caricamento")}
                 </td>
               </tr>
             ) : filtered.length === 0 ? (
               <tr>
                 <td colSpan={6} style={{ ...tdStyle, textAlign: "center", padding: "32px 14px", color: tc.textSecondary }}>
-                  Nessun prompt corrisponde al filtro
+                  {t("admin.nessunPromptCorrispondeAl")}
                 </td>
               </tr>
             ) : (
@@ -253,6 +255,7 @@ function PromptRow({
   tc: ReturnType<typeof useThemeColors>;
   tdStyle: React.CSSProperties;
 }) {
+  const { t } = useI18n();
   const isWarning = (p.avg_reflection_score ?? 1) < 0.65;
   return (
     <tr style={isWarning ? { background: "#fef2f2" } : undefined}>
@@ -288,7 +291,7 @@ function PromptRow({
               fontWeight: 500,
             }}
           >
-            XML v2
+            {t("admin.xmlV2")}
           </span>
         ) : (
           <span

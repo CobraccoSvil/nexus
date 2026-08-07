@@ -8,6 +8,7 @@ import {
 } from "../../lib/api-client";
 import { useThemeColors } from "../../lib/theme";
 import { useState } from "react";
+import { useI18n } from "../../lib/i18n";
 
 function buttonStyle(tc: ReturnType<typeof useThemeColors>, disabled: boolean) {
   return {
@@ -39,6 +40,7 @@ interface BranchManagerProps {
 }
 
 export function BranchManager({ project, branches, busy, runAction }: BranchManagerProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [newBranch, setNewBranch] = useState("");
 
@@ -48,7 +50,7 @@ export function BranchManager({ project, branches, busy, runAction }: BranchMana
         <input
           value={newBranch}
           onChange={(event) => setNewBranch(event.target.value)}
-          placeholder="Nuovo branch"
+          placeholder={t("git.nuovoBranch")}
           style={inputStyle(tc)}
         />
         <button
@@ -60,7 +62,7 @@ export function BranchManager({ project, branches, busy, runAction }: BranchMana
               setNewBranch("");
             })
           }
-          title="Crea branch — crea e passa al nuovo branch"
+          title={t("git.creaBranchCreaE")}
           style={buttonStyle(tc, busy || !project.canManageGit || !newBranch.trim())}
         >
           ⎇
@@ -68,7 +70,7 @@ export function BranchManager({ project, branches, busy, runAction }: BranchMana
       </div>
 
       <div>
-        <div style={{ color: tc.textSecondary, marginBottom: 8 }}>Branch</div>
+        <div style={{ color: tc.textSecondary, marginBottom: 8 }}>{t("git.branch")}</div>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
           {branches.map((branch) => (
             <button

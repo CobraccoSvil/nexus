@@ -3,6 +3,7 @@
 import type { useThemeColors } from "../../../lib/theme";
 import type { ProjectServiceEntry, PortEntry } from "../../../lib/api-client";
 import { stateColor, stateLabel, actBtnStyle, hdrStyle, buildDiagnosticPrompt, type ServiceAction } from "./shared";
+import { useI18n } from "../../../lib/i18n";
 
 interface ProjectServicesSectionProps {
   tc: ReturnType<typeof useThemeColors>;
@@ -56,15 +57,16 @@ export function ProjectServicesSection({
   setDiagSentFor,
   setDiagResult,
 }: ProjectServicesSectionProps) {
+  const { t } = useI18n();
   return (
     <>
       {/* ════════════════════════════════ A: SERVIZI DEL PROGETTO ═════════ */}
-      <div style={hdrStyle(tc)} title="Servizi gestiti del progetto: avvio, arresto e riavvio dal pannello.">
+      <div style={hdrStyle(tc)} title={t("panels.serviziGestitiDelProgetto")}>
         <span>Servizi del progetto{slug ? ` — ${slug}` : ""}</span>
         <div style={{ display:"flex", gap:6 }}>
-          <button onClick={fetchServices} title="Aggiorna stato" disabled={batchBusy} style={{ background:"none",border:`1px solid ${tc.border}`,borderRadius:3,color:tc.textMuted,cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10 }}>↺</button>
+          <button onClick={fetchServices} title={t("panels.aggiornaStato")} disabled={batchBusy} style={{ background:"none",border:`1px solid ${tc.border}`,borderRadius:3,color:tc.textMuted,cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10 }}>↺</button>
           <button onClick={handleRestartAll} title={managerUnavailable ? "Gestore dei servizi non attivo — avvialo prima di gestire i servizi" : services.length===0 ? "Nessun servizio del progetto. Clicca per dettagli." : "Riavvia tutti i servizi del progetto"} disabled={batchBusy} style={{ background:"transparent",border:`1px solid #f59e0b`,borderRadius:3,color:"#f59e0b",cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10,opacity:batchBusy?0.5:1 }}>↻ Tutti</button>
-          <button onClick={handleCleanupPorts} title="Termina processi su porte conflittuali (esclude i servizi del progetto)" disabled={batchBusy} style={{ background:"transparent",border:`1px solid #ef4444`,borderRadius:3,color:"#ef4444",cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10,opacity:batchBusy?0.5:1 }}>✕ Porte</button>
+          <button onClick={handleCleanupPorts} title={t("panels.terminaProcessiSuPorte")} disabled={batchBusy} style={{ background:"transparent",border:`1px solid #ef4444`,borderRadius:3,color:"#ef4444",cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10,opacity:batchBusy?0.5:1 }}>✕ Porte</button>
           <button
             onClick={runWizard}
             title={pendingCount > 0
@@ -133,7 +135,7 @@ export function ProjectServicesSection({
           </button>
           <button
             onClick={bumpLastRestart}
-            title="Ignora queste modifiche (azzera contatore)"
+            title={t("panels.ignoraQuesteModificheAzzera")}
             style={{
               background:"transparent", color:tc.textMuted, border:`1px solid ${tc.border}`,
               borderRadius:3, padding:"3px 8px", fontSize:11, cursor:"pointer", flexShrink:0,
@@ -157,7 +159,7 @@ export function ProjectServicesSection({
             }}>
               <div style={{ display:"flex", alignItems:"center", gap:6, fontWeight:600 }}>
                 <span>⚠️</span>
-                <span>Gestore dei servizi non attivo</span>
+                <span>{t("panels.gestoreDeiServiziNon")}</span>
               </div>
               <div style={{ color: tc.textSecondary, lineHeight: 1.5 }}>
                 {(managerHint ?? "Impossibile elencare i servizi del progetto: il gestore non e' al momento raggiungibile.")
@@ -171,7 +173,7 @@ export function ProjectServicesSection({
           ) : (
             <div style={{ color:tc.textMuted, fontSize:12 }}>
               {slug
-                ? <>Nessun servizio del progetto configurato. Usa <strong>+ Configura</strong> per crearne uno.</>
+                ? <>{t("panels.nessunServizioDelProgetto")} <strong>+ Configura</strong> per crearne uno.</>
                 : "Caricamento…"}
             </div>
           )
@@ -237,7 +239,7 @@ export function ProjectServicesSection({
                       ].join("\n");
                       onSendToChat?.(msg);
                     }}
-                    title="Invia diagnosi rapida alla chat di Nexus"
+                    title={t("panels.inviaDiagnosiRapidaAlla")}
                     style={{
                       background: "rgba(239,68,68,0.85)",
                       color: "#fff",
@@ -392,7 +394,7 @@ export function ProjectServicesSection({
                   borderLeft:"3px solid #22c55e",
                 }}>
                   <div style={{ fontSize:11, color:"#22c55e", fontWeight:600 }}>
-                    Problema risolto — il servizio e' ora attivo.
+                    {t("panels.problemaRisoltoIlServizio")}
                   </div>
                   <button
                     type="button"
@@ -403,7 +405,7 @@ export function ProjectServicesSection({
                       fontFamily:"inherit", padding:0, textDecoration:"underline",
                     }}
                   >
-                    Chiudi
+                    {t("panels.chiudi")}
                   </button>
                 </div>
               )}

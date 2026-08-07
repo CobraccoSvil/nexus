@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from "react";
 import { useThemeColors } from "../../lib/theme";
 import { useProjectStore, selectOperationalRefreshAt } from "../../lib/project-dispatcher";
 import { AutoWidthSelect } from "../auto-width-select";
+import { useI18n } from "../../lib/i18n";
 
 interface SecurityPanelProps {
   projectId: string;
@@ -60,6 +61,7 @@ const OUTCOME_FILTER_OPTIONS = [
 ] as const;
 
 export function SecurityPanel({ projectId }: SecurityPanelProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [items, setItems] = useState<AuditItem[]>([]);
   const [quota, setQuota] = useState<QuotaInfo | null>(null);
@@ -198,11 +200,11 @@ export function SecurityPanel({ projectId }: SecurityPanelProps) {
           <table style={{ width: "100%", fontSize: 11, borderCollapse: "collapse" }}>
             <thead>
               <tr style={{ borderBottom: `1px solid ${tc.border}` }}>
-                <th style={thStyle(tc)}>Ora</th>
-                <th style={thStyle(tc)}>Azione</th>
-                <th style={thStyle(tc)}>Risorsa</th>
-                <th style={thStyle(tc)}>Esito</th>
-                <th style={thStyle(tc)}>Dettagli</th>
+                <th style={thStyle(tc)}>{t("panels.ora")}</th>
+                <th style={thStyle(tc)}>{t("panels.azione")}</th>
+                <th style={thStyle(tc)}>{t("panels.risorsa")}</th>
+                <th style={thStyle(tc)}>{t("panels.esito")}</th>
+                <th style={thStyle(tc)}>{t("panels.dettagli")}</th>
               </tr>
             </thead>
             <tbody>

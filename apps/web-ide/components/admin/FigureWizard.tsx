@@ -34,6 +34,7 @@ import { AdminModal } from "./AdminModal";
 // value="" ("Statico (modello fisso)") viene esclusa per costruzione: una figura
 // e' tier-only, un modello fisso qui sarebbe una configurazione non ammessa.
 import { PURPOSE_TIER_OPTIONS } from "../settings/routing-config/shared";
+import { useI18n } from "../../lib/i18n";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
@@ -183,6 +184,7 @@ export interface FigureWizardProps {
 type Step = 1 | 2 | 3;
 
 export function FigureWizard({ open, onClose, onCreated }: FigureWizardProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
 
   const [step, setStep] = useState<Step>(1);
@@ -297,7 +299,7 @@ export function FigureWizard({ open, onClose, onCreated }: FigureWizardProps) {
                 <input
                   value={kind}
                   onChange={(e) => setKind(e.target.value)}
-                  placeholder="es. data_architect"
+                  placeholder={t("admin.esDataArchitect")}
                   autoFocus
                   spellCheck={false}
                   style={{ ...fieldStyle(tc), fontFamily: "var(--font-mono)" }}
@@ -306,7 +308,7 @@ export function FigureWizard({ open, onClose, onCreated }: FigureWizardProps) {
                   <span style={{ fontSize: 11, color: tc.error }}>{kindCheck.reason}</span>
                 ) : kindCheck.ok ? (
                   <span style={{ fontSize: 11, color: tc.textMuted }}>
-                    Prompt <code style={{ fontFamily: "var(--font-mono)" }}>{promptKeyPreview}</code> · purpose{" "}
+                    {t("admin.prompt")} <code style={{ fontFamily: "var(--font-mono)" }}>{promptKeyPreview}</code> · purpose{" "}
                     <code style={{ fontFamily: "var(--font-mono)" }}>{purposePreview}</code>
                   </span>
                 ) : (
@@ -325,7 +327,7 @@ export function FigureWizard({ open, onClose, onCreated }: FigureWizardProps) {
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
                   rows={2}
-                  placeholder="es. Valuta il modello dei dati: normalizzazione, indici, costo delle query sui volumi reali."
+                  placeholder={t("admin.esValutaIlModello")}
                   style={{ ...fieldStyle(tc), fontFamily: "inherit", resize: "vertical" }}
                 />
               </Field>
@@ -340,7 +342,7 @@ export function FigureWizard({ open, onClose, onCreated }: FigureWizardProps) {
                       onChange={() => setAdvisory(true)}
                     />
                     <span>
-                      <strong>Advisory</strong> — read-only: osserva e consiglia, chiude con{" "}
+                      <strong>{t("admin.advisory")}</strong> — read-only: osserva e consiglia, chiude con{" "}
                       <code style={{ fontFamily: "var(--font-mono)" }}>advisory_verdict</code>.
                     </span>
                   </label>
@@ -352,7 +354,7 @@ export function FigureWizard({ open, onClose, onCreated }: FigureWizardProps) {
                       onChange={() => setAdvisory(false)}
                     />
                     <span>
-                      <strong>Esecutivo</strong> — sub-agente che porta a termine un task delimitato.
+                      <strong>{t("admin.esecutivo")}</strong> — sub-agente che porta a termine un task delimitato.
                     </span>
                   </label>
                 </div>
@@ -402,7 +404,7 @@ export function FigureWizard({ open, onClose, onCreated }: FigureWizardProps) {
                     value={maxIterations}
                     onChange={(e) => setMaxIterations(e.target.value)}
                     inputMode="numeric"
-                    placeholder="predefinito"
+                    placeholder={t("admin.predefinito")}
                     style={fieldStyle(tc)}
                   />
                 </Field>
@@ -411,13 +413,13 @@ export function FigureWizard({ open, onClose, onCreated }: FigureWizardProps) {
                     value={timeoutS}
                     onChange={(e) => setTimeoutS(e.target.value)}
                     inputMode="numeric"
-                    placeholder="predefinito"
+                    placeholder={t("admin.predefinito")}
                     style={fieldStyle(tc)}
                   />
                 </Field>
               </div>
               <div style={{ fontSize: 11, color: tc.textMuted, marginTop: -6 }}>
-                Il tier sceglie la <em>fascia di capacita'</em>, mai un modello: il modello concreto lo
+                {t("admin.ilTierSceglieLa")} <em>fascia di capacita'</em>, mai un modello: il modello concreto lo
                 risolve best_model_for_tier dal catalog a ogni convocazione, tenendo conto di capability
                 e cooldown. Iterazioni e timeout vuoti usano i valori predefiniti del backend.
               </div>
@@ -427,7 +429,7 @@ export function FigureWizard({ open, onClose, onCreated }: FigureWizardProps) {
           {step === 2 ? (
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               <div style={{ fontSize: 12, color: tc.textMuted }}>
-                Questo prompt <strong>e'</strong> la figura. Il blocco <code style={{ fontFamily: "var(--font-mono)" }}>&lt;lente&gt;</code> e'
+                {t("admin.questoPrompt")} <strong>e'</strong> la figura. Il blocco <code style={{ fontFamily: "var(--font-mono)" }}>&lt;lente&gt;</code> e'
                 l'unica cosa che la distingue dalle altre: se descrive una prospettiva che un'altra figura
                 ha gia', il consiglio otterra' due voci che dicono la stessa cosa.
               </div>
@@ -462,9 +464,9 @@ export function FigureWizard({ open, onClose, onCreated }: FigureWizardProps) {
                       setPromptDraft("");
                     }}
                     style={btnStyle(tc, "ghost")}
-                    title="Rigenera lo scheletro dallo schema standard, scartando le modifiche"
+                    title={t("admin.rigeneraLoScheletroDallo")}
                   >
-                    Ripristina scheletro
+                    {t("admin.ripristinaScheletro")}
                   </button>
                 ) : (
                   <span style={{ fontSize: 11, color: tc.textMuted }}>
@@ -493,7 +495,7 @@ export function FigureWizard({ open, onClose, onCreated }: FigureWizardProps) {
               <SummaryItem
                 tc={tc}
                 n={1}
-                title="Definition"
+                title={t("admin.definition")}
                 target="nexus_subagent_definitions"
                 lines={[
                   `kind: ${kind}`,
@@ -504,14 +506,14 @@ export function FigureWizard({ open, onClose, onCreated }: FigureWizardProps) {
               <SummaryItem
                 tc={tc}
                 n={2}
-                title="Prompt"
+                title={t("admin.prompt")}
                 target="nexus_prompt_templates"
                 lines={[`chiave: ${promptKeyPreview}`, `versione iniziale: v1`]}
               />
               <SummaryItem
                 tc={tc}
                 n={3}
-                title="Purpose"
+                title={t("admin.purpose")}
                 target="nexus_purpose_model"
                 lines={[
                   `purpose: ${purposePreview}`,
@@ -521,7 +523,7 @@ export function FigureWizard({ open, onClose, onCreated }: FigureWizardProps) {
               <SummaryItem
                 tc={tc}
                 n={4}
-                title="Whitelist dispatcher"
+                title={t("admin.whitelistDispatcher")}
                 target="orchestrator.subagent_kinds_whitelist"
                 lines={[`append di '${kind}' — senza questo il kind esisterebbe ma non sarebbe convocabile`]}
               />
@@ -568,7 +570,7 @@ export function FigureWizard({ open, onClose, onCreated }: FigureWizardProps) {
             }}
           >
             <button type="button" onClick={handleClose} disabled={busy} style={btnStyle(tc, "ghost", busy)}>
-              Annulla
+              {t("admin.annulla")}
             </button>
             <div style={{ display: "flex", gap: 8 }}>
               {step > 1 ? (
@@ -578,7 +580,7 @@ export function FigureWizard({ open, onClose, onCreated }: FigureWizardProps) {
                   disabled={busy}
                   style={btnStyle(tc, "ghost", busy)}
                 >
-                  Indietro
+                  {t("admin.indietro")}
                 </button>
               ) : null}
               {step < 3 ? (
@@ -595,7 +597,7 @@ export function FigureWizard({ open, onClose, onCreated }: FigureWizardProps) {
                         : undefined
                   }
                 >
-                  Avanti
+                  {t("admin.avanti")}
                 </button>
               ) : (
                 <button
@@ -727,20 +729,21 @@ function SuccessPanel({
   advisory: boolean;
   onClose: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
       <div style={{ fontSize: 12, color: tc.textMuted }}>
-        Creati i quattro pezzi. Valori confermati dal backend:
+        {t("admin.creatiIQuattroPezzi")}
       </div>
       <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12, display: "flex", flexDirection: "column", gap: 4 }}>
         <li>
-          Definition <code style={{ fontFamily: "var(--font-mono)" }}>{result.kind}</code>
+          {t("admin.definition")} <code style={{ fontFamily: "var(--font-mono)" }}>{result.kind}</code>
         </li>
         <li>
-          Prompt <code style={{ fontFamily: "var(--font-mono)" }}>{result.prompt_key}</code>
+          {t("admin.prompt")} <code style={{ fontFamily: "var(--font-mono)" }}>{result.prompt_key}</code>
         </li>
         <li>
-          Purpose <code style={{ fontFamily: "var(--font-mono)" }}>{result.purpose}</code>
+          {t("admin.purpose")} <code style={{ fontFamily: "var(--font-mono)" }}>{result.purpose}</code>
         </li>
         <li>
           Whitelist dispatcher:{" "}
@@ -756,7 +759,7 @@ function SuccessPanel({
       ) : null}
       <div style={{ display: "flex", justifyContent: "flex-end" }}>
         <button type="button" onClick={onClose} style={btnStyle(tc, "primary")}>
-          Chiudi
+          {t("admin.chiudi")}
         </button>
       </div>
     </div>

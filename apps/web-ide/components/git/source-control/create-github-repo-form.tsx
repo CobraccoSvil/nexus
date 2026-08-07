@@ -2,6 +2,7 @@
 
 import type { Theme } from "../../../lib/theme";
 import { inputStyle, smallButtonStyle } from "./styles";
+import { useI18n } from "../../../lib/i18n";
 
 interface Props {
   tc: Theme;
@@ -40,19 +41,20 @@ export function CreateGithubRepoForm({
   onConfirm,
   onCancel,
 }: Props) {
+  const { t } = useI18n();
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
       {title ? <div style={{ color: tc.text, fontWeight: 700 }}>{title}</div> : null}
       <input
         value={createRepoName}
         onChange={(e) => setCreateRepoName(e.target.value)}
-        placeholder="Nome repository (alfanumerico, '-', '_', '.')"
+        placeholder={t("git.nomeRepositoryAlfanumerico")}
         style={inputStyle(tc)}
       />
       <input
         value={createRepoDesc}
         onChange={(e) => setCreateRepoDesc(e.target.value)}
-        placeholder="Descrizione (opzionale)"
+        placeholder={t("git.descrizioneOpzionale")}
         style={inputStyle(tc)}
       />
       <label style={{ display: "flex", alignItems: "center", gap: 8, color: tc.text }}>
@@ -61,7 +63,7 @@ export function CreateGithubRepoForm({
           checked={createRepoPrivate}
           onChange={(e) => setCreateRepoPrivate(e.target.checked)}
         />
-        Repository privato
+        {t("git.repositoryPrivato")}
       </label>
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
         <button
@@ -76,7 +78,7 @@ export function CreateGithubRepoForm({
           onClick={onCancel}
           style={smallButtonStyle(tc, createRepoBusy)}
         >
-          Annulla
+          {t("git.annulla")}
         </button>
       </div>
       {hint ? (

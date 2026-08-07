@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { useThemeColors } from "../../lib/theme";
 import { useProjectStore, selectOperationalRefreshAt } from "../../lib/project-dispatcher";
+import { useI18n } from "../../lib/i18n";
 
 interface QuotaBadgeProps {
   projectId: string;
@@ -27,6 +28,7 @@ interface QuotaData {
  * Aggiornamento via SSE operativo (PortAllocated/Released, job, ...).
  */
 export function QuotaBadge({ projectId }: QuotaBadgeProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [data, setData] = useState<QuotaData | null>(null);
   const operationalRefreshAt = useProjectStore(selectOperationalRefreshAt);
@@ -67,17 +69,17 @@ export function QuotaBadge({ projectId }: QuotaBadgeProps) {
       background: tc.bgCard,
       border: `1px solid ${tc.border}`,
     }}>
-      <span style={{ color: badgeColor(portsPct) }} title="Porte allocate / quota max">
+      <span style={{ color: badgeColor(portsPct) }} title={t("panels.porteAllocateQuotaMax")}>
         P:{data.usage.ports}/{data.quota.max_ports}
       </span>
       <span style={{ color: tc.border }}>|</span>
-      <span style={{ color: badgeColor(containersPct) }} title="Container attivi / quota max">
+      <span style={{ color: badgeColor(containersPct) }} title={t("panels.containerAttiviQuotaMax")}>
         C:{data.usage.containers}/{data.quota.max_containers}
       </span>
       {data.audit_stats.blocked_24h > 0 && (
         <>
           <span style={{ color: tc.border }}>|</span>
-          <span style={{ color: "#ef4444", fontWeight: 600 }} title="Azioni bloccate nelle ultime 24h">
+          <span style={{ color: "#ef4444", fontWeight: 600 }} title={t("panels.azioniBloccateNelleUltime")}>
             {data.audit_stats.blocked_24h} blk
           </span>
         </>

@@ -4,6 +4,7 @@ import type { GitHubAccountStatus } from "../../../lib/api-client";
 import { useThemeColors } from "../../../lib/theme";
 import { cardStyle, smallButtonStyle, statusBadgeStyle } from "./styles";
 import { accountLabel, accountTone } from "./labels";
+import { useI18n } from "../../../lib/i18n";
 
 interface GitHubAccountCardProps {
   githubAccount: GitHubAccountStatus | null;
@@ -22,6 +23,7 @@ export function GitHubAccountCard({
   onConnect,
   onDisconnect,
 }: GitHubAccountCardProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
 
   return (
@@ -41,7 +43,7 @@ export function GitHubAccountCard({
               onClick={() => void onDisconnect()}
               style={smallButtonStyle(tc, busy || githubBusy)}
             >
-              Scollega
+              {t("git.scollega")}
             </button>
           ) : (
             <button

@@ -31,6 +31,7 @@ import {
 } from "./styles";
 import { remoteReasonLabel } from "./labels";
 import { CreateGithubRepoForm } from "./create-github-repo-form";
+import { useI18n } from "../../../lib/i18n";
 
 interface RemoteCardProps {
   project: UserProjectDetails;
@@ -103,13 +104,14 @@ export function RemoteCard({
   setPrBaseBranch,
   onCreatePullRequest,
 }: RemoteCardProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
 
   return (
     <div style={cardStyle(tc)}>
       <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <div style={{ color: tc.text, fontWeight: 700 }}>Remote</div>
+          <div style={{ color: tc.text, fontWeight: 700 }}>{t("git.remote")}</div>
           <div style={{ color: tc.textSecondary }}>{remoteReasonLabel(githubStatus)}</div>
         </div>
         <span
@@ -179,9 +181,9 @@ export function RemoteCard({
             )
           }
           style={smallButtonStyle(tc, busy || githubBusy || !canPushPull)}
-          title="Pull dal remote corrente"
+          title={t("git.pullDalRemoteCorrente")}
         >
-          Pull
+          {t("git.pull")}
         </button>
         <button
           disabled={busy || githubBusy || !canPushPull}
@@ -191,9 +193,9 @@ export function RemoteCard({
             )
           }
           style={smallButtonStyle(tc, busy || githubBusy || !canPushPull)}
-          title="Push verso il remote corrente"
+          title={t("git.pushVersoIlRemote")}
         >
-          Push
+          {t("git.push")}
         </button>
         {githubStatus?.reason === "github_https" ? (
           <button
@@ -205,7 +207,7 @@ export function RemoteCard({
             }
             style={smallButtonStyle(tc, busy || githubBusy || !canPublishBranch)}
           >
-            Publish Branch
+            {t("git.publishBranch")}
           </button>
         ) : null}
         {githubStatus?.pullRequest ? (
@@ -215,7 +217,7 @@ export function RemoteCard({
             rel="noreferrer"
             style={linkButtonStyle(tc)}
           >
-            Open PR
+            {t("git.openPr")}
           </a>
         ) : null}
         {githubStatus?.reason === "missing_origin_remote" &&
@@ -228,9 +230,9 @@ export function RemoteCard({
               if (!createRepoName) setCreateRepoName(project.slug ?? project.name ?? "");
             }}
             style={smallButtonStyle(tc, createRepoBusy || githubBusy || busy)}
-            title="Crea un nuovo repository GitHub e collega come origin"
+            title={t("git.creaUnNuovoRepository")}
           >
-            Crea repo su GitHub
+            {t("git.creaRepoSuGithub")}
           </button>
         ) : null}
       </div>
@@ -244,7 +246,7 @@ export function RemoteCard({
         >
           <CreateGithubRepoForm
             tc={tc}
-            title="Crea repository GitHub"
+            title={t("git.creaRepositoryGithub")}
             createRepoName={createRepoName}
             setCreateRepoName={setCreateRepoName}
             createRepoDesc={createRepoDesc}
@@ -269,12 +271,12 @@ export function RemoteCard({
             gap: 8,
           }}
         >
-          <div style={{ color: tc.text, fontWeight: 700 }}>Create PR</div>
+          <div style={{ color: tc.text, fontWeight: 700 }}>{t("git.createPr")}</div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <input
               value={prTitle}
               onChange={(event) => setPrTitle(event.target.value)}
-              placeholder="Titolo pull request"
+              placeholder={t("git.titoloPullRequest")}
               style={inputStyle(tc)}
             />
             <input
@@ -287,7 +289,7 @@ export function RemoteCard({
           <textarea
             value={prBody}
             onChange={(event) => setPrBody(event.target.value)}
-            placeholder="Descrizione opzionale"
+            placeholder={t("git.descrizioneOpzionale2")}
             rows={4}
             style={{
               ...inputStyle(tc),
@@ -302,7 +304,7 @@ export function RemoteCard({
               onClick={() => void onCreatePullRequest()}
               style={smallButtonStyle(tc, githubBusy || busy || !prTitle.trim())}
             >
-              Create PR
+              {t("git.createPr")}
             </button>
             {githubStatus?.defaultBranch ? (
               <div style={{ color: tc.textMuted, fontSize: 11, alignSelf: "center" }}>
@@ -313,7 +315,7 @@ export function RemoteCard({
         </div>
       ) : null}
 
-      {githubLoading ? <div style={{ color: tc.textMuted }}>Aggiornamento stato GitHub...</div> : null}
+      {githubLoading ? <div style={{ color: tc.textMuted }}>{t("git.aggiornamentoStatoGithub")}</div> : null}
       {githubMessage ? <div style={{ color: tc.success }}>{githubMessage}</div> : null}
       {githubError ? <div style={{ color: tc.error }}>{githubError}</div> : null}
     </div>

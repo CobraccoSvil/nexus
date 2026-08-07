@@ -2,6 +2,7 @@
 
 import type { QualityFinding, QualityScanResult } from "../../../lib/api-client";
 import type { Tc, FixQueueItem } from "./types";
+import { useI18n } from "../../../lib/i18n";
 
 interface OptimizationToolbarProps {
   tc: Tc;
@@ -75,6 +76,7 @@ export function OptimizationToolbar({
   setDeepReviewTotal,
   pollDeepReviewStatus,
 }: OptimizationToolbarProps) {
+  const { t } = useI18n();
   return (
     <div style={{
       display: "flex", alignItems: "center", gap: 8, padding: "6px 10px",
@@ -101,7 +103,7 @@ export function OptimizationToolbar({
           <button
             onClick={() => startFixQueue(allActiveFindings.filter(f => f.severity === "high"))}
             disabled={!onSendToChat}
-            title="Invia i problemi HIGH un file alla volta — clicca 'File successivo' dopo ogni correzione"
+            title={t("panels.inviaIProblemiHigh")}
             style={{
               background: "#ef4444", color: "#fff", border: "none", borderRadius: 6,
               padding: "4px 12px", fontSize: 12, cursor: "pointer",
@@ -112,13 +114,13 @@ export function OptimizationToolbar({
           <button
             onClick={() => startFixQueue(allActiveFindings.filter(f => f.severity === "high"), true)}
             disabled={!onSendToChat}
-            title="Invia tutti i file HIGH in sequenza automatica — l'agente li corregge uno dopo l'altro senza intervento"
+            title={t("panels.inviaTuttiIFile")}
             style={{
               background: "#7c3aed", color: "#fff", border: "none", borderRadius: 6,
               padding: "4px 12px", fontSize: 12, cursor: "pointer",
             }}
           >
-            Auto Fix
+            {t("panels.autoFix")}
           </button>
         </>
       )}
@@ -140,13 +142,13 @@ export function OptimizationToolbar({
               <button
                 onClick={() => { setAutoFixEnabled(true); handleFixNext(); }}
                 disabled={!onSendToChat}
-                title="Continua automaticamente tutti i file rimanenti nella coda"
+                title={t("panels.continuaAutomaticamenteTuttiI")}
                 style={{
                   background: "#7c3aed", color: "#fff", border: "none", borderRadius: 6,
                   padding: "4px 12px", fontSize: 12, cursor: "pointer",
                 }}
               >
-                Riprendi Auto
+                {t("panels.riprendiAuto")}
               </button>
             </>
           )}
@@ -159,9 +161,9 @@ export function OptimizationToolbar({
                   background: "transparent", color: "#ef4444", border: `1px solid #ef4444`,
                   borderRadius: 4, padding: "1px 6px", fontSize: 10, cursor: "pointer", marginLeft: 4,
                 }}
-                title="Ferma auto-fix"
+                title={t("panels.fermaAutoFix")}
               >
-                Stop
+                {t("panels.stop")}
               </button>
             </span>
           )}
@@ -185,7 +187,7 @@ export function OptimizationToolbar({
               sessionStorage.setItem(storageKey, JSON.stringify({ ...data, fixQueue: [], fixQueueIndex: 0 }));
             } catch { /* ignore */ }
           }}
-          title="Azzera la coda e ricomincia"
+          title={t("panels.azzeraLaCodaE")}
           style={{
             background: "transparent", color: tc.textMuted, border: `1px solid ${tc.border}`,
             borderRadius: 6, padding: "2px 8px", fontSize: 11, cursor: "pointer",
@@ -208,7 +210,7 @@ export function OptimizationToolbar({
       <button
         onClick={handleDeepReview}
         disabled={deepReviewSubmitting || deepReviewState === "JOB_STATE_RUNNING" || deepReviewState === "JOB_STATE_PENDING"}
-        title="Analisi approfondita AI su tutti i file sorgente. Elaborazione in background."
+        title={t("panels.analisiApprofonditaAiSu")}
         style={{
           background: "#7c3aed", color: "#fff", border: "none", borderRadius: 6,
           padding: "4px 10px", fontSize: 12,
@@ -233,7 +235,7 @@ export function OptimizationToolbar({
               setDeepReviewCompleted(0);
               setDeepReviewTotal(0);
             }}
-            title="Annulla / Resetta analisi bloccata"
+            title={t("panels.annullaResettaAnalisiBloccata")}
             style={{
               background: "transparent", color: "#ef4444", border: `1px solid #ef444444`,
               borderRadius: 5, padding: "1px 5px", fontSize: 10, cursor: "pointer",
@@ -242,7 +244,7 @@ export function OptimizationToolbar({
         </>
       )}
       {deepReviewState === "JOB_STATE_SUCCEEDED" && (
-        <span style={{ fontSize: 11, color: "#22c55e" }} title="Analisi AI completata">✓ AI</span>
+        <span style={{ fontSize: 11, color: "#22c55e" }} title={t("panels.analisiAiCompletata")}>✓ AI</span>
       )}
       {deepReviewError && (
         <span style={{ fontSize: 11, color: "#ef4444", cursor: "pointer" }}
@@ -258,7 +260,7 @@ export function OptimizationToolbar({
             background: "transparent", color: tc.textMuted, border: `1px solid ${tc.border}`,
             borderRadius: 6, padding: "2px 6px", fontSize: 10, cursor: "pointer",
           }}
-          title="Aggiorna stato analisi AI"
+          title={t("panels.aggiornaStatoAnalisiAi")}
         >↻</button>
       )}
       {scanResult && (

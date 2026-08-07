@@ -3,6 +3,7 @@
 import type { DeepAnalysisInsights } from "../../../lib/api-client";
 import { useThemeColors } from "../../../lib/theme";
 import { cardStyle } from "./styles";
+import { useI18n } from "../../../lib/i18n";
 
 interface AnalysisInsightsCardProps {
   insights: DeepAnalysisInsights | null;
@@ -29,6 +30,7 @@ export function AnalysisInsightsCard({
   setSentIssueIds,
   setSentActionIds,
 }: AnalysisInsightsCardProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
 
   return (
@@ -51,7 +53,7 @@ export function AnalysisInsightsCard({
               flexShrink: 0,
             }} />
             <div style={{ color: tc.text, fontWeight: 600, fontSize: 12 }}>
-              Analisi AI in corso...
+              {t("git.analisiAiInCorso")}
             </div>
           </div>
           <div style={{ color: tc.textMuted, fontSize: 10, marginTop: 4, lineHeight: 1.4 }}>
@@ -66,7 +68,7 @@ export function AnalysisInsightsCard({
       {insights && (
         <div style={{ ...cardStyle(tc), minWidth: 0, overflow: "hidden" }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
-            <div style={{ color: tc.text, fontWeight: 700 }}>Analisi AI del progetto</div>
+            <div style={{ color: tc.text, fontWeight: 700 }}>{t("git.analisiAiDelProgetto")}</div>
             <div style={{ color: tc.textMuted, fontSize: 10, wordBreak: "break-all" }}>
               {insightsModel ? `${insightsModel}` : ""}{insightsAt ? ` · ${new Date(insightsAt).toLocaleString()}` : ""}
             </div>
@@ -84,7 +86,7 @@ export function AnalysisInsightsCard({
               fontSize: 10, color: tc.textMuted, marginBottom: 8,
               wordBreak: "break-word", overflowWrap: "anywhere",
             }}>
-              <span style={{ fontWeight: 600 }}>Architettura:</span> {insights.architecture.pattern}
+              <span style={{ fontWeight: 600 }}>{t("git.architettura")}</span> {insights.architecture.pattern}
               {insights.architecture.primary_languages && insights.architecture.primary_languages.length > 0 &&
                 ` · ${insights.architecture.primary_languages.join(", ")}`}
             </div>
@@ -94,7 +96,7 @@ export function AnalysisInsightsCard({
           {insights.services && insights.services.length > 0 && insights.services.some(s => s.recommended_run_mode) && (
             <div style={{ marginBottom: 8 }}>
               <div style={{ fontSize: 11, fontWeight: 600, color: tc.text, marginBottom: 4 }}>
-                Servizi e modalita' di esecuzione
+                {t("git.serviziEModalitaDi")}
               </div>
               {insights.services.map((svc, idx) => {
                 if (!svc.recommended_run_mode) return null;
@@ -274,7 +276,7 @@ export function AnalysisInsightsCard({
           {insights.suggested_actions && insights.suggested_actions.length > 0 && (
             <div>
               <div style={{ fontSize: 11, fontWeight: 600, color: tc.text, marginBottom: 4 }}>
-                Azioni suggerite
+                {t("git.azioniSuggerite")}
               </div>
               {insights.suggested_actions.slice(0, 5).map((act, idx) => {
                 const alreadyRun = sentActionIds.has(idx);

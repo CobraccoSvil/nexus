@@ -6,6 +6,7 @@ import type {
   ProjectDbConnection,
   ProjectDbTestResult,
 } from "../../lib/api-client";
+import { useI18n } from "../../lib/i18n";
 
 interface Props {
   tc: Theme;
@@ -41,6 +42,7 @@ export function ConnectionList({
   onDeleteConnection,
   onToggleNewMig,
 }: Props) {
+  const { t } = useI18n();
   return (
     <div style={{ padding: 10, display: "flex", flexDirection: "column", gap: 6, borderBottom: `1px solid ${tc.border}` }}>
       {/* wrap obbligatorio: in una sidebar da ~195px questa riga chiede 189px di
@@ -66,7 +68,7 @@ export function ConnectionList({
               fontWeight: 700,
             }}
           >
-            Crea database
+            {t("project-db.creaDatabase")}
           </button>
           <button
             type="button"
@@ -126,7 +128,7 @@ export function ConnectionList({
                 type="button"
                 onClick={() => onTestSaved(c)}
                 disabled={busy || connTestingId === c.id}
-                title="Testa questa connessione"
+                title={t("project-db.testaQuestaConnessione")}
                 style={{
                   padding: "2px 6px",
                   borderRadius: 4,
@@ -154,7 +156,7 @@ export function ConnectionList({
                     fontSize: 10,
                   }}
                 >
-                  Set primary
+                  {t("project-db.setPrimary")}
                 </button>
               )}
               <button
@@ -171,7 +173,7 @@ export function ConnectionList({
                   fontSize: 10,
                 }}
               >
-                Modifica
+                {t("project-db.modifica")}
               </button>
               <button
                 type="button"
@@ -187,7 +189,7 @@ export function ConnectionList({
                   fontSize: 10,
                 }}
               >
-                Elimina
+                {t("project-db.elimina")}
               </button>
             </div>
           </div>
@@ -222,15 +224,15 @@ export function ConnectionList({
           )}
           <div style={{ fontSize: 10, color: tc.textMuted, lineHeight: 1.5 }}>
             <div>
-              <span style={{ color: tc.textSecondary }}>Engine:</span> {c.engine ?? "—"}
+              <span style={{ color: tc.textSecondary }}>{t("project-db.engine2")}</span> {c.engine ?? "—"}
               {c.hosting_mode ? ` · ${c.hosting_mode}` : ""}
             </div>
             <div>
-              <span style={{ color: tc.textSecondary }}>Tool:</span> {c.migration_tool ?? "—"}
+              <span style={{ color: tc.textSecondary }}>{t("project-db.tool")}</span> {c.migration_tool ?? "—"}
               {c.migration_path ? ` · ${c.migration_path}` : ""}
             </div>
             <div>
-              <span style={{ color: tc.textSecondary }}>DDL override:</span>{" "}
+              <span style={{ color: tc.textSecondary }}>{t("project-db.ddlOverride")}</span>{" "}
               {c.allow_ddl_override ? "abilitato" : "disabilitato"}
             </div>
           </div>

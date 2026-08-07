@@ -7,12 +7,14 @@ import {
   useProjectStore,
 } from "../../lib/project-dispatcher";
 import { formatMonitorValue } from "../../lib/monitor-format";
+import { useI18n } from "../../lib/i18n";
 
 export interface MonitorPanelProps {
   onSendToChat?: (message: string) => void;
 }
 
 export function MonitorPanel(_props: MonitorPanelProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const monitors = useProjectStore(selectMonitors);
   const flags = useProjectStore(selectFlags);
@@ -27,7 +29,7 @@ export function MonitorPanel(_props: MonitorPanelProps) {
         </div>
         {monitorEntries.length === 0 ? (
           <div style={{ color: tc.textMuted, fontSize: 12 }}>
-            Nessun monitor attivo. L'agente puo' crearne usando il tool <code>dispatcher_update_monitor</code>.
+            {t("panels.nessunMonitorAttivoL")} <code>dispatcher_update_monitor</code>.
           </div>
         ) : (
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 8 }}>
@@ -61,7 +63,7 @@ export function MonitorPanel(_props: MonitorPanelProps) {
         </div>
         {flagEntries.length === 0 ? (
           <div style={{ color: tc.textMuted, fontSize: 12 }}>
-            Nessun flag impostato.
+            {t("panels.nessunFlagImpostato")}
           </div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>

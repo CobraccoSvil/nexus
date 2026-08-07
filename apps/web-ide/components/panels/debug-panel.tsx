@@ -10,6 +10,7 @@ import {
   selectServicesRefreshAt,
 } from "../../lib/project-dispatcher";
 import { AutoWidthSelect } from "../auto-width-select";
+import { useI18n } from "../../lib/i18n";
 
 export type DebugLevel = "ERROR" | "WARN" | "INFO" | "DEBUG";
 
@@ -135,6 +136,7 @@ function adjacentDebugLines(entries: DebugEntry[], focusId: string): string[] {
 type SourceFilter = "all" | "terminal" | string;
 
 export function DebugPanel({ projectId, terminalLines, onSendToChat }: DebugPanelProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [entries, setEntries] = useState<DebugEntry[]>([]);
   const [filters, setFilters] = useState<Record<DebugLevel, boolean>>({
@@ -414,7 +416,7 @@ export function DebugPanel({ projectId, terminalLines, onSendToChat }: DebugPane
         <button
           type="button"
           onClick={clearEntries}
-          title="Cancella log"
+          title={t("panels.cancellaLog")}
           style={{
             background: "transparent",
             border: `1px solid ${tc.border}`,
@@ -425,7 +427,7 @@ export function DebugPanel({ projectId, terminalLines, onSendToChat }: DebugPane
             fontSize: 11,
           }}
         >
-          Clear
+          {t("panels.clear")}
         </button>
       </div>
 

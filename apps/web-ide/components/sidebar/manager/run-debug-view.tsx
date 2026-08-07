@@ -33,6 +33,7 @@ import {
   isDuplicateOfManagedService,
   categorize,
 } from "./shared";
+import { useI18n } from "../../../lib/i18n";
 
 export function RunDebugView({
   tc,
@@ -47,6 +48,7 @@ export function RunDebugView({
   onRunConfigsChange?: (configs: RunConfigItem[]) => void;
   onLaunchConfig?: (channelId: string) => void;
 }) {
+  const { t } = useI18n();
   const [editing, setEditing] = useState<EditState | null>(null);
   const [saving, setSaving] = useState(false);
   const [launching, setLaunching] = useState<string | null>(null);
@@ -269,8 +271,8 @@ export function RunDebugView({
       {/* flex-row-wrap, non flex-row: in sidebar stretta titolo e comandi non
           ci stanno in riga e, non potendo andare a capo, sfondavano il
           contenitore (misurati 4px) che rispondeva con uno scroll orizzontale. */}
-      <div className="flex-row-wrap px-3 py-2" style={{ borderBottom: `1px solid ${tc.border}`, justifyContent: "space-between", gap: 6 }} title="Script & comandi una-tantum del progetto (build, test, lint, migrazioni, ecc.). Gli script che corrispondono a servizi del progetto installati e quelli di stop/kill vengono nascosti automaticamente — clicca '👁' per mostrarli.">
-        <span style={{ fontSize: 11, fontWeight: 600, color: tc.textMuted, textTransform: "uppercase", letterSpacing: 1 }}>Script &amp; Comandi</span>
+      <div className="flex-row-wrap px-3 py-2" style={{ borderBottom: `1px solid ${tc.border}`, justifyContent: "space-between", gap: 6 }} title={t("sidebar.scriptComandiUnaTantum")}>
+        <span style={{ fontSize: 11, fontWeight: 600, color: tc.textMuted, textTransform: "uppercase", letterSpacing: 1 }}>{t("sidebar.scriptAmpComandi")}</span>
         {!editing && !suggestions && (
           <div className="flex-row" style={{ gap: 4, alignItems: "center" }}>
             <button
@@ -289,19 +291,19 @@ export function RunDebugView({
             <button
               onClick={() => handleDetect(false, false)}
               disabled={!project || detecting}
-              title="Rileva configurazioni di avvio dai file del progetto (usa cache se disponibile)"
+              title={t("sidebar.rilevaConfigurazioniDiAvvio")}
               className="text-xs px-1 py-0 rounded-sm cursor-pointer" style={{ background: "none", border: `1px solid ${tc.border}`, color: tc.accent }}
             >{detecting ? "…" : "✨ Auto"}</button>
             <button
               onClick={() => handleDetect(false, true)}
               disabled={!project || detecting}
-              title="Forza riscansione del filesystem (ignora cache)"
+              title={t("sidebar.forzaRiscansioneDelFilesystem")}
               className="text-xs px-1 py-0 rounded-sm cursor-pointer" style={{ background: "none", border: `1px solid ${tc.border}`, color: tc.accent }}
             >↺</button>
             <button
               onClick={startNew}
               disabled={!project}
-              title="Nuova configurazione manuale"
+              title={t("sidebar.nuovaConfigurazioneManuale")}
               style={{ background: "none", border: "none", color: tc.accent, cursor: project ? "pointer" : "not-allowed", fontSize: 18, lineHeight: 1, padding: "0 2px" }}
             >+</button>
           </div>
@@ -325,11 +327,11 @@ export function RunDebugView({
               <button onClick={() => setSuggestions(null)} style={{ background: "none", border: "none", color: tc.textMuted, cursor: "pointer", fontSize: 14 }}>×</button>
             </div>
             {suggestions.length === 0 ? (
-              <div className="text-xs text-muted">Nessuna configurazione rilevata in questo progetto.</div>
+              <div className="text-xs text-muted">{t("sidebar.nessunaConfigurazioneRilevataIn")}</div>
             ) : (
               <>
                 <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 2 }}>
-                  Selezione iniziale: solo gli <strong style={{ color: tc.accent }}>essenziali</strong> per avviare l&apos;app. Spunta altre voci per aggiungerle.
+                  {t("sidebar.selezioneInizialeSoloGli")} <strong style={{ color: tc.accent }}>essenziali</strong> per avviare l&apos;app. Spunta altre voci per aggiungerle.
                 </div>
                 {groupedSuggestions.map(({ group, items }) => {
                   const groupIndices = items.map(it => it.idx);
@@ -354,9 +356,9 @@ export function RunDebugView({
                           {GROUP_ICON(group)} {group}
                         </span>
                         <span style={{ fontSize: 10, color: tc.textMuted, display: "flex", gap: 4, flexWrap: "wrap" }}>
-                          <button onClick={() => toggleGroup("all")} style={{ background: "none", border: "none", color: tc.textMuted, cursor: "pointer", fontSize: 10, padding: "0 2px" }} title="Seleziona tutti">{allSelected ? "✓ tutti" : "tutti"}</button>
-                          <button onClick={() => toggleGroup("essential")} style={{ background: "none", border: "none", color: tc.accent, cursor: "pointer", fontSize: 10, padding: "0 2px" }} title="Solo essenziali">essenziali</button>
-                          <button onClick={() => toggleGroup("none")} style={{ background: "none", border: "none", color: tc.textMuted, cursor: "pointer", fontSize: 10, padding: "0 2px" }} title="Nessuno">nessuno</button>
+                          <button onClick={() => toggleGroup("all")} style={{ background: "none", border: "none", color: tc.textMuted, cursor: "pointer", fontSize: 10, padding: "0 2px" }} title={t("sidebar.selezionaTutti")}>{allSelected ? "✓ tutti" : "tutti"}</button>
+                          <button onClick={() => toggleGroup("essential")} style={{ background: "none", border: "none", color: tc.accent, cursor: "pointer", fontSize: 10, padding: "0 2px" }} title={t("sidebar.soloEssenziali")}>essenziali</button>
+                          <button onClick={() => toggleGroup("none")} style={{ background: "none", border: "none", color: tc.textMuted, cursor: "pointer", fontSize: 10, padding: "0 2px" }} title={t("sidebar.nessuno")}>nessuno</button>
                         </span>
                       </div>
                       {items.map(({ s, idx }) => {
@@ -379,7 +381,7 @@ export function RunDebugView({
                                   {badge.icon} {badge.label}
                                 </span>
                                 {s.essential && (
-                                  <span title="Essenziale per l'avvio" style={{ fontSize: 9, padding: "1px 5px", borderRadius: 4, background: "#22c55e33", color: "#22c55e", fontWeight: 700 }}>essenziale</span>
+                                  <span title={t("sidebar.essenzialePerLAvvio")} style={{ fontSize: 9, padding: "1px 5px", borderRadius: 4, background: "#22c55e33", color: "#22c55e", fontWeight: 700 }}>essenziale</span>
                                 )}
                               </div>
                               <TruncatedText
@@ -407,13 +409,13 @@ export function RunDebugView({
                     {importingAll ? "Importo..." : `Importa (${selectedSuggestions.size})`}
                   </button>
                   <button onClick={() => handleDetect(true)} disabled={detecting}
-                    title="Rifinisci la classificazione con Nexus AI"
+                    title={t("sidebar.rifinisciLaClassificazioneCon")}
                     style={{ flex: "1 1 45%", background: "none", color: tc.accent, border: `1px solid ${tc.accent}`, borderRadius: 6, padding: "5px 0", fontSize: 11, cursor: "pointer" }}>
                     🤖 Rifinisci con AI
                   </button>
                   <button onClick={() => setSuggestions(null)}
                     style={{ flex: "1 1 45%", background: "none", color: tc.textSecondary, border: `1px solid ${tc.border}`, borderRadius: 6, padding: "5px 0", fontSize: 12, cursor: "pointer" }}>
-                    Annulla
+                    {t("sidebar.annulla")}
                   </button>
                 </div>
               </>
@@ -428,35 +430,35 @@ export function RunDebugView({
               {editing.id ? "Modifica configurazione" : "Nuova configurazione"}
             </div>
             <div>
-              <label style={labelStyle}>Nome</label>
-              <input style={inputStyle} placeholder="es. Dev Server" value={editing.label}
+              <label style={labelStyle}>{t("sidebar.nome")}</label>
+              <input style={inputStyle} placeholder={t("sidebar.esDevServer")} value={editing.label}
                 onChange={e => setEditing(prev => prev ? { ...prev, label: e.target.value } : null)} />
             </div>
             <div>
-              <label style={labelStyle}>Tipo</label>
+              <label style={labelStyle}>{t("sidebar.tipo")}</label>
               <select style={inputStyle} value={editing.kind}
                 onChange={e => setEditing(prev => prev ? { ...prev, kind: e.target.value, command: "" } : null)}>
                 {KIND_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
               </select>
             </div>
             <div>
-              <label style={labelStyle}>Comando</label>
+              <label style={labelStyle}>{t("sidebar.comando")}</label>
               <input style={{ ...inputStyle, fontFamily: 'var(--font-mono)' }}
                 placeholder={KIND_PLACEHOLDER[editing.kind] ?? "comando"}
                 value={editing.command}
                 onChange={e => setEditing(prev => prev ? { ...prev, command: e.target.value } : null)} />
             </div>
             <div>
-              <label style={labelStyle}>Argomenti (separati da spazio)</label>
+              <label style={labelStyle}>{t("sidebar.argomentiSeparatiDaSpazio")}</label>
               <input style={{ ...inputStyle, fontFamily: 'var(--font-mono)' }}
-                placeholder="--port 3000 --watch"
+                placeholder={t("sidebar.port3000Watch")}
                 value={editing.args}
                 onChange={e => setEditing(prev => prev ? { ...prev, args: e.target.value } : null)} />
             </div>
             <div>
-              <label style={labelStyle}>Working directory (opzionale)</label>
+              <label style={labelStyle}>{t("sidebar.workingDirectoryOpzionale")}</label>
               <input style={{ ...inputStyle, fontFamily: 'var(--font-mono)' }}
-                placeholder="lascia vuoto = root progetto"
+                placeholder={t("sidebar.lasciaVuotoRootProgetto")}
                 value={editing.cwd}
                 onChange={e => setEditing(prev => prev ? { ...prev, cwd: e.target.value } : null)} />
             </div>
@@ -467,7 +469,7 @@ export function RunDebugView({
               </button>
               <button onClick={() => { setEditing(null); setError(null); }}
                 style={{ flex: 1, background: "none", color: tc.textSecondary, border: `1px solid ${tc.border}`, borderRadius: 6, padding: "5px 0", fontSize: 12, cursor: "pointer" }}>
-                Annulla
+                {t("sidebar.annulla")}
               </button>
             </div>
           </div>
@@ -476,7 +478,7 @@ export function RunDebugView({
         {/* Config list categorizzata + filtrata */}
         {runConfigs.length === 0 && !editing ? (
           <div style={{ color: tc.textMuted, fontSize: 12, paddingTop: 4 }}>
-            Nessuna configurazione. Clicca <strong>+</strong> per aggiungerne una.
+            {t("sidebar.nessunaConfigurazioneClicca")} <strong>+</strong> per aggiungerne una.
           </div>
         ) : (() => {
           const renderCard = (config: RunConfigItem, mutedReason?: string) => {
@@ -501,11 +503,11 @@ export function RunDebugView({
                     style={{ background: "#22c55e", border: "none", borderRadius: 5, color: "#fff", width: 24, height: 24, cursor: launching ? "wait" : "pointer", fontSize: 12, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                     {launching === config.id ? "…" : "▶"}
                   </button>
-                  <button onClick={() => startEdit(config)} title="Modifica"
+                  <button onClick={() => startEdit(config)} title={t("sidebar.modifica")}
                     style={{ background: "none", border: `1px solid ${tc.border}`, borderRadius: 5, color: tc.textMuted, width: 24, height: 24, cursor: "pointer", fontSize: 12, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                     ✎
                   </button>
-                  <button onClick={() => handleDelete(config.id)} title="Elimina"
+                  <button onClick={() => handleDelete(config.id)} title={t("sidebar.elimina")}
                     style={{ background: "none", border: `1px solid ${tc.border}`, borderRadius: 5, color: tc.error, width: 24, height: 24, cursor: "pointer", fontSize: 13, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                     ×
                   </button>

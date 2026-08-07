@@ -23,6 +23,7 @@ import {
   type OutputEvent,
 } from "../../lib/api-client";
 import { useProjectStore, selectOutputChannelsChangedAt } from "../../lib/project-dispatcher";
+import { useI18n } from "../../lib/i18n";
 
 interface OutputPanelProps {
   projectId: string;
@@ -272,6 +273,7 @@ export function OutputPanel({
   onClear,
   onSendToChat,
 }: OutputPanelProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
 
   // --- Canali agente ---
@@ -550,8 +552,8 @@ ${singleErrorBlock}
    - Quali sono **conseguenze** (errori secondari che spariranno una volta risolta la causa radice).
 
 2. **Riepiloga l'analisi** in un blocco breve PRIMA di toccare codice, così:
-   > Causa radice: \`<eccezione>\` in \`<file:line>\` — ricorre N volte.
-   > Effetti a cascata: \`<altra_eccezione>\` × M, \`<altra2>\` × K.
+   > {t("panels.causaRadice")}<eccezione>\` in \`<file:line>\` — ricorre N volte.
+   > {t("panels.effettiACascata")}<altra_eccezione>\` × M, \`<altra2>\` × K.
 
 3. **Concentrati SOLO sulla causa radice.** Non tentare di fixare gli errori secondari adesso: spariranno da soli quando la radice è risolta.
 
@@ -654,7 +656,7 @@ ${tail.join("\n")}${note}
             background: tc.bgSidebar,
             flexShrink: 0,
           }}>
-            Servizi
+            {t("panels.servizi")}
           </div>
         )}
 
@@ -777,7 +779,7 @@ ${tail.join("\n")}${note}
                 onClick={onClear}
                 style={{ background: "none", border: `1px solid ${tc.border}`, borderRadius: 4, color: tc.textMuted, cursor: "pointer", padding: "2px 8px", fontSize: 11 }}
               >
-                Clear
+                {t("panels.clear")}
               </button>
             )}
           </div>
@@ -818,7 +820,7 @@ ${tail.join("\n")}${note}
                 boxShadow: "0 2px 8px rgba(0,0,0,0.3)",
                 whiteSpace: "nowrap",
               }}
-              title="Invia il testo selezionato alla chat per analisi"
+              title={t("panels.inviaIlTestoSelezionato")}
             >
               ↗ Invia alla chat
             </button>
@@ -835,7 +837,7 @@ ${tail.join("\n")}${note}
             )
           ) : (
             staticEvents.length === 0 ? (
-              <div style={{ color: tc.textMuted }}>Nessun evento per il canale selezionato.</div>
+              <div style={{ color: tc.textMuted }}>{t("panels.nessunEventoPerIl")}</div>
             ) : (
               staticEvents.map((ev) => (
                 <div key={ev.id} style={{ marginBottom: 12 }}>

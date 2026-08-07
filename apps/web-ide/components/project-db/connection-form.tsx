@@ -3,6 +3,7 @@
 import type { Theme } from "../../lib/theme";
 import type { ProjectDbTestResult } from "../../lib/api-client";
 import type { InitForm, ConnFields } from "./db-helpers";
+import { useI18n } from "../../lib/i18n";
 
 /** Field label+input renderer. Punto unico per i 5 input identici di
  *  connessione DB (regola L / ADR 0026). Prima i blocchi
@@ -89,6 +90,7 @@ export function ConnectionForm({
   onInit,
   onCancel,
 }: Props) {
+  const { t } = useI18n();
   return (
     <div style={{ padding: 10, borderBottom: `1px solid ${tc.border}`, background: `${tc.accent}10` }}>
       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -96,38 +98,38 @@ export function ConnectionForm({
           {isConfigured ? "Modifica configurazione database" : "Nuovo database progetto"}
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <label style={{ fontSize: 10, color: tc.textMuted }}>Nome connessione</label>
+          <label style={{ fontSize: 10, color: tc.textMuted }}>{t("project-db.nomeConnessione")}</label>
           <input
             type="text"
-            placeholder="primary, analytics, ..."
+            placeholder={t("project-db.primaryAnalytics")}
             value={initForm.name}
             onChange={(e) => setInitForm((f) => ({ ...f, name: e.target.value }))}
             style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
           />
-          <label style={{ fontSize: 10, color: tc.textMuted }}>Engine</label>
+          <label style={{ fontSize: 10, color: tc.textMuted }}>{t("project-db.engine")}</label>
           <select
             value={initForm.engine}
             onChange={(e) => setInitForm((f) => ({ ...f, engine: e.target.value }))}
             style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
           >
-            <option value="postgres">PostgreSQL</option>
-            <option value="mysql">MySQL</option>
-            <option value="sqlite">SQLite</option>
-            <option value="sqlserver">SQL Server</option>
+            <option value="postgres">{t("project-db.postgresql")}</option>
+            <option value="mysql">{t("project-db.mysql")}</option>
+            <option value="sqlite">{t("project-db.sqlite")}</option>
+            <option value="sqlserver">{t("project-db.sqlServer")}</option>
           </select>
-          <label style={{ fontSize: 10, color: tc.textMuted }}>Migration tool</label>
+          <label style={{ fontSize: 10, color: tc.textMuted }}>{t("project-db.migrationTool")}</label>
           <select
             value={initForm.migration_tool}
             onChange={(e) => setInitForm((f) => ({ ...f, migration_tool: e.target.value }))}
             style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
           >
-            <option value="generic_sql">Generic SQL</option>
-            <option value="alembic">Alembic</option>
-            <option value="prisma">Prisma</option>
-            <option value="knex">Knex</option>
-            <option value="flyway">Flyway</option>
+            <option value="generic_sql">{t("project-db.genericSql")}</option>
+            <option value="alembic">{t("project-db.alembic")}</option>
+            <option value="prisma">{t("project-db.prisma")}</option>
+            <option value="knex">{t("project-db.knex")}</option>
+            <option value="flyway">{t("project-db.flyway")}</option>
           </select>
-          <label style={{ fontSize: 10, color: tc.textMuted }}>Cartella migration</label>
+          <label style={{ fontSize: 10, color: tc.textMuted }}>{t("project-db.cartellaMigration")}</label>
           <input
             type="text"
             value={initForm.migration_path}
@@ -135,7 +137,7 @@ export function ConnectionForm({
             style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
           />
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4 }}>
-            <label style={{ fontSize: 10, color: tc.textMuted, margin: 0 }}>Connessione DB</label>
+            <label style={{ fontSize: 10, color: tc.textMuted, margin: 0 }}>{t("project-db.connessioneDb")}</label>
             <button
               type="button"
               onClick={() => setUseConnFields(!useConnFields)}
@@ -149,7 +151,7 @@ export function ConnectionForm({
               <DbField
                 tc={tc}
                 label="Host"
-                placeholder="localhost"
+                placeholder={t("project-db.localhost")}
                 value={connFields.host}
                 onChange={(v) => setConnFields((f) => ({ ...f, host: v }))}
               />
@@ -163,7 +165,7 @@ export function ConnectionForm({
               <DbField
                 tc={tc}
                 label="Database"
-                placeholder="nome del DB applicativo (es. myapp_dev)"
+                placeholder={t("project-db.nomeDelDbApplicativo")}
                 value={connFields.database}
                 onChange={(v) => setConnFields((f) => ({ ...f, database: v }))}
                 fullWidth
@@ -171,7 +173,7 @@ export function ConnectionForm({
               <DbField
                 tc={tc}
                 label="Utente"
-                placeholder="username"
+                placeholder={t("project-db.username")}
                 value={connFields.username}
                 onChange={(v) => setConnFields((f) => ({ ...f, username: v }))}
               />
@@ -179,7 +181,7 @@ export function ConnectionForm({
                 tc={tc}
                 label="Password"
                 type="password"
-                placeholder="password"
+                placeholder={t("project-db.password")}
                 value={connFields.password}
                 onChange={(v) => setConnFields((f) => ({ ...f, password: v }))}
               />
@@ -254,7 +256,7 @@ export function ConnectionForm({
           )}
           {detectHints && detectHints.length > 0 && (
             <div style={{ fontSize: 10, color: tc.textMuted, lineHeight: 1.4 }}>
-              <div style={{ fontWeight: 600, marginBottom: 2 }}>Indicatori rilevati:</div>
+              <div style={{ fontWeight: 600, marginBottom: 2 }}>{t("project-db.indicatoriRilevati")}</div>
               {detectHints.map((h, i) => (
                 <div key={i}>• {h}</div>
               ))}
@@ -266,7 +268,7 @@ export function ConnectionForm({
               checked={initForm.allow_ddl_override}
               onChange={(e) => setInitForm((f) => ({ ...f, allow_ddl_override: e.target.checked }))}
             />
-            Consenti DDL override manuale
+            {t("project-db.consentiDdlOverrideManuale")}
           </label>
           <div style={{ display: "flex", gap: 6 }}>
             <button
@@ -301,7 +303,7 @@ export function ConnectionForm({
                 fontSize: 12,
               }}
             >
-              Annulla
+              {t("project-db.annulla")}
             </button>
           </div>
         </div>

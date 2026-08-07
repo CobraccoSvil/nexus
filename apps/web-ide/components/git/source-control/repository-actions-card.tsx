@@ -11,6 +11,7 @@ import {
 } from "../../../lib/api-client";
 import { useThemeColors } from "../../../lib/theme";
 import { buttonStyle, cardStyle, inputStyle, sectionTitleStyle } from "./styles";
+import { useI18n } from "../../../lib/i18n";
 
 interface RepositoryActionsCardProps {
   project: UserProjectDetails;
@@ -31,11 +32,12 @@ export function RepositoryActionsCard({
   setCommitMessage,
   runAction,
 }: RepositoryActionsCardProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
 
   return (
     <div style={cardStyle(tc)}>
-      <div style={sectionTitleStyle(tc)}>Gestione Repository</div>
+      <div style={sectionTitleStyle(tc)}>{t("git.gestioneRepository")}</div>
       <div style={{ color: tc.textMuted, fontSize: 12 }}>
         Comandi rapidi per stage, commit e sincronizzazione del repository.
       </div>
@@ -43,18 +45,18 @@ export function RepositoryActionsCard({
         <button
           disabled={busy || !project.canManageGit || allChangedPaths.length === 0}
           onClick={() => runAction(() => stageGitPaths(project.id, allChangedPaths))}
-          title="Stage all — aggiungi tutte le modifiche"
+          title={t("git.stageAllAggiungiTutte")}
           style={buttonStyle(tc, busy || !project.canManageGit || allChangedPaths.length === 0)}
         >
-          Stage tutto
+          {t("git.stageTutto")}
         </button>
         <button
           disabled={busy || !project.canManageGit || (git?.staged.length ?? 0) === 0}
           onClick={() => runAction(() => unstageGitPaths(project.id, git?.staged.map((item) => item.path) ?? []))}
-          title="Unstage all — rimuovi tutte le modifiche dallo stage"
+          title={t("git.unstageAllRimuoviTutte")}
           style={buttonStyle(tc, busy || !project.canManageGit || (git?.staged.length ?? 0) === 0)}
         >
-          Rimuovi stage
+          {t("git.rimuoviStage")}
         </button>
       </div>
 
@@ -62,7 +64,7 @@ export function RepositoryActionsCard({
         <input
           value={commitMessage}
           onChange={(event) => setCommitMessage(event.target.value)}
-          placeholder="Messaggio commit"
+          placeholder={t("git.messaggioCommit")}
           style={inputStyle(tc)}
         />
         <button
@@ -73,10 +75,10 @@ export function RepositoryActionsCard({
               setCommitMessage("");
             })
           }
-          title="Commit — salva le modifiche staged"
+          title={t("git.commitSalvaLeModifiche")}
           style={buttonStyle(tc, busy || !project.canManageGit || !commitMessage.trim())}
         >
-          Commit
+          {t("git.commit")}
         </button>
       </div>
     </div>

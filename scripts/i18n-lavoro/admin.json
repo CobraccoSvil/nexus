@@ -1,0 +1,687 @@
+[
+  {
+    "chiave": "admin.prompt",
+    "it": "Prompt",
+    "en": "Prompt",
+    "es": "Prompt",
+    "occorrenze": 3,
+    "neutro": true
+  },
+  {
+    "chiave": "admin.purpose",
+    "it": "Purpose",
+    "en": "Purpose",
+    "es": "Proposito",
+    "occorrenze": 3
+  },
+  {
+    "chiave": "admin.predefinito",
+    "it": "predefinito",
+    "en": "default",
+    "es": "predeterminado",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "admin.definition",
+    "it": "Definition",
+    "en": "Definition",
+    "es": "Definicion",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "admin.annulla",
+    "it": "Annulla",
+    "en": "Cancel",
+    "es": "Cancelar",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "admin.loading",
+    "it": "Loading...",
+    "en": "Loading...",
+    "es": "Cargando...",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "admin.kind",
+    "it": "Kind",
+    "en": "Kind",
+    "es": "Tipo",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "admin.maxIter",
+    "it": "Max iter",
+    "en": "Max iter",
+    "es": "Iter. max",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "admin.esDataArchitect",
+    "it": "es. data_architect",
+    "en": "e.g. data_architect",
+    "es": "p. ej. data_architect",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.esValutaIlModello",
+    "it": "es. Valuta il modello dei dati: normalizzazione, indici, costo delle query sui volumi reali.",
+    "en": "e.g. Assess the data model: normalisation, indexes, query cost on real volumes.",
+    "es": "p. ej. Evalua el modelo de datos: normalizacion, indices, coste de las consultas con volumenes reales.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.rigeneraLoScheletroDallo",
+    "it": "Rigenera lo scheletro dallo schema standard, scartando le modifiche",
+    "en": "Regenerate the skeleton from the standard schema, discarding changes",
+    "es": "Regenera el esqueleto desde el esquema estandar, descartando los cambios",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.whitelistDispatcher",
+    "it": "Whitelist dispatcher",
+    "en": "Dispatcher whitelist",
+    "es": "Lista blanca del dispatcher",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.advisory",
+    "it": "Advisory",
+    "en": "Advisory",
+    "es": "Consultivo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.esecutivo",
+    "it": "Esecutivo",
+    "en": "Executive",
+    "es": "Ejecutivo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.ilTierSceglieLa",
+    "it": "Il tier sceglie la",
+    "en": "The tier picks the",
+    "es": "El tier elige la",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.questoPrompt",
+    "it": "Questo prompt",
+    "en": "This prompt",
+    "es": "Este prompt",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.ripristinaScheletro",
+    "it": "Ripristina scheletro",
+    "en": "Restore skeleton",
+    "es": "Restaurar esqueleto",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.indietro",
+    "it": "Indietro",
+    "en": "Back",
+    "es": "Atras",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.avanti",
+    "it": "Avanti",
+    "en": "Next",
+    "es": "Siguiente",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.creatiIQuattroPezzi",
+    "it": "Creati i quattro pezzi. Valori confermati dal backend:",
+    "en": "The four pieces have been created. Values confirmed by the backend:",
+    "es": "Se han creado las cuatro piezas. Valores confirmados por el backend:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.chiudi",
+    "it": "Chiudi",
+    "en": "Close",
+    "es": "Cerrar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.orchestrator",
+    "it": "Orchestrator",
+    "en": "Orchestrator",
+    "es": "Orquestador",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.subAgentsKinds",
+    "it": "Sub-agents kinds",
+    "en": "Sub-agent kinds",
+    "es": "Tipos de subagente",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.reload",
+    "it": "Reload",
+    "en": "Reload",
+    "es": "Recargar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.featureFlags",
+    "it": "Feature flags",
+    "en": "Feature flags",
+    "es": "Indicadores de funcion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.numericThresholds",
+    "it": "Numeric thresholds",
+    "en": "Numeric thresholds",
+    "es": "Umbrales numericos",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.plansRecenti",
+    "it": "Plans recenti",
+    "en": "Recent plans",
+    "es": "Planes recientes",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.runId",
+    "it": "Run ID",
+    "en": "Run ID",
+    "es": "ID de ejecucion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.project",
+    "it": "Project",
+    "en": "Project",
+    "es": "Proyecto",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.planner",
+    "it": "Planner",
+    "en": "Planner",
+    "es": "Planificador",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.todos",
+    "it": "Todos",
+    "en": "To-dos",
+    "es": "Tareas",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.verifier",
+    "it": "Verifier",
+    "en": "Verifier",
+    "es": "Verificador",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.subAgents",
+    "it": "Sub-agents",
+    "en": "Sub-agents",
+    "es": "Subagentes",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.creato",
+    "it": "Creato",
+    "en": "Created",
+    "es": "Creado",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.inspect",
+    "it": "Inspect",
+    "en": "Inspect",
+    "es": "Inspeccionar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.close",
+    "it": "Close",
+    "en": "Close",
+    "es": "Cerrar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.project2",
+    "it": "Project:",
+    "en": "Project:",
+    "es": "Proyecto:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.plannerModel",
+    "it": "Planner model:",
+    "en": "Planner model:",
+    "es": "Modelo del planificador:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.score",
+    "it": "Score:",
+    "en": "Score:",
+    "es": "Puntuacion:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.created",
+    "it": "Created:",
+    "en": "Created:",
+    "es": "Creado:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.approved",
+    "it": "Approved:",
+    "en": "Approved:",
+    "es": "Aprobado:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.nessunaVerifierRun",
+    "it": "Nessuna verifier run.",
+    "en": "No verifier runs.",
+    "es": "Ninguna ejecucion del verificador.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.cycle",
+    "it": "Cycle",
+    "en": "Cycle",
+    "es": "Ciclo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.todo",
+    "it": "Todo",
+    "en": "To-do",
+    "es": "Tarea",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.passed",
+    "it": "Passed",
+    "en": "Passed",
+    "es": "Superado",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.duration",
+    "it": "Duration",
+    "en": "Duration",
+    "es": "Duracion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.when",
+    "it": "When",
+    "en": "When",
+    "es": "Cuando",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.nessunaSubAgentRun",
+    "it": "Nessuna sub-agent run.",
+    "en": "No sub-agent runs.",
+    "es": "Ninguna ejecucion de subagente.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.status",
+    "it": "Status",
+    "en": "Status",
+    "es": "Estado",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.iter",
+    "it": "Iter",
+    "en": "Iter",
+    "es": "Iter.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.tokens",
+    "it": "Tokens",
+    "en": "Tokens",
+    "es": "Tokens",
+    "occorrenze": 1,
+    "neutro": true
+  },
+  {
+    "chiave": "admin.cost",
+    "it": "Cost",
+    "en": "Cost",
+    "es": "Coste",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.source",
+    "it": "Source",
+    "en": "Source",
+    "es": "Origen",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.depth",
+    "it": "Depth",
+    "en": "Depth",
+    "es": "Profundidad",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.promptAttivi",
+    "it": "Prompt attivi",
+    "en": "Active prompts",
+    "es": "Prompts activos",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.reflectionScoreMedio7gg",
+    "it": "Reflection score medio (7gg)",
+    "en": "Average reflection score (7d)",
+    "es": "Puntuacion media de reflexion (7 d)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.esperimentiRunning",
+    "it": "Esperimenti running",
+    "en": "Running experiments",
+    "es": "Experimentos en curso",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.schemaXmlV2",
+    "it": "Schema XML v2",
+    "en": "XML v2 schema",
+    "es": "Esquema XML v2",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.chiave",
+    "it": "Chiave",
+    "en": "Key",
+    "es": "Clave",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.versione",
+    "it": "Versione",
+    "en": "Version",
+    "es": "Version",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.schema",
+    "it": "Schema",
+    "en": "Schema",
+    "es": "Esquema",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.reflection7gg",
+    "it": "Reflection (7gg)",
+    "en": "Reflection (7d)",
+    "es": "Reflexion (7 d)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.feedback",
+    "it": "Feedback +",
+    "en": "Feedback +",
+    "es": "Comentarios +",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.run",
+    "it": "Run",
+    "en": "Runs",
+    "es": "Ejecuciones",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.caricamento",
+    "it": "Caricamento...",
+    "en": "Loading...",
+    "es": "Cargando...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.nessunPromptCorrispondeAl",
+    "it": "Nessun prompt corrisponde al filtro",
+    "en": "No prompt matches the filter",
+    "es": "Ningun prompt coincide con el filtro",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.xmlV2",
+    "it": "XML v2",
+    "en": "XML v2",
+    "es": "XML v2",
+    "occorrenze": 1,
+    "neutro": true
+  },
+  {
+    "chiave": "admin.baseline",
+    "it": "Baseline",
+    "en": "Baseline",
+    "es": "Linea base",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.variante",
+    "it": "Variante",
+    "en": "Variant",
+    "es": "Variante",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.delta",
+    "it": "Delta",
+    "en": "Delta",
+    "es": "Delta",
+    "occorrenze": 1,
+    "neutro": true
+  },
+  {
+    "chiave": "admin.caricamentoDettaglio",
+    "it": "Caricamento dettaglio...",
+    "en": "Loading details...",
+    "es": "Cargando el detalle...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.datiNonDisponibili",
+    "it": "Dati non disponibili",
+    "en": "Data not available",
+    "es": "Datos no disponibles",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.runReflection",
+    "it": "Run reflection",
+    "en": "Reflection runs",
+    "es": "Ejecuciones de reflexion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.scoreMedio",
+    "it": "Score medio",
+    "en": "Average score",
+    "es": "Puntuacion media",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.min",
+    "it": "Min",
+    "en": "Min",
+    "es": "Min",
+    "occorrenze": 1,
+    "neutro": true
+  },
+  {
+    "chiave": "admin.max",
+    "it": "Max",
+    "en": "Max",
+    "es": "Max",
+    "occorrenze": 1,
+    "neutro": true
+  },
+  {
+    "chiave": "admin.nessunDatoReflection",
+    "it": "Nessun dato reflection",
+    "en": "No reflection data",
+    "es": "Sin datos de reflexion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.motivazioneDecisione",
+    "it": "Motivazione decisione:",
+    "en": "Decision rationale:",
+    "es": "Motivo de la decision:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.subAgentKinds",
+    "it": "Sub-agent kinds",
+    "en": "Sub-agent kinds",
+    "es": "Tipos de subagente",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.tools",
+    "it": "Tools",
+    "en": "Tools",
+    "es": "Herramientas",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.timeout",
+    "it": "Timeout",
+    "en": "Timeout",
+    "es": "Tiempo limite",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.enabled",
+    "it": "Enabled",
+    "en": "Enabled",
+    "es": "Habilitado",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.edit",
+    "it": "Edit",
+    "en": "Edit",
+    "es": "Editar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.disable",
+    "it": "Disable",
+    "en": "Disable",
+    "es": "Deshabilitar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.description",
+    "it": "Description:",
+    "en": "Description:",
+    "es": "Descripcion:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.promptKey",
+    "it": "Prompt key:",
+    "en": "Prompt key:",
+    "es": "Clave del prompt:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.recentRuns",
+    "it": "Recent runs",
+    "en": "Recent runs",
+    "es": "Ejecuciones recientes",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.nessunaRunRecente",
+    "it": "Nessuna run recente.",
+    "en": "No recent runs.",
+    "es": "Ninguna ejecucion reciente.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.kindNonModificabile",
+    "it": "Kind — non modificabile",
+    "en": "Kind - not editable",
+    "es": "Tipo - no editable",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.descriptionUsatoPerAuto",
+    "it": "Description (usato per auto-delegation by description)",
+    "en": "Description (used for auto-delegation by description)",
+    "es": "Descripcion (usada para la auto-delegacion por descripcion)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.promptKeyDeveEsistere",
+    "it": "Prompt key (deve esistere in nexus_prompt_templates)",
+    "en": "Prompt key (must exist in nexus_prompt_templates)",
+    "es": "Clave del prompt (debe existir en nexus_prompt_templates)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.toolWhitelistCsv",
+    "it": "Tool whitelist (CSV)",
+    "en": "Tool whitelist (CSV)",
+    "es": "Lista blanca de herramientas (CSV)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.modelPurpose",
+    "it": "Model purpose",
+    "en": "Model purpose",
+    "es": "Proposito del modelo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.timeoutS",
+    "it": "Timeout (s)",
+    "en": "Timeout (s)",
+    "es": "Tiempo limite (s)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.isBackground",
+    "it": "Is background",
+    "en": "Is background",
+    "es": "Es en segundo plano",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.isEnabled",
+    "it": "Is enabled",
+    "en": "Is enabled",
+    "es": "Esta habilitado",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "admin.save",
+    "it": "Save",
+    "en": "Save",
+    "es": "Guardar",
+    "occorrenze": 1
+  }
+]

@@ -1,0 +1,639 @@
+[
+  {
+    "chiave": "panels.clear",
+    "it": "Clear",
+    "en": "Clear",
+    "es": "Limpiar",
+    "occorrenze": 3
+  },
+  {
+    "chiave": "panels.avviaTest",
+    "it": "Avvia test",
+    "en": "Run tests",
+    "es": "Ejecutar pruebas",
+    "occorrenze": 3
+  },
+  {
+    "chiave": "panels.inviaInChatUn",
+    "it": "Invia in chat un prompt per risolvere",
+    "en": "Send a prompt to the chat to fix it",
+    "es": "Envia un prompt al chat para resolverlo",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "panels.chiediANexus",
+    "it": "Chiedi a Nexus",
+    "en": "Ask Nexus",
+    "es": "Preguntar a Nexus",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "panels.abilitaPlaywright",
+    "it": "Abilita Playwright",
+    "en": "Enable Playwright",
+    "es": "Habilitar Playwright",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "panels.aggiornaStato",
+    "it": "Aggiorna stato",
+    "en": "Refresh status",
+    "es": "Actualizar estado",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "panels.ricaricaContenuto",
+    "it": "Ricarica contenuto",
+    "en": "Reload content",
+    "es": "Recargar contenido",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.cancellaContenuto",
+    "it": "Cancella contenuto",
+    "en": "Clear content",
+    "es": "Borrar contenido",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.riArmaLaRiparazione",
+    "it": "Ri-arma la riparazione automatica: la diagnosi torna in verifica e il presidio riavvia e controlla il servizio",
+    "en": "Re-arm automatic recovery: the diagnosis goes back to verification and the watchdog restarts and checks the service",
+    "es": "Rearma la reparacion automatica: el diagnostico vuelve a verificacion y el vigilante reinicia y comprueba el servicio",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.riprovaRiparazione",
+    "it": "Riprova riparazione",
+    "en": "Retry recovery",
+    "es": "Reintentar la reparacion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.terminaProcessoERilascia",
+    "it": "Termina processo e rilascia porta",
+    "en": "Kill the process and release the port",
+    "es": "Termina el proceso y libera el puerto",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.configuraPlaywrightNelProgetto",
+    "it": "Configura Playwright nel progetto tramite Nexus",
+    "en": "Set up Playwright in the project through Nexus",
+    "es": "Configura Playwright en el proyecto mediante Nexus",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.avviaITestPlaywright",
+    "it": "Avvia i test Playwright tramite Nexus",
+    "en": "Run the Playwright tests through Nexus",
+    "es": "Ejecuta las pruebas de Playwright mediante Nexus",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.chiediANexusDi",
+    "it": "Chiedi a Nexus di stabilizzare i test instabili (senza toccare la logica dell'app)",
+    "en": "Ask Nexus to stabilise the flaky tests (without touching the app logic)",
+    "es": "Pide a Nexus que estabilice las pruebas inestables (sin tocar la logica de la app)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.inviaQuestoRunFallito",
+    "it": "Invia questo run fallito alla chat di Nexus",
+    "en": "Send this failed run to the Nexus chat",
+    "es": "Envia esta ejecucion fallida al chat de Nexus",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.refresh",
+    "it": "Refresh",
+    "en": "Refresh",
+    "es": "Actualizar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.nessunProblemaAperto",
+    "it": "Nessun problema aperto.",
+    "en": "No open problems.",
+    "es": "Ningun problema abierto.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.nessunaPortaAttivaO",
+    "it": "Nessuna porta attiva o registrata per il progetto.",
+    "en": "No active or registered port for this project.",
+    "es": "Ningun puerto activo o registrado para el proyecto.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.pulisci",
+    "it": "Pulisci",
+    "en": "Clean up",
+    "es": "Limpiar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.playwrightConfiguratoPremi",
+    "it": "Playwright configurato. Premi",
+    "en": "Playwright configured. Press",
+    "es": "Playwright configurado. Pulsa",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.nessunRunPlaywrightDisponibile",
+    "it": "Nessun run Playwright disponibile. Premi",
+    "en": "No Playwright run available. Press",
+    "es": "No hay ejecuciones de Playwright. Pulsa",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.apriUnProgettoPer",
+    "it": "Apri un progetto per usare il pannello.",
+    "en": "Open a project to use this panel.",
+    "es": "Abre un proyecto para usar el panel.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.cancellaLog",
+    "it": "Cancella log",
+    "en": "Clear log",
+    "es": "Borrar el registro",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.nessunMonitorAttivoL",
+    "it": "Nessun monitor attivo. L'agente puo' crearne usando il tool",
+    "en": "No active monitor. The agent can create one with the tool",
+    "es": "Ningun monitor activo. El agente puede crear uno con la herramienta",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.nessunFlagImpostato",
+    "it": "Nessun flag impostato.",
+    "en": "No flag set.",
+    "es": "Ningun indicador establecido.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.segnaComeRisolto",
+    "it": "Segna come risolto",
+    "en": "Mark as resolved",
+    "es": "Marcar como resuelto",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.segnaComeFalsoPositivo",
+    "it": "Segna come falso positivo",
+    "en": "Mark as false positive",
+    "es": "Marcar como falso positivo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.fix",
+    "it": "Fix",
+    "en": "Fix",
+    "es": "Corregir",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.caricamento",
+    "it": "Caricamento...",
+    "en": "Loading...",
+    "es": "Cargando...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.nessunProblemaTrovatoIn",
+    "it": "Nessun problema trovato in questa categoria.",
+    "en": "No problems found in this category.",
+    "es": "No se han encontrado problemas en esta categoria.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.inviaIFindingsSelezionati",
+    "it": "Invia i findings selezionati in coda manuale",
+    "en": "Send the selected findings to the manual queue",
+    "es": "Envia los hallazgos seleccionados a la cola manual",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.inviaIFindingsSelezionati2",
+    "it": "Invia i findings selezionati in sequenza automatica",
+    "en": "Send the selected findings as an automatic sequence",
+    "es": "Envia los hallazgos seleccionados en secuencia automatica",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.fixSel",
+    "it": "Fix sel.",
+    "en": "Fix sel.",
+    "es": "Corregir sel.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.autoFixSel",
+    "it": "Auto Fix sel.",
+    "en": "Auto-fix sel.",
+    "es": "Autocorregir sel.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.fixSezione",
+    "it": "Fix sezione",
+    "en": "Fix section",
+    "es": "Corregir seccion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.autoFixSezione",
+    "it": "Auto Fix sezione",
+    "en": "Auto-fix section",
+    "es": "Autocorregir seccion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.inviaIProblemiHigh",
+    "it": "Invia i problemi HIGH un file alla volta — clicca 'File successivo' dopo ogni correzione",
+    "en": "Send HIGH problems one file at a time - click 'Next file' after each fix",
+    "es": "Envia los problemas ALTOS de uno en uno - pulsa 'Siguiente archivo' tras cada correccion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.inviaTuttiIFile",
+    "it": "Invia tutti i file HIGH in sequenza automatica — l'agente li corregge uno dopo l'altro senza intervento",
+    "en": "Send all HIGH files as an automatic sequence - the agent fixes them one after another without intervention",
+    "es": "Envia todos los archivos ALTOS en secuencia automatica - el agente los corrige uno tras otro sin intervencion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.continuaAutomaticamenteTuttiI",
+    "it": "Continua automaticamente tutti i file rimanenti nella coda",
+    "en": "Automatically continue with all remaining files in the queue",
+    "es": "Continua automaticamente con los archivos restantes de la cola",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.fermaAutoFix",
+    "it": "Ferma auto-fix",
+    "en": "Stop auto-fix",
+    "es": "Detener la autocorreccion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.azzeraLaCodaE",
+    "it": "Azzera la coda e ricomincia",
+    "en": "Clear the queue and start over",
+    "es": "Vacia la cola y empieza de nuevo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.analisiApprofonditaAiSu",
+    "it": "Analisi approfondita AI su tutti i file sorgente. Elaborazione in background.",
+    "en": "In-depth AI analysis of every source file. Runs in the background.",
+    "es": "Analisis profundo con IA de todos los archivos fuente. Se ejecuta en segundo plano.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.annullaResettaAnalisiBloccata",
+    "it": "Annulla / Resetta analisi bloccata",
+    "en": "Cancel / reset a stuck analysis",
+    "es": "Cancelar / reiniciar un analisis bloqueado",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.analisiAiCompletata",
+    "it": "Analisi AI completata",
+    "en": "AI analysis completed",
+    "es": "Analisis con IA completado",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.aggiornaStatoAnalisiAi",
+    "it": "Aggiorna stato analisi AI",
+    "en": "Refresh the AI analysis status",
+    "es": "Actualiza el estado del analisis con IA",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.autoFix",
+    "it": "Auto Fix",
+    "en": "Auto-fix",
+    "es": "Autocorregir",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.riprendiAuto",
+    "it": "Riprendi Auto",
+    "en": "Resume auto",
+    "es": "Reanudar auto",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.stop",
+    "it": "Stop",
+    "en": "Stop",
+    "es": "Detener",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.inviaIlTestoSelezionato",
+    "it": "Invia il testo selezionato alla chat per analisi",
+    "en": "Send the selected text to the chat for analysis",
+    "es": "Envia el texto seleccionado al chat para analizarlo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.causaRadice",
+    "it": "Causa radice: \\`",
+    "en": "Root cause: \\`",
+    "es": "Causa raiz: \\`",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.effettiACascata",
+    "it": "Effetti a cascata: \\`",
+    "en": "Knock-on effects: \\`",
+    "es": "Efectos en cascada: \\`",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.servizi",
+    "it": "Servizi",
+    "en": "Services",
+    "es": "Servicios",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.nessunEventoPerIl",
+    "it": "Nessun evento per il canale selezionato.",
+    "en": "No events for the selected channel.",
+    "es": "Ningun evento para el canal seleccionado.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.porteAllocateQuotaMax",
+    "it": "Porte allocate / quota max",
+    "en": "Allocated ports / max quota",
+    "es": "Puertos asignados / cuota maxima",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.containerAttiviQuotaMax",
+    "it": "Container attivi / quota max",
+    "en": "Active containers / max quota",
+    "es": "Contenedores activos / cuota maxima",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.azioniBloccateNelleUltime",
+    "it": "Azioni bloccate nelle ultime 24h",
+    "en": "Actions blocked in the last 24h",
+    "es": "Acciones bloqueadas en las ultimas 24 h",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.processoAvviatoDirettamenteFuori",
+    "it": "Processo avviato direttamente (fuori da systemd)",
+    "en": "Process started directly (outside systemd)",
+    "es": "Proceso iniciado directamente (fuera de systemd)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.serviziNexus",
+    "it": "Servizi Nexus",
+    "en": "Nexus services",
+    "es": "Servicios de Nexus",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.caricamentoServizi",
+    "it": "Caricamento servizi…",
+    "en": "Loading services…",
+    "es": "Cargando servicios…",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.aggiungiPortaManuale",
+    "it": "Aggiungi porta manuale",
+    "en": "Add a manual port",
+    "es": "Anadir un puerto manual",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.rilasciaPorta",
+    "it": "Rilascia porta",
+    "en": "Release port",
+    "es": "Liberar el puerto",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.porta",
+    "it": "Porta",
+    "en": "Port",
+    "es": "Puerto",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.etichetta",
+    "it": "Etichetta",
+    "en": "Label",
+    "es": "Etiqueta",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.nessunaPortaRegistrata",
+    "it": "Nessuna porta registrata",
+    "en": "No registered port",
+    "es": "Ningun puerto registrado",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.alloca",
+    "it": "Alloca",
+    "en": "Allocate",
+    "es": "Asignar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.serviziGestitiDelProgetto",
+    "it": "Servizi gestiti del progetto: avvio, arresto e riavvio dal pannello.",
+    "en": "Managed project services: start, stop and restart from the panel.",
+    "es": "Servicios gestionados del proyecto: iniciar, detener y reiniciar desde el panel.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.terminaProcessiSuPorte",
+    "it": "Termina processi su porte conflittuali (esclude i servizi del progetto)",
+    "en": "Kill processes on conflicting ports (project services excluded)",
+    "es": "Termina procesos en puertos en conflicto (excluye los servicios del proyecto)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.ignoraQuesteModificheAzzera",
+    "it": "Ignora queste modifiche (azzera contatore)",
+    "en": "Ignore these changes (reset the counter)",
+    "es": "Ignora estos cambios (reinicia el contador)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.inviaDiagnosiRapidaAlla",
+    "it": "Invia diagnosi rapida alla chat di Nexus",
+    "en": "Send a quick diagnosis to the Nexus chat",
+    "es": "Envia un diagnostico rapido al chat de Nexus",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.gestoreDeiServiziNon",
+    "it": "Gestore dei servizi non attivo",
+    "en": "Service manager not running",
+    "es": "El gestor de servicios no esta activo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.nessunServizioDelProgetto",
+    "it": "Nessun servizio del progetto configurato. Usa",
+    "en": "No project service configured. Use",
+    "es": "Ningun servicio del proyecto configurado. Usa",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.problemaRisoltoIlServizio",
+    "it": "Problema risolto — il servizio e' ora attivo.",
+    "en": "Problem solved - the service is now running.",
+    "es": "Problema resuelto: el servicio ya esta activo.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.chiudi",
+    "it": "Chiudi",
+    "en": "Close",
+    "es": "Cerrar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.sitoStaticoHtmlRilevato",
+    "it": "Sito statico HTML rilevato nella cartella del progetto, servito dal server integrato di Nexus.",
+    "en": "Static HTML site detected in the project folder, served by the built-in Nexus server.",
+    "es": "Sitio HTML estatico detectado en la carpeta del proyecto, servido por el servidor integrado de Nexus.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.apriIlSitoStatico",
+    "it": "Apri il sito statico in una nuova scheda del browser",
+    "en": "Open the static site in a new browser tab",
+    "es": "Abre el sitio estatico en una nueva pestana del navegador",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.sitoStaticoHtml",
+    "it": "Sito statico HTML",
+    "en": "Static HTML site",
+    "es": "Sitio HTML estatico",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.apriNelBrowser",
+    "it": "Apri nel browser",
+    "en": "Open in the browser",
+    "es": "Abrir en el navegador",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.servizio",
+    "it": "Servizio:",
+    "en": "Service:",
+    "es": "Servicio:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.descrizione",
+    "it": "Descrizione",
+    "en": "Description",
+    "es": "Descripcion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.variabiliAmbienteKeyValue",
+    "it": "Variabili ambiente (KEY=VALUE, una per riga)",
+    "en": "Environment variables (KEY=VALUE, one per line)",
+    "es": "Variables de entorno (KEY=VALUE, una por linea)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.ilServizioVerraRegistrato",
+    "it": "Il servizio verra' registrato e avviato.",
+    "en": "The service will be registered and started.",
+    "es": "El servicio se registrara y se iniciara.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.chiudiWizard",
+    "it": "Chiudi wizard",
+    "en": "Close the wizard",
+    "es": "Cerrar el asistente",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.wizardInstallaServiziDel",
+    "it": "Wizard — installa servizi del progetto",
+    "en": "Wizard - install project services",
+    "es": "Asistente - instalar servicios del proyecto",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.runConfigurations",
+    "it": "Run Configurations",
+    "en": "Run configurations",
+    "es": "Configuraciones de ejecucion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.analisiInCorso",
+    "it": "Analisi in corso…",
+    "en": "Analysis in progress…",
+    "es": "Analisis en curso…",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.scegliComeEseguire",
+    "it": "Scegli come eseguire",
+    "en": "Choose how to run it",
+    "es": "Elige como ejecutarlo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.ora",
+    "it": "Ora",
+    "en": "Time",
+    "es": "Hora",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.azione",
+    "it": "Azione",
+    "en": "Action",
+    "es": "Accion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.risorsa",
+    "it": "Risorsa",
+    "en": "Resource",
+    "es": "Recurso",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.esito",
+    "it": "Esito",
+    "en": "Outcome",
+    "es": "Resultado",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "panels.dettagli",
+    "it": "Dettagli",
+    "en": "Details",
+    "es": "Detalles",
+    "occorrenze": 1
+  }
+]

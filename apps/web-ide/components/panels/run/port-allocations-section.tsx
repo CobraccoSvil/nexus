@@ -4,6 +4,7 @@ import type { useThemeColors } from "../../../lib/theme";
 import type { PortAllocation } from "../../../lib/api-client";
 import { createPortAllocation, deletePortAllocation } from "../../../lib/api-client";
 import { hdrStyle } from "./shared";
+import { useI18n } from "../../../lib/i18n";
 
 interface PortAllocationsSectionProps {
   tc: ReturnType<typeof useThemeColors>;
@@ -36,6 +37,7 @@ export function PortAllocationsSection({
   setPortAllocMsg,
   fetchPortAllocations,
 }: PortAllocationsSectionProps) {
+  const { t } = useI18n();
   return (
     <>
       {/* B/B2: lista porte rilevate e allocate spostate nel pannello dedicato
@@ -49,12 +51,12 @@ export function PortAllocationsSection({
         <button
           onClick={() => setShowAddPort(!showAddPort)}
           style={{ background:"none",border:"none",color:tc.accent,cursor:"pointer",fontSize:12,fontWeight:600 }}
-          title="Aggiungi porta manuale"
+          title={t("panels.aggiungiPortaManuale")}
         >+</button>
       </div>
       <div style={{ padding:"6px 12px", borderBottom:`1px solid ${tc.border}` }}>
         {portAllocations.length === 0 && !showAddPort && (
-          <div style={{ fontSize:10,color:tc.textMuted,fontStyle:"italic" }}>Nessuna porta registrata</div>
+          <div style={{ fontSize:10,color:tc.textMuted,fontStyle:"italic" }}>{t("panels.nessunaPortaRegistrata")}</div>
         )}
         {portAllocations.map((a) => (
           <div key={a.id} style={{ display:"flex",alignItems:"center",gap:8,marginBottom:3 }}>
@@ -78,7 +80,7 @@ export function PortAllocationsSection({
                 }
               }}
               style={{ background:"none",border:"none",color:"#ef4444",cursor:"pointer",fontSize:12,padding:"0 2px",lineHeight:1 }}
-              title="Rilascia porta"
+              title={t("panels.rilasciaPorta")}
             >&times;</button>
           </div>
         ))}
@@ -88,14 +90,14 @@ export function PortAllocationsSection({
               type="number"
               min={1024}
               max={65535}
-              placeholder="Porta"
+              placeholder={t("panels.porta")}
               value={newPortValue}
               onChange={e => setNewPortValue(e.target.value)}
               style={{ width:64,fontSize:11,padding:"2px 4px",border:`1px solid ${tc.border}`,borderRadius:3,background:tc.bgCard,color:tc.text }}
             />
             <input
               type="text"
-              placeholder="Etichetta"
+              placeholder={t("panels.etichetta")}
               value={newPortLabel}
               onChange={e => setNewPortLabel(e.target.value)}
               style={{ flex:1,fontSize:11,padding:"2px 4px",border:`1px solid ${tc.border}`,borderRadius:3,background:tc.bgCard,color:tc.text }}
@@ -113,7 +115,7 @@ export function PortAllocationsSection({
                 }
               }}
               style={{ fontSize:10,padding:"2px 8px",background:tc.accent,color:"#fff",border:"none",borderRadius:3,cursor:"pointer" }}
-            >Alloca</button>
+            >{t("panels.alloca")}</button>
             <button
               onClick={() => { setShowAddPort(false); setNewPortValue(""); setNewPortLabel(""); setPortAllocMsg(""); }}
               style={{ background:"none",border:"none",color:tc.textMuted,cursor:"pointer",fontSize:12 }}

@@ -14,6 +14,7 @@ import {
 import { useThemeColors } from "../../lib/theme";
 import { useGlobalDialog } from "../global-dialog-provider";
 import type { UserProjectDetails } from "../../lib/api-client";
+import { useI18n } from "../../lib/i18n";
 
 interface Props {
   project: UserProjectDetails | null;
@@ -48,6 +49,7 @@ const OP_COLORS: Record<string, string> = {
 };
 
 export function MutationsSidebar({ project, onOpenInEditor }: Props) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const { confirmDialog, alertDialog } = useGlobalDialog();
   const [items, setItems] = useState<FileMutation[]>([]);
@@ -152,12 +154,12 @@ export function MutationsSidebar({ project, onOpenInEditor }: Props) {
         }}
       >
         <span style={{ fontSize: 12, fontWeight: 600, color: tc.text, textTransform: "uppercase", letterSpacing: 0.5 }}>
-          Modifiche
+          {t("sidebar.modifiche")}
         </span>
         <button
           type="button"
           onClick={() => void refresh()}
-          title="Aggiorna"
+          title={t("sidebar.aggiorna")}
           style={{ background: "transparent", border: "none", color: tc.textMuted, cursor: "pointer", fontSize: 14 }}
         >
           {"↻"}
@@ -166,7 +168,7 @@ export function MutationsSidebar({ project, onOpenInEditor }: Props) {
 
       <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
         {loading && (
-          <div style={{ padding: 12, color: tc.textMuted, fontSize: 12 }}>Caricamento...</div>
+          <div style={{ padding: 12, color: tc.textMuted, fontSize: 12 }}>{t("sidebar.caricamento")}</div>
         )}
         {error && (
           <div style={{ padding: 12, color: tc.error, fontSize: 12 }}>{error}</div>
@@ -225,7 +227,7 @@ export function MutationsSidebar({ project, onOpenInEditor }: Props) {
                     borderRadius: 4, padding: "3px 8px", cursor: "pointer",
                   }}
                 >
-                  Vedi diff
+                  {t("sidebar.vediDiff")}
                 </button>
                 {m.revertible && !isReverted && (
                   <button
@@ -261,6 +263,7 @@ export function MutationsSidebar({ project, onOpenInEditor }: Props) {
 }
 
 function DiffModal({ detail, onClose }: { detail: MutationDetail; onClose: () => void }) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const truncatedBefore = detail.before_size != null && detail.before_content == null;
   const truncatedAfter = detail.after_size != null && detail.after_content == null;
@@ -292,8 +295,8 @@ function DiffModal({ detail, onClose }: { detail: MutationDetail; onClose: () =>
           >×</button>
         </div>
         <div style={{ flex: 1, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, padding: 8, overflow: "hidden", minHeight: 0 }}>
-          <DiffPane title="Prima" content={detail.before_content} truncated={truncatedBefore} tc={tc} />
-          <DiffPane title="Dopo" content={detail.after_content} truncated={truncatedAfter} tc={tc} />
+          <DiffPane title={t("sidebar.prima")} content={detail.before_content} truncated={truncatedBefore} tc={tc} />
+          <DiffPane title={t("sidebar.dopo")} content={detail.after_content} truncated={truncatedAfter} tc={tc} />
         </div>
       </div>
     </div>

@@ -24,6 +24,7 @@ import type {
 import { subscribePlaywrightRunStream } from "../../lib/api-client";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useGlobalDialog } from "../global-dialog-provider";
+import { useI18n } from "../../lib/i18n";
 
 export type PanelTab =
   | "problems"
@@ -163,6 +164,7 @@ export function BottomPanelManager({
   agentRunEndSignal,
   onSelectPanelTab,
 }: BottomPanelManagerProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const { confirmDialog } = useGlobalDialog();
 
@@ -206,7 +208,7 @@ export function BottomPanelManager({
         {onRefreshPanel && (
           <button
             onClick={() => onRefreshPanel(tab)}
-            title="Ricarica contenuto"
+            title={t("panels.ricaricaContenuto")}
             style={{
               background: "none",
               border: `1px solid ${tc.border}`,
@@ -218,12 +220,12 @@ export function BottomPanelManager({
               marginRight: 6,
             }}
           >
-            Refresh
+            {t("panels.refresh")}
           </button>
         )}
         <button
           onClick={() => onClearPanel?.(tab)}
-          title="Cancella contenuto"
+          title={t("panels.cancellaContenuto")}
           style={{
             background: "none",
             border: `1px solid ${tc.border}`,
@@ -235,7 +237,7 @@ export function BottomPanelManager({
           }}
           disabled={!hasContent}
         >
-          Clear
+          {t("panels.clear")}
         </button>
       </div>
     ) : null;
@@ -288,7 +290,7 @@ export function BottomPanelManager({
         ) : null}
         <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: 10, minHeight: 0, overflow: "auto", flex: 1 }}>
           {problemItems.length === 0 ? (
-            <div style={{ color: tc.textMuted }}>Nessun problema aperto.</div>
+            <div style={{ color: tc.textMuted }}>{t("panels.nessunProblemaAperto")}</div>
           ) : (
             problemItems.map((item) => (
               <div
@@ -338,7 +340,7 @@ export function BottomPanelManager({
                   <button
                     type="button"
                     onClick={() => onRetryRemediation(item)}
-                    title="Ri-arma la riparazione automatica: la diagnosi torna in verifica e il presidio riavvia e controlla il servizio"
+                    title={t("panels.riArmaLaRiparazione")}
                     style={{
                       flexShrink: 0,
                       marginLeft: 2,
@@ -354,7 +356,7 @@ export function BottomPanelManager({
                       height: 16,
                       fontWeight: 600,
                     }}
-                    aria-label="Riprova riparazione"
+                    aria-label={t("panels.riprovaRiparazione")}
                   >
                     ↻ riprova
                   </button>
@@ -363,7 +365,7 @@ export function BottomPanelManager({
                   <button
                     type="button"
                     onClick={() => onSendProblemToChat(item)}
-                    title="Invia in chat un prompt per risolvere"
+                    title={t("panels.inviaInChatUn")}
                     style={{
                       flexShrink: 0,
                       marginLeft: 2,
@@ -379,7 +381,7 @@ export function BottomPanelManager({
                       height: 16,
                       fontWeight: 600,
                     }}
-                    aria-label="Chiedi a Nexus"
+                    aria-label={t("panels.chiediANexus")}
                   >
                     ↗ chat
                   </button>
@@ -389,7 +391,7 @@ export function BottomPanelManager({
                     onClick={() => {
                       onSendToChat(promptFromProblem(item));
                     }}
-                    title="Invia in chat un prompt per risolvere"
+                    title={t("panels.inviaInChatUn")}
                     style={{
                       flexShrink: 0,
                       marginLeft: 2,
@@ -405,7 +407,7 @@ export function BottomPanelManager({
                       height: 16,
                       fontWeight: 600,
                     }}
-                    aria-label="Chiedi a Nexus"
+                    aria-label={t("panels.chiediANexus")}
                   >
                     ↗ chat
                   </button>
@@ -455,7 +457,7 @@ export function BottomPanelManager({
         {clearBar("ports", ports.length > 0)}
         <div style={{ padding: 12, overflow: "auto", flex: 1, minHeight: 0 }}>
           {ports.length === 0 ? (
-            <div style={{ color: tc.textMuted }}>Nessuna porta attiva o registrata per il progetto.</div>
+            <div style={{ color: tc.textMuted }}>{t("panels.nessunaPortaAttivaO")}</div>
           ) : (
             ports.map((port, index) => {
               // Vista unificata (regola L): una porta puo' essere in ascolto
@@ -521,7 +523,7 @@ export function BottomPanelManager({
                           void onKillPort(portNum);
                         }
                       }}
-                      title="Termina processo e rilascia porta"
+                      title={t("panels.terminaProcessoERilascia")}
                       style={{
                         background: "rgba(239,68,68,0.85)",
                         color: "#fff",
@@ -604,32 +606,32 @@ export function BottomPanelManager({
             {onSendToChat && !playwrightConfigured && (
               <button
                 onClick={handleEnablePlaywright}
-                title="Configura Playwright nel progetto tramite Nexus"
+                title={t("panels.configuraPlaywrightNelProgetto")}
                 style={{
                   background: "#6366f1", color: "#fff", border: "none", borderRadius: 4,
                   padding: "2px 10px", fontSize: 11, cursor: "pointer",
                   display: "flex", alignItems: "center", gap: 4,
                 }}
               >
-                Abilita Playwright
+                {t("panels.abilitaPlaywright")}
               </button>
             )}
             {onSendToChat && (
               <button
                 onClick={handleRunPlaywright}
-                title="Avvia i test Playwright tramite Nexus"
+                title={t("panels.avviaITestPlaywright")}
                 style={{
                   background: "#10b981", color: "#fff", border: "none", borderRadius: 4,
                   padding: "2px 10px", fontSize: 11, cursor: "pointer",
                   display: "flex", alignItems: "center", gap: 4,
                 }}
               >
-                Avvia test
+                {t("panels.avviaTest")}
               </button>
             )}
             {playwrightRuns.length > 0 && (
               <button onClick={() => onClearPanel?.("playwright")} style={listRowButton(tc)}>
-                Pulisci
+                {t("panels.pulisci")}
               </button>
             )}
           </div>
@@ -638,9 +640,9 @@ export function BottomPanelManager({
           {playwrightRuns.length === 0 ? (
             <div style={{ color: tc.textMuted, fontSize: 12 }}>
               {playwrightConfigured ? (
-                <>Playwright configurato. Premi <strong>Avvia test</strong> per eseguire i test e2e.</>
+                <>{t("panels.playwrightConfiguratoPremi")} <strong>{t("panels.avviaTest")}</strong> per eseguire i test e2e.</>
               ) : (
-                <>Nessun run Playwright disponibile. Premi <strong>Abilita Playwright</strong> per configurare il framework di test, poi <strong>Avvia test</strong> per eseguirli.</>
+                <>{t("panels.nessunRunPlaywrightDisponibile")} <strong>{t("panels.abilitaPlaywright")}</strong> per configurare il framework di test, poi <strong>{t("panels.avviaTest")}</strong> per eseguirli.</>
               )}
             </div>
           ) : (
@@ -767,7 +769,7 @@ export function BottomPanelManager({
                       onClick={() => {
                         onSendToChat(promptFromFlakyPlaywrightRun(run));
                       }}
-                      title="Chiedi a Nexus di stabilizzare i test instabili (senza toccare la logica dell'app)"
+                      title={t("panels.chiediANexusDi")}
                       style={{
                         background: "rgba(168,85,247,0.85)",
                         color: "#fff",
@@ -792,7 +794,7 @@ export function BottomPanelManager({
                       onClick={() => {
                         onSendToChat(promptFromPlaywrightRun(run));
                       }}
-                      title="Invia questo run fallito alla chat di Nexus"
+                      title={t("panels.inviaQuestoRunFallito")}
                       style={{
                         background: "rgba(239,68,68,0.85)",
                         color: "#fff",
@@ -831,7 +833,7 @@ export function BottomPanelManager({
         minHeight: 0,
       }}>
         {!project ? (
-          <div style={{ padding: 12, color: tc.textMuted }}>Apri un progetto per usare il pannello.</div>
+          <div style={{ padding: 12, color: tc.textMuted }}>{t("panels.apriUnProgettoPer")}</div>
         ) : (
           <OptimizationPanel
             projectId={project.id}

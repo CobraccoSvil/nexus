@@ -4,6 +4,7 @@ import type { QualityFinding } from "../../../lib/api-client";
 import type { Tc, FixQueueItem } from "./types";
 import { FindingsSelectionBar } from "./FindingsSelectionBar";
 import { FindingItem } from "./FindingItem";
+import { useI18n } from "../../../lib/i18n";
 
 interface FindingsListProps {
   tc: Tc;
@@ -40,6 +41,7 @@ export function FindingsList({
   handleMarkFixed,
   markFalsePositive,
 }: FindingsListProps) {
+  const { t } = useI18n();
   return (
     <div style={{ flex: 1, minWidth: 0, overflowY: "auto", padding: "4px 0" }}>
 
@@ -59,10 +61,10 @@ export function FindingsList({
         />
       )}
 
-      {loading && <div style={{ padding: 12, color: tc.textMuted, fontSize: 12 }}>Caricamento...</div>}
+      {loading && <div style={{ padding: 12, color: tc.textMuted, fontSize: 12 }}>{t("panels.caricamento")}</div>}
       {!loading && visibleFindings.length === 0 && (
         <div style={{ padding: 12, color: tc.textMuted, fontSize: 12 }}>
-          Nessun problema trovato in questa categoria.
+          {t("panels.nessunProblemaTrovatoIn")}
         </div>
       )}
       {visibleFindings.map(finding => (

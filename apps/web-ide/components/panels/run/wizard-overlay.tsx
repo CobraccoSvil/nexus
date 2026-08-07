@@ -3,6 +3,7 @@
 import type { useThemeColors } from "../../../lib/theme";
 import type { ServiceWizardSuggestion } from "../../../lib/api-client";
 import { KIND_ICON, detectRunMode } from "./shared";
+import { useI18n } from "../../../lib/i18n";
 
 interface WizardOverlayProps {
   tc: ReturnType<typeof useThemeColors>;
@@ -21,6 +22,7 @@ export function WizardOverlay({
   setWizardOpen,
   setInstallingUnit,
 }: WizardOverlayProps) {
+  const { t } = useI18n();
   return (
     /* ════════════════════════════════ C: WIZARD ═══════════════════════ */
     /* Overlay assoluto: copre l'intero pannello run quando aperto.
@@ -50,15 +52,15 @@ export function WizardOverlay({
         boxShadow: "0 8px 24px rgba(0,0,0,0.3)",
       }}>
       <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 14px",borderBottom:`1px solid ${tc.border}`,background:tc.bgHeader,borderRadius:"6px 6px 0 0" }}>
-        <div style={{ fontSize:12,fontWeight:600,color:tc.text }}>Wizard — installa servizi del progetto</div>
-        <button onClick={()=>setWizardOpen(false)} title="Chiudi wizard" style={{ background:"none",border:"none",color:tc.textMuted,cursor:"pointer",fontSize:18,padding:"0 4px",lineHeight:1 }}>✕</button>
+        <div style={{ fontSize:12,fontWeight:600,color:tc.text }}>{t("panels.wizardInstallaServiziDel")}</div>
+        <button onClick={()=>setWizardOpen(false)} title={t("panels.chiudiWizard")} style={{ background:"none",border:"none",color:tc.textMuted,cursor:"pointer",fontSize:18,padding:"0 4px",lineHeight:1 }}>✕</button>
       </div>
       <div style={{ flex:1, overflowY:"auto", padding:"8px 12px" }}>
       <div style={{ fontSize:10,color:tc.textMuted,marginBottom:8,padding:"6px 8px",background:tc.bgCard,border:`1px solid ${tc.border}`,borderRadius:4 }}>
-        Installa i servizi gestiti del progetto per avviarli automaticamente. Per comandi <em>on-demand</em> (script di build, test, dev manuale) usa invece la sezione <strong>Run Configurations</strong> nella sidebar a sinistra.
+        Installa i servizi gestiti del progetto per avviarli automaticamente. Per comandi <em>on-demand</em> (script di build, test, dev manuale) usa invece la sezione <strong>{t("panels.runConfigurations")}</strong> nella sidebar a sinistra.
       </div>
 
-      {wizardLoading && <div style={{ color:tc.textMuted,fontSize:12 }}>Analisi in corso…</div>}
+      {wizardLoading && <div style={{ color:tc.textMuted,fontSize:12 }}>{t("panels.analisiInCorso")}</div>}
       {wizardMsg && <div style={{ fontSize:11,color:wizardMsg.startsWith("✓")?"#22c55e":tc.textMuted,marginBottom:8 }}>{wizardMsg}</div>}
 
       {/* Raggruppa i suggerimenti per "short" (nome del servizio): cosi' le varianti
@@ -95,7 +97,7 @@ export function WizardOverlay({
                   fontSize: 10, color: tc.textMuted, padding: "4px 10px 0",
                   fontStyle: "italic",
                 }}>
-                  Scegli come eseguire <strong>{short}</strong>:
+                  {t("panels.scegliComeEseguire")} <strong>{short}</strong>:
                 </div>
               )}
               {visible.map(svc => {

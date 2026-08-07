@@ -1,0 +1,402 @@
+[
+  {
+    "chiave": "git.branch",
+    "it": "Branch",
+    "en": "Branch",
+    "es": "Rama",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "git.aggiornamentoStatoGithub",
+    "it": "Aggiornamento stato GitHub...",
+    "en": "Refreshing GitHub status...",
+    "es": "Actualizando el estado de GitHub...",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "git.createPr",
+    "it": "Create PR",
+    "en": "Create PR",
+    "es": "Crear PR",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "git.nuovoBranch",
+    "it": "Nuovo branch",
+    "en": "New branch",
+    "es": "Nueva rama",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.creaBranchCreaE",
+    "it": "Crea branch — crea e passa al nuovo branch",
+    "en": "Create branch - create it and switch to it",
+    "es": "Crear rama - la crea y cambia a ella",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.logRecente",
+    "it": "Log recente",
+    "en": "Recent log",
+    "es": "Registro reciente",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.analisiAiInCorso",
+    "it": "Analisi AI in corso...",
+    "en": "AI analysis in progress...",
+    "es": "Analisis con IA en curso...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.analisiAiDelProgetto",
+    "it": "Analisi AI del progetto",
+    "en": "AI analysis of the project",
+    "es": "Analisis del proyecto con IA",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.architettura",
+    "it": "Architettura:",
+    "en": "Architecture:",
+    "es": "Arquitectura:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.serviziEModalitaDi",
+    "it": "Servizi e modalita' di esecuzione",
+    "en": "Services and run modes",
+    "es": "Servicios y modos de ejecucion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.azioniSuggerite",
+    "it": "Azioni suggerite",
+    "en": "Suggested actions",
+    "es": "Acciones sugeridas",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.nomeRepositoryAlfanumerico",
+    "it": "Nome repository (alfanumerico, '-', '_', '.')",
+    "en": "Repository name (alphanumeric, '-', '_', '.')",
+    "es": "Nombre del repositorio (alfanumerico, '-', '_', '.')",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.descrizioneOpzionale",
+    "it": "Descrizione (opzionale)",
+    "en": "Description (optional)",
+    "es": "Descripcion (opcional)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.repositoryPrivato",
+    "it": "Repository privato",
+    "en": "Private repository",
+    "es": "Repositorio privado",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.annulla",
+    "it": "Annulla",
+    "en": "Cancel",
+    "es": "Cancelar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.scollega",
+    "it": "Scollega",
+    "en": "Disconnect",
+    "es": "Desvincular",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.cercaRepository",
+    "it": "Cerca repository...",
+    "en": "Search repositories...",
+    "es": "Buscar repositorios...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.pubblicaProgettoSuGithub",
+    "it": "Pubblica progetto su GitHub",
+    "en": "Publish the project to GitHub",
+    "es": "Publicar el proyecto en GitHub",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.pubblicaSuGithub",
+    "it": "Pubblica su GitHub",
+    "en": "Publish to GitHub",
+    "es": "Publicar en GitHub",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.importaRepositoryGithub",
+    "it": "Importa Repository GitHub",
+    "en": "Import a GitHub repository",
+    "es": "Importar un repositorio de GitHub",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.aggiornaLista",
+    "it": "Aggiorna lista",
+    "en": "Refresh the list",
+    "es": "Actualizar la lista",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.nessunRepositoryDisponibile",
+    "it": "Nessun repository disponibile",
+    "en": "No repository available",
+    "es": "Ningun repositorio disponible",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.clonaRepositoryNelProgetto",
+    "it": "Clona repository nel progetto",
+    "en": "Clone the repository into the project",
+    "es": "Clonar el repositorio en el proyecto",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.collegaGithubPerVisualizzare",
+    "it": "Collega GitHub per visualizzare i repository disponibili.",
+    "en": "Connect GitHub to see the available repositories.",
+    "es": "Conecta GitHub para ver los repositorios disponibles.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.statoProgettoNexus",
+    "it": "Stato Progetto Nexus",
+    "en": "Nexus project status",
+    "es": "Estado del proyecto Nexus",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.puoiInizializzareIlProgetto",
+    "it": "Puoi inizializzare il progetto in qualsiasi momento.",
+    "en": "You can initialise the project at any time.",
+    "es": "Puedes inicializar el proyecto en cualquier momento.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.pullDalRemoteCorrente",
+    "it": "Pull dal remote corrente",
+    "en": "Pull from the current remote",
+    "es": "Traer desde el remoto actual",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.pushVersoIlRemote",
+    "it": "Push verso il remote corrente",
+    "en": "Push to the current remote",
+    "es": "Enviar al remoto actual",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.creaUnNuovoRepository",
+    "it": "Crea un nuovo repository GitHub e collega come origin",
+    "en": "Create a new GitHub repository and link it as origin",
+    "es": "Crea un repositorio de GitHub nuevo y lo enlaza como origin",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.creaRepositoryGithub",
+    "it": "Crea repository GitHub",
+    "en": "Create a GitHub repository",
+    "es": "Crear un repositorio de GitHub",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.titoloPullRequest",
+    "it": "Titolo pull request",
+    "en": "Pull request title",
+    "es": "Titulo de la pull request",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.descrizioneOpzionale2",
+    "it": "Descrizione opzionale",
+    "en": "Optional description",
+    "es": "Descripcion opcional",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.remote",
+    "it": "Remote",
+    "en": "Remote",
+    "es": "Remoto",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.pull",
+    "it": "Pull",
+    "en": "Pull",
+    "es": "Traer",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.push",
+    "it": "Push",
+    "en": "Push",
+    "es": "Enviar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.publishBranch",
+    "it": "Publish Branch",
+    "en": "Publish branch",
+    "es": "Publicar la rama",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.openPr",
+    "it": "Open PR",
+    "en": "Open PR",
+    "es": "Abrir PR",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.creaRepoSuGithub",
+    "it": "Crea repo su GitHub",
+    "en": "Create a repo on GitHub",
+    "es": "Crear un repo en GitHub",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.stageAllAggiungiTutte",
+    "it": "Stage all — aggiungi tutte le modifiche",
+    "en": "Stage all - add every change",
+    "es": "Preparar todo - anade todos los cambios",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.unstageAllRimuoviTutte",
+    "it": "Unstage all — rimuovi tutte le modifiche dallo stage",
+    "en": "Unstage all - remove every change from the stage",
+    "es": "Quitar todo - saca todos los cambios del area de preparacion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.messaggioCommit",
+    "it": "Messaggio commit",
+    "en": "Commit message",
+    "es": "Mensaje del commit",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.commitSalvaLeModifiche",
+    "it": "Commit — salva le modifiche staged",
+    "en": "Commit - save the staged changes",
+    "es": "Commit - guarda los cambios preparados",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.gestioneRepository",
+    "it": "Gestione Repository",
+    "en": "Repository management",
+    "es": "Gestion del repositorio",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.stageTutto",
+    "it": "Stage tutto",
+    "en": "Stage all",
+    "es": "Preparar todo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.rimuoviStage",
+    "it": "Rimuovi stage",
+    "en": "Unstage",
+    "es": "Quitar de preparacion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.commit",
+    "it": "Commit",
+    "en": "Commit",
+    "es": "Commit",
+    "occorrenze": 1,
+    "neutro": true
+  },
+  {
+    "chiave": "git.apriUnProgettoPer",
+    "it": "Apri un progetto per usare Source Control.",
+    "en": "Open a project to use source control.",
+    "es": "Abre un proyecto para usar el control de versiones.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.creaUnBranchNuovo",
+    "it": "Crea un branch nuovo oppure cambia branch corrente.",
+    "en": "Create a new branch or switch the current one.",
+    "es": "Crea una rama nueva o cambia la actual.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.staging",
+    "it": "Staging",
+    "en": "Staging",
+    "es": "Preparacion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.controllaFileStagedUnstaged",
+    "it": "Controlla file staged, unstaged e non tracciati.",
+    "en": "Check staged, unstaged and untracked files.",
+    "es": "Revisa los archivos preparados, sin preparar y sin seguimiento.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.cronologiaCommit",
+    "it": "Cronologia Commit",
+    "en": "Commit history",
+    "es": "Historial de commits",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.hunkPrecedente",
+    "it": "Hunk precedente",
+    "en": "Previous hunk",
+    "es": "Fragmento anterior",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.hunkSuccessivo",
+    "it": "Hunk successivo",
+    "en": "Next hunk",
+    "es": "Fragmento siguiente",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.vistaSplitColonneAffiancate",
+    "it": "Vista split — colonne affiancate",
+    "en": "Split view - side-by-side columns",
+    "es": "Vista dividida - columnas en paralelo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.vistaUnificataSequenziale",
+    "it": "Vista unificata — sequenziale",
+    "en": "Unified view - sequential",
+    "es": "Vista unificada - secuencial",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.modifiche",
+    "it": "Modifiche",
+    "en": "Changes",
+    "es": "Cambios",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "git.nessunaModifica",
+    "it": "Nessuna modifica",
+    "en": "No changes",
+    "es": "Sin cambios",
+    "occorrenze": 1
+  }
+]

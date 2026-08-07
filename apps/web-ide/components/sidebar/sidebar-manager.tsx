@@ -18,6 +18,7 @@ import type {
   UserProjectDetails,
   WorkspaceTreeNode,
 } from "../../lib/api-client";
+import { useI18n } from "../../lib/i18n";
 
 export type SidebarView =
   | "explorer"
@@ -86,20 +87,21 @@ export function SidebarManager({
   onFileDeleted,
   onFileRenamed,
 }: SidebarManagerProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
 
   const renderOpenEditors = () => (
     <div style={{ borderBottom: `1px solid ${tc.border}` }}>
       <ViewHeader
-        title="Open Editors"
+        title={t("sidebar.openEditors")}
         subtitle={`${allOpenTabs.length} file`}
         actions={
           <button
             type="button"
             onClick={onSaveActive}
             disabled={!activeEditorTab || !activeEditorTab.dirty || !project?.canWrite}
-            title="Salva editor attivo"
-            aria-label="Salva editor attivo"
+            title={t("sidebar.salvaEditorAttivo")}
+            aria-label={t("sidebar.salvaEditorAttivo")}
             style={iconButton(tc, !activeEditorTab || !activeEditorTab.dirty || !project?.canWrite)}
           >
             💾
@@ -109,7 +111,7 @@ export function SidebarManager({
       <div style={{ display: "flex", flexDirection: "column", gap: 4, padding: 8 }}>
         {allOpenTabs.length === 0 ? (
           <div style={{ color: tc.textMuted, fontSize: 12 }}>
-            Nessun editor aperto.
+            {t("sidebar.nessunEditorAperto")}
           </div>
         ) : (
           allOpenTabs.map((tab) => {
@@ -168,15 +170,15 @@ export function SidebarManager({
       <>
         {renderOpenEditors()}
         <ViewHeader
-          title="Explorer"
+          title={t("sidebar.explorer")}
           subtitle={project?.rootPath ? shortenAbsolutePath(project.rootPath) : "Apri un progetto"}
           actions={
             <div style={{ display: "flex", gap: 6 }}>
               <button
                 type="button"
                 onClick={() => onCreateEntry("file")}
-                title="Nuovo file"
-                aria-label="Nuovo file"
+                title={t("sidebar.nuovoFile")}
+                aria-label={t("sidebar.nuovoFile")}
                 style={iconButton(tc, !project?.canWrite)}
               >
                 📄
@@ -184,8 +186,8 @@ export function SidebarManager({
               <button
                 type="button"
                 onClick={() => onCreateEntry("directory")}
-                title="Nuova cartella"
-                aria-label="Nuova cartella"
+                title={t("sidebar.nuovaCartella")}
+                aria-label={t("sidebar.nuovaCartella")}
                 style={iconButton(tc, !project?.canWrite)}
               >
                 📁
@@ -220,7 +222,7 @@ export function SidebarManager({
   if (activeSidebarView === "search") {
     return (
       <>
-        <ViewHeader title="Search" subtitle="Ricerca nel progetto" />
+        <ViewHeader title={t("sidebar.search")} subtitle={t("sidebar.ricercaNelProgetto")} />
         <div style={{ padding: 10, borderBottom: `1px solid ${tc.border}` }}>
           <div style={{ display: "flex", gap: 8 }}>
             <input
@@ -229,14 +231,14 @@ export function SidebarManager({
               onKeyDown={(e) => {
                 if (e.key === "Enter") onSearch();
               }}
-              placeholder="Cerca testo nel workspace"
+              placeholder={t("sidebar.cercaTestoNelWorkspace")}
               style={inputStyle(tc)}
             />
             <button
               type="button"
               onClick={onSearch}
-              title="Avvia ricerca"
-              aria-label="Avvia ricerca"
+              title={t("sidebar.avviaRicerca")}
+              aria-label={t("sidebar.avviaRicerca")}
               style={iconButton(tc, searchBusy || !searchQuery.trim())}
             >
               🔎
@@ -245,10 +247,10 @@ export function SidebarManager({
         </div>
         <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 8 }}>
           {searchBusy ? (
-            <div className="text-muted">Ricerca in corso...</div>
+            <div className="text-muted">{t("sidebar.ricercaInCorso")}</div>
           ) : searchResults.length === 0 ? (
             <div style={{ color: tc.textMuted, fontSize: 12 }}>
-              Nessun risultato. Inserisci un termine e avvia la ricerca.
+              {t("sidebar.nessunRisultatoInserisciUn")}
             </div>
           ) : (
             searchResults.map((item) => (
@@ -274,7 +276,7 @@ export function SidebarManager({
   if (activeSidebarView === "source-control") {
     return (
       <>
-        <ViewHeader title="Source Control" subtitle={currentBranch} />
+        <ViewHeader title={t("sidebar.sourceControl")} subtitle={currentBranch} />
         <div
           style={{ flex: 1, minHeight: 0, overflowX: "hidden", overflowY: "auto", padding: 8, minWidth: 0 }}
         >
@@ -342,9 +344,9 @@ export function SidebarManager({
             textOverflow: "ellipsis",
             whiteSpace: "nowrap",
           }}
-          title="Apri la Knowledge Base unificata a tutto schermo"
+          title={t("sidebar.apriLaKnowledgeBase")}
         >
-          Knowledge Base unificata · <strong>Apri a schermo intero →</strong>
+          {t("sidebar.knowledgeBaseUnificata")} <strong>{t("sidebar.apriASchermoIntero")}</strong>
         </a>
         <KnowledgeNavigator projectId={project.id} />
       </div>
@@ -363,7 +365,7 @@ export function SidebarManager({
   if (activeSidebarView === "server-monitor") {
     return (
       <>
-        <ViewHeader title="Monitor" subtitle="Risorse server · ogni 2s" />
+        <ViewHeader title={t("sidebar.monitor")} subtitle={t("sidebar.risorseServerOgni2s")} />
         <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
           <ServerMonitorPanel />
         </div>

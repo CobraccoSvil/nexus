@@ -1,0 +1,452 @@
+[
+  {
+    "chiave": "sidebar.elimina",
+    "it": "Elimina",
+    "en": "Delete",
+    "es": "Eliminar",
+    "occorrenze": 3
+  },
+  {
+    "chiave": "sidebar.aggiorna",
+    "it": "Aggiorna",
+    "en": "Refresh",
+    "es": "Actualizar",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "sidebar.caricamento",
+    "it": "Caricamento...",
+    "en": "Loading...",
+    "es": "Cargando...",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "sidebar.annulla",
+    "it": "Annulla",
+    "en": "Cancel",
+    "es": "Cancelar",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "sidebar.utilizzo",
+    "it": "Utilizzo",
+    "en": "Usage",
+    "es": "Uso",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "sidebar.salvaEditorAttivo",
+    "it": "Salva editor attivo",
+    "en": "Save the active editor",
+    "es": "Guardar el editor activo",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "sidebar.nuovoFile",
+    "it": "Nuovo file",
+    "en": "New file",
+    "es": "Nuevo archivo",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "sidebar.nuovaCartella",
+    "it": "Nuova cartella",
+    "en": "New folder",
+    "es": "Nueva carpeta",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "sidebar.avviaRicerca",
+    "it": "Avvia ricerca",
+    "en": "Start search",
+    "es": "Iniciar la busqueda",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "sidebar.generaDocumentazione",
+    "it": "Genera documentazione",
+    "en": "Generate documentation",
+    "es": "Generar documentacion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.apriNellEditor",
+    "it": "Apri nell'editor",
+    "en": "Open in the editor",
+    "es": "Abrir en el editor",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.downloadDocx",
+    "it": "Download .docx",
+    "en": "Download .docx",
+    "es": "Descargar .docx",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.rigenera",
+    "it": "Rigenera",
+    "en": "Regenerate",
+    "es": "Regenerar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.documenti",
+    "it": "Documenti",
+    "en": "Documents",
+    "es": "Documentos",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.apriUnProgettoPer",
+    "it": "Apri un progetto per generare la documentazione.",
+    "en": "Open a project to generate documentation.",
+    "es": "Abre un proyecto para generar la documentacion.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.nessunDocumentoGenerato",
+    "it": "Nessun documento generato.",
+    "en": "No document generated.",
+    "es": "Ningun documento generado.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.usaIlTasto",
+    "it": "Usa il tasto",
+    "en": "Use the button",
+    "es": "Usa el boton",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.apri",
+    "it": "Apri",
+    "en": "Open",
+    "es": "Abrir",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.download",
+    "it": "Download",
+    "en": "Download",
+    "es": "Descargar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.scriptComandiUnaTantum",
+    "it": "Script & comandi una-tantum del progetto (build, test, lint, migrazioni, ecc.). Gli script che corrispondono a servizi del progetto installati e quelli di stop/kill vengono nascosti automaticamente — clicca '👁' per mostrarli.",
+    "en": "One-off project scripts and commands (build, test, lint, migrations...). Scripts matching installed project services and stop/kill ones are hidden automatically - click '👁' to show them.",
+    "es": "Scripts y comandos puntuales del proyecto (build, test, lint, migraciones...). Los scripts que corresponden a servicios instalados y los de parada se ocultan automaticamente - pulsa '👁' para mostrarlos.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.rilevaConfigurazioniDiAvvio",
+    "it": "Rileva configurazioni di avvio dai file del progetto (usa cache se disponibile)",
+    "en": "Detect run configurations from the project files (uses the cache when available)",
+    "es": "Detecta configuraciones de arranque desde los archivos del proyecto (usa la cache si esta disponible)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.forzaRiscansioneDelFilesystem",
+    "it": "Forza riscansione del filesystem (ignora cache)",
+    "en": "Force a filesystem rescan (ignores the cache)",
+    "es": "Fuerza un nuevo escaneo del sistema de archivos (ignora la cache)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.nuovaConfigurazioneManuale",
+    "it": "Nuova configurazione manuale",
+    "en": "New manual configuration",
+    "es": "Nueva configuracion manual",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.selezionaTutti",
+    "it": "Seleziona tutti",
+    "en": "Select all",
+    "es": "Seleccionar todo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.soloEssenziali",
+    "it": "Solo essenziali",
+    "en": "Essential only",
+    "es": "Solo lo esencial",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.nessuno",
+    "it": "Nessuno",
+    "en": "None",
+    "es": "Ninguno",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.essenzialePerLAvvio",
+    "it": "Essenziale per l'avvio",
+    "en": "Essential to start",
+    "es": "Esencial para el arranque",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.rifinisciLaClassificazioneCon",
+    "it": "Rifinisci la classificazione con Nexus AI",
+    "en": "Refine the classification with Nexus AI",
+    "es": "Refina la clasificacion con Nexus AI",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.esDevServer",
+    "it": "es. Dev Server",
+    "en": "e.g. Dev server",
+    "es": "p. ej. Servidor de desarrollo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.port3000Watch",
+    "it": "--port 3000 --watch",
+    "en": "--port 3000 --watch",
+    "es": "--port 3000 --watch",
+    "occorrenze": 1,
+    "neutro": true
+  },
+  {
+    "chiave": "sidebar.lasciaVuotoRootProgetto",
+    "it": "lascia vuoto = root progetto",
+    "en": "leave empty = project root",
+    "es": "dejar vacio = raiz del proyecto",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.modifica",
+    "it": "Modifica",
+    "en": "Edit",
+    "es": "Editar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.scriptAmpComandi",
+    "it": "Script &amp; Comandi",
+    "en": "Scripts &amp; commands",
+    "es": "Scripts y comandos",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.nessunaConfigurazioneRilevataIn",
+    "it": "Nessuna configurazione rilevata in questo progetto.",
+    "en": "No configuration detected in this project.",
+    "es": "Ninguna configuracion detectada en este proyecto.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.selezioneInizialeSoloGli",
+    "it": "Selezione iniziale: solo gli",
+    "en": "Initial selection: only the",
+    "es": "Seleccion inicial: solo los",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.nome",
+    "it": "Nome",
+    "en": "Name",
+    "es": "Nombre",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.tipo",
+    "it": "Tipo",
+    "en": "Type",
+    "es": "Tipo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.comando",
+    "it": "Comando",
+    "en": "Command",
+    "es": "Comando",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.argomentiSeparatiDaSpazio",
+    "it": "Argomenti (separati da spazio)",
+    "en": "Arguments (space separated)",
+    "es": "Argumentos (separados por espacios)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.workingDirectoryOpzionale",
+    "it": "Working directory (opzionale)",
+    "en": "Working directory (optional)",
+    "es": "Directorio de trabajo (opcional)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.nessunaConfigurazioneClicca",
+    "it": "Nessuna configurazione. Clicca",
+    "en": "No configuration. Click",
+    "es": "Ninguna configuracion. Haz clic en",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.prima",
+    "it": "Prima",
+    "en": "Before",
+    "es": "Antes",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.dopo",
+    "it": "Dopo",
+    "en": "After",
+    "es": "Despues",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.modifiche",
+    "it": "Modifiche",
+    "en": "Changes",
+    "es": "Cambios",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.vediDiff",
+    "it": "Vedi diff",
+    "en": "View diff",
+    "es": "Ver diferencias",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.inAttesaDiNexus",
+    "it": "In attesa di /nexus/system-metrics…",
+    "en": "Waiting for /nexus/system-metrics…",
+    "es": "Esperando /nexus/system-metrics…",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.caricamento2",
+    "it": "Caricamento…",
+    "en": "Loading…",
+    "es": "Cargando…",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.rete",
+    "it": "Rete",
+    "en": "Network",
+    "es": "Red",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.disco",
+    "it": "Disco",
+    "en": "Disk",
+    "es": "Disco",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.processiTopCpu",
+    "it": "Processi top CPU",
+    "en": "Top CPU processes",
+    "es": "Procesos con mas CPU",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.openEditors",
+    "it": "Open Editors",
+    "en": "Open editors",
+    "es": "Editores abiertos",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.explorer",
+    "it": "Explorer",
+    "en": "Explorer",
+    "es": "Explorador",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.search",
+    "it": "Search",
+    "en": "Search",
+    "es": "Buscar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.ricercaNelProgetto",
+    "it": "Ricerca nel progetto",
+    "en": "Search in the project",
+    "es": "Buscar en el proyecto",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.cercaTestoNelWorkspace",
+    "it": "Cerca testo nel workspace",
+    "en": "Search text in the workspace",
+    "es": "Buscar texto en el espacio de trabajo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.sourceControl",
+    "it": "Source Control",
+    "en": "Source control",
+    "es": "Control de versiones",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.apriLaKnowledgeBase",
+    "it": "Apri la Knowledge Base unificata a tutto schermo",
+    "en": "Open the unified knowledge base full screen",
+    "es": "Abre la base de conocimiento unificada a pantalla completa",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.monitor",
+    "it": "Monitor",
+    "en": "Monitor",
+    "es": "Monitor",
+    "occorrenze": 1,
+    "neutro": true
+  },
+  {
+    "chiave": "sidebar.risorseServerOgni2s",
+    "it": "Risorse server · ogni 2s",
+    "en": "Server resources - every 2s",
+    "es": "Recursos del servidor - cada 2 s",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.nessunEditorAperto",
+    "it": "Nessun editor aperto.",
+    "en": "No editor open.",
+    "es": "Ningun editor abierto.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.ricercaInCorso",
+    "it": "Ricerca in corso...",
+    "en": "Searching...",
+    "es": "Buscando...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.nessunRisultatoInserisciUn",
+    "it": "Nessun risultato. Inserisci un termine e avvia la ricerca.",
+    "en": "No results. Enter a term and start the search.",
+    "es": "Sin resultados. Introduce un termino e inicia la busqueda.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.knowledgeBaseUnificata",
+    "it": "Knowledge Base unificata ·",
+    "en": "Unified knowledge base -",
+    "es": "Base de conocimiento unificada -",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "sidebar.apriASchermoIntero",
+    "it": "Apri a schermo intero →",
+    "en": "Open full screen →",
+    "es": "Abrir a pantalla completa →",
+    "occorrenze": 1
+  }
+]

@@ -15,6 +15,7 @@ import {
   type InitForm,
   type ConnFields,
 } from "./db-helpers";
+import { useI18n } from "../../lib/i18n";
 
 interface Props {
   tc: Theme;
@@ -58,6 +59,7 @@ export function DetectConfig({
   onReload,
   onTestDetected,
 }: Props) {
+  const { t } = useI18n();
   return (
     <div
       style={{
@@ -70,12 +72,12 @@ export function DetectConfig({
     >
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
         <div style={{ fontSize: 10, fontWeight: 700, color: tc.textSecondary, textTransform: "uppercase", letterSpacing: "0.05em" }}>
-          Rilevato dai sorgenti del progetto
+          {t("project-db.rilevatoDaiSorgentiDel")}
         </div>
         <button
           type="button"
           onClick={onReload}
-          title="Ri-analizza i file di config (utile dopo modifiche apportate dalla chat di Nexus)"
+          title={t("project-db.riAnalizzaIFile")}
           disabled={loading}
           style={{
             padding: "1px 8px", fontSize: 10,
@@ -103,20 +105,20 @@ export function DetectConfig({
         <div style={{ fontSize: 10, color: tc.textMuted, lineHeight: 1.6 }}>
           {detectedConfig.engine && (
             <div>
-              <span style={{ color: tc.textSecondary }}>Engine:</span>{" "}
+              <span style={{ color: tc.textSecondary }}>{t("project-db.engine2")}</span>{" "}
               <span style={{ color: tc.text, fontWeight: 600 }}>{detectedConfig.engine}</span>
               {detectedConfig.hosting_mode ? ` · ${detectedConfig.hosting_mode}` : ""}
             </div>
           )}
           {detectedConfig.migration_tool && (
             <div>
-              <span style={{ color: tc.textSecondary }}>Tool:</span> {detectedConfig.migration_tool}
+              <span style={{ color: tc.textSecondary }}>{t("project-db.tool")}</span> {detectedConfig.migration_tool}
               {detectedConfig.migration_path ? ` · ${detectedConfig.migration_path}` : ""}
             </div>
           )}
           {detectedConfig.connection_string && (
             <div style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: tc.textMuted, wordBreak: "break-all", marginTop: 2 }}>
-              <span style={{ color: tc.textSecondary }}>Connessione:</span>{" "}
+              <span style={{ color: tc.textSecondary }}>{t("project-db.connessione")}</span>{" "}
               {/* Oscura password nella connection string per sicurezza */}
               {detectedConfig.connection_string.replace(/[Pp]assword=([^;,"']+)/g, "Password=***").replace(/:([^:@]+)@/, ":***@")}
             </div>
@@ -169,7 +171,7 @@ export function DetectConfig({
             marginTop: 2,
           }}
         >
-          Usa questa configurazione
+          {t("project-db.usaQuestaConfigurazione")}
         </button>
 
         <button
@@ -188,7 +190,7 @@ export function DetectConfig({
             fontWeight: 600,
             marginTop: 2,
           }}
-          title="Esegue un test di connessione usando la config rilevata (senza salvare)."
+          title={t("project-db.esegueUnTestDi")}
         >
           {busy ? "Test…" : "Testa config rilevata"}
         </button>
@@ -293,7 +295,7 @@ export function DetectConfig({
                 {category === "unreachable" && altHosts.length > 0 && (
                   <>
                     <div style={{ fontSize: 9, color: tc.textMuted }}>
-                      Cerca il DB su altre macchine della LAN:
+                      {t("project-db.cercaIlDbSu")}
                     </div>
                     {altHosts.map((h) => (
                       <button
@@ -321,7 +323,7 @@ export function DetectConfig({
                 {category === "no_database" && (
                   <>
                     <div style={{ fontSize: 9, color: tc.textMuted }}>
-                      Il server e' raggiungibile ma manca il database <code>{dbName}</code>.
+                      {t("project-db.ilServerERaggiungibile")} <code>{dbName}</code>.
                     </div>
                     <button
                       type="button"
@@ -382,7 +384,7 @@ export function DetectConfig({
                         fontWeight: 600,
                       }}
                     >
-                      Apri pannello migrazioni
+                      {t("project-db.apriPannelloMigrazioni")}
                     </button>
                   </>
                 )}
@@ -430,7 +432,7 @@ export function DetectConfig({
                     fontWeight: 600,
                   }}
                 >
-                  Configura manualmente
+                  {t("project-db.configuraManualmente")}
                 </button>
               </div>
             </div>

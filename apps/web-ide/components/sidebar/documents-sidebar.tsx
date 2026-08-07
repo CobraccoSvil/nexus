@@ -4,6 +4,7 @@ import { useThemeColors } from "../../lib/theme";
 import { useGlobalDialog } from "../global-dialog-provider";
 import type { UserProjectDetails } from "../../lib/api-client";
 import { isBinaryDocPath } from "../../lib/file-kind";
+import { useI18n } from "../../lib/i18n";
 
 interface DocumentItem {
   id: string;
@@ -48,6 +49,7 @@ const STATUS_COLORS: Record<string, string> = {
 };
 
 export function DocumentsSidebar({ project, onOpenInEditor }: DocumentsSidebarProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   // Dialog di Nexus (no window.confirm/alert nativi del browser: rompono
   // il look&feel e in alcuni embed/webview vengono soppressi).
@@ -226,14 +228,14 @@ export function DocumentsSidebar({ project, onOpenInEditor }: DocumentsSidebarPr
         }}
       >
         <span style={{ fontSize: 12, fontWeight: 600, color: tc.text, textTransform: "uppercase", letterSpacing: 0.5 }}>
-          Documenti
+          {t("sidebar.documenti")}
         </span>
         <div style={{ display: "flex", gap: 4 }}>
           {project && (
             <button
               type="button"
               onClick={() => setShowGenerate((v) => !v)}
-              title="Genera documentazione"
+              title={t("sidebar.generaDocumentazione")}
               style={{
                 background: showGenerate ? tc.accent : "transparent",
                 border: `1px solid ${showGenerate ? tc.accent : tc.border}`,
@@ -251,7 +253,7 @@ export function DocumentsSidebar({ project, onOpenInEditor }: DocumentsSidebarPr
           <button
             type="button"
             onClick={fetchDocuments}
-            title="Aggiorna"
+            title={t("sidebar.aggiorna")}
             style={{
               background: "transparent",
               border: "none",
@@ -310,7 +312,7 @@ export function DocumentsSidebar({ project, onOpenInEditor }: DocumentsSidebarPr
           </div>
           {!project && (
             <div style={{ fontSize: 11, color: tc.textMuted, marginTop: 6 }}>
-              Apri un progetto per generare la documentazione.
+              {t("sidebar.apriUnProgettoPer")}
             </div>
           )}
         </div>
@@ -319,7 +321,7 @@ export function DocumentsSidebar({ project, onOpenInEditor }: DocumentsSidebarPr
       <div style={{ flex: 1, overflow: "auto", padding: 8 }}>
         {loading && (
           <div style={{ color: tc.textMuted, fontSize: 12, padding: 10 }}>
-            Caricamento...
+            {t("sidebar.caricamento")}
           </div>
         )}
 
@@ -331,10 +333,10 @@ export function DocumentsSidebar({ project, onOpenInEditor }: DocumentsSidebarPr
 
         {!loading && documents.length === 0 && !error && (
           <div style={{ color: tc.textMuted, fontSize: 12, padding: 10, textAlign: "center" }}>
-            Nessun documento generato.
+            {t("sidebar.nessunDocumentoGenerato")}
             <br />
             <span style={{ fontSize: 11 }}>
-              Usa il tasto <strong>+ Genera</strong> oppure chiedi a Nexus nella chat.
+              {t("sidebar.usaIlTasto")} <strong>+ Genera</strong> oppure chiedi a Nexus nella chat.
             </span>
           </div>
         )}
@@ -405,7 +407,7 @@ export function DocumentsSidebar({ project, onOpenInEditor }: DocumentsSidebarPr
                     <button
                       type="button"
                       onClick={() => handleOpen(doc)}
-                      title="Apri nell'editor"
+                      title={t("sidebar.apriNellEditor")}
                       style={{
                         fontSize: 11,
                         background: tc.accent,
@@ -416,13 +418,13 @@ export function DocumentsSidebar({ project, onOpenInEditor }: DocumentsSidebarPr
                         cursor: "pointer",
                       }}
                     >
-                      Apri
+                      {t("sidebar.apri")}
                     </button>
                   )}
                   <button
                     type="button"
                     onClick={() => handleDownload(doc)}
-                    title="Download .docx"
+                    title={t("sidebar.downloadDocx")}
                     style={{
                       fontSize: 11,
                       background: tc.bgCard,
@@ -433,13 +435,13 @@ export function DocumentsSidebar({ project, onOpenInEditor }: DocumentsSidebarPr
                       cursor: "pointer",
                     }}
                   >
-                    Download
+                    {t("sidebar.download")}
                   </button>
                   <button
                     type="button"
                     onClick={() => handleGenerate(doc.doc_type)}
                     disabled={!project || generating === doc.doc_type}
-                    title="Rigenera"
+                    title={t("sidebar.rigenera")}
                     style={{
                       fontSize: 11,
                       background: "transparent",
@@ -456,7 +458,7 @@ export function DocumentsSidebar({ project, onOpenInEditor }: DocumentsSidebarPr
                   <button
                     type="button"
                     onClick={() => handleDelete(doc)}
-                    title="Elimina"
+                    title={t("sidebar.elimina")}
                     style={{
                       fontSize: 11,
                       background: "transparent",
@@ -467,7 +469,7 @@ export function DocumentsSidebar({ project, onOpenInEditor }: DocumentsSidebarPr
                       cursor: "pointer",
                     }}
                   >
-                    Elimina
+                    {t("sidebar.elimina")}
                   </button>
                 </div>
               </div>

@@ -2,6 +2,7 @@
 
 import type { Theme } from "../../lib/theme";
 import type { ProjectMigration } from "../../lib/api-client";
+import { useI18n } from "../../lib/i18n";
 
 interface Props {
   tc: Theme;
@@ -49,6 +50,7 @@ export function MigrationsSection({
   onRollback,
   onImportSchema,
 }: Props) {
+  const { t } = useI18n();
   return (
     <>
       {showNewMig && isConfigured && (
@@ -61,7 +63,7 @@ export function MigrationsSection({
             placeholder="CREATE TABLE ..."
             style={{ padding: 6, fontSize: 11, fontFamily: "var(--font-mono)", background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4, resize: "vertical" }}
           />
-          <label style={{ fontSize: 10, color: tc.textMuted }}>Motivo (min 10 caratteri)</label>
+          <label style={{ fontSize: 10, color: tc.textMuted }}>{t("project-db.motivoMin10Caratteri")}</label>
           <input
             type="text"
             value={migForm.reason}
@@ -93,7 +95,7 @@ export function MigrationsSection({
           type="button"
           onClick={onApply}
           disabled={busy || pending.length === 0}
-          title="Applica migrazioni pending"
+          title={t("project-db.applicaMigrazioniPending")}
           style={{
             flex: 1,
             padding: "6px 8px",
@@ -112,7 +114,7 @@ export function MigrationsSection({
           type="button"
           onClick={onRollback}
           disabled={busy || applied.length === 0}
-          title="Rollback ultima"
+          title={t("project-db.rollbackUltima")}
           style={{
             flex: 1,
             padding: "6px 8px",
@@ -124,7 +126,7 @@ export function MigrationsSection({
             fontSize: 12,
           }}
         >
-          Rollback
+          {t("project-db.rollback")}
         </button>
       </div>
 
@@ -133,7 +135,7 @@ export function MigrationsSection({
           type="button"
           onClick={() => onImportSchema(selectedSchemaFile || undefined)}
           disabled={busy}
-          title="Cerca un file schema nel progetto ed eseguilo sul database"
+          title={t("project-db.cercaUnFileSchema")}
           style={{
             width: "100%",
             padding: "8px 8px",
@@ -185,7 +187,7 @@ export function MigrationsSection({
                 fontWeight: 600,
               }}
             >
-              Importa
+              {t("project-db.importa")}
             </button>
           </div>
         )}
@@ -222,7 +224,7 @@ export function MigrationsSection({
         )}
 
         {loading ? (
-          <div style={{ color: tc.textMuted, fontSize: 12 }}>Caricamento…</div>
+          <div style={{ color: tc.textMuted, fontSize: 12 }}>{t("project-db.caricamento")}</div>
         ) : migrations.length === 0 ? (
           <div
             style={{
@@ -234,7 +236,7 @@ export function MigrationsSection({
               borderRadius: 6,
             }}
           >
-            Nessuna migrazione trovata.
+            {t("project-db.nessunaMigrazioneTrovata")}
           </div>
         ) : (
           migrations.map((m) => (

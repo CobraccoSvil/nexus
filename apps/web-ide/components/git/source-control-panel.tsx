@@ -38,6 +38,7 @@ import { GitHubAccountCard } from "./source-control/github-account-card";
 import { GitHubImportSection } from "./source-control/github-import-section";
 import { RemoteCard } from "./source-control/remote-card";
 import { RepositoryActionsCard } from "./source-control/repository-actions-card";
+import { useI18n } from "../../lib/i18n";
 
 export function SourceControlPanel({
   project,
@@ -54,6 +55,7 @@ export function SourceControlPanel({
   onProjectAnalyzed?: () => void;
   onSendToChat?: (msg: string) => void;
 }) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const { confirmDialog } = useGlobalDialog();
   const projectId = project?.id;
@@ -257,7 +259,7 @@ export function SourceControlPanel({
   };
 
   if (!project) {
-    return <div style={{ color: tc.textMuted }}>Apri un progetto per usare Source Control.</div>;
+    return <div style={{ color: tc.textMuted }}>{t("git.apriUnProgettoPer")}</div>;
   }
 
   const isGitRepo = runtimeIsGitRepo;
@@ -662,9 +664,9 @@ export function SourceControlPanel({
           />
 
           <div style={cardStyle(tc)}>
-            <div style={sectionTitleStyle(tc)}>Branch</div>
+            <div style={sectionTitleStyle(tc)}>{t("git.branch")}</div>
             <div style={{ color: tc.textMuted, fontSize: 12 }}>
-              Crea un branch nuovo oppure cambia branch corrente.
+              {t("git.creaUnBranchNuovo")}
             </div>
             <BranchManager
               project={project}
@@ -675,9 +677,9 @@ export function SourceControlPanel({
           </div>
 
           <div style={cardStyle(tc)}>
-            <div style={sectionTitleStyle(tc)}>Staging</div>
+            <div style={sectionTitleStyle(tc)}>{t("git.staging")}</div>
             <div style={{ color: tc.textMuted, fontSize: 12 }}>
-              Controlla file staged, unstaged e non tracciati.
+              {t("git.controllaFileStagedUnstaged")}
             </div>
             <StagingArea
               project={project}
@@ -691,7 +693,7 @@ export function SourceControlPanel({
           </div>
 
           <div style={cardStyle(tc)}>
-            <div style={sectionTitleStyle(tc)}>Cronologia Commit</div>
+            <div style={sectionTitleStyle(tc)}>{t("git.cronologiaCommit")}</div>
             <CommitLog logEntries={logEntries} />
           </div>
         </>

@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import type { useThemeColors } from "../../../lib/theme";
 import type { ServiceWizardSuggestion } from "../../../lib/api-client";
+import { useI18n } from "../../../lib/i18n";
 
 // ── Modale wizard install ──────────────────────────────────────────────────
 interface WizardInstallModalProps {
@@ -16,6 +17,7 @@ interface WizardInstallModalProps {
 }
 
 export function WizardInstallModal({ svc, onInstall, onCancel, tc, feedback }: WizardInstallModalProps) {
+  const { t } = useI18n();
   const [env, setEnv] = useState(() => {
     const obj = (svc.env ?? {}) as Record<string, string>;
     const lines = Object.entries(obj)
@@ -54,16 +56,16 @@ export function WizardInstallModal({ svc, onInstall, onCancel, tc, feedback }: W
       <div style={{ background:tc.bgCard,border:`1px solid ${tc.border}`,borderRadius:8,padding:20,width:460,maxWidth:"90vw",display:"flex",flexDirection:"column",gap:10 }}>
         <div style={{ fontWeight:700,fontSize:13,color:tc.text }}>Installa servizio — {svc.short}</div>
         <div style={{ fontSize:11,color:tc.textMuted,fontFamily:'var(--font-mono)',background:tc.bgSidebar,padding:"6px 8px",borderRadius:4 }}>
-          <div>Servizio: <strong>{svc.short || svc.unit}</strong></div>
+          <div>{t("panels.servizio")} <strong>{svc.short || svc.unit}</strong></div>
           <div>Comando: {svc.command} {svc.args.join(" ")}</div>
           <div>Dir: {svc.cwd}</div>
         </div>
-        <label style={{ fontSize:11,color:tc.textMuted }}>Descrizione</label>
+        <label style={{ fontSize:11,color:tc.textMuted }}>{t("panels.descrizione")}</label>
         <input style={inp} value={desc} onChange={e=>setDesc(e.target.value)} />
-        <label style={{ fontSize:11,color:tc.textMuted }}>Variabili ambiente (KEY=VALUE, una per riga)</label>
+        <label style={{ fontSize:11,color:tc.textMuted }}>{t("panels.variabiliAmbienteKeyValue")}</label>
         <textarea style={{ ...inp,height:64,resize:"vertical" }} value={env} onChange={e=>setEnv(e.target.value)} placeholder="PORT=20000" />
         <div style={{ fontSize:10,color:tc.textMuted }}>
-          Il servizio verra' registrato e avviato.
+          {t("panels.ilServizioVerraRegistrato")}
         </div>
         {/* Banner feedback: mostrato dopo il tentativo di install.
             - "✓"/"OK" → verde, la modale si chiude da sola dopo 1.2s.

@@ -14,6 +14,7 @@
 import { useEffect, useState } from "react";
 import { useThemeColors } from "../../lib/theme";
 import { getOrchestratorPlan, type OrchestratorPlanDetail } from "../../lib/api-client";
+import { useI18n } from "../../lib/i18n";
 
 const STATUS_COLORS: Record<string, string> = {
   pending: "#6b7280",
@@ -24,6 +25,7 @@ const STATUS_COLORS: Record<string, string> = {
 };
 
 export function PlanInspector({ runId, onClose }: { runId: string; onClose: () => void }) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [plan, setPlan] = useState<OrchestratorPlanDetail | null>(null);
   const [loading, setLoading] = useState(true);
@@ -50,19 +52,19 @@ export function PlanInspector({ runId, onClose }: { runId: string; onClose: () =
             <h2 style={{ margin: 0 }}>Plan {runId.slice(0, 8)}</h2>
             <div style={{ fontSize: 11, color: tc.textMuted, fontFamily: "var(--font-mono)" }}>{runId}</div>
           </div>
-          <button onClick={onClose} style={{ padding: "4px 12px", background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4, cursor: "pointer" }}>Close</button>
+          <button onClick={onClose} style={{ padding: "4px 12px", background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4, cursor: "pointer" }}>{t("admin.close")}</button>
         </header>
 
-        {loading && <div style={{ color: tc.textMuted }}>Loading...</div>}
+        {loading && <div style={{ color: tc.textMuted }}>{t("admin.loading")}</div>}
         {error && <div style={{ background: "#fee2e2", color: "#991b1b", padding: 8, borderRadius: 4 }}>{error}</div>}
         {plan && (
           <>
             <section style={{ marginBottom: 24, fontSize: 12 }}>
-              <div><strong>Project:</strong> <code>{plan.projectId}</code></div>
-              <div><strong>Planner model:</strong> {plan.plannerModel ?? "-"}</div>
-              <div><strong>Score:</strong> {plan.score ?? "-"}</div>
-              <div><strong>Created:</strong> {plan.createdAt?.slice(0, 19).replace("T", " ")}</div>
-              <div><strong>Approved:</strong> {plan.approvedAt?.slice(0, 19).replace("T", " ") ?? "-"}</div>
+              <div><strong>{t("admin.project2")}</strong> <code>{plan.projectId}</code></div>
+              <div><strong>{t("admin.plannerModel")}</strong> {plan.plannerModel ?? "-"}</div>
+              <div><strong>{t("admin.score")}</strong> {plan.score ?? "-"}</div>
+              <div><strong>{t("admin.created")}</strong> {plan.createdAt?.slice(0, 19).replace("T", " ")}</div>
+              <div><strong>{t("admin.approved")}</strong> {plan.approvedAt?.slice(0, 19).replace("T", " ") ?? "-"}</div>
             </section>
 
             <section style={{ marginBottom: 24 }}>
@@ -81,16 +83,16 @@ export function PlanInspector({ runId, onClose }: { runId: string; onClose: () =
             <section style={{ marginBottom: 24 }}>
               <h3 style={{ marginBottom: 8 }}>Verifier runs ({plan.verifierRuns.length})</h3>
               {plan.verifierRuns.length === 0 ? (
-                <div style={{ color: tc.textMuted, fontSize: 12 }}>Nessuna verifier run.</div>
+                <div style={{ color: tc.textMuted, fontSize: 12 }}>{t("admin.nessunaVerifierRun")}</div>
               ) : (
                 <table style={{ width: "100%", fontSize: 11, borderCollapse: "collapse" }}>
                   <thead>
                     <tr style={{ borderBottom: `1px solid ${tc.border}` }}>
-                      <th style={{ textAlign: "left", padding: 4 }}>Cycle</th>
-                      <th style={{ textAlign: "left", padding: 4 }}>Todo</th>
-                      <th style={{ textAlign: "left", padding: 4 }}>Passed</th>
-                      <th style={{ textAlign: "left", padding: 4 }}>Duration</th>
-                      <th style={{ textAlign: "left", padding: 4 }}>When</th>
+                      <th style={{ textAlign: "left", padding: 4 }}>{t("admin.cycle")}</th>
+                      <th style={{ textAlign: "left", padding: 4 }}>{t("admin.todo")}</th>
+                      <th style={{ textAlign: "left", padding: 4 }}>{t("admin.passed")}</th>
+                      <th style={{ textAlign: "left", padding: 4 }}>{t("admin.duration")}</th>
+                      <th style={{ textAlign: "left", padding: 4 }}>{t("admin.when")}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -111,18 +113,18 @@ export function PlanInspector({ runId, onClose }: { runId: string; onClose: () =
             <section style={{ marginBottom: 24 }}>
               <h3 style={{ marginBottom: 8 }}>Sub-agent runs ({plan.subagentRuns.length}) — total ${totalSubagentCost.toFixed(4)} / {totalSubagentTokens.toLocaleString()} tok</h3>
               {plan.subagentRuns.length === 0 ? (
-                <div style={{ color: tc.textMuted, fontSize: 12 }}>Nessuna sub-agent run.</div>
+                <div style={{ color: tc.textMuted, fontSize: 12 }}>{t("admin.nessunaSubAgentRun")}</div>
               ) : (
                 <table style={{ width: "100%", fontSize: 11, borderCollapse: "collapse" }}>
                   <thead>
                     <tr style={{ borderBottom: `1px solid ${tc.border}` }}>
-                      <th style={{ textAlign: "left", padding: 4 }}>Kind</th>
-                      <th style={{ textAlign: "left", padding: 4 }}>Status</th>
-                      <th style={{ textAlign: "right", padding: 4 }}>Iter</th>
-                      <th style={{ textAlign: "right", padding: 4 }}>Tokens</th>
-                      <th style={{ textAlign: "right", padding: 4 }}>Cost</th>
-                      <th style={{ textAlign: "left", padding: 4 }}>Source</th>
-                      <th style={{ textAlign: "left", padding: 4 }}>Depth</th>
+                      <th style={{ textAlign: "left", padding: 4 }}>{t("admin.kind")}</th>
+                      <th style={{ textAlign: "left", padding: 4 }}>{t("admin.status")}</th>
+                      <th style={{ textAlign: "right", padding: 4 }}>{t("admin.iter")}</th>
+                      <th style={{ textAlign: "right", padding: 4 }}>{t("admin.tokens")}</th>
+                      <th style={{ textAlign: "right", padding: 4 }}>{t("admin.cost")}</th>
+                      <th style={{ textAlign: "left", padding: 4 }}>{t("admin.source")}</th>
+                      <th style={{ textAlign: "left", padding: 4 }}>{t("admin.depth")}</th>
                     </tr>
                   </thead>
                   <tbody>

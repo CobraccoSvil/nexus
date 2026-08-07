@@ -1,0 +1,390 @@
+[
+  {
+    "chiave": "project-db.engine",
+    "it": "Engine",
+    "en": "Engine",
+    "es": "Motor",
+    "occorrenze": 3
+  },
+  {
+    "chiave": "project-db.postgresql",
+    "it": "PostgreSQL",
+    "en": "PostgreSQL",
+    "es": "PostgreSQL",
+    "occorrenze": 3,
+    "neutro": true
+  },
+  {
+    "chiave": "project-db.creaDatabase",
+    "it": "Crea database",
+    "en": "Create database",
+    "es": "Crear base de datos",
+    "occorrenze": 3
+  },
+  {
+    "chiave": "project-db.mysql",
+    "it": "MySQL",
+    "en": "MySQL",
+    "es": "MySQL",
+    "occorrenze": 2,
+    "neutro": true
+  },
+  {
+    "chiave": "project-db.sqlite",
+    "it": "SQLite",
+    "en": "SQLite",
+    "es": "SQLite",
+    "occorrenze": 2,
+    "neutro": true
+  },
+  {
+    "chiave": "project-db.sqlServer",
+    "it": "SQL Server",
+    "en": "SQL Server",
+    "es": "SQL Server",
+    "occorrenze": 2,
+    "neutro": true
+  },
+  {
+    "chiave": "project-db.engine2",
+    "it": "Engine:",
+    "en": "Engine:",
+    "es": "Motor:",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "project-db.tool",
+    "it": "Tool:",
+    "en": "Tool:",
+    "es": "Herramienta:",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "project-db.configuraManualmente",
+    "it": "Configura manualmente",
+    "en": "Configure manually",
+    "es": "Configurar manualmente",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "project-db.aggiorna",
+    "it": "Aggiorna",
+    "en": "Refresh",
+    "es": "Actualizar",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "project-db.primaryAnalytics",
+    "it": "primary, analytics, ...",
+    "en": "primary, analytics, ...",
+    "es": "primary, analytics, ...",
+    "occorrenze": 1,
+    "neutro": true
+  },
+  {
+    "chiave": "project-db.localhost",
+    "it": "localhost",
+    "en": "localhost",
+    "es": "localhost",
+    "occorrenze": 1,
+    "neutro": true
+  },
+  {
+    "chiave": "project-db.nomeDelDbApplicativo",
+    "it": "nome del DB applicativo (es. myapp_dev)",
+    "en": "application DB name (e.g. myapp_dev)",
+    "es": "nombre de la BD de la aplicacion (p. ej. myapp_dev)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.username",
+    "it": "username",
+    "en": "username",
+    "es": "usuario",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.password",
+    "it": "password",
+    "en": "password",
+    "es": "contrasena",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.nomeConnessione",
+    "it": "Nome connessione",
+    "en": "Connection name",
+    "es": "Nombre de la conexion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.migrationTool",
+    "it": "Migration tool",
+    "en": "Migration tool",
+    "es": "Herramienta de migracion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.genericSql",
+    "it": "Generic SQL",
+    "en": "Generic SQL",
+    "es": "SQL generico",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.alembic",
+    "it": "Alembic",
+    "en": "Alembic",
+    "es": "Alembic",
+    "occorrenze": 1,
+    "neutro": true
+  },
+  {
+    "chiave": "project-db.prisma",
+    "it": "Prisma",
+    "en": "Prisma",
+    "es": "Prisma",
+    "occorrenze": 1,
+    "neutro": true
+  },
+  {
+    "chiave": "project-db.knex",
+    "it": "Knex",
+    "en": "Knex",
+    "es": "Knex",
+    "occorrenze": 1,
+    "neutro": true
+  },
+  {
+    "chiave": "project-db.flyway",
+    "it": "Flyway",
+    "en": "Flyway",
+    "es": "Flyway",
+    "occorrenze": 1,
+    "neutro": true
+  },
+  {
+    "chiave": "project-db.cartellaMigration",
+    "it": "Cartella migration",
+    "en": "Migrations folder",
+    "es": "Carpeta de migraciones",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.connessioneDb",
+    "it": "Connessione DB",
+    "en": "DB connection",
+    "es": "Conexion a la BD",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.indicatoriRilevati",
+    "it": "Indicatori rilevati:",
+    "en": "Detected indicators:",
+    "es": "Indicadores detectados:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.consentiDdlOverrideManuale",
+    "it": "Consenti DDL override manuale",
+    "en": "Allow manual DDL override",
+    "es": "Permitir anulacion manual de DDL",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.annulla",
+    "it": "Annulla",
+    "en": "Cancel",
+    "es": "Cancelar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.testaQuestaConnessione",
+    "it": "Testa questa connessione",
+    "en": "Test this connection",
+    "es": "Probar esta conexion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.setPrimary",
+    "it": "Set primary",
+    "en": "Set as primary",
+    "es": "Establecer como principal",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.modifica",
+    "it": "Modifica",
+    "en": "Edit",
+    "es": "Editar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.elimina",
+    "it": "Elimina",
+    "en": "Delete",
+    "es": "Eliminar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.ddlOverride",
+    "it": "DDL override:",
+    "en": "DDL override:",
+    "es": "Anulacion de DDL:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.primary",
+    "it": "primary",
+    "en": "primary",
+    "es": "principal",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.containerDedicatoNexus",
+    "it": "Container dedicato (Nexus)",
+    "en": "Dedicated container (Nexus)",
+    "es": "Contenedor dedicado (Nexus)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.databaseEsterno",
+    "it": "Database esterno",
+    "en": "External database",
+    "es": "Base de datos externa",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.avanti",
+    "it": "Avanti",
+    "en": "Next",
+    "es": "Siguiente",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.riAnalizzaIFile",
+    "it": "Ri-analizza i file di config (utile dopo modifiche apportate dalla chat di Nexus)",
+    "en": "Re-analyse the config files (useful after changes made from the Nexus chat)",
+    "es": "Vuelve a analizar los archivos de configuracion (util tras cambios hechos desde el chat de Nexus)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.esegueUnTestDi",
+    "it": "Esegue un test di connessione usando la config rilevata (senza salvare).",
+    "en": "Run a connection test with the detected config (without saving).",
+    "es": "Ejecuta una prueba de conexion con la configuracion detectada (sin guardar).",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.rilevatoDaiSorgentiDel",
+    "it": "Rilevato dai sorgenti del progetto",
+    "en": "Detected from the project sources",
+    "es": "Detectado a partir del codigo del proyecto",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.connessione",
+    "it": "Connessione:",
+    "en": "Connection:",
+    "es": "Conexion:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.usaQuestaConfigurazione",
+    "it": "Usa questa configurazione",
+    "en": "Use this configuration",
+    "es": "Usar esta configuracion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.cercaIlDbSu",
+    "it": "Cerca il DB su altre macchine della LAN:",
+    "en": "Look for the DB on other machines in the LAN:",
+    "es": "Busca la BD en otras maquinas de la LAN:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.ilServerERaggiungibile",
+    "it": "Il server e' raggiungibile ma manca il database",
+    "en": "The server is reachable but the database is missing",
+    "es": "El servidor es accesible pero falta la base de datos",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.apriPannelloMigrazioni",
+    "it": "Apri pannello migrazioni",
+    "en": "Open the migrations panel",
+    "es": "Abrir el panel de migraciones",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.applicaMigrazioniPending",
+    "it": "Applica migrazioni pending",
+    "en": "Apply pending migrations",
+    "es": "Aplicar las migraciones pendientes",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.rollbackUltima",
+    "it": "Rollback ultima",
+    "en": "Roll back the last one",
+    "es": "Revertir la ultima",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.cercaUnFileSchema",
+    "it": "Cerca un file schema nel progetto ed eseguilo sul database",
+    "en": "Look for a schema file in the project and run it on the database",
+    "es": "Busca un archivo de esquema en el proyecto y ejecutalo en la base de datos",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.motivoMin10Caratteri",
+    "it": "Motivo (min 10 caratteri)",
+    "en": "Reason (min 10 characters)",
+    "es": "Motivo (min. 10 caracteres)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.rollback",
+    "it": "Rollback",
+    "en": "Roll back",
+    "es": "Revertir",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.importa",
+    "it": "Importa",
+    "en": "Import",
+    "es": "Importar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.caricamento",
+    "it": "Caricamento…",
+    "en": "Loading…",
+    "es": "Cargando…",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.nessunaMigrazioneTrovata",
+    "it": "Nessuna migrazione trovata.",
+    "en": "No migration found.",
+    "es": "No se ha encontrado ninguna migracion.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.apriUnProgettoPer",
+    "it": "Apri un progetto per gestirne il database.",
+    "en": "Open a project to manage its database.",
+    "es": "Abre un proyecto para gestionar su base de datos.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "project-db.databaseProgetto",
+    "it": "Database progetto",
+    "en": "Project database",
+    "es": "Base de datos del proyecto",
+    "occorrenze": 1
+  }
+]

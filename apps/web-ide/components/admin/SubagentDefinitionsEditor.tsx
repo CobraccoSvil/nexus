@@ -18,6 +18,7 @@ import {
 } from "../../lib/api-client";
 import { AdminModal } from "./AdminModal";
 import { FigureWizard } from "./FigureWizard";
+import { useI18n } from "../../lib/i18n";
 
 /** Solo MODIFICA di una definition esistente: la creazione passa dal FigureWizard,
  *  che crea i quattro pezzi in transazione. Il ramo "nuovo kind" viveva qui e
@@ -38,6 +39,7 @@ interface EditState {
 }
 
 export function SubagentDefinitionsEditor() {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const { confirmDialog } = useGlobalDialog();
   const [defs, setDefs] = useState<SubagentDefinition[]>([]);
@@ -134,7 +136,7 @@ export function SubagentDefinitionsEditor() {
     <div style={{ padding: 24, color: tc.text, maxWidth: 1200 }}>
       <header style={{ display: "flex", justifyContent: "space-between", marginBottom: 24, alignItems: "center" }}>
         <div>
-          <h1 style={{ margin: 0 }}>Sub-agent kinds</h1>
+          <h1 style={{ margin: 0 }}>{t("admin.subAgentKinds")}</h1>
           <div style={{ fontSize: 12, color: tc.textMuted }}>Custom sub-agent definitions. Project YAML overrides applicano su <code>.nexus/agents/&lt;kind&gt;.md</code>.</div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
@@ -148,13 +150,13 @@ export function SubagentDefinitionsEditor() {
       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, background: tc.bgCard }}>
         <thead>
           <tr style={{ borderBottom: `1px solid ${tc.border}` }}>
-            <th style={{ textAlign: "left", padding: 8 }}>Kind</th>
-            <th style={{ textAlign: "left", padding: 8 }}>Purpose</th>
-            <th style={{ textAlign: "left", padding: 8 }}>Tools</th>
-            <th style={{ textAlign: "right", padding: 8 }}>Max iter</th>
-            <th style={{ textAlign: "right", padding: 8 }}>Timeout</th>
+            <th style={{ textAlign: "left", padding: 8 }}>{t("admin.kind")}</th>
+            <th style={{ textAlign: "left", padding: 8 }}>{t("admin.purpose")}</th>
+            <th style={{ textAlign: "left", padding: 8 }}>{t("admin.tools")}</th>
+            <th style={{ textAlign: "right", padding: 8 }}>{t("admin.maxIter")}</th>
+            <th style={{ textAlign: "right", padding: 8 }}>{t("admin.timeout")}</th>
             <th style={{ textAlign: "center", padding: 8 }}>BG</th>
-            <th style={{ textAlign: "center", padding: 8 }}>Enabled</th>
+            <th style={{ textAlign: "center", padding: 8 }}>{t("admin.enabled")}</th>
             <th style={{ padding: 8 }}></th>
           </tr>
         </thead>
@@ -174,18 +176,18 @@ export function SubagentDefinitionsEditor() {
                 <td style={{ padding: 8, textAlign: "center" }}>{d.isBackground ? "✓" : ""}</td>
                 <td style={{ padding: 8, textAlign: "center" }}>{d.isEnabled ? "✓" : "✗"}</td>
                 <td style={{ padding: 8 }}>
-                  <button onClick={() => startEdit(d)} style={{ padding: "2px 8px", background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4, cursor: "pointer", marginRight: 4, fontSize: 11 }}>Edit</button>
-                  <button onClick={() => handleDelete(d.kind)} style={{ padding: "2px 8px", background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 4, cursor: "pointer", fontSize: 11 }}>Disable</button>
+                  <button onClick={() => startEdit(d)} style={{ padding: "2px 8px", background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4, cursor: "pointer", marginRight: 4, fontSize: 11 }}>{t("admin.edit")}</button>
+                  <button onClick={() => handleDelete(d.kind)} style={{ padding: "2px 8px", background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 4, cursor: "pointer", fontSize: 11 }}>{t("admin.disable")}</button>
                 </td>
               </tr>
               {expanded === d.kind && (
                 <tr>
                   <td colSpan={8} style={{ padding: 12, background: `${tc.border}11` }}>
-                    <div style={{ fontSize: 11, marginBottom: 8 }}><strong>Description:</strong> {d.description ?? "-"}</div>
-                    <div style={{ fontSize: 11, marginBottom: 8 }}><strong>Prompt key:</strong> <code>{d.promptKey}</code></div>
-                    <h4 style={{ marginTop: 8, marginBottom: 4 }}>Recent runs</h4>
+                    <div style={{ fontSize: 11, marginBottom: 8 }}><strong>{t("admin.description")}</strong> {d.description ?? "-"}</div>
+                    <div style={{ fontSize: 11, marginBottom: 8 }}><strong>{t("admin.promptKey")}</strong> <code>{d.promptKey}</code></div>
+                    <h4 style={{ marginTop: 8, marginBottom: 4 }}>{t("admin.recentRuns")}</h4>
                     {(recentRuns[d.kind] ?? []).length === 0 ? (
-                      <div style={{ color: tc.textMuted, fontSize: 11 }}>Nessuna run recente.</div>
+                      <div style={{ color: tc.textMuted, fontSize: 11 }}>{t("admin.nessunaRunRecente")}</div>
                     ) : (
                       <ul style={{ fontSize: 11, paddingLeft: 16, margin: 0 }}>
                         {(recentRuns[d.kind] ?? []).map((r) => (
@@ -220,48 +222,48 @@ export function SubagentDefinitionsEditor() {
         {editing && (
             <div style={{ display: "grid", gap: 12 }}>
               <label style={{ display: "flex", flexDirection: "column", gap: 2, fontSize: 12 }}>
-                <span>Kind — non modificabile</span>
+                <span>{t("admin.kindNonModificabile")}</span>
                 <input value={editing.kind} disabled style={{ ...fieldStyle(tc), opacity: 0.6 }} />
               </label>
               <label style={{ display: "flex", flexDirection: "column", gap: 2, fontSize: 12 }}>
-                <span>Description (usato per auto-delegation by description)</span>
+                <span>{t("admin.descriptionUsatoPerAuto")}</span>
                 <textarea rows={2} value={editing.description} onChange={(e) => setEditing((s) => s && { ...s, description: e.target.value })} style={fieldStyle(tc)} />
               </label>
               <label style={{ display: "flex", flexDirection: "column", gap: 2, fontSize: 12 }}>
-                <span>Prompt key (deve esistere in nexus_prompt_templates)</span>
+                <span>{t("admin.promptKeyDeveEsistere")}</span>
                 <input value={editing.promptKey} onChange={(e) => setEditing((s) => s && { ...s, promptKey: e.target.value })} style={fieldStyle(tc)} />
               </label>
               <label style={{ display: "flex", flexDirection: "column", gap: 2, fontSize: 12 }}>
-                <span>Tool whitelist (CSV)</span>
+                <span>{t("admin.toolWhitelistCsv")}</span>
                 <input value={editing.toolWhitelistCsv} onChange={(e) => setEditing((s) => s && { ...s, toolWhitelistCsv: e.target.value })} style={fieldStyle(tc)} />
               </label>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
                 <label style={{ display: "flex", flexDirection: "column", gap: 2, fontSize: 12 }}>
-                  <span>Model purpose</span>
+                  <span>{t("admin.modelPurpose")}</span>
                   <input value={editing.modelPurpose} onChange={(e) => setEditing((s) => s && { ...s, modelPurpose: e.target.value })} style={fieldStyle(tc)} />
                 </label>
                 <label style={{ display: "flex", flexDirection: "column", gap: 2, fontSize: 12 }}>
-                  <span>Max iter</span>
+                  <span>{t("admin.maxIter")}</span>
                   <input value={editing.maxIterations} onChange={(e) => setEditing((s) => s && { ...s, maxIterations: e.target.value })} style={fieldStyle(tc)} />
                 </label>
                 <label style={{ display: "flex", flexDirection: "column", gap: 2, fontSize: 12 }}>
-                  <span>Timeout (s)</span>
+                  <span>{t("admin.timeoutS")}</span>
                   <input value={editing.timeoutS} onChange={(e) => setEditing((s) => s && { ...s, timeoutS: e.target.value })} style={fieldStyle(tc)} />
                 </label>
               </div>
               <div style={{ display: "flex", gap: 16, fontSize: 12 }}>
                 <label style={{ display: "flex", gap: 4, alignItems: "center" }}>
                   <input type="checkbox" checked={editing.isBackground} onChange={(e) => setEditing((s) => s && { ...s, isBackground: e.target.checked })} />
-                  Is background
+                  {t("admin.isBackground")}
                 </label>
                 <label style={{ display: "flex", gap: 4, alignItems: "center" }}>
                   <input type="checkbox" checked={editing.isEnabled} onChange={(e) => setEditing((s) => s && { ...s, isEnabled: e.target.checked })} />
-                  Is enabled
+                  {t("admin.isEnabled")}
                 </label>
               </div>
               <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 12 }}>
-                <button onClick={() => setEditing(null)} style={{ padding: "6px 12px", background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4, cursor: "pointer" }}>Annulla</button>
-                <button onClick={handleSave} style={{ padding: "6px 12px", background: "#2563eb", color: "white", border: "none", borderRadius: 4, cursor: "pointer" }}>Save</button>
+                <button onClick={() => setEditing(null)} style={{ padding: "6px 12px", background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4, cursor: "pointer" }}>{t("admin.annulla")}</button>
+                <button onClick={handleSave} style={{ padding: "6px 12px", background: "#2563eb", color: "white", border: "none", borderRadius: 4, cursor: "pointer" }}>{t("admin.save")}</button>
               </div>
             </div>
         )}

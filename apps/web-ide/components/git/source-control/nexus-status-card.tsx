@@ -4,6 +4,7 @@ import type { UserProjectDetails } from "../../../lib/api-client";
 import { useThemeColors } from "../../../lib/theme";
 import { cardStyle, smallButtonStyle, statusBadgeStyle } from "./styles";
 import { readinessTone } from "./labels";
+import { useI18n } from "../../../lib/i18n";
 
 interface NexusStatusCardProps {
   project: UserProjectDetails;
@@ -24,20 +25,21 @@ export function NexusStatusCard({
   deepAnalysisPhase,
   onAnalyzeProject,
 }: NexusStatusCardProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
 
   return (
     <div style={cardStyle(tc)}>
       <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <div style={{ color: tc.text, fontWeight: 700 }}>Stato Progetto Nexus</div>
+          <div style={{ color: tc.text, fontWeight: 700 }}>{t("git.statoProgettoNexus")}</div>
           <div style={{ color: tc.textSecondary }}>
             {isNexusReady
               ? "Nexus Ready: progetto analizzato e pronto alla gestione AI."
               : "Analisi richiesta: progetto non inizializzato per Nexus."}
           </div>
           <div style={{ color: tc.textMuted, fontSize: 12 }}>
-            Puoi inizializzare il progetto in qualsiasi momento.
+            {t("git.puoiInizializzareIlProgetto")}
           </div>
           {project.analyzedAt ? (
             <div style={{ color: tc.textMuted, fontSize: 11 }}>

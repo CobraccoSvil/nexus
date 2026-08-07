@@ -19,6 +19,7 @@ import {
   forceDiscardExperiment,
   type PromptExperiment,
 } from "../../lib/api-client";
+import { useI18n } from "../../lib/i18n";
 
 const STATUS_BG: Record<string, string> = {
   running: "#dbeafe",
@@ -54,6 +55,7 @@ function DeltaBadge({ baseline, variant }: { baseline?: number; variant?: number
 }
 
 export default function PromptExperiments() {
+  const { t } = useI18n();
   const tc = useThemeColors();
   // Dialog di Nexus (no window.confirm/alert nativi).
   const { confirmDialog, alertDialog } = useGlobalDialog();
@@ -231,6 +233,7 @@ function ExperimentCard({
   onPromote: () => void;
   onDiscard: () => void;
 }) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const isRunning = exp.status === "running";
   const startedAt = new Date(exp.started_at).toLocaleDateString("it-IT", {
@@ -280,7 +283,7 @@ function ExperimentCard({
         {/* Metriche compatte */}
         <div style={{ display: "flex", alignItems: "center", gap: 24, fontSize: 13, flexShrink: 0 }}>
           <div style={{ textAlign: "center" }}>
-            <div style={{ fontSize: 11, color: tc.textSecondary }}>Baseline</div>
+            <div style={{ fontSize: 11, color: tc.textSecondary }}>{t("admin.baseline")}</div>
             <div style={{ fontWeight: 500, color: tc.text }}>
               {exp.baseline_success_rate !== undefined && exp.baseline_success_rate !== null
                 ? `${Math.round(exp.baseline_success_rate * 100)}%`
@@ -288,7 +291,7 @@ function ExperimentCard({
             </div>
           </div>
           <div style={{ textAlign: "center" }}>
-            <div style={{ fontSize: 11, color: tc.textSecondary }}>Variante</div>
+            <div style={{ fontSize: 11, color: tc.textSecondary }}>{t("admin.variante")}</div>
             <div style={{ fontWeight: 500, color: tc.text }}>
               {exp.variant_success_rate !== undefined && exp.variant_success_rate !== null
                 ? `${Math.round(exp.variant_success_rate * 100)}%`
@@ -296,7 +299,7 @@ function ExperimentCard({
             </div>
           </div>
           <div style={{ textAlign: "center" }}>
-            <div style={{ fontSize: 11, color: tc.textSecondary }}>Delta</div>
+            <div style={{ fontSize: 11, color: tc.textSecondary }}>{t("admin.delta")}</div>
             <DeltaBadge baseline={exp.baseline_success_rate} variant={exp.variant_success_rate} />
           </div>
         </div>
@@ -339,11 +342,11 @@ function ExperimentCard({
       {isExpanded && (
         <div style={{ borderTop: `1px solid ${tc.border}`, background: tc.bgHeader, padding: 16 }}>
           {expandLoading ? (
-            <div style={{ fontSize: 13, color: tc.textSecondary, textAlign: "center", padding: "16px 0" }}>Caricamento dettaglio...</div>
+            <div style={{ fontSize: 13, color: tc.textSecondary, textAlign: "center", padding: "16px 0" }}>{t("admin.caricamentoDettaglio")}</div>
           ) : expandedData ? (
             <ExperimentDetail data={expandedData} />
           ) : (
-            <div style={{ fontSize: 13, color: tc.textSecondary, textAlign: "center", padding: "16px 0" }}>Dati non disponibili</div>
+            <div style={{ fontSize: 13, color: tc.textSecondary, textAlign: "center", padding: "16px 0" }}>{t("admin.datiNonDisponibili")}</div>
           )}
         </div>
       )}
@@ -352,6 +355,7 @@ function ExperimentCard({
 }
 
 function ExperimentDetail({ data }: { data: PromptExperiment }) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [showDiff, setShowDiff] = useState(false);
 
@@ -371,24 +375,24 @@ function ExperimentDetail({ data }: { data: PromptExperiment }) {
               {stats ? (
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, fontSize: 13 }}>
                   <div>
-                    <div style={{ fontSize: 11, color: tc.textSecondary }}>Run reflection</div>
+                    <div style={{ fontSize: 11, color: tc.textSecondary }}>{t("admin.runReflection")}</div>
                     <div style={{ fontWeight: 500 }}>{stats.runs}</div>
                   </div>
                   <div>
-                    <div style={{ fontSize: 11, color: tc.textSecondary }}>Score medio</div>
+                    <div style={{ fontSize: 11, color: tc.textSecondary }}>{t("admin.scoreMedio")}</div>
                     <div style={{ fontWeight: 500 }}>{Math.round(stats.avg_score * 100)}%</div>
                   </div>
                   <div>
-                    <div style={{ fontSize: 11, color: tc.textSecondary }}>Min</div>
+                    <div style={{ fontSize: 11, color: tc.textSecondary }}>{t("admin.min")}</div>
                     <div>{Math.round(stats.min_score * 100)}%</div>
                   </div>
                   <div>
-                    <div style={{ fontSize: 11, color: tc.textSecondary }}>Max</div>
+                    <div style={{ fontSize: 11, color: tc.textSecondary }}>{t("admin.max")}</div>
                     <div>{Math.round(stats.max_score * 100)}%</div>
                   </div>
                 </div>
               ) : (
-                <div style={{ fontSize: 12, color: tc.textSecondary }}>Nessun dato reflection</div>
+                <div style={{ fontSize: 12, color: tc.textSecondary }}>{t("admin.nessunDatoReflection")}</div>
               )}
             </div>
           ))}
@@ -430,7 +434,7 @@ function ExperimentDetail({ data }: { data: PromptExperiment }) {
 
       {data.decision_reason && (
         <div style={{ fontSize: 12, color: tc.textSecondary, background: tc.bgCard, border: `1px solid ${tc.border}`, borderRadius: 6, padding: 12 }}>
-          <span style={{ fontWeight: 500 }}>Motivazione decisione:</span> {data.decision_reason}
+          <span style={{ fontWeight: 500 }}>{t("admin.motivazioneDecisione")}</span> {data.decision_reason}
         </div>
       )}
     </div>

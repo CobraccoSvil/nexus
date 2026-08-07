@@ -2,6 +2,7 @@
 
 import type { QualityFinding } from "../../../lib/api-client";
 import type { Tc, FixQueueItem } from "./types";
+import { useI18n } from "../../../lib/i18n";
 
 interface FindingsSelectionBarProps {
   tc: Tc;
@@ -28,6 +29,7 @@ export function FindingsSelectionBar({
   toggleSelectAllVisible,
   startFixQueue,
 }: FindingsSelectionBarProps) {
+  const { t } = useI18n();
   return (
     <div style={{
       position: "sticky", top: 0, zIndex: 2,
@@ -53,23 +55,23 @@ export function FindingsSelectionBar({
         <>
           <button
             onClick={() => startFixQueue(selectedFindings)}
-            title="Invia i findings selezionati in coda manuale"
+            title={t("panels.inviaIFindingsSelezionati")}
             style={{
               background: "#f97316", color: "#fff", border: "none", borderRadius: 4,
               padding: "2px 8px", fontSize: 10, cursor: "pointer",
             }}
           >
-            Fix sel.
+            {t("panels.fixSel")}
           </button>
           <button
             onClick={() => startFixQueue(selectedFindings, true)}
-            title="Invia i findings selezionati in sequenza automatica"
+            title={t("panels.inviaIFindingsSelezionati2")}
             style={{
               background: "#7c3aed", color: "#fff", border: "none", borderRadius: 4,
               padding: "2px 8px", fontSize: 10, cursor: "pointer",
             }}
           >
-            Auto Fix sel.
+            {t("panels.autoFixSel")}
           </button>
         </>
       )}
@@ -87,7 +89,7 @@ export function FindingsSelectionBar({
               padding: "2px 8px", fontSize: 10, cursor: "pointer",
             }}
           >
-            Fix sezione
+            {t("panels.fixSezione")}
           </button>
           <button
             onClick={() => startFixQueue(visibleHighFindings, true)}
@@ -97,7 +99,7 @@ export function FindingsSelectionBar({
               padding: "2px 8px", fontSize: 10, cursor: "pointer",
             }}
           >
-            Auto Fix sezione
+            {t("panels.autoFixSezione")}
           </button>
         </>
       )}

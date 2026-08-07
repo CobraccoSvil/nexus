@@ -21,6 +21,7 @@ import {
   updateAdminSetting,
 } from "../../lib/api-client";
 import { PlanInspector } from "./PlanInspector";
+import { useI18n } from "../../lib/i18n";
 
 const TOGGLES: { key: string; label: string; hint: string }[] = [
   { key: "orchestrator.plan_phase_enabled", label: "Plan phase", hint: "Attiva planner_node che produce TODO list prima dell'executor" },
@@ -57,6 +58,7 @@ const NUMS: { key: string; label: string; type?: "int" | "float" | "csv" }[] = [
 ];
 
 export function OrchestratorPanel() {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [settings, setSettings] = useState<Record<string, string>>({});
   const [plans, setPlans] = useState<OrchestratorPlanSummary[]>([]);
@@ -111,18 +113,18 @@ export function OrchestratorPanel() {
   return (
     <div style={{ padding: 24, color: tc.text, maxWidth: 1200 }}>
       <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
-        <h1 style={{ margin: 0 }}>Orchestrator</h1>
+        <h1 style={{ margin: 0 }}>{t("admin.orchestrator")}</h1>
         <div style={{ display: "flex", gap: 8 }}>
-          <a href="/admin/orchestrator/subagents" style={{ padding: "6px 12px", border: `1px solid ${tc.border}`, borderRadius: 4, textDecoration: "none", color: tc.text }}>Sub-agents kinds</a>
-          <button onClick={reload} style={{ padding: "6px 12px", background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4, cursor: "pointer" }}>Reload</button>
+          <a href="/admin/orchestrator/subagents" style={{ padding: "6px 12px", border: `1px solid ${tc.border}`, borderRadius: 4, textDecoration: "none", color: tc.text }}>{t("admin.subAgentsKinds")}</a>
+          <button onClick={reload} style={{ padding: "6px 12px", background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4, cursor: "pointer" }}>{t("admin.reload")}</button>
         </div>
       </header>
 
       {error && <div style={{ background: "#fee2e2", color: "#991b1b", padding: 8, borderRadius: 4, marginBottom: 16 }}>{error}</div>}
-      {loading && <div style={{ color: tc.textMuted }}>Loading...</div>}
+      {loading && <div style={{ color: tc.textMuted }}>{t("admin.loading")}</div>}
 
       <section style={{ marginBottom: 32, background: tc.bgCard, padding: 16, borderRadius: 8, border: `1px solid ${tc.border}` }}>
-        <h2 style={{ marginTop: 0 }}>Feature flags</h2>
+        <h2 style={{ marginTop: 0 }}>{t("admin.featureFlags")}</h2>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 12 }}>
           {TOGGLES.map((t) => {
             const val = settings[t.key] ?? "false";
@@ -141,7 +143,7 @@ export function OrchestratorPanel() {
       </section>
 
       <section style={{ marginBottom: 32, background: tc.bgCard, padding: 16, borderRadius: 8, border: `1px solid ${tc.border}` }}>
-        <h2 style={{ marginTop: 0 }}>Numeric thresholds</h2>
+        <h2 style={{ marginTop: 0 }}>{t("admin.numericThresholds")}</h2>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 12 }}>
           {NUMS.map((n) => (
             <label key={n.key} style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12 }}>
@@ -160,20 +162,20 @@ export function OrchestratorPanel() {
       </section>
 
       <section style={{ background: tc.bgCard, padding: 16, borderRadius: 8, border: `1px solid ${tc.border}` }}>
-        <h2 style={{ marginTop: 0 }}>Plans recenti</h2>
+        <h2 style={{ marginTop: 0 }}>{t("admin.plansRecenti")}</h2>
         {plans.length === 0 ? (
           <div style={{ color: tc.textMuted, fontSize: 12 }}>Nessun plan registrato. Lancia un run con plan_phase_enabled=true.</div>
         ) : (
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
             <thead>
               <tr style={{ borderBottom: `1px solid ${tc.border}` }}>
-                <th style={{ textAlign: "left", padding: 6 }}>Run ID</th>
-                <th style={{ textAlign: "left", padding: 6 }}>Project</th>
-                <th style={{ textAlign: "left", padding: 6 }}>Planner</th>
-                <th style={{ textAlign: "right", padding: 6 }}>Todos</th>
-                <th style={{ textAlign: "right", padding: 6 }}>Verifier</th>
-                <th style={{ textAlign: "right", padding: 6 }}>Sub-agents</th>
-                <th style={{ textAlign: "left", padding: 6 }}>Creato</th>
+                <th style={{ textAlign: "left", padding: 6 }}>{t("admin.runId")}</th>
+                <th style={{ textAlign: "left", padding: 6 }}>{t("admin.project")}</th>
+                <th style={{ textAlign: "left", padding: 6 }}>{t("admin.planner")}</th>
+                <th style={{ textAlign: "right", padding: 6 }}>{t("admin.todos")}</th>
+                <th style={{ textAlign: "right", padding: 6 }}>{t("admin.verifier")}</th>
+                <th style={{ textAlign: "right", padding: 6 }}>{t("admin.subAgents")}</th>
+                <th style={{ textAlign: "left", padding: 6 }}>{t("admin.creato")}</th>
                 <th style={{ padding: 6 }}></th>
               </tr>
             </thead>
@@ -189,7 +191,7 @@ export function OrchestratorPanel() {
                   <td style={{ padding: 6 }}>{p.createdAt?.slice(0, 19).replace("T", " ")}</td>
                   <td style={{ padding: 6 }}>
                     <button onClick={() => setSelectedRunId(p.runId)} style={{ padding: "2px 8px", background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4, cursor: "pointer", fontSize: 11 }}>
-                      Inspect
+                      {t("admin.inspect")}
                     </button>
                   </td>
                 </tr>
