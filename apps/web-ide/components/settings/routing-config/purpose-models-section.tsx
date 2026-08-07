@@ -9,6 +9,7 @@ import {
   type ProviderName,
   type RoutingConfigState,
 } from "./shared";
+import { useI18n } from "../../../lib/i18n";
 
 interface PurposeModelsSectionProps {
   config: RoutingConfigState;
@@ -39,6 +40,7 @@ export function PurposeModelsSection({
   savePurposeModel,
   testPurposeModel,
 }: PurposeModelsSectionProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const { resolved } = useTheme();
 
@@ -46,13 +48,13 @@ export function PurposeModelsSection({
     <div className="card-sm" style={{ background: tc.bgHover }}>
       <div className="flex-row" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
         <div>
-          <div className="text-base font-bold">Purpose models</div>
+          <div className="text-base font-bold">{t("settings.purposeModels")}</div>
           <div className="text-sm text-muted" style={{ marginTop: 3 }}>
             Modelli per task interni (non routing utente). Includono il fallback automatico su loop tool-use.
           </div>
         </div>
-        {purposeLoading && <span className="text-sm text-muted">Caricamento…</span>}
-        {purposeSaved && <span className="text-sm font-semibold" style={{ color: tc.success }}>Salvato ✓</span>}
+        {purposeLoading && <span className="text-sm text-muted">{t("settings.caricamento2")}</span>}
+        {purposeSaved && <span className="text-sm font-semibold" style={{ color: tc.success }}>{t("settings.salvato2")}</span>}
       </div>
       {purposeError && (
         <div style={{
@@ -135,7 +137,7 @@ export function PurposeModelsSection({
                   }));
                 }}
                 style={{ ...inputStyle(tc), padding: "6px 8px", fontSize: 12 }}
-                title="Categoria modello (tier). Statico = modello fisso scelto manualmente."
+                title={t("settings.categoriaModelloTierStatico")}
               >
                 {PURPOSE_TIER_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value}>{opt.label}</option>
@@ -197,7 +199,7 @@ export function PurposeModelsSection({
                   fontSize: 12,
                   whiteSpace: "nowrap",
                 }}
-                title="Salva questo purpose model"
+                title={t("settings.salvaQuestoPurposeModel")}
               >
                 {savingThis ? "…" : "Salva"}
               </button>
@@ -217,7 +219,7 @@ export function PurposeModelsSection({
                     fontSize: 12,
                     whiteSpace: "nowrap",
                   }}
-                  title="Testa la risoluzione runtime del fallback su loop"
+                  title={t("settings.testaLaRisoluzioneRuntime")}
                 >
                   {testBusy ? "…" : "Test"}
                 </button>

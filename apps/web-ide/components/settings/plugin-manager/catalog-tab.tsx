@@ -6,6 +6,7 @@ import { AutoWidthSelect } from "../../auto-width-select";
 import type { CatalogEntry } from "../mcp-catalog-data";
 import { defaultReleaseVersion } from "./plugin-helpers";
 import { actionButtonStyle, inputStyle, selectStyle } from "./plugin-styles";
+import { useI18n } from "../../../lib/i18n";
 
 const SCOPE_OPTIONS = [
   { value: "global", label: "Scope globale" },
@@ -52,13 +53,14 @@ export function CatalogTab({
   onInstall,
   onAddLegacyPreset,
 }: CatalogTabProps) {
+  const { t } = useI18n();
   return (
     <div style={{ display: "grid", gap: 14 }}>
       <div style={{ display: "flex", gap: 10, marginBottom: 4, alignItems: "center" }}>
         <input
           value={catalogSearch}
           onChange={(event) => onCatalogSearchChange(event.target.value)}
-          placeholder="Cerca plugin/preset MCP..."
+          placeholder={t("settings.cercaPluginPresetMcp")}
           style={inputStyle(tc)}
         />
         <AutoWidthSelect
@@ -81,7 +83,7 @@ export function CatalogTab({
             fontWeight: 600,
             whiteSpace: "nowrap",
           }}
-          title="Mostra/nasconde elementi già presenti (installati o già aggiunti come legacy)"
+          title={t("settings.mostraNascondeElementiGia")}
         >
           {showAlreadyPresent ? "Mostra: tutti" : "Mostra: non presenti"}
         </button>
@@ -98,7 +100,7 @@ export function CatalogTab({
         }}
       >
         <div style={{ fontWeight: 700, fontSize: 13, color: tc.text }}>
-          Catalogo plugin curato (installazione plugin)
+          {t("settings.catalogoPluginCuratoInstallazione")}
         </div>
         <div style={{ display: "grid", gap: 10 }}>
           {visibleCuratedCatalog.map((item) => {
@@ -147,7 +149,7 @@ export function CatalogTab({
                         color: "#b45309",
                         textTransform: "uppercase",
                       }}
-                      title="Plugin già installato: reinstallazione bloccata"
+                      title={t("settings.pluginGiaInstallatoReinstallazione")}
                     >
                       duplica bloccata
                     </span>
@@ -213,7 +215,7 @@ export function CatalogTab({
         }}
       >
         <div style={{ fontWeight: 700, fontSize: 13, color: tc.text }}>
-          Catalogo MCP esteso (preset legacy)
+          {t("settings.catalogoMcpEstesoPreset")}
         </div>
         <div style={{ fontSize: 12, color: tc.textMuted }}>
           Se un plugin non è nel catalogo curato, puoi aggiungerlo come MCP legacy e poi migrarlo quando disponibile.

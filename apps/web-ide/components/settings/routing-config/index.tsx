@@ -20,6 +20,7 @@ import { BehaviorModeSection } from "./behavior-mode-section";
 import { PurposeModelsSection } from "./purpose-models-section";
 import { ManualConfigSection } from "./manual-config-section";
 import { NexusActiveRoutingSection } from "./nexus-active-routing-section";
+import { useI18n } from "../../../lib/i18n";
 
 export type { SettingEntry, BehaviorMode, ProviderName, RoutingConfigState };
 export { ROUTING_INTENTS, MANAGED_ROUTING_KEYS };
@@ -30,6 +31,7 @@ interface RoutingConfigProps {
 }
 
 export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const { resolved } = useTheme();
   // Provider e modelli dal registry/catalog (fonte unica, regola G): niente piu'
@@ -258,13 +260,13 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
       <div className="card">
         <div className="flex-row" style={{ justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16, gap: 16 }}>
           <div>
-            <h2 className="text-xl font-bold" style={{ margin: 0 }}>Routing AI</h2>
+            <h2 className="text-xl font-bold" style={{ margin: 0 }}>{t("settings.routingAi")}</h2>
             <p className="text-base text-muted" style={{ margin: "6px 0 0" }}>
               Imposta la gerarchia globale dei provider, i modelli preferiti e gli override per intent. La chat usera questa chain in runtime.
             </p>
           </div>
           <div className="flex-row-gap-8">
-            {saved && <span className="text-sm font-semibold" style={{ color: tc.success }}>Salvato</span>}
+            {saved && <span className="text-sm font-semibold" style={{ color: tc.success }}>{t("settings.salvato")}</span>}
             <button
               onClick={saveRouting}
               disabled={saving}
@@ -361,7 +363,7 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
 
       {extraSettings.length > 0 && (
         <div className="card">
-          <div className="text-xl font-bold" style={{ marginBottom: 6 }}>Routing avanzato</div>
+          <div className="text-xl font-bold" style={{ marginBottom: 6 }}>{t("settings.routingAvanzato")}</div>
           <div className="text-sm text-muted" style={{ marginBottom: 12 }}>
             Qui restano visibili eventuali chiavi extra non gestite dal pannello principale.
           </div>

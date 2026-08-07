@@ -4,6 +4,7 @@ import type { McpServer } from "../../../lib/api-client";
 import type { Theme } from "../../../lib/theme";
 import { detectLegacyMigratableSlug, isNexusBrowserBridgeLocal } from "./plugin-helpers";
 import { actionButtonStyle } from "./plugin-styles";
+import { useI18n } from "../../../lib/i18n";
 
 const BUILTIN_TOOL_HINTS = ["nexus_mcp_tool_search", "nexus_mcp_tool_call"];
 
@@ -43,6 +44,7 @@ export function LegacyMcpList({
   onMigrate,
   onDelete,
 }: LegacyMcpListProps) {
+  const { t } = useI18n();
   return (
     <div style={{ display: "grid", gap: 10 }}>
       <div style={{ fontSize: 12, color: tc.textMuted }}>
@@ -50,7 +52,7 @@ export function LegacyMcpList({
       </div>
       {legacyConnectors.length === 0 && (
         <div style={{ fontSize: 12, color: tc.textMuted }}>
-          Nessun connettore legacy rilevato.
+          {t("settings.nessunConnettoreLegacyRilevato")}
         </div>
       )}
       {legacyConnectors.map((server) => {
@@ -85,12 +87,12 @@ export function LegacyMcpList({
                 {server.enabled ? "enabled" : "disabled"}
               </span>
               {isBuiltin && (
-                <GreenPill title="MCP integrato nel core Nexus (non è un legacy da migrare)">
+                <GreenPill title={t("settings.mcpIntegratoNelCore")}>
                   integrato
                 </GreenPill>
               )}
               {isNexusBridge && !isBuiltin && (
-                <GreenPill title="Connettore locale Nexus Browser Bridge: è già un MCP HTTP pronto all'uso (migrazione non necessaria).">
+                <GreenPill title={t("settings.connettoreLocaleNexusBrowser")}>
                   integrato
                 </GreenPill>
               )}
@@ -109,9 +111,9 @@ export function LegacyMcpList({
                     color: tc.textMuted,
                     fontWeight: 600,
                   }}
-                  title="Tool esposti dal server integrato Nexus Builtin"
+                  title={t("settings.toolEspostiDalServer")}
                 >
-                  Tool disponibili (Nexus Builtin)
+                  {t("settings.toolDisponibiliNexusBuiltin")}
                 </div>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                   {BUILTIN_TOOL_HINTS.map((name) => (
@@ -135,7 +137,7 @@ export function LegacyMcpList({
                   Questi tool servono per scoprire/eseguire tool MCP esterni a runtime (senza inviare tutta la lista al provider).
                 </div>
                 <div style={{ fontSize: 11, color: tc.textMuted }}>
-                  Elenco completo: <strong>Admin → Template Prompt → MCP Tools → Tool disponibili</strong>.
+                  {t("settings.elencoCompleto")} <strong>{t("settings.adminTemplatePromptMcp")}</strong>.
                 </div>
               </div>
             )}

@@ -3,6 +3,7 @@
 import React from "react";
 import { useThemeColors } from "../../lib/theme";
 import type { SettingEntry } from "./provider-settings";
+import { useI18n } from "../../lib/i18n";
 
 interface SecuritySettingsProps {
   items: SettingEntry[];
@@ -50,6 +51,7 @@ const TIER_INFO = [
 ];
 
 export function SecuritySettings({ items, editValues, saving, saved, onEditChange, onSave }: SecuritySettingsProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
 
   const securityItems = items.filter((i) => SECURITY_META[i.key]);
@@ -247,14 +249,14 @@ export function SecuritySettings({ items, editValues, saving, saved, onEditChang
       ) : (
         <>
           <div style={{ fontSize: 12, fontWeight: 600, color: tc.textMuted, marginBottom: 10, textTransform: "uppercase", letterSpacing: 1 }}>
-            Policy DLP
+            {t("settings.policyDlp")}
           </div>
           {securityItems
             .filter((i) => SECURITY_META[i.key]?.type === "bool" && i.key.startsWith("dlp_"))
             .map(renderBoolSetting)}
 
           <div style={{ fontSize: 12, fontWeight: 600, color: tc.textMuted, marginBottom: 10, marginTop: 20, textTransform: "uppercase", letterSpacing: 1 }}>
-            Provider Locale (Ollama)
+            {t("settings.providerLocaleOllama")}
           </div>
           {securityItems
             .filter((i) => i.key.startsWith("ollama_") && SECURITY_META[i.key]?.type === "bool")

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useI18n } from "../../lib/i18n";
 
 /**
  * Budget mensile per provider.
@@ -149,6 +150,7 @@ export function ProviderBudgetRow({
   onRecharge,
   compact,
 }: ProviderBudgetRowProps) {
+  const { t } = useI18n();
   const budget = parseFloat(it.monthly_budget_usd);
   const spent = parseFloat(it.spent_usd);
   const remaining = parseFloat(it.remaining_usd);
@@ -188,25 +190,25 @@ export function ProviderBudgetRow({
         {draft ? (
           <>
             <label>
-              Budget $: <input type="number" min="0" step="0.01" value={draft.budget} onChange={(e) => setEditing((s) => ({ ...s, [it.provider]: { ...draft, budget: e.target.value } }))} style={{ width: 80 }} />
+              {t("settings.budget")} <input type="number" min="0" step="0.01" value={draft.budget} onChange={(e) => setEditing((s) => ({ ...s, [it.provider]: { ...draft, budget: e.target.value } }))} style={{ width: 80 }} />
             </label>
             <label>
-              Soglia $: <input type="number" min="0" step="0.01" value={draft.threshold} onChange={(e) => setEditing((s) => ({ ...s, [it.provider]: { ...draft, threshold: e.target.value } }))} style={{ width: 60 }} />
+              {t("settings.soglia")} <input type="number" min="0" step="0.01" value={draft.threshold} onChange={(e) => setEditing((s) => ({ ...s, [it.provider]: { ...draft, threshold: e.target.value } }))} style={{ width: 60 }} />
             </label>
             <button onClick={() => onSetBudget(it.provider)} disabled={busy} style={btnStyle("primary")}>
-              Salva
+              {t("settings.salva")}
             </button>
             <button onClick={() => setEditing((s) => { const { [it.provider]: _removed, ...r } = s; return r; })} style={btnStyle("ghost")}>
-              Annulla
+              {t("settings.annulla")}
             </button>
           </>
         ) : (
           <>
             <button onClick={() => setEditing((s) => ({ ...s, [it.provider]: { budget: hasBudget ? it.monthly_budget_usd : "", threshold: it.min_threshold_usd } }))} style={btnStyle("ghost")}>
-              Imposta budget
+              {t("settings.impostaBudget")}
             </button>
             <button onClick={() => onRecharge(it.provider)} disabled={busy || !configured} style={btnStyle("ghost")} title={configured ? "Reset spent + period_start dopo ricarica reale" : "Imposta prima un budget"}>
-              Ricarica
+              {t("settings.ricarica")}
             </button>
             <span style={{ color: "var(--color-textMuted)" }}>
               {configured
@@ -222,11 +224,12 @@ export function ProviderBudgetRow({
 
 /** Pannello standalone "Budget mensile provider" (usato fuori dalle card). */
 export function ProviderBudget() {
+  const { t } = useI18n();
   const { items, editing, setEditing, busy, error, setBudget, recharge } = useProviderBudgets();
 
   return (
     <div style={{ marginTop: 40, borderTop: "1px solid var(--color-border)", paddingTop: 24 }}>
-      <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 6 }}>Budget mensile provider</h2>
+      <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 6 }}>{t("settings.budgetMensileProvider")}</h2>
       <p style={{ fontSize: 13, color: "var(--color-textMuted)", marginBottom: 20 }}>
         I provider AI consumer non espongono balance via API. Imposta tu il budget mensile (USD)
         quando ricarichi l&apos;account: ogni chiamata viene sottratta. Quando il residuo scende sotto

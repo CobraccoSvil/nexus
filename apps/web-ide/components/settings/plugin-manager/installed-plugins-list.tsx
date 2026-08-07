@@ -10,6 +10,7 @@ import { AutoWidthSelect } from "../../auto-width-select";
 import { healthColor } from "./plugin-helpers";
 import { actionButtonStyle, inputStyle, selectStyle } from "./plugin-styles";
 import type { PluginTestStatus } from "./types";
+import { useI18n } from "../../../lib/i18n";
 
 interface InstalledPluginsListProps {
   tc: Theme;
@@ -48,11 +49,12 @@ export function InstalledPluginsList({
   onRollback,
   onUninstall,
 }: InstalledPluginsListProps) {
+  const { t } = useI18n();
   return (
     <div style={{ display: "grid", gap: 10 }}>
       {installed.length === 0 && (
         <div className="text-sm text-muted">
-          Nessun plugin installato.
+          {t("settings.nessunPluginInstallato")}
         </div>
       )}
       {installed.map((plugin) => {
@@ -147,7 +149,7 @@ export function InstalledPluginsList({
                 }}
               >
                 <div style={{ fontWeight: 700, fontSize: 12, color: tc.warning }}>
-                  Chiavi mancanti per usare questo MCP
+                  {t("settings.chiaviMancantiPerUsare")}
                 </div>
                 <div style={{ fontSize: 12, color: tc.textMuted }}>
                   Inserisci le chiavi richieste qui sotto. Sono salvate lato server e non vengono restituite in chiaro.
@@ -160,7 +162,7 @@ export function InstalledPluginsList({
                     <input
                       type="password"
                       value={secretDrafts[key] ?? ""}
-                      placeholder="Inserisci valore segreto"
+                      placeholder={t("settings.inserisciValoreSegreto")}
                       onChange={(event) => onSecretDraftChange(key, event.target.value)}
                       style={inputStyle(tc)}
                     />
@@ -192,7 +194,7 @@ export function InstalledPluginsList({
                 onClick={() => onTest(plugin)}
                 style={actionButtonStyle(tc, isBusy || !plugin.canManage)}
               >
-                Test
+                {t("settings.test")}
               </button>
               <AutoWidthSelect
                 value={selectedVersion}
@@ -207,7 +209,7 @@ export function InstalledPluginsList({
                 onClick={() => onUpdateVersion(plugin)}
                 style={actionButtonStyle(tc, isBusy || !plugin.canManage || !selectedVersion)}
               >
-                Aggiorna
+                {t("settings.aggiorna")}
               </button>
               <button
                 type="button"
@@ -215,7 +217,7 @@ export function InstalledPluginsList({
                 onClick={() => onRollback(plugin)}
                 style={actionButtonStyle(tc, isBusy || !plugin.canManage)}
               >
-                Rollback
+                {t("settings.rollback")}
               </button>
               <button
                 type="button"
@@ -223,7 +225,7 @@ export function InstalledPluginsList({
                 onClick={() => onUninstall(plugin)}
                 style={actionButtonStyle(tc, isBusy || !plugin.canManage)}
               >
-                Disinstalla
+                {t("settings.disinstalla")}
               </button>
             </div>
           </div>

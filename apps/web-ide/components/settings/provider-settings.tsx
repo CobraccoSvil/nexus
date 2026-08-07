@@ -88,6 +88,7 @@ export interface ProviderSettingsProps {
  *  Estratto per essere mostrato una sola volta a livello superiore
  *  (providers-overview) quando ProviderSettings e' istanziato piu' volte. */
 export function GatewayStatusBanner({ providers }: { providers?: GatewayProvider[] }) {
+  const { t } = useI18n();
   if (!providers || providers.length === 0) return null;
   return (
     <div style={{
@@ -101,7 +102,7 @@ export function GatewayStatusBanner({ providers }: { providers?: GatewayProvider
         fontSize: 11, color: "var(--color-textMuted)", fontWeight: 600,
         letterSpacing: "0.07em", textTransform: "uppercase", marginRight: 4,
       }}>
-        Gateway
+        {t("settings.gateway")}
       </span>
       {providers.map((p) => (
         <div key={p.name} style={{
@@ -435,7 +436,7 @@ export function ProviderSettings({
                         {isError && (
                           <button
                             onClick={() => onReloadProvider(providerName)}
-                            title="Azzera il cooldown (utile dopo billing recharge) e ri-testa il provider"
+                            title={t("settings.azzeraIlCooldownUtile")}
                             style={{
                               padding: "3px 8px",
                               borderRadius: 6,
@@ -455,7 +456,7 @@ export function ProviderSettings({
                             href={billingUrl}
                             target="_blank"
                             rel="noopener noreferrer"
-                            title="Apri console billing"
+                            title={t("settings.apriConsoleBilling")}
                             style={{
                               padding: "3px 7px",
                               borderRadius: 6,
@@ -503,7 +504,7 @@ export function ProviderSettings({
                         fontFamily: "inherit",
                       }}
                     >
-                      Sfoglia
+                      {t("settings.sfoglia")}
                     </button>
                   )}
                   {isEditing && (
@@ -632,7 +633,7 @@ export function ProviderSettings({
                       }}
                     >
                       <option value="all-MiniLM-L6-v2">all-MiniLM-L6-v2 (curato)</option>
-                      <option value="__custom__">Custom…</option>
+                      <option value="__custom__">{t("settings.custom")}</option>
                     </select>
 
                     <button
@@ -668,7 +669,7 @@ export function ProviderSettings({
                         fontFamily: "inherit",
                         opacity: embeddingBusy ? 0.7 : 1,
                       }}
-                      title="Verifica che il modello sia caricabile e legge la dimensione embeddings"
+                      title={t("settings.verificaCheIlModello")}
                     >
                       {embeddingBusy ? "..." : "Valida"}
                     </button>
@@ -708,7 +709,7 @@ export function ProviderSettings({
                         fontFamily: "inherit",
                         opacity: embeddingBusy ? 0.7 : 1,
                       }}
-                      title="Applica il modello e fa reindex (reset della collection dedicata)"
+                      title={t("settings.applicaIlModelloE")}
                     >
                       {embeddingBusy ? "..." : "Applica + Reindex"}
                     </button>
@@ -718,7 +719,7 @@ export function ProviderSettings({
                     <input
                       type="text"
                       value={currentValue}
-                      placeholder="es. sentence-transformers/all-MiniLM-L6-v2 oppure BAAI/bge-small-en-v1.5"
+                      placeholder={t("settings.esSentenceTransformersAll")}
                       onChange={(event) => onEditChange(setting.key, event.target.value)}
                       style={{
                         width: "100%",
@@ -777,7 +778,7 @@ export function ProviderSettings({
                       </option>
                     )}
                     {modelCatalogStatus === "loading" && modelCatalog.length === 0 && (
-                      <option value="" disabled>Caricamento modelli...</option>
+                      <option value="" disabled>{t("settings.caricamentoModelli")}</option>
                     )}
                     {/* Raggruppati per provider */}
                     {Array.from(new Set(modelCatalog.map((m) => m.provider))).sort().map((provider) => (
@@ -869,7 +870,7 @@ export function ProviderSettings({
                 gap: 8,
               }}
             >
-              <strong style={{ fontSize: 14 }}>Seleziona root progetti</strong>
+              <strong style={{ fontSize: 14 }}>{t("settings.selezionaRootProgetti")}</strong>
               <button
                 onClick={onCloseBrowse}
                 style={{
@@ -882,7 +883,7 @@ export function ProviderSettings({
                   fontFamily: "inherit",
                 }}
               >
-                Chiudi
+                {t("settings.chiudi")}
               </button>
             </div>
 
@@ -925,7 +926,7 @@ export function ProviderSettings({
                   fontFamily: "inherit",
                 }}
               >
-                Su
+                {t("settings.su")}
               </button>
               <button
                 disabled={!browseData || browseBusy}
@@ -944,7 +945,7 @@ export function ProviderSettings({
                   fontFamily: "inherit",
                 }}
               >
-                Usa questa cartella
+                {t("settings.usaQuestaCartella")}
               </button>
             </div>
 
@@ -952,7 +953,7 @@ export function ProviderSettings({
               <input
                 value={newDirectoryName}
                 onChange={(event) => onSetNewDirectoryName(event.target.value)}
-                placeholder="Nuova directory"
+                placeholder={t("settings.nuovaDirectory")}
                 style={{
                   flex: 1,
                   minWidth: 0,
@@ -980,7 +981,7 @@ export function ProviderSettings({
                   fontFamily: "inherit",
                 }}
               >
-                Crea cartella
+                {t("settings.creaCartella")}
               </button>
             </div>
 
@@ -997,7 +998,7 @@ export function ProviderSettings({
               }}
             >
               {browseBusy ? (
-                <div style={{ padding: 10, fontSize: 12, color: "var(--color-textMuted)" }}>Caricamento...</div>
+                <div style={{ padding: 10, fontSize: 12, color: "var(--color-textMuted)" }}>{t("settings.caricamento")}</div>
               ) : browseError ? (
                 <div style={{ padding: 10, fontSize: 12, color: "var(--color-error)" }}>{browseError}</div>
               ) : browseData && browseData.directories.length > 0 ? (
@@ -1023,7 +1024,7 @@ export function ProviderSettings({
                 ))
               ) : (
                 <div style={{ padding: 10, fontSize: 12, color: "var(--color-textMuted)" }}>
-                  Nessuna sottodirectory disponibile.
+                  {t("settings.nessunaSottodirectoryDisponibile")}
                 </div>
               )}
             </div>

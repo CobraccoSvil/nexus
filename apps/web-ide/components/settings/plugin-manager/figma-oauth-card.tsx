@@ -3,6 +3,7 @@
 import type { FigmaOAuthStatus } from "../../../lib/api-client";
 import type { Theme } from "../../../lib/theme";
 import { actionButtonStyle } from "./plugin-styles";
+import { useI18n } from "../../../lib/i18n";
 
 interface FigmaOAuthCardProps {
   tc: Theme;
@@ -21,11 +22,12 @@ export function FigmaOAuthCard({
   onStartOAuth,
   onToggleStdioFallback,
 }: FigmaOAuthCardProps) {
+  const { t } = useI18n();
   return (
     <div className="card-sm flex-col-gap-8" style={{ marginBottom: 14 }}>
       <div className="flex-row-gap-8" style={{ flexWrap: "wrap" }}>
         <div className="text-base font-bold">
-          Figma MCP OAuth
+          {t("settings.figmaMcpOauth")}
         </div>
         <span
           style={{
@@ -62,7 +64,7 @@ export function FigmaOAuthCard({
         )}
       </div>
       <div className="text-sm text-muted">
-        Se usi Figma MCP remoto serve OAuth con scope <code>mcp:connect</code>. In alternativa puoi usare il fallback
+        {t("settings.seUsiFigmaMcp")} <code>mcp:connect</code>. In alternativa puoi usare il fallback
         locale <code>figma-developer-mcp</code>.
       </div>
       {figmaOAuthStatus?.lastError && (
@@ -93,7 +95,7 @@ export function FigmaOAuthCard({
           onClick={() => onToggleStdioFallback(!figmaPreferStdio)}
           disabled={busyKey === "figma-stdio-toggle"}
           style={actionButtonStyle(tc, busyKey === "figma-stdio-toggle")}
-          title="Abilita/disabilita fallback stdio Figma"
+          title={t("settings.abilitaDisabilitaFallbackStdio")}
         >
           {busyKey === "figma-stdio-toggle"
             ? "Aggiorno..."

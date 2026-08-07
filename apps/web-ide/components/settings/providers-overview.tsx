@@ -14,6 +14,7 @@ import {
   type SettingEntry,
 } from "./provider-settings";
 import { useProviderBudgets, ProviderBudgetRow } from "./provider-budget";
+import { useI18n } from "../../lib/i18n";
 
 // Etichetta leggibile di un provider (fallback: capitalizza il nome grezzo).
 function labelProvider(name: string): string {
@@ -112,6 +113,7 @@ function CollapsibleSection({
  * ProviderSettings (nessun fetch duplicato).
  */
 export function ProvidersOverview(props: ProviderSettingsProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const { items, gatewayProviders } = props;
   const [registry, setRegistry] = useState<ProviderRegistryEntry[]>([]);
@@ -178,14 +180,14 @@ export function ProvidersOverview(props: ProviderSettingsProps) {
       )}
 
       <CollapsibleSection
-        title="Impostazioni avanzate (globali)"
+        title={t("settings.impostazioniAvanzateGlobali")}
         subtitle={`${advanced.length} chiavi — cooldown, circuit breaker, timeout, cache`}
       >
         <ProviderSettings {...shared} items={advanced} />
       </CollapsibleSection>
 
       {other.length > 0 && (
-        <CollapsibleSection title="Altri setting" subtitle={`${other.length} chiavi`}>
+        <CollapsibleSection title={t("settings.altriSetting")} subtitle={`${other.length} chiavi`}>
           <ProviderSettings {...shared} items={other} />
         </CollapsibleSection>
       )}

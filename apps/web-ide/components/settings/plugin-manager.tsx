@@ -49,8 +49,10 @@ import {
 } from "./plugin-manager/plugin-helpers";
 import { PolicyTab } from "./plugin-manager/policy-tab";
 import type { ManagerTab, PluginTestStatus, PolicyDraft } from "./plugin-manager/types";
+import { useI18n } from "../../lib/i18n";
 
 export function PluginManager() {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const { confirmDialog, promptDialog } = useGlobalDialog();
 
@@ -724,13 +726,13 @@ export function PluginManager() {
   ];
 
   if (loading) {
-    return <div className="text-base text-muted">Caricamento Plugin Manager...</div>;
+    return <div className="text-base text-muted">{t("settings.caricamentoPluginManager")}</div>;
   }
 
   return (
     <div>
       <div style={{ marginBottom: 12 }}>
-        <div className="text-xl font-bold">Plugin Manager (MCP)</div>
+        <div className="text-xl font-bold">{t("settings.pluginManagerMcp")}</div>
         <div className="text-sm text-muted" style={{ marginTop: 4 }}>
           Catalogo curato, versioni pin, policy tool, health test, migrazione MCP legacy e gestione chiavi.
         </div>
@@ -811,7 +813,7 @@ export function PluginManager() {
             cursor: "pointer",
             opacity: busyKey === "integrate:draft" || busyKey === "integrate:publish" ? 0.7 : 1,
           }}
-          title="Crea una entry nel catalogo via tool discovery"
+          title={t("settings.creaUnaEntryNel")}
         >
           {busyKey === "integrate:draft"
             ? "Integro…"

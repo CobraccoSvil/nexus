@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useThemeColors } from "../../lib/theme";
 import { useHealthSnapshot } from "../../lib/hooks/use-health-snapshot";
+import { useI18n } from "../../lib/i18n";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
@@ -86,6 +87,7 @@ function formatUs(us: number): string {
 }
 
 export function NexusMetricsPanel() {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [stats, setStats] = useState<NexusStats | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -184,7 +186,7 @@ export function NexusMetricsPanel() {
             return (
               <>
                 <div style={{ fontSize: 12, fontWeight: 700, color: tc.textSecondary, marginBottom: 2 }}>
-                  Stato appreso (persistente)
+                  {t("settings.statoAppresoPersistente")}
                 </div>
                 <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 8 }}>
                   Conoscenza Q-Learning accumulata nel DB — non si azzera ai riavvii del backend.
@@ -224,7 +226,7 @@ export function NexusMetricsPanel() {
           })()}
 
           {/* Router Q-Learning stats */}
-          <div style={{ fontSize: 12, fontWeight: 700, color: tc.textSecondary, marginBottom: 2 }}>Router Q-Learning — sessione corrente</div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: tc.textSecondary, marginBottom: 2 }}>{t("settings.routerQLearningSessione")}</div>
           <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 8 }}>
             Contatori da quando il backend e&apos; stato avviato (azzerati a ogni restart).
           </div>
@@ -281,7 +283,7 @@ export function NexusMetricsPanel() {
           {r && r.total_decisions > 0 && (
             <div style={{ marginBottom: 16 }}>
               <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 6, fontWeight: 500 }}>
-                Distribuzione routing
+                {t("settings.distribuzioneRouting")}
               </div>
               <div style={{ display: "flex", height: 10, borderRadius: 6, overflow: "hidden", background: tc.bgHover }}>
                 <div
@@ -324,7 +326,7 @@ export function NexusMetricsPanel() {
           )}
 
           {/* Scheduler summary */}
-          <div style={{ fontSize: 12, fontWeight: 700, color: tc.textSecondary, marginBottom: 8 }}>Learning Workers</div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: tc.textSecondary, marginBottom: 8 }}>{t("settings.learningWorkers")}</div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <StatCard
               label="Workers attivi"

@@ -4,6 +4,7 @@ import type { PluginInstance, PluginToolPolicy } from "../../../lib/api-client";
 import type { Theme } from "../../../lib/theme";
 import { actionButtonStyle, inputStyle, selectStyle } from "./plugin-styles";
 import type { PolicyDraft } from "./types";
+import { useI18n } from "../../../lib/i18n";
 
 interface PolicyTabProps {
   tc: Theme;
@@ -22,10 +23,11 @@ export function PolicyTab({
   onPolicyDraftChange,
   onSavePolicy,
 }: PolicyTabProps) {
+  const { t } = useI18n();
   return (
     <div style={{ display: "grid", gap: 10 }}>
       {installed.length === 0 && (
-        <div style={{ color: tc.textMuted, fontSize: 12 }}>Nessun plugin installato.</div>
+        <div style={{ color: tc.textMuted, fontSize: 12 }}>{t("settings.nessunPluginInstallato")}</div>
       )}
       {installed.map((plugin) => {
         const draft = policyDrafts[plugin.id] ?? {
@@ -58,15 +60,15 @@ export function PolicyTab({
                 }
                 style={selectStyle(tc)}
               >
-                <option value="all">All</option>
-                <option value="allowlist">Allowlist</option>
-                <option value="denylist">Denylist</option>
+                <option value="all">{t("settings.all")}</option>
+                <option value="allowlist">{t("settings.allowlist")}</option>
+                <option value="denylist">{t("settings.denylist")}</option>
               </select>
               <input
                 value={draft.tools}
                 disabled={!plugin.canManage}
                 onChange={(event) => onPolicyDraftChange(plugin.id, { ...draft, tools: event.target.value })}
-                placeholder="Tool consentiti (CSV)"
+                placeholder={t("settings.toolConsentitiCsv")}
                 style={inputStyle(tc)}
               />
               <input
@@ -75,7 +77,7 @@ export function PolicyTab({
                 onChange={(event) =>
                   onPolicyDraftChange(plugin.id, { ...draft, blockedTools: event.target.value })
                 }
-                placeholder="Tool bloccati (CSV)"
+                placeholder={t("settings.toolBloccatiCsv")}
                 style={inputStyle(tc)}
               />
               <div>

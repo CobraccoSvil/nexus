@@ -1,0 +1,747 @@
+[
+  {
+    "chiave": "settings.sfoglia",
+    "it": "Sfoglia",
+    "en": "Browse",
+    "es": "Examinar",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "settings.annulla",
+    "it": "Annulla",
+    "en": "Cancel",
+    "es": "Cancelar",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "settings.nessunPluginInstallato",
+    "it": "Nessun plugin installato.",
+    "en": "No plugins installed.",
+    "es": "Ningun plugin instalado.",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "settings.caricamentoModelli",
+    "it": "Caricamento modelli...",
+    "en": "Loading models...",
+    "es": "Cargando modelos...",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "settings.salvato",
+    "it": "Salvato",
+    "en": "Saved",
+    "es": "Guardado",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "settings.giu",
+    "it": "Giu",
+    "en": "Down",
+    "es": "Abajo",
+    "occorrenze": 2
+  },
+  {
+    "chiave": "settings.scaricaUltimoJsonLitellm",
+    "it": "Scarica ultimo JSON LiteLLM e fa upsert in ai_price_catalog",
+    "en": "Download the latest LiteLLM JSON and upsert into ai_price_catalog",
+    "es": "Descarga el ultimo JSON de LiteLLM y hace upsert en ai_price_catalog",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.pingaOgniModelloEnabled",
+    "it": "Pinga ogni modello enabled, auto-disabilita quelli broken",
+    "en": "Ping every enabled model, auto-disable the broken ones",
+    "es": "Hace ping a cada modelo habilitado y deshabilita los rotos",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.catalogoModelli",
+    "it": "Catalogo modelli",
+    "en": "Model catalog",
+    "es": "Catalogo de modelos",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.probeCompletatoSu",
+    "it": "Probe completato su",
+    "en": "Probe completed on",
+    "es": "Sondeo completado en",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.salvaNelDbPoi",
+    "it": "Salva nel DB (poi usa 'Ricarica dal DB' sopra)",
+    "en": "Save to the DB (then use 'Reload from DB' above)",
+    "es": "Guarda en la BD (luego usa 'Recargar desde BD' arriba)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.hotReloadConfigurazione",
+    "it": "Hot-Reload Configurazione",
+    "en": "Configuration hot reload",
+    "es": "Recarga en caliente de la configuracion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.providerLlm",
+    "it": "Provider LLM",
+    "en": "LLM providers",
+    "es": "Proveedores LLM",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.impostazioniGateway",
+    "it": "Impostazioni Gateway",
+    "en": "Gateway settings",
+    "es": "Ajustes del gateway",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.leApiKeyE",
+    "it": "Le API key e i flag provider si gestiscono in",
+    "en": "API keys and provider flags are managed in",
+    "es": "Las claves API y los indicadores de proveedor se gestionan en",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.providers",
+    "it": "Providers",
+    "en": "Providers",
+    "es": "Proveedores",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.routing",
+    "it": "Routing",
+    "en": "Routing",
+    "es": "Enrutamiento",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.ricaricaDalDb",
+    "it": "Ricarica dal DB",
+    "en": "Reload from DB",
+    "es": "Recargar desde BD",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.passwordSudo",
+    "it": "Password sudo...",
+    "en": "sudo password...",
+    "es": "Contrasena de sudo...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.aggiornamentoAutomaticoOgni30s",
+    "it": "Aggiornamento automatico ogni 30s",
+    "en": "Auto-refresh every 30s",
+    "es": "Actualizacion automatica cada 30 s",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.copia",
+    "it": "Copia",
+    "en": "Copy",
+    "es": "Copiar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.cliccaAggiornaPerVerificare",
+    "it": "Clicca Aggiorna per verificare l&apos;ambiente.",
+    "en": "Click Refresh to check the environment.",
+    "es": "Haz clic en Actualizar para comprobar el entorno.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.passwordSudoRichiesta",
+    "it": "Password sudo richiesta",
+    "en": "sudo password required",
+    "es": "Se requiere contrasena de sudo",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.statoAppresoPersistente",
+    "it": "Stato appreso (persistente)",
+    "en": "Learned state (persistent)",
+    "es": "Estado aprendido (persistente)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.routerQLearningSessione",
+    "it": "Router Q-Learning — sessione corrente",
+    "en": "Q-Learning router - current session",
+    "es": "Router Q-Learning - sesion actual",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.distribuzioneRouting",
+    "it": "Distribuzione routing",
+    "en": "Routing distribution",
+    "es": "Distribucion del enrutamiento",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.learningWorkers",
+    "it": "Learning Workers",
+    "en": "Learning workers",
+    "es": "Workers de aprendizaje",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.ontaskcomplete",
+    "it": "OnTaskComplete",
+    "en": "OnTaskComplete",
+    "es": "OnTaskComplete",
+    "occorrenze": 1,
+    "neutro": true
+  },
+  {
+    "chiave": "settings.periodic",
+    "it": "Periodic",
+    "en": "Periodic",
+    "es": "Periodico",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.cercaPluginPresetMcp",
+    "it": "Cerca plugin/preset MCP...",
+    "en": "Search MCP plugins/presets...",
+    "es": "Buscar plugins/presets MCP...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.mostraNascondeElementiGia",
+    "it": "Mostra/nasconde elementi già presenti (installati o già aggiunti come legacy)",
+    "en": "Show/hide items already present (installed or already added as legacy)",
+    "es": "Muestra/oculta elementos ya presentes (instalados o anadidos como legacy)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.pluginGiaInstallatoReinstallazione",
+    "it": "Plugin già installato: reinstallazione bloccata",
+    "en": "Plugin already installed: reinstall blocked",
+    "es": "Plugin ya instalado: reinstalacion bloqueada",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.catalogoPluginCuratoInstallazione",
+    "it": "Catalogo plugin curato (installazione plugin)",
+    "en": "Curated plugin catalog (plugin installation)",
+    "es": "Catalogo de plugins curado (instalacion de plugins)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.catalogoMcpEstesoPreset",
+    "it": "Catalogo MCP esteso (preset legacy)",
+    "en": "Extended MCP catalog (legacy presets)",
+    "es": "Catalogo MCP extendido (presets legacy)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.abilitaDisabilitaFallbackStdio",
+    "it": "Abilita/disabilita fallback stdio Figma",
+    "en": "Enable/disable the Figma stdio fallback",
+    "es": "Activa/desactiva el respaldo stdio de Figma",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.figmaMcpOauth",
+    "it": "Figma MCP OAuth",
+    "en": "Figma MCP OAuth",
+    "es": "OAuth de Figma MCP",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.seUsiFigmaMcp",
+    "it": "Se usi Figma MCP remoto serve OAuth con scope",
+    "en": "Remote Figma MCP requires OAuth with scope",
+    "es": "El MCP remoto de Figma requiere OAuth con alcance",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.inserisciValoreSegreto",
+    "it": "Inserisci valore segreto",
+    "en": "Enter secret value",
+    "es": "Introduce el valor secreto",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.chiaviMancantiPerUsare",
+    "it": "Chiavi mancanti per usare questo MCP",
+    "en": "Keys missing to use this MCP",
+    "es": "Faltan claves para usar este MCP",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.test",
+    "it": "Test",
+    "en": "Test",
+    "es": "Probar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.aggiorna",
+    "it": "Aggiorna",
+    "en": "Refresh",
+    "es": "Actualizar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.rollback",
+    "it": "Rollback",
+    "en": "Roll back",
+    "es": "Revertir",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.disinstalla",
+    "it": "Disinstalla",
+    "en": "Uninstall",
+    "es": "Desinstalar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.mcpIntegratoNelCore",
+    "it": "MCP integrato nel core Nexus (non è un legacy da migrare)",
+    "en": "MCP built into the Nexus core (not a legacy one to migrate)",
+    "es": "MCP integrado en el nucleo de Nexus (no es un legacy a migrar)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.connettoreLocaleNexusBrowser",
+    "it": "Connettore locale Nexus Browser Bridge: è già un MCP HTTP pronto all'uso (migrazione non necessaria).",
+    "en": "Local Nexus Browser Bridge connector: already a ready-to-use HTTP MCP (no migration needed).",
+    "es": "Conector local Nexus Browser Bridge: ya es un MCP HTTP listo para usar (no requiere migracion).",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.toolEspostiDalServer",
+    "it": "Tool esposti dal server integrato Nexus Builtin",
+    "en": "Tools exposed by the built-in Nexus server",
+    "es": "Herramientas expuestas por el servidor integrado de Nexus",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.nessunConnettoreLegacyRilevato",
+    "it": "Nessun connettore legacy rilevato.",
+    "en": "No legacy connectors detected.",
+    "es": "No se han detectado conectores legacy.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.toolDisponibiliNexusBuiltin",
+    "it": "Tool disponibili (Nexus Builtin)",
+    "en": "Available tools (Nexus built-in)",
+    "es": "Herramientas disponibles (Nexus integrado)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.elencoCompleto",
+    "it": "Elenco completo:",
+    "en": "Full list:",
+    "es": "Lista completa:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.adminTemplatePromptMcp",
+    "it": "Admin → Template Prompt → MCP Tools → Tool disponibili",
+    "en": "Admin -> Prompt templates -> MCP tools -> Available tools",
+    "es": "Admin -> Plantillas de prompt -> Herramientas MCP -> Herramientas disponibles",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.toolConsentitiCsv",
+    "it": "Tool consentiti (CSV)",
+    "en": "Allowed tools (CSV)",
+    "es": "Herramientas permitidas (CSV)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.toolBloccatiCsv",
+    "it": "Tool bloccati (CSV)",
+    "en": "Blocked tools (CSV)",
+    "es": "Herramientas bloqueadas (CSV)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.all",
+    "it": "All",
+    "en": "All",
+    "es": "Todas",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.allowlist",
+    "it": "Allowlist",
+    "en": "Allowlist",
+    "es": "Lista de permitidos",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.denylist",
+    "it": "Denylist",
+    "en": "Denylist",
+    "es": "Lista de bloqueados",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.creaUnaEntryNel",
+    "it": "Crea una entry nel catalogo via tool discovery",
+    "en": "Create a catalog entry via tool discovery",
+    "es": "Crea una entrada del catalogo mediante descubrimiento de herramientas",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.caricamentoPluginManager",
+    "it": "Caricamento Plugin Manager...",
+    "en": "Loading Plugin Manager...",
+    "es": "Cargando el gestor de plugins...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.pluginManagerMcp",
+    "it": "Plugin Manager (MCP)",
+    "en": "Plugin manager (MCP)",
+    "es": "Gestor de plugins (MCP)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.budget",
+    "it": "Budget $:",
+    "en": "Budget $:",
+    "es": "Presupuesto $:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.soglia",
+    "it": "Soglia $:",
+    "en": "Threshold $:",
+    "es": "Umbral $:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.salva",
+    "it": "Salva",
+    "en": "Save",
+    "es": "Guardar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.impostaBudget",
+    "it": "Imposta budget",
+    "en": "Set budget",
+    "es": "Establecer presupuesto",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.ricarica",
+    "it": "Ricarica",
+    "en": "Reload",
+    "es": "Recargar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.budgetMensileProvider",
+    "it": "Budget mensile provider",
+    "en": "Monthly provider budget",
+    "es": "Presupuesto mensual del proveedor",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.laBatteriaNonHa",
+    "it": "La batteria non ha (ancora) qualificato questo modello: col gate acceso resta fuori dal routing agentico",
+    "en": "The qualification suite has not qualified this model yet: with the gate on it stays out of agentic routing",
+    "es": "La bateria aun no ha cualificado este modelo: con el gate activo queda fuera del enrutamiento agentico",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.curatelaDelTierVince",
+    "it": "Curatela del tier: vince su indice e batteria. Vuoto = nessun override (decidono le fonti automatiche).",
+    "en": "Tier curation: overrides index and qualification suite. Empty = no override (automatic sources decide).",
+    "es": "Curacion del tier: prevalece sobre el indice y la bateria. Vacio = sin anulacion (deciden las fuentes automaticas).",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.modelli",
+    "it": "Modelli",
+    "en": "Models",
+    "es": "Modelos",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.azzeraIlCooldownUtile",
+    "it": "Azzera il cooldown (utile dopo billing recharge) e ri-testa il provider",
+    "en": "Clear the cooldown (useful after a billing recharge) and re-test the provider",
+    "es": "Restablece el enfriamiento (util tras recargar el saldo) y vuelve a probar el proveedor",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.apriConsoleBilling",
+    "it": "Apri console billing",
+    "en": "Open billing console",
+    "es": "Abrir la consola de facturacion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.verificaCheIlModello",
+    "it": "Verifica che il modello sia caricabile e legge la dimensione embeddings",
+    "en": "Check that the model can be loaded and read the embedding size",
+    "es": "Comprueba que el modelo se pueda cargar y lee el tamano de los embeddings",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.applicaIlModelloE",
+    "it": "Applica il modello e fa reindex (reset della collection dedicata)",
+    "en": "Apply the model and reindex (resets the dedicated collection)",
+    "es": "Aplica el modelo y reindexa (reinicia la coleccion dedicada)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.esSentenceTransformersAll",
+    "it": "es. sentence-transformers/all-MiniLM-L6-v2 oppure BAAI/bge-small-en-v1.5",
+    "en": "e.g. sentence-transformers/all-MiniLM-L6-v2 or BAAI/bge-small-en-v1.5",
+    "es": "p. ej. sentence-transformers/all-MiniLM-L6-v2 o BAAI/bge-small-en-v1.5",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.nuovaDirectory",
+    "it": "Nuova directory",
+    "en": "New directory",
+    "es": "Nuevo directorio",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.gateway",
+    "it": "Gateway",
+    "en": "Gateway",
+    "es": "Gateway",
+    "occorrenze": 1,
+    "neutro": true
+  },
+  {
+    "chiave": "settings.custom",
+    "it": "Custom…",
+    "en": "Custom…",
+    "es": "Personalizado…",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.selezionaRootProgetti",
+    "it": "Seleziona root progetti",
+    "en": "Select the projects root",
+    "es": "Selecciona la raiz de proyectos",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.chiudi",
+    "it": "Chiudi",
+    "en": "Close",
+    "es": "Cerrar",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.su",
+    "it": "Su",
+    "en": "Up",
+    "es": "Arriba",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.usaQuestaCartella",
+    "it": "Usa questa cartella",
+    "en": "Use this folder",
+    "es": "Usar esta carpeta",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.creaCartella",
+    "it": "Crea cartella",
+    "en": "Create folder",
+    "es": "Crear carpeta",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.caricamento",
+    "it": "Caricamento...",
+    "en": "Loading...",
+    "es": "Cargando...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.nessunaSottodirectoryDisponibile",
+    "it": "Nessuna sottodirectory disponibile.",
+    "en": "No subdirectories available.",
+    "es": "No hay subdirectorios disponibles.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.impostazioniAvanzateGlobali",
+    "it": "Impostazioni avanzate (globali)",
+    "en": "Advanced settings (global)",
+    "es": "Ajustes avanzados (globales)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.altriSetting",
+    "it": "Altri setting",
+    "en": "Other settings",
+    "es": "Otros ajustes",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.ricalcolaLeCelleBest",
+    "it": "Ricalcola le celle best-fit della matrice dal catalog corrente (celle manuali saltate)",
+    "en": "Recompute the matrix best-fit cells from the current catalog (manual cells skipped)",
+    "es": "Recalcula las celdas best-fit de la matriz desde el catalogo actual (se omiten las manuales)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.modalitaNexus",
+    "it": "Modalita' Nexus",
+    "en": "Nexus mode",
+    "es": "Modo Nexus",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.caricamentoRouting",
+    "it": "Caricamento routing...",
+    "en": "Loading routing...",
+    "es": "Cargando el enrutamiento...",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.matriceDiRoutingNon",
+    "it": "Matrice di routing non disponibile per questa modalita'.",
+    "en": "Routing matrix not available for this mode.",
+    "es": "Matriz de enrutamiento no disponible para este modo.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.comeFunzionaIlRouting",
+    "it": "Come funziona il routing Dinamico",
+    "en": "How dynamic routing works",
+    "es": "Como funciona el enrutamiento dinamico",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.perOgniMessaggioL",
+    "it": "Per ogni messaggio l&apos;orchestratore analizza:",
+    "en": "For every message the orchestrator analyses:",
+    "es": "Para cada mensaje el orquestador analiza:",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.intent",
+    "it": "Intent",
+    "en": "Intent",
+    "es": "Intencion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.routingAi",
+    "it": "Routing AI",
+    "en": "AI routing",
+    "es": "Enrutamiento de IA",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.routingAvanzato",
+    "it": "Routing avanzato",
+    "en": "Advanced routing",
+    "es": "Enrutamiento avanzado",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.gerarchiaGlobaleProvider",
+    "it": "Gerarchia globale provider",
+    "en": "Global provider hierarchy",
+    "es": "Jerarquia global de proveedores",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.overridePerIntent",
+    "it": "Override per intent",
+    "en": "Per-intent override",
+    "es": "Anulacion por intencion",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.allineaAlGlobale",
+    "it": "Allinea al globale",
+    "en": "Align to global",
+    "es": "Alinear con el global",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.categoriaModelloTierStatico",
+    "it": "Categoria modello (tier). Statico = modello fisso scelto manualmente.",
+    "en": "Model category (tier). Static = fixed model chosen manually.",
+    "es": "Categoria del modelo (tier). Estatico = modelo fijo elegido manualmente.",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.salvaQuestoPurposeModel",
+    "it": "Salva questo purpose model",
+    "en": "Save this purpose model",
+    "es": "Guardar este purpose model",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.testaLaRisoluzioneRuntime",
+    "it": "Testa la risoluzione runtime del fallback su loop",
+    "en": "Test runtime resolution of the loop fallback",
+    "es": "Prueba la resolucion en runtime del respaldo por bucle",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.purposeModels",
+    "it": "Purpose models",
+    "en": "Purpose models",
+    "es": "Purpose models",
+    "occorrenze": 1,
+    "neutro": true
+  },
+  {
+    "chiave": "settings.caricamento2",
+    "it": "Caricamento…",
+    "en": "Loading…",
+    "es": "Cargando…",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.salvato2",
+    "it": "Salvato ✓",
+    "en": "Saved ✓",
+    "es": "Guardado ✓",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.policyDlp",
+    "it": "Policy DLP",
+    "en": "DLP policy",
+    "es": "Politica DLP",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.providerLocaleOllama",
+    "it": "Provider Locale (Ollama)",
+    "en": "Local provider (Ollama)",
+    "es": "Proveedor local (Ollama)",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.gatewayLlm",
+    "it": "Gateway LLM",
+    "en": "LLM gateway",
+    "es": "Gateway LLM",
+    "occorrenze": 1
+  },
+  {
+    "chiave": "settings.hotReloadEParametri",
+    "it": "Hot-reload e parametri del gateway LLM.",
+    "en": "Hot reload and parameters of the LLM gateway.",
+    "es": "Recarga en caliente y parametros del gateway LLM.",
+    "occorrenze": 1
+  }
+]

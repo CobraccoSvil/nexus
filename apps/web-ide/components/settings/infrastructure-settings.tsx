@@ -6,6 +6,7 @@ import { useProjectStore, selectProviderHealthChangedAt } from "../../lib/projec
 import type { SettingEntry } from "./provider-settings";
 import type { EnvironmentCheck } from "../../lib/api-client";
 import { getEnvironmentStatus, fixEnvironment } from "../../lib/api-client";
+import { useI18n, type TranslationKey } from "../../lib/i18n";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 // Proxy via Next.js /neural/* → mcp-core :4000 /api/neural/* (il brain Python
@@ -146,6 +147,7 @@ export function InfrastructureSettings({
   onOpenBrowse,
   onSaveImmediate,
 }: InfrastructureSettingsProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const { resolved } = useTheme();
   const [healthMap, setHealthMap] = useState<Record<string, ServiceHealth>>({});
@@ -293,7 +295,7 @@ export function InfrastructureSettings({
           {refreshing ? "\u21BB Verifica in corso..." : "\u21BB Verifica tutti i servizi"}
         </button>
         <span style={{ fontSize: 11, color: "var(--color-textMuted)" }}>
-          Aggiornamento automatico ogni 30s
+          {t("settings.aggiornamentoAutomaticoOgni30s")}
         </span>
       </div>
 
@@ -330,7 +332,7 @@ export function InfrastructureSettings({
                   cursor: "pointer",
                 }}
               >
-                Sfoglia
+                {t("settings.sfoglia")}
               </button>
             )}
           </div>
@@ -563,6 +565,7 @@ function ServiceUrlSettings({
   cardBorder: string;
   renderSettingInput: (s: SettingEntry) => React.ReactNode;
 }) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [statusMap, setStatusMap] = useState<Record<string, EnvironmentCheck>>({});
 
@@ -651,8 +654,9 @@ function envStatusColor(status: EnvironmentCheck["status"], tc: EnvTc): string {
 }
 
 function EnvCheckRow({
-  check, fixLoading, fixOutputs, onFix, onSudoInstall, tc,
+  check, fixLoading, fixOutputs, onFix, onSudoInstall, tc, t,
 }: {
+  t: (key: TranslationKey) => string;
   check: EnvironmentCheck;
   fixLoading: Record<string, boolean>;
   fixOutputs: Record<string, string>;
@@ -704,7 +708,7 @@ function EnvCheckRow({
                     onClick={() => void navigator.clipboard.writeText(fixOutputs[`${check.id}_cmd`])}
                     style={{ marginTop: 4, padding: "2px 10px", fontSize: 11, borderRadius: 4, border: `1px solid ${tc.border}`, background: tc.bgSidebar, color: tc.textMuted, cursor: "pointer" }}
                   >
-                    Copia
+                    {t("settings.copia")}
                   </button>
                 </div>
               )}
@@ -757,6 +761,7 @@ function EnvCheckRow({
 
 function EnvironmentSection({ cardBg, cardBorder }: { cardBg: string; cardBorder: string }) {
   const tc = useThemeColors();
+  const { t } = useI18n();
   const [checks, setChecks] = useState<EnvironmentCheck[]>([]);
   const [loading, setLoading] = useState(false);
   const [fixOutputs, setFixOutputs] = useState<Record<string, string>>({});
@@ -872,6 +877,7 @@ function EnvironmentSection({ cardBg, cardBorder }: { cardBg: string; cardBorder
                 onFix={runFix}
                 onSudoInstall={(action, checkId) => setSudoModal({ action, checkId })}
                 tc={tc}
+                t={t}
               />
             ))}
           </div>
@@ -879,7 +885,7 @@ function EnvironmentSection({ cardBg, cardBorder }: { cardBg: string; cardBorder
 
         {checks.length === 0 && !loading && !envError && (
           <div style={{ padding: "20px 0", textAlign: "center", color: tc.textMuted, fontSize: 12 }}>
-            Clicca Aggiorna per verificare l&apos;ambiente.
+            {t("settings.cliccaAggiornaPerVerificare")}
           </div>
         )}
       </div>
@@ -887,7 +893,7 @@ function EnvironmentSection({ cardBg, cardBorder }: { cardBg: string; cardBorder
       {sudoModal && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}>
           <div style={{ background: tc.bgCard, border: `1px solid ${tc.border}`, borderRadius: 12, padding: 24, width: 380, maxWidth: "90vw" }}>
-            <h3 style={{ margin: "0 0 8px", color: tc.text }}>Password sudo richiesta</h3>
+            <h3 style={{ margin: "0 0 8px", color: tc.text }}>{t("settings.passwordSudoRichiesta")}</h3>
             <p style={{ color: tc.textMuted, fontSize: 13, margin: "0 0 16px" }}>
               Per installare le dipendenze di sistema è necessaria la password sudo del server. La password non viene salvata.
             </p>
@@ -896,14 +902,14 @@ function EnvironmentSection({ cardBg, cardBorder }: { cardBg: string; cardBorder
               value={sudoPassword}
               onChange={e => { setSudoPassword(e.target.value); setSudoError(""); }}
               onKeyDown={e => { if (e.key === "Enter") void handleSudoConfirm(); }}
-              placeholder="Password sudo..."
+              placeholder={t("settings.passwordSudo")}
               autoFocus
               style={{ width: "100%", boxSizing: "border-box", padding: "8px 12px", borderRadius: 6, border: `1px solid ${sudoError ? tc.error : tc.border}`, background: tc.bgSidebar, color: tc.text, fontSize: 13, marginBottom: sudoError ? 6 : 16 }}
             />
             {sudoError && <div style={{ color: tc.error, fontSize: 12, marginBottom: 12 }}>{sudoError}</div>}
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
               <button onClick={() => { setSudoModal(null); setSudoPassword(""); setSudoError(""); }} style={{ padding: "6px 14px", borderRadius: 6, border: `1px solid ${tc.border}`, background: "none", color: tc.textMuted, cursor: "pointer" }}>
-                Annulla
+                {t("settings.annulla")}
               </button>
               <button
                 onClick={() => void handleSudoConfirm()}

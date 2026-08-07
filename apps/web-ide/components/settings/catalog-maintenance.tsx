@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useI18n } from "../../lib/i18n";
 
 /**
  * Sezione "Catalogo modelli" nella pagina admin Provider LLM.
@@ -42,6 +43,7 @@ type ProbeResult = {
 };
 
 export function CatalogMaintenance() {
+  const { t } = useI18n();
   const [syncing, setSyncing] = useState(false);
   const [probing, setProbing] = useState(false);
   const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
@@ -108,7 +110,7 @@ export function CatalogMaintenance() {
 
   return (
     <div style={{ marginTop: 40, borderTop: "1px solid var(--color-border)", paddingTop: 24 }}>
-      <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 6 }}>Catalogo modelli</h2>
+      <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 6 }}>{t("settings.catalogoModelli")}</h2>
       <p style={{ fontSize: 13, color: "var(--color-textMuted)", marginBottom: 20 }}>
         Sincronizzazione catalogo da LiteLLM (prezzi, context window, tool support) e verifica salute
         di ogni modello enabled. Entrambe le azioni girano automaticamente in background
@@ -116,10 +118,10 @@ export function CatalogMaintenance() {
       </p>
 
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-        <button onClick={handleSync} disabled={syncing} style={buttonStyle} title="Scarica ultimo JSON LiteLLM e fa upsert in ai_price_catalog">
+        <button onClick={handleSync} disabled={syncing} style={buttonStyle} title={t("settings.scaricaUltimoJsonLitellm")}>
           {syncing ? "⏳ Sincronizzazione…" : "🔄 Sincronizza catalogo"}
         </button>
-        <button onClick={handleProbe} disabled={probing} style={buttonStyle} title="Pinga ogni modello enabled, auto-disabilita quelli broken">
+        <button onClick={handleProbe} disabled={probing} style={buttonStyle} title={t("settings.pingaOgniModelloEnabled")}>
           {probing ? "⏳ Verifica in corso…" : "🩺 Verifica health modelli"}
         </button>
       </div>
@@ -139,7 +141,7 @@ export function CatalogMaintenance() {
 
       {probeResult && (
         <div style={{ marginTop: 12, padding: 8, borderRadius: 4, background: "var(--color-bgInput)", fontSize: 12, fontFamily: "var(--font-mono)" }}>
-          Probe completato su <b>{probeResult.total ?? 0}</b> modelli (soglia auto-disable:{" "}
+          {t("settings.probeCompletatoSu")} <b>{probeResult.total ?? 0}</b> modelli (soglia auto-disable:{" "}
           {probeResult.failure_threshold ?? "?"}): sani <b>{probeResult.healthy ?? 0}</b>, errori provider{" "}
           <b>{probeResult.provider_wide_errors ?? 0}</b>, errori modello{" "}
           <b>{probeResult.model_errors ?? 0}</b>, auto-disabilitati in questo round{" "}

@@ -391,9 +391,9 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
           <CatalogMaintenance />
           {/* ── Sezione Gateway LLM integrata ── */}
           <div style={{ marginTop: 40, borderTop: "1px solid var(--color-border)", paddingTop: 24 }}>
-            <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 6 }}>Gateway LLM</h2>
+            <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 6 }}>{t("settings.gatewayLlm")}</h2>
             <p style={{ fontSize: 13, color: "var(--color-textMuted)", marginBottom: 20 }}>
-              Hot-reload e parametri del gateway LLM.
+              {t("settings.hotReloadEParametri")}
             </p>
             <GatewayConfig
               items={gatewayItems}

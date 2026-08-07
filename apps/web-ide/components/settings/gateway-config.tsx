@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { reloadGatewayConfig, updateAdminSetting } from "../../lib/api-client";
+import { useI18n } from "../../lib/i18n";
 
 interface GatewayConfigProps {
   items: Array<{ key: string; value: string; description: string; is_secret: boolean }>;
@@ -11,6 +12,7 @@ interface GatewayConfigProps {
 }
 
 export function GatewayConfig({ items, onSaveComplete, onRefreshProviders }: GatewayConfigProps) {
+  const { t } = useI18n();
   const [reloading, setReloading] = useState(false);
   const [reloadMsg, setReloadMsg] = useState<string | null>(null);
   const [edit, setEdit] = useState<Record<string, string>>({});
@@ -62,11 +64,11 @@ export function GatewayConfig({ items, onSaveComplete, onRefreshProviders }: Gat
   return (
     <div style={{ fontFamily: "var(--font-mono)", color: "var(--color-text)" }}>
       <div style={card}>
-        <div style={lbl}>Hot-Reload Configurazione</div>
+        <div style={lbl}>{t("settings.hotReloadConfigurazione")}</div>
         <p style={{ fontSize: 12, color: "var(--color-textMuted)", marginBottom: 12 }}>
           Ricarica le API key e i flag enabled/disabled dal DB senza riavviare il gateway.
           I provider disabilitati dall&apos;admin vengono rimossi immediatamente.
-          Lo stato aggiornato compare nel banner in cima alla pagina <strong>Provider LLM</strong>.
+          Lo stato aggiornato compare nel banner in cima alla pagina <strong>{t("settings.providerLlm")}</strong>.
         </p>
         <button
           onClick={() => void handleReload()}
@@ -90,11 +92,11 @@ export function GatewayConfig({ items, onSaveComplete, onRefreshProviders }: Gat
       </div>
 
       <div style={card}>
-        <div style={lbl}>Impostazioni Gateway</div>
+        <div style={lbl}>{t("settings.impostazioniGateway")}</div>
         <p style={{ fontSize: 12, color: "var(--color-textMuted)", marginBottom: 12 }}>
-          Le API key e i flag provider si gestiscono in <strong>Providers</strong>.
-          I parametri di routing in <strong>Routing</strong>.
-          Dopo ogni modifica, clicca <em>Ricarica dal DB</em> per applicarle senza restart.
+          {t("settings.leApiKeyE")} <strong>{t("settings.providers")}</strong>.
+          I parametri di routing in <strong>{t("settings.routing")}</strong>.
+          Dopo ogni modifica, clicca <em>{t("settings.ricaricaDalDb")}</em> per applicarle senza restart.
         </p>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
           {["rate_limit_per_tenant_requests", "rate_limit_per_provider_requests",
@@ -145,7 +147,7 @@ export function GatewayConfig({ items, onSaveComplete, onRefreshProviders }: Gat
                           ? 0.65
                           : 1,
                     }}
-                    title="Salva nel DB (poi usa 'Ricarica dal DB' sopra)"
+                    title={t("settings.salvaNelDbPoi")}
                   >
                     {isBusy ? "Salvo..." : "Salva"}
                   </button>

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useThemeColors } from "../../lib/theme";
 import { useHealthSnapshot } from "../../lib/hooks/use-health-snapshot";
+import { useI18n } from "../../lib/i18n";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
@@ -54,6 +55,7 @@ function status(ws: WorkerStat): { label: string; color: string; bg: string } {
 }
 
 export function NexusWorkersPanel() {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [stats, setStats] = useState<NexusStatsSlim | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -112,8 +114,8 @@ export function NexusWorkersPanel() {
         )}
       </div>
       <div style={{ color: tc.textMuted, fontSize: 12, marginBottom: 14 }}>
-        12 background workers attivi. I worker <em>OnTaskComplete</em> scattano dopo ogni esecuzione agente;
-        i worker <em>Periodic</em> girano ogni 60s.
+        12 background workers attivi. I worker <em>{t("settings.ontaskcomplete")}</em> scattano dopo ogni esecuzione agente;
+        i worker <em>{t("settings.periodic")}</em> girano ogni 60s.
       </div>
 
       {error ? (

@@ -8,6 +8,7 @@ import {
   moveProvider,
   type RoutingConfigState,
 } from "./shared";
+import { useI18n } from "../../../lib/i18n";
 
 interface ManualConfigSectionProps {
   config: RoutingConfigState;
@@ -15,12 +16,13 @@ interface ManualConfigSectionProps {
 }
 
 export function ManualConfigSection({ config, setConfig }: ManualConfigSectionProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
 
   return (
     <>
       <div className="card-sm" style={{ background: tc.bgHover }}>
-        <div className="text-base font-bold" style={{ marginBottom: 6 }}>Gerarchia globale provider</div>
+        <div className="text-base font-bold" style={{ marginBottom: 6 }}>{t("settings.gerarchiaGlobaleProvider")}</div>
         <div className="text-sm text-muted" style={{ marginBottom: 12 }}>
           Il primo provider pronto viene usato per la chat. Se fallisce, l'orchestratore prova il successivo.
         </div>
@@ -49,14 +51,14 @@ export function ManualConfigSection({ config, setConfig }: ManualConfigSectionPr
                   disabled={index === 0}
                   style={buttonStyle(tc, index === 0)}
                 >
-                  Su
+                  {t("settings.su")}
                 </button>
                 <button
                   onClick={() => setConfig((current) => ({ ...current, providerHierarchy: moveProvider(current.providerHierarchy, provider, 1) }))}
                   disabled={index === config.providerHierarchy.length - 1}
                   style={buttonStyle(tc, index === config.providerHierarchy.length - 1)}
                 >
-                  Giu
+                  {t("settings.giu")}
                 </button>
               </div>
             </div>
@@ -65,7 +67,7 @@ export function ManualConfigSection({ config, setConfig }: ManualConfigSectionPr
       </div>
 
       <div className="card-sm" style={{ background: tc.bgHover }}>
-        <div className="text-base font-bold" style={{ marginBottom: 6 }}>Override per intent</div>
+        <div className="text-base font-bold" style={{ marginBottom: 6 }}>{t("settings.overridePerIntent")}</div>
         <div className="text-sm text-muted" style={{ marginBottom: 12 }}>
           Ogni intent puo avere una catena diversa. Se lasci la stessa sequenza della gerarchia globale, il comportamento resta uniforme.
         </div>
@@ -94,7 +96,7 @@ export function ManualConfigSection({ config, setConfig }: ManualConfigSectionPr
                   }
                   style={buttonStyle(tc, false)}
                 >
-                  Allinea al globale
+                  {t("settings.allineaAlGlobale")}
                 </button>
               </div>
               <div className="flex-col-gap-8">
@@ -128,7 +130,7 @@ export function ManualConfigSection({ config, setConfig }: ManualConfigSectionPr
                         disabled={index === 0}
                         style={buttonStyle(tc, index === 0)}
                       >
-                        Su
+                        {t("settings.su")}
                       </button>
                       <button
                         onClick={() =>
@@ -143,7 +145,7 @@ export function ManualConfigSection({ config, setConfig }: ManualConfigSectionPr
                         disabled={index === config.intentChains[intent.key].length - 1}
                         style={buttonStyle(tc, index === config.intentChains[intent.key].length - 1)}
                       >
-                        Giu
+                        {t("settings.giu")}
                       </button>
                     </div>
                   </div>

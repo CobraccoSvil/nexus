@@ -1,5 +1,5 @@
 {
-  "totale": 790,
+  "totale": 682,
   "perArea": {
     "admin": 105,
     "radice": 67,
@@ -10,7 +10,7 @@
     "landing": 4,
     "panels": 99,
     "project-db": 69,
-    "settings": 124,
+    "settings": 16,
     "shell": 25,
     "sidebar": 78,
     "sql": 5,

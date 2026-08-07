@@ -10,6 +10,7 @@ import {
   type ModelCatalogEntry,
   type PerformanceTier,
 } from "../../lib/api/models";
+import { useI18n } from "../../lib/i18n";
 
 /** La scala del catalog (mig 0528/0547). Specchio di PERFORMANCE_TIERS in
  *  nexus-agent-graph/src/decisions/tiers.rs: il vocabolario vive li'. */
@@ -48,6 +49,7 @@ export function ProviderModelsSection({
   provider,
   initialEnabledCount,
 }: ProviderModelsSectionProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [open, setOpen] = useState(false);
   const [models, setModels] = useState<ModelCatalogEntry[] | null>(null);
@@ -148,7 +150,7 @@ export function ProviderModelsSection({
         <span style={{ transition: "transform 0.15s", transform: open ? "rotate(90deg)" : "none" }}>
           &#9656;
         </span>
-        Modelli
+        {t("settings.modelli")}
         <span
           style={{
             padding: "1px 7px",
@@ -170,7 +172,7 @@ export function ProviderModelsSection({
             </div>
           )}
           {status === "loading" && (
-            <div style={{ fontSize: 12, color: tc.textMuted }}>Caricamento modelli...</div>
+            <div style={{ fontSize: 12, color: tc.textMuted }}>{t("settings.caricamentoModelli")}</div>
           )}
           {status === "error" && (
             <div style={{ fontSize: 12, color: tc.error }}>
@@ -262,7 +264,7 @@ export function ProviderModelsSection({
                     </span>
                     {m.qualificationState && m.qualificationState !== "qualified" && (
                       <span
-                        title="La batteria non ha (ancora) qualificato questo modello: col gate acceso resta fuori dal routing agentico"
+                        title={t("settings.laBatteriaNonHa")}
                         style={{ color: tc.error }}
                       >
                         {m.qualificationState}
@@ -276,7 +278,7 @@ export function ProviderModelsSection({
                   onChange={(value) =>
                     handleTier(m.model, (value || null) as PerformanceTier | null)
                   }
-                  title="Curatela del tier: vince su indice e batteria. Vuoto = nessun override (decidono le fonti automatiche)."
+                  title={t("settings.curatelaDelTierVince")}
                   options={TIER_OPTIONS}
                   style={{
                     fontSize: 10,

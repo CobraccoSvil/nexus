@@ -13,6 +13,7 @@ import {
   labelProvider,
   type RoutingConfigState,
 } from "./shared";
+import { useI18n } from "../../../lib/i18n";
 
 // Modalita' statiche per cui esiste una matrice in nexus_routing_matrix.
 // "dinamico" e "manuale" non hanno una preview (il primo risolve a runtime).
@@ -29,6 +30,7 @@ interface BehaviorModeSectionProps {
 }
 
 export function BehaviorModeSection({ config, setConfig, behaviorSaved }: BehaviorModeSectionProps) {
+  const { t } = useI18n();
   const tc = useThemeColors();
   const [previewByMode, setPreviewByMode] = useState<Record<string, RoutingPreviewEntry[]>>({});
   const [avgByMode, setAvgByMode] = useState<Record<string, number>>({});
@@ -84,12 +86,12 @@ export function BehaviorModeSection({ config, setConfig, behaviorSaved }: Behavi
     <div className="card-sm" style={{ background: tc.bgHover }}>
       <div className="flex-row" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
         <div>
-          <div className="text-base font-bold">Modalita' Nexus</div>
+          <div className="text-base font-bold">{t("settings.modalitaNexus")}</div>
           <div className="text-sm text-muted" style={{ marginTop: 3 }}>
             {BEHAVIOR_MODES.find((m) => m.value === mode)?.desc}
           </div>
         </div>
-        {behaviorSaved && <span className="text-sm font-semibold" style={{ color: tc.success }}>Salvato</span>}
+        {behaviorSaved && <span className="text-sm font-semibold" style={{ color: tc.success }}>{t("settings.salvato")}</span>}
       </div>
       <div className="flex-row-gap-8" style={{ flexWrap: "wrap" }}>
         {BEHAVIOR_MODES.map((m) => (
@@ -130,7 +132,7 @@ export function BehaviorModeSection({ config, setConfig, behaviorSaved }: Behavi
                 cursor: promoteBusy ? "wait" : "pointer",
                 whiteSpace: "nowrap",
               }}
-              title="Ricalcola le celle best-fit della matrice dal catalog corrente (celle manuali saltate)"
+              title={t("settings.ricalcolaLeCelleBest")}
             >
               {promoteBusy ? "..." : "Auto-promuovi ora"}
             </button>
@@ -141,11 +143,11 @@ export function BehaviorModeSection({ config, setConfig, behaviorSaved }: Behavi
             </div>
           )}
           {previewStatus === "loading" && preview.length === 0 && (
-            <div style={{ fontSize: 11, color: tc.textMuted }}>Caricamento routing...</div>
+            <div style={{ fontSize: 11, color: tc.textMuted }}>{t("settings.caricamentoRouting")}</div>
           )}
           {previewStatus === "error" && (
             <div style={{ fontSize: 11, color: tc.error }}>
-              Matrice di routing non disponibile per questa modalita'.
+              {t("settings.matriceDiRoutingNon")}
             </div>
           )}
           {previewStatus === "idle" && preview.length === 0 && (
@@ -190,10 +192,10 @@ export function BehaviorModeSection({ config, setConfig, behaviorSaved }: Behavi
           marginTop: 14, padding: "10px 12px", borderRadius: 8,
           background: "var(--color-bgInput)", border: "1px solid var(--color-border)",
         }}>
-          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Come funziona il routing Dinamico</div>
+          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>{t("settings.comeFunzionaIlRouting")}</div>
           <div style={{ fontSize: 12, color: "var(--color-textMuted)", lineHeight: 1.6 }}>
-            Per ogni messaggio l&apos;orchestratore analizza:
-            <br />1. <strong>Intent</strong> (fix / chat / architettura...) e <strong>complessita&apos;</strong> (token stimati)
+            {t("settings.perOgniMessaggioL")}
+            <br />1. <strong>{t("settings.intent")}</strong> (fix / chat / architettura...) e <strong>complessita&apos;</strong> (token stimati)
             <br />2. Determina il <strong>tier richiesto</strong> (light / medium / high / heavy / frontier) e la <strong>capability</strong> necessaria
             <br />3. Interroga il <strong>catalogo modelli</strong> ordinando per costo — sceglie il piu&apos; economico che soddisfa i requisiti
             <br />4. Se il catalogo e&apos; vuoto, usa la matrice Bilanciata come fallback
