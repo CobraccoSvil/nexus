@@ -303,36 +303,52 @@ async fn build_graph_out_of_graph_info(project_id: uuid::Uuid) -> String {
     }
 }
 
-pub async fn tool_read_file(ctx: &ToolContextCore, input: &Value) -> String {
-    let path_str = match input.get("path").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return "\u{274C} [Errore: parametro 'path' mancante]".to_string(),
+/// Legge un file. MIGRATO al contratto d'ingresso e a `RispostaTool`.
+///
+/// Ogni suo fallimento e' rimediabile dall'agente: un percorso sbagliato lo
+/// corregge lui, e il messaggio dice quale.
+pub async fn tool_read_file(
+    ctx: &ToolContextCore,
+    input: &Value,
+) -> nexus_types::tool_outcome::RispostaTool {
+    use crate::input_contract::{InputTool, ReadFileInput};
+    use nexus_types::tool_outcome::RispostaTool;
+
+    let params = match ReadFileInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
+    let path_str = params.path.as_str();
     let target = match resolve_relative_path(&ctx.root_path, path_str) {
         Ok(p) => p,
         Err(e) => {
-            return format!(
-                "\u{274C} [Errore percorso: {}]",
+            return RispostaTool::fallito_rimediabile(format!(
+                "[Errore percorso: {}]",
                 e.1["error"].as_str().unwrap_or("path error")
-            )
+            ))
         }
     };
     // Cap-byte difensivo (governance fs/read_max_bytes): un file enorme
     // (bundle, dump, lock) caricato integralmente satura il contesto e la
     // memoria. Soglia DB-driven (regola G); 0/assente = nessun cap.
     if let Some(err) = read_max_bytes_guard(ctx, &target, path_str).await {
-        return err;
+        // Il cap e' una soglia del progetto, ma l'agente PUO' rimediare
+        // leggendo un intervallo con `read_file_lines`, e il messaggio glielo
+        // dice: e' quello che rende la natura una promessa mantenuta.
+        return RispostaTool::fallito_rimediabile(err);
     }
 
     let content = match tokio::fs::read_to_string(&target).await {
         Ok(c) => c,
-        Err(e) => return format!("\u{274C} [Errore lettura '{}': {}]", path_str, e),
+        Err(e) => {
+            return RispostaTool::fallito_rimediabile(format!("[Errore lettura '{path_str}': {e}]"))
+        }
     };
 
     let total_lines = content.lines().count();
     if total_lines <= READ_FILE_STRUCTURE_HINT_LINES {
         // File piccolo: restituisci tutto
-        return content;
+        return RispostaTool::riuscito(content);
     }
 
     let read_full_max_lines: usize =
@@ -342,7 +358,12 @@ pub async fn tool_read_file(ctx: &ToolContextCore, input: &Value) -> String {
             .flatten()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(1200);
-    render_large_file_response(&content, total_lines, path_str, read_full_max_lines)
+    RispostaTool::riuscito(render_large_file_response(
+        &content,
+        total_lines,
+        path_str,
+        read_full_max_lines,
+    ))
 }
 
 /// Cap-byte difensivo sulla lettura integrale: se il file supera la soglia

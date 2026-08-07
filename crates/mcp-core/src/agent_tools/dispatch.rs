@@ -65,6 +65,10 @@ async fn esegui_tool_migrato(
         // misurava (11% di `old_string non trovato` seguiti da una ripetizione
         // identica, 07/08/2026).
         "edit_file" => Some(files::tool_edit_file(ctx, input).await),
+        // Migrato insieme al contratto d'ingresso: un percorso sbagliato o un
+        // file troppo grande sono entrambi rimediabili dall'agente, e il
+        // messaggio dice come.
+        "read_file" => Some(files::tool_read_file(ctx, input).await),
         _ => None,
     }
 }
@@ -77,7 +81,6 @@ async fn esegui_tool_legacy(
     input: &Value,
 ) -> nexus_types::tool_outcome::RispostaTool {
     let testo = match name {
-        "read_file" => files::tool_read_file(ctx, input).await,
         "read_file_lines" => files::tool_read_file_lines(ctx, input).await,
         "write_file" => files::tool_write_file(ctx, input).await,
         "list_files" => files::tool_list_files(ctx, input).await,

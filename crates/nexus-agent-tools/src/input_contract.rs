@@ -375,52 +375,134 @@ crate::tool_input! {
     }
 }
 
-#[cfg(test)]
-mod tests_edit_file {
-    use super::{EditFileInput, InputTool};
-
-    /// IL test della migrazione (regola O): lo schema generato dal contratto e'
-    /// lo STESSO che il catalogo consegna oggi al modello. Non confronta due
-    /// stringhe scritte a mano — prende il catalogo REALE e ne estrae il tool.
-    ///
-    /// MUTAZIONE: cambiando una descrizione o spostando un campo fra
-    /// `obbligatori` e `opzionali`, questo test rosseggia. E' cio' che rende la
-    /// migrazione dei 64 tool un'operazione verificabile invece di una
-    /// riscrittura di cui fidarsi.
-    #[test]
-    fn lo_schema_generato_coincide_con_quello_scritto_a_mano() {
-        let catalogo: serde_json::Value =
-            serde_json::from_str(crate::tool_schema::AGENT_TOOLS_JSON).expect("catalogo valido");
-        let a_mano = catalogo
-            .as_array()
-            .expect("array")
-            .iter()
-            .find(|t| t["name"] == "edit_file")
-            .map(|t| t["input_schema"].clone())
-            .expect("edit_file nel catalogo");
-
-        let generato = <EditFileInput as InputTool>::schema();
-
-        assert_eq!(
-            generato["properties"], a_mano["properties"],
-            "le properties generate devono coincidere con quelle del catalogo"
-        );
-        // L'ordine di `required` non e' significativo per il modello, il
-        // CONTENUTO si': si confrontano gli insiemi.
-        let mut r_gen: Vec<&str> = generato["required"]
-            .as_array()
-            .expect("required generato")
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        let mut r_mano: Vec<&str> = a_mano["required"]
-            .as_array()
-            .expect("required a mano")
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        r_gen.sort_unstable();
-        r_mano.sort_unstable();
-        assert_eq!(r_gen, r_mano, "gli obbligatori devono coincidere");
+crate::tool_input! {
+    /// L'input di `read_file`.
+    ReadFileInput for "read_file" {
+        obbligatori {
+            path: String, "Percorso del file relativo alla root del progetto (es. 'src/main.rs' o 'README.md')";
+        }
+        opzionali {}
     }
 }
+
+crate::tool_input! {
+    /// L'input di `read_file_lines`.
+    ///
+    /// Gli estremi sono `i64` e non `usize`: il modello puo' scrivere un numero
+    /// negativo, e un tipo che non lo rappresenta trasformerebbe un input
+    /// sbagliato in un errore di deserializzazione oscuro invece che in un
+    /// controllo di dominio con un messaggio utile.
+    ReadFileLinesInput for "read_file_lines" {
+        obbligatori {
+            path: String, "Percorso del file relativo alla root del progetto";
+            start_line: i64, "Riga di inizio (1-based, inclusa). Es: 39 per iniziare dalla riga 39.";
+            end_line: i64, "Riga di fine (1-based, inclusa). Es: 80 per leggere fino alla riga 80. Massimo 400 righe per chiamata.";
+        }
+        opzionali {}
+    }
+}
+
+crate::tool_input! {
+    /// L'input di `write_file`.
+    WriteFileInput for "write_file" {
+        obbligatori {
+            path: String, "Percorso del file relativo alla root del progetto";
+            content: String, "Contenuto completo del file da scrivere";
+        }
+        opzionali {}
+    }
+}
+
+crate::tool_input! {
+    /// L'input di `delete_file`.
+    DeleteFileInput for "delete_file" {
+        obbligatori {
+            path: String, "Percorso relativo alla root del file o directory da eliminare";
+        }
+        opzionali {
+            recursive: bool, "Se true, elimina ricorsivamente (necessario per directory non vuote). Default: false";
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_equivalenza {
+    use super::*;
+
+    /// Ogni tool MIGRATO al contratto, con lo schema che il contratto genera.
+    /// Cresce di una riga a ogni migrazione, e quella riga e' tutto cio' che
+    /// serve perche' il tool nuovo sia coperto.
+    fn migrati() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            ("edit_file", <EditFileInput as InputTool>::schema()),
+            ("read_file", <ReadFileInput as InputTool>::schema()),
+            ("read_file_lines", <ReadFileLinesInput as InputTool>::schema()),
+            ("write_file", <WriteFileInput as InputTool>::schema()),
+            ("delete_file", <DeleteFileInput as InputTool>::schema()),
+        ]
+    }
+
+    /// IL test della migrazione (regola O): per OGNI tool migrato, lo schema
+    /// generato dal contratto e' lo STESSO che il catalogo consegna al modello.
+    /// Non confronta due stringhe scritte a mano — prende il catalogo REALE.
+    ///
+    /// E' il ponte che rende la migrazione dei 64 tool un'operazione
+    /// verificabile invece di una riscrittura di cui fidarsi: un campo
+    /// rinominato, una descrizione cambiata, un obbligatorio diventato
+    /// opzionale fanno rosseggiare questo test prima che il modello se ne
+    /// accorga in esercizio.
+    ///
+    /// MUTAZIONE: cambiando una descrizione o spostando un campo fra
+    /// `obbligatori` e `opzionali`, rosseggia nominando il tool.
+    #[test]
+    fn ogni_schema_generato_coincide_con_il_catalogo() {
+        let catalogo: serde_json::Value =
+            serde_json::from_str(crate::tool_schema::AGENT_TOOLS_JSON).expect("catalogo valido");
+        let elenco = catalogo.as_array().expect("array");
+
+        for (nome, generato) in migrati() {
+            let a_mano = elenco
+                .iter()
+                .find(|t| t["name"] == nome)
+                .map(|t| t["input_schema"].clone())
+                .unwrap_or_else(|| panic!("{nome} non e' nel catalogo"));
+
+            assert_eq!(
+                generato["properties"], a_mano["properties"],
+                "properties divergenti per '{nome}'"
+            );
+
+            let ordina = |v: &serde_json::Value| {
+                let mut r: Vec<String> = v
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                r.sort();
+                r
+            };
+            assert_eq!(
+                ordina(&generato["required"]),
+                ordina(&a_mano["required"]),
+                "obbligatori divergenti per '{nome}'"
+            );
+        }
+    }
+
+    /// La copertura cresce davvero: se qualcuno aggiunge un `tool_input!` senza
+    /// registrarlo in `migrati()`, il conteggio lo dichiara. Non e' un test
+    /// della logica — e' un promemoria che fallisce, che vale piu' di un
+    /// commento.
+    #[test]
+    fn il_conteggio_dei_migrati_e_dichiarato() {
+        assert_eq!(
+            migrati().len(),
+            5,
+            "aggiornare il conteggio quando si migra un tool (e aggiungerlo a migrati())"
+        );
+    }
+}
+
