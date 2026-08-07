@@ -46,6 +46,7 @@ pub mod shadcn_setup;
 // vecchio modulo `subagent` che chiamava il brain /agent/subagent-run e' stato
 // rimosso nel porting a grafo nativo (zero-Python).
 pub mod todos;
+pub mod tool_inputs;
 pub mod tool_schema;
 pub mod ui_patterns;
 pub mod ui_reference_search;

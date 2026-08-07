@@ -311,7 +311,7 @@ pub async fn tool_read_file(
     ctx: &ToolContextCore,
     input: &Value,
 ) -> nexus_types::tool_outcome::RispostaTool {
-    use crate::input_contract::{InputTool, ReadFileInput};
+    use crate::{input_contract::InputTool, tool_inputs::ReadFileInput};
     use nexus_types::tool_outcome::RispostaTool;
 
     let params = match ReadFileInput::leggi(input) {
@@ -635,8 +635,8 @@ async fn prepare_write_and_track(
 fn read_write_params(
     ctx: &ToolContextCore,
     input: &Value,
-) -> Result<crate::input_contract::WriteFileInput, nexus_types::tool_outcome::RispostaTool> {
-    use crate::input_contract::{InputTool, WriteFileInput};
+) -> Result<crate::tool_inputs::WriteFileInput, nexus_types::tool_outcome::RispostaTool> {
+    use crate::{input_contract::InputTool, tool_inputs::WriteFileInput};
     use nexus_types::tool_outcome::RispostaTool;
 
     if !ctx.can_write {
@@ -1760,8 +1760,8 @@ fn build_old_string_not_found_message(
 fn read_edit_params(
     ctx: &ToolContextCore,
     input: &Value,
-) -> Result<crate::input_contract::EditFileInput, nexus_types::tool_outcome::RispostaTool> {
-    use crate::input_contract::{EditFileInput, InputTool};
+) -> Result<crate::tool_inputs::EditFileInput, nexus_types::tool_outcome::RispostaTool> {
+    use crate::{input_contract::InputTool, tool_inputs::EditFileInput};
     use nexus_types::tool_outcome::RispostaTool;
 
     if !ctx.can_write {
