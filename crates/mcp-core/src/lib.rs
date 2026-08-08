@@ -1,8 +1,19 @@
 // Su Windows molti sottosistemi sono Linux-only (systemd/wizard, sudo-runner,
 // docker-compose, /proc, run-mode) e il loro codice e' cfg-gated out o non
 // raggiunto: e' dead-code LECITO del porting. allow(dead_code) SOLO su Windows;
-// su Linux questo codice e' tutto usato, quindi il CI Linux continua a catturare
-// il dead-code GENUINO. Punto unico (regola L) invece di allow sparsi per-modulo.
+// su Linux quel codice e' usato, e la contromisura al dead-code GENUINO doveva
+// essere il CI Linux, dove questo allow non si applica. Punto unico (regola L)
+// invece di allow sparsi per-modulo.
+//
+// LIMITE MISURATO (08/08/2026): quella contromisura non ha potuto scattare. Il
+// gate `verify.yml` muore su `@ai-orchestrator/web-ide#test`, cioe' nella fase
+// turbo, PRIMA che `cargo clippy -- -D warnings` venga eseguito — rosso su ogni
+// run da almeno il 03/08. Nel frattempo 711 righe di dead-code genuino sono
+// sopravvissute in `agent_turn_setup.rs` (gli handler SSE del brain Python, morti
+// da mig 0462/0532), invisibili qui per questo allow e mai segnalate la'. Finche'
+// il CI non torna a raggiungere clippy, su questo crate il dead-code genuino non
+// ha nessuno che lo guardi: si censisce a mano neutralizzando questa riga e
+// leggendo i `never used` di `cargo check -p mcp-core --all-targets`.
 #![cfg_attr(windows, allow(dead_code))]
 
 mod admin;
