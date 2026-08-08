@@ -475,70 +475,87 @@ fn render_large_file_response(
     )
 }
 
-/// Estrae `(start_line, end_line)` (1-based, inclusi) dai parametri di
-/// `read_file_lines`. Accetta sia `start_line`/`end_line` (parametri corretti)
-/// sia `offset`/`limit` (alias usati erroneamente da alcune istruzioni del
-/// supervisor — mappati automaticamente per evitare loop di re-lettura). Applica
-/// il cap `READ_FILE_LINES_MAX` sul range. Estratto da `tool_read_file_lines`.
-fn parse_line_range(input: &Value) -> Result<(usize, usize), String> {
-    let start_line: usize = if let Some(n) = input.get("start_line").and_then(Value::as_u64) {
-        if n < 1 {
-            return Err("\u{274C} [Errore: 'start_line' deve essere un intero >= 1]".to_string());
-        }
-        n as usize
-    } else if let Some(n) = input.get("offset").and_then(Value::as_u64) {
-        if n < 1 {
-            return Err("\u{274C} [Errore: 'offset' deve essere un intero >= 1]".to_string());
-        }
-        n as usize
-    } else {
-        return Err(
-            "\u{274C} [Errore: parametro 'start_line' mancante (oppure 'offset' come alias)]".to_string(),
-        );
-    };
+/// Valida gli estremi `(start_line, end_line)` (1-based, inclusi) dichiarati da
+/// `read_file_lines` e applica il cap `READ_FILE_LINES_MAX` sul range.
+///
+/// Prima di questa versione la funzione leggeva l'input GREZZO e accettava anche
+/// `offset`/`limit` come alias. Quegli alias non sono mai stati nel catalogo, e
+/// il prompt del supervisore glielo dice esplicitamente dalla migrazione 0060
+/// («MAI usare "offset" o "limit" — quei parametri NON esistono in questo
+/// tool»): il sistema prometteva al modello una cosa e l'handler ne accettava
+/// un'altra, cioe' le due verita' che il contratto d'ingresso esiste per
+/// unificare. Un input fuori schema lo ferma ora `errore_di_lettura`, che nomina
+/// il campo sconosciuto — informazione sufficiente per correggere, che e' cio'
+/// che [`NaturaFallimento::Rimediabile`] pretende.
+///
+/// Gli estremi arrivano come `i64` e non come `usize`: il modello puo' scrivere
+/// un numero negativo, e un tipo che non lo rappresenta trasformerebbe un input
+/// sbagliato in un errore di deserializzazione oscuro invece che in questo
+/// controllo di dominio, che dice quale estremo e' fuori posto.
+fn valida_intervallo(
+    start_line: i64,
+    end_line: i64,
+) -> Result<(usize, usize), nexus_types::tool_outcome::RispostaTool> {
+    use nexus_types::tool_outcome::RispostaTool;
 
-    let end_line: usize = if let Some(n) = input.get("end_line").and_then(Value::as_u64) {
-        if n < start_line as u64 {
-            return Err("\u{274C} [Errore: 'end_line' deve essere >= start_line]".to_string());
-        }
-        n as usize
-    } else if let Some(limit) = input.get("limit").and_then(Value::as_u64) {
-        // offset + limit - 1 → end_line inclusa
-        (start_line as u64).saturating_add(limit).saturating_sub(1) as usize
-    } else {
-        return Err(
-            "\u{274C} [Errore: parametro 'end_line' mancante (oppure 'limit' come alias)]".to_string(),
-        );
-    };
-
-    // Limita il range massimo per evitare di caricare troppe righe
-    let end_line = end_line.min(start_line + READ_FILE_LINES_MAX - 1);
+    if start_line < 1 {
+        return Err(RispostaTool::fallito_rimediabile(format!(
+            "[Errore: 'start_line' deve essere un intero >= 1 (ricevuto {start_line})]"
+        )));
+    }
+    if end_line < start_line {
+        return Err(RispostaTool::fallito_rimediabile(format!(
+            "[Errore: 'end_line' ({end_line}) deve essere >= 'start_line' ({start_line})]"
+        )));
+    }
+    let start_line = start_line as usize;
+    // Limita il range massimo per evitare di caricare troppe righe. La somma e'
+    // saturante perche' gli estremi vengono dal modello: un `start_line` presso
+    // il massimo rappresentabile non deve trasformare un input assurdo in un
+    // panic da overflow: `render_line_range` lo respinge subito dopo, dicendo
+    // quante righe ha il file.
+    let end_line = (end_line as usize).min(start_line.saturating_add(READ_FILE_LINES_MAX - 1));
     Ok((start_line, end_line))
 }
 
-pub async fn tool_read_file_lines(ctx: &ToolContextCore, input: &Value) -> String {
-    let path_str = match input.get("path").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return "\u{274C} [Errore: parametro 'path' mancante]".to_string(),
-    };
+/// Legge un intervallo di righe. MIGRATO al contratto d'ingresso e a
+/// `RispostaTool`.
+pub async fn tool_read_file_lines(
+    ctx: &ToolContextCore,
+    input: &Value,
+) -> nexus_types::tool_outcome::RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::ReadFileLinesInput};
+    use nexus_types::tool_outcome::RispostaTool;
 
-    let (start_line, end_line) = match parse_line_range(input) {
+    let params = match ReadFileLinesInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
+    };
+    let path_str = params.path.as_str();
+
+    let (start_line, end_line) = match valida_intervallo(params.start_line, params.end_line) {
         Ok(range) => range,
-        Err(msg) => return msg,
+        Err(risposta) => return risposta,
     };
 
     let target = match resolve_relative_path(&ctx.root_path, path_str) {
         Ok(p) => p,
         Err(e) => {
-            return format!(
-                "\u{274C} [Errore percorso: {}]",
+            return RispostaTool::fallito_rimediabile(format!(
+                "[Errore percorso: {}]",
                 e.1["error"].as_str().unwrap_or("path error")
-            )
+            ))
         }
     };
     let content = match tokio::fs::read_to_string(&target).await {
         Ok(c) => c,
-        Err(e) => return format!("\u{274C} [Errore lettura '{}': {}]", path_str, e),
+        // La natura viene dal `ErrorKind` (regola M): un file assente lo corregge
+        // l'agente, un permesso negato no, e il messaggio del sistema operativo
+        // non distingue i due in modo leggibile da codice.
+        Err(e) => {
+            return RispostaTool::fallito(format!("[Errore lettura '{path_str}': {e}]"))
+                .con_natura(NaturaFallimento::da_errore_io(&e))
+        }
     };
 
     render_line_range(&content, path_str, start_line, end_line)
@@ -546,15 +563,25 @@ pub async fn tool_read_file_lines(ctx: &ToolContextCore, input: &Value) -> Strin
 
 /// Rende la porzione `[start_line, end_line]` (1-based, inclusi) del contenuto
 /// con prefisso numerato "NNNN | testo" e un hint di continuazione se restano
-/// righe. Errore esplicito se `start_line` supera il totale. Estratto da
+/// righe. Fallimento esplicito se `start_line` supera il totale. Estratto da
 /// `tool_read_file_lines`.
-fn render_line_range(content: &str, path_str: &str, start_line: usize, end_line: usize) -> String {
+fn render_line_range(
+    content: &str,
+    path_str: &str,
+    start_line: usize,
+    end_line: usize,
+) -> nexus_types::tool_outcome::RispostaTool {
+    use nexus_types::tool_outcome::RispostaTool;
+
     let total_lines = content.lines().count();
     if start_line > total_lines {
-        return format!(
-            "\u{274C} [Errore: start_line {} supera il numero totale di righe del file ({})]",
-            start_line, total_lines
-        );
+        // Rimediabile, e il messaggio porta cio' che serve per rimediare: il
+        // totale delle righe, da cui l'agente ricava un intervallo valido senza
+        // dover rileggere il file.
+        return RispostaTool::fallito_rimediabile(format!(
+            "[Errore: start_line {start_line} supera il numero totale di righe del file \
+             ({total_lines})]"
+        ));
     }
 
     let end_line = end_line.min(total_lines);
@@ -569,7 +596,7 @@ fn render_line_range(content: &str, path_str: &str, start_line: usize, end_line:
         .collect::<Vec<_>>()
         .join("\n");
 
-    format!(
+    RispostaTool::riuscito(format!(
         "// {} — righe {}-{} (totale: {} righe)\n{}{}",
         path_str,
         start_line,
@@ -582,7 +609,7 @@ fn render_line_range(content: &str, path_str: &str, start_line: usize, end_line:
         } else {
             String::new()
         }
-    )
+    ))
 }
 
 /// Prepara la scrittura di `target`: crea le directory intermedie e registra il
@@ -945,83 +972,122 @@ pub async fn upsert_project_document_if_doc(
     Ok(())
 }
 
-pub async fn tool_list_files(ctx: &ToolContextCore, input: &Value) -> String {
-    let dir_str = input.get("directory").and_then(Value::as_str).unwrap_or("");
+/// Le voci VISIBILI di una directory, ordinate, con `/` in coda alle
+/// sottodirectory. Estratto da `tool_list_files`.
+///
+/// Le entry nascoste (nome che inizia con `.`) non compaiono: e' comportamento
+/// storico di questo tool, ed e' la ragione per cui `file_exists` non puo'
+/// dedurre da questo testo se un file esista — deve interrogare il filesystem.
+/// Una entry illeggibile interrompe la raccolta senza far fallire il tool: cio'
+/// che si e' potuto elencare vale piu' di un errore su tutto.
+async fn raccogli_voci_visibili(entries: &mut tokio::fs::ReadDir) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let kind = if entry.path().is_dir() { "/" } else { "" };
+        lines.push(format!("{name}{kind}"));
+    }
+    lines.sort();
+    lines
+}
+
+/// Elenca le voci di una directory. MIGRATO al contratto e a `RispostaTool`.
+pub async fn tool_list_files(
+    ctx: &ToolContextCore,
+    input: &Value,
+) -> nexus_types::tool_outcome::RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::ListFilesInput};
+    use nexus_types::tool_outcome::RispostaTool;
+
+    let params = match ListFilesInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
+    };
+    // `directory` e' opzionale nel catalogo, e la stringa vuota vale come la sua
+    // assenza: entrambe significano "la root del progetto".
+    let dir_str = params.directory.as_deref().unwrap_or("");
     let target = if dir_str.is_empty() {
         ctx.root_path.clone()
     } else {
         match resolve_relative_path(&ctx.root_path, dir_str) {
             Ok(p) => p,
             Err(e) => {
-                return format!(
-                    "\u{274C} [Errore percorso: {}]",
+                return RispostaTool::fallito_rimediabile(format!(
+                    "[Errore percorso: {}]",
                     e.1["error"].as_str().unwrap_or("path error")
-                )
+                ))
             }
         }
     };
 
     let mut entries = match tokio::fs::read_dir(&target).await {
         Ok(rd) => rd,
-        Err(e) => return format!("\u{274C} [Errore listing '{}': {}]", dir_str, e),
+        Err(e) => {
+            return RispostaTool::fallito(format!("[Errore listing '{dir_str}': {e}]"))
+                .con_natura(NaturaFallimento::da_errore_io(&e))
+        }
     };
 
-    let mut lines = Vec::new();
-    loop {
-        match entries.next_entry().await {
-            Ok(Some(entry)) => {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with('.') {
-                    continue;
-                }
-                let kind = if entry.path().is_dir() { "/" } else { "" };
-                lines.push(format!("{name}{kind}"));
-            }
-            Ok(None) => break,
-            Err(_) => break,
-        }
-    }
-    lines.sort();
+    let lines = raccogli_voci_visibili(&mut entries).await;
     if lines.is_empty() {
         // "vuota o non trovata" era una disgiunzione che il codice sa risolvere:
         // se `read_dir` e' RIUSCITA la directory esiste, punto — l'inesistenza
         // esce dal ramo `Err` qui sopra. Quel testo faceva credere il contrario
         // a chi lo leggeva, e un consumatore del final gate ci cercava dentro
         // "non trovato" per dedurre un fallimento che non c'era.
-        format!("Directory '{}' vuota (nessuna voce visibile).", dir_str)
+        RispostaTool::riuscito(format!(
+            "Directory '{dir_str}' vuota (nessuna voce visibile)."
+        ))
     } else {
-        lines.join("\n")
+        RispostaTool::riuscito(lines.join("\n"))
     }
 }
 
-pub async fn tool_search_in_files(ctx: &ToolContextCore, input: &Value) -> String {
-    let pattern = match input.get("pattern").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return "\u{274C} [Errore: parametro 'pattern' mancante]".to_string(),
+/// Cerca un pattern nei file del progetto. MIGRATO al contratto e a
+/// `RispostaTool`.
+pub async fn tool_search_in_files(
+    ctx: &ToolContextCore,
+    input: &Value,
+) -> nexus_types::tool_outcome::RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::SearchInFilesInput};
+    use nexus_types::tool_outcome::RispostaTool;
+
+    let params = match SearchInFilesInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
+    let pattern = params.pattern.as_str();
     // Punto unico (regola L): de-duplica la root se l'agente l'ha inclusa nel
     // path e blocca il traversal ".." (resolve_relative_path -> normalize_into_root).
-    let search_path: PathBuf = if let Some(p) = input.get("path").and_then(Value::as_str) {
-        match resolve_relative_path(&ctx.root_path, p) {
+    let search_path: PathBuf = match params.path.as_deref() {
+        Some(p) => match resolve_relative_path(&ctx.root_path, p) {
             Ok(path) => path,
             Err(e) => {
-                return format!(
-                    "\u{274C} [Errore percorso: {}]",
+                return RispostaTool::fallito_rimediabile(format!(
+                    "[Errore percorso: {}]",
                     e.1["error"].as_str().unwrap_or("path error")
-                )
+                ))
             }
-        }
-    } else {
-        ctx.root_path.clone()
+        },
+        None => ctx.root_path.clone(),
     };
 
     let max_file_bytes = fs_read_max_bytes(&ctx.db).await;
     let stdout = match run_grep_or_fallback(pattern, &search_path, max_file_bytes).await {
         Ok(s) => s,
-        Err(msg) => return msg,
+        // Rimediabile, e la ragione e' strutturale: questo ramo scatta solo dove
+        // `grep` esiste ed E' GIRATO emettendo un errore proprio (il fallback
+        // Rust non fallisce mai — se la regex non compila degrada a ricerca
+        // letterale). Cio' che grep rifiuta e' quasi sempre il pattern, che e'
+        // l'unica cosa che ha scritto l'agente, e il suo messaggio viaggia qui
+        // dentro: e' l'informazione con cui correggere.
+        Err(msg) => return RispostaTool::fallito_rimediabile(msg),
     };
 
-    format_search_output(ctx, pattern, &stdout)
+    RispostaTool::riuscito(format_search_output(ctx, pattern, &stdout))
 }
 
 /// Esegue `grep -rn --include=* --max-count=50 -I` su `search_path` e ne
@@ -2106,37 +2172,44 @@ pub async fn tool_fs_mkdir(
 }
 
 /// Copia un file o una directory (ricorsiva) dentro la root del progetto.
-pub async fn tool_fs_copy(ctx: &ToolContextCore, input: &Value) -> String {
+/// MIGRATO al contratto e a `RispostaTool`.
+pub async fn tool_fs_copy(
+    ctx: &ToolContextCore,
+    input: &Value,
+) -> nexus_types::tool_outcome::RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::FsCopyInput};
+    use nexus_types::tool_outcome::RispostaTool;
+
     if !ctx.can_write {
-        return "\u{274C} [Errore: permesso di scrittura non concesso su questo progetto]".to_string();
+        return RispostaTool::fallito_di_sistema(
+            "[Errore: permesso di scrittura non concesso su questo progetto]",
+        );
     }
-    let from_str = match input.get("from").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return "\u{274C} [Errore: parametro 'from' mancante]".to_string(),
+    let params = match FsCopyInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
-    let to_str = match input.get("to").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return "\u{274C} [Errore: parametro 'to' mancante]".to_string(),
-    };
-    let overwrite = input
-        .get("overwrite")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let from_str = params.from.as_str();
+    let to_str = params.to.as_str();
+    let overwrite = params.overwrite.unwrap_or(false);
 
     let (from, to) = match resolve_from_to(&ctx.root_path, from_str, to_str) {
         Ok(pair) => pair,
-        Err(msg) => return msg,
+        Err(risposta) => return risposta,
     };
 
     if !from.exists() {
-        return format!("\u{274C} [Errore: sorgente '{}' non esiste]", from_str);
+        return RispostaTool::fallito_rimediabile(format!(
+            "[Errore: sorgente '{from_str}' non esiste]"
+        ));
     }
 
     if to.exists() && !overwrite {
-        return format!(
-            "\u{274C} [Errore: destinazione '{}' esiste gia'. Usa overwrite:true per sovrascrivere]",
-            to_str
-        );
+        // Rimediabile nella forma piu' netta: il messaggio nomina il parametro
+        // che risolve, e usarlo e' una decisione che spetta all'agente.
+        return RispostaTool::fallito_rimediabile(format!(
+            "[Errore: destinazione '{to_str}' esiste gia'. Usa overwrite:true per sovrascrivere]"
+        ));
     }
 
     copy_from_to(&from, &to, from_str, to_str).await
@@ -2144,31 +2217,46 @@ pub async fn tool_fs_copy(ctx: &ToolContextCore, input: &Value) -> String {
 
 /// Esegue la copia risolta: file singolo (creando le directory genitore) o
 /// directory ricorsiva. Estratto da `tool_fs_copy` per coesione e brevita'.
-async fn copy_from_to(from: &Path, to: &Path, from_str: &str, to_str: &str) -> String {
+async fn copy_from_to(
+    from: &Path,
+    to: &Path,
+    from_str: &str,
+    to_str: &str,
+) -> nexus_types::tool_outcome::RispostaTool {
+    use nexus_types::tool_outcome::RispostaTool;
+
     if from.is_file() {
         // Crea directory genitore se non esiste
         if let Some(parent) = to.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                return format!("\u{274C} [Errore creazione directory destinazione: {}]", e);
+                return RispostaTool::fallito(format!(
+                    "[Errore creazione directory destinazione: {e}]"
+                ))
+                .con_natura(NaturaFallimento::da_errore_io(&e));
             }
         }
         match tokio::fs::copy(from, to).await {
-            Ok(bytes) => format!(
-                "File copiato '{}' -> '{}' ({} byte)",
-                from_str, to_str, bytes
-            ),
-            Err(e) => format!("\u{274C} [Errore copia file: {}]", e),
+            Ok(bytes) => RispostaTool::riuscito(format!(
+                "File copiato '{from_str}' -> '{to_str}' ({bytes} byte)"
+            )),
+            Err(e) => RispostaTool::fallito(format!("[Errore copia file: {e}]"))
+                .con_natura(NaturaFallimento::da_errore_io(&e)),
         }
     } else if from.is_dir() {
         match copy_dir_recursive(from, to).await {
-            Ok(count) => format!(
-                "Directory copiata '{}' -> '{}' ({} file)",
-                from_str, to_str, count
-            ),
-            Err(e) => format!("\u{274C} [Errore copia directory: {}]", e),
+            Ok(count) => RispostaTool::riuscito(format!(
+                "Directory copiata '{from_str}' -> '{to_str}' ({count} file)"
+            )),
+            // La copia ricorsiva compone il proprio messaggio da piu' errori di
+            // I/O possibili e non conserva un `ErrorKind` solo: la natura non si
+            // indovina da quel testo (regola M), e resta quella che vale per
+            // l'agente — riprovare la stessa copia non cambierebbe l'esito.
+            Err(e) => RispostaTool::fallito_di_sistema(format!("[Errore copia directory: {e}]")),
         }
     } else {
-        format!("\u{274C} [Errore: '{}' non e' un file ne' una directory]", from_str)
+        RispostaTool::fallito_rimediabile(format!(
+            "[Errore: '{from_str}' non e' un file ne' una directory]"
+        ))
     }
 }
 
@@ -2205,12 +2293,14 @@ fn resolve_from_to(
     root: &Path,
     from_str: &str,
     to_str: &str,
-) -> Result<(PathBuf, PathBuf), String> {
+) -> Result<(PathBuf, PathBuf), nexus_types::tool_outcome::RispostaTool> {
+    use nexus_types::tool_outcome::RispostaTool;
+
     let from = resolve_relative_path(root, from_str).map_err(|e| {
-        format!(
-            "\u{274C} [Errore percorso sorgente: {}]",
+        RispostaTool::fallito_rimediabile(format!(
+            "[Errore percorso sorgente: {}]",
             e.1["error"].as_str().unwrap_or("path error")
-        )
+        ))
     })?;
     // La DESTINAZIONE non esiste ancora: e' il caso normale di una copia o di
     // uno spostamento. `resolve_relative_path` canonicalizza, quindi rifiutava
@@ -2219,47 +2309,63 @@ fn resolve_from_to(
     // `overwrite:true`. Che il ramo fosse irraggiungibile lo diceva gia' il
     // codice: `tool_fs_copy` controlla `if to.exists() && !overwrite`, un test
     // che ha senso solo se `to` puo' non esistere.
-    let to = resolve_write_target(root, to_str)
-        .map_err(|e| format!("\u{274C} [Errore percorso destinazione: {e}]"))?;
+    let to = resolve_write_target(root, to_str).map_err(|e| {
+        RispostaTool::fallito_rimediabile(format!("[Errore percorso destinazione: {e}]"))
+    })?;
     Ok((from, to))
 }
 
-/// Sposta (rinomina) un file o una directory. Atomico se sullo stesso filesystem.
-pub async fn tool_fs_move(ctx: &ToolContextCore, input: &Value) -> String {
+/// Sposta (rinomina) un file o una directory. Atomico se sullo stesso
+/// filesystem. MIGRATO al contratto e a `RispostaTool`.
+pub async fn tool_fs_move(
+    ctx: &ToolContextCore,
+    input: &Value,
+) -> nexus_types::tool_outcome::RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::FsMoveInput};
+    use nexus_types::tool_outcome::RispostaTool;
+
     if !ctx.can_write {
-        return "\u{274C} [Errore: permesso di scrittura non concesso su questo progetto]".to_string();
+        return RispostaTool::fallito_di_sistema(
+            "[Errore: permesso di scrittura non concesso su questo progetto]",
+        );
     }
-    let from_str = match input.get("from").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return "\u{274C} [Errore: parametro 'from' mancante]".to_string(),
+    let params = match FsMoveInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
-    let to_str = match input.get("to").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return "\u{274C} [Errore: parametro 'to' mancante]".to_string(),
-    };
+    let from_str = params.from.as_str();
+    let to_str = params.to.as_str();
 
     let (from, to) = match resolve_from_to(&ctx.root_path, from_str, to_str) {
         Ok(pair) => pair,
-        Err(msg) => return msg,
+        Err(risposta) => return risposta,
     };
 
     if !from.exists() {
-        return format!("\u{274C} [Errore: sorgente '{}' non esiste]", from_str);
+        return RispostaTool::fallito_rimediabile(format!(
+            "[Errore: sorgente '{from_str}' non esiste]"
+        ));
     }
     if to.exists() {
-        return format!("\u{274C} [Errore: destinazione '{}' esiste gia']", to_str);
+        // A differenza di `fs_copy` qui non esiste un `overwrite`: la strada per
+        // rimediare e' un'altra destinazione, o eliminare prima quella occupata.
+        return RispostaTool::fallito_rimediabile(format!(
+            "[Errore: destinazione '{to_str}' esiste gia']"
+        ));
     }
 
     // Crea directory genitore se non esiste
     if let Some(parent) = to.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return format!("\u{274C} [Errore creazione directory destinazione: {}]", e);
+            return RispostaTool::fallito(format!("[Errore creazione directory destinazione: {e}]"))
+                .con_natura(NaturaFallimento::da_errore_io(&e));
         }
     }
 
     match tokio::fs::rename(&from, &to).await {
-        Ok(()) => format!("Spostato '{}' -> '{}'", from_str, to_str),
-        Err(e) => format!("\u{274C} [Errore spostamento: {}]", e),
+        Ok(()) => RispostaTool::riuscito(format!("Spostato '{from_str}' -> '{to_str}'")),
+        Err(e) => RispostaTool::fallito(format!("[Errore spostamento: {e}]"))
+            .con_natura(NaturaFallimento::da_errore_io(&e)),
     }
 }
 
@@ -2443,11 +2549,11 @@ mod tests {
 
         let out = super::tool_list_files(&ctx, &serde_json::json!({})).await;
 
-        assert!(out.contains("README.md"), "listing: {out}");
+        assert!(out.testo.contains("README.md"), "listing: {}", out.testo);
         // Il dotfile NON compare nel listing per un umano: e' proprio la ragione
         // per cui `file_exists` non puo' piu' fidarsi di questo testo per
         // decidere se un file esiste (deve interrogare il filesystem).
-        assert!(!out.contains(".env"), "listing: {out}");
+        assert!(!out.testo.contains(".env"), "listing: {}", out.testo);
     }
 
     #[tokio::test]
@@ -2462,12 +2568,17 @@ mod tests {
         // non ha trovato voci): il vecchio testo "vuota o non trovata" affermava
         // anche il contrario, e un consumatore ci cercava "non trovat*" dentro
         // per dedurre un fallimento che non c'era mai stato.
-        assert!(!nexus_types::tool_outcome::is_tool_failure(&out), "{out}");
-        assert!(!out.to_lowercase().contains("non trovata"), "{out}");
+        assert_eq!(
+            out.esito,
+            nexus_types::tool_outcome::EsitoTool::Riuscito,
+            "{}",
+            out.testo
+        );
+        assert!(!out.testo.to_lowercase().contains("non trovata"), "{}", out.testo);
     }
 
     #[tokio::test]
-    async fn list_files_directory_assente_dichiara_il_marker() {
+    async fn list_files_directory_assente_e_un_fallimento_dichiarato() {
         let dir = tempfile::tempdir().expect("tempdir");
         let hooks = Arc::new(HookRegistranti::default());
         let ctx = ctx_di_prova(dir.path().to_path_buf(), hooks);
@@ -2475,10 +2586,19 @@ mod tests {
         let out = super::tool_list_files(&ctx, &serde_json::json!({ "directory": "assente" }))
             .await;
 
-        // QUESTO e' un fallimento vero (read_dir su un path che non esiste), e
-        // deve dichiararlo col contratto macchina: prima non lo faceva mai, e
-        // `is_error` restava falso anche qui.
-        assert!(nexus_types::tool_outcome::is_tool_failure(&out), "{out}");
+        // QUESTO e' un fallimento vero, e ora vive nel CAMPO invece che in un
+        // marker in testa al testo: comporre una premessa davanti al risultato
+        // non lo puo' piu' nascondere.
+        assert!(out.esito.e_fallito(), "{}", out.testo);
+        // Il percorso non esiste: `resolve_relative_path` canonicalizza e
+        // rifiuta prima ancora di `read_dir`. In entrambi i rami la natura e'
+        // Rimediabile — l'agente scrive un'altra directory.
+        assert_eq!(
+            out.natura,
+            Some(nexus_types::tool_outcome::NaturaFallimento::Rimediabile),
+            "{}",
+            out.testo
+        );
     }
 
     /// Il gate e' BLOCCANTE: se `enforce_on_write` rifiuta, il file non deve
@@ -2983,9 +3103,11 @@ gamma
             &serde_json::json!({"from": "sorgente.txt", "to": "copia.txt"}),
         )
         .await;
-        assert!(
-            !nexus_types::tool_outcome::is_tool_failure(&out),
-            "copia verso una destinazione nuova: {out}"
+        assert_eq!(
+            out.esito,
+            EsitoTool::Riuscito,
+            "copia verso una destinazione nuova: {}",
+            out.testo
         );
         assert!(dir.path().join("copia.txt").is_file(), "la copia esiste");
 
@@ -2996,6 +3118,157 @@ gamma
         senza_permesso.can_write = false;
         let out =
             super::tool_delete_file(&senza_permesso, &serde_json::json!({"path": "x"})).await;
+        assert_eq!(out.natura, Some(NaturaFallimento::DelSistema), "{}", out.testo);
+    }
+
+    /// `read_file_lines` prende gli estremi dal CONTRATTO, e ogni modo di
+    /// sbagliarli e' un fallimento rimediabile il cui testo dice come.
+    ///
+    /// La riga che conta e' quella degli alias: `offset`/`limit` erano mappati
+    /// in silenzio a `start_line`/`end_line` mentre il catalogo non li dichiara
+    /// e il prompt del supervisore (mig 0060) dice al modello che NON esistono.
+    /// Il contratto chiude quella divergenza — e il modello che li usa comunque
+    /// riceve un messaggio che nomina il campo, non una lettura di righe che non
+    /// aveva chiesto.
+    ///
+    /// MUTAZIONE: rimettendo la mappatura degli alias, l'asserzione sul
+    /// fallimento di `offset`/`limit` rosseggia; togliendo il totale dal
+    /// messaggio di `start_line` oltre il file, rosseggia quella sul "10" —
+    /// che e' l'informazione senza cui "rimediabile" sarebbe una promessa non
+    /// mantenuta.
+    #[tokio::test]
+    async fn read_file_lines_prende_l_intervallo_dal_contratto() {
+        use nexus_types::tool_outcome::{EsitoTool, NaturaFallimento};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = ctx_di_prova(dir.path().to_path_buf(), Arc::new(HookRegistranti::default()));
+        let righe: String = (1..=10).map(|n| format!("riga {n}\n")).collect();
+        std::fs::write(dir.path().join("f.txt"), righe).expect("seed");
+
+        let out = super::tool_read_file_lines(
+            &ctx,
+            &serde_json::json!({"path": "f.txt", "start_line": 3, "end_line": 4}),
+        )
+        .await;
+        assert_eq!(out.esito, EsitoTool::Riuscito, "{}", out.testo);
+        assert!(out.testo.contains("riga 3"), "{}", out.testo);
+        assert!(out.testo.contains("riga 4"), "{}", out.testo);
+        assert!(!out.testo.contains("riga 5"), "estremo destro incluso: {}", out.testo);
+
+        // Gli alias che il catalogo non promette: li ferma il contratto, e il
+        // messaggio nomina il tool e il campo sconosciuto.
+        let out = super::tool_read_file_lines(
+            &ctx,
+            &serde_json::json!({"path": "f.txt", "offset": 3, "limit": 2}),
+        )
+        .await;
+        assert_eq!(out.esito, EsitoTool::Fallito, "{}", out.testo);
+        assert_eq!(out.natura, Some(NaturaFallimento::Rimediabile));
+        assert!(out.testo.contains("read_file_lines"), "{}", out.testo);
+
+        // Estremi fuori dominio: `i64` li fa arrivare fino al controllo, che dice
+        // QUALE estremo e' sbagliato invece di fallire nel deserializzatore.
+        let out = super::tool_read_file_lines(
+            &ctx,
+            &serde_json::json!({"path": "f.txt", "start_line": 0, "end_line": 4}),
+        )
+        .await;
+        assert_eq!(out.natura, Some(NaturaFallimento::Rimediabile), "{}", out.testo);
+        assert!(out.testo.contains("start_line"), "{}", out.testo);
+
+        let out = super::tool_read_file_lines(
+            &ctx,
+            &serde_json::json!({"path": "f.txt", "start_line": 8, "end_line": 2}),
+        )
+        .await;
+        assert_eq!(out.natura, Some(NaturaFallimento::Rimediabile), "{}", out.testo);
+        assert!(out.testo.contains("end_line"), "{}", out.testo);
+
+        // Oltre la fine del file: il messaggio porta il totale, che e' cio' con
+        // cui l'agente costruisce un intervallo valido.
+        let out = super::tool_read_file_lines(
+            &ctx,
+            &serde_json::json!({"path": "f.txt", "start_line": 99, "end_line": 120}),
+        )
+        .await;
+        assert_eq!(out.natura, Some(NaturaFallimento::Rimediabile), "{}", out.testo);
+        assert!(out.testo.contains("10"), "manca il totale righe: {}", out.testo);
+
+        // File assente: la natura la decide il `ErrorKind`, non una scelta
+        // scritta a mano in questo handler.
+        let out = super::tool_read_file_lines(
+            &ctx,
+            &serde_json::json!({"path": "mai_esistito.txt", "start_line": 1, "end_line": 2}),
+        )
+        .await;
+        assert_eq!(out.esito, EsitoTool::Fallito, "{}", out.testo);
+        assert_eq!(out.natura, Some(NaturaFallimento::Rimediabile));
+    }
+
+    /// Il pattern mancante di `search_in_files` lo ferma il contratto, PRIMA di
+    /// qualunque I/O: il tool non arriva a leggere il cap di governance dal DB.
+    ///
+    /// E' anche la ragione per cui questo test e' istantaneo su un pool lazy mai
+    /// connesso — la stessa proprieta' che nel dispatcher ha portato un test da
+    /// 150 secondi a zero.
+    #[tokio::test]
+    async fn search_in_files_senza_pattern_lo_ferma_il_contratto() {
+        use nexus_types::tool_outcome::NaturaFallimento;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = ctx_di_prova(dir.path().to_path_buf(), Arc::new(HookRegistranti::default()));
+
+        let out = super::tool_search_in_files(&ctx, &serde_json::json!({})).await;
+
+        assert!(out.esito.e_fallito(), "{}", out.testo);
+        assert_eq!(out.natura, Some(NaturaFallimento::Rimediabile));
+        assert!(out.testo.contains("search_in_files"), "{}", out.testo);
+    }
+
+    /// `fs_move` dichiara nei campi i tre esiti che lo distinguono da `fs_copy`.
+    ///
+    /// MUTAZIONE: dichiarando `fallito_di_sistema` la destinazione occupata,
+    /// l'agente riceve «cambia strada» per una condizione che risolve da solo
+    /// scegliendo un altro nome, e la riga sulla natura rosseggia.
+    #[tokio::test]
+    async fn fs_move_dichiara_esito_e_natura_nei_campi() {
+        use nexus_types::tool_outcome::{EsitoTool, NaturaFallimento};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = ctx_di_prova(dir.path().to_path_buf(), Arc::new(HookRegistranti::default()));
+        std::fs::write(dir.path().join("a.txt"), "dati").expect("seed");
+        std::fs::write(dir.path().join("occupata.txt"), "altro").expect("seed");
+
+        // Verso una destinazione NUOVA, dentro una directory che non esiste
+        // ancora: il genitore lo crea il tool.
+        let out = super::tool_fs_move(
+            &ctx,
+            &serde_json::json!({"from": "a.txt", "to": "sotto/b.txt"}),
+        )
+        .await;
+        assert_eq!(out.esito, EsitoTool::Riuscito, "{}", out.testo);
+        assert!(dir.path().join("sotto/b.txt").is_file(), "spostato sul disco");
+        assert!(!dir.path().join("a.txt").exists(), "la sorgente non resta");
+
+        // Destinazione gia' occupata: rimediabile, l'agente ne sceglie un'altra.
+        let out = super::tool_fs_move(
+            &ctx,
+            &serde_json::json!({"from": "sotto/b.txt", "to": "occupata.txt"}),
+        )
+        .await;
+        assert_eq!(out.esito, EsitoTool::Fallito, "{}", out.testo);
+        assert_eq!(out.natura, Some(NaturaFallimento::Rimediabile));
+
+        // Senza permesso di scrittura la decisione e' del progetto: ripetere non
+        // la cambia, e il contratto non viene nemmeno letto.
+        let mut senza_permesso =
+            ctx_di_prova(dir.path().to_path_buf(), Arc::new(HookRegistranti::default()));
+        senza_permesso.can_write = false;
+        let out = super::tool_fs_move(
+            &senza_permesso,
+            &serde_json::json!({"from": "sotto/b.txt", "to": "c.txt"}),
+        )
+        .await;
         assert_eq!(out.natura, Some(NaturaFallimento::DelSistema), "{}", out.testo);
     }
 }
