@@ -60,6 +60,27 @@ async fn esegui_tool_migrato(
         // vive in `esito`. Un marker in testa alla prosa qui sarebbe tornato a
         // essere un campo travestito.
         "list_active_services" => Some(service::tool_list_active_services(ctx, input).await),
+        // Il resto di `service.rs`. Il lancio di un servizio e' il caso in cui
+        // l'esito nel campo cambia di piu': i due rami di quota ritornavano un
+        // messaggio senza marker, cioe' un avvio BLOCCATO che l'agente riceveva
+        // come conferma.
+        //
+        // `run_in_terminal` e' un alias storico che il catalogo non dichiara —
+        // il modello non lo puo' invocare — ma che il dispatch accetta e altre
+        // parti del sistema nominano (step_gate, cache dei mutatori, UI). Resta,
+        // e il contratto d'ingresso lo legge col NOME INVOCATO, cosi' un errore
+        // di parametri non rimanda allo schema di un tool diverso.
+        "run_in_terminal" => Some(service::tool_run_service(ctx, input, "task").await),
+        "run_service" => Some(service::tool_run_service(ctx, input, "service").await),
+        "read_terminal_output" => Some(service::tool_read_service_output(ctx, input).await),
+        // DIVERGENZA CHIUSA: l'handler ripiegava sull'ultimo processo quando
+        // `process_id` mancava, mentre il catalogo lo dichiara obbligatorio. La
+        // capacita' resta dove e' PROMESSA, in `tail_service_logs`.
+        "read_service_output" => Some(service::tool_read_service_output(ctx, input).await),
+        "stop_service" => Some(service::tool_stop_service(ctx, input).await),
+        "service_restart" => Some(service::tool_service_restart(ctx, input).await),
+        "tail_service_logs" => Some(service::tool_tail_service_logs(ctx, input).await),
+        "build_project_image" => Some(service::tool_build_project_image(ctx).await),
         // Ogni suo fallimento e' RIMEDIABILE e lo dichiara nel campo `natura`:
         // e' il primo tool a farlo, ed e' quello su cui la mancanza si
         // misurava (11% di `old_string non trovato` seguiti da una ripetizione
@@ -129,13 +150,6 @@ async fn esegui_tool_legacy(
         // Poll (DB-only) + resume (ri-esecuzione nativa) dei sub-agent.
         "nexus_subagent_poll" => subagent_native::tool_nexus_subagent_poll(ctx, input).await,
         "nexus_subagent_resume" => subagent_native::tool_nexus_subagent_resume(ctx, input).await,
-        "run_in_terminal" => service::tool_run_service(ctx, input, "task").await,
-        "run_service" => service::tool_run_service(ctx, input, "service").await,
-        "read_terminal_output" => service::tool_read_service_output(ctx, input).await,
-        "read_service_output" => service::tool_read_service_output(ctx, input).await,
-        "stop_service" => service::tool_stop_service(ctx, input).await,
-        "service_restart" => service::tool_service_restart(ctx, input).await,
-        "tail_service_logs" => service::tool_tail_service_logs(ctx, input).await,
         "run_specific_test" => testing::tool_run_specific_test(ctx, input).await,
         "run_lint_fix" => testing::tool_run_lint_fix(ctx, input).await,
         "format_file" => testing::tool_format_file(ctx, input).await,
@@ -149,7 +163,6 @@ async fn esegui_tool_legacy(
         "update_profile" => tool_update_profile(ctx, input).await,
         "set_sandbox_config" => sandbox::tool_set_sandbox_config(ctx, input).await,
         "get_sandbox_config" => sandbox::tool_get_sandbox_config(ctx).await,
-        "build_project_image" => service::tool_build_project_image(ctx).await,
         "scan_code_quality" => tool_scan_code_quality(ctx, input).await,
         "search_codebase_semantic" => {
             let query = input

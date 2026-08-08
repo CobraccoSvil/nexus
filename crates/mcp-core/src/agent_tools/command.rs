@@ -250,7 +250,7 @@ async fn migration_only_block(ctx: &AgentToolContext, command: &str) -> Option<S
 /// contratto: qui non si guarda cosa c'e' scritto, si guarda cosa e' stato
 /// dichiarato. Finche' lo prendeva, qualcuno poteva rimetterci un
 /// riconoscimento sul nome senza cambiare la firma.
-async fn maybe_route_to_service(ctx: &AgentToolContext, input: &Value) -> Option<String> {
+async fn maybe_route_to_service(ctx: &AgentToolContext, input: &Value) -> Option<RispostaTool> {
     let explicit_bg = input
         .get("background")
         .and_then(Value::as_bool)
@@ -259,14 +259,18 @@ async fn maybe_route_to_service(ctx: &AgentToolContext, input: &Value) -> Option
     // ── Livello 1: parametro background esplicito dall'AI ──
     if explicit_bg {
         let routed = service::tool_run_service(ctx, input, "service").await;
-        // La premessa NON deve coprire l'esito del tool inoltrato: `run_service`
-        // dichiara ancora il fallimento col marker in TESTA, e una concatenazione
-        // nuda lo spingerebbe in mezzo al testo rendendo un avvio fallito
-        // indistinguibile da uno riuscito (punto unico regola L).
-        return Some(nexus_types::tool_outcome::prepend_preserving_failure(
-            "[Background] Comando avviato come servizio server-side (background=true).",
-            &routed,
-        ));
+        // `run_service` e' migrato: l'esito sta nel campo, quindi la premessa si
+        // concatena al solo testo e non puo' piu' coprire nulla. Serviva
+        // `prepend_preserving_failure` finche' il fallimento viveva in testa
+        // alla stringa; ora non c'e' piu' niente da preservare, ed e' il
+        // secondo call site di quel punto unico a sparire.
+        return Some(RispostaTool {
+            testo: format!(
+                "[Background] Comando avviato come servizio server-side (background=true).\n{}",
+                routed.testo
+            ),
+            ..routed
+        });
     }
 
     // NESSUN livello 2. La natura di un comando non si indovina dal suo testo:
@@ -466,8 +470,11 @@ async fn command_hints_and_routing(
 
     // ── Livelli 1-2: routing a run_service (background esplicito o comando noto
     // long-running/web-service). Se instradato ritorna il messaggio; None = prosegue. ──
-    if let Some(msg) = maybe_route_to_service(ctx, input).await {
-        return Err(inoltro_legacy(msg));
+    // Nessun ponte legacy: `run_service` e' migrato e la sua risposta arriva
+    // gia' coi campi valorizzati. Ricostruirne l'esito dal testo sarebbe ora
+    // una perdita — la natura del fallimento non e' deducibile dal marker.
+    if let Some(risposta) = maybe_route_to_service(ctx, input).await {
+        return Err(risposta);
     }
 
     Ok(hints_prefix)

@@ -141,6 +141,17 @@ pub trait InputTool: Sized {
 
     /// Deserializza dall'input grezzo del tool.
     fn leggi(input: &Value) -> Result<Self, RispostaTool>;
+
+    /// Come [`Self::leggi`], ma il messaggio d'errore nomina il tool che
+    /// l'agente ha DAVVERO invocato.
+    ///
+    /// Serve dove piu' nomi di tool condividono un handler e quindi un contratto
+    /// (`run_service` e l'alias storico `run_in_terminal`): col nome dichiarato
+    /// nella macro, un errore su `run_in_terminal` rimanderebbe l'agente a
+    /// cercare lo schema di `run_service` — la stessa ragione per cui
+    /// `service::nome_del_tool` esiste. Non e' un secondo messaggio (regola L):
+    /// e' lo STESSO [`errore_di_lettura`] con l'unico dato che varia.
+    fn leggi_come(tool: &str, input: &Value) -> Result<Self, RispostaTool>;
 }
 
 /// Traduce un errore di deserializzazione nel fallimento che il modello ricevera'.
@@ -274,8 +285,17 @@ macro_rules! tool_input {
             }
 
             fn leggi(input: &::serde_json::Value) -> ::std::result::Result<Self, ::nexus_types::tool_outcome::RispostaTool> {
+                // Delega, non ricopia: il nome dichiarato qui e' l'unico dato
+                // che distingue le due letture.
+                <Self as $crate::input_contract::InputTool>::leggi_come($tool, input)
+            }
+
+            fn leggi_come(
+                tool: &str,
+                input: &::serde_json::Value,
+            ) -> ::std::result::Result<Self, ::nexus_types::tool_outcome::RispostaTool> {
                 ::serde_json::from_value::<Self>(input.clone())
-                    .map_err(|e| $crate::input_contract::errore_di_lettura($tool, e))
+                    .map_err(|e| $crate::input_contract::errore_di_lettura(tool, e))
             }
         }
     };

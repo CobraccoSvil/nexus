@@ -130,12 +130,18 @@ fn nome_del_tool(kind: &str) -> &'static str {
 /// PRIMA di tutto cio' che segue, perche' ha effetti: `dedup_and_cleanup_ports`
 /// ferma processi e libera porte, e farlo per una suite che da qui non doveva
 /// partire costerebbe un servizio vivo.
+///
+/// `intercetta_suite` ritorna ancora `String` perche' delega all'esecutore unico
+/// della suite, che vive in `testing.rs` e non e' migrato: finche' resta cosi',
+/// l'esito va ricostruito dal ponte legacy — l'UNICO punto autorizzato a farlo.
+/// Migrando `testing.rs` questa conversione sparisce. Il ponte non e' una scelta
+/// di questo modulo, e' il confine col modulo che lo precede nella migrazione.
 async fn suite_playwright_altrove(
     ctx: &AgentToolContext,
     tool: &str,
     command: &str,
     input: &Value,
-) -> Option<String> {
+) -> Option<RispostaTool> {
     super::playwright_cli::intercetta_suite(
         ctx,
         tool,
@@ -143,20 +149,25 @@ async fn suite_playwright_altrove(
         input.get("working_dir").and_then(Value::as_str),
     )
     .await
+    .map(RispostaTool::da_testo_legacy)
 }
 
 /// Avvia un servizio/processo long-running direttamente sul server.
 /// L'output viene catturato nel DB e mostrato nel pannello Output dell'IDE.
-pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind: &str) -> String {
+pub(super) async fn tool_run_service(
+    ctx: &AgentToolContext,
+    input: &Value,
+    kind: &str,
+) -> RispostaTool {
     // Nome del tool come l'ha invocato l'agente, preso PRIMA che `kind` venga
     // ridefinito dal declassamento one-shot: un messaggio che nomina un tool
     // diverso da quello chiamato manda a cercare la riga sbagliata.
     let tool_invocante = nome_del_tool(kind);
 
     // Fase 1: validazione + label/work_dir (senza refuse: la dedup deve girare prima).
-    let launch = match resolve_service_launch(ctx, input, kind).await {
+    let launch = match resolve_service_launch(ctx, input, tool_invocante, kind).await {
         Ok(l) => l,
-        Err(msg) => return msg,
+        Err(risposta) => return risposta,
     };
     let ServiceLaunch {
         command,
@@ -180,7 +191,7 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
     // (es. next dev → 3000 → conflitto con web-ide Nexus).
     let env_overrides = match allocate_web_port_env(ctx, &command, &label).await {
         Ok(env) => env,
-        Err(msg) => return msg,
+        Err(risposta) => return risposta,
     };
     // Porta su cui il servizio DEVE mettersi in ascolto. E' il segnale che
     // distingue "il processo esiste" da "il servizio serve": senza, un avvio
@@ -193,7 +204,7 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
     let process_id =
         match spawn_service_process(ctx, &label, &command, &work_dir, env_overrides, &kind).await {
             Ok(process_id) => process_id,
-            Err(msg) => return msg,
+            Err(risposta) => return risposta,
         };
 
     // Servizio web: si attende l'ASCOLTO, non un tempo fisso. Uno sano risponde
@@ -224,7 +235,7 @@ async fn gate_pre_avvio(
     label: &str,
     command: &str,
     work_dir: &Path,
-) -> Option<String> {
+) -> Option<RispostaTool> {
     // La dedup FERMA i servizi vivi con label simile, e lo fa PRIMA che questo
     // processo esista. E' il potere piu' distruttivo del lancio, e spetta solo a
     // chi un servizio lo e': sostituire un servizio con la sua nuova istanza ha
@@ -434,23 +445,32 @@ struct ServiceLaunch {
 /// backend con host 'base' -> getaddrinfo ENOTFOUND). Punto unico della
 /// validazione: security::redaction_guard (regola L). `Err(msg)` = messaggio
 /// gia' pronto da restituire.
-async fn validate_service_command(ctx: &AgentToolContext, input: &Value) -> Result<String, String> {
-    let command = match input.get("command").and_then(Value::as_str) {
-        Some(s) => s.to_string(),
-        None => return Err("\u{274C} [Errore: parametro 'command' mancante]".to_string()),
-    };
+/// La presenza e il tipo di `command` NON si controllano piu' qui: li pretende
+/// il contratto d'ingresso, che e' la stessa scrittura da cui nasce lo schema
+/// consegnato al modello. Resta cio' che il contratto non puo' sapere — il
+/// comando VUOTO (una stringa e' una stringa anche se non contiene nulla) e i
+/// placeholder di redazione copiati come valori.
+async fn validate_service_command(
+    ctx: &AgentToolContext,
+    tool: &str,
+    command: String,
+) -> Result<String, RispostaTool> {
     if command.trim().is_empty() {
-        return Err("\u{274C} [Errore: comando vuoto]".to_string());
+        return Err(RispostaTool::fallito_rimediabile(
+            "[Errore: comando vuoto. Passa in 'command' la riga da eseguire.]",
+        ));
     }
     if let Some(msg) = crate::security::redaction_guard::enforce_no_redacted_placeholder(
-        ctx,
-        "run_service",
-        "command",
-        &command,
+        ctx, tool, "command", &command,
     )
     .await
     {
-        return Err(msg);
+        // Il guard e' un punto unico non migrato e il suo messaggio resta suo:
+        // riscriverlo qui significherebbe interpretarlo. Se ne dichiara la
+        // natura, che questo modulo conosce — l'agente ha copiato un segnaposto
+        // di redazione al posto di un valore, e sostituirlo e' cio' che deve
+        // fare.
+        return Err(RispostaTool::fallito_rimediabile(msg));
     }
     Ok(command)
 }
@@ -461,9 +481,16 @@ async fn validate_service_command(ctx: &AgentToolContext, input: &Value) -> Resu
 async fn resolve_service_launch(
     ctx: &AgentToolContext,
     input: &Value,
+    tool: &str,
     kind: &str,
-) -> Result<ServiceLaunch, String> {
-    let command = validate_service_command(ctx, input).await?;
+) -> Result<ServiceLaunch, RispostaTool> {
+    use nexus_agent_tools::{input_contract::InputTool, tool_inputs::RunServiceInput};
+
+    // Il nome INVOCATO, non quello dichiarato nella macro: questo handler serve
+    // anche l'alias storico `run_in_terminal`, e un errore di parametri deve
+    // mandare l'agente allo schema del tool che ha davvero chiamato.
+    let params = RunServiceInput::leggi_come(tool, input)?;
+    let command = validate_service_command(ctx, tool, params.command).await?;
 
     // Declassamento: comandi che NON avviano un server arrivano qui via
     // auto-routing di run_command (background=true, pattern long-running,
@@ -481,7 +508,7 @@ async fn resolve_service_launch(
     let kind = declassa_se_non_e_un_servizio(kind, &command);
 
     // Risoluzione working directory (punto unico riusato anche dal restart).
-    let work_dir = resolve_service_work_dir(&ctx.root_path, input)?;
+    let work_dir = resolve_service_work_dir(&ctx.root_path, params.working_dir.as_deref())?;
 
     // Derivazione identita' (refuse per scopo: dopo dedup in tool_run_service).
     // La conseguenza sulla classificazione la dichiara l'identita' stessa
@@ -833,7 +860,7 @@ async fn spawn_service_process(
     work_dir: &std::path::Path,
     env_overrides: Option<HashMap<String, String>>,
     kind: &str,
-) -> Result<Uuid, String> {
+) -> Result<Uuid, RispostaTool> {
     crate::agent_processes::spawn_agent_process(
         &ctx.db,
         ctx.project_id,
@@ -848,18 +875,26 @@ async fn spawn_service_process(
         None,
     )
     .await
-    .map_err(|e| format!("\u{274C} [Errore avvio servizio '{}': {}]", label, e))
+    // Lo spawn fallisce per l'ambiente (sandbox, DB del progetto, risorse), non
+    // per come l'agente ha scritto la chiamata: quella era gia' passata dal
+    // contratto e da tre gate.
+    .map_err(|e| RispostaTool::fallito_di_sistema(format!("[Errore avvio servizio '{label}': {e}]")))
 }
 
 /// Legge l'output iniziale di un servizio appena avviato, registra la porta
 /// rilevata, emette gli eventi di pannello e compone il messaggio di ritorno.
+///
+/// Se la RILETTURA dell'output fallisce l'esito resta RIUSCITO: il servizio e'
+/// partito, e cio' che non e' riuscito e' guardarlo. Dichiararlo fallito
+/// attribuirebbe al lancio un esito che il lancio non ha avuto, e manderebbe
+/// l'agente a riavviare un processo vivo.
 async fn report_started_service(
     ctx: &AgentToolContext,
     label: &str,
     kind: &str,
     process_id: Uuid,
     ascolto: Option<(u16, bool)>,
-) -> String {
+) -> RispostaTool {
     let info = match crate::agent_processes::read_process_output(
         &ctx.db,
         ctx.project_id,
@@ -870,10 +905,10 @@ async fn report_started_service(
     {
         Ok(info) => info,
         Err(e) => {
-            return format!(
-                "Servizio '{}' avviato (process_id: {}), ma errore lettura output: {}",
-                label, process_id, e
-            )
+            return RispostaTool::riuscito(format!(
+                "Servizio '{label}' avviato (process_id: {process_id}), \
+                 ma errore lettura output: {e}"
+            ))
         }
     };
 
@@ -1161,7 +1196,7 @@ fn format_ascolto_mancante(
     info: &crate::agent_processes::ProcessOutput,
     port: u16,
     altrove: &AscoltoAltrove,
-) -> String {
+) -> RispostaTool {
     let pid = info
         .pid
         .map(|p| p.to_string())
@@ -1189,7 +1224,14 @@ fn format_ascolto_mancante(
             "\n(Nessun output: il processo non ha scritto nulla prima di smettere di rispondere.)",
         );
     }
-    nexus_types::tool_outcome::tool_failure(msg)
+    // TRANSITORIO, e non e' il ripiego comodo: e' il precedente gia' deciso in
+    // main per questa identica firma («servizio non in ascolto entro 20s =
+    // Transitorio»), e regge perche' la causa piu' frequente e' un avvio lento.
+    // Il testo dice all'agente di correggere PRIMA di riavviare, quindi la
+    // direttiva «ritentare e' legittimo» non lo manda a ripetere alla cieca:
+    // gli dice che riprovare, dopo la correzione, e' la strada — che e' cio' che
+    // deve fare.
+    RispostaTool::fallito_transitorio(msg)
 }
 
 fn format_started_message(
@@ -1198,7 +1240,7 @@ fn format_started_message(
     info: &crate::agent_processes::ProcessOutput,
     ascolto: Option<(u16, bool)>,
     altrove: &AscoltoAltrove,
-) -> String {
+) -> RispostaTool {
     // Un servizio che non e' entrato in ascolto NON e' avviato, per quanto il
     // suo processo sia ancora vivo. Dirlo apertamente e' l'intero scopo del
     // controllo: l'agente deve leggere il fallimento e lo stderr che lo spiega,
@@ -1227,7 +1269,7 @@ fn format_started_message(
     if info.stdout.is_empty() && info.stderr.is_empty() {
         msg.push_str("\n(Nessun output ancora. Usa read_service_output per controllare dopo qualche secondo.)");
     }
-    msg
+    RispostaTool::riuscito(msg)
 }
 
 /// Deriva lo scopo del servizio (frontend/backend) dal comando, dalla label o
@@ -1487,28 +1529,29 @@ fn sfila_apici(arg: &str) -> &str {
 /// produttore, invece di fabbricarsi la working dir a mano (regola O).
 fn resolve_service_work_dir(
     root: &std::path::Path,
-    input: &Value,
-) -> Result<std::path::PathBuf, String> {
-    let sub = input
-        .get("working_dir")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty());
-    let Some(sub) = sub else {
+    working_dir: Option<&str>,
+) -> Result<std::path::PathBuf, RispostaTool> {
+    let Some(sub) = working_dir.filter(|s| !s.is_empty()) else {
         return Ok(root.to_path_buf());
     };
     match resolve_relative_path(root, sub) {
         Ok(p) => Ok(p),
-        Err(e) => Err(format!(
-            "\u{274C} [Errore percorso: {}]",
+        // Il percorso e' un parametro che l'agente controlla, e il resolver dice
+        // gia' perche' non va bene: rimediabile con l'informazione a bordo.
+        Err(e) => Err(RispostaTool::fallito_rimediabile(format!(
+            "[Errore percorso: {}]",
             e.1["error"].as_str().unwrap_or("path error")
-        )),
+        ))),
     }
 }
 
 /// Anti-duplicato convergente sul PUNTO UNICO resource_resolver (regola L).
 /// Valutato DOPO `dedup_and_cleanup_ports`: refuse solo se, dopo stop_similar e
 /// try_free_port, lo stesso scopo e' ancora in LISTEN (servizio legit da riusare).
-async fn refuse_if_same_scope_active(ctx: &AgentToolContext, kind: &str) -> Option<String> {
+async fn refuse_if_same_scope_active(
+    ctx: &AgentToolContext,
+    kind: &str,
+) -> Option<RispostaTool> {
     let res = crate::project_workspace::resource_resolver::resolve_for_label(
         &ctx.port_registry,
         ctx.project_id,
@@ -1522,12 +1565,16 @@ async fn refuse_if_same_scope_active(ctx: &AgentToolContext, kind: &str) -> Opti
                 .port
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "?".to_string());
-            Some(format!(
-                "\u{274C} [Errore: servizio '{}' di tipo {} gia' ATTIVO sulla porta {}. \
+            // RIMEDIABILE, ed e' il caso in cui la variante e' letteralmente
+            // vera: il messaggio non dice solo che e' andata male, dice le due
+            // cose da fare — riusare la porta indicata, o riavviare con la label
+            // indicata.
+            Some(RispostaTool::fallito_rimediabile(format!(
+                "[Errore: servizio '{}' di tipo {} gia' ATTIVO sulla porta {}. \
                  Riusalo invece di crearne uno nuovo (puoi accedere a http://localhost:{}). \
                  Se vuoi davvero riavviarlo usa `service_restart` con label='{}'.]",
                 res.label, kind, port, port, res.label
-            ))
+            )))
         }
         ExistingServiceAction::AdoptStale => {
             // Allocazione dello stesso scopo SPENTA: NON rifiutare (era la causa
@@ -1550,13 +1597,26 @@ async fn refuse_if_same_scope_active(ctx: &AgentToolContext, kind: &str) -> Opti
 }
 
 /// Verifica le quote container (numero e RAM) prima di avviare un servizio.
-/// Ritorna `Some(msg)` col messaggio d'errore da restituire se una quota e'
+/// Ritorna `Some(risposta)` col fallimento da restituire se una quota e'
 /// raggiunta; `None` se l'avvio puo' proseguire. Registra l'audit dei blocchi.
+///
+/// DIVERGENZA CHIUSA: i due rami di quota ritornavano un messaggio SENZA marker
+/// di fallimento. Il servizio non partiva e l'esito diceva riuscito — un avvio
+/// bloccato dalla policy che l'agente riceveva come conferma, e su cui costruiva
+/// i passi successivi. E' la stessa forma dell'incidente che ha motivato
+/// `attende_ascolto` («il processo esiste» scambiato per «il servizio serve»),
+/// qui nella variante in cui il processo non nasce affatto. Col campo non e' piu'
+/// una dimenticanza possibile: il tipo pretende che l'esito sia dichiarato.
+///
+/// La natura e' `DelSistema` per entrambi, e non e' una scelta di comodo: una
+/// quota e' una decisione del progetto: ripetere non la cambia, e non c'e' un
+/// parametro della chiamata che la aggiri. Stesso precedente del permesso di
+/// scrittura negato in `write_file`.
 async fn check_container_quotas(
     ctx: &AgentToolContext,
     label: &str,
     command: &str,
-) -> Option<String> {
+) -> Option<RispostaTool> {
     // Separazione DB: agent_processes (conteggi container/RAM) vive nel DB
     // del progetto; le quote restano nel meta. Punto unico project_db_routes.
     // Fail-closed: quota non verificabile -> avvio bloccato con messaggio
@@ -1565,9 +1625,9 @@ async fn check_container_quotas(
         match crate::project_db_routes::project_data_pool_from(&ctx.db, ctx.project_id).await {
             Ok(p) => p,
             Err(e) => {
-                return Some(format!(
-                    "\u{274C} [Errore: DB del progetto non disponibile, quote container non verificabili: {e}]"
-                ))
+                return Some(RispostaTool::fallito_di_sistema(format!(
+                    "[Errore: DB del progetto non disponibile, quote container non verificabili: {e}]"
+                )))
             }
         };
     if let Err(reason) =
@@ -1578,7 +1638,7 @@ async fn check_container_quotas(
                 .with_resource(label.to_string())
                 .with_details(serde_json::json!({"reason": reason, "command": command})),
         );
-        return Some(format!("[Quota raggiunta: {}]", reason));
+        return quota_superata("Quota raggiunta", reason);
     }
     // Quota RAM pre-avvio (governance container/memory_quota): blocca se i
     // servizi gia' attivi del progetto saturano max_memory_mb.
@@ -1601,9 +1661,24 @@ async fn check_container_quotas(
             .with_resource(label.to_string())
             .with_details(serde_json::json!({"reason": reason})),
         );
-        return Some(format!("[Quota memoria raggiunta: {}]", reason));
+        return quota_superata("Quota memoria raggiunta", reason);
     }
     None
+}
+
+/// Il rifiuto di una quota, composto in un punto solo.
+///
+/// I tre rami di [`check_container_quotas`] dicevano la stessa cosa in tre modi,
+/// e due di loro la dicevano MALE: tornavano un messaggio senza il marker di
+/// fallimento, cioe' un avvio bloccato che l'agente riceveva come conferma.
+///
+/// Sempre [`NaturaFallimento::DelSistema`]: una quota e' una decisione del
+/// progetto, non c'e' un parametro della chiamata che la aggiri e ripeterla non
+/// la cambia. Stesso precedente del permesso di scrittura negato in `write_file`.
+fn quota_superata(cosa: &str, reason: impl std::fmt::Display) -> Option<RispostaTool> {
+    Some(RispostaTool::fallito_di_sistema(format!(
+        "[{cosa}: {reason}]"
+    )))
 }
 
 /// Per i servizi web alloca una porta nel bucket del progetto e prepara gli
@@ -1613,7 +1688,7 @@ async fn allocate_web_port_env(
     ctx: &AgentToolContext,
     command: &str,
     label: &str,
-) -> Result<Option<HashMap<String, String>>, String> {
+) -> Result<Option<HashMap<String, String>>, RispostaTool> {
     if !looks_like_web_service(command) {
         return Ok(None);
     }
@@ -1628,7 +1703,12 @@ async fn allocate_web_port_env(
         label,
     )
     .await
-    .map_err(|e| format!("\u{274C} [Errore porta per servizio '{}': {}]", label, e))?;
+    // Il bucket del progetto puo' essere esaurito, o la porta puo' non essere
+    // bindabile: in entrambi i casi non c'e' nulla nella chiamata da correggere,
+    // e il servizio non parte senza una porta che gli sia stata promessa.
+    .map_err(|e| {
+        RispostaTool::fallito_di_sistema(format!("[Errore porta per servizio '{label}': {e}]"))
+    })?;
     Ok(Some(env))
 }
 
@@ -1708,52 +1788,72 @@ async fn release_stale_port(
     );
 }
 
-/// Legge l'output di un servizio avviato con run_service
-pub(super) async fn tool_read_service_output(ctx: &AgentToolContext, input: &Value) -> String {
-    let process_id_str = input
-        .get("process_id")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+/// L'uuid di un processo, dal parametro che il contratto ha gia' letto come
+/// stringa. PUNTO UNICO (regola L) dei tre handler che lo ricevono: il
+/// messaggio di un id malformato era scritto tre volte, identico, e diceva
+/// soltanto «non valido» senza dire dove prenderne uno buono.
+///
+/// RIMEDIABILE per costruzione: l'agente ha sbagliato a copiare un id, e il
+/// testo nomina il tool che glielo restituisce (regola: dire «rimediabile»
+/// senza dire come e' una promessa non mantenuta).
+fn process_id_valido(grezzo: &str) -> Result<Uuid, RispostaTool> {
+    Uuid::parse_str(grezzo).map_err(|_| {
+        RispostaTool::fallito_rimediabile(format!(
+            "[Errore: process_id '{grezzo}' non e' un identificatore valido. \
+             Usa list_active_services per l'elenco dei processi con i loro id.]"
+        ))
+    })
+}
 
-    if process_id_str.is_empty() {
-        // Se non specificato, leggi l'ultimo processo del progetto
-        let rows = match crate::agent_processes::list_processes(&ctx.db, ctx.project_id).await {
-            Ok(r) => r,
-            Err(e) => return format!("\u{274C} [Errore: {}]", e),
-        };
-        if rows.is_empty() {
-            return "Nessun servizio avviato per questo progetto.".to_string();
-        }
-        let last = &rows[0];
-        match crate::agent_processes::read_process_output(&ctx.db, ctx.project_id, last.id, 4000)
-            .await
-        {
-            Ok(info) => format_process_output(&info),
-            Err(e) => format!("\u{274C} [Errore lettura output: {}]", e),
-        }
-    } else {
-        let process_id = match Uuid::parse_str(process_id_str) {
-            Ok(id) => id,
-            Err(_) => return "\u{274C} [Errore: process_id non valido]".to_string(),
-        };
-        match crate::agent_processes::read_process_output(&ctx.db, ctx.project_id, process_id, 4000)
-            .await
-        {
-            Ok(info) => format_process_output(&info),
-            Err(e) => format!("\u{274C} [Errore lettura output: {}]", e),
-        }
+/// Legge l'output di un servizio avviato con run_service. MIGRATO al contratto
+/// d'ingresso e a `RispostaTool`.
+///
+/// DIVERGENZA CHIUSA: l'handler accettava l'assenza di `process_id` e ripiegava
+/// sull'ultimo processo del progetto, mentre il catalogo lo dichiara — e da
+/// sempre — OBBLIGATORIO. Un ripiego che il modello non poteva conoscere, e che
+/// quindi non ha mai potuto invocare deliberatamente. La capacita' non si perde
+/// togliendolo: `tail_service_logs` la offre e la DICHIARA nel proprio schema
+/// («Se omesso, usa l'ultimo processo del progetto»), che e' il posto in cui un
+/// comportamento del genere e' utile perche' e' promesso.
+pub(super) async fn tool_read_service_output(
+    ctx: &AgentToolContext,
+    input: &Value,
+) -> RispostaTool {
+    use nexus_agent_tools::{input_contract::InputTool, tool_inputs::ReadServiceOutputInput};
+
+    let params = match ReadServiceOutputInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
+    };
+    let process_id = match process_id_valido(&params.process_id) {
+        Ok(id) => id,
+        Err(risposta) => return risposta,
+    };
+    match crate::agent_processes::read_process_output(&ctx.db, ctx.project_id, process_id, 4000)
+        .await
+    {
+        Ok(info) => RispostaTool::riuscito(format_process_output(&info)),
+        // Il processo puo' non esistere, oppure il DB puo' non rispondere: sono
+        // due cause diverse che arrivano qui come lo stesso errore opaco, e
+        // distinguerle leggendo il messaggio sarebbe la regola M al contrario.
+        // Fra le due letture possibili, DelSistema manda a cercare un'altra
+        // strada invece di far ripetere una chiamata che rifallira' identica.
+        Err(e) => RispostaTool::fallito_di_sistema(format!("[Errore lettura output: {e}]")),
     }
 }
 
-/// Ferma un servizio avviato con run_service
-pub(super) async fn tool_stop_service(ctx: &AgentToolContext, input: &Value) -> String {
-    let process_id_str = match input.get("process_id").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return "\u{274C} [Errore: parametro 'process_id' mancante]".to_string(),
+/// Ferma un servizio avviato con run_service. MIGRATO al contratto e a
+/// `RispostaTool`.
+pub(super) async fn tool_stop_service(ctx: &AgentToolContext, input: &Value) -> RispostaTool {
+    use nexus_agent_tools::{input_contract::InputTool, tool_inputs::StopServiceInput};
+
+    let params = match StopServiceInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
-    let process_id = match Uuid::parse_str(process_id_str) {
+    let process_id = match process_id_valido(&params.process_id) {
         Ok(id) => id,
-        Err(_) => return "\u{274C} [Errore: process_id non valido]".to_string(),
+        Err(risposta) => return risposta,
     };
     match crate::agent_processes::stop_process(&ctx.db, ctx.project_id, process_id).await {
         Ok(msg) => {
@@ -1764,40 +1864,65 @@ pub(super) async fn tool_stop_service(ctx: &AgentToolContext, input: &Value) -> 
                     name: format!("process:{}", process_id),
                 },
             );
-            msg
+            RispostaTool::riuscito(msg)
         }
-        Err(e) => format!("\u{274C} [Errore stop servizio: {}]", e),
+        // `stop_process` VERIFICA l'esito (pid morto + porta libera) prima di
+        // dichiarare fermo un servizio: se fallisce, il processo e' ancora vivo
+        // e ritentare la stessa chiamata non lo cambia.
+        Err(e) => RispostaTool::fallito_di_sistema(format!("[Errore stop servizio: {e}]")),
     }
 }
 
-pub(super) async fn tool_build_project_image(ctx: &AgentToolContext) -> String {
+/// MIGRATO a `RispostaTool`. Nessun contratto d'ingresso da leggere: il tool
+/// non ha parametri, e il catalogo lo dichiara con `properties` vuote.
+pub(super) async fn tool_build_project_image(ctx: &AgentToolContext) -> RispostaTool {
     use crate::sandbox::build_project_service_image;
     match build_project_service_image(ctx.project_id, &ctx.root_path, &ctx.root_path).await {
-        Ok(tag) => format!("Immagine Docker progetto buildata con successo: {}. I servizi avviati con run_service useranno questa immagine.", tag),
-        Err(e) => format!("\u{274C} [Errore build immagine: {}]", e),
+        Ok(tag) => RispostaTool::riuscito(format!(
+            "Immagine Docker progetto buildata con successo: {tag}. \
+             I servizi avviati con run_service useranno questa immagine."
+        )),
+        // La build dell'immagine dipende dal daemon Docker e dal Dockerfile del
+        // progetto: nessuna delle due e' una correzione che l'agente possa fare
+        // riformulando QUESTA chiamata, che non ha parametri.
+        Err(e) => RispostaTool::fallito_di_sistema(format!("[Errore build immagine: {e}]")),
     }
 }
 
 /// Riavvia un servizio: ferma tutti i processi con la stessa label,
 /// poi li riesegue con lo stesso comando. Attende output iniziale.
-pub(super) async fn tool_service_restart(ctx: &AgentToolContext, input: &Value) -> String {
-    let label = match input.get("label").and_then(Value::as_str) {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => return "\u{274C} [Errore: parametro 'label' obbligatorio]".to_string(),
+///
+/// La premessa finale si compone DAI campi (regola Q): l'esito e la natura di
+/// `tool_run_service` restano dove sono, e anteporre prosa non li puo' piu'
+/// coprire. Prima serviva `prepend_preserving_failure` proprio perche' il
+/// fallimento viveva in testa al testo — un campo travestito da prosa, che un
+/// `format!` distratto cancellava. Col campo non c'e' piu' niente da
+/// ricordarsi di preservare.
+///
+/// Una label che non corrisponde a nessun servizio e' RIMEDIABILE, e il testo
+/// lo dimostra invece di limitarsi a dirlo: nomina i due tool con cui
+/// correggerla o creare il servizio che non c'e'.
+pub(super) async fn tool_service_restart(ctx: &AgentToolContext, input: &Value) -> RispostaTool {
+    use nexus_agent_tools::{input_contract::InputTool, tool_inputs::ServiceRestartInput};
+
+    let params = match ServiceRestartInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
+    let label = params.label;
 
     // Cerca il processo esistente con questa label per recuperare il comando
     let existing = match crate::agent_processes::list_processes(&ctx.db, ctx.project_id).await {
         Ok(r) => r,
-        Err(e) => return format!("\u{274C} [Errore lista processi: {}]", e),
+        Err(e) => return RispostaTool::fallito_di_sistema(format!("[Errore lista processi: {e}]")),
     };
 
     let matching: Vec<_> = existing.iter().filter(|p| p.label == label).collect();
     if matching.is_empty() {
-        return format!(
-            "\u{274C} [Errore: nessun servizio trovato con label '{}'. Usa run_service per avviarlo.]",
-            label
-        );
+        return RispostaTool::fallito_rimediabile(format!(
+            "[Errore: nessun servizio trovato con label '{label}'. \
+             Usa list_active_services per le label attive, o run_service per avviarlo.]"
+        ));
     }
 
     // Recupera il comando originale dal processo piu' recente con questa label
@@ -1820,13 +1945,10 @@ pub(super) async fn tool_service_restart(ctx: &AgentToolContext, input: &Value) 
     });
 
     let result = tool_run_service(ctx, &restart_input, "service").await;
-    // La premessa NON deve coprire l'esito: `is_tool_failure` legge la testa
-    // della stringa, quindi un `format!` che antepone prosa di successo rende
-    // invisibile un riavvio fallito (regola M). Punto unico della composizione.
-    nexus_types::tool_outcome::prepend_preserving_failure(
-        format!("Servizio '{}' riavviato.", label),
-        &result,
-    )
+    RispostaTool {
+        testo: format!("Servizio '{label}' riavviato.\n{}", result.testo),
+        ..result
+    }
 }
 
 /// Legge il `working_dir` di un processo dal DB del progetto, ricadendo su
@@ -1873,17 +1995,21 @@ async fn stop_matching_processes(
     ctx: &AgentToolContext,
     matching: &[&crate::agent_processes::ProcessSummary],
     label: &str,
-) -> Result<(), String> {
+) -> Result<(), RispostaTool> {
     for proc in matching
         .iter()
         .filter(|p| p.status == "running" || p.status == "starting")
     {
         if let Err(e) = crate::agent_processes::stop_process(&ctx.db, ctx.project_id, proc.id).await
         {
-            return Err(format!(
-                "\u{274C} [Errore restart '{}': stop del processo esistente non verificato: {}]",
-                label, e
-            ));
+            // Il processo vecchio e' ancora vivo e tiene la sua porta: e' la
+            // ragione per cui il restart abortisce invece di rilanciare. Non e'
+            // transitorio — riprovare subito troverebbe lo stesso processo — e
+            // non e' rimediabile riformulando la chiamata, che ha un solo
+            // parametro e quello era giusto.
+            return Err(RispostaTool::fallito_di_sistema(format!(
+                "[Errore restart '{label}': stop del processo esistente non verificato: {e}]"
+            )));
         }
     }
     Ok(())
@@ -1891,25 +2017,34 @@ async fn stop_matching_processes(
 
 /// Legge le ultime N righe di output di un servizio, con opzione di attesa
 /// per catturare output aggiuntivo (simula follow per X secondi).
-pub(super) async fn tool_tail_service_logs(ctx: &AgentToolContext, input: &Value) -> String {
-    let process_id_str = input
-        .get("process_id")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let max_chars = input
-        .get("max_chars")
-        .and_then(Value::as_u64)
-        .unwrap_or(8000) as usize;
-    let follow_secs = input
-        .get("follow_seconds")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .min(60);
+pub(super) async fn tool_tail_service_logs(
+    ctx: &AgentToolContext,
+    input: &Value,
+) -> RispostaTool {
+    use nexus_agent_tools::{input_contract::InputTool, tool_inputs::TailServiceLogsInput};
+
+    let params = match TailServiceLogsInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
+    };
+    // I default restano quelli dell'handler: il contratto dichiara i campi
+    // opzionali, non i valori che assumono quando mancano. `max(0)` prima del
+    // cast toglie il caso che il tipo `i64` del catalogo ammette e che l'handler
+    // a mano non vedeva: un negativo diventava un `usize` enorme passando da
+    // `as`, e qui satura a zero invece di chiedere al DB tutto l'output.
+    let max_chars = params.max_chars.unwrap_or(8000).max(0) as usize;
+    let follow_secs = params.follow_seconds.unwrap_or(0).clamp(0, 60) as u64;
 
     // Risolvi process_id: specifico oppure ultimo del progetto (punto unico).
-    let process_id = match resolve_process_id_or_last(ctx, process_id_str).await {
-        Ok(id) => id,
-        Err(msg) => return msg,
+    let process_id = match resolve_process_id_or_last(ctx, params.process_id.as_deref()).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            // L'assenza E' la risposta, non un fallimento: il tool ha fatto cio'
+            // che doveva. Stesso criterio con cui `list_files` tratta una
+            // directory vuota come successo e una assente come errore.
+            return RispostaTool::riuscito("Nessun servizio avviato per questo progetto.");
+        }
+        Err(risposta) => return risposta,
     };
 
     if follow_secs == 0 {
@@ -1921,32 +2056,38 @@ pub(super) async fn tool_tail_service_logs(ctx: &AgentToolContext, input: &Value
         )
         .await
         {
-            Ok(info) => format_process_output(&info),
-            Err(e) => format!("\u{274C} [Errore lettura output: {}]", e),
+            Ok(info) => RispostaTool::riuscito(format_process_output(&info)),
+            Err(e) => RispostaTool::fallito_di_sistema(format!("[Errore lettura output: {e}]")),
         };
     }
 
-    follow_service_logs(ctx, process_id, max_chars, follow_secs).await
+    RispostaTool::riuscito(follow_service_logs(ctx, process_id, max_chars, follow_secs).await)
 }
 
-/// Risolve il process_id target: se `process_id_str` e' vuoto usa l'ultimo
-/// processo del progetto, altrimenti lo parsa. Punto unico (regola L) condiviso
-/// da tail/read. Ritorna `Err(msg)` col messaggio gia' pronto da restituire.
+/// Risolve il process_id target: assente o vuoto = l'ultimo processo del
+/// progetto, altrimenti lo parsa.
+///
+/// I tre casi sono TRE (regola Q): un id risolto, l'ASSENZA di processi — che
+/// non e' un fallimento e per questo e' `Ok(None)` e non un `Err` —, e un
+/// errore vero. Prima il secondo viaggiava come `Err` con un testo privo di
+/// marker, cioe' un non-fallimento che percorreva il canale dei fallimenti e ne
+/// usciva riuscito solo perche' qualcuno si era ricordato di non scrivere il
+/// marker. Ora lo dice il tipo.
+///
+/// Resta un punto unico anche con un solo chiamante: `read_service_output` non
+/// vi passa piu' perche' il suo `process_id` e' obbligatorio nel catalogo, ed
+/// e' quella la divergenza chiusa — non l'esistenza di questa funzione.
 async fn resolve_process_id_or_last(
     ctx: &AgentToolContext,
-    process_id_str: &str,
-) -> Result<Uuid, String> {
-    if !process_id_str.is_empty() {
-        return Uuid::parse_str(process_id_str)
-            .map_err(|_| "\u{274C} [Errore: process_id non valido]".to_string());
+    process_id_str: Option<&str>,
+) -> Result<Option<Uuid>, RispostaTool> {
+    if let Some(grezzo) = process_id_str.filter(|s| !s.is_empty()) {
+        return process_id_valido(grezzo).map(Some);
     }
     let rows = crate::agent_processes::list_processes(&ctx.db, ctx.project_id)
         .await
-        .map_err(|e| format!("\u{274C} [Errore: {}]", e))?;
-    match rows.first() {
-        Some(p) => Ok(p.id),
-        None => Err("Nessun servizio avviato per questo progetto.".to_string()),
-    }
+        .map_err(|e| RispostaTool::fallito_di_sistema(format!("[Errore: {e}]")))?;
+    Ok(rows.first().map(|p| p.id))
 }
 
 /// Modalita' follow: polleggia l'output ogni 2 secondi per `follow_secs`,
@@ -2097,7 +2238,8 @@ mod tests {
         kind: &str,
     ) -> (String, String, String) {
         let command = input["command"].as_str().unwrap_or_default().to_string();
-        let work_dir = resolve_service_work_dir(root, input).expect("working dir risolta");
+        let work_dir = resolve_service_work_dir(root, input["working_dir"].as_str())
+            .expect("working dir risolta");
         // Lo slug lo passa il PRODUTTORE, come in produzione: e' lo stesso da
         // cui nasce l'unit sotto, quindi il test non puo' misurare uno slug
         // diverso da quello con cui il riconoscimento del derivato lavora.
@@ -2621,26 +2763,39 @@ mod tests {
             Some((32976, false)),
             &AscoltoAltrove::NonAccertato,
         );
-        // Il fallimento va DICHIARATO alla macchina, non solo raccontato: senza
-        // marker in testa l'anti-loop legge una ripetizione riuscita e chiude il
-        // run come stallo invece di instradarlo a diagnosi (regola M).
-        assert!(
-            nexus_types::tool_outcome::is_tool_failure(&msg),
-            "il tool_result deve portare il marker di fallimento: {msg}"
+        // Il fallimento va DICHIARATO alla macchina, non solo raccontato:
+        // l'anti-loop che legge un esito riuscito chiude il run come stallo
+        // invece di instradarlo a diagnosi (regola M). Ora e' un CAMPO, e la
+        // differenza non e' cosmetica: prima l'asserzione era sul marker in
+        // testa alla stringa, quindi passava anche se qualcuno a valle
+        // anteponeva prosa e lo spostava — il test misurava la composizione di
+        // QUESTA funzione, non cio' che il chiamante consegna.
+        assert_eq!(
+            msg.esito,
+            nexus_types::tool_outcome::EsitoTool::Fallito,
+            "un servizio che non ascolta e' un fallimento dichiarato: {msg:?}"
+        );
+        // La NATURA dice all'agente cosa fare, ed e' la meta' che prima non
+        // esisteva: qui «ritentare dopo aver corretto» invece di un errore
+        // indistinto su cui sceglieva a caso.
+        assert_eq!(
+            msg.natura,
+            Some(nexus_types::tool_outcome::NaturaFallimento::Transitorio),
+            "{msg:?}"
         );
         assert!(
-            msg.contains("NON avviato"),
-            "un servizio che non ascolta non va annunciato come avviato: {msg}"
+            msg.testo.contains("NON avviato"),
+            "un servizio che non ascolta non va annunciato come avviato: {msg:?}"
         );
-        assert!(msg.contains("32976"), "il messaggio deve nominare la porta attesa: {msg}");
+        assert!(msg.testo.contains("32976"), "il messaggio deve nominare la porta attesa: {msg:?}");
         assert!(
-            msg.contains("Cannot find module"),
-            "lo stderr contiene la causa e deve raggiungere l'agente: {msg}"
+            msg.testo.contains("Cannot find module"),
+            "lo stderr contiene la causa e deve raggiungere l'agente: {msg:?}"
         );
         // Il processo VIVO non deve mai diventare la prova che il servizio sia su.
         assert!(
-            !msg.contains("Servizio 'backend' avviato"),
-            "status 'running' non basta a dichiarare l'avvio: {msg}"
+            !msg.testo.contains("Servizio 'backend' avviato"),
+            "status 'running' non basta a dichiarare l'avvio: {msg:?}"
         );
     }
 
@@ -2654,16 +2809,146 @@ mod tests {
             Some((32976, true)),
             &AscoltoAltrove::NonAccertato,
         );
-        assert!(msg.contains("avviato"), "{msg}");
+        assert!(msg.testo.contains("avviato"), "{msg:?}");
         assert!(
-            !nexus_types::tool_outcome::is_tool_failure(&msg),
-            "un servizio che ascolta non e' un fallimento: {msg}"
+            !msg.esito.e_fallito(),
+            "un servizio che ascolta non e' un fallimento: {msg:?}"
         );
         assert!(
-            msg.contains("In ascolto sulla porta 32976 (verificato)"),
+            msg.testo.contains("In ascolto sulla porta 32976 (verificato)"),
             "l'ascolto verificato va dichiarato, cosi' l'agente distingue una \
-             conferma provata da una presunta: {msg}"
+             conferma provata da una presunta: {msg:?}"
         );
+    }
+
+    // ── Contratto d'ingresso: cio' che il catalogo promette, l'handler lo
+    //    pretende (e nient'altro) ───────────────────────────────────────────
+
+    /// LA DIVERGENZA CHIUSA. Il catalogo dichiara `process_id` OBBLIGATORIO per
+    /// `read_service_output` da sempre; l'handler leggeva il campo a mano con
+    /// `unwrap_or("")` e, trovandolo assente, ripiegava sull'ultimo processo del
+    /// progetto — un comportamento che il modello non poteva conoscere, quindi
+    /// non poteva nemmeno invocare deliberatamente.
+    ///
+    /// Il test attraversa il CONTRATTO REALE, non una sua imitazione: la stessa
+    /// `leggi` che l'handler chiama (regola O). Costruire qui un errore serde a
+    /// mano proverebbe soltanto che serde funziona.
+    ///
+    /// MUTAZIONE ESEGUITA (08/08/2026): spostare `process_id` fra gli
+    /// `opzionali` di `ReadServiceOutputInput`. Il test NON rosseggia — non ci
+    /// arriva: il campo diventa `Option<String>`, l'handler lo passa a
+    /// `process_id_valido` che vuole `&str`, e la compilazione si ferma con
+    /// `E0308`. E' l'esito piu' forte del rosso, e va detto per quello che e':
+    /// dopo il contratto tipizzato quella divergenza non e' piu'
+    /// RAPPRESENTABILE, mentre con `input.get("process_id").unwrap_or("")`
+    /// entrambe le strade compilavano ed era questa la ragione per cui nessun
+    /// test poteva vederla. Il test resta a coprire cio' che il compilatore non
+    /// vede: che il messaggio nomini il campo e dichiari la natura giusta.
+    #[test]
+    fn read_service_output_pretende_il_process_id_che_il_catalogo_promette() {
+        use nexus_agent_tools::input_contract::InputTool;
+        use nexus_agent_tools::tool_inputs::ReadServiceOutputInput;
+
+        let mancante = ReadServiceOutputInput::leggi(&json!({}))
+            .expect_err("il catalogo lo dichiara obbligatorio: l'handler deve pretenderlo");
+        assert_eq!(
+            mancante.esito,
+            nexus_types::tool_outcome::EsitoTool::Fallito,
+            "{mancante:?}"
+        );
+        assert_eq!(
+            mancante.natura,
+            Some(nexus_types::tool_outcome::NaturaFallimento::Rimediabile),
+            "un parametro mancante lo corregge l'agente: {mancante:?}"
+        );
+        assert!(
+            mancante.testo.contains("process_id"),
+            "il messaggio deve nominare il campo che manca: {mancante:?}"
+        );
+
+        // La capacita' NON e' sparita: vive dove e' PROMESSA. Il gemello la
+        // dichiara opzionale, e li' l'assenza continua a significare «l'ultimo».
+        nexus_agent_tools::tool_inputs::TailServiceLogsInput::leggi(&json!({}))
+            .expect("tail_service_logs dichiara process_id opzionale, e lo accetta assente");
+    }
+
+    /// Il catalogo non promette alias, e con il contratto non se ne possono piu'
+    /// accettare in silenzio: `deny_unknown_fields` e' la meta' che nessuno
+    /// doveva ricordarsi di scrivere.
+    ///
+    /// MUTAZIONE: togliere `deny_unknown_fields` da `tool_object!` e questo
+    /// diventa verde su un campo che il modello non ha mai visto nel catalogo.
+    #[test]
+    fn run_service_non_accetta_campi_che_il_catalogo_non_dichiara() {
+        use nexus_agent_tools::input_contract::InputTool;
+        use nexus_agent_tools::tool_inputs::RunServiceInput;
+
+        RunServiceInput::leggi(&json!({"command": "npm run dev", "cwd": "frontend"}))
+            .expect_err("'cwd' non e' nel catalogo: il campo giusto e' 'working_dir'");
+        RunServiceInput::leggi(&json!({"command": "npm run dev", "working_dir": "frontend"}))
+            .expect("i campi dichiarati passano");
+    }
+
+    /// Il messaggio di parametri invalidi nomina il tool INVOCATO.
+    ///
+    /// `run_in_terminal` e `run_service` condividono handler e contratto, ma
+    /// sono due nomi: col nome dichiarato nella macro, un errore su
+    /// `run_in_terminal` rimanderebbe l'agente allo schema di un tool che non ha
+    /// chiamato — la stessa ragione per cui `nome_del_tool` esiste.
+    ///
+    /// MUTAZIONE: far ignorare a `leggi_come` il parametro `tool` e usare il
+    /// nome della macro; la seconda assert rosseggia.
+    #[test]
+    fn l_errore_di_parametri_nomina_il_tool_invocato() {
+        use nexus_agent_tools::input_contract::InputTool;
+        use nexus_agent_tools::tool_inputs::RunServiceInput;
+
+        let e = RunServiceInput::leggi(&json!({})).expect_err("command e' obbligatorio");
+        assert!(e.testo.contains("run_service"), "{e:?}");
+
+        let e = RunServiceInput::leggi_come(super::nome_del_tool("task"), &json!({}))
+            .expect_err("command e' obbligatorio");
+        assert!(
+            e.testo.contains("run_in_terminal"),
+            "l'agente ha invocato run_in_terminal e li' deve tornare: {e:?}"
+        );
+    }
+
+    /// Un percorso che non si risolve e' RIMEDIABILE: e' un parametro che
+    /// l'agente controlla, e il resolver dice gia' cosa non va.
+    #[test]
+    fn una_working_dir_inesistente_e_rimediabile() {
+        let (_tmp, root) = progetto("app", &[]);
+        let e = resolve_service_work_dir(&root, Some("non-esiste"))
+            .expect_err("il resolver rifiuta i percorsi inesistenti");
+        assert_eq!(
+            e.natura,
+            Some(nexus_types::tool_outcome::NaturaFallimento::Rimediabile),
+            "{e:?}"
+        );
+        // Assente e vuota sono la stessa cosa, e sono la radice: nessun
+        // fallimento da dichiarare.
+        assert_eq!(
+            resolve_service_work_dir(&root, None).expect("assente = radice"),
+            resolve_service_work_dir(&root, Some("")).expect("vuota = radice")
+        );
+    }
+
+    /// Un id malformato manda l'agente dove trovarne uno buono, invece di dirgli
+    /// soltanto «non valido» — che e' cio' che i tre handler ripetevano identico.
+    #[test]
+    fn un_process_id_malformato_dice_dove_prenderne_uno_valido() {
+        let e = super::process_id_valido("non-un-uuid").expect_err("id malformato");
+        assert_eq!(
+            e.natura,
+            Some(nexus_types::tool_outcome::NaturaFallimento::Rimediabile),
+            "{e:?}"
+        );
+        assert!(
+            e.testo.contains("list_active_services"),
+            "dire 'rimediabile' senza dire come e' una promessa non mantenuta: {e:?}"
+        );
+        super::process_id_valido(&uuid::Uuid::nil().to_string()).expect("un uuid valido passa");
     }
 
     /// Servizi senza porta (task, worker): nessun ascolto da attendere, quindi
@@ -2679,10 +2964,10 @@ mod tests {
             None,
             &AscoltoAltrove::NonAccertato,
         );
-        assert!(msg.contains("avviato"), "{msg}");
-        assert!(!msg.contains("NON avviato"), "{msg}");
-        assert!(!msg.contains("In ascolto"), "{msg}");
-        assert!(!nexus_types::tool_outcome::is_tool_failure(&msg), "{msg}");
+        assert!(msg.testo.contains("avviato"), "{msg:?}");
+        assert!(!msg.testo.contains("NON avviato"), "{msg:?}");
+        assert!(!msg.testo.contains("In ascolto"), "{msg:?}");
+        assert!(!msg.esito.e_fallito(), "{msg:?}");
     }
 
     /// L'incidente misurato: label `frontend`, porta allocata 24806, e
@@ -2719,12 +3004,12 @@ mod tests {
             &altrove,
         );
         assert!(
-            msg.contains(&reale.to_string()),
-            "il messaggio deve nominare la porta su cui si ascolta davvero: {msg}"
+            msg.testo.contains(&reale.to_string()),
+            "il messaggio deve nominare la porta su cui si ascolta davvero: {msg:?}"
         );
         assert!(
-            msg.contains("NON e' provato"),
-            "una porta trovata non e' una porta del servizio: {msg}"
+            msg.testo.contains("NON e' provato"),
+            "una porta trovata non e' una porta del servizio: {msg:?}"
         );
     }
 
@@ -2754,10 +3039,10 @@ mod tests {
             Some((attesa, false)),
             &altrove,
         );
-        assert!(msg.contains(&fuori.to_string()), "{msg}");
+        assert!(msg.testo.contains(&fuori.to_string()), "{msg:?}");
         assert!(
-            msg.contains("processo appena avviato risulta in ascolto"),
-            "{msg}"
+            msg.testo.contains("processo appena avviato risulta in ascolto"),
+            "{msg:?}"
         );
     }
 
@@ -2959,8 +3244,9 @@ mod tests {
         )
         .await;
         assert!(
-            out.contains("[run_playwright_tests] Playwright non trovato nel progetto"),
-            "la suite deve passare dall'esecutore unico, output: {out}"
+            out.testo
+                .contains("[run_playwright_tests] Playwright non trovato nel progetto"),
+            "la suite deve passare dall'esecutore unico, output: {out:?}"
         );
     }
 

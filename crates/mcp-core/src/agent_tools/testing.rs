@@ -644,7 +644,7 @@ async fn auto_start_dev_server(ctx: &AgentToolContext, root: &Path, url: &str, p
     if port_reachable(p).await {
         format!(
             "Dev server avviato automaticamente su {url}. Output: {}",
-            svc_result.chars().take(200).collect::<String>()
+            svc_result.testo.chars().take(200).collect::<String>()
         )
     } else {
         format!("ATTENZIONE: Dev server avviato ma {url} non risponde ancora dopo 15s. I test potrebbero fallire.")
