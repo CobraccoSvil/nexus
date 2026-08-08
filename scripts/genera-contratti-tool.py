@@ -43,14 +43,39 @@ DECISIONE_UMANA = {
     ),
 }
 
-# Il nome viene dal campo, ma il campo non sempre nomina la DOMANDA. Qui si
-# dichiara, invece di inventare una regola che indovini.
+# Vocabolari che hanno GIA' un punto unico altrove: generarne un gemello qui
+# sarebbe la duplicazione che la regola L vieta, e lo sarebbe in modo
+# particolarmente insidioso — due enum con gli stessi valori che nessun
+# compilatore obbliga a restare allineati.
+PUNTO_UNICO_ALTROVE = {
+    ("alta", "media", "bassa"): (
+        "gravita' evidenza: il punto unico e' nexus-agent-graph::decisions::severity"
+        "::Severity, che questo crate non vede. Il consolidamento e' spostarlo in"
+        " nexus-types come gia' fatto per i tier (decisions/tiers.rs e' un re-export)"
+    ),
+}
+
+# Il nome viene dal campo, ma il campo non sempre nomina la DOMANDA. Chiavato
+# sui VALORI e non sul nome del campo: lo stesso campo puo' portare vocabolari
+# diversi in tool diversi, ed e' il vocabolario che il tipo rappresenta.
 NOMI_ESPLICITI = {
-    # `Severity` esiste gia' in nexus-agent-graph::decisions::severity con un
-    # altro significato (la gravita' di un'evidenza in una review). Questo e' il
-    # livello di un toast: stesso nome, domanda diversa, e un nome distinto
-    # impedisce che un domani qualcuno li unifichi credendoli lo stesso.
-    "severity": "NotificationSeverity",
+    # Distinto da `Severity` di decisions::severity, che e' la gravita' di
+    # un'evidenza: questo e' il livello di un toast. Un nome distinto impedisce
+    # che un domani qualcuno li unifichi credendoli lo stesso.
+    ("info", "success", "warning", "error"): "NotificationSeverity",
+}
+
+# Un campo del catalogo puo' chiamarsi come una parola riservata Rust (`type`,
+# in `nexus_todo_write`). L'identificatore grezzo `r#type` e' un nome valido, e
+# serde ne toglie il prefisso da solo; a toglierlo dallo SCHEMA ci pensa
+# `schema_oggetto`, dove `stringify!` lo conserverebbe.
+RISERVATE_RUST = {
+    "as", "box", "break", "const", "continue", "crate", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod",
+    "move", "mut", "pub", "ref", "return", "self", "static", "struct", "super",
+    "trait", "true", "type", "unsafe", "use", "where", "while", "async", "await",
+    "dyn", "abstract", "become", "do", "final", "macro", "override", "priv",
+    "typeof", "unsized", "virtual", "yield",
 }
 
 TIPI = {
@@ -81,8 +106,13 @@ def enum_di(spec):
     return None, False
 
 
-def tipo_rust(spec, nome_enum=None):
-    """Il tipo Rust del campo, o None se la macro non lo sa esprimere."""
+def tipo_rust(spec, nome_enum=None, annidato=None):
+    """Il tipo Rust del campo, o None se la macro non lo sa esprimere.
+
+    `annidato` e' la funzione che dichiara un oggetto con forma nota e ne
+    ritorna il nome del tipo: passata dal chiamante perche' sa a quale TOOL e
+    campo appartiene, e il nome ne discende.
+    """
     valori, in_array = enum_di(spec)
     if valori:
         return f"Vec<{nome_enum}>" if in_array else nome_enum
@@ -98,10 +128,12 @@ def tipo_rust(spec, nome_enum=None):
             # nulla (i parametri posizionali di una query). `Vec<Value>` dice
             # esattamente questo, e lo schema che ne esce coincide.
             return "Vec<serde_json::Value>"
-        return None  # array di oggetti: struttura annidata
+        if items.get("type") == "object" and items.get("properties") and annidato:
+            return f"Vec<{annidato(items)}>"
+        return None
     if t == "object":
         if spec.get("properties"):
-            return None  # oggetto con forma dichiarata: struttura annidata
+            return annidato(spec) if annidato else None
         return "serde_json::Map<String, serde_json::Value>"
     if t is None:
         return "serde_json::Value"  # esplicitamente senza vincolo
@@ -130,7 +162,9 @@ def descrizione(testo: str, rientro: str, prefisso: int) -> str:
     terrebbe la riga lunga, che e' il difetto da cui si parte.
     """
     intero = escape(testo)
-    if prefisso + len(intero) + 2 <= 120:
+    # +3: le due virgolette e il punto e virgola che chiude la riga. Contarne
+    # due lasciava passare le righe di esattamente 121 caratteri.
+    if prefisso + len(intero) + 3 <= 120:
         return f'"{intero}"'
     pezzi, corrente = [], ""
     for parola in testo.split(" "):
@@ -176,14 +210,29 @@ def nome_struct(nome_tool: str) -> str:
 # sarebbero la duplicazione che questo lavoro toglie (regola L). Al contrario
 # `verdict` porta due insiemi DIVERSI (review: pass/fail/needs_changes;
 # advisory: proceed/…), quindi restano due tipi: stesso nome, domande diverse.
+def campi_ovunque(schema):
+    """Ogni (campo, spec) dello schema, ANCHE dentro gli oggetti annidati.
+
+    Il censimento fermo al primo livello lasciava senza tipo gli enum di
+    `direction`, `severity` e `status`, che vivono dentro gli oggetti di
+    advisory_verdict, debate_position e nexus_todo_write: tre tool esclusi per
+    un enum che il censimento non aveva guardato.
+    """
+    for campo, spec in (schema.get("properties") or {}).items():
+        if not isinstance(spec, dict):
+            continue
+        yield campo, spec
+        dentro = spec if spec.get("type") == "object" else (spec.get("items") or {})
+        if isinstance(dentro, dict) and dentro.get("properties"):
+            yield from campi_ovunque(dentro)
+
+
 gruppi = defaultdict(set)  # valori -> nomi di campo che li usano
 primo_tool = {}  # valori -> primo tool che li dichiara
 for t in sorted(tools, key=lambda x: x.get("name", "")):
     if t.get("name") in ENUM_DINAMICI:
         continue
-    for campo, spec in ((t.get("input_schema") or {}).get("properties") or {}).items():
-        if not isinstance(spec, dict):
-            continue
+    for campo, spec in campi_ovunque(t.get("input_schema") or {}):
         valori, _ = enum_di(spec)
         if valori:
             gruppi[valori].add(campo)
@@ -194,7 +243,7 @@ for valori, campi in gruppi.items():
     # Il campo piu' corto e' il singolare quando il gruppo ne ha due
     # (`rel_type` batte `rel_types`), ed e' l'unico quando ne ha uno.
     scelto = sorted(campi, key=lambda c: (len(c), c))[0]
-    nomi_enum[valori] = NOMI_ESPLICITI.get(scelto, camel(scelto))
+    nomi_enum[valori] = NOMI_ESPLICITI.get(valori, camel(scelto))
     per_nome[nomi_enum[valori]].append(valori)
 for nome_candidato, collisi in per_nome.items():
     if len(collisi) == 1:
@@ -227,6 +276,70 @@ for valori in sorted(gruppi, key=lambda v: nomi_enum[v]):
     righe += ["    }", "}"]
     enum_scritti.append((nomi_enum[valori], "\n".join(righe)))
 
+# --- Oggetti annidati -----------------------------------------------------
+#
+# Come per gli enum, un tipo per FORMA e non per campo: `risks` di
+# advisory_verdict e di debate_position sono la stessa struttura, e due tipi
+# identici sarebbero duplicazione (regola L). Il nome viene dal primo uso.
+oggetti_scritti, nomi_oggetto, oggetti_falliti = [], {}, {}
+
+
+def singolare(campo: str) -> str:
+    return campo[:-1] if campo.endswith("s") and not campo.endswith("ss") else campo
+
+
+def dichiara_oggetto(tool: str, campo: str, forma: dict) -> str:
+    """Dichiara un `tool_object!` per questa forma e ne ritorna il nome del tipo."""
+    chiave = json.dumps(forma, sort_keys=True)
+    if chiave in nomi_oggetto:
+        return nomi_oggetto[chiave]
+    # Anche i fallimenti si ricordano, e si RILANCIANO: `risks` ha la stessa
+    # forma in advisory_verdict e debate_position, e registrando il nome prima
+    # di saper dichiarare il tipo il secondo tool lo usava come se esistesse —
+    # un contratto che nomina un tipo mai generato, cioe' un errore di
+    # compilazione al posto di un'esclusione motivata.
+    if chiave in oggetti_falliti:
+        raise ValueError(oggetti_falliti[chiave])
+    nome = camel(tool) + camel(singolare(campo))
+    props = forma.get("properties") or {}
+    req = set(forma.get("required") or [])
+    obb, opz = [], []
+    def fallisci(motivo: str):
+        oggetti_falliti[chiave] = motivo
+        raise ValueError(motivo)
+
+    for c, sp in props.items():
+        valori = enum_di(sp)[0]
+        if valori in PUNTO_UNICO_ALTROVE:
+            fallisci(f"campo annidato '{c}': {PUNTO_UNICO_ALTROVE[valori]}")
+        # Ricorsivo perche' il catalogo annida a due livelli: gli
+        # `acceptance_criteria` di `nexus_todo_write` stanno dentro i `todos`,
+        # che stanno dentro l'input. Senza questa riga quel tool restava fuori
+        # per un campo che la macro sa esprimere benissimo.
+        rt = tipo_rust(
+            sp,
+            nomi_enum.get(valori),
+            lambda forma, _c=c: dichiara_oggetto(tool, _c, forma),
+        )
+        if rt is None:
+            fallisci(f"campo annidato '{c}' di tipo {sp.get('type')} non esprimibile")
+        if valori:
+            enum_usati.add(nomi_enum[valori])
+        nome_campo = f"r#{c}" if c in RISERVATE_RUST else c
+        prefisso = 12 + len(f"{nome_campo}: {rt}, ")
+        (obb if c in req else opz).append(
+            f"{nome_campo}: {rt}, {descrizione(sp.get('description', ''), ' ' * 12, prefisso)};"
+        )
+    righe = ["crate::tool_object! {", f"    {nome} {{", "        obbligatori {"]
+    righe += [f"            {r}" for r in obb]
+    righe += ["        }", "        opzionali {"]
+    righe += [f"            {r}" for r in opz]
+    righe += ["        }", "    }", "}"]
+    nomi_oggetto[chiave] = nome
+    oggetti_scritti.append((nome, "\n".join(righe)))
+    return nome
+
+
 generati, esclusi, enum_usati = [], [], set()
 for t in sorted(tools, key=lambda x: x.get("name", "")):
     nome = t.get("name", "")
@@ -253,27 +366,37 @@ for t in sorted(tools, key=lambda x: x.get("name", "")):
             problema = f"campo '{campo}': {DECISIONE_UMANA[(nome, campo)]}"
             break
         valori, _ = enum_di(spec)
+        if valori in PUNTO_UNICO_ALTROVE:
+            problema = f"campo '{campo}': {PUNTO_UNICO_ALTROVE[valori]}"
+            break
         if valori in enum_impossibili:
             problema = (
                 f"campo '{campo}': valori senza nome di variante deducibile "
                 f"({', '.join(enum_impossibili[valori])})"
             )
             break
-        rt = tipo_rust(spec, nomi_enum.get(valori))
+        try:
+            rt = tipo_rust(
+                spec,
+                nomi_enum.get(valori),
+                lambda forma, _c=campo: dichiara_oggetto(nome, _c, forma),
+            )
+        except ValueError as e:
+            problema = str(e)
+            break
         if rt is None:
             problema = f"campo '{campo}' di tipo {spec.get('type')} non esprimibile"
             break
         if valori:
             usati_dal_tool.add(nomi_enum[valori])
-        prefisso = 12 + len(f"{campo}: {rt}, ")
+        obbligatorio = campo in required
+        nome_campo = f"r#{campo}" if campo in RISERVATE_RUST else campo
+        prefisso = 12 + len(f"{nome_campo}: {rt}, ")
         desc = descrizione(spec.get("description", ""), " " * 12, prefisso)
-        (obb if campo in required else opz).append(f"{campo}: {rt}, {desc};")
+        (obb if obbligatorio else opz).append(f"{nome_campo}: {rt}, {desc};")
 
     if problema:
         esclusi.append((nome, problema))
-        continue
-    if not props:
-        esclusi.append((nome, "nessun parametro"))
         continue
 
     corpo = [f"crate::tool_input! {{", f"    {nome_struct(nome)} for \"{nome}\" {{"]
@@ -292,17 +415,39 @@ for t in sorted(tools, key=lambda x: x.get("name", "")):
 
 print(f"generabili : {len(generati)}")
 print(f"enum       : {len(enum_usati)} dichiarati, usati da {len(generati)} contratti")
+print(f"oggetti    : {len(oggetti_scritti)} annidati dichiarati")
 print(f"esclusi    : {len(esclusi)}")
 for n, motivo in esclusi:
     print(f"   {n:38} {motivo}")
 
-# Solo gli enum che un contratto generato usa davvero: dichiararne uno che
-# nessuno nomina sarebbe codice morto, e il gate lo rifiuterebbe.
+# Solo cio' che un contratto generato usa DAVVERO: un tool escluto per un campo
+# puo' aver gia' fatto dichiarare i suoi oggetti annidati, e un tipo che nessuno
+# nomina e' codice morto che il gate rifiuta. La chiusura e' transitiva perche'
+# un oggetto puo' contenerne un altro (`todos` -> `acceptance_criteria`).
+testo_contratti = "\n".join(c for _, _, c in generati)
+usati, cambiato = set(), True
+while cambiato:
+    cambiato = False
+    for n, c in oggetti_scritti:
+        if n in usati:
+            continue
+        visibile = re.search(rf"\b{n}\b", testo_contratti) or any(
+            re.search(rf"\b{n}\b", corpo) for altro, corpo in oggetti_scritti if altro in usati
+        )
+        if visibile:
+            usati.add(n)
+            cambiato = True
+oggetti_scritti = [(n, c) for n, c in oggetti_scritti if n in usati]
+for _, corpo in oggetti_scritti:
+    enum_usati |= {n for n, _ in enum_scritti if re.search(rf"\b{n}\b", corpo)}
 enum_da_scrivere = [c for n, c in enum_scritti if n in enum_usati]
 
 USCITA.mkdir(parents=True, exist_ok=True)
 io.open(USCITA / "contratti.rs", "w", encoding="utf-8", newline="\n").write(
-    "\n\n".join(enum_da_scrivere + [c for _, _, c in generati]) + "\n"
+    "\n\n".join(
+        enum_da_scrivere + [c for _, c in oggetti_scritti] + [c for _, _, c in generati]
+    )
+    + "\n"
 )
 io.open(USCITA / "elenco.rs", "w", encoding="utf-8", newline="\n").write(
     "\n".join(f'            ("{n}", <{s} as InputTool>::schema()),' for n, s, _ in generati)

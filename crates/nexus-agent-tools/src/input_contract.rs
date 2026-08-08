@@ -130,23 +130,37 @@ pub fn errore_di_lettura(tool: &str, e: serde_json::Error) -> RispostaTool {
 
 /// Compone lo schema `object` dai campi dichiarati. Usata dalla macro; esposta
 /// perche' i test possano costruirne uno senza passare da un tool vero.
+///
+/// Un `required` VUOTO non viene scritto. In JSON Schema le due forme dicono la
+/// stessa cosa, ma il catalogo sceglie l'assenza (20 tool su 24 senza campi
+/// obbligatori la omettono, e la omettono ANCHE gli oggetti annidati come il
+/// `viewport` di `nexus_visual_compare`) — e per un oggetto annidato il
+/// confronto col catalogo e' profondo, quindi una chiave in piu' li' e' una
+/// divergenza vera, non una sfumatura di stile.
 pub fn schema_oggetto(campi: Vec<(&str, Value, bool)>) -> Value {
     let mut properties = Map::new();
     let mut required = Vec::new();
-    for (nome, mut spec, obbligatorio) in campi {
+    for (nome, spec, obbligatorio) in campi {
+        // `stringify!` di un identificatore grezzo conserva il prefisso: il
+        // campo `type` di `nexus_todo_write` si scrive `r#type` in Rust perche'
+        // e' parola riservata, e senza questa riga lo schema avrebbe promesso al
+        // modello una property chiamata `r#type`. Serde il prefisso lo toglie
+        // gia' per conto suo, quindi il parsing era corretto e solo lo schema
+        // avrebbe mentito — la meta' del contratto che nessun compilatore
+        // controlla.
+        let nome = nome.strip_prefix("r#").unwrap_or(nome);
         if obbligatorio {
             required.push(Value::String(nome.to_string()));
         }
-        if let Some(o) = spec.as_object_mut() {
-            o.remove("__nulla__");
-        }
         properties.insert(nome.to_string(), spec);
     }
-    json!({
-        "type": "object",
-        "properties": Value::Object(properties),
-        "required": Value::Array(required),
-    })
+    let mut schema = Map::new();
+    schema.insert("type".to_string(), Value::String("object".to_string()));
+    schema.insert("properties".to_string(), Value::Object(properties));
+    if !required.is_empty() {
+        schema.insert("required".to_string(), Value::Array(required));
+    }
+    Value::Object(schema)
 }
 
 /// Dichiara l'input di un tool UNA volta: ne escono la struct e lo schema.
@@ -203,6 +217,71 @@ macro_rules! tool_input {
             }
         }
     ) => {
+        $crate::tool_object! {
+            $(#[$meta])*
+            $nome {
+                obbligatori {
+                    $(
+                        $(#[$obb_meta])*
+                        $obb: $obb_tipo, $($obb_desc)+;
+                    )*
+                }
+                opzionali {
+                    $(
+                        $(#[$opz_meta])*
+                        $opz: $opz_tipo, $($opz_desc)+;
+                    )*
+                }
+            }
+        }
+
+        impl $crate::input_contract::InputTool for $nome {
+            fn schema() -> ::serde_json::Value {
+                // Lo schema dell'input E' lo schema dell'oggetto: una seconda
+                // composizione qui potrebbe divergere da quella che il campo
+                // annidato produce, e sarebbe di nuovo due verita' per la stessa
+                // domanda.
+                <Self as $crate::input_contract::TipoJson>::schema_tipo()
+            }
+
+            fn leggi(input: &::serde_json::Value) -> ::std::result::Result<Self, ::nexus_types::tool_outcome::RispostaTool> {
+                ::serde_json::from_value::<Self>(input.clone())
+                    .map_err(|e| $crate::input_contract::errore_di_lettura($tool, e))
+            }
+        }
+    };
+}
+
+/// Dichiara un oggetto ANNIDATO: la stessa forma di [`tool_input!`], senza il
+/// nome di un tool perche' non e' l'input di nessuno.
+///
+/// Serve dove il catalogo descrive la forma di una struttura dentro un campo —
+/// i `files` di `batch_analyze_code`, il `viewport` di `nexus_visual_compare`,
+/// gli `endpoints` di `task_complete`. Il tipo che ne esce implementa
+/// [`TipoJson`], quindi si usa come tipo di campo esattamente come `String`, e
+/// `Vec<T>` lo porta dentro un array senza altro lavoro.
+///
+/// [`tool_input!`] la CHIAMA invece di ripetere il corpo: struct e schema
+/// nascono da una sola scrittura, che e' l'intero punto di questo modulo.
+#[macro_export]
+macro_rules! tool_object {
+    (
+        $(#[$meta:meta])*
+        $nome:ident {
+            obbligatori {
+                $(
+                    $(#[$obb_meta:meta])*
+                    $obb:ident : $obb_tipo:ty, $($obb_desc:literal)+;
+                )*
+            }
+            opzionali {
+                $(
+                    $(#[$opz_meta:meta])*
+                    $opz:ident : $opz_tipo:ty, $($opz_desc:literal)+;
+                )*
+            }
+        }
+    ) => {
         $(#[$meta])*
         #[derive(Debug, Clone, ::serde::Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -218,8 +297,8 @@ macro_rules! tool_input {
             )*
         }
 
-        impl $crate::input_contract::InputTool for $nome {
-            fn schema() -> ::serde_json::Value {
+        impl $crate::input_contract::TipoJson for $nome {
+            fn schema_tipo() -> ::serde_json::Value {
                 $crate::input_contract::schema_oggetto(vec![
                     $((
                         stringify!($obb),
@@ -238,11 +317,6 @@ macro_rules! tool_input {
                         false,
                     ),)*
                 ])
-            }
-
-            fn leggi(input: &::serde_json::Value) -> ::std::result::Result<Self, ::nexus_types::tool_outcome::RispostaTool> {
-                ::serde_json::from_value::<Self>(input.clone())
-                    .map_err(|e| $crate::input_contract::errore_di_lettura($tool, e))
             }
         }
     };
@@ -557,6 +631,105 @@ mod tests {
             s["properties"]["forma"]["description"], "La forma",
             "quella dichiarata resta"
         );
+    }
+
+    crate::tool_object! {
+        /// Oggetto di prova annidato, con un campo dal nome riservato in Rust.
+        #[allow(dead_code)]
+        Criterio {
+            obbligatori {
+                r#type: String, "Il tipo del criterio";
+            }
+            opzionali {
+                soglia: i64, "Una soglia";
+            }
+        }
+    }
+
+    crate::tool_input! {
+        /// Input di prova che annida: un oggetto singolo e una lista di oggetti.
+        #[allow(dead_code)]
+        ConAnnidati for "con_annidati" {
+            obbligatori {
+                criterio: Criterio, "Il criterio principale";
+            }
+            opzionali {
+                altri: Vec<Criterio>, "Gli altri criteri";
+            }
+        }
+    }
+
+    /// Un oggetto dichiarato con `tool_object!` e' un tipo come gli altri: sta
+    /// in un campo, sta dentro un `Vec`, e lo schema che ne esce e' lo schema
+    /// oggetto — non una copia scritta a parte che potrebbe divergerne.
+    ///
+    /// MUTAZIONE: se `InputTool::schema` tornasse a comporre lo schema per
+    /// conto proprio invece di delegare a `TipoJson`, le due meta' potrebbero
+    /// dire cose diverse e questo test smetterebbe di provarlo.
+    #[test]
+    fn un_oggetto_annidato_e_un_tipo_come_gli_altri() {
+        let s = <ConAnnidati as InputTool>::schema();
+        let dentro = &s["properties"]["criterio"];
+        assert_eq!(dentro["type"], "object");
+        assert_eq!(dentro["properties"]["soglia"]["type"], "integer");
+        assert_eq!(dentro["required"], json!(["type"]));
+        // Stessa forma, ma la DESCRIZIONE appartiene al campo: su un array si
+        // attacca all'array e non ai suoi elementi. E' cio' che fa il catalogo
+        // (i `todos` di `nexus_todo_write` la portano sull'array), quindi il
+        // confronto e' sulle properties.
+        let items = &s["properties"]["altri"]["items"];
+        assert_eq!(items["properties"], dentro["properties"]);
+        assert_eq!(items["required"], dentro["required"]);
+        assert!(
+            items.get("description").is_none(),
+            "la descrizione resta sull'array: {items}"
+        );
+
+        let letto = <ConAnnidati as InputTool>::leggi(&json!({
+            "criterio": {"type": "http", "soglia": 200},
+            "altri": [{"type": "file_exists"}]
+        }))
+        .expect("annidato valido");
+        assert_eq!(letto.criterio.r#type, "http");
+        assert_eq!(letto.criterio.soglia, Some(200));
+        assert_eq!(letto.altri.as_ref().map(Vec::len), Some(1));
+
+        <ConAnnidati as InputTool>::leggi(&json!({"criterio": {"soglia": 1}}))
+            .expect_err("manca un obbligatorio dell'annidato");
+    }
+
+    /// Un campo che in Rust si scrive `r#type` resta `type` verso il modello.
+    ///
+    /// MUTAZIONE: togliendo lo `strip_prefix("r#")` da `schema_oggetto`, lo
+    /// schema promette una property `r#type` che il modello non scrivera' mai —
+    /// e il parsing continuerebbe a funzionare, perche' serde il prefisso lo
+    /// toglie da solo. Cioe' esattamente il tipo di divergenza silenziosa che
+    /// questo modulo esiste per rendere impossibile.
+    #[test]
+    fn un_nome_riservato_in_rust_resta_il_nome_del_catalogo() {
+        let s = <Criterio as TipoJson>::schema_tipo();
+        let props = s["properties"].as_object().expect("oggetto");
+        assert!(props.contains_key("type"), "la property e' 'type': {props:?}");
+        assert!(!props.contains_key("r#type"), "il prefisso Rust non esce: {props:?}");
+        assert_eq!(s["required"], json!(["type"]));
+    }
+
+    /// Un `required` vuoto non compare affatto: e' la forma che il catalogo
+    /// usa, e per un oggetto ANNIDATO il confronto e' profondo — quindi una
+    /// chiave in piu' li' e' una divergenza vera.
+    ///
+    /// MUTAZIONE: riscrivendo `required` sempre, il `viewport` di
+    /// `nexus_visual_compare` smette di coincidere col catalogo e il test di
+    /// equivalenza rosseggia.
+    #[test]
+    fn un_required_vuoto_non_si_scrive() {
+        let solo_opzionali = schema_oggetto(vec![("a", json!({"type": "string"}), false)]);
+        assert!(
+            solo_opzionali.get("required").is_none(),
+            "nessun obbligatorio, nessuna chiave: {solo_opzionali}"
+        );
+        let con_obbligatorio = schema_oggetto(vec![("a", json!({"type": "string"}), true)]);
+        assert_eq!(con_obbligatorio["required"], json!(["a"]));
     }
 
     /// Un campo che lo schema NON dichiara viene rifiutato invece di essere

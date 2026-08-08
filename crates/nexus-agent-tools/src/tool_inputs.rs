@@ -34,12 +34,47 @@
 //! stessa cosa — dove generare vorrebbe dire scegliere chi ha ragione.
 
 crate::tool_enum! {
+    Action {
+        Create => "create";
+        Check => "check";
+        Add => "add";
+        Update => "update";
+    }
+}
+
+crate::tool_enum! {
+    Blocker {
+        Dependency => "dependency";
+        Credential => "credential";
+        Permission => "permission";
+        Service => "service";
+        RequestAmbiguity => "request_ambiguity";
+        Safety => "safety";
+    }
+}
+
+crate::tool_enum! {
+    Direction {
+        MustBeAbsent => "must_be_absent";
+        MustBePresent => "must_be_present";
+    }
+}
+
+crate::tool_enum! {
     DocType {
         FunctionalAnalysis => "functional_analysis";
         TechnicalAnalysis => "technical_analysis";
         ErDiagram => "er_diagram";
         ProjectManagement => "project_management";
         ReleaseNotes => "release_notes";
+    }
+}
+
+crate::tool_enum! {
+    DocsUpdated {
+        Updated => "updated";
+        NotNeeded => "not_needed";
+        Missing => "missing";
     }
 }
 
@@ -85,6 +120,16 @@ crate::tool_enum! {
 }
 
 crate::tool_enum! {
+    Method {
+        Get => "GET";
+        Post => "POST";
+        Put => "PUT";
+        Patch => "PATCH";
+        Delete => "DELETE";
+    }
+}
+
+crate::tool_enum! {
     NetworkMode {
         None => "none";
         Bridge => "bridge";
@@ -98,6 +143,23 @@ crate::tool_enum! {
         Success => "success";
         Warning => "warning";
         Error => "error";
+    }
+}
+
+crate::tool_enum! {
+    Outcome {
+        Done => "done";
+        Blocked => "blocked";
+        Partial => "partial";
+        NeedsInput => "needs_input";
+    }
+}
+
+crate::tool_enum! {
+    Priority {
+        High => "high";
+        Normal => "normal";
+        Low => "low";
     }
 }
 
@@ -126,6 +188,124 @@ crate::tool_enum! {
         Conversation => "conversation";
         Project => "project";
         All => "all";
+    }
+}
+
+crate::tool_enum! {
+    Status {
+        Pending => "pending";
+        InProgress => "in_progress";
+        Completed => "completed";
+        Blocked => "blocked";
+        Skipped => "skipped";
+    }
+}
+
+crate::tool_enum! {
+    Task {
+        Document => "document";
+        Optimize => "optimize";
+        Analyze => "analyze";
+    }
+}
+
+crate::tool_enum! {
+    Type {
+        RunCommand => "run_command";
+        Http => "http";
+        FileExists => "file_exists";
+    }
+}
+
+crate::tool_object! {
+    BatchAnalyzeCodeFile {
+        obbligatori {
+            path: String, "Percorso relativo del file";
+        }
+        opzionali {
+            content: String, "Contenuto del file (lasciare vuoto per leggere automaticamente)";
+        }
+    }
+}
+
+crate::tool_object! {
+    NexusTodoWriteAcceptanceCriteria {
+        obbligatori {
+        }
+        opzionali {
+            r#type: Type, "run_command: exit code 0 = passa; http: url + expected_status; file_exists: path.";
+            command: String, "";
+            expected: String, "";
+            url: String, "";
+            expected_status: i64, "Per type=http: status atteso (default 200).";
+            path: String, "";
+        }
+    }
+}
+
+crate::tool_object! {
+    NexusTodoWriteTodo {
+        obbligatori {
+        }
+        opzionali {
+            id: String, "UUID del todo (obbligatorio per check/update)";
+            seq: i64, "Ordinamento, opzionale (auto per create/add)";
+            content: String, "Descrizione atomica e verificabile del todo";
+            status: Status, "";
+            priority: Priority, "Default 'normal'";
+            acceptance_criteria: Vec<NexusTodoWriteAcceptanceCriteria>, 
+                "Criteri di accettazione ESEGUIBILI della voce. Forma piatta: type + il campo del tipo.";
+        }
+    }
+}
+
+crate::tool_object! {
+    NexusVisualCompareViewport {
+        obbligatori {
+        }
+        opzionali {
+            width: i64, "";
+            height: i64, "";
+        }
+    }
+}
+
+crate::tool_object! {
+    TaskCompleteEndpoint {
+        obbligatori {
+            method: Method, "Metodo HTTP.";
+            url: String, 
+                "URL assoluto, con host e porta REALI del servizio che hai avviato — leggi la porta da quella "
+                "allocata al servizio, non copiarla da questo esempio (es. http://localhost:8080/api/articoli).";
+        }
+        opzionali {
+            body: serde_json::Map<String, serde_json::Value>, 
+                "Corpo JSON della richiesta. OBBLIGATORIO per POST/PUT/PATCH: senza, la chiamata misura la "
+                "validazione dell'input e non l'endpoint, e la voce viene scartata.";
+            status: i64, "Status atteso, se diverso da un 2xx (200/201/202/204 sono accettati per default).";
+        }
+    }
+}
+
+crate::tool_input! {
+    BatchAnalyzeCodeInput for "batch_analyze_code" {
+        obbligatori {
+            files: Vec<BatchAnalyzeCodeFile>, "Lista di file da analizzare (massimo 20 file per batch)";
+            task: Task, 
+                "Tipo di analisi: 'document' genera docstring/commenti, 'optimize' suggerisce ottimizzazioni, "
+                "'analyze' revisione architetturale e potenziali bug";
+        }
+        opzionali {
+        }
+    }
+}
+
+crate::tool_input! {
+    BuildProjectImageInput for "build_project_image" {
+        obbligatori {
+        }
+        opzionali {
+        }
     }
 }
 
@@ -297,9 +477,36 @@ crate::tool_input! {
 }
 
 crate::tool_input! {
+    GetSandboxConfigInput for "get_sandbox_config" {
+        obbligatori {
+        }
+        opzionali {
+        }
+    }
+}
+
+crate::tool_input! {
     GitCommitInput for "git_commit" {
         obbligatori {
             message: String, "Messaggio di commit";
+        }
+        opzionali {
+        }
+    }
+}
+
+crate::tool_input! {
+    GitPullInput for "git_pull" {
+        obbligatori {
+        }
+        opzionali {
+        }
+    }
+}
+
+crate::tool_input! {
+    GitPushInput for "git_push" {
+        obbligatori {
         }
         opzionali {
         }
@@ -321,6 +528,15 @@ crate::tool_input! {
     GitStageInput for "git_stage" {
         obbligatori {
             paths: Vec<String>, "Lista di percorsi file da aggiungere allo staging (relativi alla root)";
+        }
+        opzionali {
+        }
+    }
+}
+
+crate::tool_input! {
+    GitStatusInput for "git_status" {
+        obbligatori {
         }
         opzionali {
         }
@@ -424,6 +640,15 @@ crate::tool_input! {
         }
         opzionali {
             relevance_score: f64, "Punteggio di pertinenza 0-1 (opzionale)";
+        }
+    }
+}
+
+crate::tool_input! {
+    ListActiveServicesInput for "list_active_services" {
+        obbligatori {
+        }
+        opzionali {
         }
     }
 }
@@ -640,6 +865,15 @@ crate::tool_input! {
 }
 
 crate::tool_input! {
+    NexusListPortsInput for "nexus_list_ports" {
+        obbligatori {
+        }
+        opzionali {
+        }
+    }
+}
+
+crate::tool_input! {
     NexusMcpToolCallInput for "nexus_mcp_tool_call" {
         obbligatori {
             server_id: String, 
@@ -729,6 +963,25 @@ crate::tool_input! {
 }
 
 crate::tool_input! {
+    NexusTodoWriteInput for "nexus_todo_write" {
+        obbligatori {
+            action: Action, 
+                "Operazione: create=reset+ricrea piano, check=marca completati, add=appende todos, "
+                "update=aggiorna status arbitrari.";
+            run_id: String, "UUID dell'agent_run corrente (passato dal brain via state.thread_id). Obbligatorio.";
+            todos: Vec<NexusTodoWriteTodo>, 
+                "Array di todo. Per create/add: content+status+priority+acceptance_criteria. Per check/update: "
+                "id obbligatorio.";
+        }
+        opzionali {
+            planner_model: String, "Modello LLM usato dal planner (per audit, opzionale).";
+            plan_acceptance_criteria: Vec<serde_json::Value>, 
+                "Acceptance criteria globali del plan (opzionale, action=create).";
+        }
+    }
+}
+
+crate::tool_input! {
     NexusTranscribeAudioInput for "nexus_transcribe_audio" {
         obbligatori {
             attachment_id: String, "";
@@ -749,6 +1002,28 @@ crate::tool_input! {
             target_dir: String, 
                 "Path relativo alla project root del progetto scaffolded. Default: '.' (root). Per "
                 "Beauty-Book/figma_export usa 'figma_export'.";
+        }
+    }
+}
+
+crate::tool_input! {
+    NexusVisualCompareInput for "nexus_visual_compare" {
+        obbligatori {
+            url: String, 
+                "URL locale dell'app avviata da screenshottare (es. 'http://localhost:29348/' o una route "
+                "specifica). Obbligatorio.";
+        }
+        opzionali {
+            reference: String, 
+                "attachment_id del design di riferimento: se e' un .make Figma viene usato il suo thumbnail.png, "
+                "se e' un'immagine viene usata direttamente. Ometti per ottenere solo lo screenshot senza "
+                "confronto.";
+            viewport: NexusVisualCompareViewport, 
+                "Dimensioni viewport {width, height}. Default 1280x800 (configurabile in settings "
+                "agent.visual_compare.viewport_*).";
+            wait_ms: i64, 
+                "Attesa (ms) dopo il load prima dello scatto. Default da settings "
+                "(agent.visual_compare.wait_ms).";
         }
     }
 }
@@ -1046,6 +1321,34 @@ crate::tool_input! {
 }
 
 crate::tool_input! {
+    TaskCompleteInput for "task_complete" {
+        obbligatori {
+            outcome: Outcome, 
+                "Esito macchina del task: done = completato e verificato; blocked = fermo per causa esterna; "
+                "partial = completato in parte; needs_input = serve input umano.";
+            summary: String, "Resoconto umano finale del lavoro svolto (o del blocco). Mostrato all'utente.";
+        }
+        opzionali {
+            next_step: String, "Cosa resta da fare (obbligatorio con outcome=partial, utile con blocked/needs_input).";
+            blocked_by: String, "Descrizione testuale della causa del blocco (solo display).";
+            blocker: Blocker, "Categoria macchina della causa del blocco (con outcome=blocked).";
+            refusal: bool,
+                "true se stai rifiutando il task per ragioni di safety/policy (non per incapacita' "
+                "tecnica).";
+            docs_updated: DocsUpdated, "Docs (README, docs/) aggiornate in questo change?";
+            files_touched: Vec<String>, "Percorsi dei file che hai creato o modificato in questo run.";
+            endpoints: Vec<TaskCompleteEndpoint>, 
+                "Endpoint HTTP che il tuo lavoro ha creato o reso funzionanti. La verifica finale LI CHIAMA "
+                "DAVVERO prima di chiudere, quindi dichiarali tutti, non solo quelli che hai gia' provato tu: "
+                "soprattutto quelli di SCRITTURA (POST/PUT/PATCH), dove sta la maggior parte dei guasti. Ogni "
+                "voce deve essere eseguibile da sola e ripetibile; se una dipende da un'altra (es. DELETE dopo "
+                "POST) elencale in quest'ordine. Una POST di prova crea un dato vero nell'applicazione: usa "
+                "valori di prova riconoscibili.";
+        }
+    }
+}
+
+crate::tool_input! {
     UiLayoutPatternsInput for "ui_layout_patterns" {
         obbligatori {
         }
@@ -1103,6 +1406,37 @@ crate::tool_input! {
     }
 }
 
+crate::tool_enum! {
+    /// Le proporzioni ammesse per un'immagine generata.
+    ///
+    /// L'UNICO enum scritto a mano: i suoi valori non sono identificatori, e da
+    /// `1024x1024` non discende un nome di variante: il generatore si ferma
+    /// invece di produrne uno inventato (`Px1024x1024` non direbbe nulla a
+    /// nessuno). Qui il nome puo' dire cosa distingue davvero i tre valori, che
+    /// e' la FORMA — ed e' esattamente cio' che un modello deve scegliere.
+    ImageSize {
+        Quadrata => "1024x1024";
+        Orizzontale => "1792x1024";
+        Verticale => "1024x1792";
+    }
+}
+
+crate::tool_input! {
+    NexusGenerateImageInput for "nexus_generate_image" {
+        obbligatori {
+            prompt: String, "Descrizione testuale dell'immagine da generare. Obbligatorio.";
+        }
+        opzionali {
+            size: ImageSize,
+                "Dimensione richiesta (opzionale). Valori tipici: '1024x1024', '1792x1024', "
+                "'1024x1792'. Se omesso si usa il default del provider.";
+            filename: String,
+                "Nome file desiderato senza percorso (opzionale): viene salvato in "
+                ".nexus/generated/ con estensione .png. Se omesso si genera un nome timestampato.";
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::input_contract::InputTool;
@@ -1112,6 +1446,8 @@ mod tests {
     /// Ogni tool DICHIARATO, con lo schema che il suo contratto genera.
     fn dichiarati() -> Vec<(&'static str, serde_json::Value)> {
         vec![
+            ("batch_analyze_code", <BatchAnalyzeCodeInput as InputTool>::schema()),
+            ("build_project_image", <BuildProjectImageInput as InputTool>::schema()),
             ("code_doc", <CodeDocInput as InputTool>::schema()),
             ("create_profile", <CreateProfileInput as InputTool>::schema()),
             ("delete_file", <DeleteFileInput as InputTool>::schema()),
@@ -1125,9 +1461,13 @@ mod tests {
             ("fs_copy", <FsCopyInput as InputTool>::schema()),
             ("fs_mkdir", <FsMkdirInput as InputTool>::schema()),
             ("fs_move", <FsMoveInput as InputTool>::schema()),
+            ("get_sandbox_config", <GetSandboxConfigInput as InputTool>::schema()),
             ("git_commit", <GitCommitInput as InputTool>::schema()),
+            ("git_pull", <GitPullInput as InputTool>::schema()),
+            ("git_push", <GitPushInput as InputTool>::schema()),
             ("git_remote_add", <GitRemoteAddInput as InputTool>::schema()),
             ("git_stage", <GitStageInput as InputTool>::schema()),
+            ("git_status", <GitStatusInput as InputTool>::schema()),
             ("knowledge_create_link", <KnowledgeCreateLinkInput as InputTool>::schema()),
             ("knowledge_create_note", <KnowledgeCreateNoteInput as InputTool>::schema()),
             ("knowledge_get_links", <KnowledgeGetLinksInput as InputTool>::schema()),
@@ -1136,6 +1476,7 @@ mod tests {
             ("knowledge_import_graph", <KnowledgeImportGraphInput as InputTool>::schema()),
             ("knowledge_search", <KnowledgeSearchInput as InputTool>::schema()),
             ("knowledge_set_relevance", <KnowledgeSetRelevanceInput as InputTool>::schema()),
+            ("list_active_services", <ListActiveServicesInput as InputTool>::schema()),
             ("list_files", <ListFilesInput as InputTool>::schema()),
             ("nexus_db_describe", <NexusDbDescribeInput as InputTool>::schema()),
             ("nexus_db_query", <NexusDbQueryInput as InputTool>::schema()),
@@ -1154,6 +1495,7 @@ mod tests {
             ("nexus_install_shadcn_components", <NexusInstallShadcnComponentsInput as InputTool>::schema()),
             ("nexus_list_archive_entries", <NexusListArchiveEntriesInput as InputTool>::schema()),
             ("nexus_list_attachments", <NexusListAttachmentsInput as InputTool>::schema()),
+            ("nexus_list_ports", <NexusListPortsInput as InputTool>::schema()),
             ("nexus_mcp_tool_call", <NexusMcpToolCallInput as InputTool>::schema()),
             ("nexus_mcp_tool_search", <NexusMcpToolSearchInput as InputTool>::schema()),
             ("nexus_read_archive_entry", <NexusReadArchiveEntryInput as InputTool>::schema()),
@@ -1161,8 +1503,10 @@ mod tests {
             ("nexus_subagent_poll", <NexusSubagentPollInput as InputTool>::schema()),
             ("nexus_subagent_resume", <NexusSubagentResumeInput as InputTool>::schema()),
             ("nexus_text_to_speech", <NexusTextToSpeechInput as InputTool>::schema()),
+            ("nexus_todo_write", <NexusTodoWriteInput as InputTool>::schema()),
             ("nexus_transcribe_audio", <NexusTranscribeAudioInput as InputTool>::schema()),
             ("nexus_verify_scaffold", <NexusVerifyScaffoldInput as InputTool>::schema()),
+            ("nexus_visual_compare", <NexusVisualCompareInput as InputTool>::schema()),
             ("read_file", <ReadFileInput as InputTool>::schema()),
             ("read_file_lines", <ReadFileLinesInput as InputTool>::schema()),
             ("read_service_output", <ReadServiceOutputInput as InputTool>::schema()),
@@ -1183,11 +1527,13 @@ mod tests {
             ("set_sandbox_config", <SetSandboxConfigInput as InputTool>::schema()),
             ("stop_service", <StopServiceInput as InputTool>::schema()),
             ("tail_service_logs", <TailServiceLogsInput as InputTool>::schema()),
+            ("task_complete", <TaskCompleteInput as InputTool>::schema()),
             ("ui_layout_patterns", <UiLayoutPatternsInput as InputTool>::schema()),
             ("ui_reference_search", <UiReferenceSearchInput as InputTool>::schema()),
             ("ui_styling_audit", <UiStylingAuditInput as InputTool>::schema()),
             ("update_profile", <UpdateProfileInput as InputTool>::schema()),
             ("write_file", <WriteFileInput as InputTool>::schema()),
+            ("nexus_generate_image", <NexusGenerateImageInput as InputTool>::schema()),
         ]
     }
 
@@ -1248,7 +1594,7 @@ mod tests {
     fn il_conteggio_dei_dichiarati_e_esplicito() {
         assert_eq!(
             dichiarati().len(),
-            76,
+            88,
             "aggiornare il conteggio quando si dichiara un tool (e aggiungerlo a dichiarati())"
         );
     }
