@@ -3080,18 +3080,18 @@ gamma
 
         // Il tool e' stato migrato a `RispostaTool` mentre questo test viveva su
         // un altro branch: l'asserzione guarda ora i CAMPI, che e' il contratto
-        // che il tool ha adottato. Il messaggio per il modello resta `testo`.
+        // che il tool ha adottato. Il messaggio di fallimento stampa la
+        // struttura INTERA (`{out:?}`) e non il solo testo: quando questo test
+        // rosseggia servono anche `esito` e `natura` per capire cosa e' successo.
         assert_eq!(out.esito, nexus_types::tool_outcome::EsitoTool::Fallito);
         assert!(
             out.testo.contains("school-courses-fe/SchoolCoursesApi"),
-            "{}",
-            out.testo
+            "{out:?}"
         );
         assert!(
             out.testo
                 .contains("il tratto esistente piu' profondo e' 'school-courses-fe'"),
-            "il modello deve sapere fin dove il percorso esiste: {}",
-            out.testo
+            "il modello deve sapere fin dove il percorso esiste: {out:?}"
         );
     }
 
