@@ -97,6 +97,35 @@ impl TipoJson for Map<String, Value> {
     }
 }
 
+impl TipoJson for nexus_types::severity::Severity {
+    fn schema_tipo() -> Value {
+        // Il vocabolario NON si riscrive qui: viene dal punto unico
+        // (`nexus-types::severity`), che e' lo stesso tipo che i panel usano per
+        // decidere il veto in minoranza. Un `tool_enum!` con gli stessi tre
+        // valori sarebbe stato un gemello, e nessun compilatore avrebbe
+        // obbligato i due a restare allineati — che e' la ragione per cui quel
+        // modulo e' migrato in `nexus-types`.
+        json!({
+            "type": "string",
+            "enum": nexus_types::severity::Severity::VALORI,
+        })
+    }
+}
+
+impl TipoJson for nexus_types::source_kind::SourceKind {
+    fn schema_tipo() -> Value {
+        // Come per `Severity`: il vocabolario viene dal punto unico, non da un
+        // elenco riscritto qui. E' il caso in cui la duplicazione aveva gia'
+        // fatto danno — il catalogo prometteva 5 valori, `SourceKind::parse` ne
+        // accettava 8, e le tre sorgenti in piu' erano irraggiungibili per chi
+        // doveva chiederle.
+        json!({
+            "type": "string",
+            "enum": nexus_types::source_kind::SourceKind::VALORI,
+        })
+    }
+}
+
 impl<T: TipoJson> TipoJson for Option<T> {
     fn schema_tipo() -> Value {
         // Un campo opzionale ha lo stesso TIPO di uno obbligatorio: la
@@ -402,6 +431,78 @@ macro_rules! tool_enum {
                 ::serde_json::json!({
                     "type": "string",
                     "enum": <$nome>::valori(),
+                })
+            }
+        }
+    };
+}
+
+/// Dichiara un campo i cui valori ammessi li fissa il RUNTIME, non il codice.
+///
+/// ```ignore
+/// tool_enum_dinamico! {
+///     /// Lo scope di verifica: i valori veri vengono dal profilo del progetto.
+///     ScopeVerifica {
+///         seed { "quick"; "full"; "typecheck"; }
+///     }
+/// }
+/// ```
+///
+/// # Perche' non e' un [`tool_enum!`]
+///
+/// Un enum Rust vincola il PARSING, e qui il vincolo sarebbe sbagliato: i
+/// valori veri di `nexus_verify_change.scope` vengono dal profilo del progetto
+/// (`lint-frontend`, `typecheck-backend`), quelli di `dispatch_subagent.kind`
+/// dal registry DB. Un enum statico rifiuterebbe alla deserializzazione proprio
+/// i valori che il catalogo — rigenerato prima di consegnarlo al modello — gli
+/// ha promesso. Sarebbe il difetto misurato il 07/08/2026 (`lint` promesso e
+/// `invalid_scope` in risposta) riprodotto un livello piu' in basso, dove
+/// nessun messaggio d'errore lo spiegherebbe.
+///
+/// Il tipo che ne esce e' quindi una stringa nel parsing, e DICE di esserlo. Il
+/// controllo dei valori resta dove sono i dati per farlo, cioe' a runtime.
+///
+/// # Perche' il seed sta comunque qui
+///
+/// `agent_turn_setup::apply_verify_scope_enum` SOSTITUISCE l'array `enum` dello
+/// schema (`pointer_mut(".../scope/enum")`): senza un array da sostituire non
+/// aggancia nulla, e il modello resterebbe senza vincolo. Il seed non e' un
+/// residuo da togliere — e' cio' che rende possibile la sostituzione, e vale
+/// anche come ripiego quando il profilo e' vuoto (progetto nuovo, DB
+/// irraggiungibile). Dichiararlo qui lo mette accanto al campo che governa,
+/// invece che dentro un letterale JSON dall'altra parte del crate.
+#[macro_export]
+macro_rules! tool_enum_dinamico {
+    (
+        $(#[$meta:meta])*
+        $nome:ident {
+            seed { $($valore:literal;)+ }
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
+        #[serde(transparent)]
+        pub struct $nome(pub ::std::string::String);
+
+        impl $nome {
+            /// I valori del SEED: quelli che lo schema porta finche' il runtime
+            /// non li sostituisce coi veri. NON sono l'insieme ammesso.
+            pub fn seed() -> &'static [&'static str] {
+                &[$($valore,)+]
+            }
+
+            /// Il valore come lo ha scritto il modello. Chi lo riceve lo valida
+            /// contro la fonte vera (profilo del progetto, registry DB).
+            pub fn come_stringa(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl $crate::input_contract::TipoJson for $nome {
+            fn schema_tipo() -> ::serde_json::Value {
+                ::serde_json::json!({
+                    "type": "string",
+                    "enum": <$nome>::seed(),
                 })
             }
         }
@@ -730,6 +831,76 @@ mod tests {
         );
         let con_obbligatorio = schema_oggetto(vec![("a", json!({"type": "string"}), true)]);
         assert_eq!(con_obbligatorio["required"], json!(["a"]));
+    }
+
+    crate::tool_enum_dinamico! {
+        /// Tipo di prova a valori dinamici: il seed e' un ripiego, non l'insieme
+        /// ammesso.
+        ScopeDiProva {
+            seed { "quick"; "full"; "lint"; }
+        }
+    }
+
+    crate::tool_input! {
+        /// Input di prova con un campo a valori dinamici.
+        #[allow(dead_code)]
+        ConDinamico for "con_dinamico" {
+            obbligatori {
+                scope: ScopeDiProva, "Lo scope";
+            }
+            opzionali {}
+        }
+    }
+
+    /// Un campo a valori dinamici PORTA il seed nello schema ma NON lo impone al
+    /// parsing: i valori veri arrivano dal profilo del progetto, e lo schema che
+    /// il modello legge e' gia' stato riscritto con quelli.
+    ///
+    /// MUTAZIONE: dichiarando `scope` con `tool_enum!` invece che con
+    /// `tool_enum_dinamico!`, `lint-frontend` viene rifiutato dalla
+    /// deserializzazione — cioe' l'agente riceve un errore per aver usato uno
+    /// dei valori che il catalogo gli aveva appena promesso, che e' il difetto
+    /// misurato il 07/08/2026 riprodotto un livello piu' in basso.
+    #[test]
+    fn un_valore_dal_progetto_non_lo_ferma_il_seed() {
+        let s = <ConDinamico as InputTool>::schema();
+        assert_eq!(
+            s["properties"]["scope"]["enum"],
+            json!(["quick", "full", "lint"]),
+            "il seed sta nello schema: e' cio' che apply_verify_scope_enum sostituisce"
+        );
+
+        // Il valore vero di un progetto reale: fuori dal seed, e legittimo.
+        let letto = <ConDinamico as InputTool>::leggi(&json!({"scope": "lint-frontend"}))
+            .expect("il seed non e' un vincolo di parsing");
+        assert_eq!(letto.scope.come_stringa(), "lint-frontend");
+
+        // E il seed resta interrogabile per chi deve ripiegarci.
+        assert!(ScopeDiProva::seed().contains(&"quick"));
+    }
+
+    /// Un vocabolario che ha gia' un punto unico non viene riscritto: lo schema
+    /// lo DERIVA dal tipo condiviso.
+    ///
+    /// MUTAZIONE: ricopiando i valori a mano dentro `schema_tipo`, questo test
+    /// resta verde — ma il giorno in cui il punto unico ne aggiunge uno, la
+    /// copia non lo segue. E' la ragione per cui l'asserzione confronta con la
+    /// costante del punto unico invece che con un elenco letterale.
+    #[test]
+    fn i_vocabolari_condivisi_vengono_dal_punto_unico() {
+        use nexus_types::{severity::Severity, source_kind::SourceKind};
+
+        let s = <Severity as TipoJson>::schema_tipo();
+        assert_eq!(s["type"], "string");
+        assert_eq!(s["enum"], json!(Severity::VALORI));
+
+        let k = <SourceKind as TipoJson>::schema_tipo();
+        assert_eq!(k["enum"], json!(SourceKind::VALORI));
+        assert_eq!(
+            k["enum"].as_array().map(Vec::len),
+            Some(8),
+            "tutte le sorgenti che SourceKind::parse accetta, non le 5 storiche"
+        );
     }
 
     /// Un campo che lo schema NON dichiara viene rifiutato invece di essere

@@ -25,13 +25,59 @@
 //! genera. L'elenco di chi e' passato davvero e' in
 //! `mcp-core::agent_tools::dispatch::esegui_tool_migrato`.
 //!
-//! # Chi non e' qui, e perche'
+//! # La copertura e' completa: 95 contratti su 95 tool
 //!
-//! Lo dichiara lo script a ogni esecuzione, con il motivo per nome. Le famiglie:
-//! enum rigenerati a runtime dal progetto o dal DB (fissarli qui riporterebbe il
-//! difetto in forma nuova), strutture annidate che la macro non esprime ancora,
-//! tool senza parametri, e i campi in cui catalogo e handler non dicono la
-//! stessa cosa — dove generare vorrebbe dire scegliere chi ha ragione.
+//! Le tre famiglie che erano rimaste fuori si sono chiuse ognuna a modo suo, e
+//! il modo dice qualcosa sul problema:
+//!
+//! - **vocabolari che esistevano gia' altrove** (la gravita' `alta|media|bassa`
+//!   dei panel): il contratto vi DELEGA. `Severity` e `SourceKind` sono migrati
+//!   in `nexus-types` proprio perche' fossero raggiungibili anche da qui — un
+//!   enum gemello avrebbe avuto gli stessi valori senza che nulla obbligasse i
+//!   due a restare allineati.
+//! - **valori che li fissa il RUNTIME** (lo `scope` dal profilo del progetto, il
+//!   `kind` dal registry DB): [`crate::tool_enum_dinamico!`]. Porta il seed nello
+//!   schema, dove `apply_verify_scope_enum` lo sostituisce coi valori veri, e
+//!   lascia il parsing a una stringa — perche' un enum statico rifiuterebbe
+//!   proprio i valori che il catalogo rigenerato ha appena promesso.
+//! - **un nome che il generatore non poteva dedurre** (`1024x1024` non da' una
+//!   variante): scritto a mano, dove un umano puo' chiamare i tre valori con
+//!   cio' che davvero li distingue.
+//!
+//! Lo script continua a dichiarare, a ogni esecuzione, chi non riesce a
+//! generare e perche': oggi solo `nexus_generate_image`, che infatti e' qui a
+//! mano.
+
+crate::tool_enum_dinamico! {
+    KindSubagente {
+        seed {
+            "plan";
+            "explore";
+            "implement";
+            "verify";
+            "review";
+            "rust_implementer";
+            "python_implementer";
+            "frontend_implementer";
+            "db_architect";
+            "doc_writer";
+            "test_author";
+        }
+    }
+}
+
+crate::tool_enum_dinamico! {
+    ScopeVerifica {
+        seed {
+            "quick";
+            "full";
+            "typecheck";
+            "build";
+            "lint";
+            "test";
+        }
+    }
+}
 
 crate::tool_enum! {
     Action {
@@ -39,6 +85,14 @@ crate::tool_enum! {
         Check => "check";
         Add => "add";
         Update => "update";
+    }
+}
+
+crate::tool_enum! {
+    AdvisoryVerdict {
+        Proceed => "proceed";
+        ProceedWithChanges => "proceed_with_changes";
+        Block => "block";
     }
 }
 
@@ -176,6 +230,14 @@ crate::tool_enum! {
 }
 
 crate::tool_enum! {
+    ReviewVerdict {
+        Pass => "pass";
+        Fail => "fail";
+        NeedsChanges => "needs_changes";
+    }
+}
+
+crate::tool_enum! {
     SeverityFilter {
         All => "all";
         High => "high";
@@ -188,6 +250,13 @@ crate::tool_enum! {
         Conversation => "conversation";
         Project => "project";
         All => "all";
+    }
+}
+
+crate::tool_enum! {
+    Stance {
+        Support => "support";
+        Oppose => "oppose";
     }
 }
 
@@ -218,12 +287,68 @@ crate::tool_enum! {
 }
 
 crate::tool_object! {
+    AdvisoryVerdictRequirement {
+        obbligatori {
+            text: String, "Il vincolo, come frase azionabile.";
+        }
+        opzionali {
+            direction: Direction, 
+                "must_be_absent se il vincolo chiede che qualcosa SPARISCA dal codice (es. rimuovere o "
+                "sostituire un valore); must_be_present se chiede che qualcosa CI SIA (es. aggiungere o "
+                "impostare un valore). Dichiaralo sempre: e' l'unico modo per il sistema di riscontrare il "
+                "vincolo sul file senza indovinare dal testo.";
+        }
+    }
+}
+
+crate::tool_object! {
+    AdvisoryVerdictRisk {
+        obbligatori {
+            description: String, "Il rischio e la sua evidenza concreta.";
+        }
+        opzionali {
+            severity: nexus_types::severity::Severity, "Severita' del rischio.";
+            area: String, "Ambito del rischio (es. sicurezza, dati, deploy).";
+        }
+    }
+}
+
+crate::tool_object! {
+    AdvisoryVerdictContestedDecision {
+        obbligatori {
+            topic: String, "La decisione in una riga (es. 'come isolare i sub-run che scrivono').";
+            options: Vec<String>, 
+                "Le alternative REALI e mutuamente esclusive, almeno due, ognuna descritta in modo autonomo e "
+                "comprensibile senza il resto del parere.";
+        }
+        opzionali {
+        }
+    }
+}
+
+crate::tool_object! {
     BatchAnalyzeCodeFile {
         obbligatori {
             path: String, "Percorso relativo del file";
         }
         opzionali {
             content: String, "Contenuto del file (lasciare vuoto per leggere automaticamente)";
+        }
+    }
+}
+
+crate::tool_object! {
+    DispatchSubagentsTask {
+        obbligatori {
+            kind: KindSubagente, 
+                "Tipo di sub-agent (vedi dispatch_subagent per la guida; le 6 figure di analisi read-only del "
+                "consiglio sono convocabili qui in batch). Enum SEED: a runtime sostituito coi kind da "
+                "nexus_subagent_definitions.";
+            task: String, "Descrizione COMPLETA e AUTONOMA del task";
+        }
+        opzionali {
+            context: String, "Contesto aggiuntivo opzionale";
+            expected_output_format: String, "Forma del summary atteso (opzionale)";
         }
     }
 }
@@ -271,6 +396,19 @@ crate::tool_object! {
 }
 
 crate::tool_object! {
+    ReviewVerdictFinding {
+        obbligatori {
+            file: String, "Percorso del file col difetto.";
+            description: String, "Il difetto e la sua evidenza concreta (scenario di fallimento).";
+        }
+        opzionali {
+            line: i64, "Riga (1-based) del difetto, se puntuale.";
+            severity: nexus_types::severity::Severity, "Severita' del difetto.";
+        }
+    }
+}
+
+crate::tool_object! {
     TaskCompleteEndpoint {
         obbligatori {
             method: Method, "Metodo HTTP.";
@@ -283,6 +421,35 @@ crate::tool_object! {
                 "Corpo JSON della richiesta. OBBLIGATORIO per POST/PUT/PATCH: senza, la chiamata misura la "
                 "validazione dell'input e non l'endpoint, e la voce viene scartata.";
             status: i64, "Status atteso, se diverso da un 2xx (200/201/202/204 sono accettati per default).";
+        }
+    }
+}
+
+crate::tool_input! {
+    AdvisoryVerdictInput for "advisory_verdict" {
+        obbligatori {
+            verdict: AdvisoryVerdict, 
+                "Parere macchina: proceed = via libera dalla tua lente; proceed_with_changes = si procede coi "
+                "requisiti indicati; block = non eseguibile cosi', va corretto prima (richiede almeno un rischio "
+                "con evidenza).";
+            summary: String, "Resoconto umano del parere (cosa hai analizzato e con quale conclusione).";
+        }
+        opzionali {
+            requirements: Vec<AdvisoryVerdictRequirement>, 
+                "Vincoli/requisiti che l'esecuzione DEVE rispettare secondo la tua lente. Ognuno un testo "
+                "azionabile con la direzione dichiarata (vedi 'direction').";
+            risks: Vec<AdvisoryVerdictRisk>, 
+                "Rischi con evidenza. Obbligatorio (non vuoto) con verdict=block: un veto senza evidenza viene "
+                "rifiutato.";
+            recommendations: Vec<String>, "Suggerimenti non vincolanti dalla tua prospettiva.";
+            contested_decision: AdvisoryVerdictContestedDecision, 
+                "Dichiaralo SOLO se la richiesta nasconde una DECISIONE ARCHITETTURALE aperta: piu' strade "
+                "alternative difendibili, dove la scelta cambia il progetto e nessuna e' ovviamente superiore. "
+                "Non dichiararlo per un dettaglio implementativo, per una scelta gia' presa nel repo (ADR/punto "
+                "unico esistente), ne' quando una strada e' chiaramente giusta: farebbe convocare un dibattito "
+                "costoso su una domanda gia' risolta. Se lo dichiari, avvocati indipendenti riceveranno UNA "
+                "opzione ciascuno da difendere con evidenza, e il coordinatore decidera' sul merito del "
+                "confronto.";
         }
     }
 }
@@ -343,12 +510,85 @@ crate::tool_input! {
 }
 
 crate::tool_input! {
+    DebatePositionInput for "debate_position" {
+        obbligatori {
+            assigned_position: String, 
+                "La posizione che ti e' stata assegnata, ripetuta ALLA LETTERA come compare nel task. E' la "
+                "chiave di attribuzione del voto.";
+            stance: Stance, 
+                "support = la posizione assegnata regge ed e' preferibile; oppose = studiate le prove NON regge "
+                "(resa onesta: non e' una sconfitta, e' evidenza).";
+            summary: String, "Resoconto umano della tua arringa (cosa hai verificato e con quale conclusione).";
+        }
+        opzionali {
+            key_arguments: Vec<String>, 
+                "Argomenti concreti a sostegno della tua conclusione, ognuno una frase con evidenza (file:riga "
+                "dove possibile). Niente retorica: prove.";
+            risks: Vec<AdvisoryVerdictRisk>, 
+                "Rischi trovati, con evidenza. Obbligatorio (non vuoto) con stance=oppose: arrendere la tesi "
+                "senza spiegare perche' non e' evidenza, e viene rifiutato.";
+        }
+    }
+}
+
+crate::tool_input! {
     DeleteFileInput for "delete_file" {
         obbligatori {
             path: String, "Percorso relativo alla root del file o directory da eliminare";
         }
         opzionali {
             recursive: bool, "Se true, elimina ricorsivamente (necessario per directory non vuote). Default: false";
+        }
+    }
+}
+
+crate::tool_input! {
+    DispatchSubagentInput for "dispatch_subagent" {
+        obbligatori {
+            kind: KindSubagente, 
+                "Tipo di sub-agent. SCEGLI implementativi "
+                "(rust_implementer/python_implementer/frontend_implementer/db_architect/doc_writer/test_author) "
+                "per creare/modificare file. SCEGLI explore solo per analisi senza scrittura. Le FIGURE DI "
+                "ANALISI del consiglio "
+                "(program_manager/project_manager/functional_analyst/software_architect/sysadmin/security_engineer) "
+                "sono READ-ONLY: convocale a MONTE per far analizzare la richiesta dalle diverse prospettive "
+                "PRIMA di pianificare; ognuna chiude con advisory_verdict. 'implement' e' il fallback generico "
+                "se nessun specialista combacia. NB: l'enum qui e' un SEED di fallback; a runtime il catalogo "
+                "del run principale (build_tools_json_for_agent) lo SOSTITUISCE con i kind reali da "
+                "nexus_subagent_definitions (regola G/L: registry DB unica fonte).";
+            task: String, 
+                "Descrizione COMPLETA e AUTONOMA del sotto-task. Il sub-agent non vede la conversation del main: "
+                "includi obiettivo, file da toccare, vincoli, criteri di completamento.";
+        }
+        opzionali {
+            context: String, "Contesto aggiuntivo opzionale: file rilevanti, vincoli, decisioni precedenti.";
+            expected_output_format: String, 
+                "Forma del summary atteso, es. 'lista file modificati', 'paragrafo 300 char con file:linea', "
+                "'json {passed, results}'.";
+            background: bool, 
+                "Se true, NON attendere il sub-agent: il main si sospende e riprende automaticamente quando il "
+                "sub-agent completa (fan-in asincrono). Usa SOLO per task lunghi e indipendenti quando puoi "
+                "procedere con altro lavoro senza il risultato immediato, per non tenere bloccato il main. "
+                "Default false = attesa sincrona (il main resta fermo fino al summary). NB: un dispatch "
+                "background salta l'isolamento worktree.";
+        }
+    }
+}
+
+crate::tool_input! {
+    DispatchSubagentsInput for "dispatch_subagents" {
+        obbligatori {
+            tasks: Vec<DispatchSubagentsTask>, "Task indipendenti (1-8) eseguiti in parallelo";
+        }
+        opzionali {
+            max_parallel: i64, 
+                "Ampiezza ondata concorrente (default e tetto dal setting admin "
+                "orchestrator.max_parallel_subagents)";
+            background: bool, 
+                "Se true, NON attendere il batch: il main si sospende e riprende quando TUTTI i sub-agent "
+                "completano (fan-in asincrono). Usa SOLO per batch di task lunghi e indipendenti quando puoi "
+                "procedere senza i risultati immediati. Default false = attesa sincrona. NB: con background=true "
+                "il batch salta l'isolamento worktree ed esegue sul ramo sequenziale.";
         }
     }
 }
@@ -927,6 +1167,22 @@ crate::tool_input! {
 }
 
 crate::tool_input! {
+    NexusSearchSemanticInput for "nexus_search_semantic" {
+        obbligatori {
+            query: String, "Testo da cercare (es. 'cosa fa il bottone Send nel chat input?'). Max 2000 char.";
+        }
+        opzionali {
+            source_kinds: Vec<nexus_types::source_kind::SourceKind>, 
+                "Filtra per tipologia. Default: le fonti per-progetto (attachment, kb, chat_history, "
+                "tool_result, code). Le altre vanno chieste esplicitamente.";
+            top_k: i64, "Numero hit (default da settings agent.rag.top_k_default, max 100).";
+            filter_attachment_id: String, "Restringe a un singolo attachment_id.";
+            filter_session_id: String, "Restringe a una session_id (rilevante per chat_history).";
+        }
+    }
+}
+
+crate::tool_input! {
     NexusSubagentPollInput for "nexus_subagent_poll" {
         obbligatori {
             subagent_run_id: String, "UUID del sub-agent run (ritornato da dispatch_subagent).";
@@ -990,6 +1246,23 @@ crate::tool_input! {
             language: String, 
                 "Lingua dell'audio in ISO-639-1 (es. 'it', 'en'), opzionale: migliora accuratezza e velocita'. "
                 "Se omessa il modello la rileva automaticamente.";
+        }
+    }
+}
+
+crate::tool_input! {
+    NexusVerifyChangeInput for "nexus_verify_change" {
+        obbligatori {
+        }
+        opzionali {
+            scope: ScopeVerifica, 
+                "quick = typecheck+lint (rapido, dopo ogni modifica); full = catena completa "
+                "typecheck+build+lint+test (prima di dichiarare done); oppure un singolo step.";
+            working_dir: String, 
+                "Sottocartella del progetto in cui eseguire i comandi (default: root del progetto). Utile nei "
+                "monorepo. Il comando gira GIA' in questa cartella: NON ripeterla nel comando (niente 'cd "
+                "<questa>' ne prefissi '<questa>/' nei path), o i percorsi si sommano (es. working_dir=frontend "
+                "+ 'frontend/x' esegue in frontend/frontend/x).";
         }
     }
 }
@@ -1102,6 +1375,21 @@ crate::tool_input! {
                 "Etichetta logica del servizio (es. 'backend-dev', 'frontend-dev', 'api', 'web'). Obbligatorio.";
         }
         opzionali {
+        }
+    }
+}
+
+crate::tool_input! {
+    ReviewVerdictInput for "review_verdict" {
+        obbligatori {
+            verdict: ReviewVerdict, 
+                "Verdetto macchina della review: pass = nessun difetto reale; fail = difetti che rendono il "
+                "lavoro non accettabile; needs_changes = accettabile ma da correggere.";
+            summary: String, "Resoconto umano della review (cosa e' stato verificato e con quale esito).";
+        }
+        opzionali {
+            findings: Vec<ReviewVerdictFinding>, 
+                "Difetti trovati con evidenza. Obbligatorio (non vuoto) con verdict=fail o needs_changes.";
         }
     }
 }
@@ -1332,9 +1620,8 @@ crate::tool_input! {
             next_step: String, "Cosa resta da fare (obbligatorio con outcome=partial, utile con blocked/needs_input).";
             blocked_by: String, "Descrizione testuale della causa del blocco (solo display).";
             blocker: Blocker, "Categoria macchina della causa del blocco (con outcome=blocked).";
-            refusal: bool,
-                "true se stai rifiutando il task per ragioni di safety/policy (non per incapacita' "
-                "tecnica).";
+            refusal: bool, 
+                "true se stai rifiutando il task per ragioni di safety/policy (non per incapacita' tecnica).";
             docs_updated: DocsUpdated, "Docs (README, docs/) aggiornate in questo change?";
             files_touched: Vec<String>, "Percorsi dei file che hai creato o modificato in questo run.";
             endpoints: Vec<TaskCompleteEndpoint>, 
@@ -1446,11 +1733,15 @@ mod tests {
     /// Ogni tool DICHIARATO, con lo schema che il suo contratto genera.
     fn dichiarati() -> Vec<(&'static str, serde_json::Value)> {
         vec![
+            ("advisory_verdict", <AdvisoryVerdictInput as InputTool>::schema()),
             ("batch_analyze_code", <BatchAnalyzeCodeInput as InputTool>::schema()),
             ("build_project_image", <BuildProjectImageInput as InputTool>::schema()),
             ("code_doc", <CodeDocInput as InputTool>::schema()),
             ("create_profile", <CreateProfileInput as InputTool>::schema()),
+            ("debate_position", <DebatePositionInput as InputTool>::schema()),
             ("delete_file", <DeleteFileInput as InputTool>::schema()),
+            ("dispatch_subagent", <DispatchSubagentInput as InputTool>::schema()),
+            ("dispatch_subagents", <DispatchSubagentsInput as InputTool>::schema()),
             ("dispatcher_emit_event", <DispatcherEmitEventInput as InputTool>::schema()),
             ("dispatcher_highlight_panel", <DispatcherHighlightPanelInput as InputTool>::schema()),
             ("dispatcher_post_notification", <DispatcherPostNotificationInput as InputTool>::schema()),
@@ -1500,11 +1791,13 @@ mod tests {
             ("nexus_mcp_tool_search", <NexusMcpToolSearchInput as InputTool>::schema()),
             ("nexus_read_archive_entry", <NexusReadArchiveEntryInput as InputTool>::schema()),
             ("nexus_read_attachment", <NexusReadAttachmentInput as InputTool>::schema()),
+            ("nexus_search_semantic", <NexusSearchSemanticInput as InputTool>::schema()),
             ("nexus_subagent_poll", <NexusSubagentPollInput as InputTool>::schema()),
             ("nexus_subagent_resume", <NexusSubagentResumeInput as InputTool>::schema()),
             ("nexus_text_to_speech", <NexusTextToSpeechInput as InputTool>::schema()),
             ("nexus_todo_write", <NexusTodoWriteInput as InputTool>::schema()),
             ("nexus_transcribe_audio", <NexusTranscribeAudioInput as InputTool>::schema()),
+            ("nexus_verify_change", <NexusVerifyChangeInput as InputTool>::schema()),
             ("nexus_verify_scaffold", <NexusVerifyScaffoldInput as InputTool>::schema()),
             ("nexus_visual_compare", <NexusVisualCompareInput as InputTool>::schema()),
             ("read_file", <ReadFileInput as InputTool>::schema()),
@@ -1513,6 +1806,7 @@ mod tests {
             ("recall_context", <RecallContextInput as InputTool>::schema()),
             ("rename_file", <RenameFileInput as InputTool>::schema()),
             ("request_port", <RequestPortInput as InputTool>::schema()),
+            ("review_verdict", <ReviewVerdictInput as InputTool>::schema()),
             ("run_command", <RunCommandInput as InputTool>::schema()),
             ("run_lint_fix", <RunLintFixInput as InputTool>::schema()),
             ("run_playwright_tests", <RunPlaywrightTestsInput as InputTool>::schema()),
@@ -1594,7 +1888,7 @@ mod tests {
     fn il_conteggio_dei_dichiarati_e_esplicito() {
         assert_eq!(
             dichiarati().len(),
-            88,
+            95,
             "aggiornare il conteggio quando si dichiara un tool (e aggiungerlo a dichiarati())"
         );
     }

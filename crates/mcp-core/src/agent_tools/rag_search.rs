@@ -21,39 +21,35 @@ fn search_failure(payload: Value) -> String {
 }
 
 pub async fn tool_nexus_search_semantic(ctx: &AgentToolContext, input: &Value) -> String {
-    let query = input
-        .get("query")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    use nexus_agent_tools::input_contract::InputTool;
+    use nexus_agent_tools::tool_inputs::NexusSearchSemanticInput;
+
+    // Il contratto d'ingresso sostituisce cinque `input.get(...)` scritti a
+    // mano, e con essi il difetto peggiore di questo handler: `source_kinds`
+    // passava da un `filter_map` che SCARTAVA i valori non riconosciuti in
+    // silenzio. Chiedere di filtrare su una sorgente inesistente non produceva
+    // un errore — produceva la lista vuota, cioe' il DEFAULT, cioe' tutte le
+    // sorgenti: il modello credeva di aver ristretto la ricerca e otteneva
+    // l'opposto. Ora un valore fuori vocabolario e' un fallimento rimediabile
+    // che elenca gli ammessi.
+    let params = match NexusSearchSemanticInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return search_failure(json!({"error": risposta.testo})),
+    };
+
+    let query = params.query.trim().to_string();
     if query.is_empty() {
         return search_failure(json!({"error": "campo 'query' obbligatorio"}));
     }
-    let top_k = input
-        .get("top_k")
-        .and_then(Value::as_u64)
-        .map(|n| n as usize);
-    let kinds: Vec<SourceKind> = input
-        .get("source_kinds")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().and_then(SourceKind::parse))
-                .collect()
-        })
-        .unwrap_or_default();
-    let filter_attachment_id = input
-        .get("filter_attachment_id")
-        .and_then(Value::as_str)
-        .map(|s| s.to_string());
-    let filter_session_id = input
-        .get("filter_session_id")
-        .and_then(Value::as_str)
+    let top_k = params.top_k.and_then(|n| usize::try_from(n).ok());
+    let kinds: Vec<SourceKind> = params.source_kinds.unwrap_or_default();
+    let filter_session_id = params
+        .filter_session_id
+        .as_deref()
         .and_then(|s| Uuid::parse_str(s).ok());
 
     let mut extra: Vec<(String, Value)> = Vec::new();
-    if let Some(att_id) = filter_attachment_id.clone() {
+    if let Some(att_id) = params.filter_attachment_id {
         extra.push(("source_id".to_string(), json!(att_id)));
     }
 

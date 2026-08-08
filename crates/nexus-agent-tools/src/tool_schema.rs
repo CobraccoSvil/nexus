@@ -1609,7 +1609,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
       "type": "object",
       "properties": {
         "query": {"type": "string", "description": "Testo da cercare (es. 'cosa fa il bottone Send nel chat input?'). Max 2000 char."},
-        "source_kinds": {"type": "array", "items": {"type": "string", "enum": ["attachment", "kb", "chat_history", "tool_result", "code"]}, "description": "Filtra per tipologia. Default: tutte tranne 'code'."},
+        "source_kinds": {"type": "array", "items": {"type": "string", "enum": ["attachment", "kb", "chat_history", "tool_result", "code", "meta_doc", "conversation", "prompt_correction"]}, "description": "Filtra per tipologia. Default: le fonti per-progetto (attachment, kb, chat_history, tool_result, code). Le altre vanno chieste esplicitamente."},
         "top_k": {"type": "integer", "description": "Numero hit (default da settings agent.rag.top_k_default, max 100)."},
         "filter_attachment_id": {"type": "string", "description": "Restringe a un singolo attachment_id."},
         "filter_session_id": {"type": "string", "description": "Restringe a una session_id (rilevante per chat_history)."}
