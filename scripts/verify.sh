@@ -8,9 +8,11 @@
 #      fino al 2026-08-05: stessa copertura, un attraversamento in meno)
 #   3. cargo nextest run workspace (no fail-fast) + cargo test --doc workspace
 #      (i doctest vanno a parte: nextest non li esegue)
+#   4. I gate ratchet (fine-riga, settings, duplicazione, i18n, qualita' Rust)
 #
 # Utilizzato sia dall'hook pre-commit (lefthook) sia dalla CI.
-# Uscita non-zero se qualunque fase fallisce. Stampa il nome della fase fallita.
+# Uscita non-zero se qualunque fase fallisce. Stampa il nome delle fasi fallite,
+# e — quando si e' fermato prima della fine — quelle che NON ha eseguito.
 
 set -euo pipefail
 
@@ -26,11 +28,12 @@ GREEN="\033[0;32m"
 RED="\033[0;31m"
 NC="\033[0m"
 
-# Durata di ogni fase, per il riepilogo finale. Sta QUI e non nei chiamanti
-# perche' run_phase e' il punto unico da cui passa ogni fase (regola L): una
-# misura aggiunta a ogni call site divergerebbe alla prima fase nuova.
-FASI_NOMI=()
-FASI_SECONDI=()
+# Piano delle fasi, esecuzione, riepilogo e fail-fast: punto unico, sorgibile e
+# provato a parte da scripts/gate-fasi-selftest.sh. Sta fuori di qui perche' un
+# gate che dura venti minuti non e' un banco di prova: la meccanica va potuta
+# esercitare con fasi finte, senza compilare niente (regola O).
+# shellcheck source=scripts/gate-fasi.sh
+source "$ROOT_DIR/scripts/gate-fasi.sh"
 
 # La premessa che accompagna i numeri: due run con premesse diverse non sono
 # confrontabili, e senza questa riga non si vede (regola O).
@@ -50,6 +53,15 @@ premessa() {
     echo "   target dir   : ${target} (${stato_cache})"
     echo "   incrementale : CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-<non impostata>}"
     echo "   toolchain    : $(rustc --version 2>/dev/null || echo '<rustc non invocabile>')"
+    # La versione di Node e' una premessa quanto la toolchain Rust: le fasi TS e
+    # i gate ratchet girano su di lei, e la differenza fra locale e CI e' stata
+    # per un mese la sola causa del rosso (vedi gate_pretende_node).
+    echo "   node         : $(node --version 2>/dev/null || echo '<node non invocabile>') (minimo: $(node -p "require('./package.json').engines?.node ?? '<non dichiarato>'" 2>/dev/null || echo '<illeggibile>'))"
+    if [[ "$FAIL_FAST" == "1" ]]; then
+        echo "   alla prima fase rossa: STOP (fail-fast)"
+    else
+        echo "   alla prima fase rossa: prosegue (riporta tutte le fasi rotte)"
+    fi
     # QUALE file ha dato DATABASE_URL, non il suo valore. In un worktree e' il
     # .env del repo COMUNE: senza questa riga "i test sqlx passano" non dice
     # contro quale configurazione, ed e' proprio la differenza fra i due alberi
@@ -64,61 +76,36 @@ premessa() {
     echo
 }
 
-# Riepilogo ordinato per durata decrescente. Stampato anche quando una fase
-# fallisce: le fasi gia' concluse restano una misura valida, e chi debugga un
-# gate lento ha bisogno proprio di quelle.
-riepilogo_fasi() {
-    [[ ${#FASI_NOMI[@]} -eq 0 ]] && return 0
-    local i totale=0
-    for i in "${!FASI_NOMI[@]}"; do
-        totale=$((totale + ${FASI_SECONDI[$i]}))
-    done
-    echo
-    echo -e "${YELLOW}== verify: durata per fase (decrescente) ==${NC}"
-    for i in "${!FASI_NOMI[@]}"; do
-        printf '%s\t%s\n' "${FASI_SECONDI[$i]}" "${FASI_NOMI[$i]}"
-    done | sort -rn | while IFS=$'\t' read -r sec nome; do
-        printf '   %3dm%02ds  %s\n' $((sec / 60)) $((sec % 60)) "$nome"
-    done
-    printf '   %3dm%02ds  TOTALE\n' $((totale / 60)) $((totale % 60))
-}
-
-run_phase() {
-    local name="$1"
-    shift
-    echo -e "${YELLOW}==> verify: ${name}${NC}"
-    local inizio=$SECONDS
-    local esito=0
-    # `|| esito=$?` invece di `if ! ...`: la durata va registrata anche quando la
-    # fase fallisce, e con `set -e` un comando fallito senza guard uscirebbe qui.
-    "$@" || esito=$?
-    FASI_NOMI+=("$name")
-    FASI_SECONDI+=("$((SECONDS - inizio))")
-    if [[ $esito -ne 0 ]]; then
-        echo -e "${RED}!! verify: fase '${name}' FALLITA${NC}" >&2
-        riepilogo_fasi
-        exit 1
-    fi
-}
-
 SKIP_RUST="${VERIFY_SKIP_RUST:-0}"
 SKIP_TS="${VERIFY_SKIP_TS:-0}"
+
+# PREMESSE, TUTTE PRIMA DI QUALUNQUE FASE.
+#
+# Una premessa non soddisfatta non e' un difetto del codice: il gate non e'
+# eseguibile, e lo dichiara col codice dedicato (78) invece di un rosso
+# indistinguibile da un test fallito. Punto unico in gate-premesse.sh.
+#
+# Stanno tutte QUI, in testa, e non sparse fra le fasi: la premessa di nextest
+# viveva in mezzo al gate, quindi in CI una sua assenza si sarebbe scoperta dopo
+# gli otto minuti delle fasi TypeScript. Chiedere prima costa qualche secondo e
+# rende l'esito immediato.
+if [[ "$SKIP_TS" != "1" ]]; then
+    gate_pretende_turbo
+fi
+# Anche a TS saltato: i gate ratchet i18n e honeypot-tsc girano su node.
+gate_pretende_node
+if [[ "$SKIP_RUST" != "1" ]]; then
+    gate_pretende_nextest
+fi
 
 # Prima di qualunque fase: sotto quali condizioni stanno per nascere i numeri.
 # In testa e non solo nel riepilogo, cosi' resta stampata anche se il gate muore
 # a meta'.
 premessa
 
-
 if [[ "$SKIP_TS" != "1" ]]; then
-    # Premessa, non fase: se turbo non e' invocabile in questo albero il gate non
-    # e' eseguibile e lo dichiara col codice dedicato (78), invece di produrre un
-    # rosso indistinguibile da un typecheck fallito. Stesso punto unico del
-    # pre-commit (regola L): la domanda "turbo c'e'?" ha una risposta sola.
-    gate_pretende_turbo
-
-    run_phase "check TypeScript toolchain" node scripts/check-no-honeypot-tsc.mjs
-    run_phase "turbo typecheck+lint+test" pnpm exec turbo run typecheck lint test --continue
+    aggiungi_fase "check TypeScript toolchain" node scripts/check-no-honeypot-tsc.mjs
+    aggiungi_fase "turbo typecheck+lint+test" pnpm exec turbo run typecheck lint test --continue
 else
     echo "-- verify: TS saltato (VERIFY_SKIP_TS=1)"
 fi
@@ -137,30 +124,21 @@ if [[ "$SKIP_RUST" != "1" ]]; then
     #
     # Cio' che si perde: il rosso su un errore di sintassi arriva qualche decina
     # di secondi piu' tardi. Nessuna copertura.
-    run_phase "cargo clippy --workspace --all-targets -- -D warnings" \
+    aggiungi_fase "cargo clippy --workspace --all-targets -- -D warnings" \
         cargo clippy --workspace --all-targets -- -D warnings
     # Esecutore: nextest invece di `cargo test`. Schedula i test in processi
     # separati, quindi non serializza per binario — sui ~4000 test del workspace,
     # e in particolare sui 106 `#[sqlx::test]` che creano un DB a testa (i
-    # "long-pole"), e' dove si guadagna di piu'.
-    #
-    # Obbligatorio, non opzionale: un gate che ripiegasse in silenzio su
-    # `cargo test` misurerebbe una cosa diversa da quella che misura la CI, e la
-    # differenza non si vedrebbe finche' non conta (regola O).
-    if ! cargo nextest --version >/dev/null 2>&1; then
-        echo -e "${RED}!! verify: cargo-nextest non e' installato.${NC}" >&2
-        echo "   Installalo con: cargo install cargo-nextest --locked" >&2
-        echo "   (e' l'esecutore dei test del gate: senza, questo gate non e' eseguibile)" >&2
-        exit 1
-    fi
-    run_phase "cargo nextest run --workspace --no-fail-fast" \
+    # "long-pole"), e' dove si guadagna di piu'. La sua presenza e' una premessa,
+    # pretesa sopra.
+    aggiungi_fase "cargo nextest run --workspace --no-fail-fast" \
         cargo nextest run --workspace --no-fail-fast
 
     # I DOCTEST vanno eseguiti a parte, e questa riga NON e' ridondante: nextest
     # esegue solo binari di test compilati e non esegue i doctest — nel workspace
     # ce ne sono 90. Senza questa fase la copertura calerebbe in silenzio, che e'
     # il modo peggiore di perdere un pezzo di gate.
-    run_phase "cargo test --doc --workspace" cargo test --doc --workspace
+    aggiungi_fase "cargo test --doc --workspace" cargo test --doc --workspace
 else
     echo "-- verify: Rust saltato (VERIFY_SKIP_RUST=1)"
 fi
@@ -169,7 +147,7 @@ fi
 # pre-commit perche' e' una proprieta' dell'ALBERO, non del commit: un checkout
 # fresco puo' introdurla senza che nessuno committi nulla, e chi esegue il gate
 # completo e' spesso il primo a toccare quell'albero.
-run_phase "fine-riga dichiarati (eol=lf)" bash scripts/check-eol.sh
+aggiungi_fase "fine-riga dichiarati (eol=lf)" bash scripts/check-eol.sh
 
 # Premesse dei gate, provate DA UN WORKTREE (regola O). Sta in un gate e non fra
 # le verifiche a mano per la ragione che rende i suoi due difetti particolari:
@@ -177,12 +155,18 @@ run_phase "fine-riga dichiarati (eol=lf)" bash scripts/check-eol.sh
 # osservabili da dove si guarda di solito, e una regressione resterebbe verde
 # finche' qualcuno non crea un albero nuovo. Costo: pochi secondi, un repository
 # usa-e-getta sotto /tmp.
-run_phase "premesse dei gate da un worktree" bash scripts/gate-premesse-selftest.sh
+aggiungi_fase "premesse dei gate da un worktree" bash scripts/gate-premesse-selftest.sh
+
+# La meccanica delle fasi verifica se stessa. Sta nel gate e non fra le prove a
+# mano per la lezione che il repo ha gia' pagato altrove: uno strumento che
+# nessun gate interroga si e' costruito, non e' entrato in esercizio. Costa
+# meno di un secondo e non compila niente.
+aggiungi_fase "meccanica delle fasi (self-test)" bash scripts/gate-fasi-selftest.sh
 
 # Gate ratchet configurazioni: settings morte/fantasma/invisibili possono solo
 # scendere (baseline in scripts/audit-settings-baseline.json). Se il DB live
 # non e' raggiungibile lo script degrada da solo in modalita' --no-db.
-run_phase "audit settings (gate ratchet)" bash scripts/audit-settings.sh --gate
+aggiungi_fase "audit settings (gate ratchet)" bash scripts/audit-settings.sh --gate
 
 # Gate ratchet duplicazione (jscpd, baseline in .dup-baseline.json).
 #
@@ -195,7 +179,7 @@ run_phase "audit settings (gate ratchet)" bash scripts/audit-settings.sh --gate
 # Costa 19s (misurati) su un gate che ne dura oltre 1300: non e' il motivo per
 # cui sta fuori dal pre-commit — li' resta escluso perche' scansiona l'albero
 # intero, e un pre-commit deve guardare cio' che si sta committando.
-run_phase "duplicazione (gate ratchet jscpd)" bash scripts/dup-report.sh
+aggiungi_fase "duplicazione (gate ratchet jscpd)" bash scripts/dup-report.sh
 
 # Gate ratchet testo non tradotto della web-ide (baseline in
 # scripts/i18n-baseline.json). La UI e' bilingue a meta': 391 chiavi passano dal
@@ -203,17 +187,25 @@ run_phase "duplicazione (gate ratchet jscpd)" bash scripts/dup-report.sh
 # frasi adiacenti possono parlare lingue diverse. L'estrazione richiede piu'
 # ondate; questo gate impedisce che il debito CRESCA nel frattempo, e la
 # baseline si riallinea al ribasso dopo ognuna.
-run_phase "testo non tradotto (gate ratchet i18n)" node scripts/i18n-ratchet.mjs
+aggiungi_fase "testo non tradotto (gate ratchet i18n)" node scripts/i18n-ratchet.mjs
 
 # Gate ratchet qualita codice Rust: findings totali, funzioni >50 righe,
 # complessita >20, security possono solo scendere (baseline in
 # scripts/quality-baseline.json). Saltabile con VERIFY_SKIP_RUST=1.
 if [[ "$SKIP_RUST" != "1" ]]; then
-    run_phase "quality scan (gate ratchet)" bash scripts/quality-scan.sh --gate
+    aggiungi_fase "quality scan (gate ratchet)" bash scripts/quality-scan.sh --gate
 else
     echo "-- verify: quality scan saltato (VERIFY_SKIP_RUST=1)"
 fi
 
+esegui_piano
 riepilogo_fasi
+
+if piano_ha_fasi_rosse; then
+    echo
+    echo -e "${RED}KO verify: il gate ha fasi rosse (elenco sopra)${NC}" >&2
+    exit 1
+fi
+
 echo
 echo -e "${GREEN}OK verify: tutte le fasi passate${NC}"

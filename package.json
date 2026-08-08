@@ -2,6 +2,9 @@
   "name": "ai-orchestrator-v2",
   "private": true,
   "packageManager": "pnpm@10.7.0",
+  "engines": {
+    "node": ">=22.18.0"
+  },
   "scripts": {
     "build": "turbo run build",
     "dev": "turbo run dev --parallel",
