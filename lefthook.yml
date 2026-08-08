@@ -57,6 +57,14 @@ pre-commit:
       run: bash scripts/check-eol.sh
       fail_text: "pre-commit: un file dichiarato eol=lf e' materializzato CRLF. Ri-materializzalo (il messaggio sopra ha i comandi)."
 
+    # fail_text: NON afferma una causa, e non e' pigrizia. Questo testo e'
+    # statico per costruzione — lefthook lo stampa senza vedere l'esito del
+    # comando — quindi non puo' sapere se il gate ha bocciato il codice o se non
+    # e' mai partito. Un testo statico che afferma "correggi typecheck/lint"
+    # sbaglia esattamente nel caso in cui l'utente ha piu' bisogno di leggere il
+    # vero (misurato l'08/08/2026: worktree senza node_modules, gate mai
+    # eseguito, sessione mandata a cercare un difetto nel proprio TypeScript).
+    # La causa la compone chi la conosce, cioe' lo script (gate-premesse.sh).
     turbo_quick:
       glob:
         - "*.ts"
@@ -65,7 +73,7 @@ pre-commit:
         - "*.jsx"
         - "*.json"
       run: bash scripts/precommit-turbo.sh
-      fail_text: "pre-commit turbo fallito: correggi typecheck/lint."
+      fail_text: "pre-commit turbo: non superato. La causa e' nel messaggio sopra (questo testo e' statico e non la conosce)."
 
     # Solo sorgenti Rust e manifest cargo: nessun file *.yaml/*.yml e' input di
     # 'cargo check' (verificato: niente include_str! di yaml, build.rs leggono solo
@@ -82,8 +90,13 @@ pre-commit:
       glob:
         - "*.rs"
         - "*.toml"
+      # fail_text neutro per la stessa ragione di turbo_quick: qui il caso
+      # misurato era il .env assente nel worktree, e questo testo diceva
+      # "correggi gli errori/warning clippy" dopo 2,4s, senza che nulla fosse
+      # stato compilato. Lo script distingue ora i due esiti nel codice d'uscita
+      # (78 = non eseguito, 1 = clippy ha bocciato) e ne compone il testo.
       run: bash scripts/precommit-cargo-check.sh
-      fail_text: "pre-commit cargo fallito: correggi gli errori/warning clippy."
+      fail_text: "pre-commit cargo: non superato. La causa e' nel messaggio sopra (questo testo e' statico e non la conosce)."
 
     # Gate ratchet qualita (scripts/quality-baseline.json): ~2-8s a target caldo.
     # Sta qui e non solo in `pnpm verify`/CI perche' e' un gate GLOBALE: chi lo
