@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use tokio::process::Command;
 
+use nexus_types::tool_outcome::NaturaFallimento;
+
 use crate::context_core::ToolContextCore;
 use crate::paths::resolve_relative_path;
 
@@ -311,7 +313,7 @@ pub async fn tool_read_file(
     ctx: &ToolContextCore,
     input: &Value,
 ) -> nexus_types::tool_outcome::RispostaTool {
-    use crate::input_contract::{InputTool, ReadFileInput};
+    use crate::{input_contract::InputTool, tool_inputs::ReadFileInput};
     use nexus_types::tool_outcome::RispostaTool;
 
     let params = match ReadFileInput::leggi(input) {
@@ -635,8 +637,8 @@ async fn prepare_write_and_track(
 fn read_write_params(
     ctx: &ToolContextCore,
     input: &Value,
-) -> Result<crate::input_contract::WriteFileInput, nexus_types::tool_outcome::RispostaTool> {
-    use crate::input_contract::{InputTool, WriteFileInput};
+) -> Result<crate::tool_inputs::WriteFileInput, nexus_types::tool_outcome::RispostaTool> {
+    use crate::{input_contract::InputTool, tool_inputs::WriteFileInput};
     use nexus_types::tool_outcome::RispostaTool;
 
     if !ctx.can_write {
@@ -1262,26 +1264,37 @@ fn append_file_matches(
     per_file
 }
 
-pub async fn tool_delete_file(ctx: &ToolContextCore, input: &Value) -> String {
+/// Elimina un file o una directory. MIGRATO al contratto e a `RispostaTool`.
+pub async fn tool_delete_file(
+    ctx: &ToolContextCore,
+    input: &Value,
+) -> nexus_types::tool_outcome::RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::DeleteFileInput};
+    use nexus_types::tool_outcome::RispostaTool;
+
     if !ctx.can_write {
-        return "\u{274C} [Errore: permesso di scrittura non concesso su questo progetto]".to_string();
+        // Del sistema, come in `write_file`: e' una decisione del progetto e
+        // ritentare non la cambia.
+        return RispostaTool::fallito_di_sistema(
+            "[Errore: permesso di scrittura non concesso su questo progetto]",
+        );
     }
-    let path_str = match input.get("path").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return "\u{274C} [Errore: parametro 'path' mancante]".to_string(),
+    let params = match DeleteFileInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
-    let recursive = input
-        .get("recursive")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let path_str = params.path.as_str();
+    let recursive = params.recursive.unwrap_or(false);
 
     let target = match resolve_relative_path(&ctx.root_path, path_str) {
         Ok(p) => p,
+        // Un percorso fuori dalla root o inesistente: l'agente ne scrive un
+        // altro, ed e' l'unica cosa che serve.
         Err(e) => {
-            return format!(
-                "\u{274C} [Errore percorso: {}]",
+            return RispostaTool::fallito_rimediabile(format!(
+                "[Errore percorso: {}]",
                 e.1["error"].as_str().unwrap_or("path error")
-            )
+            ))
         }
     };
 
@@ -1298,55 +1311,77 @@ pub async fn tool_delete_file(ctx: &ToolContextCore, input: &Value) -> String {
                     op: "deleted".to_string(),
                 },
             );
-            format!("File '{}' eliminato con successo", path_str)
+            RispostaTool::riuscito(format!("File '{}' eliminato con successo", path_str))
         }
-        Err(e) => format!("\u{274C} [Errore eliminazione '{}': {}]", path_str, e),
+        Err(e) => RispostaTool::fallito(format!("[Errore eliminazione '{}': {}]", path_str, e))
+        .con_natura(NaturaFallimento::da_errore_io(&e)),
     }
 }
 
 /// Elimina una directory, ricorsivamente se `recursive`. Estratto da
 /// `tool_delete_file`: il ramo non-ricorsivo suggerisce `recursive:true` se la
 /// directory non e' vuota.
-async fn delete_directory(target: &Path, path_str: &str, recursive: bool) -> String {
+async fn delete_directory(
+    target: &Path,
+    path_str: &str,
+    recursive: bool,
+) -> nexus_types::tool_outcome::RispostaTool {
+    use nexus_types::tool_outcome::RispostaTool;
+
     if recursive {
         match tokio::fs::remove_dir_all(target).await {
-            Ok(()) => format!(
+            Ok(()) => RispostaTool::riuscito(format!(
                 "Directory '{}' eliminata ricorsivamente con successo",
                 path_str
-            ),
-            Err(e) => format!("\u{274C} [Errore eliminazione directory '{}': {}]", path_str, e),
+            )),
+            Err(e) => RispostaTool::fallito(format!("[Errore eliminazione directory '{}': {}]", path_str, e))
+            .con_natura(NaturaFallimento::da_errore_io(&e)),
         }
     } else {
         match tokio::fs::remove_dir(target).await {
-            Ok(()) => format!("Directory '{}' eliminata con successo", path_str),
-            Err(e) => format!(
-                "\u{274C} [Errore eliminazione directory '{}': {} (se non e' vuota usa recursive:true)]",
-                path_str, e
-            ),
+            Ok(()) => {
+                RispostaTool::riuscito(format!("Directory '{}' eliminata con successo", path_str))
+            }
+            // La direttiva sta gia' nel testo, ed e' l'unico caso in cui la
+            // natura la sappiamo meglio del kind: `DirectoryNotEmpty` e'
+            // rimediabile perche' esiste il flag, e il messaggio lo nomina.
+            Err(e) => RispostaTool::fallito(
+                format!(
+                    "[Errore eliminazione directory '{}': {} (se non e' vuota usa recursive:true)]",
+                    path_str, e
+                ),
+            )
+            .con_natura(NaturaFallimento::da_errore_io(&e)),
         }
     }
 }
 
-pub async fn tool_rename_file(ctx: &ToolContextCore, input: &Value) -> String {
+/// Rinomina o sposta un file. MIGRATO al contratto e a `RispostaTool`.
+pub async fn tool_rename_file(
+    ctx: &ToolContextCore,
+    input: &Value,
+) -> nexus_types::tool_outcome::RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::RenameFileInput};
+    use nexus_types::tool_outcome::RispostaTool;
+
     if !ctx.can_write {
-        return "\u{274C} [Errore: permesso di scrittura non concesso su questo progetto]".to_string();
+        return RispostaTool::fallito_di_sistema(
+            "[Errore: permesso di scrittura non concesso su questo progetto]",
+        );
     }
-    let from_str = match input.get("from").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return "\u{274C} [Errore: parametro 'from' mancante]".to_string(),
+    let params = match RenameFileInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
-    let to_str = match input.get("to").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return "\u{274C} [Errore: parametro 'to' mancante]".to_string(),
-    };
+    let (from_str, to_str) = (params.from.as_str(), params.to.as_str());
 
     let from = match resolve_relative_path(&ctx.root_path, from_str) {
         Ok(p) => p,
         Err(e) => {
-            return format!(
-                "\u{274C} [Errore percorso sorgente: {}]",
+            return RispostaTool::fallito_rimediabile(format!(
+                "[Errore percorso sorgente: {}]",
                 e.1["error"].as_str().unwrap_or("path error")
-            )
+            ))
         }
     };
 
@@ -1355,18 +1390,24 @@ pub async fn tool_rename_file(ctx: &ToolContextCore, input: &Value) -> String {
     // de-duplica la root come per la sorgente e blocca traversal/uscita dalla root.
     let to = match resolve_write_target(&ctx.root_path, to_str) {
         Ok(p) => p,
-        Err(e) => return format!("\u{274C} [Errore percorso destinazione: {e}]"),
+        Err(e) => {
+            return RispostaTool::fallito_rimediabile(format!(
+                "[Errore percorso destinazione: {e}]"
+            ))
+        }
     };
 
     if let Some(parent) = to.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return format!("\u{274C} [Errore creazione directory destinazione: {}]", e);
+            return RispostaTool::fallito(format!("[Errore creazione directory destinazione: {}]", e))
+            .con_natura(NaturaFallimento::da_errore_io(&e));
         }
     }
 
     match tokio::fs::rename(&from, &to).await {
-        Ok(()) => format!("Rinominato '{}' → '{}'", from_str, to_str),
-        Err(e) => format!("\u{274C} [Errore rinomina '{}' → '{}': {}]", from_str, to_str, e),
+        Ok(()) => RispostaTool::riuscito(format!("Rinominato '{}' → '{}'", from_str, to_str)),
+        Err(e) => RispostaTool::fallito(format!("[Errore rinomina '{}' → '{}': {}]", from_str, to_str, e))
+        .con_natura(NaturaFallimento::da_errore_io(&e)),
     }
 }
 
@@ -1760,8 +1801,8 @@ fn build_old_string_not_found_message(
 fn read_edit_params(
     ctx: &ToolContextCore,
     input: &Value,
-) -> Result<crate::input_contract::EditFileInput, nexus_types::tool_outcome::RispostaTool> {
-    use crate::input_contract::{EditFileInput, InputTool};
+) -> Result<crate::tool_inputs::EditFileInput, nexus_types::tool_outcome::RispostaTool> {
+    use crate::{input_contract::InputTool, tool_inputs::EditFileInput};
     use nexus_types::tool_outcome::RispostaTool;
 
     if !ctx.can_write {
@@ -2023,29 +2064,44 @@ fn spawn_edit_reindex(ctx: &ToolContextCore, target: &Path, path_str: &str) {
 }
 
 /// Crea una directory con semantica `-p` (idempotente, crea genitori).
-pub async fn tool_fs_mkdir(ctx: &ToolContextCore, input: &Value) -> String {
+/// Crea una directory. MIGRATO al contratto e a `RispostaTool`.
+pub async fn tool_fs_mkdir(
+    ctx: &ToolContextCore,
+    input: &Value,
+) -> nexus_types::tool_outcome::RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::FsMkdirInput};
+    use nexus_types::tool_outcome::RispostaTool;
+
     if !ctx.can_write {
-        return "\u{274C} [Errore: permesso di scrittura non concesso su questo progetto]".to_string();
+        return RispostaTool::fallito_di_sistema(
+            "[Errore: permesso di scrittura non concesso su questo progetto]",
+        );
     }
-    let path_str = match input.get("path").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return "\u{274C} [Errore: parametro 'path' mancante]".to_string(),
-    };
-    let target = match resolve_relative_path(&ctx.root_path, path_str) {
+    let params = match FsMkdirInput::leggi(input) {
         Ok(p) => p,
-        Err(e) => {
-            return format!(
-                "\u{274C} [Errore percorso: {}]",
-                e.1["error"].as_str().unwrap_or("path error")
-            )
-        }
+        Err(risposta) => return risposta,
+    };
+    let path_str = params.path.as_str();
+    // `resolve_write_target` e non `resolve_relative_path`: il secondo
+    // CANONICALIZZA, e canonicalizzare un percorso che non esiste ancora
+    // fallisce con "Percorso non trovato" — cioe' esattamente il caso per cui
+    // questo tool esiste. Con quel resolver `create_dir_all` era irraggiungibile
+    // per qualunque directory nuova, e il tool riusciva SOLO su una directory
+    // gia' presente, dove non aveva niente da fare. Stessa distinzione che
+    // `rename_file` fa da sempre per la propria destinazione; il punto unico
+    // de-duplica la root e blocca l'uscita dalla root in entrambi i casi.
+    let target = match resolve_write_target(&ctx.root_path, path_str) {
+        Ok(p) => p,
+        Err(e) => return RispostaTool::fallito_rimediabile(format!("[Errore percorso: {e}]")),
     };
     if target.is_dir() {
-        return format!("Directory '{}' esiste gia'", path_str);
+        // Non e' un fallimento: cio' che l'agente voleva c'e' gia'.
+        return RispostaTool::riuscito(format!("Directory '{}' esiste gia'", path_str));
     }
     match tokio::fs::create_dir_all(&target).await {
-        Ok(()) => format!("Directory '{}' creata con successo", path_str),
-        Err(e) => format!("\u{274C} [Errore creazione directory '{}': {}]", path_str, e),
+        Ok(()) => RispostaTool::riuscito(format!("Directory '{}' creata con successo", path_str)),
+        Err(e) => RispostaTool::fallito(format!("[Errore creazione directory '{}': {}]", path_str, e))
+        .con_natura(NaturaFallimento::da_errore_io(&e)),
     }
 }
 
@@ -2156,12 +2212,15 @@ fn resolve_from_to(
             e.1["error"].as_str().unwrap_or("path error")
         )
     })?;
-    let to = resolve_relative_path(root, to_str).map_err(|e| {
-        format!(
-            "\u{274C} [Errore percorso destinazione: {}]",
-            e.1["error"].as_str().unwrap_or("path error")
-        )
-    })?;
+    // La DESTINAZIONE non esiste ancora: e' il caso normale di una copia o di
+    // uno spostamento. `resolve_relative_path` canonicalizza, quindi rifiutava
+    // con "Percorso non trovato" ogni destinazione nuova — e i due tool
+    // riuscivano SOLO verso un percorso gia' esistente, cioe' solo con
+    // `overwrite:true`. Che il ramo fosse irraggiungibile lo diceva gia' il
+    // codice: `tool_fs_copy` controlla `if to.exists() && !overwrite`, un test
+    // che ha senso solo se `to` puo' non esistere.
+    let to = resolve_write_target(root, to_str)
+        .map_err(|e| format!("\u{274C} [Errore percorso destinazione: {e}]"))?;
     Ok((from, to))
 }
 
@@ -2868,6 +2927,76 @@ gamma
             "etichetta occorrenza 2 mancante: {}",
             msg
         );
+    }
+
+    /// I tre tool che mutano il filesystem dichiarano l'esito nei CAMPI, e la
+    /// natura del fallimento la prendono dal `ErrorKind` invece che sceglierla
+    /// caso per caso.
+    ///
+    /// MUTAZIONE: sostituendo `da_errore_io` con un `fallito_rimediabile`
+    /// fisso, il ramo del file inesistente resta verde ma quello del permesso
+    /// negato mentirebbe — ed e' il motivo per cui la natura non si sceglie a
+    /// mano su un errore che il sistema operativo ha gia' classificato.
+    #[tokio::test]
+    async fn i_tool_di_mutazione_dichiarano_esito_e_natura_nei_campi() {
+        use nexus_types::tool_outcome::{EsitoTool, NaturaFallimento};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = ctx_di_prova(dir.path().to_path_buf(), Arc::new(HookRegistranti::default()));
+
+        // Creare una directory NUOVA: e' l'unica cosa che questo tool fa, ed e'
+        // il caso in cui non funzionava. Con `resolve_relative_path` il
+        // percorso veniva canonicalizzato prima di esistere e il tool rispondeva
+        // "[Errore percorso: Percorso non trovato]" — `create_dir_all` era
+        // irraggiungibile, e il solo esito possibile era "esiste gia'".
+        // Rimettendo quel resolver, questa riga rosseggia.
+        let out = super::tool_fs_mkdir(&ctx, &serde_json::json!({"path": "sotto"})).await;
+        assert_eq!(out.esito, EsitoTool::Riuscito, "{}", out.testo);
+        assert!(dir.path().join("sotto").is_dir(), "la directory esiste sul disco");
+        let out = super::tool_fs_mkdir(&ctx, &serde_json::json!({"path": "sotto"})).await;
+        assert_eq!(out.esito, EsitoTool::Riuscito, "esiste gia' non e' un errore");
+
+        // Un parametro mancante lo ferma il CONTRATTO, non un controllo scritto
+        // a mano dentro l'handler: la natura e' rimediabile e il testo nomina
+        // il tool.
+        let out = super::tool_rename_file(&ctx, &serde_json::json!({"from": "a.txt"})).await;
+        assert_eq!(out.esito, EsitoTool::Fallito);
+        assert_eq!(out.natura, Some(NaturaFallimento::Rimediabile));
+        assert!(out.testo.contains("rename_file"), "{}", out.testo);
+
+        // Eliminare cio' che non c'e': l'errore e' `NotFound`, quindi
+        // rimediabile — l'agente puo' verificare il percorso.
+        let out =
+            super::tool_delete_file(&ctx, &serde_json::json!({"path": "mai_esistito.txt"})).await;
+        assert_eq!(out.esito, EsitoTool::Fallito, "{}", out.testo);
+        assert_eq!(out.natura, Some(NaturaFallimento::Rimediabile));
+
+        // Copiare verso una destinazione NUOVA: stesso difetto di mkdir, in un
+        // altro punto. `resolve_from_to` canonicalizzava anche la destinazione,
+        // quindi copia e spostamento riuscivano solo verso un percorso gia'
+        // esistente — con `overwrite:true`, l'unico caso che il controllo
+        // `to.exists() && !overwrite` lascia passare. Rimettendo li'
+        // `resolve_relative_path`, questa riga rosseggia.
+        std::fs::write(dir.path().join("sorgente.txt"), "dati").expect("sorgente");
+        let out = super::tool_fs_copy(
+            &ctx,
+            &serde_json::json!({"from": "sorgente.txt", "to": "copia.txt"}),
+        )
+        .await;
+        assert!(
+            !nexus_types::tool_outcome::is_tool_failure(&out),
+            "copia verso una destinazione nuova: {out}"
+        );
+        assert!(dir.path().join("copia.txt").is_file(), "la copia esiste");
+
+        // Senza permesso di scrittura la causa e' del SISTEMA: e' una decisione
+        // del progetto, e ripetere non la cambia.
+        let mut senza_permesso =
+            ctx_di_prova(dir.path().to_path_buf(), Arc::new(HookRegistranti::default()));
+        senza_permesso.can_write = false;
+        let out =
+            super::tool_delete_file(&senza_permesso, &serde_json::json!({"path": "x"})).await;
+        assert_eq!(out.natura, Some(NaturaFallimento::DelSistema), "{}", out.testo);
     }
 }
 

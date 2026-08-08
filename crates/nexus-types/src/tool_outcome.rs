@@ -145,6 +145,46 @@ impl NaturaFallimento {
             Self::DelSistema => "system",
         }
     }
+
+    /// Di chi e' il problema, dato un errore del FILESYSTEM.
+    ///
+    /// PUNTO UNICO (regola L) perche' la domanda e' la stessa per ogni tool che
+    /// tocca i file — creare, copiare, spostare, eliminare — e senza un posto
+    /// solo ognuno l'avrebbe risolta a modo suo, o non l'avrebbe risolta
+    /// affatto degradando ogni errore di I/O a «rimediabile».
+    ///
+    /// Legge [`std::io::ErrorKind`], che e' un segnale STRUTTURATO (regola M):
+    /// il messaggio del sistema operativo e' localizzato e cambia fra Windows e
+    /// Linux, quindi classificarci sopra sarebbe fragile per costruzione.
+    ///
+    /// Il default e' [`Self::DelSistema`] e non `Rimediabile`: dire
+    /// «rimediabile» obbliga il testo a spiegare COME (lo dice il doc della
+    /// variante), e per un errore che non sappiamo leggere non lo sappiamo.
+    /// Fra le due letture sbagliate possibili, questa manda l'agente a cercare
+    /// un'altra strada invece che a ripetere una chiamata che rifallira'.
+    pub fn da_errore_io(e: &std::io::Error) -> Self {
+        use std::io::ErrorKind as K;
+        match e.kind() {
+            // Dipendono da cio' che l'agente ha CHIESTO: un altro percorso, un
+            // flag diverso, un controllo prima. Il testo che accompagna deve
+            // dire quale.
+            K::NotFound
+            | K::AlreadyExists
+            | K::InvalidInput
+            | K::InvalidData
+            | K::IsADirectory
+            | K::NotADirectory
+            | K::DirectoryNotEmpty => Self::Rimediabile,
+            // Decisioni dell'ambiente: ripetere non le cambia.
+            K::PermissionDenied | K::ReadOnlyFilesystem | K::StorageFull => Self::DelSistema,
+            // Condizioni di momento: ritentare la STESSA cosa e' la strategia
+            // giusta, e una ripetizione qui non e' uno stallo.
+            K::Interrupted | K::WouldBlock | K::TimedOut | K::ResourceBusy | K::Deadlock => {
+                Self::Transitorio
+            }
+            _ => Self::DelSistema,
+        }
+    }
 }
 
 /// Cio' che un tool agente restituisce: l'esito in un campo, il testo per
@@ -488,5 +528,45 @@ boom".to_string());
 
         let r = RispostaTool::da_testo_legacy("contenuto del file letto".to_string());
         assert_eq!(r.exit_code, None, "un tool non-comando non ha exit code");
+    }
+
+    /// La natura di un errore di I/O viene dal suo `ErrorKind`, non dal testo
+    /// che il sistema operativo compone (regola M).
+    ///
+    /// MUTAZIONE: portando `PermissionDenied` fra i rimediabili, l'agente
+    /// riceve «puoi correggere da solo» per una decisione che non dipende da
+    /// lui, e questo test rosseggia sulla riga del permesso.
+    #[test]
+    fn la_natura_di_un_errore_io_viene_dal_kind() {
+        use std::io::{Error, ErrorKind};
+        let caso = |k: ErrorKind| NaturaFallimento::da_errore_io(&Error::new(k, "qualunque testo"));
+
+        assert_eq!(caso(ErrorKind::NotFound), NaturaFallimento::Rimediabile);
+        assert_eq!(
+            caso(ErrorKind::DirectoryNotEmpty),
+            NaturaFallimento::Rimediabile,
+            "la direttiva e' 'usa recursive:true', che l'agente puo' fare"
+        );
+        assert_eq!(
+            caso(ErrorKind::PermissionDenied),
+            NaturaFallimento::DelSistema
+        );
+        assert_eq!(caso(ErrorKind::TimedOut), NaturaFallimento::Transitorio);
+
+        // Un kind che non sappiamo leggere NON diventa «rimediabile»: dirlo
+        // obbligherebbe il testo a spiegare come rimediare, e non lo sappiamo.
+        assert_eq!(
+            caso(ErrorKind::Other),
+            NaturaFallimento::DelSistema,
+            "l'ignoto manda a cercare un'altra strada, non a ripetere"
+        );
+
+        // Il TESTO non conta: due errori con lo stesso kind e messaggi opposti
+        // hanno la stessa natura.
+        assert_eq!(
+            NaturaFallimento::da_errore_io(&Error::new(ErrorKind::NotFound, "permission denied")),
+            NaturaFallimento::Rimediabile,
+            "il messaggio mente, il kind no"
+        );
     }
 }

@@ -253,6 +253,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         },
         "plan_acceptance_criteria": {
           "type": "array",
+          "items": {},
           "description": "Acceptance criteria globali del plan (opzionale, action=create)."
         }
       },

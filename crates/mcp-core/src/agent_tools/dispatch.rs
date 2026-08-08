@@ -70,6 +70,14 @@ async fn esegui_tool_migrato(
         // messaggio dice come.
         "read_file" => Some(files::tool_read_file(ctx, input).await),
         "write_file" => Some(files::tool_write_file(ctx, input).await),
+        // I tre tool che MUTANO il filesystem senza scrivere contenuto. La
+        // natura del loro fallimento non e' una scelta caso per caso: viene da
+        // `NaturaFallimento::da_errore_io`, che la legge dal `ErrorKind`
+        // (regola M) invece che dal messaggio del sistema operativo — che e'
+        // localizzato e diverso fra Windows e Linux.
+        "delete_file" => Some(files::tool_delete_file(ctx, input).await),
+        "rename_file" => Some(files::tool_rename_file(ctx, input).await),
+        "fs_mkdir" => Some(files::tool_fs_mkdir(ctx, input).await),
         _ => None,
     }
 }
@@ -115,14 +123,11 @@ async fn esegui_tool_legacy(
         "stop_service" => service::tool_stop_service(ctx, input).await,
         "service_restart" => service::tool_service_restart(ctx, input).await,
         "tail_service_logs" => service::tool_tail_service_logs(ctx, input).await,
-        "fs_mkdir" => files::tool_fs_mkdir(ctx, input).await,
         "fs_copy" => files::tool_fs_copy(ctx, input).await,
         "fs_move" => files::tool_fs_move(ctx, input).await,
         "run_specific_test" => testing::tool_run_specific_test(ctx, input).await,
         "run_lint_fix" => testing::tool_run_lint_fix(ctx, input).await,
         "format_file" => testing::tool_format_file(ctx, input).await,
-        "delete_file" => files::tool_delete_file(ctx, input).await,
-        "rename_file" => files::tool_rename_file(ctx, input).await,
         // Catena di verifica post-modifica (ADR 0019 L3): typecheck -> build ->
         // lint -> test con fail-fast e VerifyReport strutturato.
         "nexus_verify_change" => verify::tool_nexus_verify_change(ctx, input).await,

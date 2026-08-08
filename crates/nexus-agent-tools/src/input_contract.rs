@@ -72,9 +72,9 @@ impl TipoJson for f64 {
     }
 }
 
-impl TipoJson for Vec<String> {
+impl<T: TipoJson> TipoJson for Vec<T> {
     fn schema_tipo() -> Value {
-        json!({"type": "array", "items": {"type": "string"}})
+        json!({"type": "array", "items": T::schema_tipo()})
     }
 }
 
@@ -84,6 +84,16 @@ impl TipoJson for Value {
         // descrive. E' l'unica via d'uscita dal contratto, e va motivata dove
         // la si usa.
         json!({})
+    }
+}
+
+impl TipoJson for Map<String, Value> {
+    fn schema_tipo() -> Value {
+        // Un oggetto di cui il catalogo dichiara la FORMA (e' un oggetto) ma non
+        // il contenuto: il payload di un evento, gli argomenti da inoltrare a un
+        // tool MCP esterno. Distinto da [`Value`], che non promette nemmeno
+        // questo — e la differenza la legge il modello, non noi.
+        json!({"type": "object"})
     }
 }
 
@@ -120,23 +130,37 @@ pub fn errore_di_lettura(tool: &str, e: serde_json::Error) -> RispostaTool {
 
 /// Compone lo schema `object` dai campi dichiarati. Usata dalla macro; esposta
 /// perche' i test possano costruirne uno senza passare da un tool vero.
+///
+/// Un `required` VUOTO non viene scritto. In JSON Schema le due forme dicono la
+/// stessa cosa, ma il catalogo sceglie l'assenza (20 tool su 24 senza campi
+/// obbligatori la omettono, e la omettono ANCHE gli oggetti annidati come il
+/// `viewport` di `nexus_visual_compare`) — e per un oggetto annidato il
+/// confronto col catalogo e' profondo, quindi una chiave in piu' li' e' una
+/// divergenza vera, non una sfumatura di stile.
 pub fn schema_oggetto(campi: Vec<(&str, Value, bool)>) -> Value {
     let mut properties = Map::new();
     let mut required = Vec::new();
-    for (nome, mut spec, obbligatorio) in campi {
+    for (nome, spec, obbligatorio) in campi {
+        // `stringify!` di un identificatore grezzo conserva il prefisso: il
+        // campo `type` di `nexus_todo_write` si scrive `r#type` in Rust perche'
+        // e' parola riservata, e senza questa riga lo schema avrebbe promesso al
+        // modello una property chiamata `r#type`. Serde il prefisso lo toglie
+        // gia' per conto suo, quindi il parsing era corretto e solo lo schema
+        // avrebbe mentito — la meta' del contratto che nessun compilatore
+        // controlla.
+        let nome = nome.strip_prefix("r#").unwrap_or(nome);
         if obbligatorio {
             required.push(Value::String(nome.to_string()));
         }
-        if let Some(o) = spec.as_object_mut() {
-            o.remove("__nulla__");
-        }
         properties.insert(nome.to_string(), spec);
     }
-    json!({
-        "type": "object",
-        "properties": Value::Object(properties),
-        "required": Value::Array(required),
-    })
+    let mut schema = Map::new();
+    schema.insert("type".to_string(), Value::String("object".to_string()));
+    schema.insert("properties".to_string(), Value::Object(properties));
+    if !required.is_empty() {
+        schema.insert("required".to_string(), Value::Array(required));
+    }
+    Value::Object(schema)
 }
 
 /// Dichiara l'input di un tool UNA volta: ne escono la struct e lo schema.
@@ -162,6 +186,12 @@ pub fn schema_oggetto(campi: Vec<(&str, Value, bool)>) -> Value {
 /// esattamente le due meta' che divergevano. Un campo negli `opzionali` diventa
 /// `Option<T>` nella struct — il tipo lo dice, non un commento.
 ///
+/// La descrizione puo' stare su piu' letterali adiacenti, concatenati senza
+/// separatore: le descrizioni del catalogo arrivano a 325 caratteri, e su una
+/// riga sola sforavano il gate delle righe lunghe di `quality-scan`. Lo spazio
+/// fra un pezzo e il successivo va scritto DENTRO il pezzo — se manca, il testo
+/// che il modello legge cambia, e il test di equivalenza col catalogo lo dice.
+///
 /// La prima stesura metteva `#[serde(default)]` su TUTTI i campi e derivava
 /// `required` dal tipo: lo schema dichiarava `path` obbligatorio e il parsing
 /// accettava la sua assenza restituendo una stringa vuota. Il difetto che
@@ -176,13 +206,78 @@ macro_rules! tool_input {
             obbligatori {
                 $(
                     $(#[$obb_meta:meta])*
-                    $obb:ident : $obb_tipo:ty, $obb_desc:literal;
+                    $obb:ident : $obb_tipo:ty, $($obb_desc:literal)+;
                 )*
             }
             opzionali {
                 $(
                     $(#[$opz_meta:meta])*
-                    $opz:ident : $opz_tipo:ty, $opz_desc:literal;
+                    $opz:ident : $opz_tipo:ty, $($opz_desc:literal)+;
+                )*
+            }
+        }
+    ) => {
+        $crate::tool_object! {
+            $(#[$meta])*
+            $nome {
+                obbligatori {
+                    $(
+                        $(#[$obb_meta])*
+                        $obb: $obb_tipo, $($obb_desc)+;
+                    )*
+                }
+                opzionali {
+                    $(
+                        $(#[$opz_meta])*
+                        $opz: $opz_tipo, $($opz_desc)+;
+                    )*
+                }
+            }
+        }
+
+        impl $crate::input_contract::InputTool for $nome {
+            fn schema() -> ::serde_json::Value {
+                // Lo schema dell'input E' lo schema dell'oggetto: una seconda
+                // composizione qui potrebbe divergere da quella che il campo
+                // annidato produce, e sarebbe di nuovo due verita' per la stessa
+                // domanda.
+                <Self as $crate::input_contract::TipoJson>::schema_tipo()
+            }
+
+            fn leggi(input: &::serde_json::Value) -> ::std::result::Result<Self, ::nexus_types::tool_outcome::RispostaTool> {
+                ::serde_json::from_value::<Self>(input.clone())
+                    .map_err(|e| $crate::input_contract::errore_di_lettura($tool, e))
+            }
+        }
+    };
+}
+
+/// Dichiara un oggetto ANNIDATO: la stessa forma di [`tool_input!`], senza il
+/// nome di un tool perche' non e' l'input di nessuno.
+///
+/// Serve dove il catalogo descrive la forma di una struttura dentro un campo —
+/// i `files` di `batch_analyze_code`, il `viewport` di `nexus_visual_compare`,
+/// gli `endpoints` di `task_complete`. Il tipo che ne esce implementa
+/// [`TipoJson`], quindi si usa come tipo di campo esattamente come `String`, e
+/// `Vec<T>` lo porta dentro un array senza altro lavoro.
+///
+/// [`tool_input!`] la CHIAMA invece di ripetere il corpo: struct e schema
+/// nascono da una sola scrittura, che e' l'intero punto di questo modulo.
+#[macro_export]
+macro_rules! tool_object {
+    (
+        $(#[$meta:meta])*
+        $nome:ident {
+            obbligatori {
+                $(
+                    $(#[$obb_meta:meta])*
+                    $obb:ident : $obb_tipo:ty, $($obb_desc:literal)+;
+                )*
+            }
+            opzionali {
+                $(
+                    $(#[$opz_meta:meta])*
+                    $opz:ident : $opz_tipo:ty, $($opz_desc:literal)+;
                 )*
             }
         }
@@ -202,14 +297,14 @@ macro_rules! tool_input {
             )*
         }
 
-        impl $crate::input_contract::InputTool for $nome {
-            fn schema() -> ::serde_json::Value {
+        impl $crate::input_contract::TipoJson for $nome {
+            fn schema_tipo() -> ::serde_json::Value {
                 $crate::input_contract::schema_oggetto(vec![
                     $((
                         stringify!($obb),
                         $crate::input_contract::con_descrizione(
                             <$obb_tipo as $crate::input_contract::TipoJson>::schema_tipo(),
-                            $obb_desc,
+                            ::std::concat!($($obb_desc),+),
                         ),
                         true,
                     ),)*
@@ -217,16 +312,97 @@ macro_rules! tool_input {
                         stringify!($opz),
                         $crate::input_contract::con_descrizione(
                             <$opz_tipo as $crate::input_contract::TipoJson>::schema_tipo(),
-                            $opz_desc,
+                            ::std::concat!($($opz_desc),+),
                         ),
                         false,
                     ),)*
                 ])
             }
+        }
+    };
+}
 
-            fn leggi(input: &::serde_json::Value) -> ::std::result::Result<Self, ::nexus_types::tool_outcome::RispostaTool> {
-                ::serde_json::from_value::<Self>(input.clone())
-                    .map_err(|e| $crate::input_contract::errore_di_lettura($tool, e))
+/// Dichiara UNA volta i valori ammessi di un campo: ne escono il tipo Rust che
+/// li rappresenta e l'`enum` che lo schema promette al modello.
+///
+/// ```ignore
+/// tool_enum! {
+///     /// In che forma restituire il contenuto.
+///     Encoding {
+///         Auto => "auto";
+///         Text => "text";
+///         Base64 => "base64";
+///     }
+/// }
+/// ```
+///
+/// # Perche' un tipo e non una `String`
+///
+/// Era la sola famiglia di campi su cui il catalogo prometteva PIU' di quanto
+/// l'handler pretendesse: lo schema dichiarava quattro valori, il parsing
+/// accettava qualunque stringa e il controllo — dove c'era — era un `match` con
+/// un ramo `_` scritto a mano. Le due divergenze REALI misurate il 07/08/2026
+/// (`nexus_verify_change.scope` che prometteva `lint` contro il `lint-frontend`
+/// del profilo, `knowledge_import_graph.format` che offriva `mermaid` e `dot`
+/// che l'handler rifiuta) stanno entrambe qui.
+///
+/// Col tipo, un valore fuori elenco non arriva all'handler: lo ferma la
+/// deserializzazione, e il messaggio che serde compone elenca i valori ammessi —
+/// quindi il fallimento e' rimediabile ED e' accompagnato da cio' che serve per
+/// rimediare, senza che nessuno scriva quell'elenco una seconda volta.
+///
+/// # Perche' i valori restano scritti accanto alle varianti
+///
+/// `rename_all = "snake_case"` avrebbe dedotto la stringa dal nome della
+/// variante, ma i due non coincidono sempre (`RetryOk` non da' `retry_ok` per
+/// tutte le convenzioni, e `1024x1024` non e' un identificatore affatto). La
+/// stringa e' il contratto col modello: si dichiara, non si deriva.
+#[macro_export]
+macro_rules! tool_enum {
+    (
+        $(#[$meta:meta])*
+        $nome:ident {
+            $(
+                $(#[$var_meta:meta])*
+                $variante:ident => $valore:literal;
+            )+
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
+        pub enum $nome {
+            $(
+                $(#[$var_meta])*
+                #[serde(rename = $valore)]
+                $variante,
+            )+
+        }
+
+        impl $nome {
+            /// Il valore canonico sul wire (regola N): quello che il modello
+            /// scrive e quello che finisce in DB o in un payload.
+            ///
+            /// Non e' una `impl Display`: un `to_string()` che qualcuno rilegga
+            /// e' un protocollo travestito (regola Q). Questo e' un accessore, e
+            /// chi lo chiama sta serializzando, non raccontando.
+            pub fn come_stringa(self) -> &'static str {
+                match self {
+                    $(Self::$variante => $valore,)+
+                }
+            }
+
+            /// I valori ammessi, nell'ordine in cui il catalogo li dichiara.
+            pub fn valori() -> &'static [&'static str] {
+                &[$($valore,)+]
+            }
+        }
+
+        impl $crate::input_contract::TipoJson for $nome {
+            fn schema_tipo() -> ::serde_json::Value {
+                ::serde_json::json!({
+                    "type": "string",
+                    "enum": <$nome>::valori(),
+                })
             }
         }
     };
@@ -234,7 +410,17 @@ macro_rules! tool_input {
 
 /// Aggiunge la descrizione al frammento di tipo. Estratta perche' la macro non
 /// debba contenere un blocco mutabile per ogni campo.
+///
+/// Una descrizione VUOTA non diventa `"description": ""`: la chiave resta
+/// assente. Non e' cosmesi — sei campi del catalogo non hanno descrizione
+/// (`attachment_id` dei tool di estrazione), e una chiave vuota li avrebbe fatti
+/// divergere dal catalogo, cioe' avrebbe cambiato il contratto verso il modello
+/// dentro un lavoro che deve lasciarlo identico. Il vuoto qui significa «il
+/// catalogo non la dichiara», e scriverle e' un lavoro a se'.
 pub fn con_descrizione(mut schema: Value, descrizione: &str) -> Value {
+    if descrizione.is_empty() {
+        return schema;
+    }
     if let Some(o) = schema.as_object_mut() {
         o.insert(
             "description".to_string(),
@@ -332,6 +518,220 @@ mod tests {
         );
     }
 
+    crate::tool_enum! {
+        /// Enum di prova: valori snake_case, uno con una cifra.
+        Forma {
+            Auto => "auto";
+            Testo => "text";
+            RetryOk => "retry_ok";
+        }
+    }
+
+    crate::tool_input! {
+        /// Input di prova che usa l'enum: singolo e dentro una lista.
+        #[allow(dead_code)]
+        ConEnum for "con_enum" {
+            obbligatori {
+                forma: Forma, "La forma";
+            }
+            opzionali {
+                forme: Vec<Forma>, "Le forme ammesse";
+                libero: ::serde_json::Map<String, ::serde_json::Value>, "Oggetto senza forma dichiarata";
+                senza_descrizione: String, "";
+            }
+        }
+    }
+
+    /// Un valore fuori elenco non arriva all'handler: lo ferma il parsing, e il
+    /// messaggio porta i valori ammessi senza che nessuno li riscriva.
+    ///
+    /// MUTAZIONE: togliendo `#[serde(rename = $valore)]` dalla macro, il valore
+    /// `"text"` non viene piu' riconosciuto (serde cercherebbe `"Testo"`) e la
+    /// prima meta' del test rosseggia.
+    #[test]
+    fn un_valore_fuori_elenco_non_arriva_all_handler() {
+        let valido = json!({"forma": "retry_ok"});
+        let letto = <ConEnum as InputTool>::leggi(&valido).expect("valore ammesso");
+        assert_eq!(letto.forma, Forma::RetryOk);
+        assert_eq!(letto.forma.come_stringa(), "retry_ok", "il wire e' il valore");
+
+        let fuori = json!({"forma": "urgentissimo"});
+        let errore = <ConEnum as InputTool>::leggi(&fuori).expect_err("valore non ammesso");
+        assert_eq!(
+            errore.natura,
+            Some(nexus_types::tool_outcome::NaturaFallimento::Rimediabile),
+            "scegliere un altro valore e' cosa che l'agente puo' fare"
+        );
+        for ammesso in Forma::valori() {
+            assert!(
+                errore.testo.contains(ammesso),
+                "l'errore elenca i valori ammessi, manca '{ammesso}': {}",
+                errore.testo
+            );
+        }
+    }
+
+    /// Il vincolo sopravvive DENTRO una lista.
+    ///
+    /// E' il difetto misurato sul catalogo reale: `knowledge_get_subgraph.rel_types`
+    /// e `nexus_search_semantic.source_kinds` dichiarano l'enum negli `items`, e
+    /// un `Vec<String>` lo avrebbe perso — cioe' avrebbe tolto al modello un
+    /// vincolo che oggi ha.
+    ///
+    /// MUTAZIONE: riportando `Vec<T>` a un impl fisso su `Vec<String>`, gli
+    /// `items` perdono la chiave `enum` e questo test rosseggia.
+    #[test]
+    fn una_lista_di_enum_conserva_il_vincolo_negli_items() {
+        let s = <ConEnum as InputTool>::schema();
+        let items = &s["properties"]["forme"]["items"];
+        assert_eq!(items["type"], "string");
+        assert_eq!(
+            items["enum"],
+            json!(["auto", "text", "retry_ok"]),
+            "gli items portano l'enum, nell'ordine dichiarato"
+        );
+
+        let letto = <ConEnum as InputTool>::leggi(&json!({"forma": "auto", "forme": ["text"]}))
+            .expect("lista valida");
+        assert_eq!(letto.forme, Some(vec![Forma::Testo]));
+        <ConEnum as InputTool>::leggi(&json!({"forma": "auto", "forme": ["inventato"]}))
+            .expect_err("un valore fuori elenco non passa nemmeno dentro una lista");
+    }
+
+    /// Le due forme dell'ignoto non si confondono: un oggetto di cui il catalogo
+    /// dichiara almeno il TIPO, e un campo su cui non promette nulla.
+    #[test]
+    fn oggetto_libero_e_assenza_di_vincolo_restano_distinti() {
+        let s = <ConEnum as InputTool>::schema();
+        assert_eq!(s["properties"]["libero"]["type"], "object");
+        assert_eq!(
+            <serde_json::Value as TipoJson>::schema_tipo(),
+            json!({}),
+            "Value non promette nemmeno di essere un oggetto"
+        );
+    }
+
+    /// Una descrizione assente nel catalogo resta assente: non diventa una
+    /// chiave vuota che il modello dovrebbe leggere come informazione.
+    ///
+    /// MUTAZIONE: togliendo il ritorno anticipato in `con_descrizione`, compare
+    /// `"description": ""` e questo test rosseggia — con esso i sei tool di
+    /// estrazione allegati, che nel catalogo non la dichiarano.
+    #[test]
+    fn una_descrizione_assente_non_diventa_una_chiave_vuota() {
+        let s = <ConEnum as InputTool>::schema();
+        let campo = s["properties"]["senza_descrizione"]
+            .as_object()
+            .expect("oggetto");
+        assert!(
+            !campo.contains_key("description"),
+            "la chiave non c'e' affatto: {campo:?}"
+        );
+        assert_eq!(
+            s["properties"]["forma"]["description"], "La forma",
+            "quella dichiarata resta"
+        );
+    }
+
+    crate::tool_object! {
+        /// Oggetto di prova annidato, con un campo dal nome riservato in Rust.
+        #[allow(dead_code)]
+        Criterio {
+            obbligatori {
+                r#type: String, "Il tipo del criterio";
+            }
+            opzionali {
+                soglia: i64, "Una soglia";
+            }
+        }
+    }
+
+    crate::tool_input! {
+        /// Input di prova che annida: un oggetto singolo e una lista di oggetti.
+        #[allow(dead_code)]
+        ConAnnidati for "con_annidati" {
+            obbligatori {
+                criterio: Criterio, "Il criterio principale";
+            }
+            opzionali {
+                altri: Vec<Criterio>, "Gli altri criteri";
+            }
+        }
+    }
+
+    /// Un oggetto dichiarato con `tool_object!` e' un tipo come gli altri: sta
+    /// in un campo, sta dentro un `Vec`, e lo schema che ne esce e' lo schema
+    /// oggetto — non una copia scritta a parte che potrebbe divergerne.
+    ///
+    /// MUTAZIONE: se `InputTool::schema` tornasse a comporre lo schema per
+    /// conto proprio invece di delegare a `TipoJson`, le due meta' potrebbero
+    /// dire cose diverse e questo test smetterebbe di provarlo.
+    #[test]
+    fn un_oggetto_annidato_e_un_tipo_come_gli_altri() {
+        let s = <ConAnnidati as InputTool>::schema();
+        let dentro = &s["properties"]["criterio"];
+        assert_eq!(dentro["type"], "object");
+        assert_eq!(dentro["properties"]["soglia"]["type"], "integer");
+        assert_eq!(dentro["required"], json!(["type"]));
+        // Stessa forma, ma la DESCRIZIONE appartiene al campo: su un array si
+        // attacca all'array e non ai suoi elementi. E' cio' che fa il catalogo
+        // (i `todos` di `nexus_todo_write` la portano sull'array), quindi il
+        // confronto e' sulle properties.
+        let items = &s["properties"]["altri"]["items"];
+        assert_eq!(items["properties"], dentro["properties"]);
+        assert_eq!(items["required"], dentro["required"]);
+        assert!(
+            items.get("description").is_none(),
+            "la descrizione resta sull'array: {items}"
+        );
+
+        let letto = <ConAnnidati as InputTool>::leggi(&json!({
+            "criterio": {"type": "http", "soglia": 200},
+            "altri": [{"type": "file_exists"}]
+        }))
+        .expect("annidato valido");
+        assert_eq!(letto.criterio.r#type, "http");
+        assert_eq!(letto.criterio.soglia, Some(200));
+        assert_eq!(letto.altri.as_ref().map(Vec::len), Some(1));
+
+        <ConAnnidati as InputTool>::leggi(&json!({"criterio": {"soglia": 1}}))
+            .expect_err("manca un obbligatorio dell'annidato");
+    }
+
+    /// Un campo che in Rust si scrive `r#type` resta `type` verso il modello.
+    ///
+    /// MUTAZIONE: togliendo lo `strip_prefix("r#")` da `schema_oggetto`, lo
+    /// schema promette una property `r#type` che il modello non scrivera' mai —
+    /// e il parsing continuerebbe a funzionare, perche' serde il prefisso lo
+    /// toglie da solo. Cioe' esattamente il tipo di divergenza silenziosa che
+    /// questo modulo esiste per rendere impossibile.
+    #[test]
+    fn un_nome_riservato_in_rust_resta_il_nome_del_catalogo() {
+        let s = <Criterio as TipoJson>::schema_tipo();
+        let props = s["properties"].as_object().expect("oggetto");
+        assert!(props.contains_key("type"), "la property e' 'type': {props:?}");
+        assert!(!props.contains_key("r#type"), "il prefisso Rust non esce: {props:?}");
+        assert_eq!(s["required"], json!(["type"]));
+    }
+
+    /// Un `required` vuoto non compare affatto: e' la forma che il catalogo
+    /// usa, e per un oggetto ANNIDATO il confronto e' profondo — quindi una
+    /// chiave in piu' li' e' una divergenza vera.
+    ///
+    /// MUTAZIONE: riscrivendo `required` sempre, il `viewport` di
+    /// `nexus_visual_compare` smette di coincidere col catalogo e il test di
+    /// equivalenza rosseggia.
+    #[test]
+    fn un_required_vuoto_non_si_scrive() {
+        let solo_opzionali = schema_oggetto(vec![("a", json!({"type": "string"}), false)]);
+        assert!(
+            solo_opzionali.get("required").is_none(),
+            "nessun obbligatorio, nessuna chiave: {solo_opzionali}"
+        );
+        let con_obbligatorio = schema_oggetto(vec![("a", json!({"type": "string"}), true)]);
+        assert_eq!(con_obbligatorio["required"], json!(["a"]));
+    }
+
     /// Un campo che lo schema NON dichiara viene rifiutato invece di essere
     /// ignorato in silenzio: se il modello lo ha scritto, si aspettava che
     /// facesse qualcosa.
@@ -346,163 +746,3 @@ mod tests {
         );
     }
 }
-
-// Il doc della struct sta DENTRO la macro: il pattern `$(#[$meta:meta])*` lo
-// cattura e lo attacca al tipo generato. Messo qui fuori resterebbe orfano, e
-// clippy lo rifiuta.
-//
-// Lo schema che ne esce deve COINCIDERE con quello scritto a mano in
-// `tool_schema`: finche' le due forme convivono, il test
-// `lo_schema_generato_coincide_con_quello_scritto_a_mano` e' il ponte che
-// impedisce alla migrazione di cambiare in silenzio il contratto verso il
-// modello. Quando il catalogo sara' generato, quel test sparira' insieme alla
-// copia che verifica.
-crate::tool_input! {
-    /// L'input di `edit_file`, primo tool a passare dal contratto.
-    ///
-    /// PERCHE' LUI PER PRIMO: e' quello su cui i difetti di questa famiglia si
-    /// sono misurati (11% di `old_string non trovato`, con l'estratto che
-    /// mostrava la zona sbagliata del file), ed e' gia' migrato a
-    /// `RispostaTool` — quindi il contratto d'ingresso completa un giro che era
-    /// gia' fatto per l'uscita.
-    EditFileInput for "edit_file" {
-        obbligatori {
-            path: String, "Percorso del file relativo alla root";
-            old_string: String, "Stringa esatta da sostituire (deve esistere esattamente una volta nel file)";
-            new_string: String, "Stringa con cui sostituire old_string";
-        }
-        opzionali {}
-    }
-}
-
-crate::tool_input! {
-    /// L'input di `read_file`.
-    ReadFileInput for "read_file" {
-        obbligatori {
-            path: String, "Percorso del file relativo alla root del progetto (es. 'src/main.rs' o 'README.md')";
-        }
-        opzionali {}
-    }
-}
-
-crate::tool_input! {
-    /// L'input di `read_file_lines`.
-    ///
-    /// Gli estremi sono `i64` e non `usize`: il modello puo' scrivere un numero
-    /// negativo, e un tipo che non lo rappresenta trasformerebbe un input
-    /// sbagliato in un errore di deserializzazione oscuro invece che in un
-    /// controllo di dominio con un messaggio utile.
-    ReadFileLinesInput for "read_file_lines" {
-        obbligatori {
-            path: String, "Percorso del file relativo alla root del progetto";
-            start_line: i64, "Riga di inizio (1-based, inclusa). Es: 39 per iniziare dalla riga 39.";
-            end_line: i64, "Riga di fine (1-based, inclusa). Es: 80 per leggere fino alla riga 80. Massimo 400 righe per chiamata.";
-        }
-        opzionali {}
-    }
-}
-
-crate::tool_input! {
-    /// L'input di `write_file`.
-    WriteFileInput for "write_file" {
-        obbligatori {
-            path: String, "Percorso del file relativo alla root del progetto";
-            content: String, "Contenuto completo del file da scrivere";
-        }
-        opzionali {}
-    }
-}
-
-crate::tool_input! {
-    /// L'input di `delete_file`.
-    DeleteFileInput for "delete_file" {
-        obbligatori {
-            path: String, "Percorso relativo alla root del file o directory da eliminare";
-        }
-        opzionali {
-            recursive: bool, "Se true, elimina ricorsivamente (necessario per directory non vuote). Default: false";
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests_equivalenza {
-    use super::*;
-
-    /// Ogni tool MIGRATO al contratto, con lo schema che il contratto genera.
-    /// Cresce di una riga a ogni migrazione, e quella riga e' tutto cio' che
-    /// serve perche' il tool nuovo sia coperto.
-    fn migrati() -> Vec<(&'static str, serde_json::Value)> {
-        vec![
-            ("edit_file", <EditFileInput as InputTool>::schema()),
-            ("read_file", <ReadFileInput as InputTool>::schema()),
-            ("read_file_lines", <ReadFileLinesInput as InputTool>::schema()),
-            ("write_file", <WriteFileInput as InputTool>::schema()),
-            ("delete_file", <DeleteFileInput as InputTool>::schema()),
-        ]
-    }
-
-    /// IL test della migrazione (regola O): per OGNI tool migrato, lo schema
-    /// generato dal contratto e' lo STESSO che il catalogo consegna al modello.
-    /// Non confronta due stringhe scritte a mano — prende il catalogo REALE.
-    ///
-    /// E' il ponte che rende la migrazione dei 64 tool un'operazione
-    /// verificabile invece di una riscrittura di cui fidarsi: un campo
-    /// rinominato, una descrizione cambiata, un obbligatorio diventato
-    /// opzionale fanno rosseggiare questo test prima che il modello se ne
-    /// accorga in esercizio.
-    ///
-    /// MUTAZIONE: cambiando una descrizione o spostando un campo fra
-    /// `obbligatori` e `opzionali`, rosseggia nominando il tool.
-    #[test]
-    fn ogni_schema_generato_coincide_con_il_catalogo() {
-        let catalogo: serde_json::Value =
-            serde_json::from_str(crate::tool_schema::AGENT_TOOLS_JSON).expect("catalogo valido");
-        let elenco = catalogo.as_array().expect("array");
-
-        for (nome, generato) in migrati() {
-            let a_mano = elenco
-                .iter()
-                .find(|t| t["name"] == nome)
-                .map(|t| t["input_schema"].clone())
-                .unwrap_or_else(|| panic!("{nome} non e' nel catalogo"));
-
-            assert_eq!(
-                generato["properties"], a_mano["properties"],
-                "properties divergenti per '{nome}'"
-            );
-
-            let ordina = |v: &serde_json::Value| {
-                let mut r: Vec<String> = v
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|x| x.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                r.sort();
-                r
-            };
-            assert_eq!(
-                ordina(&generato["required"]),
-                ordina(&a_mano["required"]),
-                "obbligatori divergenti per '{nome}'"
-            );
-        }
-    }
-
-    /// La copertura cresce davvero: se qualcuno aggiunge un `tool_input!` senza
-    /// registrarlo in `migrati()`, il conteggio lo dichiara. Non e' un test
-    /// della logica — e' un promemoria che fallisce, che vale piu' di un
-    /// commento.
-    #[test]
-    fn il_conteggio_dei_migrati_e_dichiarato() {
-        assert_eq!(
-            migrati().len(),
-            5,
-            "aggiornare il conteggio quando si migra un tool (e aggiungerlo a migrati())"
-        );
-    }
-}
-
