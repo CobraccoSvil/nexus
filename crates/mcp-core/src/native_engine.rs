@@ -865,6 +865,33 @@ impl NativeRunOutcome {
             k::TIMEOUT_CAUSE: Value::Null,
         })
     }
+
+    /// Le fonti da cui deriva il RIASSUNTO di questo run, per il punto unico
+    /// [`nexus_agent_graph::decisions::riassunto_del_run`] (regola L).
+    ///
+    /// Esiste come metodo, e non come quattro argomenti passati a mano dai due
+    /// finalizzatori, per la regola O: la struttura che il giudizio riceve deve
+    /// nascere DALL'esito reale del run, non da una sua ricomposizione al call
+    /// site. I quattro blocchi hanno lo stesso tipo e tutti un campo `summary`:
+    /// uno scambio fatto a mano non lo vedrebbe ne' il compilatore ne' un test.
+    ///
+    /// Gemella di [`Self::structured_verdict`], che porta gli stessi blocchi
+    /// oltre il confine padre<->figlio: quella li SERIALIZZA per il wire, questa
+    /// li PRESTA al giudizio in-process, senza copie.
+    pub fn fonti_riassunto(&self) -> nexus_agent_graph::decisions::FontiRiassunto<'_> {
+        nexus_agent_graph::decisions::FontiRiassunto {
+            testo_libero: self.final_answer.as_deref(),
+            review: self.review_verdict.as_ref(),
+            advisory: self.advisory_verdict.as_ref(),
+            debate: self.debate_position.as_ref(),
+            declared: self.declared_outcome.as_ref(),
+        }
+    }
+
+    /// Il riassunto di questo run, dal punto unico (regola L).
+    pub fn riassunto(&self) -> nexus_agent_graph::decisions::RiassuntoRun {
+        nexus_agent_graph::decisions::riassunto_del_run(self.fonti_riassunto())
+    }
 }
 
 /// Context window (token) del modello del turno dal catalog (regola G). `0` =
@@ -4810,6 +4837,79 @@ mod tests {
         assert_eq!(out.provider_used.as_deref(), Some("anthropic"));
         assert_eq!(out.model_used.as_deref(), Some("claude-real"));
         assert!(out.resume_at.is_none());
+    }
+
+    // ── Il riassunto di un run che ha chiuso con la sola dichiarazione ───────
+    //
+    // Regola O: i test partono da `map_outcome`, il produttore reale del
+    // `NativeRunOutcome` che i due finalizzatori ricevono. Costruire l'outcome a
+    // mano fisserebbe qui l'assunto da verificare — che i blocchi dichiarati
+    // arrivino davvero dallo stato — e quel legame (`state.advisory_verdict` ->
+    // `out.advisory_verdict`) e' proprio cio' che regge il ripiego.
+
+    /// IL DIFETTO MISURATO: la figura chiama `advisory_verdict` come ultimissima
+    /// azione, senza prosa. `result` resta vuoto e prima il sub-run chiudeva con
+    /// riassunto VUOTO.
+    ///
+    /// MUTAZIONE dichiarata: riportando `finalize_success` a
+    /// `o.final_answer.clone().unwrap_or_default()` questo test fallisce con
+    /// `None` al posto del parere — il valore del difetto in produzione.
+    #[test]
+    fn riassunto_dal_parere_quando_la_figura_chiude_senza_prosa() {
+        let state = AgentState {
+            result: None,
+            stop_reason: Some(StopReason::EndTurn),
+            advisory_verdict: Some(serde_json::json!({
+                "verdict": "proceed_with_changes",
+                "summary": "Tailwind installato ma non configurato.",
+                "requirements": [],
+                "risks": [],
+                "recommendations": [],
+            })),
+            ..Default::default()
+        };
+        let out = map_outcome(StepOutcome::Completed(state));
+        assert_eq!(out.final_answer, None, "la figura non ha prodotto prosa");
+        assert_eq!(
+            out.riassunto().testo(),
+            Some("Tailwind installato ma non configurato."),
+        );
+        assert_eq!(
+            out.riassunto().derivato_da(),
+            Some(nexus_agent_graph::decisions::Finalizzatore::Advisory),
+        );
+    }
+
+    /// Il testo libero, quando c'e', resta la risposta: il ripiego riempie il
+    /// vuoto e non riscrive cio' che gia' funzionava (118 sub-run su 148).
+    #[test]
+    fn riassunto_preferisce_il_testo_libero_alla_dichiarazione() {
+        let state = AgentState {
+            result: Some("resoconto scritto dal modello".to_string()),
+            stop_reason: Some(StopReason::EndTurn),
+            declared_outcome: Some(serde_json::json!({
+                "outcome": "done",
+                "summary": "riassunto dichiarato",
+            })),
+            ..Default::default()
+        };
+        let out = map_outcome(StepOutcome::Completed(state));
+        assert_eq!(out.riassunto().testo(), Some("resoconto scritto dal modello"));
+        assert_eq!(out.riassunto().derivato_da(), None);
+    }
+
+    /// Senza prosa e senza dichiarazione (timeout, errore del motore) il
+    /// riassunto e' ASSENTE: i tre run storici in questo stato non avevano nulla
+    /// da recuperare, e il ripiego non deve inventarglielo.
+    #[test]
+    fn riassunto_assente_senza_prosa_ne_dichiarazione() {
+        let state = AgentState {
+            result: None,
+            stop_reason: Some(StopReason::EndTurn),
+            ..Default::default()
+        };
+        let out = map_outcome(StepOutcome::Completed(state));
+        assert_eq!(out.riassunto().testo(), None);
     }
 
     // ── L'esito non si deduce da un contatore (regola M) ─────────────────────

@@ -2260,6 +2260,54 @@ for rifiuto in $(grep -rln '"invalid_scope"' --include='*.rs' crates/ 2>/dev/nul
   fi
 done
 
+# ── riassunto di un run: una domanda, un punto unico ─────────────────────────
+# Due presidi.
+#
+# 1. Nessuno si prende il `summary` di un finalizzatore per conto proprio per
+#    farne il riassunto di un run. E' il modo in cui il difetto era nato: il run
+#    principale aveva il suo `declared_outcome -> get("summary")` scritto a mano
+#    e copriva UN solo finalizzatore su quattro; la chiusura del sub-run non
+#    aveva nulla. Chi ne aggiungesse un terzo coprirebbe il proprio caso e
+#    lascerebbe scoperti gli altri, di nuovo in silenzio.
+# 2. I DUE finalizzatori delegano davvero. Un `unwrap_or_default()` sul solo
+#    `final_answer` in una chiusura significa che quel percorso torna a scrivere
+#    la stringa vuota quando la figura chiude con la sola dichiarazione — cioe'
+#    il comportamento di prima, su una strada sola: 30 riassunti vuoti su 148
+#    sub-run, tutti con il campo `summary` compilato (MISURATO 08/08/2026).
+#
+# PERIMETRO: `crates/mcp-core/`, cioe' dove il riassunto di un run si COMPONE
+# alla chiusura. I nodi di `nexus-agent-graph/src/nodes/` restano fuori di
+# proposito: li' il summary dichiarato viene letto per SCRIVERE `state.result`
+# (chiusura d'autorita' su done ripetuto, meta-reasoner DeclareBlocked,
+# enforcement del panel), cioe' per alimentare il testo libero che il punto
+# unico poi preferisce. Sono a MONTE della domanda, non una seconda risposta, e
+# un perimetro largo li segnalerebbe come regressioni facendo disinnestare la
+# guard al primo che ci sbatte contro.
+riassunto_hits="$(grep -rn "declared_outcome\|advisory_verdict\|review_verdict\|debate_position" \
+  --include='*.rs' crates/mcp-core/ 2>/dev/null \
+  | grep -E 'get\("summary"\)' \
+  | grep -vE '^[^:]+:[0-9]+:\s*(//|\*)' \
+  || true)"
+for chiusura in crates/mcp-core/src/agent_tools/subagent_native.rs \
+                crates/mcp-core/src/chat_messages/agent_run.rs; do
+  if [[ -f "$chiusura" ]] && ! grep -q 'riassunto()' "$chiusura"; then
+    riassunto_hits="${riassunto_hits}
+$chiusura: finalizzatore che NON delega a NativeRunOutcome::riassunto()"
+  fi
+done
+if [[ -n "${riassunto_hits// /}" ]]; then
+  echo "!! riassunto-del-run: il riassunto di un run e' deciso fuori dal punto unico:" >&2
+  printf '%s\n' "$riassunto_hits" >&2
+  echo "   La domanda 'qual e' il riassunto di questo run?' vive in" >&2
+  echo "   decisions/run_summary.rs (riassunto_del_run); le fonti nascono dal" >&2
+  echo "   produttore NativeRunOutcome::fonti_riassunto, mai ricomposte al call" >&2
+  echo "   site. Il campo 'summary' e' OBBLIGATORIO in tutti e quattro i tool:" >&2
+  echo "   una figura che chiude con la sola dichiarazione ha comunque parlato." >&2
+  fail=1
+else
+  echo "OK riassunto-del-run: la domanda ha un punto unico e i due finalizzatori vi delegano"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

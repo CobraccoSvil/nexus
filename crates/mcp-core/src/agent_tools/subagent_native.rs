@@ -4892,7 +4892,17 @@ async fn finalize_success(
     depth: i64,
     o: &NativeRunOutcome,
 ) -> Value {
-    let summary = o.final_answer.clone().unwrap_or_default();
+    // Il riassunto dal PUNTO UNICO (regola L): il testo libero di chiusura se
+    // c'e', altrimenti il campo `summary` OBBLIGATORIO del finalizzatore che ha
+    // chiuso il run. Prima qui c'era il solo `final_answer`, e una figura che
+    // obbediva alla propria consegna — chiamare `advisory_verdict` come
+    // ULTIMISSIMA azione, senza prosa in piu' — chiudeva con riassunto VUOTO: il
+    // parere esisteva, strutturato e obbligatorio, e nessuno dei suoi lettori lo
+    // mostrava (`final_summary` del sub-run, `final_answer` della gemella,
+    // payload `summary` della narrazione da cui il nastro attivita' compone la
+    // riga di chiusura). MISURATO il 08/08/2026 sui tre progetti vivi: 30
+    // riassunti vuoti su 148 sub-run, TUTTI e 30 con `summary` dichiarato pieno.
+    let summary = o.riassunto().testo().unwrap_or_default().to_string();
     // `status` LIFECYCLE del sub-run (completed = arrivato a End, paused = fermato
     // su interrupt HITL). Backward-compat: todo_runner e il batch lo leggono come
     // {completed|paused}; NON va sostituito col verdetto canonico (regredirebbe i
@@ -7048,6 +7058,76 @@ mod tests {
         assert_eq!(run.2, 7);
         assert_eq!(run.3, 1200, "total = prompt + completion");
         assert!(run.4, "completed_at valorizzato");
+    }
+
+    /// IL DIFETTO MISURATO l'08/08/2026 sui tre DB-progetto vivi: una figura che
+    /// chiude con la sola `advisory_verdict` — cioe' che OBBEDISCE alla propria
+    /// consegna, «chiamalo come ULTIMISSIMA azione» — non produce testo libero, e
+    /// la chiusura scriveva la stringa vuota su ENTRAMBE le righe. 30 sub-run su
+    /// 148 in quello stato, tutti col campo `summary` compilato.
+    ///
+    /// Il test arriva alla CONSEGUENZA (le colonne, non la funzione pura) e passa
+    /// dal finalizzatore REALE `finalize_success`, non da `mark_run`: e' li' che
+    /// il riassunto veniva scelto, e un test su `mark_run` — che riceve il testo
+    /// gia' deciso — non avrebbe mai potuto vedere il difetto (regola O).
+    ///
+    /// MUTAZIONE dichiarata: riportando `finalize_success` a
+    /// `o.final_answer.clone().unwrap_or_default()` i tre assert falliscono con
+    /// la stringa vuota, che e' esattamente il valore misurato in produzione.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn chiusura_figura_senza_prosa_persiste_il_parere_dichiarato(pool: sqlx::PgPool) {
+        const PARERE: &str = "Tailwind installato ma non configurato: manca il CSS di ingresso.";
+        let child = seed_sub_con_gemella(&pool).await;
+        let mut o = outcome_zero();
+        // La figura non ha scritto prosa: ha solo dichiarato il parere.
+        o.final_answer = None;
+        o.advisory_verdict = Some(json!({
+            "verdict": "proceed_with_changes",
+            "summary": PARERE,
+            "requirements": [],
+            "risks": [],
+            "recommendations": [],
+        }));
+
+        let result = finalize_success(&pool, None, child, "software_architect", 1, &o).await;
+
+        // (1) La colonna del sub-run, da cui il pannello legge il riassunto.
+        let sub: Option<String> =
+            sqlx::query_scalar("SELECT final_summary FROM nexus_subagent_runs WHERE id = $1")
+                .bind(child)
+                .fetch_one(&pool)
+                .await
+                .expect("riga sub");
+        assert_eq!(sub.as_deref(), Some(PARERE));
+        // (2) La gemella `agent_runs`, scritta dalla stessa statement.
+        let gemella: Option<String> =
+            sqlx::query_scalar("SELECT final_answer FROM agent_runs WHERE id = $1")
+                .bind(child)
+                .fetch_one(&pool)
+                .await
+                .expect("riga gemella");
+        assert_eq!(gemella.as_deref(), Some(PARERE));
+        // (3) Il tool_result che il coordinatore riceve: il campo prominente
+        //     `summary` era vuoto anche li', e il parere viaggiava nel solo
+        //     blocco `outcome` che non tutti i lettori aprono.
+        assert_eq!(result[K_SUMMARY], json!(PARERE));
+    }
+
+    /// Un sub-run senza prosa E senza dichiarazione (timeout, errore del motore)
+    /// non ha un riassunto da recuperare: la colonna resta vuota, e il ripiego
+    /// non gliene inventa uno. Sono i 3 run storici su 148 in questo stato.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn chiusura_senza_prosa_ne_dichiarazione_non_inventa_un_riassunto(pool: sqlx::PgPool) {
+        let child = seed_sub_con_gemella(&pool).await;
+        let o = outcome_zero();
+        finalize_success(&pool, None, child, "explore", 1, &o).await;
+        let sub: Option<String> =
+            sqlx::query_scalar("SELECT final_summary FROM nexus_subagent_runs WHERE id = $1")
+                .bind(child)
+                .fetch_one(&pool)
+                .await
+                .expect("riga sub");
+        assert_eq!(sub.as_deref(), Some(""), "assenza, non un testo inventato");
     }
 
     /// Il caso MISURATO il 30/07/2026 (bacheca-attivita, run 1845a0ce): chiusura
