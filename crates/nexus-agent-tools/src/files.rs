@@ -3078,10 +3078,20 @@ gamma
         )
         .await;
 
-        assert!(out.contains("school-courses-fe/SchoolCoursesApi"), "{out}");
+        // Il tool e' stato migrato a `RispostaTool` mentre questo test viveva su
+        // un altro branch: l'asserzione guarda ora i CAMPI, che e' il contratto
+        // che il tool ha adottato. Il messaggio per il modello resta `testo`.
+        assert_eq!(out.esito, nexus_types::tool_outcome::EsitoTool::Fallito);
         assert!(
-            out.contains("il tratto esistente piu' profondo e' 'school-courses-fe'"),
-            "il modello deve sapere fin dove il percorso esiste: {out}"
+            out.testo.contains("school-courses-fe/SchoolCoursesApi"),
+            "{}",
+            out.testo
+        );
+        assert!(
+            out.testo
+                .contains("il tratto esistente piu' profondo e' 'school-courses-fe'"),
+            "il modello deve sapere fin dove il percorso esiste: {}",
+            out.testo
         );
     }
 
