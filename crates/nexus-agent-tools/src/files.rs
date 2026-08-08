@@ -3078,10 +3078,14 @@ gamma
         )
         .await;
 
-        assert!(out.contains("school-courses-fe/SchoolCoursesApi"), "{out}");
         assert!(
-            out.contains("il tratto esistente piu' profondo e' 'school-courses-fe'"),
-            "il modello deve sapere fin dove il percorso esiste: {out}"
+            out.testo.contains("school-courses-fe/SchoolCoursesApi"),
+            "{out:?}"
+        );
+        assert!(
+            out.testo
+                .contains("il tratto esistente piu' profondo e' 'school-courses-fe'"),
+            "il modello deve sapere fin dove il percorso esiste: {out:?}"
         );
     }
 
