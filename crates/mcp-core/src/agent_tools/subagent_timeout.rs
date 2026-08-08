@@ -27,7 +27,9 @@
 //! E' l'oggetto della domanda, come in `agent_tools::playwright_cli`), non il
 //! racconto di un esito: leggerlo non e' la regola M al contrario.
 
-use nexus_agent_graph::decisions::{classifica_causa_timeout, CausaTimeout, TentativoOsservato};
+use nexus_agent_graph::decisions::{
+    classifica_causa_timeout, AttesaInCoda, CausaTimeout, TentativoOsservato,
+};
 use nexus_types::tool_outcome::RispostaTool;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
@@ -45,13 +47,43 @@ const MAX_PASSI: i64 = 30;
 /// del proprio nome, ed e' giusto che la firma resti il nome.
 const CAMPI_COMANDO: [&str; 2] = ["command", "cmd"];
 
-/// La causa del timeout di `run_id`, dai passi che ha lasciato.
+/// La causa del timeout di `run_id`, dai passi che ha lasciato e dal tempo che
+/// ha passato in coda.
 ///
 /// Non fallisce verso l'alto: un DB che non risponde produce
 /// [`CausaTimeout::NotObservable`], che e' esattamente cio' che si sa in quel
 /// caso — «non ho potuto guardare», mai «non e' successo niente».
-pub(crate) async fn causa_del_timeout(pool: &PgPool, run_id: Uuid) -> CausaTimeout {
-    classifica_causa_timeout(&tentativi_finali(pool, run_id).await)
+///
+/// `budget_s` e' il timeout della figura: serve a dire se l'attesa in coda e'
+/// stata la maggior parte della sua vita o un dettaglio.
+pub(crate) async fn causa_del_timeout(
+    pool: &PgPool,
+    run_id: Uuid,
+    budget_s: i64,
+) -> CausaTimeout {
+    classifica_causa_timeout(
+        &tentativi_finali(pool, run_id).await,
+        attesa_in_coda(run_id, budget_s),
+    )
+}
+
+/// Quanto ha atteso il run in coda, dal registro del carico.
+///
+/// Registro mai inizializzato (nessuna chiamata governata in questo processo) o
+/// run che non vi compare -> [`AttesaInCoda::NonMisurata`]. Non e' uno zero: un
+/// run che non e' passato di li' non ha «atteso zero», semplicemente non lo
+/// sappiamo, e le due cose portano a conclusioni diverse.
+fn attesa_in_coda(run_id: Uuid, budget_s: i64) -> AttesaInCoda {
+    let Some(registro) = crate::provider_inflight::registro() else {
+        return AttesaInCoda::NonMisurata;
+    };
+    match registro.attesa_del_run(run_id) {
+        Some(attesa) => AttesaInCoda::Misurata {
+            attesa_s: attesa.as_secs(),
+            budget_s: u64::try_from(budget_s).unwrap_or(0),
+        },
+        None => AttesaInCoda::NonMisurata,
+    }
 }
 
 /// Gli ultimi passi del run, in ordine CRONOLOGICO (il criterio guarda la coda).
@@ -216,7 +248,7 @@ mod tests {
             )
             .await
             .expect("step persistito");
-        let causa = causa_del_timeout(&pool, run_id).await;
+        let causa = causa_del_timeout(&pool, run_id, 180).await;
         assert_eq!(
             causa.key(),
             "last_attempt_failed",
@@ -264,7 +296,7 @@ mod tests {
         )
         .await;
 
-        let causa = causa_del_timeout(&pool, run_id).await;
+        let causa = causa_del_timeout(&pool, run_id, 180).await;
         assert_eq!(causa.key(), "last_attempt_failed");
         let nota = causa.nota();
         assert!(nota.contains("run_command(sudo)"), "{nota}");
@@ -292,7 +324,7 @@ mod tests {
             )
             .await;
         }
-        let causa = causa_del_timeout(&pool, run_id).await;
+        let causa = causa_del_timeout(&pool, run_id, 180).await;
         match &causa {
             CausaTimeout::RepeatedFailures {
                 tentativi, firma, ..
@@ -326,7 +358,7 @@ mod tests {
             .await;
         }
         assert_eq!(
-            causa_del_timeout(&pool, run_id).await.key(),
+            causa_del_timeout(&pool, run_id, 180).await.key(),
             "last_attempt_failed"
         );
     }
@@ -337,7 +369,7 @@ mod tests {
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn senza_passi_la_causa_non_e_osservabile(pool: PgPool) {
         let run_id = crate::test_support::seed_agent_run(&pool).await;
-        assert_eq!(causa_del_timeout(&pool, run_id).await.key(), "not_observable");
+        assert_eq!(causa_del_timeout(&pool, run_id, 180).await.key(), "not_observable");
     }
 
     /// Il tempo finito su lavoro che procedeva: e' la sola diagnosi che rende
@@ -356,7 +388,7 @@ mod tests {
             "EXIT CODE: 0\n12 passing",
         )
         .await;
-        let causa = causa_del_timeout(&pool, run_id).await;
+        let causa = causa_del_timeout(&pool, run_id, 180).await;
         assert_eq!(causa.key(), "no_failure_at_end");
     }
 }

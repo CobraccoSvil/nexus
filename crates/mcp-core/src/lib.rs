@@ -102,6 +102,7 @@ mod prompt_memories;
 mod prompt_templates;
 mod provider_cooldown;
 mod provider_error_classifier;
+mod provider_inflight;
 mod provider_health_probe;
 mod rag;
 mod reconcile_default_models;

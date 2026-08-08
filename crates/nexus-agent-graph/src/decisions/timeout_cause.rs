@@ -27,7 +27,10 @@
 //! - la coda non e' un fallimento -> lo si dice: il tempo e' finito su lavoro
 //!   che procedeva, e allargare il budget e' una domanda legittima (mentre nel
 //!   primo caso sarebbe la toppa che la regola H vieta);
-//! - nessuno step osservabile -> [`CausaTimeout::NonOsservabile`], mai un
+//! - nessuno step osservabile, ma la maggior parte del budget passata in CODA
+//!   verso un fornitore saturo -> [`CausaTimeout::QueuedNeverRan`]: il run non
+//!   aspettava il modello, aspettava il proprio turno di parlargli;
+//! - nessuno step osservabile -> [`CausaTimeout::NotObservable`], mai un
 //!   silenzio travestito da «tutto bene» (regola Q).
 //!
 //! «Fallito» viene dal CAMPO dell'esito, non dal testo: i fatti li costruisce il
@@ -64,6 +67,46 @@ const RIPETIZIONI_MINIME: usize = 2;
 /// messaggio e' per l'umano: deve stare in una riga del pannello, non essere il
 /// log intero.
 const MAX_MESSAGGIO: usize = 400;
+
+/// Quale frazione del budget deve essere finita in CODA perche' la coda sia la
+/// causa e non un dettaglio.
+///
+/// Come [`RIPETIZIONI_MINIME`], e' una definizione e non una taratura (quindi
+/// non e' un setting, regola G): «la maggior parte del budget» significa piu'
+/// della meta'. Sotto quella soglia il run ha atteso un po' e poi e' morto per
+/// qualcos'altro, e attribuire il timeout alla coda manderebbe a dimensionare la
+/// concorrenza quando il problema era il modello.
+const FRAZIONE_BUDGET_IN_CODA: f64 = 0.5;
+
+/// Quanto del budget del run se n'e' andato aspettando un fornitore saturo.
+///
+/// I due casi sono distinti nel tipo perche' significano cose diverse (regola
+/// Q): «non misurata» e' un run che non e' passato da un punto che la registra,
+/// e non va confuso con un run che non ha atteso affatto. Il primo non autorizza
+/// nessuna conclusione, il secondo la autorizza eccome — e' la prova che il
+/// tempo se n'e' andato altrove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttesaInCoda {
+    /// Nessuna misura disponibile per questo run.
+    NonMisurata,
+    /// Misurata: quanto ha atteso, e su quale budget totale.
+    Misurata { attesa_s: u64, budget_s: u64 },
+}
+
+impl AttesaInCoda {
+    /// La coda si e' presa la maggior parte del budget?
+    ///
+    /// Un budget dichiarato zero (o assente) non consente il confronto: non si
+    /// puo' dire «la maggior parte» di un totale ignoto, e si risponde di no.
+    fn domina_il_budget(&self) -> bool {
+        match self {
+            Self::NonMisurata => false,
+            Self::Misurata { attesa_s, budget_s } => {
+                *budget_s > 0 && (*attesa_s as f64) > (*budget_s as f64) * FRAZIONE_BUDGET_IN_CODA
+            }
+        }
+    }
+}
 
 /// Un tentativo osservato nella storia di un run: che cosa ha invocato e come e'
 /// andata.
@@ -124,6 +167,23 @@ pub enum CausaTimeout {
         /// Tentativi osservati nella finestra guardata.
         osservati: usize,
     },
+    /// Il run non ha mai avuto un turno E la maggior parte del suo budget se n'e'
+    /// andata in CODA verso un fornitore saturo: non stava aspettando il
+    /// modello, stava aspettando il proprio turno di parlargli.
+    ///
+    /// E' la diagnosi che l'08/08/2026 non esisteva. Otto figure convocate dal
+    /// Consiglio su gestione-corsi sono scadute tutte e otto, con cinque
+    /// fornitori disponibili per otto chiamate concorrenti piu' il carico di
+    /// quattro sessioni parallele: il pannello diceva «timeout» per tutte, e
+    /// quella parola manda a cercare un modello lento o un budget stretto. I due
+    /// rimedi sono opposti — qui non serve piu' tempo, serve non partire in otto
+    /// verso gli stessi cinque — e senza il campo nessuno poteva sceglierli.
+    QueuedNeverRan {
+        /// Secondi passati in coda.
+        atteso_s: u64,
+        /// Budget totale del run, per dire quanto pesa quell'attesa.
+        budget_s: u64,
+    },
     /// Nessuno step osservabile. Non si puo' dire perche', e dirlo e' meglio che
     /// dedurre che andasse tutto bene.
     NotObservable,
@@ -138,6 +198,7 @@ impl CausaTimeout {
             Self::RepeatedFailures { .. } => "repeated_failures",
             Self::LastAttemptFailed { .. } => "last_attempt_failed",
             Self::NoFailureAtEnd { .. } => "no_failure_at_end",
+            Self::QueuedNeverRan { .. } => "queued_never_ran",
             Self::NotObservable => "not_observable",
         }
     }
@@ -169,6 +230,10 @@ impl CausaTimeout {
                 "budget esaurito su lavoro in corso ({osservati} passi osservati, \
                  l'ultimo non e' un fallimento)"
             ),
+            Self::QueuedNeverRan { atteso_s, budget_s } => format!(
+                "budget esaurito senza mai un turno: {atteso_s}s dei {budget_s}s disponibili \
+                 passati in coda su un fornitore saturo (non e' il modello a essere lento)"
+            ),
             Self::NotObservable => {
                 "budget esaurito; nessun passo osservabile per dirne la causa".to_string()
             }
@@ -186,9 +251,27 @@ fn exit(code: Option<i32>) -> String {
 /// IL CRITERIO, in un posto solo.
 ///
 /// `storia` e' in ordine CRONOLOGICO: l'ultimo elemento e' l'ultima cosa che il
-/// run ha fatto prima che il tempo finisse.
-pub fn classifica_causa_timeout(storia: &[TentativoOsservato]) -> CausaTimeout {
+/// run ha fatto prima che il tempo finisse. `coda` e' quanto di quel budget se
+/// n'e' andato aspettando un fornitore saturo.
+///
+/// La coda si guarda SOLO quando la storia e' vuota, e non e' una scorciatoia:
+/// un run che ha prodotto passi ha avuto i suoi turni, quindi il modello gli ha
+/// risposto e la coda — per quanto lunga — non e' cio' che lo ha fermato. Il
+/// caso che questa variante esiste per nominare e' precisamente l'altro: nessun
+/// turno, mai.
+pub fn classifica_causa_timeout(
+    storia: &[TentativoOsservato],
+    coda: AttesaInCoda,
+) -> CausaTimeout {
     let Some(ultimo) = storia.last() else {
+        if let AttesaInCoda::Misurata { attesa_s, budget_s } = coda {
+            if coda.domina_il_budget() {
+                return CausaTimeout::QueuedNeverRan {
+                    atteso_s: attesa_s,
+                    budget_s,
+                };
+            }
+        }
         return CausaTimeout::NotObservable;
     };
     if !ultimo.fallito {
@@ -269,7 +352,7 @@ mod tests {
                 tool_failure("[sudo] apt-get update fallito: binary nexus-sudo-runner non trovato"),
             ),
         ];
-        let causa = classifica_causa_timeout(&storia);
+        let causa = classifica_causa_timeout(&storia, AttesaInCoda::NonMisurata);
         assert_eq!(causa.key(), "last_attempt_failed");
         let nota = causa.nota();
         assert!(nota.contains("run_command(sudo)"), "{nota}");
@@ -292,7 +375,7 @@ mod tests {
                 tool_failure("apt-get: command not found"),
             )
         };
-        let causa = classifica_causa_timeout(&[apt(), apt(), apt()]);
+        let causa = classifica_causa_timeout(&[apt(), apt(), apt()], AttesaInCoda::NonMisurata);
         match &causa {
             CausaTimeout::RepeatedFailures {
                 tentativi, firma, ..
@@ -311,7 +394,7 @@ mod tests {
             dal_risultato("run_command", "run_command(winget)", tool_failure("boom")),
         ];
         assert_eq!(
-            classifica_causa_timeout(&storia).key(),
+            classifica_causa_timeout(&storia, AttesaInCoda::NonMisurata).key(),
             "last_attempt_failed",
             "tentare alternative diverse non e' ripetere la stessa strada"
         );
@@ -325,7 +408,7 @@ mod tests {
         let riuscito =
             dal_risultato("run_command", "run_command(npm)", "EXIT CODE: 0\nok".into());
         let storia = vec![fallito(), riuscito, fallito()];
-        assert_eq!(classifica_causa_timeout(&storia).key(), "last_attempt_failed");
+        assert_eq!(classifica_causa_timeout(&storia, AttesaInCoda::NonMisurata).key(), "last_attempt_failed");
     }
 
     /// Il tempo finito su lavoro che procedeva e' una diagnosi DIVERSA, ed e'
@@ -338,7 +421,7 @@ mod tests {
             dal_risultato("read_file", "read_file", "contenuto".into()),
             dal_risultato("run_command", "run_command(npm)", "EXIT CODE: 0\nok".into()),
         ];
-        let causa = classifica_causa_timeout(&storia);
+        let causa = classifica_causa_timeout(&storia, AttesaInCoda::NonMisurata);
         assert_eq!(causa, CausaTimeout::NoFailureAtEnd { osservati: 2 });
         assert!(causa.nota().contains("lavoro in corso"), "{}", causa.nota());
     }
@@ -347,7 +430,7 @@ mod tests {
     /// a un esito.
     #[test]
     fn senza_storia_la_causa_e_non_osservabile() {
-        let causa = classifica_causa_timeout(&[]);
+        let causa = classifica_causa_timeout(&[], AttesaInCoda::NonMisurata);
         assert_eq!(causa, CausaTimeout::NotObservable);
         assert_eq!(causa.key(), "not_observable");
     }
@@ -364,8 +447,99 @@ mod tests {
             "run_command(cargo)",
             "EXIT CODE: 101\nerror[E0308]".into(),
         )];
-        let causa = classifica_causa_timeout(&storia);
+        let causa = classifica_causa_timeout(&storia, AttesaInCoda::NonMisurata);
         assert_eq!(causa.key(), "no_failure_at_end");
+    }
+
+    /// IL caso dell'08/08/2026: nessun turno, e il budget finito in coda.
+    ///
+    /// Prima usciva come `not_observable`, che e' onesto ma manda a cercare la
+    /// causa dove non c'e'. Le due diagnosi portano a rimedi opposti: qui non
+    /// serve piu' tempo, serve non partire in otto verso gli stessi cinque.
+    ///
+    /// MUTAZIONE: togliere il ramo della coda da `classifica_causa_timeout`
+    /// (tornare a `NotObservable` appena la storia e' vuota) fa rosseggiare
+    /// questo test col valore del difetto — la figura tace sul motivo per cui
+    /// non ha mai parlato.
+    #[test]
+    fn senza_turni_e_con_la_coda_dominante_la_causa_e_la_coda() {
+        let causa = classifica_causa_timeout(
+            &[],
+            AttesaInCoda::Misurata {
+                attesa_s: 170,
+                budget_s: 180,
+            },
+        );
+        assert_eq!(causa.key(), "queued_never_ran");
+        let nota = causa.nota();
+        assert!(nota.contains("170s"), "{nota}");
+        assert!(nota.contains("coda"), "{nota}");
+    }
+
+    /// Un'attesa che NON domina il budget non spiega il timeout: due secondi in
+    /// coda e centosettantotto ad aspettare il modello sono un modello lento, e
+    /// dire «coda» manderebbe a dimensionare la concorrenza per niente.
+    #[test]
+    fn una_coda_breve_non_spiega_il_timeout() {
+        let causa = classifica_causa_timeout(
+            &[],
+            AttesaInCoda::Misurata {
+                attesa_s: 2,
+                budget_s: 180,
+            },
+        );
+        assert_eq!(causa.key(), "not_observable");
+    }
+
+    /// «Non misurata» non e' «zero» e non e' «coda»: un run che non e' passato
+    /// da un punto che registra l'attesa non autorizza nessuna conclusione, e la
+    /// diagnosi resta quella storica.
+    #[test]
+    fn un_attesa_non_misurata_lascia_la_causa_non_osservabile() {
+        assert_eq!(
+            classifica_causa_timeout(&[], AttesaInCoda::NonMisurata).key(),
+            "not_observable"
+        );
+        // Budget ignoto: non si puo' dire «la maggior parte» di un totale che
+        // non si conosce, nemmeno con un'attesa enorme.
+        assert_eq!(
+            classifica_causa_timeout(
+                &[],
+                AttesaInCoda::Misurata {
+                    attesa_s: 9999,
+                    budget_s: 0
+                }
+            )
+            .key(),
+            "not_observable"
+        );
+    }
+
+    /// La coda si guarda SOLO senza turni: un run che ha prodotto passi ha avuto
+    /// risposta dal modello, e la sua diagnosi resta quella dei fatti.
+    ///
+    /// MUTAZIONE: spostare il controllo della coda PRIMA della storia fa
+    /// diventare `queued_never_ran` un run che stava lavorando — cioe' nasconde
+    /// il fallimento vero dietro una scusa sulla concorrenza.
+    #[test]
+    fn con_dei_turni_la_coda_non_scavalca_i_fatti() {
+        let storia = vec![dal_risultato(
+            "run_command",
+            "run_command(apt-get)",
+            tool_failure("apt-get: command not found"),
+        )];
+        let causa = classifica_causa_timeout(
+            &storia,
+            AttesaInCoda::Misurata {
+                attesa_s: 170,
+                budget_s: 180,
+            },
+        );
+        assert_eq!(
+            causa.key(),
+            "last_attempt_failed",
+            "chi ha avuto turni ha una causa nei fatti, non nella coda"
+        );
     }
 
     /// Il vocabolario sul wire e' quello canonico in inglese (regola N) e
@@ -373,11 +547,14 @@ mod tests {
     /// vedono lo stesso nome.
     #[test]
     fn la_serializzazione_usa_il_vocabolario_canonico() {
-        let causa = classifica_causa_timeout(&[dal_risultato(
-            "run_command",
-            "run_command(apt-get)",
-            tool_failure("apt-get: command not found"),
-        )]);
+        let causa = classifica_causa_timeout(
+            &[dal_risultato(
+                "run_command",
+                "run_command(apt-get)",
+                tool_failure("apt-get: command not found"),
+            )],
+            AttesaInCoda::NonMisurata,
+        );
         let v = serde_json::to_value(&causa).expect("serializzabile");
         assert_eq!(v["kind"], causa.key());
         assert_eq!(v["firma"], "run_command(apt-get)");
