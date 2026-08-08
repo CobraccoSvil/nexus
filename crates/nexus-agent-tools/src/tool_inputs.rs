@@ -1344,6 +1344,12 @@ crate::tool_input! {
                 "voce deve essere eseguibile da sola e ripetibile; se una dipende da un'altra (es. DELETE dopo "
                 "POST) elencale in quest'ordine. Una POST di prova crea un dato vero nell'applicazione: usa "
                 "valori di prova riconoscibili.";
+            rendered_container: String,
+                "Selettore CSS dell'elemento che il JavaScript della pagina RIEMPIE all'avvio (es. "
+                "'#courses-grid', '.product-list'). Dichiaralo quando il contenuto visibile non sta nell'HTML "
+                "ma lo genera il codice: la verifica finale apre la pagina in un browser vero e pretende che "
+                "quell'elemento contenga qualcosa. Senza dichiarazione restano gli altri controlli, ma un "
+                "contenitore che resta vuoto per un id sbagliato non lo vede nessuno.";
         }
     }
 }
