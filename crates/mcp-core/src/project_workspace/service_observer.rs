@@ -27,7 +27,8 @@
 //!     process_util) + journalctl (log). Comportamento invariato.
 //!   - Windows: i servizi di progetto girano come `agent_processes` (kind=
 //!     'service', tabella per-progetto): enumerazione via `list_services_windows`
-//!     (services.rs, riuso), stato da `process_alive(pid)` + `status`/`exit_code`,
+//!     (services.rs, riuso), stato dal punto unico `service_liveness` (le due
+//!     prove: pid registrato e porta allocata in ascolto) + `status`/`exit_code`,
 //!     metriche via Win32 (process_util), log da `output`/`error_output`. Il
 //!     conteggio restart nativo non esiste su Windows -> quella specifica anomaly
 //!     e' disabilitata (documentato), senza rompere il ciclo.
@@ -208,8 +209,8 @@ struct UnitSample {
 /// - Unix: systemd `--user` (file unit + is-active + MainPID + NRestarts +
 ///   InvocationID) e journalctl per il run-log. Comportamento invariato.
 /// - Windows: `agent_processes` (kind='service'), enumerati con il PUNTO UNICO
-///   `list_services_windows` (services.rs, dedup label/fantasma). Stato da
-///   `process_alive(pid)` + `status`/`exit_code`; run-log da `output`/
+///   `list_services_windows` (services.rs, dedup label/fantasma). Stato dal
+///   punto unico `service_liveness` + `status`/`exit_code`; run-log da `output`/
 ///   `error_output`. Nessun systemctl/journalctl/proc.
 #[cfg(unix)]
 async fn collect_units(
@@ -248,8 +249,9 @@ async fn collect_units(
 /// (voci fantasma nascoste, similarita') e' delegata al PUNTO UNICO
 /// `visible_windows_services` (services.rs), la stessa logica del pannello
 /// Servizi; lo slug e l'unit dai punti unici `project_service_slug`/
-/// `service_unit_name`. Regola M: lo stato deriva da `process_alive(pid)` +
-/// VALIDAZIONE IDENTITA' del PID + `status`/`exit_code`, non dal parsing dei log.
+/// `service_unit_name`. Regola M: lo stato deriva dalle prove osservate del
+/// punto unico `service_liveness` (pid registrato con identita' validata, porta
+/// allocata in ascolto) + `status`/`exit_code`, non dal parsing dei log.
 ///
 /// Anti-riciclo PID (regola M/H): `agent_processes.pid` NON viene mai azzerato
 /// allo stop/crash, e Windows ricicla i PID in modo aggressivo, quindi un pid
@@ -274,12 +276,12 @@ async fn collect_units(
     let slug = super::services::project_service_slug(name);
     let (rows, visible) = windows_visible_service_rows(state, project_id).await;
 
-    // Le stesse DUE prove del pannello Servizi, raccolte una volta per ciclo. Qui
-    // pesano di piu' che nel pannello: un servizio dichiarato morto per errore non
-    // produce solo una riga sbagliata, apre una diagnosi di crash e mette in moto
-    // la remediation — cioe' un riavvio di cio' che sta gia' girando.
-    let porte_per_label = super::services::porte_allocate_per_label(&state.db, project_id).await;
-    let listener = super::service_liveness::osserva_listener().await;
+    // Le stesse DUE prove del pannello Servizi, dallo stesso punto unico e
+    // raccolte una volta per ciclo. Qui pesano di piu' che nel pannello: un
+    // servizio dichiarato morto per errore non produce solo una riga sbagliata,
+    // apre una diagnosi di crash e mette in moto la remediation — cioe' un
+    // riavvio di cio' che sta gia' girando.
+    let prove = super::service_liveness::ProveDiVita::del_progetto(&state.db, project_id).await;
 
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -288,16 +290,7 @@ async fn collect_units(
         if !seen.insert(row.0.clone()) || !visible.contains(&row.0) {
             continue;
         }
-        let porte = porte_per_label
-            .get(&row.0)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        out.push(windows_service_sample(
-            &slug,
-            row,
-            porte,
-            listener.as_deref().map_err(String::clone),
-        ));
+        out.push(windows_service_sample(&slug, row, &prove));
     }
     out
 }
@@ -376,17 +369,17 @@ type WindowsServiceRow = (
 /// vera, e il pannello Problemi apriva diagnosi di crash su servizi vivi.
 #[cfg(windows)]
 fn windows_pid_state(
+    label: &str,
     status: &str,
     pid: Option<i32>,
     exit_code: Option<i32>,
     started_at: Option<chrono::DateTime<chrono::Utc>>,
-    porte_allocate: &[u16],
-    listener: Result<&[(u16, u32)], String>,
+    prove: &super::service_liveness::ProveDiVita,
 ) -> (String, Option<u32>) {
     use super::service_liveness::{ProvaDiVita, StatoServizio};
 
     let pid_u = pid.and_then(|p| u32::try_from(p).ok()).filter(|&p| p > 0);
-    let verdetto = super::service_liveness::valuta(pid, started_at, porte_allocate, listener);
+    let verdetto = prove.verdetto(label, pid, started_at);
 
     // Il pid da riportare e' quello di cui la prova parla: col capostipite morto
     // e la porta viva, il pid REGISTRATO non esiste piu' e chi campiona le
@@ -424,19 +417,12 @@ fn windows_pid_state(
 fn windows_service_sample(
     slug: &str,
     row: WindowsServiceRow,
-    porte_allocate: &[u16],
-    listener: Result<&[(u16, u32)], String>,
+    prove: &super::service_liveness::ProveDiVita,
 ) -> UnitSample {
     let (label, status, _created_at, pid, exit_code, output, error_output, started_at) = row;
     let unit = super::services::service_unit_name(slug, &label);
-    let (active_state, effective_pid) = windows_pid_state(
-        &status,
-        pid,
-        exit_code,
-        started_at,
-        porte_allocate,
-        listener,
-    );
+    let (active_state, effective_pid) =
+        windows_pid_state(&label, &status, pid, exit_code, started_at, prove);
 
     // Marcatore di run: pid + started_at. Cambia a ogni nuovo avvio (pid nuovo,
     // started_at pure) -> reset grace/anti-spam. Non viene parsato.

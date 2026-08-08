@@ -957,7 +957,8 @@ async fn fetch_agent_process_rows(
     project_id: Uuid,
 ) -> Vec<sqlx::postgres::PgRow> {
     sqlx::query(
-        "SELECT id, label, command, status, pid, COALESCE(kind, 'service') as kind FROM agent_processes \
+        "SELECT id, label, command, status, pid, started_at, \
+                COALESCE(kind, 'service') as kind FROM agent_processes \
          WHERE project_id = $1 \
          ORDER BY created_at DESC LIMIT 20",
     )
@@ -1024,7 +1025,8 @@ pub async fn get_output_channels(
 
     // Identifica i processi fantasma (status='running' ma PID morto), li sana nel
     // DB e restituisce le sole righe vive per la costruzione dei canali agent.
-    let agent_rows = sanitize_orphan_processes(&proj_pool, agent_rows_raw).await;
+    let agent_rows =
+        sanitize_orphan_processes(&state.db, &proj_pool, project_id, agent_rows_raw).await;
 
     for row in &agent_rows {
         channels.push(agent_row_to_channel(row));
@@ -1094,32 +1096,67 @@ fn push_agent_svc_channels(channels: &mut Vec<Value>, agent_rows_raw: &[sqlx::po
     }
 }
 
-/// Self-healing: marca come 'stopped' nel DB i processi 'running' con PID
-/// inesistente (residui di chat precedenti, restart, kill esterni) e ritorna le
-/// sole righe non-fantasma. Liveness cross-platform: punto unico
-/// process_util::process_alive (regola L); il vecchio check inline su
-/// `/proc/{pid}` era cieco su Windows e spegneva servizi realmente vivi.
+/// Self-healing: marca come 'stopped' nel DB i processi 'running' il cui
+/// processo non c'e' piu' (residui di chat precedenti, restart, kill esterni) e
+/// ritorna le sole righe non-fantasma.
+///
+/// Due domande, due punti unici (regola L): per un processo one-shot vale
+/// [`crate::process_liveness`] (esiste ANCORA, ed e' il nostro? un pid riciclato
+/// non lo e'); per un SERVIZIO vale
+/// [`crate::project_workspace::service_liveness`], perche' il pid registrato e'
+/// la shell e il server e' un discendente che le sopravvive. Prima qui girava
+/// `process_alive` grezzo per entrambi: dichiarava vivo un pid riciclato e
+/// scriveva 'stopped' su servizi che stavano servendo richieste — e la scrittura
+/// rendeva l'errore persistente.
+/// Gli id delle righe `running` la cui morte e' ACCERTATA dal punto unico. Solo
+/// quelle: una riga che il SO non ci ha lasciato giudicare resta com'e', perche'
+/// persistere una non-osservazione e' il modo in cui l'errore diventa definitivo.
+fn righe_da_marcare_ferme(
+    rows: &[sqlx::postgres::PgRow],
+    prove: Option<&super::service_liveness::ProveDiVita>,
+) -> Vec<Uuid> {
+    rows.iter()
+        .filter(|row| {
+            row.try_get::<String, _>("status")
+                .map(|s| s == "running")
+                .unwrap_or(false)
+        })
+        .filter(|row| {
+            super::service_liveness::verdetto_di_riga(
+                &row.try_get::<String, _>("kind").unwrap_or_default(),
+                &row.try_get::<String, _>("label").unwrap_or_default(),
+                row.try_get::<Option<i32>, _>("pid").ok().flatten(),
+                row.try_get("started_at").unwrap_or(None),
+                prove,
+            )
+            .autorizza_a_dichiararlo_morto()
+        })
+        .filter_map(|row| row.try_get::<Uuid, _>("id").ok())
+        .collect()
+}
+
 async fn sanitize_orphan_processes(
+    db: &sqlx::PgPool,
     proj_pool: &sqlx::PgPool,
+    project_id: Uuid,
     agent_rows_raw: Vec<sqlx::postgres::PgRow>,
 ) -> Vec<sqlx::postgres::PgRow> {
-    let mut orphan_ids: Vec<Uuid> = Vec::new();
-    for row in &agent_rows_raw {
-        let status: String = row.try_get::<String, _>("status").unwrap_or_default();
-        if status != "running" {
-            continue;
-        }
-        let pid: Option<i32> = row.try_get::<Option<i32>, _>("pid").ok().flatten();
-        let alive = match pid {
-            Some(p) if p > 0 => crate::process_util::process_alive(p as u32),
-            _ => false,
-        };
-        if !alive {
-            if let Ok(id) = row.try_get::<Uuid, _>("id") {
-                orphan_ids.push(id);
-            }
-        }
-    }
+    let campo_vale = |row: &sqlx::postgres::PgRow, campo: &str, atteso: &str| {
+        row.try_get::<String, _>(campo)
+            .map(|v| v == atteso)
+            .unwrap_or(false)
+    };
+    let e_servizio = |row: &sqlx::postgres::PgRow| {
+        campo_vale(row, "kind", "service") && campo_vale(row, "status", "running")
+    };
+    // Le prove del servizio costano una query e una syscall: si raccolgono solo
+    // se c'e' almeno un servizio da giudicare.
+    let prove = if agent_rows_raw.iter().any(e_servizio) {
+        Some(super::service_liveness::ProveDiVita::del_progetto(db, project_id).await)
+    } else {
+        None
+    };
+    let orphan_ids = righe_da_marcare_ferme(&agent_rows_raw, prove.as_ref());
     if !orphan_ids.is_empty() {
         let _ = sqlx::query("UPDATE agent_processes SET status = 'stopped' WHERE id = ANY($1)")
             .bind(&orphan_ids)

@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::Json;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::json;
 use sqlx::PgPool;
 use tokio::time::sleep;
@@ -539,6 +539,77 @@ async fn persist_probe(db: &PgPool, dependency: &str, result: &ProbeResult) {
 
 // ── Detect e termina task bloccati ───────────────────────────────────────────
 
+/// Servizi orfani di UN progetto: reap SOLO su una morte ACCERTATA del SERVIZIO,
+/// dal punto unico `service_liveness` — non del processo registrato, che e' la
+/// shell e non il server (i figli le sopravvivono). Ritorna gli id reapati.
+///
+/// Prima il criterio qui era `process_alive(pid)` grezzo, e sbagliava in ENTRAMBE
+/// le direzioni: dichiarava vivo un pid RICICLATO su un estraneo, e morto un
+/// servizio che stava servendo richieste. MISURATO l'08/08/2026 su gestione-corsi:
+/// ucciso il solo capostipite `bash` 10896, questo ramo ha scritto `failed` 39
+/// secondi dopo mentre il server rispondeva HTTP 200 sulla porta 34894 allocata a
+/// quella label. La scrittura e' il danno vero: il pannello mostra la riga morta e
+/// l'observer apre una diagnosi di crash, cioe' mette in moto la remediation su
+/// cio' che gira.
+async fn reap_servizi_morti(
+    db: &PgPool,
+    pool: &PgPool,
+    project_id: uuid::Uuid,
+) -> Vec<uuid::Uuid> {
+    let running: Vec<(uuid::Uuid, String, Option<i32>, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT id, label, pid, started_at FROM agent_processes \
+         WHERE status = 'running' AND kind = 'service'",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    if running.is_empty() {
+        return Vec::new();
+    }
+    // Le prove costano una query e una syscall: si raccolgono una volta per
+    // progetto, e solo se c'e' almeno una riga da giudicare.
+    let prove =
+        crate::project_workspace::service_liveness::ProveDiVita::del_progetto(db, project_id).await;
+    let mut reapati = Vec::new();
+    for (id, label, pid, started_at) in running {
+        let verdetto = prove.verdetto(&label, pid, started_at);
+        if verdetto.autorizza_a_dichiararlo_morto() {
+            reapati.extend(marca_servizio_morto(pool, id).await);
+        } else if !verdetto.e_vivo() {
+            // Non abbiamo osservato niente: la riga resta com'e'. Scrivere
+            // 'failed' su una non-osservazione e' il modo in cui l'errore
+            // diventa persistente e la lettura dopo lo conferma.
+            tracing::warn!(
+                project_id = %project_id,
+                process_id = %id,
+                label = %label,
+                motivo = %verdetto.descrizione(),
+                "task_watchdog: stato del servizio non accertabile, riga lasciata invariata"
+            );
+        }
+    }
+    reapati
+}
+
+/// Marca `failed` una riga di servizio: la scrittura, separata dal criterio.
+async fn marca_servizio_morto(pool: &PgPool, id: uuid::Uuid) -> Option<uuid::Uuid> {
+    const MOTIVO: &str =
+        "\nWatchdog: servizio non piu vivo (processo registrato morto, nessuna porta in ascolto)";
+    sqlx::query_scalar::<_, uuid::Uuid>(
+        "UPDATE agent_processes \
+         SET status = 'failed', \
+             stopped_at = NOW(), \
+             error_output = COALESCE(error_output, '') || $2 \
+         WHERE id = $1 AND status = 'running' \
+         RETURNING id",
+    )
+    .bind(id)
+    .bind(MOTIVO)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_default()
+}
+
 async fn terminate_stale_tasks(db: &PgPool, agent_channels: &AgentChannels) {
     // Quality scans bloccate (>5 minuti in "running")
     let stale_scans = sqlx::query_scalar::<_, i64>(
@@ -623,37 +694,8 @@ async fn terminate_stale_tasks(db: &PgPool, agent_channels: &AgentChannels) {
         .unwrap_or_default();
         stale_processes.append(&mut ids);
 
-        // (b) Servizi orfani: reap SOLO se il processo OS non e' piu' vivo (punto
-        // unico liveness cross-platform: process_util::process_alive).
-        let running_services: Vec<(uuid::Uuid, Option<i32>)> = sqlx::query_as(
-            "SELECT id, pid FROM agent_processes \
-             WHERE status = 'running' AND kind = 'service'",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap_or_default();
-        for (id, pid) in running_services {
-            let alive =
-                matches!(pid, Some(p) if p > 0 && crate::process_util::process_alive(p as u32));
-            if alive {
-                continue;
-            }
-            let reaped = sqlx::query_scalar::<_, uuid::Uuid>(
-                "UPDATE agent_processes \
-                 SET status = 'failed', \
-                     stopped_at = NOW(), \
-                     error_output = COALESCE(error_output, '') || '\nWatchdog: servizio con pid terminato' \
-                 WHERE id = $1 AND status = 'running' \
-                 RETURNING id",
-            )
-            .bind(id)
-            .fetch_optional(&pool)
-            .await
-            .unwrap_or_default();
-            if let Some(reaped_id) = reaped {
-                stale_processes.push(reaped_id);
-            }
-        }
+        // (b) Servizi orfani: vedi `reap_servizi_morti`.
+        stale_processes.extend(reap_servizi_morti(db, &pool, project_id).await);
     }
 
     for id in &stale_processes {

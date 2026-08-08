@@ -533,37 +533,6 @@ pub(super) fn reconcile_dead_service_rows(
     }
 }
 
-/// Porte registrate a ciascuna label di questo progetto, dal META
-/// (`nexus_port_allocations`). La chiave e' la label ESATTA perche' l'allocazione
-/// e' chiavata su `(project_id, label)`: e' quella corrispondenza a rendere il
-/// listener una prova di vita di QUEL servizio. Il vocabolario largo di
-/// `similar_service_labels` risponde a un'altra domanda («due label indicano lo
-/// stesso RUOLO?») e qui attribuirebbe a un servizio la porta di un altro.
-///
-/// Un DB che non risponde da una mappa vuota, non un errore: il chiamante
-/// degrada a `NessunaPortaAllocata`, cioe' al verdetto sul solo pid — che e'
-/// esattamente il comportamento di prima, quindi non peggiora nulla.
-#[cfg(windows)]
-pub(super) async fn porte_allocate_per_label(
-    db: &sqlx::PgPool,
-    project_id: Uuid,
-) -> std::collections::HashMap<String, Vec<u16>> {
-    let righe: Vec<(String, i32)> = sqlx::query_as(
-        "SELECT label, port FROM nexus_port_allocations WHERE project_id = $1 AND label <> ''",
-    )
-    .bind(project_id)
-    .fetch_all(db)
-    .await
-    .unwrap_or_default();
-    let mut mappa: std::collections::HashMap<String, Vec<u16>> = std::collections::HashMap::new();
-    for (label, port) in righe {
-        if let Ok(p) = u16::try_from(port) {
-            mappa.entry(label).or_default().push(p);
-        }
-    }
-    mappa
-}
-
 /// Windows: elenca i servizi di progetto come processi gestiti (agent_processes
 /// kind='service'), nella STESSA shape di list_services_fallback. Su Windows non
 /// esistono unit systemd: l'install (install_service_windows) registra i servizi
@@ -606,24 +575,18 @@ pub(super) async fn list_services_windows(
     .unwrap_or_default();
 
     // Le DUE prove di vita di un servizio, raccolte UNA volta per l'intero
-    // elenco: il pid registrato lo porta gia' la riga, le porte allocate e i
-    // listener no. Il capostipite registrato e' la shell, non il server (vedi
-    // service_liveness): senza la seconda prova, ogni servizio il cui bash e'
-    // morto risultava spento anche mentre serviva richieste.
-    let porte_per_label = porte_allocate_per_label(db, project_id).await;
-    let listener = super::service_liveness::osserva_listener().await;
+    // elenco dal punto unico: il pid registrato lo porta gia' la riga, le porte
+    // allocate e i listener no. Il capostipite registrato e' la shell, non il
+    // server (vedi service_liveness): senza la seconda prova, ogni servizio il
+    // cui bash e' morto risultava spento anche mentre serviva richieste.
+    let prove = super::service_liveness::ProveDiVita::del_progetto(db, project_id).await;
 
     // Self-heal: una riga running/starting la cui morte e' ACCERTATA diventa
     // 'stopped' sia nel display sia in DB, cosi' il pannello Servizi non mostra
     // 'running' un processo defunto/estraneo e resta COERENTE col pannello
     // Problemi (l'observer interroga lo stesso punto unico in windows_pid_state).
     let esito = reconcile_dead_service_rows(rows, |label, pid, started| {
-        super::service_liveness::valuta(
-            pid,
-            started,
-            porte_per_label.get(label).map(Vec::as_slice).unwrap_or(&[]),
-            listener.as_deref().map_err(String::clone),
-        )
+        prove.verdetto(label, pid, started)
     });
     if !esito.pid_morti.is_empty() {
         let _ = sqlx::query(

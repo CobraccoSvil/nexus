@@ -235,6 +235,50 @@ pub async fn stop_similar_running_services(
     stopped
 }
 
+/// Quante volte si richiede il verdetto sul SERVIZIO dopo l'uscita del suo
+/// capostipite, a `ATTESA_FRA_VERIFICHE` l'una dall'altra. Non e' un
+/// ritenta-finche'-vivo: e' la finestra in cui un server lanciato in background
+/// si lega alla porta dopo che la shell e' gia' uscita. Oltre, il silenzio e'
+/// una risposta.
+const VERIFICHE_SERVIZIO_A_USCITA_CAPOSTIPITE: u32 = 3;
+const ATTESA_FRA_VERIFICHE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `agent_processes.kind` dei servizi (vocabolario canonico, regola N).
+const KIND_SERVICE: &str = "service";
+
+/// Il SERVIZIO e' vivo benche' il suo capostipite sia uscito?
+///
+/// La domanda si pone piu' di una volta perche' qui l'istante e' il peggiore
+/// possibile: una shell che lancia il server in background esce in millisecondi,
+/// e il server si lega alla porta dopo (misurato: 2s su gestione-corsi).
+/// Guardare una volta sola significherebbe chiedere «ascolta?» prima che possa
+/// ascoltare. E lo sbaglio qui non si ripara da solo: scritta `failed`, la riga
+/// esce da 'running' e il watchdog — che guarda le sole righe 'running' — non la
+/// riesamina mai piu'.
+async fn servizio_ancora_vivo(
+    db_meta: &PgPool,
+    project_id: Uuid,
+    label: &str,
+    pid: i32,
+    avvio: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    for tentativo in 0..VERIFICHE_SERVIZIO_A_USCITA_CAPOSTIPITE {
+        if tentativo > 0 {
+            tokio::time::sleep(ATTESA_FRA_VERIFICHE).await;
+        }
+        let prove = crate::project_workspace::service_liveness::ProveDiVita::del_progetto(
+            db_meta, project_id,
+        )
+        .await;
+        let verdetto = prove.verdetto(label, Some(pid), Some(avvio));
+        if verdetto.e_vivo() {
+            tracing::info!(motivo = %verdetto.descrizione(), "servizio vivo dopo l'uscita del capostipite");
+            return true;
+        }
+    }
+    false
+}
+
 /// Spawns a background process on the server, captures output into the DB.
 /// Returns the process UUID immediately (fire-and-forget for the caller).
 ///
@@ -389,6 +433,10 @@ pub async fn spawn_agent_process(
     };
 
     let pid = child.id().unwrap_or(0) as i32;
+    // L'istante che il DB sta per annotare (`started_at = NOW()`): serve al
+    // criterio d'identita' del pid, che senza attesa non puo' distinguere il
+    // nostro processo da un estraneo che ne abbia ereditato il numero.
+    let avvio_registrato = chrono::Utc::now();
 
     // Update DB with PID and status=running
     let _ = sqlx::query(
@@ -404,6 +452,12 @@ pub async fn spawn_agent_process(
     let stderr = child.stderr.take();
     // Il task di background eredita il pool instradato del progetto (separazione DB).
     let db_clone = proj_pool.clone();
+    // ...e il META, dove vivono le allocazioni di porta: senza, alla morte del
+    // capostipite questo task potrebbe solo dedurre lo stato del SERVIZIO dallo
+    // stato della SHELL, che e' il difetto (vedi service_liveness).
+    let db_meta = db.clone();
+    let kind_owned = kind.to_string();
+    let label_owned = label.to_string();
 
     // Spawn background task to read output and flush to DB
     tokio::spawn(async move {
@@ -489,6 +543,25 @@ pub async fn spawn_agent_process(
         };
 
         let final_status = if exit_code == 0 { "stopped" } else { "failed" };
+
+        // Cio' che si e' appena osservato e' l'uscita della SHELL. Per un
+        // SERVIZIO non e' ancora l'esito del servizio: il server e' un
+        // discendente e le sopravvive (misurato su gestione-corsi: la catena
+        // `bash -> bash -> dotnet -> SchoolCoursesApi` restava viva e in ascolto
+        // sulla porta allocata mentre il capostipite era morto). La domanda ha un
+        // punto unico, e prima di scrivere una morte va posta a quello.
+        if kind_owned == KIND_SERVICE
+            && servizio_ancora_vivo(&db_meta, project_id, &label_owned, pid, avvio_registrato).await
+        {
+            tracing::info!(
+                project_id = %project_id,
+                label = %label_owned,
+                exit_code,
+                "il capostipite del servizio e' uscito ma il servizio e' vivo: riga lasciata 'running'"
+            );
+            return;
+        }
+
         // Non sovrascrivere se già marcato 'stopped' da una richiesta esplicita di stop
         let _ = sqlx::query(
             "UPDATE agent_processes SET status=$1, exit_code=$2, stopped_at=NOW() WHERE id=$3 AND status != 'stopped'",
