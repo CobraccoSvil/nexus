@@ -36,6 +36,37 @@
 # Sta in lefthook.yml con 'priority: 1' (supportato da v1.13.6, verificato) e
 # senza glob: gira prima di ogni gate e per qualunque tipo di file staged, cosi'
 # copre anche i gate che verranno aggiunti con altri glob.
+#
+# CIO' CHE QUESTO GUARD NON PUO' VEDERE, e perche' non e' una lacuna da tappare.
+#
+#   L'08/08/2026 una sessione ha visto nell'output di 'turbo_quick' percorsi di
+#   un ALTRO worktree, col guard verde. Non e' un buco del guard: e' una domanda
+#   diversa. Qui si verifica DOVE girano i comandi; li' i comandi giravano
+#   nell'albero giusto e semplicemente non sono stati eseguiti.
+#
+#   Turbo v2 tiene una cache condivisa fra tutti i worktree dello stesso
+#   repository, e lo dichiara. Riprodotto da un worktree con node_modules
+#   proprio, eseguendo 'turbo run typecheck --filter=@ai-orchestrator/types':
+#
+#     - Remote caching disabled, using shared worktree cache
+#     @ai-orchestrator/types:typecheck: cache hit, replaying logs 410d93af7a9c3493
+#     @ai-orchestrator/types:typecheck: > ... D:\IDEAI-worktrees\intelligent-mclaren-eb04d7\packages\types
+#     Time: 3.177s >>> FULL TURBO
+#
+#   Nessun tsc e' partito in questo albero: l'entry era stata prodotta in un
+#   altro worktree e ne e' stato ripristinato e ristampato il log (la cache sta
+#   in <repo-principale>/.turbo/cache, e i manifest elencano <pkg>/.turbo/
+#   turbo-<task>.log fra gli output — per questo il log ricompare, con i percorsi
+#   assoluti di la').
+#
+#   Il replay non e' di per se' sbagliato: la chiave di turbo e' il CONTENUTO
+#   degli input, quindi due alberi identici hanno lo stesso esito, ed e' lo
+#   stesso meccanismo della remote cache fra macchine. Cio' che manca e' la
+#   premessa: "typecheck OK" non dice che in questo albero non e' stato
+#   eseguito niente. Estendere questo guard non aiuterebbe — il replay avviene
+#   dentro turbo, dopo che questo script ha gia' concluso, e su un canale
+#   (l'hash del contenuto) che qui non e' osservabile. Sta scritto qui perche' e'
+#   qui che lo cerchera' il prossimo che vede percorsi altrui in un output.
 set -euo pipefail
 
 # Rete di sicurezza indipendente contro la trappola documentata di git

@@ -73,10 +73,38 @@ else
     export CARGO_INCREMENTAL=1
 fi
 
+# Vocabolario dell'esito "gate non eseguito" e premesse comuni: punto unico.
+# Sorgiato qui, cosi' ogni gate che gia' sorge questo file lo ottiene.
+# shellcheck source=scripts/gate-premesse.sh
+source "$(dirname "${BASH_SOURCE[0]}")/gate-premesse.sh"
+
 # La radice del repo/worktree, risolta da QUESTO file e non ereditata dal
 # chiamante: cosi' il valore non dipende da chi ci sorge (precommit-cargo-check.sh
 # non definisce ROOT_DIR, verify.sh si).
 _gate_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export NEXUS_GATE_ROOT="$_gate_root"
+
+# La radice del repo COMUNE. In un worktree e' un ALTRO albero: quello che
+# contiene la git dir condivisa, cioe' il repo principale.
+#
+# Serve perche' alcune premesse dei gate NON sono versionate e vivono per
+# convenzione solo li' — il `.env` in primis (`.gitignore` lo esclude, riga 16).
+# Un worktree nasce quindi sempre senza, e il gate che lo pretende si ferma il
+# giorno in cui viene creato l'albero, non il giorno in cui qualcuno sbaglia.
+#
+# La fonte e' `--git-common-dir`, che e' git a dichiarare, non un'euristica sui
+# path: nel repo principale coincide con la propria git dir, in un worktree punta
+# al `.git` del principale. `--path-format=absolute` (git 2.31+, gia' preteso da
+# check-hook-tree.sh) evita il relativo che il primo caso restituirebbe.
+#
+# Se git non e' interrogabile la radice comune resta questa: nessun ripiego
+# inventato, si degrada al comportamento di prima.
+_gate_common_root="$_gate_root"
+_gate_common_dir="$(git -C "$_gate_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+if [[ -n "$_gate_common_dir" ]]; then
+    _gate_common_root="$(cd "$(dirname "$_gate_common_dir")" 2>/dev/null && pwd || echo "$_gate_root")"
+fi
+export NEXUS_GATE_COMMON_ROOT="$_gate_common_root"
 
 # CARGO_TARGET_DIR — dove i gate compilano.
 #
@@ -118,18 +146,76 @@ export CARGO_TARGET_DIR="${NEXUS_GATE_TARGET_DIR:-${_gate_root}/target}"
 #   esportasse la variabile per far divergere gli altri. Ora la lettura e' una
 #   sola, esplicita, e vale per tutti i gate.
 #
-#   Qui si LEGGE e si esporta; non si impone. Chi non puo' procedere senza
-#   (precommit-cargo-check.sh) tiene il proprio fail-closed: un file sorgiato
-#   non puo' uscire senza terminare il chiamante.
-if [[ -z "${DATABASE_URL:-}" ]] && [[ -f "${_gate_root}/.env" ]]; then
-    # Estrae il valore senza eseguire il file; strip del CR finale (.env
-    # editato su Windows).
-    _gate_db_url="$(grep -m1 '^DATABASE_URL=' "${_gate_root}/.env" 2>/dev/null | cut -d= -f2-)"
-    _gate_db_url="${_gate_db_url%$'\r'}"
-    if [[ -n "$_gate_db_url" ]]; then
-        export DATABASE_URL="$_gate_db_url"
-    fi
-    unset _gate_db_url
+#   Qui si LEGGE e si esporta; non si impone. Chi non puo' procedere senza lo
+#   pretende chiamando `gate_pretende_database_url` (sotto).
+#
+#   DOVE si legge: questo albero, poi il repo COMUNE. Fino all'08/08/2026 c'era
+#   solo il primo, e in un worktree il primo non esiste mai — `.env` e'
+#   gitignored, quindi un albero nuovo nasce senza e nessun checkout lo porta.
+#   Il gate si fermava percio' in ogni worktree, sempre, e lo faceva con un
+#   messaggio che accusava clippy (vedi gate-premesse.sh).
+#
+#   L'ordine non e' arbitrario: un `.env` messo NEL worktree e' una decisione
+#   presa per quell'albero e vince, il comune e' cio' da cui si eredita quando
+#   nessuno ha deciso niente. Nel repo principale i due candidati coincidono e
+#   ne resta uno: il caso normale non cambia comportamento.
+#
+#   Il file effettivamente letto viene esportato: e' la premessa dei numeri che
+#   verranno (regola O), e senza di essa "DATABASE_URL c'e'" non dice da dove.
+_gate_env_candidati=("${_gate_root}/.env")
+if [[ "$_gate_common_root" != "$_gate_root" ]]; then
+    _gate_env_candidati+=("${_gate_common_root}/.env")
+fi
+# Separati da newline, non da spazi: un percorso con spazi e' legittimo su
+# Windows e lo split sugli spazi lo spezzerebbe in due candidati inesistenti.
+#
+# NON esportata, a differenza delle altre: l'unico consumatore e'
+# `gate_pretende_database_url` nello stesso processo, e una variabile
+# d'ambiente multilinea e' una stranezza che i processi figli (cargo, turbo,
+# node) non hanno chiesto di gestire.
+printf -v NEXUS_GATE_ENV_CANDIDATI '%s\n' "${_gate_env_candidati[@]}"
+
+if [[ -z "${DATABASE_URL:-}" ]]; then
+    for _gate_env_file in "${_gate_env_candidati[@]}"; do
+        [[ -f "$_gate_env_file" ]] || continue
+        # Estrae il valore senza eseguire il file; strip del CR finale (.env
+        # editato su Windows).
+        _gate_db_url="$(grep -m1 '^DATABASE_URL=' "$_gate_env_file" 2>/dev/null | cut -d= -f2-)"
+        _gate_db_url="${_gate_db_url%$'\r'}"
+        if [[ -n "$_gate_db_url" ]]; then
+            export DATABASE_URL="$_gate_db_url"
+            export NEXUS_GATE_ENV_FILE="$_gate_env_file"
+            break
+        fi
+    done
+    unset _gate_db_url _gate_env_file
 fi
 
-unset _gate_root
+# Premessa dei gate cargo: senza DATABASE_URL le macro SQLx non possono
+# verificare le query, quindi il gate non e' eseguibile — non e' fallito.
+#
+# Sta qui e non nel chiamante perche' il messaggio deve dire DOVE si e' cercato,
+# e i candidati li conosce solo questo file (regola L: chi costruisce la lista
+# la spiega; un chiamante che se la ricomponesse divergerebbe al primo cambio
+# dell'ordine).
+gate_pretende_database_url() {
+    [[ -n "${DATABASE_URL:-}" ]] && return 0
+    local dettagli=("cercato in:")
+    local candidato
+    while IFS= read -r candidato; do
+        [[ -n "$candidato" ]] || continue
+        if [[ -f "$candidato" ]]; then
+            dettagli+=("  - $candidato (presente, senza riga DATABASE_URL=)")
+        else
+            dettagli+=("  - $candidato (assente)")
+        fi
+    done <<< "$NEXUS_GATE_ENV_CANDIDATI"
+    gate_stop_configurazione \
+        "DATABASE_URL non impostata: le macro SQLx verificano le query a compile-time contro un DB reale." \
+        "${dettagli[@]}" \
+        "" \
+        "Rimedio: avvia il DB locale ed esporta DATABASE_URL, oppure valorizzala" \
+        "nel .env di uno dei percorsi sopra (vedi .env.local.example)."
+}
+
+unset _gate_root _gate_common_root _gate_common_dir _gate_env_candidati

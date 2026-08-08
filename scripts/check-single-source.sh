@@ -2414,6 +2414,38 @@ else
   echo "OK vita-processo: la guardia dello stack interroga il SO"
 fi
 
+# premesse-dei-gate — «il gate ha bocciato il codice, o non e' mai partito?»
+#
+# Due regressioni possibili, entrambe silenziose. (1) Un secondo posto in cui un
+# gate dichiara di essersi fermato: divergerebbe dal primo, e il fail_text di
+# lefthook tornerebbe ad accusare il codice per una causa che non conosce.
+# (2) Un gate che smette di PRETENDERE la propria premessa: non e' un errore
+# visibile — lo script resta valido e i test restano verdi — semplicemente
+# fallisce piu' avanti col messaggio sbagliato, che era il difetto dell'08/08.
+# La definizione, non la menzione: ancorata a inizio riga, cosi' il pattern non
+# matcha se stesso ne' i commenti che nominano la funzione per spiegarla.
+premesse_hits="$(grep -rlnE '^ *gate_stop_configurazione\(\)' scripts/ 2>/dev/null \
+  | grep -v '^scripts/gate-premesse\.sh$' || true)"
+for coppia in "scripts/precommit-cargo-check.sh:gate_pretende_database_url" \
+              "scripts/precommit-turbo.sh:gate_pretende_turbo" \
+              "scripts/verify.sh:gate_pretende_turbo"; do
+  file="${coppia%%:*}"; pretesa="${coppia##*:}"
+  if [[ -f "$file" ]] && ! grep -q "^ *${pretesa}\$" "$file"; then
+    premesse_hits="${premesse_hits}
+$file: non pretende piu' la propria premessa ($pretesa)"
+  fi
+done
+if [[ -n "${premesse_hits// /}" ]]; then
+  echo "!! premesse-dei-gate: un gate dichiara il proprio esito fuori dal punto unico:" >&2
+  printf '%s\n' "$premesse_hits" >&2
+  echo "   'gate non eseguito' e 'codice bocciato' sono due valori del codice" >&2
+  echo "   d'uscita (78 vs 1), non due frasi: il punto unico e'" >&2
+  echo "   scripts/gate-premesse.sh, e i gate vi delegano la pretesa." >&2
+  fail=1
+else
+  echo "OK premesse-dei-gate: l'esito 'non eseguito' ha un punto unico e i gate lo pretendono"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

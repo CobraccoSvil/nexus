@@ -46,9 +46,21 @@ premessa() {
         stato_cache="caldo"
     fi
     echo -e "${YELLOW}== verify: da dove sto guardando ==${NC}"
+    echo "   albero       : ${ROOT_DIR}"
     echo "   target dir   : ${target} (${stato_cache})"
     echo "   incrementale : CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-<non impostata>}"
     echo "   toolchain    : $(rustc --version 2>/dev/null || echo '<rustc non invocabile>')"
+    # QUALE file ha dato DATABASE_URL, non il suo valore. In un worktree e' il
+    # .env del repo COMUNE: senza questa riga "i test sqlx passano" non dice
+    # contro quale configurazione, ed e' proprio la differenza fra i due alberi
+    # (regola O: un numero senza la sua premessa e' un'opinione).
+    if [[ -n "${NEXUS_GATE_ENV_FILE:-}" ]]; then
+        echo "   DATABASE_URL : letta da ${NEXUS_GATE_ENV_FILE}"
+    elif [[ -n "${DATABASE_URL:-}" ]]; then
+        echo "   DATABASE_URL : ereditata dall'ambiente"
+    else
+        echo "   DATABASE_URL : <non impostata: le fasi sqlx falliranno>"
+    fi
     echo
 }
 
@@ -99,6 +111,12 @@ premessa
 
 
 if [[ "$SKIP_TS" != "1" ]]; then
+    # Premessa, non fase: se turbo non e' invocabile in questo albero il gate non
+    # e' eseguibile e lo dichiara col codice dedicato (78), invece di produrre un
+    # rosso indistinguibile da un typecheck fallito. Stesso punto unico del
+    # pre-commit (regola L): la domanda "turbo c'e'?" ha una risposta sola.
+    gate_pretende_turbo
+
     run_phase "check TypeScript toolchain" node scripts/check-no-honeypot-tsc.mjs
     run_phase "turbo typecheck+lint+test" pnpm exec turbo run typecheck lint test --continue
 else
@@ -152,6 +170,14 @@ fi
 # fresco puo' introdurla senza che nessuno committi nulla, e chi esegue il gate
 # completo e' spesso il primo a toccare quell'albero.
 run_phase "fine-riga dichiarati (eol=lf)" bash scripts/check-eol.sh
+
+# Premesse dei gate, provate DA UN WORKTREE (regola O). Sta in un gate e non fra
+# le verifiche a mano per la ragione che rende i suoi due difetti particolari:
+# nel repo principale il .env c'e' e node_modules pure, quindi non sono
+# osservabili da dove si guarda di solito, e una regressione resterebbe verde
+# finche' qualcuno non crea un albero nuovo. Costo: pochi secondi, un repository
+# usa-e-getta sotto /tmp.
+run_phase "premesse dei gate da un worktree" bash scripts/gate-premesse-selftest.sh
 
 # Gate ratchet configurazioni: settings morte/fantasma/invisibili possono solo
 # scendere (baseline in scripts/audit-settings-baseline.json). Se il DB live

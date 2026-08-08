@@ -29,15 +29,13 @@ source scripts/gate-env.sh
 # tutti i gate insieme. DATABASE_URL entra nel fingerprint di Cargo
 # (`sqlx-macros` dichiara `rerun-if-env-changed`), quindi due gate che la
 # leggessero per conto proprio potrebbero divergere e invalidarsi a vicenda.
-# Qui resta il solo fail-closed: chi non puo' procedere senza lo dice, e un file
-# sorgiato non puo' uscire per conto del chiamante.
-if [ -z "${DATABASE_URL:-}" ]; then
-  echo "pre-commit cargo: DATABASE_URL non impostato e non trovato in <repo>/.env." >&2
-  echo "  Le macro SQLx verificano le query a compile-time: avvia il DB locale ed" >&2
-  echo "  esporta DATABASE_URL, oppure valorizzalo nel .env del repo (vedi" >&2
-  echo "  .env.local.example)." >&2
-  exit 1
-fi
+#
+# Qui resta la PRETESA: chi non puo' procedere senza lo dichiara. Il messaggio e
+# il codice d'uscita li compone il punto unico, che conosce i percorsi cercati e
+# distingue "gate non eseguito" (78) da "clippy ha bocciato il codice" (1) — due
+# esiti che prima uscivano entrambi come 1, e che lefthook non poteva percio'
+# raccontare in modo diverso. Vedi gate-premesse.sh.
+gate_pretende_database_url
 
 # clippy e NON `cargo check`, e il motivo e' la CACHE, non la severita'.
 #
