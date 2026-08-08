@@ -70,6 +70,16 @@ async fn esegui_tool_migrato(
         // messaggio dice come.
         "read_file" => Some(files::tool_read_file(ctx, input).await),
         "write_file" => Some(files::tool_write_file(ctx, input).await),
+        // Gli estremi dell'intervallo arrivano dal contratto: gli alias
+        // `offset`/`limit`, che il catalogo non ha mai promesso e che il prompt
+        // del supervisore dichiara inesistenti dalla mig 0060, non sono piu'
+        // accettati in silenzio.
+        "read_file_lines" => Some(files::tool_read_file_lines(ctx, input).await),
+        // I due tool di sola LETTURA della struttura: una directory vuota e' un
+        // successo, una assente e' un fallimento, e ora la differenza sta nel
+        // campo invece che in un marker anteposto al testo.
+        "list_files" => Some(files::tool_list_files(ctx, input).await),
+        "search_in_files" => Some(files::tool_search_in_files(ctx, input).await),
         // I tre tool che MUTANO il filesystem senza scrivere contenuto. La
         // natura del loro fallimento non e' una scelta caso per caso: viene da
         // `NaturaFallimento::da_errore_io`, che la legge dal `ErrorKind`
@@ -78,6 +88,12 @@ async fn esegui_tool_migrato(
         "delete_file" => Some(files::tool_delete_file(ctx, input).await),
         "rename_file" => Some(files::tool_rename_file(ctx, input).await),
         "fs_mkdir" => Some(files::tool_fs_mkdir(ctx, input).await),
+        // Copia e spostamento chiudono `files.rs`: la loro natura viene dal
+        // `ErrorKind` come per gli altri tre, tranne dove il messaggio nomina il
+        // parametro che rimedia (`overwrite:true`) — li' e' rimediabile per
+        // costruzione, ed e' il tool a saperlo.
+        "fs_copy" => Some(files::tool_fs_copy(ctx, input).await),
+        "fs_move" => Some(files::tool_fs_move(ctx, input).await),
         _ => None,
     }
 }
@@ -90,9 +106,6 @@ async fn esegui_tool_legacy(
     input: &Value,
 ) -> nexus_types::tool_outcome::RispostaTool {
     let testo = match name {
-        "read_file_lines" => files::tool_read_file_lines(ctx, input).await,
-        "list_files" => files::tool_list_files(ctx, input).await,
-        "search_in_files" => files::tool_search_in_files(ctx, input).await,
         "git_status" => git::tool_git_status(ctx).await,
         "git_stage" => git::tool_git_stage(ctx, input).await,
         "git_commit" => git::tool_git_commit(ctx, input).await,
@@ -123,8 +136,6 @@ async fn esegui_tool_legacy(
         "stop_service" => service::tool_stop_service(ctx, input).await,
         "service_restart" => service::tool_service_restart(ctx, input).await,
         "tail_service_logs" => service::tool_tail_service_logs(ctx, input).await,
-        "fs_copy" => files::tool_fs_copy(ctx, input).await,
-        "fs_move" => files::tool_fs_move(ctx, input).await,
         "run_specific_test" => testing::tool_run_specific_test(ctx, input).await,
         "run_lint_fix" => testing::tool_run_lint_fix(ctx, input).await,
         "format_file" => testing::tool_format_file(ctx, input).await,
