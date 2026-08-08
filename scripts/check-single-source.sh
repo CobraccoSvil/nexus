@@ -2375,8 +2375,54 @@ assert_single "vita-processo-criterio" 'pub\(crate\) fn classifica\(' \
 # registrato e' la shell, il server e' un suo discendente che le sopravvive
 # (misurato su gestione-corsi il 07/08, pid 20728 morto e porta 34859 in ascolto
 # dal pid 3860). Delegano il pannello Servizi e l'observer.
-assert_single "vita-servizio" 'pub\(super\) fn classifica_servizio' \
+assert_single "vita-servizio" 'pub\(crate\) fn classifica_servizio' \
   'crates/mcp-core/src/project_workspace/service_liveness.rs' crates
+# E la RACCOLTA delle due prove sta con il criterio: e' la meta' della domanda che
+# si sbaglia per omissione. Chi raccoglie da se' le porte allocate finisce per
+# porre la domanda a meta' — o per non porla affatto, che e' cio' che il
+# task_watchdog faceva con `process_alive` grezzo mentre il servizio rispondeva.
+assert_single "prove-vita-servizio" 'struct ProveDiVita' \
+  'crates/mcp-core/src/project_workspace/service_liveness.rs' crates
+assert_single "porte-allocate-per-label" 'fn porte_allocate_per_label' \
+  'crates/mcp-core/src/project_workspace/service_liveness.rs' crates
+# Ogni punto che scrive la morte di un servizio come VERDETTO deve aver posto la
+# domanda del servizio, non quella del processo. MISURATO l'08/08/2026: il
+# pannello delegava gia', il watchdog no — e bastava lui a scrivere `failed` su
+# un servizio che rispondeva HTTP 200 sulla porta allocata alla sua label.
+#
+# Il criterio e' il FILE che scrive, non la singola query. Un pattern SQL piu'
+# stretto sarebbe inerte: le stringhe sono spezzate su piu' righe con `\`, e
+# grep, che lavora per riga, vedrebbe solo `UPDATE agent_processes \` — mancando
+# proprio il watchdog, cioe' l'unico punto in cui il difetto e' stato misurato
+# (provato prima di scrivere questo guard).
+#
+# Chi scrive su `agent_processes` o interroga il punto unico, o compare qui sotto
+# con il motivo: sono i punti che scrivono una CONSEGUENZA e non un verdetto —
+# hanno appena ucciso i processi loro stessi, o non toccano lo stato di vita.
+morte_servizio_esenti=(
+  # stop esplicito: uccide i pid e poi ne registra l'esito, non deduce nulla
+  'crates/mcp-core/src/project_workspace/service_manager.rs'
+  # marca solo `resume_dispatched_at`: non scrive stato di vita
+  'crates/mcp-core/src/process_resume.rs'
+)
+morte_servizio_muta=""
+while IFS= read -r f; do
+  [[ -z "$f" ]] && continue
+  esente=""
+  for e in "${morte_servizio_esenti[@]}"; do [[ "$f" == "$e" ]] && esente=1; done
+  [[ -n "$esente" ]] && continue
+  grep -q 'service_liveness' "$f" || morte_servizio_muta+="  $f"$'\n'
+done <<< "$(grep -rl --include='*.rs' --exclude-dir=target \
+  'UPDATE agent_processes' crates 2>/dev/null || true)"
+if [[ -n "$morte_servizio_muta" ]]; then
+  echo "!! morte-servizio: si scrive lo stato terminale di un servizio senza" >&2
+  echo "   interrogare il punto unico service_liveness (il pid registrato e' la" >&2
+  echo "   shell: un servizio vivo verrebbe scritto 'failed'):" >&2
+  printf '%s' "$morte_servizio_muta" >&2
+  fail=1
+else
+  echo "OK morte-servizio: chi scrive la morte di un servizio interroga il punto unico"
+fi
 # Il predicato vecchio non deve poter rientrare da nessuna parte: era il canale a
 # due valori da cui nascevano entrambe le direzioni del difetto.
 identita_bool="$(grep -rn --include='*.rs' --exclude-dir=target \

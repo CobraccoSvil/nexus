@@ -496,52 +496,84 @@ async fn restore_billing_cooldowns_from_redis(mut conn: redis::aio::MultiplexedC
 /// non idempotente). Estratta dalla closure `tokio::spawn` in `main` per
 /// contenerne complessita e lunghezza; comportamento invariato.
 async fn mark_stale_project_processes_failed(db_recover: sqlx::PgPool) {
-    use sqlx::Row;
-    for pid in project_db_routes::list_all_project_ids(&db_recover).await {
-        let pool = match project_db_routes::project_data_pool_from(&db_recover, pid).await {
-            Ok(pool) => pool,
+    for project_id in project_db_routes::list_all_project_ids(&db_recover).await {
+        match project_db_routes::project_data_pool_from(&db_recover, project_id).await {
+            Ok(pool) => riconcilia_processi_di_progetto(&db_recover, &pool, project_id).await,
             Err(e) => {
-                tracing::warn!(project_id = %pid, error = %e, "boot-recovery processi stale: DB progetto non disponibile, progetto saltato per questo giro");
-                continue;
+                tracing::warn!(project_id = %project_id, error = %e, "boot-recovery processi stale: DB progetto non disponibile, progetto saltato per questo giro");
             }
+        }
+    }
+}
+
+/// Le due prove del SERVIZIO, raccolte una volta per progetto e solo se c'e'
+/// almeno una riga di servizio da giudicare: costano una query e una syscall.
+async fn prove_di_vita_se_servono(
+    meta: &sqlx::PgPool,
+    project_id: uuid::Uuid,
+    righe: &[sqlx::postgres::PgRow],
+) -> Option<project_workspace::service_liveness::ProveDiVita> {
+    use sqlx::Row;
+    let c_e_un_servizio = righe.iter().any(|r| {
+        r.try_get::<String, _>("kind")
+            .map(|k| k == "service")
+            .unwrap_or(false)
+    });
+    if !c_e_un_servizio {
+        return None;
+    }
+    Some(project_workspace::service_liveness::ProveDiVita::del_progetto(meta, project_id).await)
+}
+
+/// Le righe 'running'/'starting' di UN progetto: verdetto dal punto unico, e
+/// scrittura solo su una morte ACCERTATA.
+///
+/// Per un processo one-shot la domanda e' «e' ancora il MIO processo?» (un pid
+/// riciclato non lo e'); per un SERVIZIO e' un'altra ancora, perche' il pid
+/// registrato e' la shell — e al boot il caso tipico e' proprio quello: mcp-core
+/// e' ripartito, il monitor non c'e' piu', ma il server che aveva avviato e' un
+/// discendente ancora in ascolto sulla sua porta. Un pid che il SO non ci lascia
+/// interrogare resta com'e': persistere una non-osservazione e' il modo in cui
+/// l'errore diventa definitivo.
+async fn riconcilia_processi_di_progetto(
+    meta: &sqlx::PgPool,
+    pool: &sqlx::PgPool,
+    project_id: uuid::Uuid,
+) {
+    use sqlx::Row;
+    let stale = sqlx::query(
+        "SELECT id, kind, label, pid, started_at FROM agent_processes \
+         WHERE status IN ('running', 'starting')",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let prove = prove_di_vita_se_servono(meta, project_id, &stale).await;
+    for row in stale {
+        let Ok(id) = row.try_get::<uuid::Uuid, _>("id") else {
+            continue;
         };
-        let stale = sqlx::query(
-            "SELECT id, pid, started_at FROM agent_processes WHERE status IN ('running', 'starting')",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap_or_default();
-        for row in stale {
-            let Ok(id) = row.try_get::<uuid::Uuid, _>("id") else {
-                continue;
-            };
-            let ppid: Option<i32> = row.try_get("pid").unwrap_or(None);
-            let started_at: Option<chrono::DateTime<chrono::Utc>> =
-                row.try_get("started_at").unwrap_or(None);
-            // Punto unico (regola L): il pid viene dal DB, quindi la domanda e'
-            // «e' ancora il MIO processo?» e non «esiste un pid cosi'?». Senza
-            // `started_at` questa riconciliazione non vedeva i pid RICICLATI e
-            // lasciava 'running' righe il cui processo non esisteva piu' da un
-            // pezzo. E si scrive 'failed' solo su una morte ACCERTATA: un pid
-            // che il SO non ci lascia interrogare resta com'e', perche' questa
-            // funzione gira al boot, quando i servizi possono benissimo essere
-            // vivi e appartenere a una sessione che non e' la nostra.
-            let verdetto = crate::process_liveness::stato_da_riga(ppid, started_at);
-            if verdetto.autorizza_a_dichiararlo_morto() {
-                let _ = sqlx::query(
-                    "UPDATE agent_processes SET status='failed', stopped_at=NOW() WHERE id=$1 AND status IN ('running','starting')",
-                )
-                .bind(id)
-                .execute(&pool)
-                .await;
-            } else if !verdetto.e_vivo() {
-                tracing::warn!(
-                    project_id = %pid,
-                    process_id = %id,
-                    motivo = %verdetto.descrizione(),
-                    "boot-recovery: stato del processo non accertabile, riga lasciata invariata"
-                );
-            }
+        let verdetto = project_workspace::service_liveness::verdetto_di_riga(
+            &row.try_get::<String, _>("kind").unwrap_or_default(),
+            &row.try_get::<String, _>("label").unwrap_or_default(),
+            row.try_get("pid").unwrap_or(None),
+            row.try_get("started_at").unwrap_or(None),
+            prove.as_ref(),
+        );
+        if verdetto.autorizza_a_dichiararlo_morto() {
+            let _ = sqlx::query(
+                "UPDATE agent_processes SET status='failed', stopped_at=NOW() WHERE id=$1 AND status IN ('running','starting')",
+            )
+            .bind(id)
+            .execute(pool)
+            .await;
+        } else if !verdetto.e_vivo() {
+            tracing::warn!(
+                project_id = %project_id,
+                process_id = %id,
+                motivo = %verdetto.descrizione(),
+                "boot-recovery: stato del processo non accertabile, riga lasciata invariata"
+            );
         }
     }
 }
@@ -777,6 +809,13 @@ async fn build_orchestrator(
 /// riconciliazione dei processi per-progetto e' gestita dal blocco mark-only in
 /// `build_app_state`, che itera list_all_project_ids + project_data_pool_from.
 /// NON duplicare qui.
+///
+/// Qui la domanda resta quella sul PROCESSO e non quella sul SERVIZIO
+/// ([`project_workspace::service_liveness`]): la seconda prova e' un listener su
+/// una porta allocata a `(project_id, label)`, e queste righe storiche stanno sul
+/// meta senza il progetto a cui apparterrebbero. Le righe dei servizi vivi non
+/// passano di qui — passano da `mark_stale_project_processes_failed`, che ha il
+/// progetto e pone la domanda completa.
 async fn reconcile_stale_processes(db: &sqlx::PgPool) {
     use sqlx::Row;
     let stale = sqlx::query(
