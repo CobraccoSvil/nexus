@@ -12,20 +12,20 @@ mod agent_router_server;
 mod agent_todos_routes;
 mod agent_tool_result_cache;
 mod agent_tools;
+mod agent_turn_setup;
 mod agent_types;
 mod auth;
 mod billing;
-mod agent_turn_setup;
 pub use nexus_build_graph as build_graph;
 mod cache;
 mod capability;
+mod catalog_sync_worker;
 /// Il metro del registro delle porte (ADR 0042, P0(b)): quante identita' di
 /// servizio contiene `nexus_port_allocations` e quante ne descrivono una viva.
 /// Sola lettura, eseguito on-demand; vive qui perche' la domanda «chi ascolta
 /// adesso» ha un punto unico `pub(crate)` in questo crate (vedi il modulo).
 #[cfg(test)]
 mod censimento_porte;
-mod catalog_sync_worker;
 mod change_drafts;
 mod chat_agent;
 mod chat_attachments;
@@ -47,9 +47,9 @@ mod fanin_worker;
 mod file_mutations;
 mod github;
 mod http_metrics;
+mod intent_classifier;
 mod internal_learning;
 mod internal_routing;
-mod intent_classifier;
 pub(crate) use nexus_types::llm_json;
 mod governance_telemetry;
 mod long_running;
@@ -61,7 +61,6 @@ mod model_health_probe;
 mod model_observation;
 mod model_qualification;
 mod model_switch;
-mod runtime_health;
 mod models;
 mod mutations_api;
 mod native_engine;
@@ -79,22 +78,24 @@ mod playwright_env;
 pub mod playwright_live;
 mod plugins;
 mod port_registry;
+mod process_liveness;
 mod process_resume;
 mod process_util;
 mod profile_selection;
 mod profiles;
+mod runtime_health;
 // Estratto in crate workspace (split 7.4): re-export per mantenere
 // validi i path crate::project_db:: dei moduli esistenti.
 pub use nexus_project_db as project_db;
 mod db_retention;
 mod learned_instructions;
-mod project_db_routes;
-mod project_files;
-mod project_git;
 mod probe_agentic_loop;
 mod probe_chain_measure;
 mod probe_latent_state;
 mod probe_world;
+mod project_db_routes;
+mod project_files;
+mod project_git;
 mod project_workspace;
 mod projects;
 mod prompt_memories;
@@ -102,8 +103,8 @@ mod prompt_templates;
 mod provider_cooldown;
 mod provider_error_classifier;
 mod provider_health_probe;
-mod reconcile_default_models;
 mod rag;
+mod reconcile_default_models;
 mod routes;
 mod routing_config;
 mod routing_matrix;
@@ -134,8 +135,8 @@ mod trace_store;
 mod ui_clarification;
 mod ui_flags;
 mod vector_memory;
-mod verify_profile;
 mod verify_probe;
+mod verify_profile;
 mod wiki;
 
 use std::net::SocketAddr;
@@ -217,14 +218,17 @@ struct AppState {
 // leggere l'exit code da /proc/{pid}/status. Estratto da `spawn_reattach_monitor`
 // per tenere ciascuna funzione sotto la soglia di lunghezza (comportamento invariato).
 #[cfg(unix)]
-async fn reattach_fallback_poll(id: uuid::Uuid, pid_val: i32, db_clone: &sqlx::PgPool) {
+async fn reattach_fallback_poll(id: uuid::Uuid, pid: i32, avvio: Option<i64>, db: &sqlx::PgPool) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        if !crate::process_util::process_alive(pid_val as u32) {
+        // Punto unico: il polling dura ore, e un pid riciclato nel frattempo
+        // terrebbe questo loop in attesa di un processo che non e' il nostro.
+        if crate::process_liveness::stato_del_pid(pid as u32, avvio).autorizza_a_dichiararlo_morto()
+        {
             let exit_code: Option<i32> = tokio::process::Command::new("sh")
                 .args([
                     "-c",
-                    &format!("cat /proc/{}/status 2>/dev/null | grep -c VmPeak", pid_val),
+                    &format!("cat /proc/{}/status 2>/dev/null | grep -c VmPeak", pid),
                 ])
                 .output()
                 .await
@@ -236,7 +240,7 @@ async fn reattach_fallback_poll(id: uuid::Uuid, pid_val: i32, db_clone: &sqlx::P
             )
             .bind(id)
             .bind(exit_code.unwrap_or(-1))
-            .execute(db_clone)
+            .execute(db)
             .await;
             break;
         }
@@ -296,34 +300,34 @@ async fn reattach_stream_output(
 // Interamente Linux-centrico (dipende da /proc, `tail`, `sh`, `kill`).
 // Estratta da `main` (era un `fn` nested, nessuna cattura d'ambiente): sposta
 // la lunghezza/complessita fuori dal corpo di `main`, comportamento invariato.
+// `avvio` e' l'istante d'avvio ATTESO (epoch unix, da `agent_processes.started_at`):
+// senza, questo monitor resterebbe in polling su un pid che il SO puo' aver
+// riassegnato a un estraneo. Firma su una riga, e non spezzata per parametro: le
+// due varianti di piattaforma hanno lo stesso contratto, quindi una firma
+// multi-riga e' un blocco IDENTICO in due punti — il rilevatore di duplicazione
+// lo conta, e ha ragione a contarlo.
 #[cfg(unix)]
-fn spawn_reattach_monitor(id: uuid::Uuid, pid_val: i32, db_clone: sqlx::PgPool) {
+fn spawn_reattach_monitor(id: uuid::Uuid, pid: i32, avvio: Option<i64>, db: sqlx::PgPool) {
     tokio::spawn(async move {
-        let stdout_path = format!("/proc/{}/fd/1", pid_val);
-        let stderr_path = format!("/proc/{}/fd/2", pid_val);
+        let stdout_path = format!("/proc/{}/fd/1", pid);
+        let stderr_path = format!("/proc/{}/fd/2", pid);
         let mut child = match tokio::process::Command::new("tail")
-            .args([
-                "-f",
-                "--pid",
-                &pid_val.to_string(),
-                &stdout_path,
-                &stderr_path,
-            ])
+            .args(["-f", "--pid", &pid.to_string(), &stdout_path, &stderr_path])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
         {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!("Failed to re-attach to process {}: {}", pid_val, e);
-                reattach_fallback_poll(id, pid_val, &db_clone).await;
+                tracing::warn!("Failed to re-attach to process {}: {}", pid, e);
+                reattach_fallback_poll(id, pid, avvio, &db).await;
                 return;
             }
         };
 
         // Leggi output dal tail e appendilo al DB
         if let Some(stdout) = child.stdout.take() {
-            reattach_stream_output(stdout, id, &db_clone).await;
+            reattach_stream_output(stdout, id, &db).await;
         }
 
         // tail è uscito: il processo originale è terminato
@@ -331,7 +335,7 @@ fn spawn_reattach_monitor(id: uuid::Uuid, pid_val: i32, db_clone: sqlx::PgPool) 
             "UPDATE agent_processes SET status='stopped', stopped_at=NOW() WHERE id=$1 AND status='running'"
         )
         .bind(id)
-        .execute(&db_clone)
+        .execute(&db)
         .await;
     });
 }
@@ -344,11 +348,18 @@ fn spawn_reattach_monitor(id: uuid::Uuid, pid_val: i32, db_clone: sqlx::PgPool) 
 // reale non e' recuperabile senza aver aperto il processo come figlio).
 // Estratta da `main` (era un `fn` nested, nessuna cattura d'ambiente).
 #[cfg(windows)]
-fn spawn_reattach_monitor(id: uuid::Uuid, pid_val: i32, db_clone: sqlx::PgPool) {
+fn spawn_reattach_monitor(id: uuid::Uuid, pid: i32, avvio: Option<i64>, db: sqlx::PgPool) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            if !crate::process_util::process_alive(pid_val as u32) {
+            // Punto unico, con l'identita': questo loop vive quanto il processo,
+            // e Windows ricicla i pid. Senza il confronto, il primo estraneo che
+            // eredita il pid lo terrebbe «vivo» a tempo indeterminato; e senza il
+            // ramo dell'ignoto, un pid momentaneamente non interrogabile lo
+            // farebbe marcare stopped mentre e' vivo.
+            if crate::process_liveness::stato_del_pid(pid as u32, avvio)
+                .autorizza_a_dichiararlo_morto()
+            {
                 // exit_code non determinabile su Windows senza handle del figlio:
                 // si lascia NULL (coerente col path Unix, che scrive -1 solo se
                 // non riesce a leggere VmPeak).
@@ -356,7 +367,7 @@ fn spawn_reattach_monitor(id: uuid::Uuid, pid_val: i32, db_clone: sqlx::PgPool) 
                     "UPDATE agent_processes SET status='stopped', stopped_at=NOW() WHERE id=$1",
                 )
                 .bind(id)
-                .execute(&db_clone)
+                .execute(&db)
                 .await;
                 break;
             }
@@ -495,7 +506,7 @@ async fn mark_stale_project_processes_failed(db_recover: sqlx::PgPool) {
             }
         };
         let stale = sqlx::query(
-            "SELECT id, pid FROM agent_processes WHERE status IN ('running', 'starting')",
+            "SELECT id, pid, started_at FROM agent_processes WHERE status IN ('running', 'starting')",
         )
         .fetch_all(&pool)
         .await
@@ -505,17 +516,31 @@ async fn mark_stale_project_processes_failed(db_recover: sqlx::PgPool) {
                 continue;
             };
             let ppid: Option<i32> = row.try_get("pid").unwrap_or(None);
-            let alive = matches!(
-                ppid,
-                Some(p) if p > 0 && crate::process_util::process_alive(p as u32)
-            );
-            if !alive {
+            let started_at: Option<chrono::DateTime<chrono::Utc>> =
+                row.try_get("started_at").unwrap_or(None);
+            // Punto unico (regola L): il pid viene dal DB, quindi la domanda e'
+            // «e' ancora il MIO processo?» e non «esiste un pid cosi'?». Senza
+            // `started_at` questa riconciliazione non vedeva i pid RICICLATI e
+            // lasciava 'running' righe il cui processo non esisteva piu' da un
+            // pezzo. E si scrive 'failed' solo su una morte ACCERTATA: un pid
+            // che il SO non ci lascia interrogare resta com'e', perche' questa
+            // funzione gira al boot, quando i servizi possono benissimo essere
+            // vivi e appartenere a una sessione che non e' la nostra.
+            let verdetto = crate::process_liveness::stato_da_riga(ppid, started_at);
+            if verdetto.autorizza_a_dichiararlo_morto() {
                 let _ = sqlx::query(
                     "UPDATE agent_processes SET status='failed', stopped_at=NOW() WHERE id=$1 AND status IN ('running','starting')",
                 )
                 .bind(id)
                 .execute(&pool)
                 .await;
+            } else if !verdetto.e_vivo() {
+                tracing::warn!(
+                    project_id = %pid,
+                    process_id = %id,
+                    motivo = %verdetto.descrizione(),
+                    "boot-recovery: stato del processo non accertabile, riga lasciata invariata"
+                );
             }
         }
     }
@@ -754,39 +779,51 @@ async fn build_orchestrator(
 /// NON duplicare qui.
 async fn reconcile_stale_processes(db: &sqlx::PgPool) {
     use sqlx::Row;
-    let stale =
-        sqlx::query("SELECT id, pid FROM agent_processes WHERE status IN ('running', 'starting')")
-            .fetch_all(db)
-            .await
-            .unwrap_or_default();
+    let stale = sqlx::query(
+        "SELECT id, pid, started_at FROM agent_processes WHERE status IN ('running', 'starting')",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
 
     for row in stale {
         let id: uuid::Uuid = row.get("id");
         let pid: Option<i32> = row.try_get("pid").unwrap_or(None);
-        // Liveness cross-platform: punto unico process_util::process_alive
-        // (Unix: /proc/{pid}; Windows: OpenProcess). Sostituisce il vecchio
-        // `kill -0`, no-op silenzioso su Windows.
-        let still_alive = match pid {
-            Some(p) if p > 0 => crate::process_util::process_alive(p as u32),
-            _ => false,
-        };
+        let started_at: Option<chrono::DateTime<chrono::Utc>> =
+            row.try_get("started_at").unwrap_or(None);
+        // Punto unico (regola L): pid persistito -> `process_liveness`, che
+        // guarda anche l'identita'. Il vecchio `process_alive` da solo non
+        // vedeva i pid riciclati, e per contro avrebbe marcato 'failed' un
+        // processo soltanto non interrogabile.
+        let verdetto = crate::process_liveness::stato_da_riga(pid, started_at);
 
-        if !still_alive {
+        if verdetto.autorizza_a_dichiararlo_morto() {
             let _ = sqlx::query(
                 "UPDATE agent_processes SET status='failed', stopped_at=NOW() WHERE id=$1",
             )
             .bind(id)
             .execute(db)
             .await;
-            tracing::info!("Stale process {} (pid={:?}) marked failed", id, pid);
+            tracing::info!(
+                "Stale process {} (pid={:?}) marked failed: {}",
+                id,
+                pid,
+                verdetto.descrizione()
+            );
+        } else if !verdetto.e_vivo() {
+            tracing::warn!(
+                process_id = %id,
+                motivo = %verdetto.descrizione(),
+                "reconcile_stale_processes: stato non accertabile, riga lasciata invariata"
+            );
         } else {
             tracing::info!(
                 "Process {} (pid={:?}) still running, re-attaching monitor",
                 id,
                 pid
             );
-            // still_alive=true implica pid.is_some(); difensivamente saltiamo
-            // la re-attach se la condizione viene violata in futuro.
+            // `e_vivo()` implica pid.is_some(); difensivamente saltiamo la
+            // re-attach se la condizione viene violata in futuro.
             let Some(pid_val) = pid else {
                 tracing::warn!("Process {} alive ma pid=None: skip re-attach", id);
                 continue;
@@ -794,7 +831,10 @@ async fn reconcile_stale_processes(db: &sqlx::PgPool) {
             // Il monitoring di re-attach e' OS-specifico: su Unix segue stdout+stderr
             // via /proc/{pid}/fd/1,2 con `tail`; su Windows /proc non esiste, quindi
             // ci si limita a poll della liveness. Punto unico: spawn_reattach_monitor.
-            spawn_reattach_monitor(id, pid_val, db.clone());
+            // L'avvio atteso viaggia col pid: il monitor resta in polling per ore,
+            // e senza di esso un riciclo del pid dopo la morte del processo lo
+            // terrebbe «vivo» per sempre.
+            spawn_reattach_monitor(id, pid_val, started_at.map(|t| t.timestamp()), db.clone());
         }
     }
 }

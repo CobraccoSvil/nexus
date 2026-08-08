@@ -28,6 +28,13 @@ function Test-NexusShellElevated {
   return ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 }
 
+# PREMESSA VINCOLANTE: risponde alla domanda RISTRETTA «esiste un processo con
+# questo pid?», ed e' legittima SOLO qui — su un pid appena tentato da un kill,
+# nell'arco di secondi, per vedere se e' sparito. Per un pid letto da un
+# REGISTRO (il pidfile) non e' la domanda giusta: quel numero puo' essere stato
+# riciclato, e questa funzione risponderebbe $true per un estraneo. Quel caso ha
+# il suo punto unico, lib\nexus-liveness.ps1 (Get-NexusProcessLiveness), a cui
+# dev-stop.ps1 delega PRIMA di arrivare qui.
 function Test-NexusProcessAlive {
   param([AllowNull()][object]$ProcessId)
   if (-not $ProcessId) { return $false }

@@ -274,6 +274,13 @@ async fn collect_units(
     let slug = super::services::project_service_slug(name);
     let (rows, visible) = windows_visible_service_rows(state, project_id).await;
 
+    // Le stesse DUE prove del pannello Servizi, raccolte una volta per ciclo. Qui
+    // pesano di piu' che nel pannello: un servizio dichiarato morto per errore non
+    // produce solo una riga sbagliata, apre una diagnosi di crash e mette in moto
+    // la remediation — cioe' un riavvio di cio' che sta gia' girando.
+    let porte_per_label = super::services::porte_allocate_per_label(&state.db, project_id).await;
+    let listener = super::service_liveness::osserva_listener().await;
+
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for row in rows {
@@ -281,7 +288,16 @@ async fn collect_units(
         if !seen.insert(row.0.clone()) || !visible.contains(&row.0) {
             continue;
         }
-        out.push(windows_service_sample(&slug, row));
+        let porte = porte_per_label
+            .get(&row.0)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        out.push(windows_service_sample(
+            &slug,
+            row,
+            porte,
+            listener.as_deref().map_err(String::clone),
+        ));
     }
     out
 }
@@ -348,43 +364,79 @@ type WindowsServiceRow = (
 );
 
 /// Deriva `(active_state, effective_pid)` di una riga service Windows. Stato
-/// strutturato (regola M): la liveness reale via process_alive + VALIDAZIONE
-/// IDENTITA' del PID (anti-riciclo: creation-time vs started_at; dato mancante =>
-/// non vivo, fail-safe) hanno la precedenza sul campo `status` (che puo' restare
-/// 'running' dopo un crash o un riciclo del PID).
+/// strutturato (regola M) dal punto unico [`crate::process_liveness`]: liveness
+/// reale + identita' del PID (anti-riciclo) hanno la precedenza sul campo
+/// `status`, che puo' restare 'running' dopo un crash o un riciclo del PID.
+///
+/// Ma solo una morte ACCERTATA la scavalca. Quando il SO non risponde — pid non
+/// interrogabile (processo di un altro utente o elevato), istante d'avvio non
+/// registrato o non leggibile — non c'e' nulla che possa avere la precedenza su
+/// niente: si mantiene cio' che il registro dichiara, e la riga NON viene
+/// declassata a 'inactive'. Prima quel caso valeva `false` insieme alla morte
+/// vera, e il pannello Problemi apriva diagnosi di crash su servizi vivi.
 #[cfg(windows)]
 fn windows_pid_state(
     status: &str,
     pid: Option<i32>,
     exit_code: Option<i32>,
     started_at: Option<chrono::DateTime<chrono::Utc>>,
+    porte_allocate: &[u16],
+    listener: Result<&[(u16, u32)], String>,
 ) -> (String, Option<u32>) {
+    use super::service_liveness::{ProvaDiVita, StatoServizio};
+
     let pid_u = pid.and_then(|p| u32::try_from(p).ok()).filter(|&p| p > 0);
-    let alive = match pid_u {
-        Some(p) if crate::process_util::process_alive(p) => {
-            crate::process_util::pid_identity_confirmed(p, started_at.map(|t| t.timestamp()))
-        }
-        _ => false,
-    };
-    // Vivo E identita' confermata => 'active'; altrimenti morto: exit_code!=0 o
-    // status='failed' => 'failed', sennò 'inactive'.
-    let active_state = if alive {
-        "active".to_string()
-    } else if status == "failed" || exit_code.is_some_and(|c| c != 0) {
-        "failed".to_string()
+    let verdetto = super::service_liveness::valuta(pid, started_at, porte_allocate, listener);
+
+    // Il pid da riportare e' quello di cui la prova parla: col capostipite morto
+    // e la porta viva, il pid REGISTRATO non esiste piu' e chi campiona le
+    // metriche non deve inseguirlo. Il servizio pero' e' attivo.
+    if let StatoServizio::Vivo(prova) = &verdetto {
+        let pid_vivo = match prova {
+            ProvaDiVita::PidRegistrato { pid } => Some(*pid),
+            ProvaDiVita::PortaAllocataInAscolto { pid, .. } => Some(*pid),
+        };
+        return ("active".to_string(), pid_vivo);
+    }
+    if !verdetto.autorizza_a_dichiararlo_morto() {
+        // Non osservato: il registro resta l'unica cosa che sappiamo. Il pid
+        // continua a valere come riferimento (il processo potrebbe esserci
+        // eccome: e' l'osservazione che manca, non il processo).
+        let dal_registro = match status {
+            "running" | "starting" => "active",
+            "failed" => "failed",
+            _ => "inactive",
+        };
+        return (dal_registro.to_string(), pid_u);
+    }
+    // Morte accertata: 'failed' se c'e' un segnale di fallimento, sennò spento.
+    let active_state = if status == "failed" || exit_code.is_some_and(|c| c != 0) {
+        "failed"
     } else {
-        "inactive".to_string()
+        "inactive"
     };
-    (active_state, if alive { pid_u } else { None })
+    (active_state.to_string(), None)
 }
 
 /// Costruisce un `UnitSample` da una riga service Windows. Estratto da
 /// `collect_units` (comportamento invariato).
 #[cfg(windows)]
-fn windows_service_sample(slug: &str, row: WindowsServiceRow) -> UnitSample {
+fn windows_service_sample(
+    slug: &str,
+    row: WindowsServiceRow,
+    porte_allocate: &[u16],
+    listener: Result<&[(u16, u32)], String>,
+) -> UnitSample {
     let (label, status, _created_at, pid, exit_code, output, error_output, started_at) = row;
     let unit = super::services::service_unit_name(slug, &label);
-    let (active_state, effective_pid) = windows_pid_state(&status, pid, exit_code, started_at);
+    let (active_state, effective_pid) = windows_pid_state(
+        &status,
+        pid,
+        exit_code,
+        started_at,
+        porte_allocate,
+        listener,
+    );
 
     // Marcatore di run: pid + started_at. Cambia a ogni nuovo avvio (pid nuovo,
     // started_at pure) -> reset grace/anti-spam. Non viene parsato.
@@ -1430,8 +1482,7 @@ async fn apply_run_reset(
         st.prev_active_enter = active_enter;
         st.run_seen_at = Some(Instant::now());
         st.last_crash_sig = None;
-        let resolved =
-            resolve_open_crashes(&ctx.state.db, ctx.project_id, unit).await;
+        let resolved = resolve_open_crashes(&ctx.state.db, ctx.project_id, unit).await;
         notify_problems_panel_refresh(ctx.project_id, resolved);
     }
     st.run_seen_at
@@ -1487,8 +1538,7 @@ async fn detect_structural_failure(
         if grace_ok {
             // Servizio sano dopo il grace: chiude eventuali crash aperti (ciclo di
             // vita: quando viene riparato, il problema sparisce).
-            let resolved =
-                resolve_open_crashes(&ctx.state.db, ctx.project_id, unit).await;
+            let resolved = resolve_open_crashes(&ctx.state.db, ctx.project_id, unit).await;
             notify_problems_panel_refresh(ctx.project_id, resolved);
             st.last_crash_sig = None;
         }
@@ -1714,12 +1764,8 @@ async fn run_cycle(
         // raggiunge mai. Guard !is_empty(): non azzerare tutto su un errore
         // di systemctl.
         if !observed_units.is_empty() {
-            let resolved = resolve_diagnoses_for_absent_units(
-                &state.db,
-                project_id,
-                &observed_units,
-            )
-            .await;
+            let resolved =
+                resolve_diagnoses_for_absent_units(&state.db, project_id, &observed_units).await;
             notify_problems_panel_refresh(project_id, resolved);
         }
     }

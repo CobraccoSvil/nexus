@@ -25,6 +25,8 @@ $PIDFILE = Join-Path $RUNTIME 'nexus-dev.pids.json'
 
 # Lettura dei manifest: punto unico condiviso con dev-service.ps1/nexus-publish.ps1.
 . (Join-Path $PSScriptRoot 'lib\nexus-manifest.ps1')
+# «Questo processo registrato e' vivo?»: punto unico condiviso con dev-stop.ps1.
+. (Join-Path $PSScriptRoot 'lib\nexus-liveness.ps1')
 
 # Ordine di avvio: infra dati -> mcp-core (attende 5s) -> altri Rust -> web-ide.
 $order = @(
@@ -42,10 +44,64 @@ foreach ($pg in 'postgresql-x64-17', 'nexus-pg-nexus', 'nexus-pg-app') {
   }
 }
 
-# Evita doppioni se uno stack e' gia' attivo.
+# Evita doppioni se uno stack e' gia' attivo — CHIEDENDOLO AL SISTEMA OPERATIVO,
+# non al filesystem (incidente 2026-08-08).
+#
+# Prima qui bastava `Test-Path $PIDFILE`: l'esistenza di un file era trattata
+# come la prova che nove processi stessero girando. L'08/08/2026 erano morti
+# tutti e nove insieme — sono figli di una console, e quando quella termina se ne
+# vanno insieme — e il file li elencava ancora tutti: lo stack non ripartiva, e
+# l'unico rimedio era eseguire dev-stop.ps1 per fermare cio' che non c'era.
+#
+# Il pidfile resta la fonte di CHI cercare; l'esistenza la dice il SO. E i tre
+# esiti vogliono tre condotte diverse: qualcuno vivo -> non si parte (era il caso
+# per cui la guardia esiste); tutti morti -> il file e' un residuo, si dice e si
+# procede; qualcuno non interrogabile -> non si decide da soli, perche' agire
+# sull'ignoto e' il difetto nell'altra direzione.
 if (Test-Path $PIDFILE) {
-  Write-Warning "Trovato ${PIDFILE}: uno stack potrebbe essere gia' attivo. Esegui prima .\deploy\dev-stop.ps1. Interrompo."
-  return
+  $voci = @()
+  try { $voci = Read-NexusPidFile -Path $PIDFILE }
+  catch {
+    Write-Warning "${PIDFILE} illeggibile ($($_.Exception.Message)): non posso sapere cosa c'e' in giro. Esegui .\deploy\dev-stop.ps1 e rilancia. Interrompo."
+    return
+  }
+  # I pidfile scritti prima di questo criterio non portano ne' `start` ne' `exe`,
+  # e senza almeno una prova ogni pid resterebbe «non interrogabile» — cioe' lo
+  # stack bloccato come prima, che e' proprio il difetto da chiudere. L'exe
+  # atteso pero' lo sappiamo comunque: e' quello che il manifest dichiara per
+  # quell'id, e il manifest si legge dal suo punto unico.
+  $voci = @($voci | ForEach-Object {
+      $v = $_
+      if ($v.PSObject.Properties['exe'] -and $v.exe) { return $v }
+      $xml = Join-Path $WINSW "$($v.id)\$($v.id).xml"
+      $atteso = $null
+      if (Test-Path $xml) {
+        try { $atteso = [IO.Path]::GetFileNameWithoutExtension((Read-NexusServiceManifest -Path $xml).Executable) }
+        catch { $atteso = $null }
+      }
+      [pscustomobject]@{
+        id    = $v.id
+        pid   = $v.pid
+        start = (& { if ($v.PSObject.Properties['start']) { $v.start } else { $null } })
+        exe   = $atteso
+      }
+    })
+  $stato = Get-NexusStackLiveness -Voci $voci
+  $vivi = @($stato | Where-Object { $_.Vivo })
+  $ignoti = @($stato | Where-Object { -not $_.Vivo -and -not $_.AutorizzaDichiararloMorto })
+
+  if ($vivi.Count -gt 0) {
+    Write-Warning "Stack gia' ATTIVO: $($vivi.Count) processo/i vivo/i ($(($vivi | ForEach-Object { "$($_.Id) pid $($_.ProcessId)" }) -join ', ')). Esegui prima .\deploy\dev-stop.ps1. Interrompo."
+    return
+  }
+  if ($ignoti.Count -gt 0) {
+    Write-Warning "Stato non accertabile per $($ignoti.Count) processo/i del pidfile:"
+    $ignoti | ForEach-Object { Write-Warning "  $($_.Id) pid $($_.ProcessId): $($_.Dettaglio)" }
+    Write-Warning "Non riavvio da solo: un doppio stack e' peggio di uno fermo. Verifica con Get-Process, poi esegui .\deploy\dev-stop.ps1 (da shell ELEVATA se i processi sono elevati). Interrompo."
+    return
+  }
+  Write-Host "Pidfile residuo: tutti e $($stato.Count) i processi registrati sono morti, lo rimuovo e proseguo." -ForegroundColor DarkGray
+  Remove-Item $PIDFILE -Force -ErrorAction SilentlyContinue
 }
 
 New-Item -ItemType Directory -Force -Path $LOGDIR | Out-Null
@@ -127,7 +183,21 @@ foreach ($id in $order) {
       else { Set-Item -Path "env:$k" -Value $saved[$k] }
     }
 
-    $started += [pscustomobject]@{ id = $id; pid = $proc.Id }
+    # `start` (epoch unix dell'avvio REALE, letto dal SO) e' il discriminante
+    # d'identita' del pid: senza, alla lettura successiva non c'e' modo di dire
+    # se quel numero e' ancora questo processo o un estraneo che ne ha ereditato
+    # il pid. Si legge qui, dove il processo e' appena nato e certamente il
+    # nostro. Se il SO non lo dichiara resta assente, e chi legge lo trattera'
+    # per quello che e': non accertabile, mai «vivo» d'ufficio.
+    $started += [pscustomobject]@{
+      id    = $id
+      pid   = $proc.Id
+      start = (Get-NexusProcessStartUnix -ProcessId $proc.Id)
+      # Il nome si MISURA sul processo nato, non si deduce dal manifest: se
+      # l'eseguibile lanciato non fosse quello dichiarato, un `exe` copiato dal
+      # manifest confermerebbe per sempre un'identita' mai verificata.
+      exe   = $proc.ProcessName
+    }
     Write-Host ("avviato {0,-16} pid {1}" -f $id, $proc.Id) -ForegroundColor Green
 
     if ($id -eq 'nexus-mcp-core') { Start-Sleep -Seconds 5 } else { Start-Sleep -Milliseconds 600 }

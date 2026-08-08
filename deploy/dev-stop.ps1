@@ -13,10 +13,16 @@ $RUNTIME = 'D:\IDEAI-runtime'
 $PIDFILE = Join-Path $RUNTIME 'nexus-dev.pids.json'
 
 . (Join-Path $PSScriptRoot 'lib\nexus-process.ps1')
+. (Join-Path $PSScriptRoot 'lib\nexus-liveness.ps1')
 
 # Processi sopravvissuti al kill: raccolti qui e riportati insieme in coda, cosi'
 # un fallimento non impedisce di tentare gli altri servizi.
 $survivors = @()
+# Voci del pidfile su cui NON si e' tentato nulla perche' non si e' potuto
+# accertare di chi fosse il pid. Tengono vivo il pidfile ed escludono l'uscita 0
+# esattamente come i sopravvissuti: in entrambi i casi non sappiamo se un .exe
+# resta lockato, e dev-build.ps1 non deve compilarci contro.
+$nonAccertati = @()
 
 function Invoke-Kill([int]$processId, [string]$label, [string]$how) {
   $res = Stop-NexusProcessTree -ProcessId $processId -Label $label -KillTree
@@ -34,17 +40,34 @@ function Invoke-Kill([int]$processId, [string]$label, [string]$how) {
 # sia un array sia un oggetto singolo (pidfile serializzato a un elemento).
 if (Test-Path $PIDFILE) {
   try {
-    $procs = Get-Content $PIDFILE -Raw | ConvertFrom-Json
-    foreach ($p in @($procs)) {
-      if ($p.pid) { Invoke-Kill ([int]$p.pid) ([string]$p.id) '' }
+    $procs = Read-NexusPidFile -Path $PIDFILE
+    # Il pid nel file e' un NUMERO, non un'identita': prima di `taskkill /T /F`
+    # si verifica che sia ancora il nostro processo. Senza questa domanda un pid
+    # riciclato dal SO fa abbattere l'albero di un estraneo — e' la stessa
+    # ragione per cui dev-start non si fida piu' del solo file, vista dal lato
+    # in cui l'errore fa danno invece di bloccare.
+    foreach ($v in (Get-NexusStackLiveness -Voci @($procs))) {
+      if ($v.Vivo) {
+        Invoke-Kill $v.ProcessId $v.Id ''
+        continue
+      }
+      if ($v.AutorizzaDichiararloMorto) {
+        # Gia' fermo (o pid riciclato: il nostro processo non c'e' piu').
+        continue
+      }
+      Write-Warning "$($v.Id) pid $($v.ProcessId): NON tocco questo pid, $($v.Dettaglio)"
+      $nonAccertati += $v
     }
   }
   catch { Write-Warning "pidfile illeggibile ($($_.Exception.Message)); procedo col fallback per nome." }
-  # Il pidfile va via solo se NESSUN processo e' sopravvissuto: cancellarlo mentre
+  # Il pidfile va via solo se non resta nulla di aperto: cancellarlo mentre
   # qualcosa e' ancora vivo perde l'unica traccia del PID (orfano non rintracciabile)
   # e fa credere a dev-start.ps1 che lo stack sia giu'.
-  if ($survivors.Count -eq 0) { Remove-Item $PIDFILE -Force -ErrorAction SilentlyContinue }
-  else { Write-Warning "$PIDFILE NON rimosso: contiene processi ancora vivi." }
+  if ($survivors.Count -eq 0 -and $nonAccertati.Count -eq 0) {
+    Remove-Item $PIDFILE -Force -ErrorAction SilentlyContinue
+  }
+  elseif ($survivors.Count -gt 0) { Write-Warning "$PIDFILE NON rimosso: contiene processi ancora vivi." }
+  else { Write-Warning "$PIDFILE NON rimosso: contiene pid di cui non si e' potuto accertare lo stato." }
 }
 
 # 2) SEMPRE fallback per nome dei processi noti ancora vivi. Il pidfile puo' essere
@@ -77,6 +100,11 @@ Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object {
 if ($survivors.Count -gt 0) {
   Write-Host ''
   [Console]::Error.WriteLine("Stack NON fermato: $($survivors.Count) processo/i sopravvissuto/i al kill (vedi sopra). Non compilare: gli eseguibili sono lockati.")
+  exit 1
+}
+if ($nonAccertati.Count -gt 0) {
+  Write-Host ''
+  [Console]::Error.WriteLine("Stack NON dichiarato fermo: $($nonAccertati.Count) pid del pidfile non erano accertabili e non sono stati toccati (vedi sopra). Non compilare: non sappiamo se quegli eseguibili sono ancora in uso.")
   exit 1
 }
 Write-Host 'Stack fermato.' -ForegroundColor Cyan
