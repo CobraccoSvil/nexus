@@ -3057,6 +3057,34 @@ gamma
     /// fisso, il ramo del file inesistente resta verde ma quello del permesso
     /// negato mentirebbe — ed e' il motivo per cui la natura non si sceglie a
     /// mano su un errore che il sistema operativo ha gia' classificato.
+    /// La causa del percorso deve arrivare fino al MODELLO, che e' il solo
+    /// consumatore di questo testo (regola O: si asserisce la conseguenza, non
+    /// la stringa della funzione interna — `paths.rs` prova gia' quella).
+    ///
+    /// Il caso e' quello misurato l'08/08/2026 su gestione-corsi: il modello
+    /// chiede un sottopath di una cartella che ESISTE. Il testo storico era
+    /// "[Errore percorso: Percorso non trovato]" per QUALUNQUE causa, e da li'
+    /// non si poteva sapere se avesse sbagliato l'ultimo segmento, l'intero
+    /// ramo, o se il resolver fosse rotto.
+    #[tokio::test]
+    async fn list_files_consegna_al_modello_la_causa_e_il_tratto_esistente() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("school-courses-fe/src")).expect("albero");
+        let ctx = ctx_di_prova(dir.path().to_path_buf(), Arc::new(HookRegistranti::default()));
+
+        let out = super::tool_list_files(
+            &ctx,
+            &serde_json::json!({"directory": "school-courses-fe/SchoolCoursesApi"}),
+        )
+        .await;
+
+        assert!(out.contains("school-courses-fe/SchoolCoursesApi"), "{out}");
+        assert!(
+            out.contains("il tratto esistente piu' profondo e' 'school-courses-fe'"),
+            "il modello deve sapere fin dove il percorso esiste: {out}"
+        );
+    }
+
     #[tokio::test]
     async fn i_tool_di_mutazione_dichiarano_esito_e_natura_nei_campi() {
         use nexus_types::tool_outcome::{EsitoTool, NaturaFallimento};
