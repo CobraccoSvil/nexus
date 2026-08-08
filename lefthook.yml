@@ -108,6 +108,24 @@ pre-commit:
       run: bash scripts/check-single-source.sh
       fail_text: "pre-commit: regressione su un punto unico (regola L / ADR 0026)."
 
+    # Criterio «questo processo registrato e' vivo?» degli script di deploy: qui
+    # un errore non produce un messaggio sbagliato, produce un'AZIONE sbagliata
+    # (uno stack che non riparte, o un taskkill /T sull'albero di un estraneo che
+    # ha ereditato un pid). Gira solo quando si tocca quel criterio, e solo dove
+    # c'e' PowerShell: in CI Linux `powershell.exe` non esiste e il passo si salta
+    # dichiarandolo, invece di risultare verde per assenza.
+    liveness_selftest:
+      glob:
+        - "deploy/lib/nexus-liveness.ps1"
+        - "deploy/dev-start.ps1"
+        - "deploy/dev-stop.ps1"
+        - "scripts/liveness-selftest.ps1"
+      # Una riga sola: lefthook passa il `run` a `sh -c` e un blocco if/then/fi
+      # su piu' righe arriva troncato (`syntax error: unexpected end of file`),
+      # cioe' il gate fallisce senza aver eseguito nulla.
+      run: bash scripts/liveness-selftest.sh
+      fail_text: "pre-commit: il criterio di liveness degli script di deploy non supera il proprio self-test (scripts/liveness-selftest.ps1)."
+
     # Gate ratchet dei marker di debito e delle frasi di inerzia
     # (scripts/markers-baseline.json): grep istantaneo. Il conteggio puo' solo
     # SCENDERE — nessun commit aggiunge un TODO/FIXME/INERTE netto. Come gli altri

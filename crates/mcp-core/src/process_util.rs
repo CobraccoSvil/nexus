@@ -173,20 +173,46 @@ pub(crate) fn read_process_metrics(pid: u32) -> Option<ProcessMetrics> {
     }
 }
 
-/// (Solo Windows) Istante di AVVIO del processo `pid` come epoch unix (secondi).
-/// `None` se il PID non esiste/non e' accessibile o il creation-time non e'
-/// leggibile.
+/// Istante di AVVIO del processo `pid` come epoch unix (secondi). `None` se il
+/// PID non esiste/non e' accessibile o il creation-time non e' leggibile.
 ///
-/// Serve a VALIDARE L'IDENTITA' di un PID persistito (regola M): Windows ricicla
-/// i PID in modo aggressivo, quindi un `pid` letto dal DB (`agent_processes.pid`,
-/// mai azzerato allo stop) puo' gia' appartenere a un processo ESTRANEO. Il
-/// chiamante confronta questo start-time con lo `started_at` atteso del servizio:
-/// se non combaciano (entro tolleranza), il PID e' riciclato e il servizio va
-/// trattato come morto. `process_alive`/`read_process_metrics` da soli non
-/// bastano: `OpenProcess` riesce su QUALSIASI processo con quel PID.
+/// E' il DISCRIMINANTE D'IDENTITA' di un PID persistito (regola M): un `pid`
+/// letto da un registro (`agent_processes.pid`, il pidfile degli script di
+/// deploy) puo' gia' appartenere a un processo ESTRANEO, perche' il SO li
+/// ricicla. Il criterio che confronta questo valore con l'avvio atteso e' UNICO
+/// e vive in [`crate::process_liveness`]: qui si raccoglie soltanto il fatto.
 ///
-/// Su Unix questa validazione non serve (il PID viene da `systemctl MainPID`
-/// fresco a ogni ciclo, mai stantio), quindi la funzione e' Windows-only.
+/// Cross-platform di proposito, anche se la validazione nacque per Windows: un
+/// criterio d'identita' che esiste su una piattaforma sola non e' un criterio,
+/// e' un ramo che su Linux degrada in silenzio a «non interrogabile» — cioe' il
+/// difetto che [`crate::process_liveness`] esiste per rendere visibile.
+///
+/// - Windows: `GetProcessTimes` (creation FILETIME, unita' 100ns dal 1601).
+/// - Unix: `/proc/<pid>/stat` campo 22 (`starttime`, tick dal boot) diviso
+///   USER_HZ, sommato a `btime` di `/proc/stat` (istante del boot in epoch).
+#[cfg(unix)]
+pub(crate) fn process_start_unix(pid: u32) -> Option<i64> {
+    /// USER_HZ standard Linux: `starttime` e' in 1/100 di secondo dal boot.
+    const USER_HZ: i64 = 100;
+
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Il campo comm (2o) e' fra parentesi e puo' contenere spazi: si riparte
+    // dopo ')', dove i campi ricominciano da "state" (campo 3). starttime e' il
+    // campo 22 -> indice 19 in questa numerazione.
+    let after = stat.rsplit_once(')').map(|(_, b)| b).unwrap_or(&stat);
+    let starttime: i64 = after.split_whitespace().nth(19)?.parse().ok()?;
+
+    // `btime` di /proc/stat e' l'istante del boot in epoch unix: senza, i tick
+    // dal boot non sono confrontabili con un timestamp del registro.
+    let boot_unix: i64 = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))
+        .and_then(|v| v.trim().parse().ok())?;
+
+    Some(boot_unix + starttime / USER_HZ)
+}
+
 #[cfg(windows)]
 pub(crate) fn process_start_unix(pid: u32) -> Option<i64> {
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
@@ -239,111 +265,117 @@ pub(crate) fn process_start_unix(pid: u32) -> Option<i64> {
     }
 }
 
-/// (Solo Windows) Tolleranza (secondi) nel confronto tra il creation-time reale
-/// del processo e lo `started_at` registrato in `agent_processes`, per validare
-/// l'identita' del PID (anti-riciclo). `started_at` e' impostato a NOW() subito
-/// dopo lo spawn della shell, il creation-time del figlio arriva pochi istanti
-/// dopo: lo scarto legittimo e' di frazioni di secondo. Un PID riciclato ha
-/// creation-time arbitrario (tipicamente molto distante). Margine ampio per non
-/// invalidare mai un processo vero, stretto abbastanza da scartare un estraneo.
-#[cfg(windows)]
-pub(crate) const PID_IDENTITY_TOLERANCE_S: i64 = 10;
-
-/// (Solo Windows) Predicato puro (regola L, testabile) dell'identita' di un PID:
-/// il creation-time reale del processo (`real_start`, epoch unix) combacia con
-/// lo `started_at` atteso (`expected_start`) entro `tolerance` secondi? Se non
-/// combacia, il PID e' stato riciclato dal SO su un processo estraneo -> il
-/// servizio va trattato come morto. Entrambi gli input sono Option: un dato
-/// mancante = identita' non confermabile = false (fail-safe: meglio un possibile
-/// crash segnalato che mascherato con metriche altrui).
-#[cfg(windows)]
-pub(crate) fn pid_identity_ok(
-    real_start: Option<i64>,
-    expected_start: Option<i64>,
-    tolerance: i64,
-) -> bool {
-    match (real_start, expected_start) {
-        (Some(real), Some(expected)) => (real - expected).abs() <= tolerance,
-        _ => false,
+/// Cosa il SO dice dell'ESISTENZA del `pid`. Raccoglie il fatto e basta: a
+/// giudicarlo e' [`crate::process_liveness`], punto unico del criterio.
+///
+/// Le quattro risposte non sono zelo tassonomico. `OpenProcess` fallisce con lo
+/// stesso handle nullo sia quando il pid non esiste sia quando il SO nega
+/// l'accesso (processo di un altro utente, o elevato mentre noi non lo siamo), e
+/// un `bool` fa delle due la stessa cosa: da li' nasce il servizio vivo
+/// dichiarato morto. E un processo USCITO resta apribile finche' un handle al
+/// suo oggetto kernel e' aperto altrove — tipicamente la shell che l'ha lanciato
+/// — quindi «apribile» non significa «in esecuzione»: serve il codice di uscita.
+///
+/// - Unix: `/proc/<pid>/stat` (stato `Z` = zombie -> uscito; assenza della
+///   directory -> assente; lettura negata -> non interrogabile).
+/// - Windows: `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` +
+///   `GetExitCodeProcess` (`STILL_ACTIVE` = 259 solo se ancora in esecuzione).
+#[cfg(unix)]
+pub(crate) fn esistenza_processo(pid: u32) -> crate::process_liveness::Esistenza {
+    use crate::process_liveness::Esistenza;
+    if pid == 0 {
+        return Esistenza::Assente;
+    }
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Esistenza::Assente,
+        Err(e) => {
+            return Esistenza::NonInterrogabile {
+                codice: e.raw_os_error().unwrap_or(0) as u32,
+            }
+        }
+    };
+    // Dopo ')' i campi ripartono da "state": 'Z' e' un processo terminato di cui
+    // resta solo la voce, l'equivalente Unix del processo uscito con handle
+    // ancora aperto.
+    let stato = stat
+        .rsplit_once(')')
+        .map(|(_, b)| b)
+        .unwrap_or(&stat)
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    if stato == "Z" {
+        Esistenza::Uscito
+    } else {
+        Esistenza::InEsecuzione
     }
 }
 
-/// (Solo Windows) PUNTO UNICO (regola L) della verifica di identita' di un PID
-/// persistito: il processo con quel `pid` e' ANCORA il processo registrato con
-/// `started_at` atteso? Combina lettura del creation-time reale e predicato di
-/// tolleranza. Usato dall'observer (stato servizi), dal port_enforcer
-/// (attribuzione PID->progetto) e dalla riconciliazione del pannello Servizi:
-/// senza questa verifica un PID riciclato dal SO su un processo estraneo (lsass,
-/// svchost, postgres dell'infrastruttura) veniva attribuito al progetto e le sue
-/// porte flaggate/killate come violazioni, o un servizio mostrato 'running'.
-///
-/// VINCOLO TIMEBASE: `expected_start_unix` deriva da `agent_processes.started_at`
-/// (`NOW()` del server Postgres) mentre `real_start` viene dalle FILETIME Win32
-/// (clock dell'host). Nell'ambiente canonico Nexus i Postgres sono NATIVI Windows
-/// (`pg_ctl` su C:\Program Files\PostgreSQL, non container) -> stesso clock host,
-/// scarto misurato < 1s, ben dentro la tolleranza. Se in futuro il DB girasse in
-/// una VM/container con orologio derivante rispetto all'host, la tolleranza fissa
-/// di 10s non basterebbe e servirebbe ancorare l'anti-riciclo a un dato host-side
-/// (es. registrare il creation-time reale allo spawn, non `NOW()` del DB).
 #[cfg(windows)]
-pub(crate) fn pid_identity_confirmed(
-    pid: u32,
-    expected_start_unix: Option<i64>,
-) -> bool {
-    pid_identity_ok(
-        process_start_unix(pid),
-        expected_start_unix,
-        PID_IDENTITY_TOLERANCE_S,
-    )
-}
-
-/// `true` se esiste un processo vivo con questo `pid`.
-///
-/// - Unix: presenza di `/proc/{pid}` (coerente con l'implementazione storica).
-/// - Windows: `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` riesce solo se il PID
-///   esiste ed e' accessibile; un PID terminato non e' apribile (handle 0 -> non-vivo).
-///   Non si usa `WaitForSingleObject` perche' richiederebbe il diritto `SYNCHRONIZE`.
-#[cfg(unix)]
-pub(crate) fn process_alive(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
-}
-
-#[cfg(windows)]
-pub(crate) fn process_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::CloseHandle;
+pub(crate) fn esistenza_processo(pid: u32) -> crate::process_liveness::Esistenza {
+    use crate::process_liveness::Esistenza;
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER};
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     if pid == 0 {
-        return false;
+        return Esistenza::Assente;
     }
-    // ATTENZIONE (fix root-cause): `OpenProcess` da solo NON basta a decidere la
-    // liveness su Windows. Riesce (handle non-zero) anche su un processo GIA'
-    // USCITO, finche' un handle al suo process object resta aperto altrove (es. la
-    // shell padre che l'ha lanciato): il PID non e' riusato ma il processo e'
-    // morto (zombie non-reaped, invisibile a Get-Process). Il vecchio codice
-    // ritornava true in questo caso -> falso positivo su TUTTI i processi
-    // terminati-non-reaped, e i consumer (riconciliazione stato servizi, detect
-    // porte, cleanup) trattavano i morti come vivi. Serve il codice di uscita:
-    // `GetExitCodeProcess` ritorna STILL_ACTIVE (259) solo se il processo e'
-    // ancora in esecuzione. Edge noto e trascurabile: un processo che esce con
-    // codice esattamente 259 verrebbe riportato vivo (i dev server escono con 0 o
-    // il codice di crash, mai 259).
-    // In windows-sys 0.52 HANDLE e' un isize; OpenProcess ritorna 0 su fallimento.
-    // SAFETY: `pid` e' un intero senza vincoli; OpenProcess/GetExitCodeProcess
-    // gestiscono il fallimento (handle 0 / ritorno 0). L'handle viene sempre
-    // rilasciato con CloseHandle. Nessun puntatore a memoria condivisa.
+    /// `GetExitCodeProcess` riporta questo finche' il processo e' in esecuzione.
+    /// Edge noto e trascurabile: un processo che esce con codice esattamente 259
+    /// risulterebbe in esecuzione (i dev server escono con 0 o col codice di
+    /// crash, mai 259).
     const STILL_ACTIVE: u32 = 259;
+    // SAFETY: `pid` e' un intero senza vincoli; OpenProcess/GetExitCodeProcess
+    // segnalano il fallimento (handle 0 / ritorno 0) e sono gestiti. L'handle
+    // non-nullo e' SEMPRE rilasciato con CloseHandle. `exit_code` e' stack-locale
+    // e non esce dallo scope: nessun aliasing.
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle == 0 {
-            return false;
+            // `ERROR_INVALID_PARAMETER` e' come il SO dice «questo pid non
+            // esiste». Qualunque altro codice — in pratica `ERROR_ACCESS_DENIED`
+            // — dice che il processo potrebbe esserci e non ce lo lascia vedere:
+            // trattarlo come assenza e' l'errore che dichiara morti i vivi.
+            let codice = GetLastError();
+            return if codice == ERROR_INVALID_PARAMETER {
+                Esistenza::Assente
+            } else {
+                Esistenza::NonInterrogabile { codice }
+            };
         }
         let mut exit_code: u32 = 0;
-        let ok = GetExitCodeProcess(handle, &mut exit_code);
+        let letto = GetExitCodeProcess(handle, &mut exit_code);
+        let codice_errore = if letto == 0 { GetLastError() } else { 0 };
         CloseHandle(handle);
-        ok != 0 && exit_code == STILL_ACTIVE
+        if letto == 0 {
+            return Esistenza::NonInterrogabile {
+                codice: codice_errore,
+            };
+        }
+        if exit_code == STILL_ACTIVE {
+            Esistenza::InEsecuzione
+        } else {
+            Esistenza::Uscito
+        }
     }
+}
+
+/// `true` se esiste un processo IN ESECUZIONE con questo `pid`.
+///
+/// PREMESSA VINCOLANTE: risponde alla domanda RISTRETTA «c'e' un processo con
+/// questo pid?», ed e' legittima solo per un pid ottenuto dal SO poco fa (un
+/// listener appena enumerato, un pid appena tentato da un kill, un `MainPID`
+/// letto ora da systemctl). Per un pid che viene da un REGISTRO — una colonna,
+/// un pidfile — non e' la domanda giusta e non va usata: il pid puo' essere
+/// stato riciclato, e questa funzione risponderebbe `true` per un estraneo.
+/// Quel caso ha il suo punto unico: [`crate::process_liveness::stato_del_pid`].
+pub(crate) fn process_alive(pid: u32) -> bool {
+    matches!(
+        esistenza_processo(pid),
+        crate::process_liveness::Esistenza::InEsecuzione
+    )
 }
 
 /// Termina il processo `pid` in modo best-effort. PUNTO UNICO (regola L) per la
@@ -956,7 +988,10 @@ mod tests {
             exe_name_senza_estensione(&utf16("my.service.host")),
             "my.service.host"
         );
-        assert_eq!(exe_name_senza_estensione(&utf16("senza-punto")), "senza-punto");
+        assert_eq!(
+            exe_name_senza_estensione(&utf16("senza-punto")),
+            "senza-punto"
+        );
     }
 
     #[test]
@@ -988,14 +1023,17 @@ mod tests {
         assert!(read_process_metrics(u32::MAX).is_none());
     }
 
-    #[cfg(windows)]
     #[test]
     fn start_unix_del_processo_corrente_plausibile() {
-        // Il creation-time del processo corrente deve essere leggibile e coerente:
-        // dopo il 2020-01-01 (1577836800) e non nel futuro. Serve alla validazione
-        // anti-riciclo del PID nel collector Windows dell'observer.
+        // L'istante d'avvio del processo corrente deve essere leggibile e
+        // coerente: dopo il 2020-01-01 (1577836800) e non nel futuro. E' il
+        // discriminante d'identita' anti-riciclo, quindi un `None` qui
+        // renderebbe ogni verdetto «non interrogabile» — cioe' il criterio
+        // inerte proprio dove serve. Cross-platform di proposito: il ramo Unix
+        // somma btime e starttime, e se sbagliasse unita' di misura darebbe un
+        // numero fuori scala che questo test cattura.
         let start = process_start_unix(std::process::id())
-            .expect("creation-time del processo corrente leggibile");
+            .expect("istante d'avvio del processo corrente leggibile");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -1004,41 +1042,25 @@ mod tests {
         assert!(start <= now + 5, "start-time nel futuro: {start} > {now}");
     }
 
-    #[cfg(windows)]
     #[test]
     fn start_unix_pid_inesistente_none() {
         assert!(process_start_unix(u32::MAX).is_none());
     }
 
-    #[cfg(windows)]
+    /// Il processo corrente esiste ed e' in esecuzione; un pid assurdo e'
+    /// ASSENTE, non «non interrogabile». La distinzione e' il fatto su cui
+    /// `process_liveness` decide se una morte si puo' persistere: se il SO
+    /// dicesse `NonInterrogabile` per un pid inesistente, nessuna riga stantia
+    /// verrebbe piu' corretta.
     #[test]
-    fn pid_identity_riconosce_riciclo() {
-        // Creation-time entro tolleranza dello started_at atteso = identita' OK
-        // (e' il nostro servizio). started_at 1000, real 1002, tolleranza 10.
-        assert!(pid_identity_ok(Some(1002), Some(1000), 10));
-        assert!(pid_identity_ok(Some(1000), Some(1000), 10));
-        // Creation-time molto distante = PID riciclato su un processo estraneo
-        // (avviato in un altro momento) -> identita' FALLITA -> servizio morto.
-        assert!(!pid_identity_ok(Some(1050), Some(1000), 10));
-        assert!(!pid_identity_ok(Some(500), Some(1000), 10));
-        // Dato mancante (started_at NULL o creation-time non leggibile) = identita'
-        // non confermabile -> false (fail-safe).
-        assert!(!pid_identity_ok(None, Some(1000), 10));
-        assert!(!pid_identity_ok(Some(1000), None, 10));
-        assert!(!pid_identity_ok(None, None, 10));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn pid_identity_confirmed_processo_corrente() {
-        // Il processo corrente con il PROPRIO start-time reale come atteso deve
-        // confermare l'identita'; con uno started_at lontano deve rifiutarla
-        // (simula il riciclo: riga DB stantia con PID riassegnato).
-        let me = std::process::id();
-        let real = process_start_unix(me).expect("start-time leggibile");
-        assert!(pid_identity_confirmed(me, Some(real)));
-        assert!(!pid_identity_confirmed(me, Some(real - 3600)));
-        assert!(!pid_identity_confirmed(me, None));
+    fn esistenza_distingue_in_esecuzione_da_assente() {
+        use crate::process_liveness::Esistenza;
+        assert_eq!(
+            esistenza_processo(std::process::id()),
+            Esistenza::InEsecuzione
+        );
+        assert_eq!(esistenza_processo(u32::MAX), Esistenza::Assente);
+        assert_eq!(esistenza_processo(0), Esistenza::Assente);
     }
 
     #[cfg(windows)]

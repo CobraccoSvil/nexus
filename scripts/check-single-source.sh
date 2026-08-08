@@ -2354,6 +2354,65 @@ if [[ -n "${riassunto_hits// /}" ]]; then
 else
   echo "OK riassunto-del-run: la domanda ha un punto unico e i due finalizzatori vi delegano"
 fi
+# -- vita-processo (2026-08-08) ----------------------------------------------
+#
+# «Questo processo registrato e' vivo?» ha UN criterio. Prima ne aveva tre, e
+# sbagliavano in direzioni opposte: `process_alive` da solo diceva VIVO su un pid
+# riciclato (l'08/08 il pidfile dello stack dev elencava nove processi morti da
+# ore, e dev-start.ps1 si rifiutava di ripartire); `process_alive &&
+# pid_identity_confirmed` diceva MORTO ogni volta che l'identita' non era
+# CONFERMABILE, e i consumatori che persistono scrivevano quel non-verdetto in DB
+# come 'stopped'/'failed'.
+#
+# Il criterio ha tre esiti perche' i casi sono tre: `e_vivo()` e
+# `autorizza_a_dichiararlo_morto()` non sono l'uno la negazione dell'altro, e un
+# `bool` non poteva esprimerlo.
+assert_single "vita-processo" 'pub\(crate\) enum StatoProcesso' \
+  'crates/mcp-core/src/process_liveness.rs' crates
+assert_single "vita-processo-criterio" 'pub\(crate\) fn classifica\(' \
+  'crates/mcp-core/src/process_liveness.rs' crates
+# «Questo SERVIZIO e' vivo?» e' un'ALTRA domanda, e ha il suo punto unico: il pid
+# registrato e' la shell, il server e' un suo discendente che le sopravvive
+# (misurato su gestione-corsi il 07/08, pid 20728 morto e porta 34859 in ascolto
+# dal pid 3860). Delegano il pannello Servizi e l'observer.
+assert_single "vita-servizio" 'pub\(super\) fn classifica_servizio' \
+  'crates/mcp-core/src/project_workspace/service_liveness.rs' crates
+# Il predicato vecchio non deve poter rientrare da nessuna parte: era il canale a
+# due valori da cui nascevano entrambe le direzioni del difetto.
+identita_bool="$(grep -rn --include='*.rs' --exclude-dir=target \
+  -E 'fn pid_identity_(ok|confirmed)' crates 2>/dev/null || true)"
+if [[ -n "$identita_bool" ]]; then
+  echo "!! vita-processo: l'identita' del pid torna a essere un booleano" >&2
+  echo "   (l'ignoto degraderebbe di nuovo a 'morto'). Usare" >&2
+  echo "   mcp_core::process_liveness::stato_del_pid / stato_da_riga:" >&2
+  printf '%s\n' "$identita_bool" >&2
+  fail=1
+else
+  echo "OK vita-processo: nessun predicato booleano d'identita' del pid"
+fi
+# Gemello PowerShell: l'istante d'avvio E' il discriminante d'identita', e ha un
+# solo lettore. Un altro script che se lo rilegga per conto proprio e' un secondo
+# criterio, che divergera' da questo come i tre di prima.
+avvio_ps="$(grep -rln --include='*.ps1' -E '\.StartTime' deploy/ 2>/dev/null \
+  | grep -v 'deploy/lib/nexus-liveness.ps1' || true)"
+if [[ -n "$avvio_ps" ]]; then
+  echo "!! vita-processo: l'istante d'avvio si rilegge fuori dal punto unico:" >&2
+  printf '%s\n' "$avvio_ps" >&2
+  echo "   Delegare a Get-NexusProcessLiveness (deploy/lib/nexus-liveness.ps1)." >&2
+  fail=1
+else
+  echo "OK vita-processo: un solo lettore dell'istante d'avvio negli script"
+fi
+# E la guardia dello stack non torna a decidere dall'ESISTENZA DEL FILE: e' cio'
+# che il 08/08/2026 ha bloccato il riavvio di uno stack gia' morto.
+if grep -qE '^\s*if \(Test-Path \$PIDFILE\) \{\s*$' deploy/dev-start.ps1 \
+  && ! grep -q 'Get-NexusStackLiveness' deploy/dev-start.ps1; then
+  echo "!! vita-processo: dev-start.ps1 decide dal solo Test-Path del pidfile," >&2
+  echo "   senza chiedere al sistema operativo chi e' ancora vivo." >&2
+  fail=1
+else
+  echo "OK vita-processo: la guardia dello stack interroga il SO"
+fi
 
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
