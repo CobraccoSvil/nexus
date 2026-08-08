@@ -236,6 +236,18 @@ pub struct FinalGateConfig {
     /// una copia qui per soddisfare il grafo delle dipendenze sarebbe la seconda
     /// definizione dello stesso criterio (regola L).
     pub ui_styling_criterion: Option<crate::runtime::ports::CriterionSpec>,
+    /// Criterio «l'app SENZA server mostra davvero il suo contenuto?», gia'
+    /// costruito dal motore. `None` = criterio spento, oppure il progetto non e'
+    /// un'app statica (ha un servizio, o non ha una pagina): in quei casi non
+    /// nasce affatto, invece di nascere e dichiararsi inconcludente — un
+    /// inconcludente chiude il run `completed_unverified`, e un criterio
+    /// inapplicabile non deve declassare i run a cui non si applica.
+    ///
+    /// Arriva PRONTO per la stessa ragione di `ui_styling_criterion`: il suo URL
+    /// dipende dalla RADICE del progetto e dall'entry rilevata sul filesystem,
+    /// che questo crate non vede. Il nodo vi aggiunge la sola parte che conosce
+    /// lui — il contenitore DICHIARATO dall'agente.
+    pub static_render_criterion: Option<crate::runtime::ports::CriterionSpec>,
     /// ADR 0036: catena di verifica PER-AMBIENTE risolta a monte (profilo
     /// inferito da LLM in `project_verify_profiles`, step marcati gate=true).
     /// Un criterio `run_command` per step, nell'ordine del profilo (es.
@@ -320,6 +332,7 @@ impl Default for FinalGateConfig {
             // Nessun criterio a DB muto: lo costruisce il motore quando la
             // chiave e' accesa e il progetto ha una radice.
             ui_styling_criterion: None,
+            static_render_criterion: None,
             verify_steps: Vec::new(),
             verify_profile_missing: false,
             origine_frontend: None,
@@ -722,6 +735,25 @@ impl FinalGateNode {
         //      «completato». Interrogarla qui e' la differenza fra una misura
         //      costruita e una in esercizio.
         criteria.extend(self.cfg.ui_styling_criterion.clone());
+
+        // (5e) L'app SENZA server MOSTRA il proprio contenuto? Il criterio (5c)
+        //      non copre questo caso e non per svista: e' costruito attorno a
+        //      un'ORIGINE HTTP, e un'app statica non ha un servizio a cui
+        //      chiedere. Qui il contenuto non arriva dalla rete — lo genera il
+        //      JavaScript della pagina — quindi l'unico modo di sapere se e'
+        //      arrivato e' aprirla e guardare il DOM dopo che ha girato.
+        //      MISURATO l'08/08/2026 su gestione-corsi: `landing/index.html`
+        //      approvata al terzo tentativo guardando i FILE, con le sei card
+        //      generate all'avvio da una funzione in fondo allo script. La
+        //      pagina era corretta; un `throw` prima di quella chiamata avrebbe
+        //      dato lo stesso file valido e una griglia vuota, e nessun criterio
+        //      attivo distingueva i due casi.
+        //      Il contenitore DICHIARATO si innesta qui perche' e' l'unica parte
+        //      che il nodo conosce (sta nello stato del run); il resto del
+        //      criterio arriva gia' risolto dal motore.
+        criteria.extend(self.cfg.static_render_criterion.clone().map(|c| {
+            crate::decisions::static_render::con_contenitore(c, state.declared_outcome.as_ref())
+        }));
 
         // (6) design_verify (P5): per i task figma l'agente non puo' chiudere con
         //     una resa visiva sotto soglia che HA GIA' misurato con nexus_visual_compare.
@@ -2477,6 +2509,71 @@ mod tests {
             })
             .is_none(),
             "senza origine frontend il criterio non deve nascere"
+        );
+    }
+
+    /// L'ANELLO CHE CONTA per il criterio della resa: deve arrivare fino ai
+    /// criteri del gate, e portarsi dietro la DICHIARAZIONE dell'agente.
+    ///
+    /// Le due parti nascono in posti diversi — l'URL lo risolve il motore, che
+    /// conosce la radice; il contenitore lo sa solo qui, dove si vede lo stato
+    /// del run — ed e' proprio la giunzione in cui una delle due puo' perdersi
+    /// senza che nulla fallisca: il criterio resterebbe valido, con un segnale
+    /// in meno e nessuno ad accorgersene.
+    ///
+    /// MUTAZIONE: togliere `con_contenitore` dall'`extend` -> il selettore
+    /// sparisce dalla spec e il browser non cerca piu' nulla, cioe' il caso
+    /// «id sbagliato, nessuna eccezione, pagina piena» torna verde.
+    #[test]
+    fn il_criterio_della_resa_arriva_al_gate_con_la_dichiarazione() {
+        use crate::decisions::static_render::{self, CRITERION_TYPE};
+        let criterio = static_render::criterio_resa(
+            Some("http://127.0.0.1:4000/preview/abc/landing/index.html"),
+            None,
+            5,
+            15.0,
+            2500,
+        );
+        let cerca = |dichiarato: Option<Value>| {
+            let node = node_with(
+                FinalGateConfig {
+                    static_render_criterion: criterio.clone(),
+                    ..FinalGateConfig::default()
+                },
+                Arc::new(StubCriteriaRunner::with_results(vec![])),
+            );
+            let mut st = software_state();
+            st.declared_outcome = dichiarato;
+            node.build_criteria(&st)
+                .into_iter()
+                .find(|c| c.criterion_type == CRITERION_TYPE)
+        };
+
+        let c = cerca(Some(
+            json!({ "outcome": "done", "rendered_container": "#courses-grid" }),
+        ))
+        .expect("il criterio risolto dal motore deve arrivare ai criteri del gate");
+        assert_eq!(c.spec[static_render::CHIAVE_CONTENITORE], "#courses-grid");
+        assert_eq!(c.spec[static_render::CHIAVE_MIN_ELEMENTI], 5);
+
+        // Senza dichiarazione il criterio nasce lo stesso, coi due segnali che
+        // non richiedono di dichiarare nulla.
+        let senza = cerca(None).expect("il criterio non dipende dalla dichiarazione");
+        assert!(senza.spec.get(static_render::CHIAVE_CONTENITORE).is_none());
+
+        // Progetto non statico (o criterio spento): il motore non lo costruisce
+        // e il gate non lo inventa. Un inconcludente qui declasserebbe a
+        // `completed_unverified` ogni run a cui il criterio non si applica.
+        let node = node_with(
+            FinalGateConfig::default(),
+            Arc::new(StubCriteriaRunner::with_results(vec![])),
+        );
+        assert!(
+            !node
+                .build_criteria(&software_state())
+                .iter()
+                .any(|c| c.criterion_type == CRITERION_TYPE),
+            "senza criterio risolto dal motore, il gate non ne crea uno"
         );
     }
 

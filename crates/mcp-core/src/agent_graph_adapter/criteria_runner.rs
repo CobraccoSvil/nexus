@@ -49,6 +49,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use nexus_agent_graph::decisions::browser_dialogue;
+use nexus_agent_graph::decisions::static_render;
 use nexus_agent_graph::runtime::ports::{
     CriteriaRunner, CriterionOutcome, CriterionProvenance, CriterionResult, CriterionSpec,
     PortError, ToolCall, ToolExecutor, ToolOutcome,
@@ -597,6 +598,13 @@ impl FinalGateCriteriaRunnerAdapter {
             t if t == nexus_agent_tools::ui_styling::CRITERION_TYPE => {
                 self.check_ui_styling().await
             }
+            // L'app SENZA server mostra il proprio contenuto? Stessa attesa di
+            // readiness del dialogo: l'indirizzo e' la route `/preview` di
+            // mcp-core, che e' pur sempre un servizio HTTP da interrogare.
+            t if t == static_render::CRITERION_TYPE => {
+                self.attesa_bersaglio_http(&c.spec).await;
+                self.check_static_render(&c.spec, timeout_s).await
+            }
             "file_exists" => {
                 self.check_file_exists(&c.spec, &c.expected, timeout_s)
                     .await
@@ -1139,15 +1147,57 @@ task_complete (outcome + summary)"
         .await
         {
             Ok(p) => p,
-            Err(e) => {
-                return (
-                    CriterionOutcome::Inconclusive,
-                    json!({ "skipped_reason": format!("osservazione non riuscita: {e}"), "url": url }),
-                );
-            }
+            Err(e) => return strumento_muto(url, &e),
         };
         let verdetto = browser_dialogue::classifica_dialogo(&prove, &terze_parti);
         esito_dialogo(url, &prove, verdetto)
+    }
+
+    /// L'app SENZA server mostra il proprio contenuto? Il criterio e' il punto
+    /// unico puro [`static_render::classifica_resa`]: qui SOLO l'I/O (aprire la
+    /// pagina, contare il DOM) e la traduzione dell'esito.
+    ///
+    /// Un guasto dello STRUMENTO e' `Inconclusive`, mai `Failed`, per la stessa
+    /// ragione del criterio gemello: bocciare un progetto perche' la macchina
+    /// non sa guardarlo sarebbe il falso positivo peggiore, e il gate ha gia' il
+    /// canale giusto per dirlo (un run con inconcludenti chiude
+    /// `completed_unverified`, non `passed`).
+    async fn check_static_render(&self, spec: &Value, timeout_s: f64) -> (CriterionOutcome, Value) {
+        let Some(p) = ParametriResa::da_spec(spec) else {
+            return (
+                CriterionOutcome::Inconclusive,
+                json!({ "skipped_reason": "nessuna pagina da aprire" }),
+            );
+        };
+        let (url, selettore) = (p.url.as_str(), p.selettore.as_deref());
+        // La radice serve solo come working dir del processo node: la
+        // node_modules di Nexus vive nella CWD del servizio, e il progetto
+        // osservato non deve avere nulla installato.
+        let radice = self
+            .run_root
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let prove = match crate::agent_tools::browser_probe::osserva_resa(
+            &radice,
+            url,
+            selettore,
+            p.attesa_ms,
+            timeout_s.max(1.0) as u64,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => return strumento_muto(url, &e),
+        };
+        let verdetto = static_render::classifica_resa(&prove, p.minimo);
+        // Il selettore lo porta la spec, non i fatti: e' qui che le cause che lo
+        // riguardano prendono il loro nome, o il rilievo direbbe «il contenitore
+        // e' vuoto» senza dire quale.
+        let verdetto = match selettore {
+            Some(s) => static_render::cause_con_selettore(verdetto, s),
+            None => verdetto,
+        };
+        esito_resa(url, &prove, verdetto)
     }
 
     /// Lo stile dichiarato dal codice e' applicato? Il criterio e' il punto
@@ -1433,6 +1483,107 @@ fn esito_dialogo(
                         descrizioni.join("; ")
                     ),
                     "failed_requests": descrizioni,
+                    "console_errors": prove.errori_console.iter().take(3).collect::<Vec<_>>(),
+                }),
+            )
+        }
+    }
+}
+
+/// Un guasto dello STRUMENTO — Chromium assente, node assente, timeout — e'
+/// `Inconclusive`, mai `Failed`.
+///
+/// La decisione e' la stessa per i due criteri che aprono un browser, e sta in
+/// un punto solo perche' e' proprio dove sbagliarla costa: bocciare un progetto
+/// perche' la macchina non sa guardarlo e' il falso positivo peggiore, e il
+/// gate ha gia' il canale giusto per dirlo (un run con inconcludenti chiude
+/// `completed_unverified`, non `passed`). Se un domani si volesse cambiare,
+/// deve cambiare per entrambi o per nessuno.
+fn strumento_muto(url: &str, errore: &str) -> (CriterionOutcome, Value) {
+    (
+        CriterionOutcome::Inconclusive,
+        json!({
+            "skipped_reason": format!("osservazione non riuscita: {errore}"),
+            "url": url,
+        }),
+    )
+}
+
+/// I parametri della resa, letti dalla spec in un punto solo.
+///
+/// Le chiavi sono quelle del punto unico (`static_render::CHIAVE_*`) e si
+/// leggono qui, non sparse nel corpo del check: e' l'unico posto in cui la spec
+/// costruita dal produttore torna a essere dati, e tenerlo insieme rende
+/// evidente quando un campo manca. Senza URL non c'e' nulla da aprire e la
+/// struttura non nasce: la misura non e' possibile, e lo dice il tipo.
+struct ParametriResa {
+    url: String,
+    selettore: Option<String>,
+    minimo: usize,
+    attesa_ms: u64,
+}
+
+impl ParametriResa {
+    fn da_spec(spec: &Value) -> Option<Self> {
+        let url = spec
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|u| !u.is_empty())?;
+        Some(Self {
+            url: url.to_string(),
+            selettore: spec
+                .get(static_render::CHIAVE_CONTENITORE)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            minimo: spec
+                .get(static_render::CHIAVE_MIN_ELEMENTI)
+                .and_then(Value::as_u64)
+                .unwrap_or(5) as usize,
+            attesa_ms: spec
+                .get(static_render::CHIAVE_ATTESA_MS)
+                .and_then(Value::as_u64)
+                .unwrap_or(2000),
+        })
+    }
+}
+
+/// Traduce il verdetto della resa nella forma del gate. Gemella di
+/// [`esito_dialogo`]: stessa forma di evidenza, perche' chi legge un rilievo
+/// del gate non deve imparare due vocabolari per due criteri fratelli.
+///
+/// Gli errori di CONSOLE entrano nell'evidenza anche quando il verdetto e'
+/// negativo per altro: non bocciano (lo dichiara il punto unico), ma sono la
+/// prima cosa utile a chi deve capire perche' la pagina e' vuota.
+fn esito_resa(
+    url: &str,
+    prove: &static_render::ProveResa,
+    verdetto: static_render::VerdettoResa,
+) -> (CriterionOutcome, Value) {
+    use static_render::VerdettoResa;
+    match verdetto {
+        VerdettoResa::Resa { elementi } => (
+            CriterionOutcome::Passed,
+            json!({ "url": url, "elements_rendered": elementi }),
+        ),
+        VerdettoResa::NonConcludente { motivo } => (
+            CriterionOutcome::Inconclusive,
+            json!({ "url": url, "skipped_reason": motivo }),
+        ),
+        VerdettoResa::NonResa { cause } => {
+            let descrizioni: Vec<String> = cause.iter().take(5).map(|c| c.descrizione()).collect();
+            (
+                CriterionOutcome::Failed,
+                json!({
+                    "url": url,
+                    "elements_rendered": prove.elementi_resi,
+                    "error": format!(
+                        "la pagina non mostra il proprio contenuto: {}",
+                        descrizioni.join("; ")
+                    ),
+                    "causes": descrizioni,
                     "console_errors": prove.errori_console.iter().take(3).collect::<Vec<_>>(),
                 }),
             )

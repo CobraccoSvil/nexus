@@ -1465,6 +1465,53 @@ elif [[ "$avvii_bad" -eq 0 ]]; then
   echo "OK iniezione-porta-libera: $avvii percorsi di avvio delegano al punto unico"
 fi
 
+# «L'app SENZA server mostra il proprio contenuto?» (2026-08-08, mig 0685)
+#
+# Il criterio e il suo discriminante vivono in un punto solo. Il secondo conta
+# quanto il primo: «questo progetto e' un'app statica?» ha due fatti (servizio e
+# pagina) che si raccolgono in posti diversi, ed e' esattamente la forma in cui
+# una decisione si sparpaglia — due call site che rispondono ciascuno a modo suo
+# e divergono in silenzio.
+assert_single "resa-statica" 'fn classifica_resa' \
+  'crates/nexus-agent-graph/src/decisions/static_render.rs' crates
+assert_single "natura-app-dai-fatti" 'fn classifica_natura' \
+  'crates/nexus-agent-graph/src/decisions/static_render.rs' crates
+
+# Il guard che conta davvero: la pagina da guardare non si cerca due volte.
+#
+# `detect_static_entry` (mcp-core/src/static_preview.rs) e' gia' il punto unico
+# di «qual e' la pagina di questo progetto», e la usa il pannello Servizi per il
+# pulsante "Apri nel browser". Il gate DEVE guardare quella stessa pagina: una
+# seconda ricerca — foss'anche un solo `index.html` scritto a mano nel motore —
+# darebbe al criterio un bersaglio diverso da quello che l'utente apre, e il
+# verde varrebbe per un file che nessuno guarda. Si esaminano le sole righe di
+# CODICE (nei test il nome e' la fixture, e li' e' legittimo).
+per_file_entry=0
+for f in crates/mcp-core/src/native_engine.rs \
+         crates/mcp-core/src/agent_graph_adapter/criteria_runner.rs; do
+  [[ -f "$f" ]] || continue
+  per_file_entry=$((per_file_entry + 1))
+  if awk '
+    /^#\[cfg\(test\)\]/ { exit }
+    /^[[:space:]]*\/\// { next }
+    /"[^"]*index\.html"|"[^"]*index\.htm"|"[^"]*home\.html"|"[^"]*main\.html"/ {
+      trovato = 1; print "   " FILENAME " riga " NR ": " $0 > "/dev/stderr"
+    }
+    END { exit !trovato }
+  ' "$f" 2>&1; then
+    echo "!! entry-dal-punto-unico: la pagina del progetto e' cercata a mano." >&2
+    echo "   Delegare a static_preview::detect_static_entry: il gate deve" >&2
+    echo "   guardare la STESSA pagina che il pannello Servizi apre." >&2
+    fail=1
+  fi
+done
+if [[ "$per_file_entry" -eq 0 ]]; then
+  echo "!! entry-dal-punto-unico: nessun file esaminato (percorsi cambiati?)." >&2
+  fail=1
+else
+  echo "OK entry-dal-punto-unico: $per_file_entry file delegano il rilevamento della pagina"
+fi
+
 # «Lo stile che il codice dichiara e' applicato?» (2026-07-29, mig 0655)
 #
 # Il criterio vive in un punto solo. Un secondo giudice dello stile — anche

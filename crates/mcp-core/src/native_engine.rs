@@ -1307,6 +1307,11 @@ async fn load_final_gate_config(db: &PgPool, project_id: Option<Uuid>) -> FinalG
             setting_bool(db, "agent.final_gate.ui_styling_enabled", false).await,
             endpoint_timeout_s,
         ),
+        // La resa di un'app SENZA server (mig 0685) nasce piu' avanti, in
+        // `run_engine`: il suo URL dipende dalla RADICE del progetto e
+        // dall'entry rilevata sul filesystem, che qui non ci sono — stesso
+        // motivo per cui `verify_steps` resta al Default in questo loader.
+        static_render_criterion: d.static_render_criterion.clone(),
         // Escalation su non-convergenza del gate (mig 0577): al cap di max_cycles con
         // criteri oggettivi ancora falliti, cede il turno all'executor per promuovere
         // un modello piu' capace invece di chiudere secco. `max_escalations` RIUSA la
@@ -1371,6 +1376,69 @@ fn criterio_stile(
         expected: serde_json::json!({}),
         timeout_s: Some(timeout_s),
     })
+}
+
+/// Il criterio della resa di un'app SENZA server, quando il progetto E' una di
+/// quelle app.
+///
+/// Il DISCRIMINANTE non e' indovinato dal testo del task ne' dal nome dei file:
+/// sono due fatti osservabili, e li mette insieme il punto unico puro
+/// [`static_render::classifica_natura`] (regola L). Dove c'e' un servizio la
+/// domanda completa la pone gia' il dialogo (criterio 5c), che vede anche le
+/// chiamate dati; dove non c'e' pagina non c'e' niente da guardare. In
+/// entrambi i casi il criterio NON nasce — non nasce e si dichiara
+/// inconcludente, che declasserebbe a `completed_unverified` ogni run a cui
+/// questo criterio non si applica.
+///
+/// L'INDIRIZZO e' la route `/preview` di mcp-core, non un `file:///`, e per due
+/// ragioni. E' la strada che l'utente percorre davvero quando apre la pagina dal
+/// pannello Servizi, quindi la misura raggiunge il suo oggetto come la
+/// produzione (regola O); e su `file:///` un `fetch('./dati.json')` legittimo e'
+/// bloccato dalla same-origin policy, cioe' il criterio inventerebbe un difetto
+/// che sotto HTTP non esiste. L'URL base viene dal DB (`settings.mcp_core_url`,
+/// mig 0190) come per ogni altro servizio: senza, il criterio non nasce, perche'
+/// una pagina che non si sa dove aprire non e' misurabile.
+async fn criterio_resa_statica(
+    db: &PgPool,
+    root: &str,
+    project_id: Uuid,
+    origine_frontend: Option<&str>,
+    timeout_s: f64,
+    attesa_ms: u64,
+) -> Option<nexus_agent_graph::runtime::ports::CriterionSpec> {
+    use nexus_agent_graph::decisions::static_render::{
+        classifica_natura, criterio_resa, NaturaApp,
+    };
+    if !setting_bool(db, "agent.final_gate.static_render_enabled", false).await {
+        return None;
+    }
+    // Il rilevamento e' il punto unico gia' in esercizio nel pannello Servizi
+    // (`detect_static_entry`): il gate deve guardare LA STESSA pagina che il
+    // pulsante "Apri nel browser" apre, o misurerebbe un altro file.
+    let entry = crate::static_preview::detect_static_entry(root).await;
+    let NaturaApp::Statica { entry } = classifica_natura(origine_frontend, entry.as_deref()) else {
+        return None;
+    };
+    let base = nexus_auth::get_setting(db, "mcp_core_url").await;
+    let Some(base) = base.map(|b| b.trim().trim_end_matches('/').to_string()).filter(|b| !b.is_empty()) else {
+        tracing::warn!(
+            target: "mcp_core::native_engine",
+            %project_id,
+            "resa statica non misurata: `settings.mcp_core_url` assente, \
+             nessun indirizzo su cui aprire la pagina"
+        );
+        return None;
+    };
+    let minimo = setting_i64(db, "agent.final_gate.static_render_min_elements", 5).await;
+    criterio_resa(
+        Some(&format!("{base}/preview/{project_id}/{entry}")),
+        // Il contenitore lo dichiara l'agente, e lo innesta il nodo: qui non si
+        // conosce lo stato del run.
+        None,
+        minimo.max(0) as usize,
+        timeout_s,
+        attesa_ms,
+    )
 }
 
 async fn load_origine_frontend(db: &PgPool, project_id: Uuid) -> Option<String> {
@@ -3078,6 +3146,20 @@ async fn build_native_engine(
             // un solo comando. Stessa classe di `final_gate_verdict`: un proxy di
             // presenza/conteggio non e' un segnale di esito (regola M).
             final_gate_cfg.verify_profile_missing = final_gate_cfg.verify_steps.is_empty();
+
+            // La resa di un'app SENZA server si risolve QUI e non nel loader:
+            // il rilevamento dell'entry vuole la radice, che li' non c'e'. Il
+            // discriminante lo decide il punto unico, coi due fatti gia'
+            // raccolti (origine del servizio e pagina rilevata).
+            final_gate_cfg.static_render_criterion = criterio_resa_statica(
+                &db,
+                &root,
+                pid,
+                final_gate_cfg.origine_frontend.as_deref(),
+                final_gate_cfg.endpoint_timeout_s,
+                final_gate_cfg.browser_settle_ms,
+            )
+            .await;
         } else {
             // Sessione senza progetto/root (es. run di servizio): niente
             // catena, dichiarazione onesta come per il profilo mancante.

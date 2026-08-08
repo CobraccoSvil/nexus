@@ -90,6 +90,14 @@
 //!     misura: `recommendations` e' l'altra lista e non genera rilievi. L'I/O
 //!     (leggere il file dal workspace) e' il parametro `leggi` di
 //!     `compose_conformance`.
+//!   - [`static_render`]: PUNTO UNICO di "l'app SENZA server mostra davvero il
+//!     suo contenuto?". Terzo di una famiglia: `endpoint_probes` chiede al
+//!     server, `browser_dialogue` chiede alla pagina se ottiene i propri dati
+//!     (e pretende un'origine HTTP), qui non c'e' nessun servizio a cui
+//!     chiedere — il contenuto lo genera il JS della pagina, e l'unico modo di
+//!     saperlo e' guardare il DOM dopo che ha girato. Anche il DISCRIMINANTE
+//!     sta qui (`classifica_natura`): quale delle tre misure si applica e' un
+//!     fatto del progetto, mai un'euristica sul testo del task.
 //!
 //! Le `route_after_*` NON sono qui: stanno nel PR 2b.
 
@@ -122,6 +130,7 @@ pub mod progress_controller;
 pub mod requirement_conformance;
 pub mod reward;
 pub mod scale_reason;
+pub mod static_render;
 pub mod supervisor;
 pub mod suspension_watch;
 pub mod switch_reason;
