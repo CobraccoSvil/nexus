@@ -111,7 +111,9 @@ use crate::decisions::tool_dispatch::{
     normalize_debate_position, normalize_declared_outcome, normalize_review_verdict,
     ContextMessage, DeclarationRejected,
 };
-use crate::decisions::{build_m16_allowed, is_tool_allowed, merge_discovered_run, M16_META_TOOLS};
+use crate::decisions::{
+    build_m16_allowed, is_tool_allowed, merge_discovered_run, Finalizzatore, M16_META_TOOLS,
+};
 use crate::py_json::{py_json_dumps, SortKeys};
 use crate::runtime::ports::{
     self as ports, AgentStepStore, ContextOffload, MetaStepStore, OffloadKind, PersistedStep,
@@ -122,7 +124,13 @@ use crate::state::{AgentState, Message, MessageContent, MetaStep, StateDelta, St
 
 /// Tool brain-only `task_complete` (`TASK_COMPLETE_TOOL_NAME`, helpers.py:413):
 /// non eseguito via ToolExecutor, registra l'esito dichiarato.
-const TASK_COMPLETE_TOOL_NAME: &str = "task_complete";
+///
+/// Il nome viene dal vocabolario canonico dei finalizzatori
+/// ([`crate::decisions::Finalizzatore`], regole N/L) invece di ripetere il
+/// letterale: quel vocabolario e' anche cio' con cui il riassunto del run
+/// attribuisce la propria provenienza, e due copie renderebbero possibile
+/// riconoscere un tool con un nome e attribuirlo con un altro.
+const TASK_COMPLETE_TOOL_NAME: &str = Finalizzatore::TaskComplete.nome_tool();
 
 /// Cap di default (byte) dello schema di un tool scoperto via M16: oltre, lo
 /// schema si scarta (safe-default identico al brain; il valore vero e' il
@@ -142,21 +150,21 @@ const RUN_NOTES_TOOL_NAME: &str = "nexus_run_notes";
 /// verdetto strutturato della review (gemello di `task_complete` per il canale
 /// del giudice). Non eseguito via ToolExecutor; registrato nello stato e
 /// propagato oltre il confine sub-run via `structured_verdict` (regola M).
-const REVIEW_VERDICT_TOOL_NAME: &str = "review_verdict";
+const REVIEW_VERDICT_TOOL_NAME: &str = Finalizzatore::Review.nome_tool();
 
 /// Tool brain-only `advisory_verdict` (consiglio di figure a monte): una FIGURA
 /// di analisi dichiara il parere strutturato con la sua lente (gemello di
 /// `review_verdict` per il canale del consiglio). Non eseguito via ToolExecutor;
 /// registrato nello stato e propagato oltre il confine sub-run via
 /// `structured_verdict` (campo `advisory`, regola M).
-const ADVISORY_VERDICT_TOOL_NAME: &str = "advisory_verdict";
+const ADVISORY_VERDICT_TOOL_NAME: &str = Finalizzatore::Advisory.nome_tool();
 
 /// Tool brain-only `debate_position` (tesi contrapposte): un AVVOCATO dichiara
 /// la posizione strutturata sulla tesi che gli e' stata assegnata (gemello di
 /// `advisory_verdict` per il canale del dibattito). Non eseguito via
 /// ToolExecutor; registrato nello stato e propagato oltre il confine sub-run via
 /// `structured_verdict` (campo `debate`, regola M).
-const DEBATE_POSITION_TOOL_NAME: &str = "debate_position";
+const DEBATE_POSITION_TOOL_NAME: &str = Finalizzatore::Debate.nome_tool();
 
 /// Tool di dispatch sub-agente (singolo/batch). Il loro tool_result puo' portare
 /// il SEGNALE STRUTTURATO `background_dispatched: true` (Fase D fan-in): il padre

@@ -1581,16 +1581,13 @@ pub(crate) async fn native_outcome_to_run_result(
         })
         .collect();
 
-    // Il summary DICHIARATO via task_complete (ADR 0034) e' testo umano di
-    // display: fa da risposta quando il modello ha chiuso senza produrre testo.
-    let declared_summary = outcome
-        .declared_outcome
-        .as_ref()
-        .and_then(|v| v.get("summary"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+    // Il riassunto del run dal PUNTO UNICO (regola L): testo libero se c'e',
+    // altrimenti il `summary` dichiarato dal finalizzatore. Qui viveva la meta'
+    // della risposta — il ripiego c'era, ma guardava il solo `declared_outcome`
+    // (`task_complete`) e ignorava gli altri tre finalizzatori; la chiusura del
+    // SUB-run, che e' dove le figure di verdetto chiudono, non ne aveva nessuno.
+    // Una domanda sola, due risposte diverse: il punto unico mancava.
+    let riassunto = outcome.riassunto();
     // Status canonico dal PUNTO UNICO della classificazione (regola L/M):
     // `NativeRunOutcome::classify_status` — stessa funzione usata dal ponte
     // esito del SUB-agente (`structured_verdict`), cosi' il verdetto che un
@@ -1627,13 +1624,10 @@ pub(crate) async fn native_outcome_to_run_result(
     let provider = outcome.provider_used.clone().unwrap_or_default();
     let model = outcome.model_used.clone().unwrap_or_default();
 
-    // Il summary DICHIARATO fa da risposta quando il modello ha chiuso con
-    // task_complete senza produrre testo (parita' WAVE 3.2): mai un
-    // "completed" muto se il modello ha comunque dichiarato l'esito.
-    let final_answer = outcome
-        .final_answer
-        .filter(|s| !s.trim().is_empty())
-        .or(declared_summary);
+    // Mai un "completed" muto se il modello ha comunque dichiarato l'esito: la
+    // precedenza (testo libero, poi il `summary` dichiarato) e' quella del punto
+    // unico, risolta sopra.
+    let final_answer = riassunto.testo().map(str::to_string);
 
     // Annotazione di esito ONESTO (regola M): se la verifica oggettiva
     // pre-chiusura NON e' passata (final_gate al cap/forced), il resoconto e' la

@@ -129,6 +129,7 @@ pub mod predictive_cap;
 pub mod progress_controller;
 pub mod requirement_conformance;
 pub mod reward;
+pub mod run_summary;
 pub mod scale_reason;
 pub mod static_render;
 pub mod supervisor;
@@ -212,6 +213,7 @@ pub use reward::{
     aggregate_score, final_reward, heuristic_reward, prelim_reward, round_half_even,
     MAX_AGENT_ITERATIONS,
 };
+pub use run_summary::{riassunto_del_run, Finalizzatore, FontiRiassunto, RiassuntoRun};
 pub use scale_reason::{
     apply_hysteresis, build_scale_context, context_window_ok, scale_cache_key, scale_trigger,
     validate_scale_move, ScaleHysteresisConfig, ScaleTriggerConfig,
