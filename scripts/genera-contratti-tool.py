@@ -28,31 +28,51 @@ from pathlib import Path
 RADICE = Path(__file__).resolve().parents[1]
 SCHEMA = RADICE / "crates/nexus-agent-tools/src/tool_schema.rs"
 
-# Tool i cui valori dipendono dal PROGETTO o dal DB: l'enum e' rigenerato a
-# runtime e un contratto statico lo fisserebbe (vedi il commento in
-# input_contract.rs). Restano fuori DELIBERATAMENTE.
-ENUM_DINAMICI = {"nexus_verify_change", "dispatch_subagent", "dispatch_subagents"}
+# Campi i cui valori ammessi li fissa il RUNTIME (il profilo del progetto, il
+# registry DB): il contratto li dichiara con `tool_enum_dinamico!`, che porta il
+# SEED nello schema — dove `apply_verify_scope_enum` lo sostituisce — e lascia
+# il parsing a una stringa. Un enum Rust qui rifiuterebbe alla deserializzazione
+# proprio i valori che il catalogo rigenerato ha promesso al modello.
+#
+# Chiave `(tool, campo)` -> nome del tipo. Il campo puo' essere annidato
+# (`tasks[].kind` di dispatch_subagents): li' conta il solo nome.
+ENUM_DINAMICI = {
+    ("nexus_verify_change", "scope"): "ScopeVerifica",
+    ("dispatch_subagent", "kind"): "KindSubagente",
+    ("dispatch_subagents", "kind"): "KindSubagente",
+}
 
 # Campi in cui catalogo e handler NON dicono la stessa cosa: generare un
 # contratto significherebbe scegliere quale dei due ha ragione, e quella e' una
 # decisione, non una traduzione. Restano fuori finche' qualcuno non decide.
-DECISIONE_UMANA = {
-    ("nexus_search_semantic", "source_kinds"): (
-        "lo schema promette 5 valori, l'handler ne accetta 8 via SourceKind::parse "
-        "(mcp-core/src/rag/mod.rs) e scarta in silenzio i non riconosciuti"
-    ),
-}
+#
+# Vuoto: l'unico caso noto (`nexus_search_semantic.source_kinds`, schema con 5
+# valori contro gli 8 di `SourceKind::parse`) e' stato deciso il 08/08/2026
+# allineando lo schema al vocabolario — le tre sorgenti in piu' sono collection
+# vive, che un commento dichiarava gia' «esposte tramite il canale unico
+# nexus_search_semantic», e il vocabolario ora e' un punto unico condiviso.
+DECISIONE_UMANA = {}
 
-# Vocabolari che hanno GIA' un punto unico altrove: generarne un gemello qui
-# sarebbe la duplicazione che la regola L vieta, e lo sarebbe in modo
-# particolarmente insidioso — due enum con gli stessi valori che nessun
-# compilatore obbliga a restare allineati.
-PUNTO_UNICO_ALTROVE = {
-    ("alta", "media", "bassa"): (
-        "gravita' evidenza: il punto unico e' nexus-agent-graph::decisions::severity"
-        "::Severity, che questo crate non vede. Il consolidamento e' spostarlo in"
-        " nexus-types come gia' fatto per i tier (decisions/tiers.rs e' un re-export)"
-    ),
+# Vocabolari che hanno GIA' un punto unico: il contratto ci DELEGA invece di
+# dichiarare un gemello. Due enum con gli stessi valori sarebbero la
+# duplicazione nella sua forma peggiore — nessun compilatore obbliga a tenerli
+# allineati, e la divergenza si scopre in esercizio.
+#
+# Il tipo deve essere raggiungibile da `nexus-agent-tools` e implementare
+# `TipoJson`: e' la ragione per cui `Severity` e' migrato in `nexus-types`
+# (`decisions/severity.rs` resta un re-export, come per i tier).
+TIPI_CONDIVISI = {
+    ("alta", "media", "bassa"): "nexus_types::severity::Severity",
+    (
+        "attachment",
+        "kb",
+        "chat_history",
+        "tool_result",
+        "code",
+        "meta_doc",
+        "conversation",
+        "prompt_correction",
+    ): "nexus_types::source_kind::SourceKind",
 }
 
 # Il nome viene dal campo, ma il campo non sempre nomina la DOMANDA. Chiavato
@@ -230,9 +250,9 @@ def campi_ovunque(schema):
 gruppi = defaultdict(set)  # valori -> nomi di campo che li usano
 primo_tool = {}  # valori -> primo tool che li dichiara
 for t in sorted(tools, key=lambda x: x.get("name", "")):
-    if t.get("name") in ENUM_DINAMICI:
-        continue
     for campo, spec in campi_ovunque(t.get("input_schema") or {}):
+        if (t.get("name"), campo) in ENUM_DINAMICI:
+            continue  # il seed non e' un vocabolario: non entra fra gli enum
         valori, _ = enum_di(spec)
         if valori:
             gruppi[valori].add(campo)
@@ -243,6 +263,10 @@ for valori, campi in gruppi.items():
     # Il campo piu' corto e' il singolare quando il gruppo ne ha due
     # (`rel_type` batte `rel_types`), ed e' l'unico quando ne ha uno.
     scelto = sorted(campi, key=lambda c: (len(c), c))[0]
+    if valori in TIPI_CONDIVISI:
+        # Nessun enum da dichiarare: il tipo esiste gia' e il contratto lo usa.
+        nomi_enum[valori] = TIPI_CONDIVISI[valori]
+        continue
     nomi_enum[valori] = NOMI_ESPLICITI.get(valori, camel(scelto))
     per_nome[nomi_enum[valori]].append(valori)
 for nome_candidato, collisi in per_nome.items():
@@ -265,8 +289,28 @@ def variante(valore: str):
     return c if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", c) else None
 
 
+# I tipi a valori dinamici: un `tool_enum_dinamico!` per NOME (KindSubagente e'
+# lo stesso tipo per i due dispatch), col seed preso dal catalogo.
+dinamici_scritti, seed_visto = [], {}
+for t in tools:
+    for campo, spec in campi_ovunque(t.get("input_schema") or {}):
+        tipo = ENUM_DINAMICI.get((t.get("name"), campo))
+        if not tipo:
+            continue
+        valori = enum_di(spec)[0] or ()
+        if tipo in seed_visto:
+            assert seed_visto[tipo] == valori, f"{tipo}: due seed diversi"
+            continue
+        seed_visto[tipo] = valori
+        righe = ["crate::tool_enum_dinamico! {", f"    {tipo} {{", "        seed {"]
+        righe += [f'            "{v}";' for v in valori]
+        righe += ["        }", "    }", "}"]
+        dinamici_scritti.append((tipo, "\n".join(righe)))
+
 enum_scritti, enum_impossibili = [], {}
 for valori in sorted(gruppi, key=lambda v: nomi_enum[v]):
+    if valori in TIPI_CONDIVISI:
+        continue  # il tipo esiste gia' altrove: qui non si dichiara nulla
     varianti = [(variante(v), v) for v in valori]
     if any(nome is None for nome, _ in varianti):
         enum_impossibili[valori] = [v for n, v in varianti if n is None]
@@ -309,21 +353,20 @@ def dichiara_oggetto(tool: str, campo: str, forma: dict) -> str:
         raise ValueError(motivo)
 
     for c, sp in props.items():
+        dinamico = ENUM_DINAMICI.get((tool, c))
         valori = enum_di(sp)[0]
-        if valori in PUNTO_UNICO_ALTROVE:
-            fallisci(f"campo annidato '{c}': {PUNTO_UNICO_ALTROVE[valori]}")
         # Ricorsivo perche' il catalogo annida a due livelli: gli
         # `acceptance_criteria` di `nexus_todo_write` stanno dentro i `todos`,
         # che stanno dentro l'input. Senza questa riga quel tool restava fuori
         # per un campo che la macro sa esprimere benissimo.
-        rt = tipo_rust(
+        rt = dinamico or tipo_rust(
             sp,
             nomi_enum.get(valori),
             lambda forma, _c=c: dichiara_oggetto(tool, _c, forma),
         )
         if rt is None:
             fallisci(f"campo annidato '{c}' di tipo {sp.get('type')} non esprimibile")
-        if valori:
+        if valori and not dinamico:
             enum_usati.add(nomi_enum[valori])
         nome_campo = f"r#{c}" if c in RISERVATE_RUST else c
         prefisso = 12 + len(f"{nome_campo}: {rt}, ")
@@ -345,9 +388,6 @@ for t in sorted(tools, key=lambda x: x.get("name", "")):
     nome = t.get("name", "")
     if not nome:
         continue
-    if nome in ENUM_DINAMICI:
-        esclusi.append((nome, "enum rigenerato a runtime (progetto/DB)"))
-        continue
     sch = t.get("input_schema") or {}
     props = sch.get("properties") or {}
     required = set(sch.get("required") or [])
@@ -365,10 +405,8 @@ for t in sorted(tools, key=lambda x: x.get("name", "")):
         if (nome, campo) in DECISIONE_UMANA:
             problema = f"campo '{campo}': {DECISIONE_UMANA[(nome, campo)]}"
             break
+        dinamico = ENUM_DINAMICI.get((nome, campo))
         valori, _ = enum_di(spec)
-        if valori in PUNTO_UNICO_ALTROVE:
-            problema = f"campo '{campo}': {PUNTO_UNICO_ALTROVE[valori]}"
-            break
         if valori in enum_impossibili:
             problema = (
                 f"campo '{campo}': valori senza nome di variante deducibile "
@@ -376,7 +414,7 @@ for t in sorted(tools, key=lambda x: x.get("name", "")):
             )
             break
         try:
-            rt = tipo_rust(
+            rt = dinamico or tipo_rust(
                 spec,
                 nomi_enum.get(valori),
                 lambda forma, _c=campo: dichiara_oggetto(nome, _c, forma),
@@ -387,7 +425,7 @@ for t in sorted(tools, key=lambda x: x.get("name", "")):
         if rt is None:
             problema = f"campo '{campo}' di tipo {spec.get('type')} non esprimibile"
             break
-        if valori:
+        if valori and not dinamico:
             usati_dal_tool.add(nomi_enum[valori])
         obbligatorio = campo in required
         nome_campo = f"r#{campo}" if campo in RISERVATE_RUST else campo
@@ -445,7 +483,10 @@ enum_da_scrivere = [c for n, c in enum_scritti if n in enum_usati]
 USCITA.mkdir(parents=True, exist_ok=True)
 io.open(USCITA / "contratti.rs", "w", encoding="utf-8", newline="\n").write(
     "\n\n".join(
-        enum_da_scrivere + [c for _, c in oggetti_scritti] + [c for _, _, c in generati]
+        [c for _, c in dinamici_scritti]
+        + enum_da_scrivere
+        + [c for _, c in oggetti_scritti]
+        + [c for _, _, c in generati]
     )
     + "\n"
 )

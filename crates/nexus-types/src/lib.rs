@@ -30,6 +30,8 @@ pub mod long_running_dto;
 pub mod purpose;
 pub mod routing_client;
 pub mod settings_dto;
+pub mod severity;
+pub mod source_kind;
 pub mod system_prompt;
 pub mod tiers;
 pub mod token_usage;
