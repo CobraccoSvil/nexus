@@ -4007,7 +4007,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
     // STESSA session_id del parent (eredita root/permessi/canali). Lo stato porta
     // parent_run_id + subagent_depth -> il grafo applica i guard di annidamento
     // (UnderstandingNode salta il fan-out explore se depth>=1).
-    let deps = build_native_deps_for_tool(&ctx, timeout_s).await;
+    let deps = build_native_deps_for_tool(&ctx, timeout_s, subagent_run_id).await;
     // Canale SSE proprio del sub-run: NON instrada al frontend (l'output utente
     // resta quello del main, che riceve solo il summary). Il receiver alimenta
     // il PONTE narrazione verso il padre (prima era scartato: feature muta);
@@ -4647,9 +4647,16 @@ async fn run_council_figure(
 /// Regole:
 ///   - ogni figura risolve col SUO purpose (nessun purpose condiviso imposto),
 ///     escludendo i provider gia' assegnati alle figure precedenti;
-///   - pool esaurito -> la figura tiene il provider duplicato (WARN dentro
-///     `resolve_model_excluding`): meglio un parere in piu' che una figura in
-///     meno;
+///   - pool esaurito -> la figura tiene un provider gia' usato (meglio un parere
+///     in piu' che una figura in meno), ma NON uno qualsiasi: quello meno
+///     carico, contando le chiamate in volo e i pin gia' dati in questo giro
+///     (`provider_inflight`, regola L). Prima il ripiego era
+///     `resolve_purpose_model_db` senza esclusione, cioe' «il piu' preferito»:
+///     con otto figure e cinque fornitori le prime cinque prendevano uno
+///     ciascuno e le ULTIME TRE finivano tutte sullo stesso, che si ritrovava
+///     quattro chiamate mentre gli altri quattro ne avevano una. E' la forma
+///     concreta con cui, l'08/08/2026 su gestione-corsi, un fan-out da otto ha
+///     saturato un fornitore e prodotto zero pareri;
 ///   - pin di sessione presente -> nessuna pre-assegnazione (il pin si propaga
 ///     ai subagenti per scelta deliberata; la diversita' non si applica);
 ///   - ogni esito non risolvibile -> `None`: la figura segue il percorso
@@ -4669,6 +4676,12 @@ async fn resolve_council_assignments(
         return nessuna;
     }
     let mut exclude: Vec<String> = Vec::new();
+    // Quante figure di QUESTO giro sono gia' state mandate su ciascun fornitore.
+    // Sono chiamate che partiranno fra un istante: per il fornitore pesano come
+    // quelle gia' in volo, e senza contarle il ripiego rifarebbe la
+    // concentrazione guardando un sistema che al momento della scelta e' ancora
+    // fermo.
+    let mut prenotati: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut out: Vec<Option<(String, String)>> = Vec::with_capacity(kinds.len());
     for kind in kinds {
         let Ok(Some(definition)) = fetch_definition(db, kind).await else {
@@ -4680,18 +4693,100 @@ async fn resolve_council_assignments(
             out.push(None);
             continue;
         }
-        let (provider, model) = resolve_model_excluding(db, &purpose, kind, &exclude).await;
-        if provider.is_empty() || model.is_empty() {
-            out.push(None);
-            continue;
-        }
+        let (provider, model) =
+            match assegna_figura(db, &purpose, kind, &exclude, &prenotati).await {
+                Some(coppia) => coppia,
+                None => {
+                    out.push(None);
+                    continue;
+                }
+            };
         let pl = provider.to_lowercase();
         if !exclude.contains(&pl) {
-            exclude.push(pl);
+            exclude.push(pl.clone());
         }
+        *prenotati.entry(pl).or_insert(0) += 1;
         out.push(Some((provider, model)));
     }
     out
+}
+
+/// Il fornitore di UNA figura: nuovo se ce n'e' uno libero, altrimenti il meno
+/// carico fra quelli gia' usati.
+///
+/// I due rami rispondono a due domande diverse e vanno tenuti distinti: finche'
+/// esiste un fornitore non ancora assegnato, la DIVERSITA' vince su tutto (due
+/// pareri dallo stesso modello non sono due pareri, difetto del 20/07). Solo
+/// quando la diversita' non e' piu' ottenibile subentra il carico, che decide
+/// come DISTRIBUIRE i duplicati inevitabili invece di ammucchiarli.
+async fn assegna_figura(
+    db: &sqlx::PgPool,
+    purpose: &str,
+    kind: &str,
+    exclude: &[String],
+    prenotati: &std::collections::HashMap<String, usize>,
+) -> Option<(String, String)> {
+    // Ramo 1: un fornitore ancora libero. `_excluding` non ripiega da solo — il
+    // ripiego interno resta per gli altri suoi chiamanti — quindi qui un pool
+    // vuoto si riconosce dall'esito non risolto.
+    if let crate::internal_routing::PurposeResolution::Resolved {
+        provider, model, ..
+    } = crate::internal_routing::resolve_purpose_model_db_excluding(db, purpose, exclude).await
+    {
+        return Some((provider, model));
+    }
+    // Ramo 2: tutti i fornitori del tier sono gia' assegnati. Si riparte
+    // dall'elenco COMPLETO dei candidati e si prende il meno carico.
+    let candidati = crate::internal_routing::resolve_purpose_provider_candidates_db(
+        db,
+        purpose,
+        exclude.len().max(1),
+        1,
+    )
+    .await
+    .unwrap_or_default();
+    if candidati.is_empty() {
+        // Nemmeno un candidato: la figura segue il percorso storico e produce i
+        // propri rifiuti strutturati. Non si inventa un fornitore.
+        return None;
+    }
+    let nomi: Vec<String> = candidati.iter().map(|c| c.provider.clone()).collect();
+    // Registro non ancora inizializzato (nessuna chiamata governata finora):
+    // resta la sola distribuzione di questo giro, che e' gia' cio' che serve al
+    // fan-out. Il carico in volo la raffina, non la sostituisce.
+    let scelto = match crate::provider_inflight::registro() {
+        Some(r) => r.indice_meno_carico(&nomi, prenotati).unwrap_or(0),
+        None => indice_meno_prenotato(&nomi, prenotati),
+    };
+    let c = &candidati[scelto];
+    tracing::warn!(
+        kind = %kind, model_purpose = %purpose, provider = %c.provider,
+        gia_assegnati = exclude.len(),
+        "consiglio: fornitori distinti esauriti, figura sul meno carico (parere duplicato dichiarato)"
+    );
+    Some((c.provider.clone(), c.model.clone()))
+}
+
+/// Il meno prenotato in QUESTO giro, quando il registro del carico non c'e'.
+///
+/// Stesso tie-break del registro (a parita' vince il primo, cioe' il piu'
+/// preferito): due criteri che scegliessero diversamente renderebbero
+/// l'assegnazione dipendente dall'essere passati o meno da una chiamata
+/// governata, che non c'entra nulla con la domanda.
+fn indice_meno_prenotato(
+    nomi: &[String],
+    prenotati: &std::collections::HashMap<String, usize>,
+) -> usize {
+    nomi.iter()
+        .enumerate()
+        .min_by_key(|(i, p)| {
+            (
+                prenotati.get(&p.trim().to_lowercase()).copied().unwrap_or(0),
+                *i,
+            )
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0)
 }
 
 /// Il fornitore che la SESSIONE ricorda (`chat_sessions.preferred_provider`,
@@ -4806,7 +4901,8 @@ async fn finalize_timeout(
 ) -> Value {
     // Gli step del sub-run vivono nel DB del PROGETTO, con `run_id` = id del
     // sub-run (la riga `agent_runs` creata da `ensure_child_agent_run`).
-    let causa = crate::agent_tools::subagent_timeout::causa_del_timeout(pool, sub_run_id).await;
+    let causa =
+        crate::agent_tools::subagent_timeout::causa_del_timeout(pool, sub_run_id, timeout_s).await;
     let nota = causa.nota();
     let errore = format!("[Sub-agent timeout dopo {timeout_s}s] {nota}");
     let verdict = terminal_verdict("timed_out", "timeout", Some(&causa));
@@ -5235,7 +5331,15 @@ fn compact_summary(text: &str) -> String {
 /// deadline del padre): da li' nasce il budget d'attesa verso il gateway. Prima
 /// il budget veniva derivato dal default globale (300s) anche per una figura che
 /// vive 240s.
-async fn build_native_deps_for_tool(ctx: &AgentToolContext, run_timeout_s: i64) -> NativeDeps {
+///
+/// `run_id` e' il sub-run che sta per partire: il client lo timbra sulle proprie
+/// attese in coda, cosi' una figura che scade puo' dire se il budget se n'e'
+/// andato in coda o in attesa del modello (`provider_inflight`).
+async fn build_native_deps_for_tool(
+    ctx: &AgentToolContext,
+    run_timeout_s: i64,
+    run_id: Uuid,
+) -> NativeDeps {
     let db = (*ctx.core.db).clone();
     let tool_runner_deps = crate::tool_runner_server::ToolRunnerDeps {
         db: db.clone(),
@@ -5250,7 +5354,8 @@ async fn build_native_deps_for_tool(ctx: &AgentToolContext, run_timeout_s: i64) 
         &db,
         u64::try_from(run_timeout_s).ok().filter(|&s| s > 0),
     )
-    .await;
+    .await
+    .per_run(run_id);
     // Anche i SUB-RUN portano il gate duale: l'apply del worktree copre solo
     // le mutazioni FILE, mentre stop di servizi, kill di processi e SQL
     // distruttivo eseguiti da un figlio colpiscono il sistema reale
@@ -5900,6 +6005,91 @@ mod tests {
             "picco {} oltre il tetto di processo 4",
             peak.load(Ordering::SeqCst)
         );
+    }
+
+    /// IL CASO dell'08/08/2026, riprodotto sul fan-out VERO (regola O): otto
+    /// figure concorrenti e pochi fornitori a servirle.
+    ///
+    /// Passa da `spawn_fanout_with`, cioe' dallo stesso punto unico che convoca
+    /// il Consiglio in produzione — un task per figura, non una simulazione a un
+    /// thread — e da `provider_inflight::permesso`, lo stesso che il client
+    /// gateway interroga prima di ogni chiamata. Cio' che il test misura e' il
+    /// PICCO di chiamate contemporanee su UN fornitore: e' il numero che quella
+    /// sera nessuno poteva vedere, ed e' il solo che distingue «otto chiamate
+    /// distribuite» da «otto chiamate addosso allo stesso».
+    ///
+    /// I semafori del fan-out sono deliberatamente larghi (8 e 12): se fossero
+    /// stretti, il picco resterebbe basso per merito LORO e il test sarebbe
+    /// verde su un governo del carico che non esiste — il falso verde della
+    /// regola O nella sua forma piu' comune.
+    ///
+    /// MUTAZIONE: costruire il registro con un tetto altissimo
+    /// (`RegistroCarico::new(99, ...)`) fa salire il picco a 8 e rosseggiare
+    /// l'assert, col valore del difetto misurato.
+    #[tokio::test]
+    async fn otto_figure_su_pochi_fornitori_non_si_ammucchiano() {
+        use crate::provider_inflight::RegistroCarico;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        const FIGURE: usize = 8;
+        const FORNITORI: [&str; 3] = ["alfa", "beta", "gamma"];
+        const TETTO: usize = 2;
+
+        let registro = Arc::new(RegistroCarico::new(
+            TETTO,
+            std::time::Duration::from_secs(5),
+        ));
+        // Picco osservato per fornitore: lo legge ogni figura DOPO aver ottenuto
+        // il permesso, cioe' mentre e' davvero in volo.
+        let picchi: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+
+        let out = spawn_fanout_with(
+            Arc::new(tokio::sync::Semaphore::new(FIGURE)),
+            Some(Arc::new(tokio::sync::Semaphore::new(12))),
+            FIGURE,
+            |i: usize| {
+                let registro = Arc::clone(&registro);
+                let picchi = Arc::clone(&picchi);
+                // Round-robin: la distribuzione che l'assegnazione produce a
+                // monte. Qui si misura cosa succede DOPO, quando le figure che
+                // condividono un fornitore ci arrivano insieme.
+                let fornitore = FORNITORI[i % FORNITORI.len()];
+                async move {
+                    let (_permesso, _esito) =
+                        registro.permesso(fornitore, "modello-x", None).await;
+                    let ora = registro.in_volo_verso_fornitore(fornitore);
+                    {
+                        let mut p = picchi.lock().expect("picchi");
+                        let voce = p.entry(fornitore.to_string()).or_insert(0);
+                        *voce = (*voce).max(ora);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    json!({ "ok": true })
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(out.len(), FIGURE, "tutte le figure devono rientrare");
+        let picchi = picchi.lock().expect("picchi");
+        for (fornitore, picco) in picchi.iter() {
+            assert!(
+                *picco <= TETTO,
+                "fornitore '{fornitore}': {picco} chiamate insieme, oltre il tetto {TETTO}"
+            );
+        }
+        assert_eq!(
+            picchi.len(),
+            FORNITORI.len(),
+            "il carico deve essersi distribuito su tutti i fornitori, non su uno"
+        );
+        // Il registro torna vuoto: le guardie sono state rilasciate all'uscita
+        // di ogni task. Un contatore che non torna a zero e' il difetto classico
+        // di questa forma, e qui il fan-out reale lo escluderebbe.
+        for f in FORNITORI {
+            assert_eq!(registro.in_volo_verso_fornitore(f), 0, "'{f}' resta occupato");
+        }
     }
 
     /// GOVERNOR: un fan-out `Nested` NON tocca il semaforo di processo — anche

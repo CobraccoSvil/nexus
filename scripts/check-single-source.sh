@@ -2446,6 +2446,42 @@ else
   echo "OK premesse-dei-gate: l'esito 'non eseguito' ha un punto unico e i gate lo pretendono"
 fi
 
+# ── carico-per-fornitore (2026-08-08) ───────────────────────────────────────
+# «Quante chiamate sono in volo verso questo fornitore?» e' UNA domanda, e prima
+# non ne esisteva nessuna: il rischio non e' che la risposta diverga, e' che
+# qualcuno si costruisca il proprio contatore accanto. Tre presidi.
+#
+# 1. Il conteggio e la coda vivono in un modulo solo. Un secondo registro
+#    conterebbe un sottoinsieme delle chiamate e, credendo scarico un fornitore
+#    che non lo e', rifarebbe esattamente il difetto dell'08/08.
+assert_single "registro-carico" 'struct RegistroCarico' \
+  'crates/mcp-core/src/provider_inflight.rs' crates
+# 2. La GUARDIA e' l'unica forma che regge alla cancellazione del task (ogni
+#    figura che scade). Un decremento esplicito scritto altrove non verrebbe
+#    eseguito su quel percorso, e il fornitore resterebbe saturo per sempre
+#    proprio dopo un'ondata di timeout.
+assert_single "permesso-chiamata" 'struct PermessoChiamata' \
+  'crates/mcp-core/src/provider_inflight.rs' crates
+# 3. L'innesto sta DENTRO `NexusGatewayClient::complete`, che e' il confine da
+#    cui passa ogni chiamata al modello di mcp-core. Spostarlo piu' in alto (nel
+#    fan-out) misurerebbe una convocazione invece di un fornitore, e le chiamate
+#    delle altre sessioni — che quella sera pesavano sugli stessi cinque —
+#    tornerebbero invisibili.
+if ! awk '
+  /pub async fn complete\(&self, req: GwRequest\)/ { dentro = 1 }
+  dentro && /governo_del_carico/ { trovato = 1; exit }
+  dentro && /^    }/ { exit }
+  END { exit !trovato }
+' crates/mcp-core/src/nexus_gateway.rs 2>/dev/null; then
+  echo "!! carico-per-fornitore: complete() non chiede piu' il permesso al registro." >&2
+  echo "   Il conteggio deve stare sul CONFINE (ogni chiamata al modello passa di" >&2
+  echo "   li'), non nel fan-out: altrimenti misura una convocazione, non il" >&2
+  echo "   carico vero del fornitore." >&2
+  fail=1
+else
+  echo "OK carico-per-fornitore: il confine col gateway chiede il permesso"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1
