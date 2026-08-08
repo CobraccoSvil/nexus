@@ -113,11 +113,19 @@ pre-commit:
     # Guard dei punti unici (regola L / ADR 0026): grep istantaneo, blocca nuove
     # definizioni di un punto unico fuori dal suo modulo. Il gate jscpd "ratchet"
     # completo gira in CI (verify.yml), non a ogni commit per non rallentarlo.
+    # '*.sh' dall'08/08/2026: da quando il guard copre anche un punto unico
+    # scritto in shell (premesse-dei-gate), i soli glob dei linguaggi lo
+    # rendevano irraggiungibile proprio per i commit che possono romperlo —
+    # misurato sul commit che l'ha introdotto, saltato con "no matching staged
+    # files". In locale non c'e' altra strada: 'verify.sh' non invoca questo
+    # script, lo fa solo la CI, quindi senza il glob la regressione la vedrebbe
+    # chi non l'ha scritta.
     single_source_guard:
       glob:
         - "*.rs"
         - "*.ts"
         - "*.tsx"
+        - "*.sh"
       run: bash scripts/check-single-source.sh
       fail_text: "pre-commit: regressione su un punto unico (regola L / ADR 0026)."
 
