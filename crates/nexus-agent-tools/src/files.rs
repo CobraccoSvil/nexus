@@ -3068,6 +3068,8 @@ gamma
     /// ramo, o se il resolver fosse rotto.
     #[tokio::test]
     async fn list_files_consegna_al_modello_la_causa_e_il_tratto_esistente() {
+        use nexus_types::tool_outcome::EsitoTool;
+
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("school-courses-fe/src")).expect("albero");
         let ctx = ctx_di_prova(dir.path().to_path_buf(), Arc::new(HookRegistranti::default()));
@@ -3078,10 +3080,19 @@ gamma
         )
         .await;
 
-        assert!(out.contains("school-courses-fe/SchoolCoursesApi"), "{out}");
+        // `out.testo`, non `out`: la firma del tool e' migrata a `RispostaTool`
+        // (regola Q, l'esito in un campo) e il testo e' uno dei suoi campi.
+        assert_eq!(out.esito, EsitoTool::Fallito, "{}", out.testo);
         assert!(
-            out.contains("il tratto esistente piu' profondo e' 'school-courses-fe'"),
-            "il modello deve sapere fin dove il percorso esiste: {out}"
+            out.testo.contains("school-courses-fe/SchoolCoursesApi"),
+            "{}",
+            out.testo
+        );
+        assert!(
+            out.testo
+                .contains("il tratto esistente piu' profondo e' 'school-courses-fe'"),
+            "il modello deve sapere fin dove il percorso esiste: {}",
+            out.testo
         );
     }
 
