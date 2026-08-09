@@ -80,13 +80,36 @@ fn project_qdrant_filter(project_id: Uuid) -> Value {
     })
 }
 
-/// Tronca il testo da embeddare al limite (2000 char) senza copiarlo se corto.
+/// Byte massimi di testo consegnati all'embedder.
+const EMBED_MAX_BYTES: usize = 2000;
+
+/// Tronca il testo da embeddare al limite senza copiarlo se corto.
+///
+/// PANIC CHIUSO. Era `&text[..2000]`, e in Rust affettare uno `&str` a un indice
+/// che non e' un confine di carattere PANICA. Il doc diceva «2000 char» ma
+/// `text.len()` conta BYTE, e i due coincidono solo in ASCII: bastava una query
+/// di ricerca piu' lunga di 2000 byte con un accento o un'emoji a cavallo di
+/// quel confine per far cadere il processo. Non e' un caso di laboratorio — la
+/// query la scrive il MODELLO, e questo helper la riceve da tre chiamanti:
+/// `knowledge_search`, `knowledge_create_note` (dove il testo e' il corpo di una
+/// nota) e `knowledge_get_subgraph`.
+///
+/// Il limite resta in BYTE, che e' quello che l'embedder vede davvero; a
+/// cambiare e' solo il punto di taglio, portato indietro fino al confine di
+/// carattere piu' vicino. Passare a 2000 CARATTERI avrebbe fatto crescere il
+/// testo inviato per ogni lingua non-ASCII, che e' una decisione sull'embedder e
+/// non la correzione di un panic.
 fn embed_slice(text: &str) -> &str {
-    if text.len() > 2000 {
-        &text[..2000]
-    } else {
-        text
+    if text.len() <= EMBED_MAX_BYTES {
+        return text;
     }
+    // L'ultimo confine di carattere che non supera il limite. `is_char_boundary`
+    // e' vero per definizione su 0, quindi il ciclo termina sempre.
+    let mut fine = EMBED_MAX_BYTES;
+    while !text.is_char_boundary(fine) {
+        fine -= 1;
+    }
+    &text[..fine]
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1506,5 +1529,43 @@ mod tests {
         assert_eq!(map_edge_type_to_rel("needs"), "depends_on");
         assert_eq!(map_edge_type_to_rel("refinement"), "refines");
         assert_eq!(map_edge_type_to_rel("qualcosa_di_ignoto"), "relates");
+    }
+
+    /// IL PANIC. Un testo oltre il limite con un carattere multibyte a cavallo
+    /// del confine faceva cadere il processo su `&text[..2000]`.
+    ///
+    /// La query mette una 'e' accentata ESATTAMENTE a cavallo del byte 2000:
+    /// 1999 caratteri ASCII, poi due byte che il taglio spezzerebbe a meta'.
+    ///
+    /// MUTAZIONE che rende rosso: rimettere `&text[..EMBED_MAX_BYTES]` al posto
+    /// del ciclo su `is_char_boundary`. Il test non fallisce con un assert: il
+    /// processo PANICA con «byte index 2000 is not a char boundary», che e'
+    /// esattamente cio' che accadeva a chi cercava con una query lunga in una
+    /// lingua accentata.
+    #[test]
+    fn un_carattere_multibyte_sul_confine_non_fa_panicare_il_taglio() {
+        let query = format!("{}è{}", "a".repeat(1999), "b".repeat(100));
+        assert!(query.len() > EMBED_MAX_BYTES);
+        assert!(
+            !query.is_char_boundary(EMBED_MAX_BYTES),
+            "il test non riproduce il caso se il byte 2000 e' gia' un confine valido"
+        );
+
+        let tagliato = embed_slice(&query);
+
+        // Taglia PRIMA del limite, mai dopo: il limite dell'embedder e' in byte.
+        assert!(tagliato.len() <= EMBED_MAX_BYTES);
+        // E non spezza il carattere: il risultato resta uno `&str` valido, che
+        // e' il solo modo in cui poteva esistere senza panicare.
+        assert!(tagliato.chars().all(|c| c == 'a'));
+        assert_eq!(tagliato.len(), 1999);
+    }
+
+    #[test]
+    fn un_testo_entro_il_limite_non_viene_toccato() {
+        let corto = "ricerca sui documenti del progetto";
+        assert_eq!(embed_slice(corto), corto);
+        let al_limite = "a".repeat(EMBED_MAX_BYTES);
+        assert_eq!(embed_slice(&al_limite).len(), EMBED_MAX_BYTES);
     }
 }
