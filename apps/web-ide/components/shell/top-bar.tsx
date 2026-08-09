@@ -134,62 +134,91 @@ function ProviderStatusIndicator({
           {names.map((name) => {
             const label = providerDisplayLabel(name);
             const state = providerStatus[name];
-            return (
-              <div
-                key={name}
-                title={providerTitle(label, state)}
-                style={{
-                  display: "flex",
-                  alignItems: "flex-start",
-                  gap: 8,
-                  padding: "5px 6px",
-                  borderRadius: 6,
-                  minWidth: 0,
-                }}
-              >
-                <span style={{ marginTop: 3, flexShrink: 0 }}>
+            // La riga e' la stessa per tutti: pallino, nome, e all'estremita'
+            // destra la freccia SOLO per chi ha un dettaglio da mostrare. Pallino
+            // e nome restano incolonnati fra provider con e senza dettaglio --
+            // prima il nome dei primi scivolava in alto per fare posto al blocco
+            // sottostante, e la colonna che si scorre (chi e' giu'?) si spezzava.
+            const riga = (
+              <>
+                <span style={{ display: "flex", flexShrink: 0 }}>
                   <StatusDot ok={state.ok} billing={state.billing} />
                 </span>
-                <span style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 1 }}>
-                  <span style={{ color: tc.text, fontSize: 12, fontWeight: 600 }}>{label}</span>
-                  {/* Provider disponibile (verde): il nome basta, "Disponibile" e' ridondante.
-                      Il dettaglio si mostra solo per stati non-ok (billing/errore/sconosciuto).
-
-                      Collassato di DEFAULT: il pannello risponde a "chi e' giu'?", e la
-                      risposta e' il pallino accanto al nome. Con due provider in errore il
-                      dettaglio esteso occupava meta' popover e spingeva fuori dalla vista
-                      i provider sani, che sono quelli su cui si decide dove instradare.
-                      `<details>` nativo invece di uno stato React: la persistenza per riga
-                      la gestisce il browser, e senza `open` nasce chiuso a ogni apertura --
-                      che e' voluto, il pannello e' una lettura di stato, non una sessione. */}
-                  {state.ok !== true && (
-                    <details style={{ minWidth: 0 }}>
-                      <summary
-                        style={{
-                          color: tc.textMuted,
-                          fontSize: 11,
-                          cursor: "pointer",
-                          listStyle: "revert",
-                          userSelect: "none",
-                        }}
-                      >
-                        {t("panels.dettagli")}
-                      </summary>
-                      <span
-                        style={{
-                          display: "block",
-                          color: tc.textMuted,
-                          fontSize: 11,
-                          overflowWrap: "anywhere",
-                          paddingTop: 2,
-                        }}
-                      >
-                        {detailText(state)}
-                      </span>
-                    </details>
-                  )}
+                <span
+                  style={{
+                    color: tc.text,
+                    fontSize: 12,
+                    fontWeight: 600,
+                    minWidth: 0,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                  }}
+                >
+                  {label}
                 </span>
-              </div>
+              </>
+            );
+            const stileRiga = {
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              padding: "5px 6px",
+              borderRadius: 6,
+              minWidth: 0,
+            } as const;
+
+            // Provider disponibile (verde): il nome basta, "Disponibile" e'
+            // ridondante e una freccia che apre il nulla e' peggio del silenzio.
+            if (state.ok === true) {
+              return (
+                <div key={name} title={providerTitle(label, state)} style={stileRiga}>
+                  {riga}
+                </div>
+              );
+            }
+
+            // Collassato di DEFAULT: il pannello risponde a "chi e' giu'?", e la
+            // risposta e' il pallino accanto al nome. Con due provider in errore il
+            // dettaglio esteso occupava meta' popover e spingeva fuori dalla vista
+            // i provider sani, che sono quelli su cui si decide dove instradare.
+            // `<details>` nativo invece di uno stato React: senza `open` nasce
+            // chiuso a ogni apertura, e il pannello e' una lettura di stato, non
+            // una sessione. Il marker nativo (a sinistra) e' tolto in globals.css
+            // via `.nx-provider-row`: da li' spingerebbe pallino e nome fuori
+            // allineamento rispetto ai provider senza dettaglio.
+            return (
+              <details key={name} className="nx-provider-row" style={{ minWidth: 0 }}>
+                <summary
+                  title={providerTitle(label, state)}
+                  style={{ ...stileRiga, cursor: "pointer", userSelect: "none" }}
+                >
+                  {riga}
+                  <span
+                    aria-hidden="true"
+                    className="nx-provider-caret"
+                    style={{
+                      marginLeft: "auto",
+                      flexShrink: 0,
+                      color: tc.textMuted,
+                      fontSize: 10,
+                      lineHeight: 1,
+                    }}
+                  >
+                    ▶
+                  </span>
+                </summary>
+                <span
+                  style={{
+                    display: "block",
+                    color: tc.textMuted,
+                    fontSize: 11,
+                    overflowWrap: "anywhere",
+                    padding: "0 6px 5px 26px",
+                  }}
+                >
+                  {detailText(state)}
+                </span>
+              </details>
             );
           })}
         </div>
