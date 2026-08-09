@@ -15,6 +15,7 @@
 
 use super::*;
 use crate::suite_verification::{SuiteOutcome, SuiteStats};
+use nexus_types::tool_outcome::RispostaTool;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
@@ -413,17 +414,18 @@ fn extra_args_da_input(input: &Value) -> Vec<String> {
 fn resolve_playwright_root(
     ctx: &AgentToolContext,
     config_path_override: &Option<String>,
-) -> Result<(std::path::PathBuf, Vec<std::path::PathBuf>), String> {
+) -> Result<(std::path::PathBuf, Vec<std::path::PathBuf>), RispostaTool> {
     let Some(cp) = config_path_override else {
         return Ok(pick_playwright_root_with_stale(&ctx.root_path));
     };
     // Punto unico (regola L): de-duplica la root se l'agente l'ha inclusa
     // in config_path e blocca il traversal (resolve_relative_path).
+    // RIMEDIABILE, e prima usciva NUDO: un `config_path` sbagliato tornava
+    // all'agente come un'esecuzione riuscita che non aveva eseguito nulla.
     let not_found = || {
-        format!(
-            "[run_playwright_tests] config_path '{}' non trovato. Passa una directory relativa (es. \"app\") o un file config.",
-            cp
-        )
+        RispostaTool::fallito_rimediabile(format!(
+            "[run_playwright_tests] config_path '{cp}' non trovato. Passa una directory relativa (es. \"app\") o un file config."
+        ))
     };
     let resolved = resolve_relative_path(&ctx.root_path, cp).map_err(|_| not_found())?;
     let dir = if resolved.is_dir() {
@@ -565,7 +567,7 @@ fn preflight_blocked_message(missing: &[String], root: &Path) -> String {
 /// Beauty-Book chat 6: 6:49 min senza UPDATE, browser non avviato mai).
 /// Toggle via setting agent.testing.preflight_check_enabled (default true).
 /// Ritorna Err(messaggio) se il run va bloccato.
-async fn run_preflight_check(ctx: &AgentToolContext, root: &Path) -> Result<(), String> {
+async fn run_preflight_check(ctx: &AgentToolContext, root: &Path) -> Result<(), RispostaTool> {
     if !preflight_enabled(ctx).await {
         return Ok(());
     }
@@ -578,7 +580,13 @@ async fn run_preflight_check(ctx: &AgentToolContext, root: &Path) -> Result<(), 
         tracing::info!("preflight: autofix riuscito, procedo con il run playwright");
         return Ok(());
     }
-    Err(preflight_blocked_message(&missing, root))
+    // DEL SISTEMA: mancano librerie di sistema, e le tre strade che il
+    // messaggio propone richiedono tutte privilegi che questo run non ha (Sudo
+    // Manager, apt-get, install-deps). Ripetere la chiamata non ne installa
+    // nessuna. Anche questo usciva nudo, cioe' come un successo.
+    Err(RispostaTool::fallito_di_sistema(preflight_blocked_message(
+        &missing, root,
+    )))
 }
 
 /// Estrae la porta numerica da una URL `http(s)://localhost:PORT/...`.
@@ -1509,27 +1517,31 @@ pub(super) async fn esegui_suite_delegata(
     inv: &super::playwright_cli::InvocazioneSuite,
     working_dir_param: Option<&str>,
     riga: &str,
-) -> String {
+) -> RispostaTool {
     let input = input_per_runner(inv, working_dir_param, riga);
     let coda = avvertenze_di_traduzione(inv);
     let out = tool_run_playwright_tests(ctx, &input).await;
-    // La premessa si antepone dal PONTE, non con un `format!`:
-    // `tool_run_playwright_tests` dichiara il fallimento col marker IN TESTA
-    // (`tool_failure`), e qualunque testo messo davanti lo spingeva in mezzo
-    // alla stringa — dove `is_tool_failure`, che guarda solo la testa, non lo
-    // vede piu'. Il tool risultava RIUSCITO a tutti i consumatori a valle
-    // (`inoltro_legacy`, `tool_run_tests`, `tool_run_service`): una suite rossa
-    // passava per verde. Il ponte esiste apposta e lo dichiara nel proprio doc:
-    // toglie il marker dal corpo e lo rimette in testa alla composizione.
-    nexus_types::tool_outcome::prepend_preserving_failure(
-        format!(
+    // La premessa si concatena al solo TESTO: esito, natura ed exit code
+    // restano nei campi e nessuna prosa anteposta li puo' coprire.
+    //
+    // Era il caso che motivava `prepend_preserving_failure`, e vale la pena
+    // ricordare cosa succedeva senza: il fallimento viveva col marker IN TESTA
+    // alla stringa, un `format!` davanti lo spingeva in mezzo, e
+    // `is_tool_failure` — che guarda solo la testa — non lo vedeva piu'. Una
+    // suite ROSSA passava per verde a tutti i consumatori a valle. Il ponte
+    // rimediava rimettendo il marker in testa alla composizione; col campo non
+    // c'e' piu' niente da rimettere a posto, ed e' l'ultimo suo chiamante di
+    // produzione a sparire.
+    RispostaTool {
+        testo: format!(
             "[{tool} -> run_playwright_tests] La suite Playwright ha un solo esecutore: BASE_URL dalle \
              porte allocate al progetto, preflight Chromium, attesa del servizio bersaglio e \
              registrazione nel pannello Playwright. La riga e' stata eseguita da li' con i suoi \
-             argomenti.{coda}"
+             argomenti.{coda}\n{}",
+            out.testo
         ),
-        &out,
-    )
+        ..out
+    }
 }
 
 /// Le due variabili con cui una riga dichiara l'URL del bersaglio: sono le
@@ -1621,7 +1633,10 @@ fn directory_della_suite(
     }
 }
 
-pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Value) -> String {
+pub(super) async fn tool_run_playwright_tests(
+    ctx: &AgentToolContext,
+    input: &Value,
+) -> RispostaTool {
     // ── 1. Parametri ─────────────────────────────────────────────────────────
     let params = parse_playwright_params(input);
     let PlaywrightRunParams {
@@ -1642,7 +1657,7 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
     let (playwright_root, stale_configs) = match resolve_playwright_root(ctx, &config_path_override)
     {
         Ok(v) => v,
-        Err(msg) => return msg,
+        Err(risposta) => return risposta,
     };
     let root = &playwright_root;
     tracing::info!(playwright_root = %root.display(), "run_playwright_tests: directory scelta");
@@ -1665,18 +1680,20 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
         .is_dir();
 
     if !has_config && !has_playwright_nm {
-        return format!(
+        // RIMEDIABILE per costruzione: il messaggio non dice solo che manca,
+        // detta le due righe che lo installano.
+        return RispostaTool::fallito_rimediabile(format!(
             "[run_playwright_tests] Playwright non trovato nel progetto (cercato in {} e sottodirectory).\n\
              Installa con: run_command({{\"command\": \"pnpm add -D @playwright/test\", \"working_dir\": \"app\"}}).\n\
              Poi inizializza: run_command({{\"command\": \
              \"npx playwright install --with-deps chromium\", \"working_dir\": \"app\"}}).",
             ctx.root_path.display()
-        );
+        ));
     }
 
     // ── 2bis. Pre-flight check librerie sistema chromium-headless-shell ──────
-    if let Err(msg) = run_preflight_check(ctx, root).await {
-        return msg;
+    if let Err(risposta) = run_preflight_check(ctx, root).await {
+        return risposta;
     }
 
     // ── 3. Server raggiungibile? (pre-volo del tool: l'avvio automatico e'
@@ -1727,11 +1744,10 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
         // stato), non della suite: e' comunque un tool fallito, e lo dichiara
         // dal ponte come i dodici altri rami di questo file — nudo, il modello
         // lo leggeva come un successo senza esito.
-        Err(e) => {
-            return nexus_types::tool_outcome::tool_failure(format!(
-                "[run_playwright_tests] {e}"
-            ))
-        }
+        // DEL SISTEMA: e' la memoria della suite o la chiave di stato a non
+        // rispondere, non la suite. Nessun parametro della chiamata la rimette
+        // in piedi, e ripetere identico rifallisce.
+        Err(e) => return RispostaTool::fallito_di_sistema(format!("[run_playwright_tests] {e}")),
     };
 
     // ── 5. Output finale: note del pre-volo + esito dichiarato dal punto unico
@@ -1741,7 +1757,44 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
     }
     out.push_str(&format!("Server: {server_status}\n"));
     out.push_str(&verifica.testo);
-    out
+    risposta_da_verifica(&verifica, out)
+}
+
+/// Traduce l'esito GIA' strutturato della verifica nei campi di [`RispostaTool`].
+///
+/// `SuiteVerification` porta `outcome` (vocabolario canonico `passed|flaky|
+/// tests_failed|setup_failed`, punto unico `suite_verification`) ed `exit_code`,
+/// e questo tool li appiattiva entrambi nel testo: chi a valle voleva sapere
+/// com'era andata la suite doveva rileggere la prosa, cioe' esattamente cio' che
+/// la regola M vieta e che la regola Q rende inutile.
+///
+/// I quattro casi non collassano in due:
+/// - `Passed` -> riuscito;
+/// - `Flaky` -> RIUSCITO, per il contratto gia' deciso in `suite_verification`
+///   (un fallito i cui test ripassano alla riesecuzione mirata non apre il ciclo
+///   di correzione e non boccia il gate; resta debito di TEST, e il testo lo
+///   dice);
+/// - `TestsFailed` -> tool RIUSCITO con `exit_code` valorizzato. Il tool ha
+///   fatto il suo lavoro — ha eseguito e ha riportato — e i test rossi sono
+///   l'esito del COMANDO. E' la stessa distinzione su cui il final_gate decide
+///   se rieseguire il criterio o correggere il codice;
+/// - `SetupFailed` -> tool FALLITO: la suite non e' mai partita, quindi non c'e'
+///   nessun esito di test da riportare. TRANSITORIO perche' la causa tipica e'
+///   l'ambiente non ancora pronto (servizio bersaglio freddo, Chromium in
+///   installazione), dove ritentare e' la strategia corretta.
+fn risposta_da_verifica(
+    verifica: &crate::suite_verification::SuiteVerification,
+    testo: String,
+) -> RispostaTool {
+    match verifica.outcome {
+        SuiteOutcome::SetupFailed => RispostaTool::fallito_transitorio(testo),
+        // `exit_code` None = timeout o processo mai terminato: si dichiara
+        // comunque un comando andato male, senza inventare un numero preciso.
+        SuiteOutcome::TestsFailed => {
+            RispostaTool::comando(testo, verifica.exit_code.unwrap_or(-1))
+        }
+        SuiteOutcome::Passed | SuiteOutcome::Flaky => RispostaTool::riuscito(testo),
+    }
 }
 
 // L'esito strutturato (regola M) vive nel punto unico
@@ -2210,16 +2263,18 @@ fn extract_stat(line: &str, keyword: &str) -> Option<usize> {
 fn resolve_work_path(
     ctx: &AgentToolContext,
     working_dir: &str,
-) -> Result<std::path::PathBuf, String> {
+) -> Result<std::path::PathBuf, RispostaTool> {
     if working_dir.is_empty() {
         return Ok(ctx.root_path.clone());
     }
     match resolve_relative_path(&ctx.root_path, working_dir) {
         Ok(p) => Ok(p),
-        Err(e) => Err(format!(
-            "\u{274C} [Errore percorso: {}]",
+        // Il percorso e' un parametro che l'agente controlla, e il resolver dice
+        // gia' fin dove esiste: rimediabile con l'informazione a bordo.
+        Err(e) => Err(RispostaTool::fallito_rimediabile(format!(
+            "[Errore percorso: {}]",
             e.1["error"].as_str().unwrap_or("path error")
-        )),
+        ))),
     }
 }
 
@@ -2261,34 +2316,34 @@ fn detect_test_command(work_path: &Path, test_name: &str) -> Option<String> {
 
 /// Esegue un singolo test (o un filtro per nome) invece dell'intera suite.
 /// Rileva il framework dal progetto: cargo test, pnpm test, pytest.
-pub(super) async fn tool_run_specific_test(ctx: &AgentToolContext, input: &Value) -> String {
-    let test_name = match input.get("test_name").and_then(Value::as_str) {
-        Some(s) if !s.is_empty() => s,
-        _ => return "\u{274C} [Errore: parametro 'test_name' obbligatorio]".to_string(),
-    };
-    let working_dir = input
-        .get("working_dir")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let timeout_secs = input
-        .get("timeout_secs")
-        .and_then(Value::as_u64)
-        .unwrap_or(120)
-        .min(600);
+pub(super) async fn tool_run_specific_test(
+    ctx: &AgentToolContext,
+    input: &Value,
+) -> RispostaTool {
+    use nexus_agent_tools::{input_contract::InputTool, tool_inputs::RunSpecificTestInput};
 
-    let work_path = match resolve_work_path(ctx, working_dir) {
+    let params = match RunSpecificTestInput::leggi(input) {
         Ok(p) => p,
-        Err(e) => return e,
+        Err(risposta) => return risposta,
+    };
+    let timeout_secs = params.timeout_secs.unwrap_or(120).clamp(0, 600) as u64;
+
+    let work_path = match resolve_work_path(ctx, params.working_dir.as_deref().unwrap_or("")) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
 
-    let command = match detect_test_command(&work_path, test_name) {
+    let command = match detect_test_command(&work_path, &params.test_name) {
         Some(c) => c,
+        // RIMEDIABILE: l'agente puo' indicare un'altra `working_dir`, e il
+        // messaggio elenca i marker cercati — cioe' cosa deve esserci perche'
+        // il rilevamento riesca.
         None => {
-            return format!(
-                "\u{274C} [Errore: framework di test non rilevato in '{}'. \
+            return RispostaTool::fallito_rimediabile(format!(
+                "[Errore: framework di test non rilevato in '{}'. \
                  File cercati: Cargo.toml, package.json, pytest.ini, pyproject.toml, mix.exs, go.mod]",
                 work_path.display()
-            )
+            ))
         }
     };
 
@@ -2329,68 +2384,76 @@ fn detect_lint_command(work_path: &Path, check_only: bool) -> Option<String> {
 }
 
 /// Esegue il linter con fix automatico (clippy --fix, eslint --fix, ruff --fix).
-pub(super) async fn tool_run_lint_fix(ctx: &AgentToolContext, input: &Value) -> String {
-    if !ctx.can_write {
-        return "\u{274C} [Errore: permesso di scrittura non concesso]".to_string();
-    }
-    let check_only = input
-        .get("check_only")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let working_dir = input
-        .get("working_dir")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let timeout_secs = input
-        .get("timeout_secs")
-        .and_then(Value::as_u64)
-        .unwrap_or(120)
-        .min(300);
+pub(super) async fn tool_run_lint_fix(ctx: &AgentToolContext, input: &Value) -> RispostaTool {
+    use nexus_agent_tools::{input_contract::InputTool, tool_inputs::RunLintFixInput};
 
-    let work_path = match resolve_work_path(ctx, working_dir) {
+    if let Some(negato) = permesso_di_scrittura(ctx) {
+        return negato;
+    }
+    let params = match RunLintFixInput::leggi(input) {
         Ok(p) => p,
-        Err(e) => return e,
+        Err(risposta) => return risposta,
+    };
+    let timeout_secs = params.timeout_secs.unwrap_or(120).clamp(0, 300) as u64;
+
+    let work_path = match resolve_work_path(ctx, params.working_dir.as_deref().unwrap_or("")) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
 
-    let command = match detect_lint_command(&work_path, check_only) {
+    let command = match detect_lint_command(&work_path, params.check_only.unwrap_or(false)) {
         Some(c) => c,
         None => {
-            return format!(
-                "\u{274C} [Errore: linter non rilevato in '{}'. \
+            return RispostaTool::fallito_rimediabile(format!(
+                "[Errore: linter non rilevato in '{}'. \
                  Supportati: cargo clippy (Rust), eslint (Node), ruff (Python)]",
                 work_path.display()
-            )
+            ))
         }
     };
 
     run_test_command(ctx, &command, &work_path, timeout_secs).await
 }
 
-/// Formatta un singolo file (rustfmt, prettier, black) in base all'estensione.
-pub(super) async fn tool_format_file(ctx: &AgentToolContext, input: &Value) -> String {
-    if !ctx.can_write {
-        return "\u{274C} [Errore: permesso di scrittura non concesso]".to_string();
+/// Il rifiuto per permesso di scrittura mancante, in un punto solo.
+///
+/// DEL SISTEMA, sempre: il permesso e' una decisione del progetto sul run, non
+/// un parametro della chiamata. Riformularla non la cambia, e ripeterla e' il
+/// solo modo di sprecare iterazioni contro una porta chiusa. Stesso precedente
+/// del permesso di scrittura negato in `write_file`.
+fn permesso_di_scrittura(ctx: &AgentToolContext) -> Option<RispostaTool> {
+    if ctx.can_write {
+        return None;
     }
-    let path_str = match input.get("path").and_then(Value::as_str) {
-        Some(s) if !s.is_empty() => s,
-        _ => return "\u{274C} [Errore: parametro 'path' obbligatorio]".to_string(),
+    Some(RispostaTool::fallito_di_sistema(
+        "[Errore: permesso di scrittura non concesso]",
+    ))
+}
+
+/// Formatta un singolo file (rustfmt, prettier, black) in base all'estensione.
+pub(super) async fn tool_format_file(ctx: &AgentToolContext, input: &Value) -> RispostaTool {
+    use nexus_agent_tools::{input_contract::InputTool, tool_inputs::FormatFileInput};
+
+    if let Some(negato) = permesso_di_scrittura(ctx) {
+        return negato;
+    }
+    let params = match FormatFileInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
-    let check_only = input
-        .get("check_only")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let path_str = params.path.as_str();
 
     let target = match resolve_relative_path(&ctx.root_path, path_str) {
         Ok(p) => p,
         Err(e) => {
-            return format!(
-                "\u{274C} [Errore percorso: {}]",
+            return RispostaTool::fallito_rimediabile(format!(
+                "[Errore percorso: {}]",
                 e.1["error"].as_str().unwrap_or("path error")
-            )
+            ))
         }
     };
     if !target.is_file() {
-        return format!("\u{274C} [Errore: '{}' non e' un file]", path_str);
+        return RispostaTool::fallito_rimediabile(format!("[Errore: '{path_str}' non e' un file]"));
     }
 
     let ext = target
@@ -2399,14 +2462,13 @@ pub(super) async fn tool_format_file(ctx: &AgentToolContext, input: &Value) -> S
         .unwrap_or("")
         .to_lowercase();
 
-    let command = match detect_format_command(&ext, &target, check_only) {
+    let command = match detect_format_command(&ext, &target, params.check_only.unwrap_or(false)) {
         Some(c) => c,
         None => {
-            return format!(
-                "\u{274C} [Errore: formatter non disponibile per estensione '.{}'. \
-                 Supportati: .rs (rustfmt), .ts/.js/.json/.css/.md (prettier), .py (black), .go (gofmt)]",
-                ext
-            )
+            return RispostaTool::fallito_rimediabile(format!(
+                "[Errore: formatter non disponibile per estensione '.{ext}'. \
+                 Supportati: .rs (rustfmt), .ts/.js/.json/.css/.md (prettier), .py (black), .go (gofmt)]"
+            ))
         }
     };
 
@@ -2447,30 +2509,46 @@ fn detect_format_command(ext: &str, target: &Path, check_only: bool) -> Option<S
 }
 
 /// Helper comune: esegue un comando con timeout e cattura output.
+/// DIVERGENZA CHIUSA: lo stato d'uscita finiva nel testo come `Exit code: N`, e
+/// il ponte legacy cerca `EXIT CODE: ` MAIUSCOLO. Le due scritture non si sono
+/// mai incontrate: per i tre tool che passano di qui — `run_specific_test`,
+/// `run_lint_fix`, `format_file` — `RispostaTool.exit_code` e' stato `None`
+/// SEMPRE, e con esso il dato su cui il final_gate decide se rieseguire un
+/// criterio o correggere il codice. Nessun test poteva vederlo: il testo era
+/// corretto e leggibile, mancava solo chi lo rileggesse con la stessa
+/// convenzione di chi lo scriveva.
+///
+/// Ora il campo e' il campo. Il testo continua a dirlo perche' lo legge il
+/// modello, ma nessun codice lo analizza piu' per saperlo (regola Q, punto 3).
+///
+/// L'esito resta `Riuscito` anche a `exit_code != 0`: il tool ha fatto il suo
+/// lavoro — ha eseguito e ha riportato — e un lint rosso e' un COMANDO fallito,
+/// non un tool fallito. Collassarli renderebbe un test rotto indistinguibile da
+/// un runner che non e' partito.
 async fn run_test_command(
     _ctx: &AgentToolContext,
     command: &str,
     work_dir: &Path,
     timeout_secs: u64,
-) -> String {
+) -> RispostaTool {
     let (exit_code, stdout, stderr) =
         match spawn_and_capture_output(command, work_dir, timeout_secs).await {
             Ok(v) => v,
-            Err(msg) => return msg,
+            Err(risposta) => return risposta,
         };
 
     // Tronca output se troppo lungo (coda degli ultimi 6000 byte)
     let stdout_tail = truncate_output_tail(stdout, 6000);
     let stderr_tail = truncate_output_tail(stderr, 6000);
 
-    let mut result = format!("Exit code: {}\n", exit_code);
+    let mut result = format!("Exit code: {exit_code}\n");
     if !stdout_tail.is_empty() {
-        result.push_str(&format!("\nOutput:\n{}", stdout_tail));
+        result.push_str(&format!("\nOutput:\n{stdout_tail}"));
     }
     if !stderr_tail.is_empty() {
-        result.push_str(&format!("\nErrori:\n{}", stderr_tail));
+        result.push_str(&format!("\nErrori:\n{stderr_tail}"));
     }
-    result
+    RispostaTool::comando(result, exit_code)
 }
 
 /// Lancia `command` nella shell isolata, cattura stdout/stderr in parallelo a
@@ -2480,7 +2558,7 @@ async fn spawn_and_capture_output(
     command: &str,
     work_dir: &Path,
     timeout_secs: u64,
-) -> Result<(i32, String, String), String> {
+) -> Result<(i32, String, String), RispostaTool> {
     use tokio::io::AsyncReadExt;
 
     // L'isolamento env (env_clear + host env filtrato) e' dentro
@@ -2494,7 +2572,10 @@ async fn spawn_and_capture_output(
         .spawn()
     {
         Ok(c) => c,
-        Err(e) => return Err(format!("\u{274C} [Errore avvio: {}]", e)),
+        // L'avvio del processo dipende dalla shell isolata e dall'ambiente, non
+        // da come l'agente ha scritto la riga: quella non e' ancora stata letta
+        // da nessuno.
+        Err(e) => return Err(RispostaTool::fallito_di_sistema(format!("[Errore avvio: {e}]"))),
     };
 
     let stdout_handle = child.stdout.take();
@@ -2519,7 +2600,11 @@ async fn spawn_and_capture_output(
 
     let exit_code = match timeout_result {
         Ok(Ok(status)) => status.code().unwrap_or(-1),
-        Ok(Err(e)) => return Err(format!("\u{274C} [Errore attesa processo: {}]", e)),
+        Ok(Err(e)) => {
+            return Err(RispostaTool::fallito_di_sistema(format!(
+                "[Errore attesa processo: {e}]"
+            )))
+        }
         Err(_) => {
             let _ = child.start_kill();
             // Come nel ramo timeout di `command.rs`: droppare un `JoinHandle`
@@ -2529,10 +2614,14 @@ async fn spawn_and_capture_output(
             // sempre.
             stdout_task.abort();
             stderr_task.abort();
-            return Err(format!(
-                "[Timeout dopo {}s. Comando: {}]",
-                timeout_secs, command
-            ));
+            // Prima usciva NUDO, senza marker: un comando ucciso dal timeout
+            // arrivava all'agente come un'esecuzione riuscita di cui mancava
+            // solo l'output. TRANSITORIO come il servizio che non entra in
+            // ascolto entro la sua finestra, e il testo nomina il parametro che
+            // da' l'altra strada.
+            return Err(RispostaTool::fallito_transitorio(format!(
+                "[Timeout dopo {timeout_secs}s. Comando: {command}.                  Se il comando e' legittimamente lento alza 'timeout_secs'.]"
+            )));
         }
     };
 

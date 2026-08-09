@@ -81,6 +81,28 @@ async fn esegui_tool_migrato(
         "service_restart" => Some(service::tool_service_restart(ctx, input).await),
         "tail_service_logs" => Some(service::tool_tail_service_logs(ctx, input).await),
         "build_project_image" => Some(service::tool_build_project_image(ctx).await),
+        // `testing.rs` e i due tool di comando che condividono la sua catena.
+        // Qui l'esito nel campo recupera un dato che era MUTO: lo stato d'uscita
+        // finiva nel testo come "Exit code: N" e "(exit code: N)", mentre il
+        // ponte legacy cerca "EXIT CODE: " MAIUSCOLO. Le due scritture non si
+        // sono mai incontrate, quindi per questi quattro tool il campo su cui il
+        // final_gate decide se rieseguire un criterio o correggere il codice e'
+        // stato `None` sempre.
+        "run_playwright_tests" => Some(testing::tool_run_playwright_tests(ctx, input).await),
+        "run_specific_test" => Some(testing::tool_run_specific_test(ctx, input).await),
+        "run_lint_fix" => Some(testing::tool_run_lint_fix(ctx, input).await),
+        "format_file" => Some(testing::tool_format_file(ctx, input).await),
+        "run_tests" => Some(command::tool_run_tests(ctx, input).await),
+        // `git.rs`: CINQUE handler su sei componevano `[git <verbo> error: ...]`
+        // senza marker, cioe' un commit rifiutato, un push respinto e un pull in
+        // conflitto arrivavano all'agente come esecuzioni riuscite. Anche il
+        // rifiuto "non e' un repository git" usciva nudo, da tutti e sei.
+        "git_status" => Some(git::tool_git_status(ctx).await),
+        "git_stage" => Some(git::tool_git_stage(ctx, input).await),
+        "git_commit" => Some(git::tool_git_commit(ctx, input).await),
+        "git_push" => Some(git::tool_git_push(ctx).await),
+        "git_pull" => Some(git::tool_git_pull(ctx).await),
+        "git_remote_add" => Some(git::tool_git_remote_add(ctx, input).await),
         // Ogni suo fallimento e' RIMEDIABILE e lo dichiara nel campo `natura`:
         // e' il primo tool a farlo, ed e' quello su cui la mancanza si
         // misurava (11% di `old_string non trovato` seguiti da una ripetizione
@@ -127,12 +149,6 @@ async fn esegui_tool_legacy(
     input: &Value,
 ) -> nexus_types::tool_outcome::RispostaTool {
     let testo = match name {
-        "git_status" => git::tool_git_status(ctx).await,
-        "git_stage" => git::tool_git_stage(ctx, input).await,
-        "git_commit" => git::tool_git_commit(ctx, input).await,
-        "git_push" => git::tool_git_push(ctx).await,
-        "git_pull" => git::tool_git_pull(ctx).await,
-        "git_remote_add" => git::tool_git_remote_add(ctx, input).await,
         // Fix M51: tool dedicato per allocazione porta (evita curl via run_command).
         "request_port" => ports::tool_request_port(ctx, input).await,
         // Tool read-only per verifica/audit dello stato porte (bucket + allocazioni).
@@ -150,15 +166,11 @@ async fn esegui_tool_legacy(
         // Poll (DB-only) + resume (ri-esecuzione nativa) dei sub-agent.
         "nexus_subagent_poll" => subagent_native::tool_nexus_subagent_poll(ctx, input).await,
         "nexus_subagent_resume" => subagent_native::tool_nexus_subagent_resume(ctx, input).await,
-        "run_specific_test" => testing::tool_run_specific_test(ctx, input).await,
-        "run_lint_fix" => testing::tool_run_lint_fix(ctx, input).await,
-        "format_file" => testing::tool_format_file(ctx, input).await,
         // Catena di verifica post-modifica (ADR 0019 L3): typecheck -> build ->
         // lint -> test con fail-fast e VerifyReport strutturato.
         "nexus_verify_change" => verify::tool_nexus_verify_change(ctx, input).await,
         // Tool dedicato ai cicli test-fix-test: esecuzione sincrona con
         // timeout esteso (raccomandato dai prompt al posto di run_command).
-        "run_tests" => command::tool_run_tests(ctx, input).await,
         "create_profile" => tool_create_profile(ctx, input).await,
         "update_profile" => tool_update_profile(ctx, input).await,
         "set_sandbox_config" => sandbox::tool_set_sandbox_config(ctx, input).await,
@@ -218,7 +230,6 @@ async fn esegui_tool_legacy(
                 .min(10) as usize;
             tool_recall_context(ctx, &query, &source, limit).await
         }
-        "run_playwright_tests" => testing::tool_run_playwright_tests(ctx, input).await,
         "batch_analyze_code" => tool_batch_analyze_code(ctx, input).await,
         // ── Dispatcher centrale (pilotaggio pannelli) ──────────────────────
         "dispatcher_emit_event" => dispatcher::tool_dispatcher_emit_event(ctx, input).await,

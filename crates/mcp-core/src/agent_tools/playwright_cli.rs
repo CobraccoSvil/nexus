@@ -165,10 +165,15 @@ pub(super) async fn intercetta_suite(
     tool: &str,
     command: &str,
     working_dir_param: Option<&str>,
-) -> Option<String> {
+) -> Option<nexus_types::tool_outcome::RispostaTool> {
     let inv = invocazione_suite(command)?;
     if inv.composita {
-        return Some(rifiuto_riga_composita(tool, command));
+        // RIMEDIABILE: il messaggio dice come spezzare la riga. Prima usciva
+        // dal ponte insieme al resto; ora il rifiuto e' un fallimento
+        // dichiarato, distinto dall'esito della suite che non e' stata eseguita.
+        return Some(nexus_types::tool_outcome::RispostaTool::fallito_rimediabile(
+            rifiuto_riga_composita(tool, command),
+        ));
     }
     // Il boxing spezza un ciclo di TIPI, non un rischio a runtime: da qui si va
     // al runner, e il runner con `auto_start_server` puo' avviare il dev server

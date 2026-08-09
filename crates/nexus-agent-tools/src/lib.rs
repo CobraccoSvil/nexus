@@ -86,3 +86,4 @@ pub(crate) fn errore_json(messaggio: impl std::fmt::Display) -> String {
 pub(crate) fn errore_json_con_dettagli(dettagli: serde_json::Value) -> String {
     nexus_types::tool_outcome::tool_failure(dettagli.to_string())
 }
+

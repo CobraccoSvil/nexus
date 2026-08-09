@@ -1,63 +1,122 @@
 //! Tool Git: status, stage, commit, push, pull.
+//!
+//! MIGRATI al contratto d'ingresso e a `RispostaTool` (regola Q).
+//!
+//! DIVERGENZA CHIUSA, e non era piccola: CINQUE handler su sei componevano il
+//! proprio errore come `[git <verbo> error: ...]`, SENZA il marker di
+//! fallimento. Un `git commit` che rifiuta per hook, un `git push` respinto dal
+//! remoto, un `git pull --rebase` fermo su conflitto arrivavano all'agente come
+//! esecuzioni RIUSCITE il cui testo raccontava un errore — e la regola M vieta
+//! di leggere quel testo per accorgersene. L'agente proseguiva come se il lavoro
+//! fosse salvato.
+//!
+//! Il caso e' quello che la regola Q descrive alla lettera: finche' la firma era
+//! `-> String` l'esito non aveva dove stare, e comporre `format!("[git ... ]")`
+//! era indistinguibile dal comporre un risultato. Col campo la dimenticanza non
+//! e' piu' rappresentabile.
 
+use nexus_types::tool_outcome::RispostaTool;
 use nexus_types::git_exec::run_git_command;
 use serde_json::Value;
 
 use super::ToolContextCore;
 
-pub async fn tool_git_status(ctx: &ToolContextCore) -> String {
+/// Il rifiuto dei tool git quando il progetto non e' un repository.
+///
+/// DEL SISTEMA: non e' un parametro che l'agente possa correggere ne' una
+/// condizione che passi da sola. Prima usciva NUDO — cioe' come un successo —
+/// da tutti e sei gli handler.
+fn non_e_un_repo() -> RispostaTool {
+    RispostaTool::fallito_di_sistema(
+        "Il progetto non e' un repository git: nessun comando git e' applicabile.",
+    )
+}
+
+/// Il rifiuto per permesso di scrittura mancante.
+///
+/// DEL SISTEMA: e' una decisione del progetto sul run, non un parametro della
+/// chiamata. Ripetere non la cambia.
+fn permesso_di_scrittura(ctx: &ToolContextCore) -> Option<RispostaTool> {
+    if ctx.can_write {
+        return None;
+    }
+    Some(RispostaTool::fallito_di_sistema(
+        "[Errore: permesso di scrittura non concesso]",
+    ))
+}
+
+/// Il fallimento di un comando git.
+///
+/// DEL SISTEMA per default e non rimediabile: `run_git_command` fallisce per lo
+/// stato del repository o del remoto (hook che rifiuta, conflitto, credenziali,
+/// nulla da committare), non per come l'agente ha scritto la chiamata — che ha
+/// uno o due parametri, gia' validati dal contratto. Dire «rimediabile»
+/// obbligherebbe il messaggio a spiegare COME, e qui non lo sappiamo: quello che
+/// sappiamo lo dice git, e viaggia nel testo.
+fn git_fallito(verbo: &str, e: impl std::fmt::Display) -> RispostaTool {
+    RispostaTool::fallito_di_sistema(format!("[git {verbo} error: {e}]"))
+}
+
+pub async fn tool_git_status(ctx: &ToolContextCore) -> RispostaTool {
     if !ctx.is_git_repo {
-        return "Il progetto non e' un repository git.".to_string();
+        return non_e_un_repo();
     }
     match run_git_command(&ctx.root_path, &["status", "--porcelain=v1", "-b"]).await {
-        Ok((stdout, _)) => {
-            if stdout.trim().is_empty() {
-                "Repository pulito, nessuna modifica pendente.".to_string()
-            } else {
-                stdout
-            }
-        }
-        Err(e) => format!("[git status error: {}]", e),
+        // Un repository pulito e' una RISPOSTA, non un fallimento: e' lo stesso
+        // criterio con cui `list_files` tratta una directory vuota.
+        Ok((stdout, _)) => RispostaTool::riuscito(if stdout.trim().is_empty() {
+            "Repository pulito, nessuna modifica pendente.".to_string()
+        } else {
+            stdout
+        }),
+        Err(e) => git_fallito("status", e),
     }
 }
 
-pub async fn tool_git_stage(ctx: &ToolContextCore, input: &Value) -> String {
+pub async fn tool_git_stage(ctx: &ToolContextCore, input: &Value) -> RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::GitStageInput};
+
     if !ctx.is_git_repo {
-        return "Il progetto non e' un repository git.".to_string();
+        return non_e_un_repo();
     }
-    if !ctx.can_write {
-        return "\u{274C} [Errore: permesso di scrittura non concesso]".to_string();
+    if let Some(negato) = permesso_di_scrittura(ctx) {
+        return negato;
     }
-    let paths: Vec<String> = match input.get("paths").and_then(Value::as_array) {
-        Some(arr) => arr
-            .iter()
-            .filter_map(|v| v.as_str().map(ToOwned::to_owned))
-            .collect(),
-        None => return "\u{274C} [Errore: parametro 'paths' mancante o non valido]".to_string(),
+    // La presenza e il TIPO di `paths` li pretende il contratto: la lettura a
+    // mano scartava in silenzio gli elementi non-stringa (`filter_map`), quindi
+    // `["a", 42]` metteva in staging il solo primo percorso e riportava
+    // successo. Ora un array malformato e' un errore che nomina il campo.
+    let params = match GitStageInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
-    if paths.is_empty() {
-        return "\u{274C} [Errore: 'paths' vuoto]".to_string();
+    if params.paths.is_empty() {
+        return RispostaTool::fallito_rimediabile(
+            "[Errore: 'paths' vuoto: indica almeno un percorso da mettere in staging]",
+        );
     }
     let mut args = vec!["add"];
-    let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-    args.extend(path_refs.iter().copied());
+    args.extend(params.paths.iter().map(String::as_str));
     match run_git_command(&ctx.root_path, &args).await {
-        Ok(_) => format!("Staged: {}", paths.join(", ")),
-        Err(e) => format!("[git add error: {}]", e),
+        Ok(_) => RispostaTool::riuscito(format!("Staged: {}", params.paths.join(", "))),
+        Err(e) => git_fallito("add", e),
     }
 }
 
-pub async fn tool_git_commit(ctx: &ToolContextCore, input: &Value) -> String {
+pub async fn tool_git_commit(ctx: &ToolContextCore, input: &Value) -> RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::GitCommitInput};
+
     if !ctx.is_git_repo {
-        return "Il progetto non e' un repository git.".to_string();
+        return non_e_un_repo();
     }
-    if !ctx.can_write {
-        return "\u{274C} [Errore: permesso di scrittura non concesso]".to_string();
+    if let Some(negato) = permesso_di_scrittura(ctx) {
+        return negato;
     }
-    let message = match input.get("message").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return "\u{274C} [Errore: parametro 'message' mancante]".to_string(),
+    let params = match GitCommitInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
+    let message = params.message.as_str();
     match run_git_command(&ctx.root_path, &["commit", "-m", message]).await {
         Ok((stdout, _)) => {
             // Dispatcher: notifica GitStatusChanged → pannello Git aggiorna branch + counts
@@ -109,79 +168,82 @@ pub async fn tool_git_commit(ctx: &ToolContextCore, input: &Value) -> String {
                     }
                 }
             });
-            stdout.trim().to_string()
+            RispostaTool::riuscito(stdout.trim())
         }
-        Err(e) => format!("[git commit error: {}]", e),
+        Err(e) => git_fallito("commit", e),
     }
 }
 
-pub async fn tool_git_push(ctx: &ToolContextCore) -> String {
+pub async fn tool_git_push(ctx: &ToolContextCore) -> RispostaTool {
     if !ctx.is_git_repo {
-        return "Il progetto non e' un repository git.".to_string();
+        return non_e_un_repo();
     }
-    if !ctx.can_write {
-        return "\u{274C} [Errore: permesso di scrittura non concesso]".to_string();
+    if let Some(negato) = permesso_di_scrittura(ctx) {
+        return negato;
     }
     match run_git_command(&ctx.root_path, &["push"]).await {
-        Ok((stdout, stderr)) => {
-            let out = if stdout.trim().is_empty() {
-                stderr
-            } else {
-                stdout
-            };
-            out.trim().to_string()
-        }
-        Err(e) => format!("[git push error: {}]", e),
+        // git scrive il resoconto del push su STDERR anche quando riesce: il
+        // ripiego non e' un errore mascherato, e' dove git mette l'output.
+        Ok((stdout, stderr)) => RispostaTool::riuscito(
+            if stdout.trim().is_empty() { stderr } else { stdout }.trim(),
+        ),
+        Err(e) => git_fallito("push", e),
     }
 }
 
-pub async fn tool_git_pull(ctx: &ToolContextCore) -> String {
+pub async fn tool_git_pull(ctx: &ToolContextCore) -> RispostaTool {
     if !ctx.is_git_repo {
-        return "Il progetto non e' un repository git.".to_string();
+        return non_e_un_repo();
     }
     match run_git_command(&ctx.root_path, &["pull", "--rebase"]).await {
-        Ok((stdout, _)) => stdout.trim().to_string(),
-        Err(e) => format!("[git pull error: {}]", e),
+        Ok((stdout, _)) => RispostaTool::riuscito(stdout.trim()),
+        Err(e) => git_fallito("pull", e),
     }
 }
 
 /// Fix M16: configura un remote git (es. `origin`) puntando a un URL.
 /// Tool agente che evita all'agente di usare `run_command git remote add ...` shell.
 /// Input: `{name: string, url: string}` (default name = "origin")
-pub async fn tool_git_remote_add(ctx: &ToolContextCore, input: &Value) -> String {
+pub async fn tool_git_remote_add(ctx: &ToolContextCore, input: &Value) -> RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::GitRemoteAddInput};
+
     if !ctx.is_git_repo {
-        return "Il progetto non e' un repository git.".to_string();
+        return non_e_un_repo();
     }
-    if !ctx.can_write {
-        return "\u{274C} [Errore: permesso di scrittura non concesso]".to_string();
+    if let Some(negato) = permesso_di_scrittura(ctx) {
+        return negato;
     }
-    let name = input
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("origin")
-        .trim();
-    let url = match input.get("url").and_then(Value::as_str) {
-        Some(u) if !u.trim().is_empty() => u.trim(),
-        _ => return "\u{274C} [Errore: parametro 'url' obbligatorio]".to_string(),
+    let params = match GitRemoteAddInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
+    // Il default `origin` resta dell'handler: il contratto dichiara il campo
+    // opzionale, non il valore che assume quando manca.
+    let name = params.name.as_deref().unwrap_or("origin").trim();
+    let url = params.url.trim();
+    if url.is_empty() {
+        return RispostaTool::fallito_rimediabile(
+            "[Errore: 'url' vuoto: passa l'indirizzo del remote]",
+        );
+    }
 
     // Validazione: name puro alfanumerico/underscore/dash, no path traversal
     if !name
         .chars()
         .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
     {
-        return format!(
-            "\u{274C} [Errore: nome remote non valido '{}' (solo alfanumerico/-/_)]",
-            name
-        );
+        // RIMEDIABILI entrambe: sono i due parametri della chiamata, e il
+        // messaggio dice esattamente quale forma e' ammessa.
+        return RispostaTool::fallito_rimediabile(format!(
+            "[Errore: nome remote non valido '{name}' (solo alfanumerico/-/_)]"
+        ));
     }
 
     // Validazione: url deve essere https:// o git@ (no file:// path locali per evitare leak)
     if !url.starts_with("https://") && !url.starts_with("git@") && !url.starts_with("ssh://") {
-        return format!(
-            "\u{274C} [Errore: url remote deve iniziare con https://, git@ o ssh:// (rifiutato: '{}')]",
-            url
-        );
+        return RispostaTool::fallito_rimediabile(format!(
+            "[Errore: url remote deve iniziare con https://, git@ o ssh:// (rifiutato: '{url}')]"
+        ));
     }
 
     // Se il remote esiste gia: rimuovilo e ricrealo (idempotente)
@@ -189,17 +251,19 @@ pub async fn tool_git_remote_add(ctx: &ToolContextCore, input: &Value) -> String
 
     match run_git_command(&ctx.root_path, &["remote", "add", name, url]).await {
         Ok(_) => {
-            // Verifica con git remote -v
+            // Verifica con git remote -v. Se la verifica non risponde il remote
+            // e' comunque configurato: l'esito resta riuscito e il testo dice
+            // solo cio' che si e' potuto accertare.
             match run_git_command(&ctx.root_path, &["remote", "-v"]).await {
-                Ok((stdout, _)) => format!(
-                    "Remote '{}' configurato verso {}.\n\nStato remote:\n{}",
-                    name,
-                    url,
+                Ok((stdout, _)) => RispostaTool::riuscito(format!(
+                    "Remote '{name}' configurato verso {url}.\n\nStato remote:\n{}",
                     stdout.trim()
-                ),
-                Err(_) => format!("Remote '{}' configurato verso {}.", name, url),
+                )),
+                Err(_) => {
+                    RispostaTool::riuscito(format!("Remote '{name}' configurato verso {url}."))
+                }
             }
         }
-        Err(e) => format!("[git remote add error: {}]", e),
+        Err(e) => git_fallito("remote add", e),
     }
 }

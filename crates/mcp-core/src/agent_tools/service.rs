@@ -131,11 +131,9 @@ fn nome_del_tool(kind: &str) -> &'static str {
 /// ferma processi e libera porte, e farlo per una suite che da qui non doveva
 /// partire costerebbe un servizio vivo.
 ///
-/// `intercetta_suite` ritorna ancora `String` perche' delega all'esecutore unico
-/// della suite, che vive in `testing.rs` e non e' migrato: finche' resta cosi',
-/// l'esito va ricostruito dal ponte legacy — l'UNICO punto autorizzato a farlo.
-/// Migrando `testing.rs` questa conversione sparisce. Il ponte non e' una scelta
-/// di questo modulo, e' il confine col modulo che lo precede nella migrazione.
+/// Nessuna conversione: `intercetta_suite` e' migrato insieme al suo esecutore
+/// (`testing.rs`), quindi la risposta arriva gia' coi campi valorizzati e il
+/// ponte legacy che stava qui e' sparito.
 async fn suite_playwright_altrove(
     ctx: &AgentToolContext,
     tool: &str,
@@ -149,7 +147,6 @@ async fn suite_playwright_altrove(
         input.get("working_dir").and_then(Value::as_str),
     )
     .await
-    .map(RispostaTool::da_testo_legacy)
 }
 
 /// Avvia un servizio/processo long-running direttamente sul server.
