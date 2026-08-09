@@ -107,6 +107,13 @@
 //!     saperlo e' guardare il DOM dopo che ha girato. Anche il DISCRIMINANTE
 //!     sta qui (`classifica_natura`): quale delle tre misure si applica e' un
 //!     fatto del progetto, mai un'euristica sul testo del task.
+//!   - [`origine_frontend`]: PUNTO UNICO di "qual e' l'INDIRIZZO del frontend?",
+//!     cioe' la premessa delle due misure qui sopra (senza origine non nascono).
+//!     Il criterio e' strutturale — un frontend e' cio' che SERVE UNA PAGINA
+//!     (2xx + `Content-Type` HTML sulla propria radice), non cio' che si chiama
+//!     "frontend": l'elenco di parole assolveva per omissione e il dialogo
+//!     browser non era MAI nato. Ospita anche `dichiara_html`, lo stesso segnale
+//!     che `endpoint_probes` legge all'inverso (`reject_html`).
 //!
 //! Le `route_after_*` NON sono qui: stanno nel PR 2b.
 
@@ -133,6 +140,7 @@ pub mod m16;
 pub mod meta_reason;
 pub mod orchestration_reason;
 pub mod orchestration_sizing;
+pub mod origine_frontend;
 pub mod panel_quorum;
 pub mod severity;
 pub mod shell_command;

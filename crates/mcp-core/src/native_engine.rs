@@ -1212,10 +1212,28 @@ async fn load_final_gate_config(db: &PgPool, project_id: Option<Uuid>) -> FinalG
         (true, Some(pid)) => load_configured_endpoint_criteria(db, pid, endpoint_timeout_s).await,
         _ => Vec::new(),
     };
-    // Origine del frontend, per provare gli endpoint ANCHE attraverso di esso
-    // (regola G: il nodo non legge il DB, la risoluzione sta qui).
-    let origine_frontend = match (endpoint_check_enabled, project_id) {
-        (true, Some(pid)) => load_origine_frontend(db, pid).await,
+    // Dialogo frontend<->backend osservato da browser (mig 0681). Letto QUI e
+    // non nel letterale piu' sotto perche' e' anche uno dei tre consumatori
+    // dell'origine, e la sua risoluzione va decisa prima.
+    let browser_dialogue_enabled = setting_bool(
+        db,
+        "agent.final_gate.browser_dialogue_enabled",
+        d.browser_dialogue_enabled,
+    )
+    .await;
+    // Origine del frontend. La usano TRE consumatori — le prove d'integrazione
+    // attraverso il frontend, il dialogo browser, e il discriminante di
+    // `static_render` (`classifica_natura`) — e finche' la sua risoluzione era
+    // appesa al solo `endpoint_check_enabled` spegnere quella chiave ne
+    // silenziava altri due senza dirlo: il dialogo non sarebbe nato, e un
+    // progetto CON servizio sarebbe stato classificato «app statica» e aperto su
+    // `/preview`, cioe' misurato male e non semplicemente non misurato.
+    // (Regola G: il nodo non legge il DB, la risoluzione sta qui.)
+    let static_render_enabled =
+        setting_bool(db, "agent.final_gate.static_render_enabled", false).await;
+    let serve_origine = endpoint_check_enabled || browser_dialogue_enabled || static_render_enabled;
+    let origine_frontend = match (serve_origine, project_id) {
+        (true, Some(pid)) => load_origine_frontend(db, pid, endpoint_timeout_s).await,
         _ => None,
     };
     // Criteri COMANDO (ADR 0036): la catena per-ambiente arriva dal profilo
@@ -1305,12 +1323,7 @@ async fn load_final_gate_config(db: &PgPool, project_id: Option<Uuid>) -> FinalG
             })
             .unwrap_or(d.docs_globs),
         // Dialogo frontend<->backend osservato da browser (mig 0681).
-        browser_dialogue_enabled: setting_bool(
-            db,
-            "agent.final_gate.browser_dialogue_enabled",
-            d.browser_dialogue_enabled,
-        )
-        .await,
+        browser_dialogue_enabled,
         // Stesso separatore `;` dei glob docs: un URL puo' contenere virgole.
         browser_third_parties: nexus_auth::get_setting(
             db,
@@ -1468,26 +1481,30 @@ async fn criterio_resa_statica(
     )
 }
 
-async fn load_origine_frontend(db: &PgPool, project_id: Uuid) -> Option<String> {
-    let righe: Vec<(i32, String)> = sqlx::query_as(
-        "SELECT port, label FROM nexus_port_allocations WHERE project_id = $1",
-    )
-    .bind(project_id)
-    .fetch_all(db)
-    .await
-    .inspect_err(|e| {
-        tracing::warn!(
-            target: "mcp_core::native_engine",
-            error = %e,
-            %project_id,
-            "porte del progetto non leggibili: nessuna prova d'integrazione col frontend"
-        );
-    })
-    .unwrap_or_default();
-    righe
-        .into_iter()
-        .find(|(_, label)| crate::agent_processes::similar_service_labels(label, "frontend"))
-        .map(|(port, _)| format!("http://127.0.0.1:{port}"))
+/// L'origine del frontend su cui il gate costruisce le prove d'integrazione e
+/// il dialogo browser. DELEGA al punto unico
+/// [`nexus_agent_graph::decisions::origine_frontend`] (criterio) attraverso il
+/// suo confine I/O in `project_workspace::origine_frontend` (fatti).
+///
+/// Qui restano le due sole cose che competono al chiamante: la pazienza da
+/// concedere alle prove — la stessa degli altri criteri HTTP del gate, letta dal
+/// DB (regola G) — e il LOG del verdetto. Il log e' `info` e non solo un ramo
+/// d'errore: chi legge il gate deve sapere DA DOVE ha guardato, perche' un
+/// numero senza la sua premessa e' un'opinione (regola O). Fino al 09/08/2026
+/// questa funzione sceglieva l'origine prendendo la prima allocazione la cui
+/// LABEL somigliasse a «frontend»: su gestione-corsi nessuna delle tre label la
+/// somigliava, il dialogo browser non nasceva mai, e l'unico segnale era il
+/// silenzio.
+async fn load_origine_frontend(db: &PgPool, project_id: Uuid, timeout_s: f64) -> Option<String> {
+    let esito =
+        crate::project_workspace::origine_frontend::risolvi(db, project_id, timeout_s).await;
+    tracing::info!(
+        target: "mcp_core::native_engine",
+        %project_id,
+        verdetto = %esito.descrizione(),
+        "origine frontend del final_gate"
+    );
+    esito.origine().map(str::to_string)
 }
 
 async fn load_configured_endpoint_criteria(

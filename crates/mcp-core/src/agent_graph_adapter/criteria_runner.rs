@@ -1746,21 +1746,14 @@ fn esito_http(
 /// rispondeva 404, e Vite ripiegava su `index.html` con **status 200**. Il gate
 /// vedeva 200 e approvava un'applicazione le cui due meta' non si parlavano.
 ///
-/// Era il limite DICHIARATO nel commento di quel criterio quando fu scritto
-/// ("cattura il proxy assente o mal indirizzato, non il fallback silenzioso");
-/// qui viene chiuso, e la chiusura non passa dal corpo ma dall'header.
-///
-/// Il `Content-Type` e' la fonte: e' cio' che il server DICHIARA di aver
-/// mandato. Il corpo interviene solo quando l'header manca — un `<!DOCTYPE html`
-/// in testa e' sintassi, non prosa, e senza header non c'e' altro da chiedere.
+/// Il PREDICATO non vive piu' qui: e' il punto unico
+/// [`nexus_agent_graph::decisions::origine_frontend::dichiara_html`], perche' lo
+/// stesso segnale ha un secondo lettore che lo interpreta all'INVERSO — sulla
+/// radice di un servizio una risposta HTML e' la prova che li' c'e' un frontend.
+/// Due implementazioni della stessa domanda divergerebbero, e divergendo
+/// darebbero due idee diverse di che cosa sia una pagina (regola L).
 fn risposta_e_html(content_type: Option<&str>, text: &str) -> bool {
-    if let Some(ct) = content_type {
-        let ct = ct.to_ascii_lowercase();
-        // `text/html`, `text/html; charset=utf-8`, `application/xhtml+xml`.
-        return ct.contains("text/html") || ct.contains("xhtml");
-    }
-    let inizio = text.trim_start().to_ascii_lowercase();
-    inizio.starts_with("<!doctype html") || inizio.starts_with("<html")
+    nexus_agent_graph::decisions::origine_frontend::dichiara_html(content_type, text)
 }
 
 /// Caratteri di corpo della risposta conservati nell'evidence di una prova HTTP.
@@ -2302,16 +2295,16 @@ mod tests {
         assert!(passed, "senza reject_html l'HTML non e' un difetto");
     }
 
-    /// Header assente: si guarda l'inizio del corpo, che e' sintassi e non prosa.
-    /// Un JSON che PARLA di html non e' una pagina.
+    /// La DELEGA al punto unico e' cablata: il vocabolario completo (header che
+    /// vince sul corpo, sintassi contro prosa, xhtml) e' provato una volta sola
+    /// dove vive il predicato, in `decisions::origine_frontend`. Qui si verifica
+    /// solo che `reject_html` arrivi davvero li' — con due implementazioni
+    /// separate questa asserzione resterebbe verde su una copia divergente.
     #[test]
-    fn senza_header_decide_la_sintassi_non_una_parola_nel_corpo() {
-        assert!(risposta_e_html(None, "  <!DOCTYPE html><html>"));
-        assert!(risposta_e_html(None, "<html><body>x</body></html>"));
-        assert!(!risposta_e_html(None, "{\"tipo\":\"text/html\",\"nota\":\"<html> nel dato\"}"));
-        // L'header, quando c'e', ha la precedenza sul corpo.
-        assert!(!risposta_e_html(Some("application/json"), "<!DOCTYPE html>"));
+    fn il_riconoscimento_html_delega_al_punto_unico() {
         assert!(risposta_e_html(Some("text/html; charset=utf-8"), "{}"));
+        assert!(risposta_e_html(None, "  <!DOCTYPE html><html>"));
+        assert!(!risposta_e_html(Some("application/json"), "<!DOCTYPE html>"));
     }
 
     /// ToolExecutor fittizio: ritorna risultati pre-programmati per nome, e
