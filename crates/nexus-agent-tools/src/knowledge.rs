@@ -26,6 +26,7 @@
 //!       blocked_by   -> blocked_by
 //!       relates      -> relates
 
+use nexus_types::tool_outcome::{NaturaFallimento, RispostaTool};
 use crate::context_core::ToolContextCore;
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -358,11 +359,20 @@ pub async fn tool_knowledge_search(ctx: &ToolContextCore, input: &Value) -> Stri
 
 /// `code_doc` — documentazione code-wiki di un file. Cerca doc con
 /// `kind='code_doc'` il cui `vault_file_path` o `title` matcha `file_path`.
-pub async fn tool_code_doc(ctx: &ToolContextCore, input: &Value) -> String {
-    let file_path = match input.get("file_path").and_then(|v| v.as_str()) {
-        Some(p) if !p.trim().is_empty() => p.trim(),
-        _ => return crate::errore_json("file_path mancante o vuoto"),
+pub async fn tool_code_doc(ctx: &ToolContextCore, input: &Value) -> RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::CodeDocInput};
+
+    let params = match CodeDocInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
+    let file_path = params.file_path.trim();
+    if file_path.is_empty() {
+        return crate::errore_tool(
+            "file_path vuoto: passa il percorso del file, relativo alla root del progetto",
+            NaturaFallimento::Rimediabile,
+        );
+    }
 
     let row = sqlx::query(
         r#"
@@ -384,15 +394,24 @@ pub async fn tool_code_doc(ctx: &ToolContextCore, input: &Value) -> String {
         Ok(Some(r)) => {
             let title: String = r.try_get("title").unwrap_or_default();
             let body: String = r.try_get("body_md").unwrap_or_default();
-            json!({ "file": title, "found": true, "body": body }).to_string()
+            RispostaTool::riuscito(
+                json!({ "file": title, "found": true, "body": body }).to_string(),
+            )
         }
-        Ok(None) => json!({
-            "file": file_path,
-            "found": false,
-            "message": "Nessuna documentazione (code_doc) per questo file. Prova knowledge_search per contesto correlato."
-        })
-        .to_string(),
-        Err(e) => crate::errore_json(format!("query fallita: {e}")),
+        // L'assenza E' la risposta, e il messaggio indirizza gia' altrove: resta
+        // un successo, come la directory vuota di `list_files`.
+        Ok(None) => RispostaTool::riuscito(
+            json!({
+                "file": file_path,
+                "found": false,
+                "message": "Nessuna documentazione (code_doc) per questo file. Prova knowledge_search per contesto correlato."
+            })
+            .to_string(),
+        ),
+        Err(e) => crate::errore_tool(
+            format!("query fallita: {e}"),
+            NaturaFallimento::DelSistema,
+        ),
     }
 }
 
@@ -431,14 +450,25 @@ fn knowledge_note_json(note_id: Uuid, row: &sqlx::postgres::PgRow) -> Value {
 }
 
 /// `knowledge_get_note` — body completo di un doc by id (scoped al progetto).
-pub async fn tool_knowledge_get_note(ctx: &ToolContextCore, input: &Value) -> String {
-    let note_id = match input
-        .get("note_id")
-        .and_then(|v| v.as_str())
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        Some(id) => id,
-        None => return crate::errore_json("note_id mancante o non UUID valido"),
+/// MIGRATO al contratto d'ingresso e a `RispostaTool` (regola Q).
+///
+/// PROMESSA FOSSILE, dichiarata e non chiusa: il catalogo annuncia «Aggiorna
+/// access_count della nota» (`tool_schema.rs:1494`) e questo handler esegue una
+/// sola SELECT. La stringa `access_count` non compare in nessuna migrazione ne'
+/// in nessun sorgente del repo: non e' una funzione rotta, e' una frase
+/// sopravvissuta a una colonna che non e' mai esistita. Toglierla dal catalogo
+/// cambia cio' che il modello legge, quindi la decisione non e' di questa
+/// migrazione — ma resta scritto qui che il tool non conta niente.
+pub async fn tool_knowledge_get_note(ctx: &ToolContextCore, input: &Value) -> RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::KnowledgeGetNoteInput};
+
+    let params = match KnowledgeGetNoteInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
+    };
+    let note_id = match uuid_nota(&params.note_id, "note_id") {
+        Ok(id) => id,
+        Err(risposta) => return risposta,
     };
 
     let row = match sqlx::query(
@@ -455,11 +485,19 @@ pub async fn tool_knowledge_get_note(ctx: &ToolContextCore, input: &Value) -> St
     .await
     {
         Ok(Some(r)) => r,
-        Ok(None) => return crate::errore_json("nota non trovata o non accessibile"),
-        Err(e) => return crate::errore_json(format!("DB: {e}")),
+        // RIMEDIABILE: l'id e' sbagliato o la nota appartiene a un altro
+        // progetto, e il messaggio deve dire dove trovarne uno valido — prima
+        // diceva solo «non trovata o non accessibile», che non e' un'azione.
+        Ok(None) => {
+            return crate::errore_tool(
+                "nota non trovata o non accessibile: usa knowledge_search per gli id delle note                  di questo progetto",
+                NaturaFallimento::Rimediabile,
+            )
+        }
+        Err(e) => return crate::errore_tool(format!("DB: {e}"), NaturaFallimento::DelSistema),
     };
 
-    knowledge_note_json(note_id, &row).to_string()
+    RispostaTool::riuscito(knowledge_note_json(note_id, &row).to_string())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1120,19 +1158,31 @@ pub async fn tool_knowledge_create_link(ctx: &ToolContextCore, input: &Value) ->
 /// `knowledge_set_relevance` — marca un doc come off-topic (`edit_lock='frozen'`)
 /// o on-topic (`edit_lock='none'`). Il campo `relevance_score` non e' piu'
 /// persistito nel nuovo schema; viene accettato per compatibilita' ma ignorato.
-pub async fn tool_knowledge_set_relevance(ctx: &ToolContextCore, input: &Value) -> String {
-    let note_id = match input
-        .get("note_id")
-        .and_then(|v| v.as_str())
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        Some(id) => id,
-        None => return crate::errore_json("note_id mancante o non UUID valido"),
+/// MIGRATO al contratto d'ingresso e a `RispostaTool` (regola Q).
+///
+/// DIVERGENZA DICHIARATA, non chiusa: il catalogo promette `relevance_score`
+/// (`tool_schema.rs:1586`, «Punteggio di pertinenza 0-1») e questo handler non
+/// lo legge, oggi come prima — non c'e' una colonna dove metterlo. Il parametro
+/// e' una promessa che il sistema non mantiene, e il contratto lo dichiara
+/// perche' il catalogo lo dichiara: toglierlo dallo schema cambierebbe cio' che
+/// il modello vede, e va deciso da chi sa se quella colonna arrivera'. Qui si
+/// annota che passarlo non ha effetto.
+///
+/// Un tipo sbagliato ora si distingue da un campo assente: `off_topic` letto con
+/// `as_bool()` respingeva la stringa `"true"` col messaggio «off_topic (bool)
+/// mancante», che per chi l'aveva passata era falso.
+pub async fn tool_knowledge_set_relevance(ctx: &ToolContextCore, input: &Value) -> RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::KnowledgeSetRelevanceInput};
+
+    let params = match KnowledgeSetRelevanceInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
-    let off_topic = match input.get("off_topic").and_then(|v| v.as_bool()) {
-        Some(b) => b,
-        None => return crate::errore_json("off_topic (bool) mancante"),
+    let note_id = match uuid_nota(&params.note_id, "note_id") {
+        Ok(id) => id,
+        Err(risposta) => return risposta,
     };
+    let off_topic = params.off_topic;
     let new_lock = if off_topic { "frozen" } else { "none" };
 
     let res = sqlx::query(
@@ -1149,18 +1199,48 @@ pub async fn tool_knowledge_set_relevance(ctx: &ToolContextCore, input: &Value) 
     .await;
 
     match res {
-        Ok(r) if r.rows_affected() > 0 => json!({
-            "ok": true,
-            "note_id": note_id.to_string(),
-            "off_topic": off_topic,
-        })
-        .to_string(),
-        Ok(_) => crate::errore_json("nota non trovata nel progetto corrente"),
+        Ok(r) if r.rows_affected() > 0 => RispostaTool::riuscito(
+            json!({
+                "ok": true,
+                "note_id": note_id.to_string(),
+                "off_topic": off_topic,
+            })
+            .to_string(),
+        ),
+        // RIMEDIABILE: l'id e' sbagliato o appartiene a un altro progetto, e il
+        // messaggio nomina il tool con cui trovarne uno valido — senza, dire
+        // «rimediabile» sarebbe una promessa non mantenuta.
+        Ok(_) => crate::errore_tool(
+            "nota non trovata nel progetto corrente: usa knowledge_search per gli id delle note              di questo progetto",
+            NaturaFallimento::Rimediabile,
+        ),
         // "UPDATE" qui e' il prefisso di un messaggio d'errore diagnostico, non
         // una query costruita per interpolazione: la UPDATE sopra e' interamente
         // parametrizzata via .bind(). Il messaggio evita la keyword SQL letterale.
-        Err(e) => crate::errore_json(format!("aggiornamento rilevanza fallito: {e}")),
+        Err(e) => crate::errore_tool(
+            format!("aggiornamento rilevanza fallito: {e}"),
+            NaturaFallimento::DelSistema,
+        ),
     }
+}
+
+/// L'uuid di una nota, dal parametro che il contratto ha letto come stringa.
+///
+/// PUNTO UNICO dei quattro handler che ricevono un id di nota. Il contratto
+/// pretende che il campo CI SIA e sia una stringa; che sia un uuid non lo puo'
+/// dire, e quel controllo resta qui — ma i due casi ora sono DUE. Prima
+/// `.and_then(Uuid::parse_str(s).ok())` li collassava, e chi aveva passato un id
+/// malformato riceveva «mancante»: un messaggio che gli diceva di aggiungere un
+/// campo che aveva gia' messo.
+fn uuid_nota(grezzo: &str, campo: &str) -> Result<Uuid, RispostaTool> {
+    Uuid::parse_str(grezzo).map_err(|_| {
+        crate::errore_tool(
+            format!(
+                "{campo}: '{grezzo}' non e' un UUID valido.                  Usa knowledge_search per gli id delle note di questo progetto."
+            ),
+            NaturaFallimento::Rimediabile,
+        )
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -50,6 +50,24 @@ async fn esegui_tool_migrato(
     name: &str,
     input: &Value,
 ) -> Option<nexus_types::tool_outcome::RispostaTool> {
+    // Spezzato per FAMIGLIA e non per comodita' di lettura: questo match cresce
+    // di un braccio a ogni tool migrato, quindi senza una divisione la funzione
+    // supera le soglie del gate qualita' per costruzione — e ricompattarla a
+    // ogni lotto sarebbe rimandare la stessa domanda.
+    if let Some(risposta) = migrati_esecuzione(ctx, name, input).await {
+        return Some(risposta);
+    }
+    migrati_contenuti(ctx, name, input).await
+}
+
+/// I tool migrati che ESEGUONO qualcosa: comandi, servizi, suite di test, git.
+/// Cio' che li accomuna e' il campo `exit_code` e la distinzione fra «il tool ha
+/// fatto il suo lavoro» e «il comando e' andato bene».
+async fn migrati_esecuzione(
+    ctx: &AgentToolContext,
+    name: &str,
+    input: &Value,
+) -> Option<nexus_types::tool_outcome::RispostaTool> {
     match name {
         // Lo stato d'uscita di un comando e' il dato su cui decidono il
         // final_gate e la catena di verifica: viaggia nel campo `exit_code`,
@@ -134,6 +152,29 @@ async fn esegui_tool_migrato(
         // fallivano un salto piu' in la', dal provider.
         "nexus_generate_image" => Some(image_tools::tool_nexus_generate_image(&ctx.core, input).await),
         "nexus_generate_video" => Some(video_tools::tool_nexus_generate_video(&ctx.core, input).await),
+        // I tre handler AUTONOMI di `knowledge.rs` (gli altri sei dipendono da
+        // helper che inghiottono gli errori del DB con `.unwrap_or_default()`, e
+        // vanno portati a `Result` prima di poter dichiarare un esito onesto).
+        // Due promesse del catalogo restano tali e sono annotate nel codice:
+        // `knowledge_set_relevance` dichiara `relevance_score` e non lo legge,
+        // `knowledge_get_note` annuncia di aggiornare `access_count` e fa una
+        // sola SELECT — quella colonna non esiste in nessuna migrazione.
+        "code_doc" => Some(knowledge::tool_code_doc(&ctx.core, input).await),
+        "knowledge_get_note" => Some(knowledge::tool_knowledge_get_note(&ctx.core, input).await),
+        "knowledge_set_relevance" => Some(knowledge::tool_knowledge_set_relevance(&ctx.core, input).await),
+        _ => None,
+    }
+}
+
+/// I tool migrati che LEGGONO o TRASFORMANO contenuti: file, documenti,
+/// archivi, media, lenti UI, note della KB. Nessuno di loro esegue processi,
+/// quindi nessuno ha un `exit_code` da riportare.
+async fn migrati_contenuti(
+    ctx: &AgentToolContext,
+    name: &str,
+    input: &Value,
+) -> Option<nexus_types::tool_outcome::RispostaTool> {
+    match name {
         // Ogni suo fallimento e' RIMEDIABILE e lo dichiara nel campo `natura`:
         // e' il primo tool a farlo, ed e' quello su cui la mancanza si
         // misurava (11% di `old_string non trovato` seguiti da una ripetizione
@@ -276,14 +317,11 @@ async fn esegui_tool_legacy(
         // arriva gia' dichiarato come non fidato (vedi il modulo).
         // ── Knowledge Base per-progetto ────────────────────────────────────
         "knowledge_search" => knowledge::tool_knowledge_search(ctx, input).await,
-        "code_doc" => knowledge::tool_code_doc(ctx, input).await,
-        "knowledge_get_note" => knowledge::tool_knowledge_get_note(ctx, input).await,
         "knowledge_create_note" => knowledge::tool_knowledge_create_note(ctx, input).await,
         // Comp.0: navigazione/modifica del grafo KB (link, sottografo, pertinenza)
         "knowledge_get_links" => knowledge::tool_knowledge_get_links(ctx, input).await,
         "knowledge_get_subgraph" => knowledge::tool_knowledge_get_subgraph(ctx, input).await,
         "knowledge_create_link" => knowledge::tool_knowledge_create_link(ctx, input).await,
-        "knowledge_set_relevance" => knowledge::tool_knowledge_set_relevance(ctx, input).await,
         // Comp.2: import di grafi esterni nella KB (JSON node-link / Mermaid / DOT)
         "knowledge_import_graph" => knowledge::tool_knowledge_import_graph(ctx, input).await,
         // ── Allegati chat (ADR 0010) ───────────────────────────────────────
