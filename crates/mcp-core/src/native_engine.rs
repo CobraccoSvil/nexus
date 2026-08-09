@@ -1465,6 +1465,28 @@ async fn criterio_resa_statica(
         minimo.max(0) as usize,
         timeout_s,
         attesa_ms,
+        &politica_risorse(db).await,
+    )
+}
+
+/// La politica delle risorse della pagina, TUTTA dal DB (mig 0692).
+///
+/// Nessun ripiego nel codice, ne' per i tipi ne' per la soglia (regola G): con
+/// le chiavi assenti la politica non e' utilizzabile e il criterio DICHIARA di
+/// non rispondere sulle risorse, invece di giudicarle con numeri che nessun
+/// amministratore ha scelto. Il verso e' quello prudente: la configurazione
+/// mancante non produce un rosso, produce un silenzio dichiarato.
+async fn politica_risorse(db: &PgPool) -> nexus_agent_graph::decisions::PoliticaRisorse {
+    nexus_agent_graph::decisions::PoliticaRisorse::nuova(
+        setting_csv(
+            db,
+            "agent.final_gate.static_render_resource_types",
+            Vec::new(),
+        )
+        .await,
+        nexus_auth::get_setting(db, "agent.final_gate.static_render_broken_resource_ratio")
+            .await
+            .and_then(|v| v.trim().parse::<f64>().ok()),
     )
 }
 
