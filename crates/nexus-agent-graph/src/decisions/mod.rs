@@ -114,6 +114,13 @@
 //!     "frontend": l'elenco di parole assolveva per omissione e il dialogo
 //!     browser non era MAI nato. Ospita anche `dichiara_html`, lo stesso segnale
 //!     che `endpoint_probes` legge all'inverso (`reject_html`).
+//!   - [`risorse_pagina`]: PUNTO UNICO di "le RISORSE che la pagina referenzia
+//!     sono arrivate?". Quarto della stessa famiglia, e la domanda che mancava:
+//!     un'immagine rotta E' un elemento reso, quindi `static_render` la conta e
+//!     la pagina passa con l'occhio vuoto. Il tipo lo DICHIARA il browser
+//!     (`resourceType()`), mai l'estensione dell'URL; il verdetto distingue le
+//!     assenze sparse dal TIPO compromesso e separa la causa locale da quella
+//!     esterna. Lo consuma `static_render` sulla stessa singola osservazione.
 //!
 //! Le `route_after_*` NON sono qui: stanno nel PR 2b.
 
@@ -148,6 +155,7 @@ pub mod predictive_cap;
 pub mod progress_controller;
 pub mod requirement_conformance;
 pub mod reward;
+pub mod risorse_pagina;
 pub mod run_summary;
 pub mod scale_reason;
 pub mod static_render;
@@ -238,6 +246,10 @@ pub use progress_controller::{
 pub use reward::{
     aggregate_score, final_reward, heuristic_reward, prelim_reward, round_half_even,
     MAX_AGENT_ITERATIONS,
+};
+pub use risorse_pagina::{
+    classifica_risorse, origine_di, provenienza, PoliticaRisorse, Provenienza, RisorsaMancante,
+    RisorsaOsservata, TipoCompromesso, VerdettoRisorse,
 };
 pub use run_summary::{riassunto_del_run, Finalizzatore, FontiRiassunto, RiassuntoRun};
 pub use scale_reason::{

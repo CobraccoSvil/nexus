@@ -33,6 +33,24 @@
 //! vuoto che la lente dello stile evita apposta: entra nell'evidenza come
 //! contesto per chi legge, mai nel verdetto.
 //!
+//! IL QUARTO SEGNALE, aggiunto il 09/08/2026 e MISURATO in esercizio lo stesso
+//! giorno: le RISORSE che la pagina referenzia e non riesce a caricare. Il
+//! ciclo qui sopra aveva appena funzionato — pagina bocciata a zero elementi,
+//! agente rimandato, pagina ripassata — e l'app approvata aveva tutte le
+//! immagini rotte: sei `<img>` verso `https://via.placeholder.com/...`, un
+//! servizio esterno irraggiungibile, e nessun file immagine nel progetto. I tre
+//! segnali sopra non potevano vederlo, e non per svista: **un'immagine rotta E'
+//! un elemento reso**, quindi il conteggio del DOM la contava, il contenitore
+//! aveva i suoi figli e nessuna eccezione era stata lanciata. Il criterio
+//! faceva esattamente cio' che dichiara; mancava la domanda.
+//! Il giudizio sulle risorse e' il punto unico [`super::risorse_pagina`], e non
+//! e' un booleano: entra qui come causa SOLO quando un TIPO e' compromesso —
+//! cioe' quando la quota di fallimenti di quel tipo raggiunge la soglia DB —
+//! mentre le assenze sparse restano evidenza. La ragione e' la stessa del
+//! `console.error`: «una icona decorativa manca» e «nessuna immagine di questa
+//! pagina e' arrivata» non sono lo stesso fatto, e trattarli allo stesso modo
+//! comprerebbe il caso misurato al prezzo dei rimandi a vuoto.
+//!
 //! MISURATO col criterio in esercizio sulla pagina reale e su una sua copia col
 //! solo `throw` aggiunto prima di `filterCourses('all')`:
 //!
@@ -58,6 +76,10 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+
+use super::risorse_pagina::{
+    self, PoliticaRisorse, RisorsaMancante, RisorsaOsservata, TipoCompromesso, VerdettoRisorse,
+};
 
 /// Cosa e' successo al contenitore dichiarato. Tre stati e non un `usize`:
 /// «non l'ho trovato» e «l'ho trovato vuoto» mandano a due correzioni diverse
@@ -95,6 +117,17 @@ pub struct ProveResa {
     /// nell'evidenza, mai nel verdetto (vedi doc del modulo).
     #[serde(default)]
     pub errori_console: Vec<String>,
+    /// Le risorse sub-documento che la pagina ha chiesto, con l'esito e il tipo
+    /// dichiarati dal browser. `None` = non riportate dall'osservazione, che
+    /// NON e' una lista vuota: quella direbbe «la pagina non ha chiesto nulla».
+    #[serde(default)]
+    pub risorse: Option<Vec<RisorsaOsservata>>,
+    /// L'URL su cui la pagina si e' fermata, come lo dichiara il browser (dopo
+    /// eventuali redirezioni). Serve SOLO ad attribuire la provenienza di una
+    /// risorsa mancante: senza, il verdetto e' lo stesso e i rilievi dicono
+    /// «origine non stabilita» invece di indovinare di chi sia la colpa.
+    #[serde(default)]
+    pub origine: Option<String>,
 }
 
 /// Cosa impedisce alla pagina di mostrare il proprio contenuto. Vocabolario
@@ -115,6 +148,13 @@ pub enum CausaNonResa {
     },
     /// Il `body` reso non contiene abbastanza elementi per essere una pagina.
     PaginaVuota { elementi: usize, minimo: usize },
+    /// Un TIPO di risorsa non e' arrivato: la pagina ha i suoi nodi e non ha
+    /// cio' che quei nodi dovevano mostrare. Il giudizio lo da'
+    /// [`super::risorse_pagina`]; qui si porta il suo verdetto nel rilievo.
+    RisorseNonCaricate {
+        tipi: Vec<TipoCompromesso>,
+        mancanti: Vec<RisorsaMancante>,
+    },
 }
 
 impl CausaNonResa {
@@ -142,9 +182,27 @@ impl CausaNonResa {
                 "la pagina resa ha {elementi} elementi, sotto il minimo di {minimo}: \
                  nulla e' stato mostrato"
             ),
+            Self::RisorseNonCaricate { tipi, mancanti } => {
+                let quali: Vec<String> = tipi.iter().map(TipoCompromesso::descrizione).collect();
+                let esempi: Vec<String> = mancanti
+                    .iter()
+                    .take(ESEMPI_RISORSE)
+                    .map(RisorsaMancante::descrizione)
+                    .collect();
+                format!(
+                    "la pagina referenzia risorse che non arrivano, e i suoi nodi restano \
+                     vuoti all'occhio ({}); per esempio: {}",
+                    quali.join("; "),
+                    esempi.join(", ")
+                )
+            }
         }
     }
 }
+
+/// Quante risorse mancanti si nominano nel rilievo: bastano a riconoscere il
+/// difetto senza riversare l'intera pagina nel contesto del turno.
+const ESEMPI_RISORSE: usize = 3;
 
 /// L'esito della misura. `NonConcludente` NON e' un dettaglio: e' cio' che
 /// impedisce a «non ho potuto guardare» di diventare «va tutto bene».
@@ -173,7 +231,16 @@ pub const MIN_FIGLI_CONTENITORE: usize = 1;
 /// numero non c'e' pagina, sopra non si giudica il merito — questo criterio
 /// accerta che qualcosa sia stato RESO, non che sia bello (per quello c'e' la
 /// lente dello stile, che e' un'altra domanda e un altro criterio).
-pub fn classifica_resa(prove: &ProveResa, minimo_elementi: usize) -> VerdettoResa {
+///
+/// `politica` governa il quarto segnale, le risorse (anch'essa dal DB): entra
+/// fra le cause SOLO quando un tipo e' compromesso, e cio' che non raggiunge
+/// quella soglia — o non e' stato osservabile — non produce nulla qui e resta
+/// nell'evidenza, dove lo mette [`risorse_della_pagina`].
+pub fn classifica_resa(
+    prove: &ProveResa,
+    minimo_elementi: usize,
+    politica: &PoliticaRisorse,
+) -> VerdettoResa {
     if !prove.pagina_caricata {
         return VerdettoResa::NonConcludente {
             motivo: "la pagina non si e' caricata: file non raggiungibile".to_string(),
@@ -202,11 +269,38 @@ pub fn classifica_resa(prove: &ProveResa, minimo_elementi: usize) -> VerdettoRes
         });
     }
 
+    // Il quarto segnale entra per ULTIMO, ed e' un ordine e non un caso: le tre
+    // cause sopra dicono «la pagina non e' stata generata», questa dice «e'
+    // stata generata e non ha di che mostrarsi». Chi legge il rilievo affronta
+    // prima cio' che impedisce alla pagina di esistere.
+    if let VerdettoRisorse::TipiCompromessi { tipi, mancanti } =
+        risorse_della_pagina(prove, politica)
+    {
+        cause.push(CausaNonResa::RisorseNonCaricate { tipi, mancanti });
+    }
+
     if cause.is_empty() {
         VerdettoResa::Resa { elementi }
     } else {
         VerdettoResa::NonResa { cause }
     }
+}
+
+/// Il verdetto sulle risorse di QUESTA pagina: lega i fatti gia' raccolti al
+/// punto unico che li giudica ([`super::risorse_pagina::classifica_risorse`]).
+///
+/// Esiste come funzione perche' il legame fra i campi di [`ProveResa`] e gli
+/// argomenti del criterio sia scritto in un posto solo: lo usano
+/// [`classifica_resa`], per decidere, e il runner del gate, per l'evidenza —
+/// che deve riportare anche le assenze SOTTO soglia, cioe' proprio i casi in
+/// cui il verdetto della resa non dice nulla. E' pura e deterministica, quindi
+/// le due chiamate sono la stessa risposta, non due risposte.
+pub fn risorse_della_pagina(prove: &ProveResa, politica: &PoliticaRisorse) -> VerdettoRisorse {
+    risorse_pagina::classifica_risorse(
+        prove.risorse.as_deref(),
+        prove.origine.as_deref(),
+        politica,
+    )
 }
 
 /// La causa che riguarda il contenitore, se ce n'e' una. `None` = nessuna
@@ -309,6 +403,8 @@ pub const CRITERION_TYPE: &str = "static_render";
 pub const CHIAVE_CONTENITORE: &str = "container_selector";
 pub const CHIAVE_MIN_ELEMENTI: &str = "min_elements";
 pub const CHIAVE_ATTESA_MS: &str = "settle_ms";
+pub const CHIAVE_TIPI_RISORSA: &str = "resource_types";
+pub const CHIAVE_SOGLIA_RISORSE: &str = "broken_resource_ratio";
 
 /// La spec del criterio, costruita QUI e non dai chiamanti: il produttore del
 /// criterio e' uno solo, cosi' i test possono attraversarlo invece di
@@ -317,12 +413,18 @@ pub const CHIAVE_ATTESA_MS: &str = "settle_ms";
 /// `url` e' l'indirizzo su cui la pagina va aperta. Non nasce senza: una
 /// pagina che non si sa dove aprire non e' misurabile, e un criterio che
 /// fallisse per questo boccerebbe il progetto per un difetto della misura.
+///
+/// La `politica` delle risorse viaggia nella SPEC e non come stato del runner,
+/// per la stessa ragione del vocabolario delle terze parti in
+/// [`super::browser_dialogue`]: e' configurazione (regola G), la risolve a
+/// monte chi legge il DB, e cosi' il runner non lo legge.
 pub fn criterio_resa(
     url: Option<&str>,
     contenitore: Option<&str>,
     minimo_elementi: usize,
     timeout_s: f64,
     attesa_ms: u64,
+    politica: &PoliticaRisorse,
 ) -> Option<crate::runtime::ports::CriterionSpec> {
     use crate::runtime::ports::{CriterionProvenance, CriterionSpec};
     let url = url.map(str::trim).filter(|u| !u.is_empty())?;
@@ -330,6 +432,16 @@ pub fn criterio_resa(
     spec.insert("url".to_string(), json!(url));
     spec.insert(CHIAVE_MIN_ELEMENTI.to_string(), json!(minimo_elementi));
     spec.insert(CHIAVE_ATTESA_MS.to_string(), json!(attesa_ms));
+    spec.insert(
+        CHIAVE_TIPI_RISORSA.to_string(),
+        json!(politica.tipi_governati),
+    );
+    // La soglia entra solo se configurata: una chiave assente nella spec dice
+    // al criterio «non risponderai sulle risorse», e un numero di ripiego
+    // scritto qui sarebbe il magic fallback che la regola G vieta.
+    if let Some(s) = politica.soglia {
+        spec.insert(CHIAVE_SOGLIA_RISORSE.to_string(), json!(s));
+    }
     if let Some(c) = contenitore.map(str::trim).filter(|c| !c.is_empty()) {
         spec.insert(CHIAVE_CONTENITORE.to_string(), json!(c));
     }
@@ -383,11 +495,38 @@ pub fn con_contenitore(
 mod tests {
     use super::*;
 
+    use super::super::browser_dialogue::RichiestaOsservata;
+    use super::super::risorse_pagina::Provenienza;
+
     fn resa(elementi: usize) -> ProveResa {
         ProveResa {
             pagina_caricata: true,
             elementi_resi: Some(elementi),
             ..Default::default()
+        }
+    }
+
+    /// La politica delle risorse come la scrive la migrazione 0692.
+    fn politica() -> PoliticaRisorse {
+        PoliticaRisorse::nuova(
+            vec![
+                "image".into(),
+                "stylesheet".into(),
+                "script".into(),
+                "media".into(),
+            ],
+            Some(1.0),
+        )
+    }
+
+    fn immagine(url: &str, status: Option<u16>, errore: &str) -> RisorsaOsservata {
+        RisorsaOsservata {
+            richiesta: RichiestaOsservata {
+                url: url.into(),
+                status,
+                errore: errore.into(),
+            },
+            tipo: Some("image".into()),
         }
     }
 
@@ -404,7 +543,7 @@ mod tests {
             errori_esecuzione: vec!["ReferenceError: courses is not defined".into()],
             ..resa(48)
         };
-        let VerdettoResa::NonResa { cause } = classifica_resa(&prove, 5) else {
+        let VerdettoResa::NonResa { cause } = classifica_resa(&prove, 5, &politica()) else {
             panic!("una pagina che lancia non ha reso il proprio contenuto");
         };
         assert_eq!(cause.len(), 1);
@@ -425,7 +564,7 @@ mod tests {
             contenitore: Some(EsitoContenitore::Trovato { figli: 0 }),
             ..resa(48)
         };
-        let v = cause_con_selettore(classifica_resa(&prove, 5), "#courses-grid");
+        let v = cause_con_selettore(classifica_resa(&prove, 5, &politica()), "#courses-grid");
         let VerdettoResa::NonResa { cause } = v else {
             panic!("un contenitore vuoto e' il difetto che questo criterio esiste per vedere");
         };
@@ -445,7 +584,7 @@ mod tests {
             ..resa(48)
         };
         assert_eq!(
-            classifica_resa(&ok, 5),
+            classifica_resa(&ok, 5, &politica()),
             VerdettoResa::Resa { elementi: 48 }
         );
     }
@@ -459,7 +598,7 @@ mod tests {
             contenitore: Some(EsitoContenitore::Assente),
             ..resa(48)
         };
-        let v = cause_con_selettore(classifica_resa(&prove, 5), "#griglia");
+        let v = cause_con_selettore(classifica_resa(&prove, 5, &politica()), "#griglia");
         let VerdettoResa::NonResa { cause } = v else {
             panic!("un selettore che non esiste e' un difetto");
         };
@@ -475,7 +614,7 @@ mod tests {
     /// cio' che era, senza lanciare nulla di osservabile.
     #[test]
     fn una_pagina_quasi_vuota_non_ha_reso_niente() {
-        let VerdettoResa::NonResa { cause } = classifica_resa(&resa(2), 5) else {
+        let VerdettoResa::NonResa { cause } = classifica_resa(&resa(2), 5, &politica()) else {
             panic!("due elementi non sono una pagina resa");
         };
         assert_eq!(
@@ -497,7 +636,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            classifica_resa(&spenta, 5),
+            classifica_resa(&spenta, 5, &politica()),
             VerdettoResa::NonConcludente { .. }
         ));
 
@@ -506,7 +645,8 @@ mod tests {
             elementi_resi: None,
             ..Default::default()
         };
-        let VerdettoResa::NonConcludente { motivo } = classifica_resa(&non_contata, 5) else {
+        let VerdettoResa::NonConcludente { motivo } = classifica_resa(&non_contata, 5, &politica())
+        else {
             panic!("un conteggio mancante non e' uno zero e non e' un successo");
         };
         assert!(motivo.contains("non misurabile"), "{motivo}");
@@ -523,7 +663,7 @@ mod tests {
             ..resa(48)
         };
         assert_eq!(
-            classifica_resa(&prove, 5),
+            classifica_resa(&prove, 5, &politica()),
             VerdettoResa::Resa { elementi: 48 }
         );
     }
@@ -537,7 +677,7 @@ mod tests {
             contenitore: Some(EsitoContenitore::Trovato { figli: 0 }),
             ..resa(1)
         };
-        let VerdettoResa::NonResa { cause } = classifica_resa(&prove, 5) else {
+        let VerdettoResa::NonResa { cause } = classifica_resa(&prove, 5, &politica()) else {
             panic!("tre difetti insieme restano difetti");
         };
         assert_eq!(cause.len(), 3, "eccezione + contenitore vuoto + pagina vuota");
@@ -574,8 +714,9 @@ mod tests {
     /// Il criterio si costruisce dal produttore unico, e senza URL non nasce.
     #[test]
     fn il_criterio_nasce_solo_con_un_url() {
-        assert!(criterio_resa(None, None, 5, 30.0, 2000).is_none());
-        assert!(criterio_resa(Some("  "), None, 5, 30.0, 2000).is_none());
+        let p = politica();
+        assert!(criterio_resa(None, None, 5, 30.0, 2000, &p).is_none());
+        assert!(criterio_resa(Some("  "), None, 5, 30.0, 2000, &p).is_none());
 
         let c = criterio_resa(
             Some("http://127.0.0.1:4000/preview/e4d446ce/landing/index.html"),
@@ -583,19 +724,161 @@ mod tests {
             5,
             30.0,
             2000,
+            &p,
         )
         .expect("criterio");
         assert_eq!(c.criterion_type, CRITERION_TYPE);
         assert_eq!(c.spec[CHIAVE_MIN_ELEMENTI], 5);
         assert_eq!(c.spec[CHIAVE_ATTESA_MS], 2000);
         assert_eq!(c.spec[CHIAVE_CONTENITORE], "#courses-grid");
+        // La politica delle risorse viaggia nella spec: il runner non legge il DB.
+        assert_eq!(c.spec[CHIAVE_TIPI_RISORSA][0], "image");
+        assert_eq!(c.spec[CHIAVE_SOGLIA_RISORSE], 1.0);
 
         // Senza contenitore dichiarato la chiave non c'e' affatto: un
         // selettore vuoto nella spec farebbe cercare al browser un elemento
         // che nessuno ha chiesto.
-        let senza = criterio_resa(Some("http://x/index.html"), Some(" "), 5, 30.0, 2000)
+        let senza = criterio_resa(Some("http://x/index.html"), Some(" "), 5, 30.0, 2000, &p)
             .expect("criterio");
         assert!(senza.spec.get(CHIAVE_CONTENITORE).is_none());
+
+        // Soglia non configurata: la chiave NON entra nella spec. Un numero di
+        // ripiego scritto qui deciderebbe al posto dell'amministratore.
+        let muta = criterio_resa(
+            Some("http://x/index.html"),
+            None,
+            5,
+            30.0,
+            2000,
+            &PoliticaRisorse::nuova(vec!["image".into()], None),
+        )
+        .expect("criterio");
+        assert!(muta.spec.get(CHIAVE_SOGLIA_RISORSE).is_none());
+    }
+
+    /// IL CASO MISURATO IL 09/08/2026: la pagina si genera, ha i suoi nodi, il
+    /// contenitore e' pieno, nessuna eccezione — e tutte le sue immagini sono
+    /// rotte. Con i soli tre segnali storici era `Resa`.
+    ///
+    /// MUTAZIONE: togliere il ramo delle risorse da `classifica_resa` (o
+    /// portare la soglia oltre 1.0) -> questo test torna `Resa`, ed e'
+    /// esattamente il verde che il gate ha dato all'app con sei `<img>` verso
+    /// `via.placeholder.com`.
+    #[test]
+    fn le_immagini_tutte_rotte_bocciano_una_pagina_altrimenti_resa() {
+        let pagina = "http://127.0.0.1:4000/preview/e4d446ce/index.html";
+        let prove = ProveResa {
+            contenitore: Some(EsitoContenitore::Trovato { figli: 6 }),
+            origine: Some(pagina.to_string()),
+            risorse: Some(
+                (1..=6)
+                    .map(|n| {
+                        immagine(
+                            &format!("https://via.placeholder.com/300x200?text=Prodotto+{n}"),
+                            None,
+                            "net::ERR_NAME_NOT_RESOLVED",
+                        )
+                    })
+                    .collect(),
+            ),
+            ..resa(100)
+        };
+
+        // Coi soli tre segnali storici la pagina era resa: i nodi ci sono tutti.
+        assert_eq!(
+            classifica_resa(&prove, 5, &PoliticaRisorse::default()),
+            VerdettoResa::Resa { elementi: 100 },
+            "senza politica il criterio non risponde sulle risorse, e non deve inventare"
+        );
+
+        let VerdettoResa::NonResa { cause } = classifica_resa(&prove, 5, &politica()) else {
+            panic!("una pagina senza una sola immagine non mostra il proprio contenuto");
+        };
+        assert_eq!(cause.len(), 1, "l'unico difetto sono le risorse");
+        let CausaNonResa::RisorseNonCaricate { tipi, mancanti } = &cause[0] else {
+            panic!("attesa la causa delle risorse: {:?}", cause[0]);
+        };
+        assert_eq!(tipi[0].tipo, "image");
+        assert_eq!((tipi[0].falliti, tipi[0].osservati), (6, 6));
+        assert_eq!(mancanti[0].provenienza, Provenienza::Esterna);
+        let d = cause[0].descrizione();
+        assert!(
+            d.contains("image: 6 su 6") && d.contains("via.placeholder.com"),
+            "il rilievo nomina il tipo e un URL: {d}"
+        );
+
+        // La stessa pagina con le immagini locali che arrivano: nessun rilievo.
+        let sane = ProveResa {
+            risorse: Some(
+                (1..=6)
+                    .map(|n| {
+                        immagine(
+                            &format!("http://127.0.0.1:4000/preview/e4d446ce/img/{n}.png"),
+                            Some(200),
+                            "",
+                        )
+                    })
+                    .collect(),
+            ),
+            ..prove.clone()
+        };
+        assert_eq!(
+            classifica_resa(&sane, 5, &politica()),
+            VerdettoResa::Resa { elementi: 100 }
+        );
+    }
+
+    /// Un'assenza SOTTO soglia non ferma nulla, e nemmeno un'osservazione muta:
+    /// il quarto segnale e' additivo, e la sua assenza non declassa un verdetto
+    /// che gli altri tre hanno gia' dato.
+    ///
+    /// MUTAZIONE: far entrare `AlcuneMancanti` fra le cause -> questo test cade,
+    /// ed e' il falso rosso su una icona decorativa.
+    #[test]
+    fn una_risorsa_sparsa_e_l_ignoto_non_bocciano() {
+        let pagina = "http://127.0.0.1:4000/preview/e4d446ce/index.html";
+        let mut r: Vec<RisorsaOsservata> = (1..=5)
+            .map(|n| {
+                immagine(
+                    &format!("http://127.0.0.1:4000/preview/e4d446ce/img/{n}.png"),
+                    Some(200),
+                    "",
+                )
+            })
+            .collect();
+        r.push(immagine(
+            "http://127.0.0.1:4000/preview/e4d446ce/img/icona.svg",
+            Some(404),
+            "",
+        ));
+        let sparsa = ProveResa {
+            origine: Some(pagina.to_string()),
+            risorse: Some(r),
+            ..resa(100)
+        };
+        assert_eq!(
+            classifica_resa(&sparsa, 5, &politica()),
+            VerdettoResa::Resa { elementi: 100 }
+        );
+        // ...ma il fatto e' registrato: e' il dato con cui si decidera' se
+        // abbassare la soglia, e senza di esso si deciderebbe a intuito.
+        assert!(matches!(
+            risorse_della_pagina(&sparsa, &politica()),
+            VerdettoRisorse::AlcuneMancanti { .. }
+        ));
+
+        // Osservazione che non ha riportato le risorse: la pagina resta resa e
+        // il non-osservato lo dichiara il verdetto delle risorse, non il
+        // silenzio.
+        let muta = ProveResa { ..resa(100) };
+        assert_eq!(
+            classifica_resa(&muta, 5, &politica()),
+            VerdettoResa::Resa { elementi: 100 }
+        );
+        assert!(matches!(
+            risorse_della_pagina(&muta, &politica()),
+            VerdettoRisorse::NonOsservabile { .. }
+        ));
     }
 
     /// La dichiarazione dell'agente arriva al criterio: l'URL lo risolve chi
@@ -607,7 +890,7 @@ mod tests {
     /// elemento che nessuno ha dichiarato.
     #[test]
     fn il_contenitore_dichiarato_entra_nel_criterio() {
-        let base = criterio_resa(Some("http://x/index.html"), None, 5, 30.0, 2000)
+        let base = criterio_resa(Some("http://x/index.html"), None, 5, 30.0, 2000, &politica())
             .expect("criterio");
         let dichiarato = json!({ "outcome": "done", "rendered_container": "#courses-grid" });
         let c = con_contenitore(base.clone(), Some(&dichiarato));
