@@ -153,6 +153,17 @@ pub fn classifica_dialogo(prove: &ProveBrowser, terze_parti: &[String]) -> Verde
     }
 }
 
+/// «Questa richiesta osservata e' fallita?»
+///
+/// PUNTO UNICO del predicato, e non e' una comodita': la stessa domanda se la
+/// pone [`super::risorse_pagina`] sulle risorse sub-documento della STESSA
+/// osservazione, e due encoding della regola divergerebbero al primo status
+/// che uno dei due decidesse di trattare diversamente. La risposta e'
+/// letteralmente [`causa_di`], cosi' la regola resta scritta una volta sola.
+pub fn richiesta_fallita(r: &RichiestaOsservata) -> bool {
+    causa_di(r).is_some()
+}
+
 /// La causa di UNA richiesta, se e' fallita. `None` = e' andata a buon fine.
 fn causa_di(r: &RichiestaOsservata) -> Option<CausaDialogo> {
     match r.status {

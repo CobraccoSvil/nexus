@@ -1512,6 +1512,54 @@ else
   echo "OK entry-dal-punto-unico: $per_file_entry file delegano il rilevamento della pagina"
 fi
 
+# «Le RISORSE che la pagina referenzia sono arrivate?» (2026-08-09, mig 0692)
+#
+# Il criterio vive in un punto solo, e con esso il predicato «questa richiesta
+# osservata e' fallita?»: quel predicato lo usano DUE criteri sugli stessi fatti
+# (il dialogo sulle chiamate dati, questo sulle risorse), e due encoding della
+# stessa regola divergerebbero al primo status che uno dei due decidesse di
+# trattare diversamente — senza che nulla fallisca.
+assert_single "risorse-di-pagina" 'fn classifica_risorse' \
+  'crates/nexus-agent-graph/src/decisions/risorse_pagina.rs' crates
+assert_single "richiesta-fallita" 'fn richiesta_fallita' \
+  'crates/nexus-agent-graph/src/decisions/browser_dialogue.rs' crates
+
+# Il guard che conta davvero: il TIPO di una risorsa lo dichiara il browser.
+#
+# `resourceType()` e' un segnale strutturato (regola M). Dedurlo dall'estensione
+# dell'URL sembra equivalente e non lo e': `/api/thumb?id=3` e' un'immagine e
+# `/logo.png.txt` non lo e', quindi l'euristica sbaglia in ENTRAMBE le
+# direzioni — manca un tipo compromesso, o ne inventa uno. E sbaglierebbe in
+# silenzio, perche' il verdetto resterebbe della forma giusta. Si esaminano le
+# sole righe di CODICE: nei test gli URL con estensione sono la fixture.
+tipi_esaminati=0
+tipi_bad=0
+for f in crates/nexus-agent-graph/src/decisions/risorse_pagina.rs \
+         crates/mcp-core/src/agent_tools/browser_probe.rs; do
+  [[ -f "$f" ]] || continue
+  tipi_esaminati=$((tipi_esaminati + 1))
+  if awk '
+    /^#\[cfg\(test\)\]/ { exit }
+    /^[[:space:]]*\/\// { next }
+    /ends_with\("\.|extension\(\)|\.png"|\.jpg"|\.jpeg"|\.svg"|\.webp"|\.css"|\.js"/ {
+      trovato = 1; print "   " FILENAME " riga " NR ": " $0 > "/dev/stderr"
+    }
+    END { exit !trovato }
+  ' "$f" 2>&1; then
+    echo "!! tipo-risorsa-dichiarato: il tipo e' dedotto dall'URL." >&2
+    echo "   Usare il campo che il browser dichiara (resourceType()): un URL" >&2
+    echo "   senza estensione puo' essere un'immagine, e viceversa." >&2
+    tipi_bad=$((tipi_bad + 1))
+    fail=1
+  fi
+done
+if [[ "$tipi_esaminati" -eq 0 ]]; then
+  echo "!! tipo-risorsa-dichiarato: nessun file esaminato (percorsi cambiati?)." >&2
+  fail=1
+elif [[ "$tipi_bad" -eq 0 ]]; then
+  echo "OK tipo-risorsa-dichiarato: $tipi_esaminati file leggono il tipo dal browser"
+fi
+
 # «Lo stile che il codice dichiara e' applicato?» (2026-07-29, mig 0655)
 #
 # Il criterio vive in un punto solo. Un secondo giudice dello stile — anche

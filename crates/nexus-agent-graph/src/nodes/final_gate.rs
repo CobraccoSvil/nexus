@@ -2526,6 +2526,7 @@ mod tests {
     /// «id sbagliato, nessuna eccezione, pagina piena» torna verde.
     #[test]
     fn il_criterio_della_resa_arriva_al_gate_con_la_dichiarazione() {
+        use crate::decisions::risorse_pagina::PoliticaRisorse;
         use crate::decisions::static_render::{self, CRITERION_TYPE};
         let criterio = static_render::criterio_resa(
             Some("http://127.0.0.1:4000/preview/abc/landing/index.html"),
@@ -2533,6 +2534,7 @@ mod tests {
             5,
             15.0,
             2500,
+            &PoliticaRisorse::nuova(vec!["image".into()], Some(1.0)),
         );
         let cerca = |dichiarato: Option<Value>| {
             let node = node_with(

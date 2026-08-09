@@ -2,13 +2,18 @@
 //! riporta i fatti osservati (richieste di rete, errori di console ed
 //! esecuzione, DOM reso). Non giudica: i criteri sono i punti unici puri
 //! [`nexus_agent_graph::decisions::browser_dialogue`] («la pagina ottiene i
-//! propri dati?») e [`nexus_agent_graph::decisions::static_render`] («la pagina
-//! mostra il proprio contenuto?»), che ricevono questi fatti.
+//! propri dati?»), [`nexus_agent_graph::decisions::static_render`] («la pagina
+//! mostra il proprio contenuto?») e
+//! [`nexus_agent_graph::decisions::risorse_pagina`] («cio' che referenzia e'
+//! arrivato?»), che ricevono questi fatti.
 //!
-//! Le due domande condividono il confine e non lo script: uno solo, una sola
-//! esecuzione, due interpreti sui campi che a ciascuna competono. Due script
+//! Le tre domande condividono il confine e non lo script: uno solo, una sola
+//! esecuzione, piu' interpreti sui campi che a ciascuna competono. Due script
 //! divergerebbero, e la divergenza si vedrebbe come due criteri che misurano
-//! cose leggermente diverse senza che nessuno sappia dire quali (regola L).
+//! cose leggermente diverse senza che nessuno sappia dire quali (regola L). La
+//! terza domanda e' arrivata dopo le altre due e non ha aggiunto un'apertura di
+//! pagina: ha aggiunto due campi al payload (il TIPO su ogni richiesta e l'URL
+//! finale della pagina), che e' la prova che il taglio del confine reggeva.
 //!
 //! Perche' un browser e non una richiesta lato server: una `reqwest` non manda
 //! `Origin` e non applica la same-origin policy, quindi un backend senza CORS
@@ -30,6 +35,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use nexus_agent_graph::decisions::browser_dialogue::{ProveBrowser, RichiestaOsservata};
+use nexus_agent_graph::decisions::risorse_pagina::RisorsaOsservata;
 use nexus_agent_graph::decisions::static_render::{EsitoContenitore, ProveResa};
 
 /// Marcatore del payload JSON sullo stdout dello script Node.
@@ -52,15 +58,28 @@ mod campo {
     pub const CARICATA: &str = "loaded";
     pub const ELEMENTI: &str = "elementCount";
     pub const CONTENITORE: &str = "container";
+    /// Il tipo di risorsa dichiarato dal browser, su ogni richiesta.
+    ///
+    /// Si chiama `resourceKind` e non `type` per una ragione che riguarda il
+    /// GUARD, non il gusto: il test che confronta i campi con lo script cerca il
+    /// nome come sottostringa, e `type` comparirebbe comunque (in `m.type()`)
+    /// anche dopo averlo tolto dal payload — cioe' il guard resterebbe verde su
+    /// un contratto rotto, che e' esattamente il difetto che quel test esiste
+    /// per impedire.
+    pub const TIPO_RISORSA: &str = "resourceKind";
+    /// L'URL su cui la pagina si e' fermata, per attribuire la provenienza.
+    pub const URL_PAGINA: &str = "pageUrl";
 
     /// Tutti, per il test che li confronta con lo script.
-    pub const TUTTI: [&str; 6] = [
+    pub const TUTTI: [&str; 8] = [
         RICHIESTE,
         ERRORI_CONSOLE,
         ERRORI_PAGINA,
         CARICATA,
         ELEMENTI,
         CONTENITORE,
+        TIPO_RISORSA,
+        URL_PAGINA,
     ];
 }
 
@@ -212,21 +231,7 @@ pub fn interpreta(payload: &str) -> Result<ProveBrowser, String> {
     let richieste = v
         .get(campo::RICHIESTE)
         .and_then(|r| r.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|r| {
-                    Some(RichiestaOsservata {
-                        url: r.get("url")?.as_str()?.to_string(),
-                        status: r.get("status").and_then(|s| s.as_u64()).map(|s| s as u16),
-                        errore: r
-                            .get("error")
-                            .and_then(|e| e.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                    })
-                })
-                .collect()
-        })
+        .map(|a| a.iter().filter_map(richiesta_da).collect())
         .unwrap_or_default();
     // Il dialogo non distingue un'eccezione da un avviso: per la sua domanda
     // sono entrambi contorno dell'evidenza, e li teneva gia' in un'unica lista.
@@ -267,12 +272,58 @@ pub fn interpreta_resa(payload: &str) -> Result<ProveResa, String> {
             EsitoContenitore::Assente
         })
     });
+    // Assente = non riportate. NON una lista vuota: quella direbbe «la pagina
+    // non ha chiesto nulla», e il criterio delle risorse tratta i due casi in
+    // modo opposto (uno e' una pagina autosufficiente, l'altro un'osservazione
+    // che non ha guardato).
+    let risorse = v
+        .get(campo::RICHIESTE)
+        .and_then(|r| r.as_array())
+        .map(|a| a.iter().filter_map(risorsa_da).collect());
     Ok(ProveResa {
         pagina_caricata: caricata(&v),
         elementi_resi,
         contenitore,
         errori_esecuzione: lista(&v, campo::ERRORI_PAGINA),
         errori_console: lista(&v, campo::ERRORI_CONSOLE),
+        risorse,
+        origine: v
+            .get(campo::URL_PAGINA)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    })
+}
+
+/// UNA richiesta del payload. Punto unico della lettura per i due interpreti:
+/// se il dialogo e le risorse la ricostruissero ognuno per conto proprio, un
+/// campo rinominato nello script resterebbe letto correttamente da uno dei due
+/// e in silenzio dall'altro.
+fn richiesta_da(r: &serde_json::Value) -> Option<RichiestaOsservata> {
+    Some(RichiestaOsservata {
+        url: r.get("url")?.as_str()?.to_string(),
+        status: r.get("status").and_then(|s| s.as_u64()).map(|s| s as u16),
+        errore: r
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+/// La stessa richiesta, piu' il TIPO che il browser le ha attribuito. Assente
+/// = non dichiarato, mai una stringa vuota: il criterio distingue «di che tipo
+/// e' questa risorsa non lo so» da «e' di un tipo che non governo».
+fn risorsa_da(r: &serde_json::Value) -> Option<RisorsaOsservata> {
+    Some(RisorsaOsservata {
+        richiesta: richiesta_da(r)?,
+        tipo: r
+            .get(campo::TIPO_RISORSA)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -330,6 +381,10 @@ const {{ chromium }} = require('playwright');
     // Le chiamate dati partono dopo il primo render: si attende che la rete si
     // calmi, con un tetto, e non un istante fisso.
     try {{ await page.waitForLoadState('networkidle', {{ timeout: {attesa} }}); }} catch (_) {{}}
+    // DOPO le redirezioni: e' l'origine rispetto a cui una risorsa e' locale o
+    // di terzi, e prenderla dall'URL richiesto direbbe la cosa sbagliata su una
+    // pagina che e' stata rediretta altrove.
+    try {{ fatti.pageUrl = page.url(); }} catch (_) {{}}
 {misura}
     await browser.close();
   }} catch (e) {{
@@ -373,11 +428,11 @@ const ASCOLTATORI: &str = r#"
     page.on('requestfailed', (r) => {
       if (r.resourceType() === 'document') return;
       const f = r.failure();
-      fatti.requests.push({ url: r.url(), error: (f && f.errorText) ? f.errorText : 'richiesta fallita' });
+      fatti.requests.push({ url: r.url(), resourceKind: r.resourceType(), error: (f && f.errorText) ? f.errorText : 'richiesta fallita' });
     });
     page.on('response', (r) => {
       if (r.request().resourceType() === 'document') return;
-      fatti.requests.push({ url: r.url(), status: r.status() });
+      fatti.requests.push({ url: r.url(), resourceKind: r.request().resourceType(), status: r.status() });
     });"#;
 
 /// Il frammento che misura il DOM RESO, dopo che il JS ha girato.
@@ -411,6 +466,7 @@ const MISURA_DOM: &str = r#"
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nexus_agent_graph::decisions::risorse_pagina::PoliticaRisorse;
 
     /// I fatti arrivano dal PRODUTTORE vero (`interpreta`), non da una
     /// struttura fabbricata: e' la giunzione fra lo script e il criterio, ed
@@ -532,9 +588,87 @@ mod tests {
 
         // E il criterio, sugli stessi fatti, dichiara il difetto.
         assert!(matches!(
-            classifica_resa(&p, 5),
+            classifica_resa(&p, 5, &PoliticaRisorse::default()),
             VerdettoResa::NonResa { .. }
         ));
+    }
+
+    /// IL CASO REALE del 09/08/2026, e il test attraversa il PRODUTTORE: il
+    /// payload ha la forma che lo script emette (i suoi campi sono gli stessi
+    /// che `lo_script_e_gli_interpreti_usano_gli_stessi_campi` verifica contro
+    /// il JavaScript), e da li' i fatti arrivano al criterio per la strada della
+    /// produzione — nessuna lista di risorse fabbricata a mano.
+    ///
+    /// Sei card, sei `<img>` verso `via.placeholder.com` irraggiungibile, DOM
+    /// pieno, contenitore popolato, nessuna eccezione: e' la pagina che il gate
+    /// ha approvato.
+    ///
+    /// MUTAZIONE: togliere `resourceKind` dallo script (o dal payload) -> il
+    /// tipo non arriva, il verdetto delle risorse diventa `NonOsservabile` e la
+    /// pagina torna `Resa`. E' la stessa cosa che accade togliendo il ramo delle
+    /// risorse dal criterio: il difetto reale ricompare in entrambi i casi.
+    #[test]
+    fn le_immagini_rotte_arrivano_al_criterio_dal_produttore() {
+        use nexus_agent_graph::decisions::risorse_pagina::VerdettoRisorse;
+        use nexus_agent_graph::decisions::static_render::{
+            classifica_resa, risorse_della_pagina, CausaNonResa, VerdettoResa,
+        };
+        let immagini: Vec<String> = (1..=6)
+            .map(|n| {
+                format!(
+                    r#"{{"url":"https://via.placeholder.com/300x200?text=Prodotto+{n}",
+                        "resourceKind":"image","error":"net::ERR_NAME_NOT_RESOLVED"}}"#
+                )
+            })
+            .collect();
+        let payload = format!(
+            r#"{{"loaded":true,"elementCount":118,
+              "pageUrl":"http://127.0.0.1:4000/preview/e4d446ce/index.html",
+              "container":{{"found":true,"children":6}},
+              "consoleErrors":[],"pageErrors":[],
+              "requests":[{},
+                {{"url":"http://127.0.0.1:4000/preview/e4d446ce/style.css",
+                 "resourceKind":"stylesheet","status":200}}]}}"#,
+            immagini.join(",")
+        );
+
+        let prove = interpreta_resa(&payload).expect("fatti leggibili");
+        assert_eq!(
+            prove.risorse.as_ref().map(Vec::len),
+            Some(7),
+            "sei immagini piu' il foglio di stile"
+        );
+        assert_eq!(
+            prove.origine.as_deref(),
+            Some("http://127.0.0.1:4000/preview/e4d446ce/index.html")
+        );
+
+        let politica = PoliticaRisorse::nuova(
+            vec!["image".into(), "stylesheet".into(), "script".into(), "media".into()],
+            Some(1.0),
+        );
+        assert!(risorse_della_pagina(&prove, &politica).e_bloccante());
+
+        let VerdettoResa::NonResa { cause } = classifica_resa(&prove, 5, &politica) else {
+            panic!("una pagina le cui immagini non arrivano non mostra il proprio contenuto");
+        };
+        assert!(matches!(
+            cause.as_slice(),
+            [CausaNonResa::RisorseNonCaricate { .. }]
+        ));
+
+        // LA MUTAZIONE, esercitata: senza il tipo dichiarato dallo script il
+        // criterio non risponde e la pagina ripassa — il verde del 09/08.
+        let senza_tipo = payload.replace("\"resourceKind\":", "\"ignorato\":");
+        let cieche = interpreta_resa(&senza_tipo).expect("fatti leggibili");
+        assert!(matches!(
+            risorse_della_pagina(&cieche, &politica),
+            VerdettoRisorse::NonOsservabile { .. }
+        ));
+        assert_eq!(
+            classifica_resa(&cieche, 5, &politica),
+            VerdettoResa::Resa { elementi: 118 }
+        );
     }
 
     /// Un conteggio ASSENTE non e' uno zero: la pagina non e' stata misurata, e
@@ -546,6 +680,14 @@ mod tests {
         let p = interpreta_resa(r#"{"loaded":true}"#).expect("leggibile");
         assert_eq!(p.elementi_resi, None);
         assert_eq!(p.contenitore, None, "nessuna dichiarazione, nessun contenitore");
+        assert_eq!(
+            p.risorse, None,
+            "richieste non riportate: non e' una pagina senza risorse"
+        );
+        assert_eq!(p.origine, None);
+        // Le richieste riportate e VUOTE sono un fatto diverso, e resta tale.
+        let muta = interpreta_resa(r#"{"loaded":true,"requests":[]}"#).expect("leggibile");
+        assert_eq!(muta.risorse, Some(Vec::new()));
         assert!(interpreta_resa("non-json").is_err());
     }
 
@@ -601,8 +743,9 @@ mod prova_dal_vivo {
     #[tokio::test]
     #[ignore]
     async fn osserva_pagina_statica_reale() {
+        use nexus_agent_graph::decisions::risorse_pagina::PoliticaRisorse;
         use nexus_agent_graph::decisions::static_render::{
-            cause_con_selettore, classifica_resa,
+            cause_con_selettore, classifica_resa, risorse_della_pagina,
         };
         let url = std::env::var("NEXUS_PROVA_URL").unwrap_or_else(|_| {
             "http://127.0.0.1:4000/preview/e4d446ce-28a4-44a9-bcab-d7a78b0541b4/landing/index.html"
@@ -623,7 +766,15 @@ mod prova_dal_vivo {
         for c in prove.errori_console.iter().take(5) {
             println!("  console: {c}");
         }
-        let v = classifica_resa(&prove, 5);
+        // La politica com'e' scritta dalla mig 0692: la prova dal vivo deve
+        // usare la stessa configurazione dell'esercizio, o misurerebbe un
+        // criterio che nessuno esegue.
+        let politica = PoliticaRisorse::nuova(
+            vec!["image".into(), "stylesheet".into(), "script".into(), "media".into()],
+            Some(1.0),
+        );
+        println!("RISORSE: {:?}", risorse_della_pagina(&prove, &politica));
+        let v = classifica_resa(&prove, 5, &politica);
         let v = match sel.as_deref() {
             Some(s) => cause_con_selettore(v, s),
             None => v,

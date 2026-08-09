@@ -49,6 +49,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use nexus_agent_graph::decisions::browser_dialogue;
+use nexus_agent_graph::decisions::risorse_pagina::{PoliticaRisorse, VerdettoRisorse};
 use nexus_agent_graph::decisions::static_render;
 use nexus_agent_graph::runtime::ports::{
     CriteriaRunner, CriterionOutcome, CriterionProvenance, CriterionResult, CriterionSpec,
@@ -1189,7 +1190,7 @@ task_complete (outcome + summary)"
             Ok(p) => p,
             Err(e) => return strumento_muto(url, &e),
         };
-        let verdetto = static_render::classifica_resa(&prove, p.minimo);
+        let verdetto = static_render::classifica_resa(&prove, p.minimo, &p.politica);
         // Il selettore lo porta la spec, non i fatti: e' qui che le cause che lo
         // riguardano prendono il loro nome, o il rilievo direbbe «il contenitore
         // e' vuoto» senza dire quale.
@@ -1197,7 +1198,11 @@ task_complete (outcome + summary)"
             Some(s) => static_render::cause_con_selettore(verdetto, s),
             None => verdetto,
         };
-        esito_resa(url, &prove, verdetto)
+        // Le risorse si riportano SEMPRE, anche a verdetto positivo: le assenze
+        // sotto soglia non bocciano nessuno e sono il solo dato con cui si
+        // potra' decidere, misurando, se quella soglia va abbassata.
+        let risorse = static_render::risorse_della_pagina(&prove, &p.politica);
+        esito_resa(url, &prove, verdetto, &risorse)
     }
 
     /// Lo stile dichiarato dal codice e' applicato? Il criterio e' il punto
@@ -1521,6 +1526,7 @@ struct ParametriResa {
     selettore: Option<String>,
     minimo: usize,
     attesa_ms: u64,
+    politica: PoliticaRisorse,
 }
 
 impl ParametriResa {
@@ -1546,6 +1552,23 @@ impl ParametriResa {
                 .get(static_render::CHIAVE_ATTESA_MS)
                 .and_then(Value::as_u64)
                 .unwrap_or(2000),
+            // Nessun ripiego, per nessuno dei due (regola G): chiavi assenti
+            // nella spec = politica inutilizzabile = il criterio dichiara di
+            // non rispondere sulle risorse. Un elenco di tipi scritto qui
+            // deciderebbe al posto della configurazione, e la deciderebbe in
+            // un posto che nessun amministratore puo' cambiare.
+            politica: PoliticaRisorse::nuova(
+                spec.get(static_render::CHIAVE_TIPI_RISORSA)
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                spec.get(static_render::CHIAVE_SOGLIA_RISORSE)
+                    .and_then(Value::as_f64),
+            ),
         })
     }
 }
@@ -1561,16 +1584,18 @@ fn esito_resa(
     url: &str,
     prove: &static_render::ProveResa,
     verdetto: static_render::VerdettoResa,
+    risorse: &VerdettoRisorse,
 ) -> (CriterionOutcome, Value) {
     use static_render::VerdettoResa;
+    let risorse = risorse.evidenza();
     match verdetto {
         VerdettoResa::Resa { elementi } => (
             CriterionOutcome::Passed,
-            json!({ "url": url, "elements_rendered": elementi }),
+            json!({ "url": url, "elements_rendered": elementi, "resources": risorse }),
         ),
         VerdettoResa::NonConcludente { motivo } => (
             CriterionOutcome::Inconclusive,
-            json!({ "url": url, "skipped_reason": motivo }),
+            json!({ "url": url, "skipped_reason": motivo, "resources": risorse }),
         ),
         VerdettoResa::NonResa { cause } => {
             let descrizioni: Vec<String> = cause.iter().take(5).map(|c| c.descrizione()).collect();
@@ -1585,6 +1610,7 @@ fn esito_resa(
                     ),
                     "causes": descrizioni,
                     "console_errors": prove.errori_console.iter().take(3).collect::<Vec<_>>(),
+                    "resources": risorse,
                 }),
             )
         }
