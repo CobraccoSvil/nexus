@@ -153,11 +153,40 @@ function ProviderStatusIndicator({
                 <span style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 1 }}>
                   <span style={{ color: tc.text, fontSize: 12, fontWeight: 600 }}>{label}</span>
                   {/* Provider disponibile (verde): il nome basta, "Disponibile" e' ridondante.
-                      Il dettaglio si mostra solo per stati non-ok (billing/errore/sconosciuto). */}
+                      Il dettaglio si mostra solo per stati non-ok (billing/errore/sconosciuto).
+
+                      Collassato di DEFAULT: il pannello risponde a "chi e' giu'?", e la
+                      risposta e' il pallino accanto al nome. Con due provider in errore il
+                      dettaglio esteso occupava meta' popover e spingeva fuori dalla vista
+                      i provider sani, che sono quelli su cui si decide dove instradare.
+                      `<details>` nativo invece di uno stato React: la persistenza per riga
+                      la gestisce il browser, e senza `open` nasce chiuso a ogni apertura --
+                      che e' voluto, il pannello e' una lettura di stato, non una sessione. */}
                   {state.ok !== true && (
-                    <span style={{ color: tc.textMuted, fontSize: 11, overflowWrap: "anywhere" }}>
-                      {detailText(state)}
-                    </span>
+                    <details style={{ minWidth: 0 }}>
+                      <summary
+                        style={{
+                          color: tc.textMuted,
+                          fontSize: 11,
+                          cursor: "pointer",
+                          listStyle: "revert",
+                          userSelect: "none",
+                        }}
+                      >
+                        {t("panels.dettagli")}
+                      </summary>
+                      <span
+                        style={{
+                          display: "block",
+                          color: tc.textMuted,
+                          fontSize: 11,
+                          overflowWrap: "anywhere",
+                          paddingTop: 2,
+                        }}
+                      >
+                        {detailText(state)}
+                      </span>
+                    </details>
                   )}
                 </span>
               </div>
