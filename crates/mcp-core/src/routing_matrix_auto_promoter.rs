@@ -1338,6 +1338,36 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_ignora_i_fallimenti_consecutivi() {
+        // La proprieta' che il campo `consecutive_failures` documenta, DETTA
+        // invece che sottintesa: la decisione di cleanup e' invariante rispetto
+        // a quel contatore, perche' la salute e' solo `is_enabled` (ADR 0025).
+        //
+        // Il campo sta nella fixture proprio perche' la regola POTREBBE
+        // consultarlo: e' cosi' che il test sopra si accorgerebbe di una
+        // reintroduzione del filtro `failures = 0`. Finche' nessuno lo leggeva,
+        // pero', quella premessa restava in un commento e il campo era dead
+        // code — invisibile su Windows (l'`allow` di lib.rs) e un errore su
+        // Linux con `-D warnings`. Qui il campo entra in un'asserzione: la
+        // proprieta' e' verificata e il dead code sparisce per la stessa
+        // ragione, non per un `allow`.
+        let sano = chealth("openai", "gpt-5", true, 0);
+        let fallito = chealth("openai", "gpt-5", true, 7);
+        assert_ne!(
+            sano.consecutive_failures, fallito.consecutive_failures,
+            "le due fixture devono differire proprio nel campo sotto esame"
+        );
+
+        let row = mrow("openai", "gpt-5", true, false);
+        assert_eq!(
+            row_should_be_deactivated(&row, std::slice::from_ref(&sano)),
+            row_should_be_deactivated(&row, std::slice::from_ref(&fallito)),
+            "la decisione di cleanup non deve dipendere da consecutive_failures \
+             (ADR 0025: pretendere failures=0 causava starvation)"
+        );
+    }
+
+    #[test]
     fn cleanup_keeps_row_with_healthy_model() {
         let row = mrow("anthropic", "claude-opus", true, false);
         let catalog = vec![chealth("anthropic", "claude-opus", true, 0)];

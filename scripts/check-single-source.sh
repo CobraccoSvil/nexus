@@ -2474,7 +2474,9 @@ premesse_hits="$(grep -rlnE '^ *gate_stop_configurazione\(\)' scripts/ 2>/dev/nu
   | grep -v '^scripts/gate-premesse\.sh$' || true)"
 for coppia in "scripts/precommit-cargo-check.sh:gate_pretende_database_url" \
               "scripts/precommit-turbo.sh:gate_pretende_turbo" \
-              "scripts/verify.sh:gate_pretende_turbo"; do
+              "scripts/verify.sh:gate_pretende_turbo" \
+              "scripts/verify.sh:gate_pretende_node" \
+              "scripts/verify.sh:gate_pretende_nextest"; do
   file="${coppia%%:*}"; pretesa="${coppia##*:}"
   if [[ -f "$file" ]] && ! grep -q "^ *${pretesa}\$" "$file"; then
     premesse_hits="${premesse_hits}
@@ -2490,6 +2492,44 @@ if [[ -n "${premesse_hits// /}" ]]; then
   fail=1
 else
   echo "OK premesse-dei-gate: l'esito 'non eseguito' ha un punto unico e i gate lo pretendono"
+fi
+
+# versione-node — la versione di Node ha UN posto solo: .nvmrc.
+#
+# Il difetto che presidia e' gia' costato cinque settimane di CI cieca. Due
+# workflow dichiaravano `node-version: "20"` scritto a mano, il locale girava su
+# 24, e nessuno dei due posti diceva che erano due. Quando i test della web-ide
+# sono diventati file .ts eseguiti da `node --test` (2026-07-03), il CI ha
+# iniziato a morire nella PRIMA fase — e siccome il gate era fail-fast, clippy e
+# nextest non sono piu' stati eseguiti fino all'08/08/2026.
+#
+# La regressione da impedire e' precisamente il ritorno del numero scritto a
+# mano: `node-version:` con un valore, invece di `node-version-file: .nvmrc`.
+# Un workflow che lo reintroducesse non fallirebbe — girerebbe, con una versione
+# diversa da quella di tutti gli altri.
+node_hits=""
+if [[ ! -f .nvmrc ]]; then
+  node_hits=".nvmrc assente: la versione di Node non ha piu' un punto unico"
+fi
+# La CHIAVE con un valore letterale, non la menzione: `^[^#]*` esclude le righe
+# di commento (compresi quelli che spiegano questo guard), e il valore atteso
+# dopo i due punti impedisce di matchare `node-version-file:`. Stessa disciplina
+# del guard premesse-dei-gate: un pattern che matcha la propria spiegazione
+# rende il guard inservibile al primo commento.
+node_hardcoded="$(grep -rnE '^[^#]*[{[:space:]-]node-version:[[:space:]]*["'"'"'0-9]' \
+  .github/workflows/ 2>/dev/null || true)"
+if [[ -n "$node_hardcoded" ]]; then
+  node_hits="${node_hits}
+$node_hardcoded"
+fi
+if [[ -n "${node_hits// /}" ]]; then
+  echo "!! versione-node: la versione di Node e' dichiarata fuori da .nvmrc:" >&2
+  printf '%s\n' "$node_hits" >&2
+  echo "   Usa 'node-version-file: .nvmrc' nei workflow. Il MINIMO tollerato sta" >&2
+  echo "   in package.json (engines.node) e lo pretende gate_pretende_node." >&2
+  fail=1
+else
+  echo "OK versione-node: .nvmrc e' l'unico posto in cui la versione e' scritta"
 fi
 
 # ── carico-per-fornitore (2026-08-08) ───────────────────────────────────────

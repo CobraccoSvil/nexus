@@ -30,9 +30,45 @@
 #        in precommit-turbo.sh, cancella la riga `gate_pretende_turbo`
 #      -> deve ROSSEGGIARE il caso 5
 #
+#   4) riporta gate_pretende_node a un confronto inventato:
+#        in gate-premesse.sh, sostituisci il corpo con `return 0`
+#      -> deve ROSSEGGIARE il caso 7 (era il difetto: un Node insufficiente
+#         usciva come "Could not find lib/**/*.test.ts", cioe' accusava un file)
+#
+#   5) togli l'isolamento dall'ambiente git dell'hook:
+#        in questo file, cancella la riga `unset GIT_DIR ...` in testa
+#      -> deve ROSSEGGIARE il caso 8 (era il difetto: eseguito come hook
+#         pre-commit, questo script committava sul repo REALE e vi registrava
+#         un worktree, perche' GIT_DIR batte `git -C`)
+#
 # Uso: bash scripts/gate-premesse-selftest.sh
 # Exit 0 = tutti i casi superati.
 set -uo pipefail
+
+# L'AMBIENTE GIT EREDITATO VA VIA PRIMA DI QUALUNQUE COMANDO GIT.
+#
+# Questo script crea un repository usa-e-getta e ci lavora con `git -C <tmp>`.
+# `-C` cambia la directory, ma NON batte le variabili d'ambiente: se GIT_DIR e
+# GIT_INDEX_FILE sono impostate, ogni comando git le usa e lavora sul repo che
+# le ha esportate — dovunque punti `-C`.
+#
+# MISURATO l'09/08/2026, la prima volta che questo selftest e' stato agganciato
+# a lefthook: durante un `git commit`, git esporta GIT_DIR e GIT_INDEX_FILE agli
+# hook. Il `git -C "$COMUNE" commit -m "selftest: script dei gate"` di riga ~90
+# ha percio' committato l'INDICE REALE sul branch reale — un commit col
+# contenuto giusto e il messaggio del selftest — e il `worktree add ... main`
+# successivo ha registrato nel repo reale un worktree sotto /tmp, poi cancellato
+# da `cleanup`, lasciando un worktree orfano e l'indice pieno del contenuto di
+# `main`. Niente e' andato perso, ma solo perche' il working tree non viene
+# toccato da nessuno dei due comandi.
+#
+# Fuori da un hook il difetto non esiste (nessuna delle due variabili e'
+# impostata), ed e' il motivo per cui lo script e' vissuto finora dentro
+# `pnpm verify` senza mai mostrarlo. Lo stesso vale per qualunque script che
+# maneggi un repo temporaneo: l'isolamento non lo da' `-C`, lo da' questo unset.
+unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_COMMON_DIR GIT_PREFIX \
+  GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE \
+  GIT_INDEX_VERSION GIT_REFLOG_ACTION
 
 SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
 TMP="$(mktemp -d)"
@@ -146,6 +182,79 @@ echo "### 6. il target dir resta dell'albero, non del comune"
 # Un target condiviso farebbe girare i test di un albero sul binario di un altro.
 esito "CARGO_TARGET_DIR del worktree" \
   "$WT/target" "$(sorgi "$WT" CARGO_TARGET_DIR)"
+
+echo
+echo "### 7. Node insufficiente: la causa e' la versione, non il codice"
+# La strada e' quella della produzione: verify.sh sorge gate-env.sh (che sorge
+# gate-premesse.sh) e invoca la premessa. Il minimo lo legge da package.json
+# dell'albero, che qui si scrive apposta — nel repo reale c'e' sempre, e col
+# valore giusto, quindi il caso non sarebbe osservabile (regola O).
+pretende_node() { # pretende_node <albero>  -> stampa il messaggio
+  (cd "$1" && bash -c 'source scripts/gate-env.sh 2>/dev/null; gate_pretende_node' 2>&1)
+}
+codice_node() { # codice_node <albero>  -> stampa il solo codice d'uscita
+  (cd "$1" && bash -c 'source scripts/gate-env.sh 2>/dev/null; gate_pretende_node' \
+    >/dev/null 2>&1; echo $?)
+}
+
+printf '{"engines":{"node":">=999.0.0"}}\n' > "$WT/package.json"
+esito "Node sotto il minimo: esce 78 (EX_CONFIG), non 1" "78" "$(codice_node "$WT")"
+msg_node="$(pretende_node "$WT")"
+case "$msg_node" in
+  *"non soddisfa il minimo dichiarato"*) causa_node=si ;;
+  *) causa_node="no -- $msg_node" ;;
+esac
+esito "il messaggio nomina la versione di node, non un file mancante" "si" "$causa_node"
+
+printf '{"engines":{"node":">=0.0.1"}}\n' > "$WT/package.json"
+esito "minimo soddisfatto: la premessa non intralcia" "0" "$(codice_node "$WT")"
+
+# Un range che questo gate non sa confrontare non viene indovinato: si ferma
+# dichiarandolo. Un confronto approssimato renderebbe la premessa piu'
+# permissiva senza che nessuno lo sappia.
+printf '{"engines":{"node":"^22 || >=24"}}\n' > "$WT/package.json"
+esito "range non interpretabile: 78, non un confronto inventato" "78" "$(codice_node "$WT")"
+
+# Nessun minimo dichiarato: niente da pretendere, nessun valore di ripiego.
+printf '{"name":"selftest"}\n' > "$WT/package.json"
+esito "engines.node assente: la premessa passa senza inventare un minimo" \
+  "0" "$(codice_node "$WT")"
+rm -f "$WT/package.json"
+
+# Il caso 8 rilancia questo stesso script: la guardia impedisce la ricorsione.
+if [ "${NEXUS_SELFTEST_ANNIDATO:-}" != "1" ]; then
+  echo
+  echo "### 8. eseguito come hook: non tocca il repo che lo ha invocato"
+  # Il difetto misurato l'09/08 (vedi l'unset in testa). La misura riproduce
+  # l'ambiente vero di un hook — GIT_DIR e GIT_INDEX_FILE esportate da git — e
+  # guarda la CONSEGUENZA su un repo vittima: il suo HEAD e la sua lista di
+  # worktree. Non verifica che le variabili siano state unsettate: quello e' il
+  # come, e un domani il rimedio potrebbe essere un altro (regola O).
+  VITTIMA="$TMP/vittima"
+  git init -q -b main "$VITTIMA"
+  git -C "$VITTIMA" config user.email selftest@nexus.local
+  git -C "$VITTIMA" config user.name "gate selftest"
+  printf 'segnaposto\n' > "$VITTIMA/file.txt"
+  git -C "$VITTIMA" add -A
+  git -C "$VITTIMA" -c core.hooksPath="$NOHOOKS" -c commit.gpgsign=false \
+    commit -q -m "vittima: stato iniziale"
+  head_prima="$(git -C "$VITTIMA" rev-parse HEAD)"
+  wt_prima="$(git -C "$VITTIMA" worktree list | wc -l)"
+
+  # Una modifica NON committata nell'indice: e' cio' che il difetto committava.
+  printf 'modifica in staging\n' > "$VITTIMA/file.txt"
+  git -C "$VITTIMA" add -A
+
+  GIT_DIR="$VITTIMA/.git" GIT_INDEX_FILE="$VITTIMA/.git/index" \
+    NEXUS_SELFTEST_ANNIDATO=1 bash "$SCRIPTS/gate-premesse-selftest.sh" >/dev/null 2>&1
+  annidato=$?
+
+  esito "l'esecuzione annidata supera i propri casi" "0" "$annidato"
+  esito "HEAD della vittima invariato (nessun commit di straforo)" \
+    "$head_prima" "$(git -C "$VITTIMA" rev-parse HEAD)"
+  esito "nessun worktree registrato nella vittima" \
+    "$wt_prima" "$(git -C "$VITTIMA" worktree list | wc -l)"
+fi
 
 echo
 if [ "$falliti" -eq 0 ]; then

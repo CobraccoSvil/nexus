@@ -3068,6 +3068,8 @@ gamma
     /// ramo, o se il resolver fosse rotto.
     #[tokio::test]
     async fn list_files_consegna_al_modello_la_causa_e_il_tratto_esistente() {
+        use nexus_types::tool_outcome::EsitoTool;
+
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("school-courses-fe/src")).expect("albero");
         let ctx = ctx_di_prova(dir.path().to_path_buf(), Arc::new(HookRegistranti::default()));
@@ -3080,10 +3082,11 @@ gamma
 
         // Il tool e' stato migrato a `RispostaTool` mentre questo test viveva su
         // un altro branch: l'asserzione guarda ora i CAMPI, che e' il contratto
-        // che il tool ha adottato. Il messaggio di fallimento stampa la
-        // struttura INTERA (`{out:?}`) e non il solo testo: quando questo test
-        // rosseggia servono anche `esito` e `natura` per capire cosa e' successo.
-        assert_eq!(out.esito, nexus_types::tool_outcome::EsitoTool::Fallito);
+        // che il tool ha adottato (regola Q). Anche questo assert porta la sua
+        // diagnostica, e la porta sulla struttura INTERA (`{out:?}`): `assert_eq!`
+        // da solo stampa i due `esito` e tace su `natura` e `testo`, che sono i
+        // campi da cui si capisce PERCHE' l'esito non e' quello atteso.
+        assert_eq!(out.esito, EsitoTool::Fallito, "{out:?}");
         assert!(
             out.testo.contains("school-courses-fe/SchoolCoursesApi"),
             "{out:?}"

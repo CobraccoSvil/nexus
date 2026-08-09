@@ -126,6 +126,9 @@ pre-commit:
         - "*.ts"
         - "*.tsx"
         - "*.sh"
+        # I workflow: dall'08/08/2026 il guard presidia anche la versione di
+        # Node, che vive in .nvmrc e non piu' scritta a mano in ogni YAML.
+        - ".github/workflows/*.yml"
       run: bash scripts/check-single-source.sh
       fail_text: "pre-commit: regressione su un punto unico (regola L / ADR 0026)."
 
@@ -146,6 +149,29 @@ pre-commit:
       # cioe' il gate fallisce senza aver eseguito nulla.
       run: bash scripts/liveness-selftest.sh
       fail_text: "pre-commit: il criterio di liveness degli script di deploy non supera il proprio self-test (scripts/liveness-selftest.ps1)."
+
+    # I gate che verificano se stessi. Girano solo quando si toccano gli script
+    # che li governano, e per la stessa ragione del liveness_selftest: qui un
+    # errore non produce un messaggio sbagliato, produce un gate che TACE — una
+    # fase saltata che nessuno dichiara, o una premessa che passa per buona una
+    # configurazione insufficiente. Costano pochi secondi e non compilano nulla.
+    gate_fasi_selftest:
+      glob:
+        - "scripts/gate-fasi.sh"
+        - "scripts/gate-fasi-selftest.sh"
+        - "scripts/verify.sh"
+      run: bash scripts/gate-fasi-selftest.sh
+      fail_text: "pre-commit: la meccanica delle fasi del gate non supera il proprio self-test (scripts/gate-fasi-selftest.sh)."
+
+    gate_premesse_selftest:
+      glob:
+        - "scripts/gate-env.sh"
+        - "scripts/gate-premesse.sh"
+        - "scripts/gate-premesse-selftest.sh"
+        - "scripts/precommit-cargo-check.sh"
+        - "scripts/precommit-turbo.sh"
+      run: bash scripts/gate-premesse-selftest.sh
+      fail_text: "pre-commit: le premesse dei gate non superano il proprio self-test da un worktree (scripts/gate-premesse-selftest.sh)."
 
     # Gate ratchet dei marker di debito e delle frasi di inerzia
     # (scripts/markers-baseline.json): grep istantaneo. Il conteggio puo' solo

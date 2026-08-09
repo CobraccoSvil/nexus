@@ -56,10 +56,21 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
+      # pnpm PRIMA di setup-node, e non e' cosmetica: con `cache: pnpm` l'action
+      # di Node cerca l'eseguibile pnpm per calcolare la chiave di cache, e se
+      # non c'e' ancora muore con "Unable to locate executable file: pnpm".
+      # E' esattamente cio' che accadeva: questo job e' rosso su OGNI run e non
+      # ha mai eseguito un test Playwright — moriva prima, nello step di setup.
+      # Un gate che sembra esistere e non ha mai misurato niente.
+      #
+      # @v4 senza `version:`: la versione di pnpm la dichiara "packageManager"
+      # in package.json (punto unico), come gia' in verify.yml.
+      - uses: pnpm/action-setup@v4
+      # Versione di Node dal punto unico .nvmrc, come in verify.yml: qui c'era lo
+      # stesso "20" scritto a mano, e questo job esegue la web-ide, i cui test
+      # sono file .ts che sotto Node 22.18 non partono affatto.
       - uses: actions/setup-node@v4
-        with: { node-version: "20", cache: "pnpm" }
-      - uses: pnpm/action-setup@v3
-        with: { version: 10 }
+        with: { node-version-file: .nvmrc, cache: "pnpm" }
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm test:ui-e2e
