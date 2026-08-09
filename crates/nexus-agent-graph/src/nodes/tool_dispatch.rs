@@ -421,6 +421,44 @@ enum MotivoBlocco {
     StepGateRejected,
 }
 
+/// Esito del passo 2a per QUESTO batch: passa, oppure no e con quale natura.
+///
+/// Due varianti invece di una coppia `(decision, Option<GateBlock>)`: la natura
+/// del blocco esiste se e solo se il batch e' fermo, e con l'opzione quella
+/// verita' andava riaffermata a ogni consumatore con un `unwrap_or` — cioe' con
+/// un ripiego che, sbagliando, avrebbe deciso in silenzio se il run prosegue.
+#[derive(Debug, Clone, PartialEq)]
+enum EsitoGate {
+    /// Il batch puo' partire: unanimita', oppure degrado DICHIARATO su un
+    /// Critical (`UnavailableDeclared`).
+    Procede(crate::decisions::step_gate::StepGateDecision),
+    /// Il batch non parte. `decision` dice cosa ha deciso la matrice, `blocco`
+    /// se ripetere puo' cambiarlo.
+    Fermo {
+        decision: crate::decisions::step_gate::StepGateDecision,
+        blocco: crate::decisions::step_gate::GateBlock,
+    },
+}
+
+impl EsitoGate {
+    fn decision(&self) -> &crate::decisions::step_gate::StepGateDecision {
+        match self {
+            Self::Procede(d) => d,
+            Self::Fermo { decision, .. } => decision,
+        }
+    }
+
+    /// La natura del blocco, se il batch e' fermo. Per il payload, che la
+    /// dichiara anche quando il run prosegue (li' e' `null`, e la differenza
+    /// fra «non ho bloccato» e «non l'ho classificato» resta visibile).
+    fn blocco(&self) -> Option<crate::decisions::step_gate::GateBlock> {
+        match self {
+            Self::Procede(_) => None,
+            Self::Fermo { blocco, .. } => Some(*blocco),
+        }
+    }
+}
+
 /// Esito di UNA tool_result, prima della ricomposizione nell'ordine dei pending.
 /// Mappa il dict `{type, tool_use_id, content, is_error, exit_code?, raw_content?}`
 /// del Python. `content` e' un `Value` (la stringa JSON del tool, gia' eventualmente
@@ -1320,28 +1358,21 @@ impl ToolDispatchNode {
         let report = Self::convoca_porta(ctx, state, run_id, critici, level, prior_rejections)
             .await;
 
-        let (decision, cap_raggiunto) = self.decidi_con_cap(&report, level, prior_rejections);
-        let payload = payload_convocazione(
-            &decision,
-            level,
-            steps_slim,
-            &report,
-            prior_rejections,
-            cap_raggiunto,
-        );
-        self.emetti_meta_validazione(ctx, state, &decision, level, &report, payload.clone())
+        let esito = self.decidi(&report, level, prior_rejections);
+        let payload = payload_convocazione(&esito, level, steps_slim, &report, prior_rejections);
+        self.emetti_meta_validazione(ctx, state, esito.decision(), level, &report, payload.clone())
             .await;
 
-        self.esito_decisione(decision, state, pending, &report, prior_rejections, run_id, payload)
+        self.esito_decisione(esito, state, pending, &report, prior_rejections, run_id, payload)
             .await
     }
 
-    /// (2a) La CONSEGUENZA della decisione sul flusso del turno: `None` = i
-    /// tool si eseguono; `Some(delta)` = rimando o sospensione.
+    /// (2a) La CONSEGUENZA sul flusso del turno: `None` = i tool si eseguono;
+    /// `Some(delta)` = rimando, sospensione o chiusura del run.
     #[allow(clippy::too_many_arguments)]
     async fn esito_decisione(
         &self,
-        decision: crate::decisions::step_gate::StepGateDecision,
+        esito: EsitoGate,
         state: &AgentState,
         pending: &[Value],
         report: &ports::StepValidationReport,
@@ -1350,32 +1381,75 @@ impl ToolDispatchNode {
         payload: Value,
     ) -> Option<OpaqueDelta> {
         use crate::decisions::step_gate::StepGateDecision;
-        match decision {
-            StepGateDecision::Approved => None,
-            StepGateDecision::UnavailableDeclared => {
+        match esito {
+            EsitoGate::Procede(StepGateDecision::UnavailableDeclared) => {
                 tracing::warn!(
                     target: "nexus_agent_graph::tool_dispatch",
                     "gate duale senza verdetti utilizzabili su un Critical: si procede DICHIARANDOLO"
                 );
                 None
             }
-            // IN AUTONOMIA NON SI CHIEDE (regola D): in Automatic/Continuous
-            // l'utente ha scelto di non essere interrotto, e non c'e' nessuno
-            // che sciolga la sospensione — una domanda li' e' un run appeso
-            // fino alla scadenza, non una difesa. Il gate dice NO al passo e
-            // lo rimanda al modello coi motivi: l'agente cambia strada o
-            // chiude `blocked`, che e' l'esito onesto. La sospensione resta
-            // dove qualcuno la puo' sciogliere: Confirm e Studio, dove
-            // `automation_requires_hitl` (punto unico) e' vero.
-            StepGateDecision::NeedsHuman => {
-                self.esito_needs_human(state, pending, report, prior_rejections, run_id, payload)
-                    .await
+            EsitoGate::Procede(_) => None,
+            EsitoGate::Fermo { decision, blocco } => {
+                self.esito_blocco(
+                    decision,
+                    blocco,
+                    state,
+                    pending,
+                    report,
+                    prior_rejections,
+                    run_id,
+                    payload,
+                )
+                .await
             }
-            StepGateDecision::Rejected => Some(
-                self.step_gate_reject_delta(state, pending, report, prior_rejections, run_id)
-                    .await,
-            ),
         }
+    }
+
+    /// (2a) Il batch non parte: a CHI tocca la conseguenza, il passo o il run?
+    ///
+    /// Tre esiti, e la scelta fra loro non e' di comodo:
+    ///
+    /// - dove un umano c'e' (Conferma/Studio, punto unico
+    ///   [`crate::decisions::hitl::automation_requires_hitl`]) una decisione
+    ///   che il modello non puo' prendere e' SUA: sospensione coi verdetti
+    ///   allegati. Vale sia per un `NeedsHuman` sia per un gate che ha esaurito
+    ///   i rimandi — in entrambi i casi la domanda ha un destinatario;
+    /// - in autonomia NON SI CHIEDE (regola D): l'utente ha scelto di non
+    ///   essere interrotto e nessuno scioglierebbe una sospensione. Quando il
+    ///   gate ha esaurito i rimandi il run si CHIUDE dichiarando l'esito —
+    ///   non una domanda, una dichiarazione terminale;
+    /// - altrimenti il batch torna al modello col motivo, che e' la risposta
+    ///   giusta finche' cambiare strada puo' cambiare l'esito.
+    ///
+    /// PERCHE' LA CHIUSURA. Fino al 09/08 ogni blocco in autonomia era il solo
+    /// rimando, e la premessa dichiarata era «l'agente cambia strada o chiude
+    /// `blocked`, che e' l'esito onesto». La premessa e' stata falsificata in
+    /// esercizio la prima sera di `enforce`: l'agente non ha fatto ne' l'una ne'
+    /// l'altra cosa — ha riscritto lo stesso script con nove nomi diversi. Cio'
+    /// che mancava non era un'altra difesa: era che qualcuno DICHIARASSE quella
+    /// chiusura, invece di lasciarla alla buona volonta' del modello.
+    #[allow(clippy::too_many_arguments)]
+    async fn esito_blocco(
+        &self,
+        decision: crate::decisions::step_gate::StepGateDecision,
+        blocco: crate::decisions::step_gate::GateBlock,
+        state: &AgentState,
+        pending: &[Value],
+        report: &ports::StepValidationReport,
+        prior_rejections: u32,
+        run_id: &str,
+        payload: Value,
+    ) -> Option<OpaqueDelta> {
+        use crate::decisions::step_gate::StepGateDecision;
+        let interpella = crate::decisions::hitl::automation_requires_hitl(state.automation_mode);
+        if interpella && (decision == StepGateDecision::NeedsHuman || blocco.ferma_il_run()) {
+            return Some(self.hitl_suspend_delta_con_validazioni(state, pending, Some(payload)));
+        }
+        Some(
+            self.step_gate_block_delta(state, pending, report, blocco, prior_rejections, run_id)
+                .await,
+        )
     }
 
     /// (2a) Telemetria di taratura (observe / Critical in
@@ -1453,24 +1527,41 @@ impl ToolDispatchNode {
         Some((level, critici, steps_slim))
     }
 
-    /// (2a) La decisione dai verdetti + il cap anti ping-pong: un ennesimo
-    /// rimando non riparte verso il modello, degrada alla decisione umana
-    /// (dichiarato nel payload con `cap_reached`).
-    fn decidi_con_cap(
+    /// (2a) La decisione dai verdetti, con la NATURA del blocco quando ferma.
+    ///
+    /// Entrambe delegate ai punti unici di `decisions::step_gate`
+    /// ([`decide_step_gate`] e [`classify_block`]): qui non si decide nulla, si
+    /// mette insieme cio' che il nodo dovra' consumare.
+    ///
+    /// Il cap NON degrada piu' la decisione a `NeedsHuman`, ed e' il difetto
+    /// #19: in autonomia quel degrado tornava a essere lo stesso rimando, e il
+    /// tetto contava fino a due senza mai produrre una conseguenza diversa
+    /// (MISURATO il 09/08: `cap_reached=true` dalla seconda convocazione, e le
+    /// quattro successive hanno convocato lo stesso). Ora il tetto e' UNA delle
+    /// nature del blocco, e la sua conseguenza la porta il vocabolario.
+    fn decidi(
         &self,
         report: &ports::StepValidationReport,
         level: crate::decisions::step_gate::StepCriticality,
         prior_rejections: u32,
-    ) -> (crate::decisions::step_gate::StepGateDecision, bool) {
-        use crate::decisions::step_gate::{decide_step_gate, StepGateDecision, StepVerdict};
+    ) -> EsitoGate {
+        use crate::decisions::step_gate::{
+            classify_block, decide_step_gate, StepGateDecision, StepVerdict,
+        };
         let verdetti: Vec<StepVerdict> = report.verdicts.iter().map(|v| v.verdict).collect();
         let decision = decide_step_gate(&verdetti, level);
-        let cap_raggiunto = decision == StepGateDecision::Rejected
-            && prior_rejections + 1 >= self.cfg.step_gate_max_rejections.max(1);
-        if cap_raggiunto {
-            (StepGateDecision::NeedsHuman, true)
-        } else {
-            (decision, false)
+        match decision {
+            StepGateDecision::Approved | StepGateDecision::UnavailableDeclared => {
+                EsitoGate::Procede(decision)
+            }
+            StepGateDecision::Rejected | StepGateDecision::NeedsHuman => EsitoGate::Fermo {
+                decision,
+                blocco: classify_block(
+                    &verdetti,
+                    prior_rejections,
+                    self.cfg.step_gate_max_rejections,
+                ),
+            },
         }
     }
 
@@ -1527,46 +1618,27 @@ impl ToolDispatchNode {
         .await;
     }
 
-    /// (2a) Che fare quando il gate rimanda la decisione a un umano: dipende
-    /// da CHI puo' rispondere. In Conferma e Studio l'utente e' al terminale e
-    /// la sospensione ha un destinatario; in Automatic/Continuous ha scelto di
-    /// non essere interrotto (regola D) e nessuno la scioglierebbe — li' il
-    /// gate dice NO al passo e lo rimanda al modello, che cambia strada o
-    /// chiude `blocked`. La domanda «questa modalita' vuole l'umano?» ha gia'
-    /// il suo punto unico: `hitl::automation_requires_hitl`.
+    /// Il delta del batch BLOCCATO: nessun tool eseguito, ogni pending riceve
+    /// un tool_result sintetico coi motivi dei validatori (e l'alternativa piu'
+    /// sicura, se proposta), il contatore dei rimandi sale nello stato.
+    ///
+    /// Finche' il blocco e' un rimando, il turno torna al modello (`ToolUse`).
+    /// Quando la natura del blocco dice che il run si ferma
+    /// ([`GateBlock::ferma_il_run`]) gli stessi tool_result restano — un
+    /// tool_use senza risposta lascia una conversazione malformata al prossimo
+    /// resume — e il delta acquista la dichiarazione terminale.
     #[allow(clippy::too_many_arguments)]
-    async fn esito_needs_human(
+    async fn step_gate_block_delta(
         &self,
         state: &AgentState,
         pending: &[Value],
         report: &ports::StepValidationReport,
-        prior_rejections: u32,
-        run_id: &str,
-        payload: Value,
-    ) -> Option<OpaqueDelta> {
-        if crate::decisions::hitl::automation_requires_hitl(state.automation_mode) {
-            return Some(self.hitl_suspend_delta_con_validazioni(state, pending, Some(payload)));
-        }
-        Some(
-            self.step_gate_reject_delta(state, pending, report, prior_rejections, run_id)
-                .await,
-        )
-    }
-
-    /// Il delta del RIMANDO: nessun tool eseguito, ogni pending riceve un
-    /// tool_result sintetico coi motivi dei validatori (e l'alternativa piu'
-    /// sicura, se proposta). Il turno torna al modello (`ToolUse`), il
-    /// contatore dei rimandi sale nello stato.
-    async fn step_gate_reject_delta(
-        &self,
-        state: &AgentState,
-        pending: &[Value],
-        report: &ports::StepValidationReport,
+        blocco: crate::decisions::step_gate::GateBlock,
         prior_rejections: u32,
         run_id: &str,
     ) -> OpaqueDelta {
         use crate::decisions::step_gate::STEP_GATE_REJECTIONS_EXTRA_KEY;
-        let testo = testo_rimando(report);
+        let testo = testo_rimando(report, blocco);
         let results: Vec<ToolResultBlock> = pending
             .iter()
             .map(|p| {
@@ -1588,15 +1660,18 @@ impl ToolDispatchNode {
             STEP_GATE_REJECTIONS_EXTRA_KEY.to_string(),
             json!(prior_rejections + 1),
         );
-        StateDelta {
+        let mut delta = StateDelta {
             messages: Some(vec![tool_msg]),
             meta_steps: Some(tool_steps),
             pending_tool_uses: Some(Some(vec![])),
             stop_reason: Some(Some(StopReason::ToolUse)),
             extra: Some(extra),
             ..Default::default()
+        };
+        if blocco.ferma_il_run() {
+            chiudi_run_bloccato(&mut delta, blocco);
         }
-        .into_opaque()
+        delta.into_opaque()
     }
 
     /// (3) Risolve UNA volta per turno le soglie del pre-filtro dei pending.
@@ -2479,6 +2554,45 @@ fn riassunto_verdetto(v: &ports::ValidatorVerdict) -> String {
     }
 }
 
+/// Il run si CHIUDE dichiarando l'esito, invece di rifiutare l'ennesimo passo.
+///
+/// Non e' una difesa in piu': il passo critico non veniva eseguito nemmeno
+/// prima. E' la fine di un ciclo che non finiva — in autonomia il rimando era
+/// l'unica conseguenza possibile, e con essa il run poteva riproporre lo stesso
+/// passo finche' aveva budget (MISURATO: nove volte).
+///
+/// La forma della chiusura e' quella gia' usata dal meta-reasoner quando
+/// dichiara un blocco (`executor::DeclareBlocked`): esito normalizzato dal
+/// punto unico [`crate::decisions::tool_dispatch::normalize_declared_outcome`],
+/// `blocker` dal vocabolario ADR 0034, `EndTurn` — da li' l'edge post-dispatch
+/// instrada al final_gate, che e' la strada di chiusura ordinaria. Il `blocker`
+/// NON e' un letterale: lo dichiara [`GateBlock::blocker`], che a sua volta
+/// delega a `SuspensionOrigin::StepGate` — lo stesso run fermato dallo stesso
+/// gate non puo' avere due cause a seconda di quale strada l'ha chiuso.
+fn chiudi_run_bloccato(delta: &mut StateDelta, blocco: crate::decisions::step_gate::GateBlock) {
+    let summary = format!(
+        "Run fermato dal gate sui passi critici: {}. Nessun passo critico e' stato \
+         eseguito senza approvazione. Il dettaglio dei validatori — chi ha risposto, \
+         chi si e' astenuto e perche' — e' nei passi di validazione del run.",
+        blocco.motivo()
+    );
+    let outcome = crate::decisions::tool_dispatch::normalize_declared_outcome(&json!({
+        "outcome": "blocked",
+        "summary": summary,
+        "blocker": blocco.blocker(),
+    }))
+    .unwrap_or_else(|_| json!({"outcome": "blocked", "summary": summary}));
+    tracing::warn!(
+        target: "nexus_agent_graph::tool_dispatch",
+        blocco = blocco.as_str(),
+        blocker = blocco.blocker(),
+        "gate duale: il run si chiude BLOCCATO invece di rimandare ancora il passo"
+    );
+    delta.result = Some(Some(summary));
+    delta.declared_outcome = Some(Some(outcome));
+    delta.stop_reason = Some(Some(StopReason::EndTurn));
+}
+
 /// Un report senza convocati col degrado DICHIARATO (GAP-2: la matrice della
 /// doppia astensione decide, mai un salto silenzioso).
 fn report_degradato(motivo: &str) -> ports::StepValidationReport {
@@ -2492,13 +2606,13 @@ fn report_degradato(motivo: &str) -> ports::StepValidationReport {
 /// e le query di taratura: per ogni validatore provider, modello,
 /// verdetto|astensione+causa e costo — GAP-2, il denominatore resta visibile).
 fn payload_convocazione(
-    decision: &crate::decisions::step_gate::StepGateDecision,
+    esito: &EsitoGate,
     level: crate::decisions::step_gate::StepCriticality,
     steps_slim: Vec<Value>,
     report: &ports::StepValidationReport,
     prior_rejections: u32,
-    cap_raggiunto: bool,
 ) -> Value {
+    let blocco = esito.blocco();
     let validators_slim: Vec<Value> = report
         .verdicts
         .iter()
@@ -2516,13 +2630,22 @@ fn payload_convocazione(
         })
         .collect();
     json!({
-        "decision": decision,
+        "decision": esito.decision(),
         "level": level.as_str(),
         "steps": steps_slim,
         "validators": validators_slim,
         "degraded": report.degraded,
         "prior_rejections": prior_rejections,
-        "cap_reached": cap_raggiunto,
+        // La NATURA del blocco: `null` quando il batch passa. Le due domande
+        // restano distinte anche nel payload — «non ho bloccato» non e' «non
+        // l'ho classificato» (regola Q).
+        "block": blocco.map(crate::decisions::step_gate::GateBlock::as_str),
+        // Il run si e' fermato qui? E' il campo che rende misurabile in
+        // esercizio quello che il 09/08 si e' potuto solo dedurre dai nomi dei
+        // file prodotti. `cap_reached` resta col suo nome storico: le query di
+        // taratura gia' scritte lo leggono.
+        "cap_reached": blocco.map(crate::decisions::step_gate::GateBlock::ferma_il_run)
+            .unwrap_or(false),
     })
 }
 
@@ -2530,31 +2653,47 @@ fn payload_convocazione(
 /// espresso un verdetto, «rifiutato dai validatori» sarebbe falso e non
 /// aiuterebbe l'agente a cambiare strada. In autonomia questo testo e' tutto
 /// cio' che riceve per decidere cosa fare dopo.
-fn intestazione_rimando(report: &ports::StepValidationReport) -> String {
-    use crate::decisions::step_gate::StepVerdict;
-    let nessun_rifiuto = !report
-        .verdicts
-        .iter()
-        .any(|v| v.verdict == StepVerdict::Reject);
-    if nessun_rifiuto {
-        let perche = report
-            .degraded
-            .as_deref()
-            .unwrap_or("nessun validatore indipendente disponibile");
-        return format!(
-            "Il gate sui passi critici NON ha potuto autorizzare questo batch e \
-             nessun tool e' stato eseguito: {perche}. In modalita' autonoma non \
-             si chiede conferma all'utente, quindi il passo resta non eseguito."
-        );
-    }
-    "Il gate di validazione sui passi critici ha RIFIUTATO questo batch: \
-     nessun tool e' stato eseguito."
-        .to_string()
+fn intestazione_rimando(
+    report: &ports::StepValidationReport,
+    blocco: crate::decisions::step_gate::GateBlock,
+) -> String {
+    use crate::decisions::step_gate::GateBlock;
+    // La causa viene dal CAMPO, non da un secondo esame dei verdetti (regola Q,
+    // punto 3): prima questa funzione riguardava il report per decidere se
+    // c'era stato un rifiuto, cioe' rifaceva a valle la classificazione che il
+    // gate aveva gia' fatto — e la sua conclusione poteva divergere da quella
+    // su cui il nodo aveva appena deciso il destino del run.
+    let coda = match blocco {
+        GateBlock::StepRejected => String::new(),
+        GateBlock::NotJudgeable => format!(
+            " NON e' un giudizio su questo passo: {}. Riscriverlo in un altro file o \
+             con un altro nome NON cambia l'esito — o trovi una strada che non \
+             richieda un passo critico, oppure dichiara `blocked` con blocker \
+             `safety`.",
+            report.degraded.as_deref().unwrap_or(blocco.motivo())
+        ),
+        GateBlock::RetriesExhausted => format!(
+            " Inoltre {}: il run si chiude qui.",
+            blocco.motivo()
+        ),
+    };
+    let apertura = if blocco == GateBlock::StepRejected {
+        "Il gate di validazione sui passi critici ha RIFIUTATO questo batch: nessun \
+         tool e' stato eseguito."
+    } else {
+        "Il gate sui passi critici NON ha potuto autorizzare questo batch e nessun \
+         tool e' stato eseguito. In modalita' autonoma non si chiede conferma \
+         all'utente, quindi il passo resta non eseguito."
+    };
+    format!("{apertura}{coda}")
 }
 
 /// Il testo del rimando del gate duale, composto DAI campi del report (regola
 /// Q, punto 3: renderer struttura->prosa; il consumatore e' il modello).
-fn testo_rimando(report: &ports::StepValidationReport) -> String {
+fn testo_rimando(
+    report: &ports::StepValidationReport,
+    blocco: crate::decisions::step_gate::GateBlock,
+) -> String {
     use crate::decisions::step_gate::StepVerdict;
     let mut motivi: Vec<String> = Vec::new();
     for v in report.verdicts.iter().filter(|v| v.verdict == StepVerdict::Reject) {
@@ -2569,7 +2708,7 @@ fn testo_rimando(report: &ports::StepValidationReport) -> String {
     }
     let mut testo = format!(
         "{}\nMotivi:\n{}",
-        intestazione_rimando(report),
+        intestazione_rimando(report, blocco),
         if motivi.is_empty() {
             "- (nessun verdetto espresso dai validatori)".to_string()
         } else {
@@ -2587,10 +2726,24 @@ fn testo_rimando(report: &ports::StepValidationReport) -> String {
     {
         testo.push_str(&format!("\nAlternativa piu' sicura proposta: {a}"));
     }
-    testo.push_str(
-        "\nRivedi il passo: proponi una variante piu' sicura o motiva nel piano \
-         perche' il passo e' necessario cosi'.",
-    );
+    // Cosa FARE ora dipende dalla natura del blocco, ed e' la meta' che
+    // mancava: «rivedi il passo» davanti a un quorum mancante manda l'agente a
+    // correggere qualcosa che nessuno gli ha contestato — che e' precisamente
+    // il giro dei nove script.
+    use crate::decisions::step_gate::GateBlock;
+    testo.push_str(match blocco {
+        GateBlock::StepRejected => {
+            "\nRivedi il passo: proponi una variante piu' sicura o motiva nel piano \
+             perche' il passo e' necessario cosi'."
+        }
+        GateBlock::NotJudgeable => {
+            "\nNON riproporre lo stesso passo: cerca una strada che non richieda un \
+             passo critico, oppure chiudi dichiarando `blocked`."
+        }
+        GateBlock::RetriesExhausted => {
+            "\nNessun altro tentativo verra' valutato in questo run."
+        }
+    });
     testo
 }
 
@@ -4927,6 +5080,184 @@ mod tests {
             "run_command",
             json!({"command": "rm -rf /srv/dati"}),
         )])
+    }
+
+    /// I nomi dei file che il run ha prodotto la sera del 09/08/2026, uno per
+    /// ogni rimando: sono il reperto, e il test li usa perche' il ciclo che
+    /// riproduce sia lo stesso e non una sua parafrasi.
+    const SCRIPT_DEL_09_08: &[&str] = &[
+        "apply_fixes.js",
+        "final_fix.js",
+        "complete_fix.js",
+        "batch_fix.js",
+        "final_batch_fix.js",
+    ];
+
+    /// IL CICLO MISURATO il 09/08/2026, prima serata di `enforce` (mig 0689).
+    ///
+    /// Un run di riparazione su un'app statica ha ripetuto NOVE volte la stessa
+    /// sequenza: scrive uno script di correzione (`write_file`: passa), prova a
+    /// eseguirlo (`run_command`: `unconfined` -> pavimento Critical -> il gate
+    /// convoca), il gate non autorizza, l'agente scrive un ALTRO script. I
+    /// fornitori NON mancavano: quel che mancava era una conseguenza diversa
+    /// dal rimando. In autonomia nessun umano sblocca, quindi il ciclo finiva
+    /// col budget, non con un esito.
+    ///
+    /// Cosa asserisce, in ordine di importanza:
+    ///  1. il fail-closed non si allenta MAI — il passo critico non gira in
+    ///     nessuno dei giri, nemmeno in quello che chiude il run;
+    ///  2. il ciclo TERMINA, e termina al secondo giro (tetto di default 2);
+    ///  3. termina DICHIARANDO: `declared_outcome` = blocked + blocker `safety`,
+    ///     cioe' l'esito che l'edge post-dispatch instrada al final_gate — non
+    ///     un run che si spegne per esaurimento del budget;
+    ///  4. il primo rimando dice all'agente che NON e' colpa del suo passo, che
+    ///     e' la sola informazione capace di evitargli il sesto script.
+    ///
+    /// STRADA DELLA PRODUZIONE (regola O): config `cfg_gate_0688` = quella
+    /// deployata; pending costruiti da `pending_dal_gateway`, cioe' dal
+    /// produttore vero (`tool_uses_da_risposta`); classificazione, convocazione
+    /// e conseguenza attraversate da `ToolDispatchNode::run`. Lo stato di un
+    /// giro e' quello PRODOTTO dal giro precedente (`apply`), come nel grafo:
+    /// e' cosi' che il contatore dei rimandi arriva al secondo giro, e un test
+    /// che glielo scrivesse a mano fisserebbe l'assunto da verificare.
+    ///
+    /// MUTAZIONI, tutte col difetto reale:
+    ///  - `GateBlock::ferma_il_run` -> sempre `false` (cioe' il comportamento
+    ///    del 09/08: ogni blocco e' un rimando): il ciclo arriva in fondo ai
+    ///    cinque script senza chiudere, e l'ultima assert cade dicendo quanti
+    ///    ne ha scritti;
+    ///  - rimettere il cap sui soli `Rejected` (difetto #19): qui i verdetti
+    ///    sono due astensioni, il cap non si calcola mai e il ciclo non finisce;
+    ///  - far degradare il cap a `NeedsHuman` invece di fermare: in autonomia
+    ///    `NeedsHuman` torna a essere lo stesso rimando, e il ciclo non finisce.
+    #[tokio::test]
+    async fn senza_verdetti_il_run_si_chiude_invece_di_riscrivere_lo_script() {
+        use crate::decisions::step_gate::StepVerdict;
+        // LA FORMA DEL REPORT DELL'INCIDENTE, ricostruita dal testo che il run
+        // ha prodotto: «...nessun tool e' stato eseguito: nessun validatore
+        // indipendente disponibile». Quella coda e' il DEFAULT di
+        // `report.degraded`, quindi il degrado era `None` — cioe' la selezione
+        // DUE provider distinti li aveva trovati (unico ramo di
+        // `seleziona_convocati` che non dichiara un degrado) — e nessun
+        // verdetto era un `Reject`. Su un Critical la doppia astensione
+        // PROCEDE dichiarandolo (`UnavailableDeclared`), quindi la sola
+        // combinazione che blocca e' un approve accanto a un'astensione: un
+        // giudice ha risposto, l'altro no.
+        let mut ch = verdetto("challenger", StepVerdict::Abstained);
+        ch.abstain_cause = Some("billing".into());
+        ch.reasons.clear();
+        ch.safer_alternative = None;
+        let mut gk = verdetto("gatekeeper", StepVerdict::Approve);
+        gk.reasons.clear();
+        gk.safer_alternative = None;
+        let gate = Arc::new(StubStepGate {
+            report: ports::StepValidationReport {
+                verdicts: vec![gk, ch],
+                degraded: None,
+            },
+            chiamate: std::sync::Mutex::new(0),
+        });
+        let tools = Arc::new(MapToolExecutor::new());
+        let (n, _steps, _rc) = node(cfg_gate_0688(), tools.clone());
+        let ctx = ctx_con_gate(gate.clone());
+
+        let mut st = state_with_pending(Vec::new());
+        let mut chiuso_al_giro: Option<usize> = None;
+        let mut primo_rimando = String::new();
+        for (i, script) in SCRIPT_DEL_09_08.iter().enumerate() {
+            st.pending_tool_uses = Some(pending_dal_gateway(&[(
+                "run_command",
+                json!({ "command": format!("node {script}") }),
+            )]));
+            let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+            assert!(
+                tools.seen.lock().unwrap().is_empty(),
+                "giro {}: il passo critico non deve girare in nessun caso",
+                i + 1
+            );
+            assert_ne!(
+                out.awaiting_confirmation,
+                Some(true),
+                "giro {}: in autonomia non si chiede conferma a nessuno (regola D)",
+                i + 1
+            );
+            if i == 0 {
+                let blocks = blocks_of(out.messages.last().expect("msg"));
+                primo_rimando = blocks[0]["content"].as_str().unwrap_or_default().to_string();
+            }
+            if out.declared_outcome.is_some() {
+                chiuso_al_giro = Some(i + 1);
+                let dichiarato = out.declared_outcome.clone().expect("esito dichiarato");
+                assert_eq!(dichiarato["outcome"], "blocked");
+                assert_eq!(
+                    dichiarato["blocker"], "safety",
+                    "il blocker e' quello del gate, non un letterale scritto qui"
+                );
+                assert_eq!(
+                    out.stop_reason,
+                    Some(StopReason::EndTurn),
+                    "il turno chiude: l'edge post-dispatch porta al final_gate"
+                );
+                break;
+            }
+            st = out;
+        }
+
+        assert_eq!(
+            chiuso_al_giro,
+            Some(2),
+            "il gate deve chiudere il run al tetto dei rimandi: senza, l'agente \
+             continua a riscrivere lo stesso script ({} nomi diversi il 09/08) \
+             finche' il budget regge",
+            SCRIPT_DEL_09_08.len()
+        );
+        assert!(
+            primo_rimando.contains("NON e' un giudizio su questo passo")
+                && primo_rimando.contains("NON riproporre lo stesso passo"),
+            "il primo rimando deve dire che la causa non e' il passo, altrimenti \
+             l'agente corregge cio' che nessuno gli ha contestato: {primo_rimando}"
+        );
+    }
+
+    /// Il rovescio, e serve a impedire che il fix diventi un martello: un
+    /// RIFIUTO vero e' un giudizio su questo passo, e li' il rimando resta la
+    /// risposta giusta — il modello puo' proporre una variante. Mutazione: far
+    /// chiudere il run a ogni blocco -> il primo giro dichiara gia' un esito e
+    /// il rimando coi motivi sparisce.
+    #[tokio::test]
+    async fn un_rifiuto_vero_resta_un_rimando_al_primo_giro() {
+        use crate::decisions::step_gate::StepVerdict;
+        let gate = Arc::new(StubStepGate {
+            report: ports::StepValidationReport {
+                verdicts: vec![
+                    verdetto("gatekeeper", StepVerdict::Approve),
+                    verdetto("challenger", StepVerdict::Reject),
+                ],
+                degraded: None,
+            },
+            chiamate: std::sync::Mutex::new(0),
+        });
+        let tools = Arc::new(MapToolExecutor::new());
+        let (n, _steps, _rc) = node(cfg_gate_0688(), tools.clone());
+        let ctx = ctx_con_gate(gate);
+        let mut st = state_with_pending(Vec::new());
+        st.pending_tool_uses = Some(pending_dal_gateway(&[(
+            "run_command",
+            json!({"command": "dotnet ef database update"}),
+        )]));
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        assert!(
+            out.declared_outcome.is_none(),
+            "un rifiuto giudicato non chiude il run: il modello puo' cambiare strada"
+        );
+        assert_eq!(out.stop_reason, Some(StopReason::ToolUse), "si torna al modello");
+        let blocks = blocks_of(out.messages.last().expect("msg"));
+        let content = blocks[0]["content"].as_str().unwrap();
+        assert!(content.contains("RIFIUTATO") && content.contains("bersaglio fuori progetto"));
+        assert!(
+            content.contains("Rivedi il passo"),
+            "qui la strada c'e' ed e' rivedere il passo: {content}"
+        );
     }
 
     /// APPROVE unanime: i tool si eseguono (il gate non ferma il flusso).
