@@ -527,6 +527,7 @@ pub async fn resolve_purpose_provider_candidates_db(
         limit,
         min_providers,
         CandidateDiversity::PerProvider,
+        &[],
     )
     .await
 }
@@ -542,12 +543,26 @@ pub async fn resolve_purpose_provider_candidates_db(
 /// dieci modelli qualificati che openrouter offriva nello stesso tier. Un giudice
 /// solo ripetuto sei volte non e' meno indipendente di due giudici: e' l'assenza
 /// del quorum, con l'apparenza di averlo.
+///
+/// `exclude_providers` sono i fornitori che il chiamante NON puo' accettare (il
+/// veto «giudice != worker»), e vanno detti QUI perche' sono ELEGGIBILITA', non
+/// un filtro da applicare al risultato. La tier-chain si ferma al primo anello
+/// che soddisfa `min_providers`: se quell'anello contiene solo il fornitore
+/// vietato, la catena si e' fermata su un pool che il chiamante buttera' via, e
+/// i tier successivi — gia' autorizzati dalla catena — non vengono mai
+/// interrogati. MISURATO il 09/08/2026 sul gate duale: purpose `step_validator`
+/// (tier medium, capability `reasoning`), tre soli fornitori nel tier medium
+/// (anthropic, mistral, openai) di cui due in cooldown billing, esecutore
+/// mistral. La selezione tornava l'unico rimasto, mistral, il chiamante lo
+/// filtrava e dichiarava `unavailable_declared` — mentre deepseek, google e
+/// openrouter stavano un gradino sopra, sani e mai guardati.
 pub async fn resolve_purpose_provider_candidates_db_by(
     db: &PgPool,
     purpose: &str,
     limit: usize,
     min_providers: usize,
     diversity: CandidateDiversity,
+    exclude_providers: &[String],
 ) -> Result<Vec<PurposeProviderCandidate>, PurposeResolution> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -584,7 +599,10 @@ pub async fn resolve_purpose_provider_candidates_db_by(
         capability: rule.capability.as_deref(),
         min_context_window: 0,
         min_tier: Some(&floor),
-        exclude_providers: &[],
+        // Il veto del chiamante entra nell'ELEGGIBILITA' (vedi doc): cosi' la
+        // condizione di uscita dalla tier-chain conta i fornitori che il
+        // chiamante puo' davvero usare, non quelli che scartera'.
+        exclude_providers,
         pin: None,
         rank: if rule.requires_tool_use {
             Rank::CostFirst
@@ -1273,6 +1291,7 @@ mod tests {
             2,
             1,
             CandidateDiversity::PerProviderAndModel,
+            &[],
         )
         .await
         .expect("candidati");
@@ -1352,6 +1371,7 @@ mod tests {
             2,
             1,
             CandidateDiversity::PerProviderAndModel,
+            &[],
         )
         .await
         .expect("candidati");
