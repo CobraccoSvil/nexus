@@ -151,7 +151,7 @@ async fn interroga_radice(client: &reqwest::Client, porta: u16) -> RispostaRadic
     // Le due meta' del criterio: SUCCESSO e documento HTML. Il solo HTML
     // lascerebbe passare il `Cannot GET /` di Express (404, text/html) e le
     // pagine d'eccezione di sviluppo (500, text/html).
-    if dichiara_html(content_type.as_deref(), &inizio) {
+    if status.is_success() && dichiara_html(content_type.as_deref(), &inizio) {
         RispostaRadice::Pagina {
             status: status.as_u16(),
         }
