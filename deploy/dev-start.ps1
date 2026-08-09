@@ -25,8 +25,10 @@ $PIDFILE = Join-Path $RUNTIME 'nexus-dev.pids.json'
 
 # Lettura dei manifest: punto unico condiviso con dev-service.ps1/nexus-publish.ps1.
 . (Join-Path $PSScriptRoot 'lib\nexus-manifest.ps1')
-# «Questo processo registrato e' vivo?»: punto unico condiviso con dev-stop.ps1.
-. (Join-Path $PSScriptRoot 'lib\nexus-liveness.ps1')
+# FORMA del pidfile (campi, lettura, scrittura, completamento) piu' il criterio
+# «questo processo registrato e' vivo?» che si porta dietro: punto unico
+# condiviso con dev-stop.ps1 e dev-service.ps1.
+. (Join-Path $PSScriptRoot 'lib\nexus-pidfile.ps1')
 
 # Ordine di avvio: infra dati -> mcp-core (attende 5s) -> altri Rust -> web-ide.
 $order = @(
@@ -65,27 +67,17 @@ if (Test-Path $PIDFILE) {
     Write-Warning "${PIDFILE} illeggibile ($($_.Exception.Message)): non posso sapere cosa c'e' in giro. Esegui .\deploy\dev-stop.ps1 e rilancia. Interrompo."
     return
   }
-  # I pidfile scritti prima di questo criterio non portano ne' `start` ne' `exe`,
-  # e senza almeno una prova ogni pid resterebbe «non interrogabile» — cioe' lo
-  # stack bloccato come prima, che e' proprio il difetto da chiudere. L'exe
-  # atteso pero' lo sappiamo comunque: e' quello che il manifest dichiara per
-  # quell'id, e il manifest si legge dal suo punto unico.
-  $voci = @($voci | ForEach-Object {
-      $v = $_
-      if ($v.PSObject.Properties['exe'] -and $v.exe) { return $v }
-      $xml = Join-Path $WINSW "$($v.id)\$($v.id).xml"
-      $atteso = $null
-      if (Test-Path $xml) {
-        try { $atteso = [IO.Path]::GetFileNameWithoutExtension((Read-NexusServiceManifest -Path $xml).Executable) }
-        catch { $atteso = $null }
-      }
-      [pscustomobject]@{
-        id    = $v.id
-        pid   = $v.pid
-        start = (& { if ($v.PSObject.Properties['start']) { $v.start } else { $null } })
-        exe   = $atteso
-      }
-    })
+  # I pidfile scritti prima del contratto non portano ne' `start` ne' `exe`, e
+  # senza almeno una prova ogni pid resterebbe «non interrogabile» — cioe' lo
+  # stack bloccato, che e' proprio il difetto da chiudere. Il completamento dal
+  # manifest sta nel punto unico perche' dev-stop.ps1 ne ha lo STESSO bisogno:
+  # finche' e' vissuto solo qui, la stessa lettura dava «tutti morti, procedo» a
+  # dev-start e «nove pid non accertabili» a dev-stop, sullo stesso file.
+  $voci = Resolve-NexusPidEntries -Voci $voci -WinswRoot $WINSW
+  $antecedenti = @($voci | Where-Object { $_.Antecedente })
+  if ($antecedenti.Count -gt 0) {
+    Write-Host "Pidfile senza prove d'identita' per $($antecedenti.Count) voce/i (file antecedente al contratto): completate dai manifest WinSW." -ForegroundColor DarkGray
+  }
   $stato = Get-NexusStackLiveness -Voci $voci
   $vivi = @($stato | Where-Object { $_.Vivo })
   $ignoti = @($stato | Where-Object { -not $_.Vivo -and -not $_.AutorizzaDichiararloMorto })
@@ -183,21 +175,11 @@ foreach ($id in $order) {
       else { Set-Item -Path "env:$k" -Value $saved[$k] }
     }
 
-    # `start` (epoch unix dell'avvio REALE, letto dal SO) e' il discriminante
-    # d'identita' del pid: senza, alla lettura successiva non c'e' modo di dire
-    # se quel numero e' ancora questo processo o un estraneo che ne ha ereditato
-    # il pid. Si legge qui, dove il processo e' appena nato e certamente il
-    # nostro. Se il SO non lo dichiara resta assente, e chi legge lo trattera'
-    # per quello che e': non accertabile, mai «vivo» d'ufficio.
-    $started += [pscustomobject]@{
-      id    = $id
-      pid   = $proc.Id
-      start = (Get-NexusProcessStartUnix -ProcessId $proc.Id)
-      # Il nome si MISURA sul processo nato, non si deduce dal manifest: se
-      # l'eseguibile lanciato non fosse quello dichiarato, un `exe` copiato dal
-      # manifest confermerebbe per sempre un'identita' mai verificata.
-      exe   = $proc.ProcessName
-    }
+    # Le prove d'identita' (`start`, epoch unix dell'avvio REALE, ed `exe`) le
+    # misura il costruttore unico, QUI, dove il processo e' appena nato e
+    # certamente il nostro. Registrare un pid e annotarne le prove sono la stessa
+    # azione: separarle e' cio' che ha prodotto un pidfile di soli pid.
+    $started += New-NexusPidEntry -Id $id -ProcessId $proc.Id
     Write-Host ("avviato {0,-16} pid {1}" -f $id, $proc.Id) -ForegroundColor Green
 
     if ($id -eq 'nexus-mcp-core') { Start-Sleep -Seconds 5 } else { Start-Sleep -Milliseconds 600 }
@@ -207,13 +189,9 @@ foreach ($id in $order) {
   }
 }
 
-# Serializza SEMPRE come array JSON: in PS 5.1 `$started | ConvertTo-Json` con 1 solo
-# elemento produce un OGGETTO singolo, non un array -> dev-stop iterava male e lasciava
-# orfani. Forziamo le parentesi quadre se ConvertTo-Json le ha omesse.
-$json = $started | ConvertTo-Json -Depth 3
-if ($json -and $json -notmatch '^\s*\[') { $json = "[`n$json`n]" }
-if (-not $json) { $json = '[]' }
-Set-Content -Path $PIDFILE -Value $json -Encoding utf8
+# La serializzazione (array JSON anche con un solo elemento, campi canonici) sta
+# nel punto unico: era ricopiata qui e in dev-service.ps1, e la copia divergeva.
+Write-NexusPidFile -Path $PIDFILE -Voci $started
 Write-Host ''
 if ($started.Count -lt $order.Count) {
   Write-Warning "Avviati $($started.Count)/$($order.Count) processi: alcuni servizi non sono partiti (vedi warning sopra e i log in $LOGDIR)."

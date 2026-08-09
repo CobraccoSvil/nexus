@@ -141,8 +141,13 @@ pre-commit:
     liveness_selftest:
       glob:
         - "deploy/lib/nexus-liveness.ps1"
+        # La FORMA del pidfile e' nello stesso self-test: il criterio vale quanto
+        # le prove che il registro gli porta, e il 09/08/2026 erano state
+        # cancellate da un secondo scrittore mentre il criterio restava giusto.
+        - "deploy/lib/nexus-pidfile.ps1"
         - "deploy/dev-start.ps1"
         - "deploy/dev-stop.ps1"
+        - "deploy/dev-service.ps1"
         - "scripts/liveness-selftest.ps1"
       # Una riga sola: lefthook passa il `run` a `sh -c` e un blocco if/then/fi
       # su piu' righe arriva troncato (`syntax error: unexpected end of file`),

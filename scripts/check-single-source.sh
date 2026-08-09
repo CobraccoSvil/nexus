@@ -2559,6 +2559,56 @@ else
   echo "OK vita-processo: la guardia dello stack interroga il SO"
 fi
 
+# forma-pidfile — «chi scrive il registro dei pid, e con quali campi?»
+#
+# Il criterio di vitalita' e' esatto ma vale quanto le PROVE che il registro gli
+# porta, e quelle prove le annota chi scrive. Il 09/08/2026 dev-service.ps1
+# leggeva il pidfile in una hashtable `id -> pid` e lo riscriveva da quella: una
+# sola azione su un solo servizio spogliava tutte e nove le voci, nessun pid era
+# piu' identificabile, dev-stop.ps1 usciva 1 e il deploy si fermava con gli
+# eseguibili lockati. Il criterio non poteva accorgersene: si comportava bene.
+#
+# Due regressioni possibili, entrambe silenziose. (1) Un secondo posto che
+# serializza il pidfile: divergera' dal primo come divergeva Write-PidMap.
+# (2) Un consumatore che smette di delegare — costruisce una voce a mano
+# (perdendo l'annotazione delle prove) o giudica un file senza completarne le
+# prove mancanti (bloccando ogni pidfile antecedente).
+pidfile_scrittori="$(grep -rlnE '(Set-Content[^|]*\$PIDFILE|\$PIDFILE[^|]*ConvertTo-Json)' \
+  --include='*.ps1' deploy/ 2>/dev/null | grep -v 'deploy/lib/nexus-pidfile\.ps1' || true)"
+if [[ -n "$pidfile_scrittori" ]]; then
+  echo "!! forma-pidfile: il pidfile si serializza fuori dal punto unico:" >&2
+  printf '%s\n' "$pidfile_scrittori" >&2
+  echo "   Delegare a Write-NexusPidFile (deploy/lib/nexus-pidfile.ps1): la" >&2
+  echo "   proiezione sui campi canonici e' cio' che impedisce a una vista" >&2
+  echo "   ridotta di arrivare su disco." >&2
+  fail=1
+else
+  echo "OK forma-pidfile: un solo scrittore del registro dei pid"
+fi
+pidfile_muti=""
+# chi SCRIVE deve costruire le voci dal costruttore che misura le prove;
+# chi GIUDICA deve prima completare le prove mancanti dai manifest.
+for coppia in "deploy/dev-start.ps1:New-NexusPidEntry" \
+              "deploy/dev-start.ps1:Resolve-NexusPidEntries" \
+              "deploy/dev-stop.ps1:Resolve-NexusPidEntries" \
+              "deploy/dev-service.ps1:New-NexusPidEntry" \
+              "deploy/dev-service.ps1:Resolve-NexusPidEntries"; do
+  file="${coppia%%:*}"; atteso="${coppia##*:}"
+  if [[ -f "$file" ]] && ! grep -q "$atteso" "$file"; then
+    pidfile_muti+="  $file non chiama $atteso"$'\n'
+  fi
+done
+if [[ -n "$pidfile_muti" ]]; then
+  echo "!! forma-pidfile: un consumatore non delega piu' al punto unico:" >&2
+  printf '%s' "$pidfile_muti" >&2
+  echo "   Senza New-NexusPidEntry le prove d'identita' non vengono annotate;" >&2
+  echo "   senza Resolve-NexusPidEntries un pidfile antecedente resta per sempre" >&2
+  echo "   'non interrogabile' e lo stack non si dichiara mai fermo." >&2
+  fail=1
+else
+  echo "OK forma-pidfile: scrittori e giudici del pidfile delegano al punto unico"
+fi
+
 # premesse-dei-gate — «il gate ha bocciato il codice, o non e' mai partito?»
 #
 # Due regressioni possibili, entrambe silenziose. (1) Un secondo posto in cui un

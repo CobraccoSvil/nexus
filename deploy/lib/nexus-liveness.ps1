@@ -1,4 +1,4 @@
-# Punto unico (regola L) PowerShell della domanda «questo processo REGISTRATO e'
+﻿# Punto unico (regola L) PowerShell della domanda «questo processo REGISTRATO e'
 # ancora vivo?». Dot-source da dev-start.ps1 / dev-stop.ps1 / nexus-process.ps1:
 #   . (Join-Path $PSScriptRoot 'lib\nexus-liveness.ps1')
 #
@@ -154,54 +154,16 @@ function Get-NexusProcessLiveness {
     -NomeReale $nome -NomeAtteso $ExpectedName
 }
 
-# Legge il pidfile e ne restituisce SEMPRE le voci come array piatto.
+# IL PIDFILE NON STA QUI. La sua forma — quali campi porta una voce, chi li
+# annota, come si serializza e come si rilegge — e' lib\nexus-pidfile.ps1, che
+# dot-sourcia questo file e vi aggiunge Get-NexusStackLiveness (il criterio
+# applicato a un intero registro) e Read-NexusPidFile (la lettura).
 #
-# Esiste perche' PS 5.1 ha due trappole opposte su questo file, e ognuna e' gia'
-# costata orfani:
-#
-#  - in SCRITTURA `$x | ConvertTo-Json` con UN solo elemento produce un oggetto,
-#    non un array (dev-start.ps1 lo compensa forzando le parentesi quadre);
-#  - in LETTURA `@(Get-Content ... | ConvertFrom-Json)` NON enumera l'array: lo
-#    incapsula, e si ottiene UN elemento che contiene i nove. `$v.pid` diventa
-#    allora un `Object[]` e ogni conversione a valle fallisce. Misurato sul
-#    pidfile vero: nove voci lette come una.
-#
-# La differenza fra le due forme e' invisibile a rileggere il codice, quindi la
-# lettura si fa in UN posto: l'assegnazione a variabile PRIMA di `@()` e' cio'
-# che enumera davvero.
-function Read-NexusPidFile {
-  param([Parameter(Mandatory = $true)][string]$Path)
-  if (-not (Test-Path $Path)) { return , @() }
-  $raw = Get-Content $Path -Raw
-  if (-not $raw -or -not $raw.Trim()) { return , @() }
-  $dati = $raw | ConvertFrom-Json
-  return , @($dati)
-}
-
-# Verdetto per ogni voce di un pidfile, con la voce di origine accanto.
-# `$Voci` sono gli oggetti deserializzati dal JSON: `{ id, pid, start, exe }`. I
-# campi `start` ed `exe` mancano nei pidfile scritti prima di questo criterio, ed
-# e' il motivo per cui l'assenza delle prove e' un caso previsto e non un errore.
-function Get-NexusStackLiveness {
-  param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Voci)
-  $campo = { param($v, $nome) if ($v.PSObject.Properties[$nome] -and $v.$nome) { $v.$nome } else { $null } }
-  $out = @()
-  foreach ($v in $Voci) {
-    if (-not $v.pid) { continue }
-    $rawStart = & $campo $v 'start'
-    $atteso = if ($null -ne $rawStart) { [int64]$rawStart } else { $null }
-    $exe = & $campo $v 'exe'
-    $verdetto = Get-NexusProcessLiveness -ProcessId ([int]$v.pid) -ExpectedStartUnix $atteso `
-      -ExpectedName ([string]$exe)
-    $out += [pscustomobject]@{
-      Id                        = [string]$v.id
-      ProcessId                 = [int]$v.pid
-      Stato                     = $verdetto.Stato
-      Causa                     = $verdetto.Causa
-      Dettaglio                 = $verdetto.Dettaglio
-      Vivo                      = $verdetto.Vivo
-      AutorizzaDichiararloMorto = $verdetto.AutorizzaDichiararloMorto
-    }
-  }
-  return , $out
-}
+# La separazione e' voluta e non e' estetica: questo modulo e' il gemello di
+# crates/mcp-core/src/process_liveness.rs, e per restare gemello non deve
+# conoscere un formato che esiste solo negli script di deploy: il gemello Rust
+# non ha nessun pidfile a cui corrispondere. Di la' invece stanno accanto TUTTI
+# i punti che conoscono i nomi dei campi: chi li scrive, chi li legge e chi li
+# traduce nei termini di questo criterio. Con la traduzione da una parte e la
+# scrittura dall'altra, una rinomina spegnerebbe il discriminante senza far
+# fallire nulla.
