@@ -43,6 +43,20 @@
 //! rotta comunque, e chi la guarda non vede di chi sia la colpa): producono
 //! RILIEVI diversi, perche' la correzione e' diversa.
 //!
+//! UN CASO CHE QUESTO MODULO NON DISTINGUE, e lo dice invece di indovinare: una
+//! richiesta che il BROWSER ha annullato (`net::ERR_ABORTED` — succede a un
+//! `<video>` il cui preload viene cancellato, o a una risorsa ancora in volo
+//! quando la pagina viene chiusa) qui conta come non arrivata, mentre in verita'
+//! il suo esito non si sa. Escluderla sarebbe corretto in linea di principio e
+//! NON e' stato fatto: sui fatti raccolti finora quel codice non e' mai comparso
+//! — lo script attende `networkidle` prima di misurare e chiude dopo, quindi le
+//! richieste tagliate dalla chiusura non arrivano nemmeno al payload — e scrivere
+//! il ramo prima di averlo visto significherebbe fissare un'ipotesi sulla forma
+//! del dato invece di misurarla, che e' il modo in cui nascono le euristiche
+//! inerti. Se un giorno un rilievo nominera' `net::ERR_ABORTED`, il posto dove
+//! intervenire e' questo, e l'intervento e' toglierlo dal numeratore E dal
+//! denominatore: un esito ignoto non e' un fallimento, e nemmeno un successo.
+//!
 //! CONFINE (regola L): qui SOLO il criterio puro sui fatti gia' raccolti.
 //! L'I/O — aprire la pagina in Chromium e registrare le richieste — sta in
 //! `mcp-core` (`agent_tools::browser_probe`), ed e' la STESSA singola
@@ -381,20 +395,8 @@ pub fn classifica_risorse(
             motivo: "il browser non ha riportato le richieste della pagina".to_string(),
         };
     };
-    if !politica.e_utilizzabile() {
-        return VerdettoRisorse::NonOsservabile {
-            motivo: "politica delle risorse non configurata: nessun tipo governato \
-                     o soglia assente"
-                .to_string(),
-        };
-    }
-    // Il tipo lo dichiara il browser. Se NESSUNA risorsa lo porta, non e' che
-    // la pagina non ne abbia: e' che questa osservazione non lo sa dire, e un
-    // «nessuna risorsa governata» sarebbe una risposta inventata.
-    if !risorse.is_empty() && risorse.iter().all(|r| r.tipo.is_none()) {
-        return VerdettoRisorse::NonOsservabile {
-            motivo: "il browser non ha dichiarato il tipo di alcuna risorsa".to_string(),
-        };
+    if let Some(v) = non_misurabile(risorse, politica) {
+        return v;
     }
 
     let governate: Vec<&RisorsaOsservata> = risorse
@@ -405,18 +407,7 @@ pub fn classifica_risorse(
         return VerdettoRisorse::NessunaDichiarata;
     }
 
-    let mancanti: Vec<RisorsaMancante> = governate
-        .iter()
-        .filter(|r| richiesta_fallita(&r.richiesta))
-        .map(|r| RisorsaMancante {
-            url: r.richiesta.url.clone(),
-            tipo: r.tipo.clone(),
-            status: r.richiesta.status,
-            errore: r.richiesta.errore.clone(),
-            provenienza: provenienza(&r.richiesta.url, origine_pagina),
-        })
-        .collect();
-
+    let mancanti = mancanti_fra(&governate, origine_pagina);
     if mancanti.is_empty() {
         return VerdettoRisorse::TutteCaricate {
             osservate: governate.len(),
@@ -431,6 +422,52 @@ pub fn classifica_risorse(
         };
     }
     VerdettoRisorse::TipiCompromessi { tipi, mancanti }
+}
+
+/// I modi in cui la domanda NON ha risposta, raccolti in un posto solo perche'
+/// e' la meta' che si sbaglia per omissione: chi la rifa' per conto proprio ne
+/// dimentica uno, e quello diventa un verde. `None` = si puo' misurare.
+fn non_misurabile(
+    risorse: &[RisorsaOsservata],
+    politica: &PoliticaRisorse,
+) -> Option<VerdettoRisorse> {
+    if !politica.e_utilizzabile() {
+        return Some(VerdettoRisorse::NonOsservabile {
+            motivo: "politica delle risorse non configurata: nessun tipo governato \
+                     o soglia assente"
+                .to_string(),
+        });
+    }
+    // Il tipo lo dichiara il browser. Se NESSUNA risorsa lo porta, non e' che
+    // la pagina non ne abbia: e' che questa osservazione non lo sa dire, e un
+    // «nessuna risorsa governata» sarebbe una risposta inventata.
+    if !risorse.is_empty() && risorse.iter().all(|r| r.tipo.is_none()) {
+        return Some(VerdettoRisorse::NonOsservabile {
+            motivo: "il browser non ha dichiarato il tipo di alcuna risorsa".to_string(),
+        });
+    }
+    None
+}
+
+/// Le risorse governate che non sono arrivate, con la provenienza attribuita.
+///
+/// L'attribuzione avviene QUI e non nei fatti: la provenienza e' un giudizio
+/// (dipende da dove sta la pagina), e i fatti portano il solo URL.
+fn mancanti_fra(
+    governate: &[&RisorsaOsservata],
+    origine_pagina: Option<&str>,
+) -> Vec<RisorsaMancante> {
+    governate
+        .iter()
+        .filter(|r| richiesta_fallita(&r.richiesta))
+        .map(|r| RisorsaMancante {
+            url: r.richiesta.url.clone(),
+            tipo: r.tipo.clone(),
+            status: r.richiesta.status,
+            errore: r.richiesta.errore.clone(),
+            provenienza: provenienza(&r.richiesta.url, origine_pagina),
+        })
+        .collect()
 }
 
 /// I tipi che raggiungono la soglia, in ordine deterministico (per nome): due

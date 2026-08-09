@@ -103,8 +103,8 @@ BEGIN
 END $$;
 
 -- Guard: la soglia deve essere un numero interpretabile. Un valore che il
--- codice non sa leggere non e'' un errore visibile — degrada a "criterio muto",
--- cioe'' allo stesso silenzio di prima, e nessuno se ne accorgerebbe.
+-- codice non sa leggere non produce un errore visibile: degrada a "criterio
+-- muto", cioe' allo stesso silenzio di prima, e nessuno se ne accorgerebbe.
 DO $$
 DECLARE
   grezzo TEXT;
