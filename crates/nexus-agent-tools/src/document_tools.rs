@@ -9,6 +9,8 @@ use quick_xml::Reader;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use nexus_types::tool_outcome::{NaturaFallimento, RispostaTool};
+
 use super::attachment_inspector::load_attachment;
 use super::ToolContextCore;
 
@@ -53,41 +55,84 @@ pub async fn extract_docx_text_inline(file_path: &std::path::Path) -> Result<Str
     Ok(text)
 }
 
+// MIGRATI al contratto d'ingresso e a `RispostaTool` (regola Q).
+//
+// I tre handler avevano la STESSA struttura ripetuta tre volte — leggi l'id,
+// carica il record, leggi i byte, estrai in `spawn_blocking` — e con essa gli
+// stessi quattro rami d'errore. Ora la sequenza vive in `documento_da_allegato`
+// e `esito_estrazione`: un ramo in meno da dimenticare, e la natura dichiarata
+// in un posto solo invece che in dodici.
+
+/// Carica i byte dell'allegato: lookup del record + lettura del file.
+///
+/// Punto unico dei due rami che i tre tool ripetevano identici. Le due nature
+/// sono DIVERSE e per questo la funzione le distingue invece di darne una sola:
+/// un allegato che non risulta nel progetto e' un id sbagliato — RIMEDIABILE, e
+/// `nexus_list_attachments` dice quali esistono; un file che il DB dichiara ma
+/// il filesystem non consegna e' un guasto dello storage, che nessuna
+/// riformulazione della chiamata aggira.
+async fn documento_da_allegato(
+    ctx: &ToolContextCore,
+    attachment_id: Uuid,
+) -> Result<Vec<u8>, RispostaTool> {
+    let record = load_attachment(&ctx.db, attachment_id, ctx.project_id)
+        .await
+        .map_err(|e| crate::errore_tool(e, NaturaFallimento::Rimediabile))?;
+    tokio::fs::read(&record.file_path)
+        .await
+        .map_err(|e| crate::errore_tool(format!("read fallita: {e}"), NaturaFallimento::da_errore_io(&e)))
+}
+
+/// L'esito di un'estrazione eseguita in `spawn_blocking`.
+///
+/// I tre casi restano tre: il documento estratto, l'estrattore che rifiuta il
+/// contenuto (RIMEDIABILE — un range di pagine invalido o un foglio inesistente
+/// sono parametri, e il messaggio dell'estrattore lo dice), e il task che non e'
+/// arrivato in fondo (DEL SISTEMA: non e' il documento a essere sbagliato).
+fn esito_estrazione(
+    result: Result<Result<Value, String>, tokio::task::JoinError>,
+) -> RispostaTool {
+    match result {
+        Ok(Ok(v)) => RispostaTool::riuscito(v.to_string()),
+        Ok(Err(e)) => crate::errore_tool(e, NaturaFallimento::Rimediabile),
+        Err(e) => crate::errore_tool(
+            format!("spawn_blocking fallita: {e}"),
+            NaturaFallimento::DelSistema,
+        ),
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // PDF
 // ──────────────────────────────────────────────────────────────────────────
 
 /// `nexus_extract_pdf_text(attachment_id, page_start?, page_end?)`.
-pub async fn tool_nexus_extract_pdf_text(ctx: &ToolContextCore, input: &Value) -> String {
-    let attachment_id = match input
-        .get("attachment_id")
-        .and_then(Value::as_str)
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        Some(id) => id,
-        None => return crate::errore_json("Parametro 'attachment_id' obbligatorio."),
-    };
-    let page_start = input.get("page_start").and_then(Value::as_u64);
-    let page_end = input.get("page_end").and_then(Value::as_u64);
+pub async fn tool_nexus_extract_pdf_text(ctx: &ToolContextCore, input: &Value) -> RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::NexusExtractPdfTextInput};
 
-    let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
-        Ok(r) => r,
-        Err(e) => return crate::errore_json(e),
+    let params = match NexusExtractPdfTextInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
+    let attachment_id = match uuid_allegato(&params.attachment_id) {
+        Ok(id) => id,
+        Err(risposta) => return risposta,
+    };
+    // I due estremi restano `u64` per l'estrattore: negativi non hanno senso e
+    // il `max(0)` li porta a zero, dove `saturating_sub(1)` li tratta gia' come
+    // "dall'inizio". Prima `as_u64` scartava in silenzio un valore negativo
+    // insieme al parametro, con lo stesso effetto ma senza dirlo.
+    let page_start = params.page_start.map(|v| v.max(0) as u64);
+    let page_end = params.page_end.map(|v| v.max(0) as u64);
 
-    let bytes = match tokio::fs::read(&record.file_path).await {
+    let bytes = match documento_da_allegato(ctx, attachment_id).await {
         Ok(b) => b,
-        Err(e) => return crate::errore_json(format!("read fallita: {e}")),
+        Err(risposta) => return risposta,
     };
 
-    let result =
-        tokio::task::spawn_blocking(move || extract_pdf(&bytes, page_start, page_end)).await;
-
-    match result {
-        Ok(Ok(v)) => v.to_string(),
-        Ok(Err(e)) => crate::errore_json(e),
-        Err(e) => crate::errore_json(format!("spawn_blocking fallita: {e}")),
-    }
+    esito_estrazione(
+        tokio::task::spawn_blocking(move || extract_pdf(&bytes, page_start, page_end)).await,
+    )
 }
 
 fn extract_pdf(
@@ -147,32 +192,41 @@ fn extract_pdf(
 // ──────────────────────────────────────────────────────────────────────────
 
 /// `nexus_extract_docx_text(attachment_id)`.
-pub async fn tool_nexus_extract_docx_text(ctx: &ToolContextCore, input: &Value) -> String {
-    let attachment_id = match input
-        .get("attachment_id")
-        .and_then(Value::as_str)
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        Some(id) => id,
-        None => return crate::errore_json("Parametro 'attachment_id' obbligatorio."),
+pub async fn tool_nexus_extract_docx_text(ctx: &ToolContextCore, input: &Value) -> RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::NexusExtractDocxTextInput};
+
+    let params = match NexusExtractDocxTextInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
+    };
+    let attachment_id = match uuid_allegato(&params.attachment_id) {
+        Ok(id) => id,
+        Err(risposta) => return risposta,
     };
 
-    let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
-        Ok(r) => r,
-        Err(e) => return crate::errore_json(e),
-    };
-
-    let bytes = match tokio::fs::read(&record.file_path).await {
+    let bytes = match documento_da_allegato(ctx, attachment_id).await {
         Ok(b) => b,
-        Err(e) => return crate::errore_json(format!("read fallita: {e}")),
+        Err(risposta) => return risposta,
     };
+    esito_estrazione(tokio::task::spawn_blocking(move || extract_docx(&bytes)).await)
+}
 
-    let result = tokio::task::spawn_blocking(move || extract_docx(&bytes)).await;
-    match result {
-        Ok(Ok(v)) => v.to_string(),
-        Ok(Err(e)) => crate::errore_json(e),
-        Err(e) => crate::errore_json(format!("spawn_blocking fallita: {e}")),
-    }
+/// L'uuid di un allegato, dal parametro che il contratto ha letto come stringa.
+///
+/// Il contratto pretende che il campo CI SIA e sia una stringa; che sia un uuid
+/// non lo puo' dire, e quel controllo resta qui. RIMEDIABILE, e il messaggio
+/// nomina il tool che restituisce gli id validi — prima diceva soltanto
+/// «obbligatorio», che davanti a un id malformato era anche falso: il parametro
+/// c'era, non era un uuid.
+fn uuid_allegato(grezzo: &str) -> Result<Uuid, RispostaTool> {
+    Uuid::parse_str(grezzo).map_err(|_| {
+        crate::errore_tool(
+            format!(
+                "attachment_id '{grezzo}' non e' un UUID valido.                  Usa nexus_list_attachments per gli id degli allegati di questa sessione."
+            ),
+            NaturaFallimento::Rimediabile,
+        )
+    })
 }
 
 fn extract_docx(bytes: &[u8]) -> Result<Value, String> {
@@ -237,35 +291,24 @@ fn extract_docx(bytes: &[u8]) -> Result<Value, String> {
 // ──────────────────────────────────────────────────────────────────────────
 
 /// `nexus_extract_xlsx_data(attachment_id, sheet_name?)`.
-pub async fn tool_nexus_extract_xlsx_data(ctx: &ToolContextCore, input: &Value) -> String {
-    let attachment_id = match input
-        .get("attachment_id")
-        .and_then(Value::as_str)
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        Some(id) => id,
-        None => return crate::errore_json("Parametro 'attachment_id' obbligatorio."),
-    };
-    let sheet_name = input
-        .get("sheet_name")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+pub async fn tool_nexus_extract_xlsx_data(ctx: &ToolContextCore, input: &Value) -> RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::NexusExtractXlsxDataInput};
 
-    let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
-        Ok(r) => r,
-        Err(e) => return crate::errore_json(e),
+    let params = match NexusExtractXlsxDataInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
+    let attachment_id = match uuid_allegato(&params.attachment_id) {
+        Ok(id) => id,
+        Err(risposta) => return risposta,
+    };
+    let sheet_name = params.sheet_name;
 
-    let bytes = match tokio::fs::read(&record.file_path).await {
+    let bytes = match documento_da_allegato(ctx, attachment_id).await {
         Ok(b) => b,
-        Err(e) => return crate::errore_json(format!("read fallita: {e}")),
+        Err(risposta) => return risposta,
     };
-    let result = tokio::task::spawn_blocking(move || extract_xlsx(&bytes, sheet_name)).await;
-    match result {
-        Ok(Ok(v)) => v.to_string(),
-        Ok(Err(e)) => crate::errore_json(e),
-        Err(e) => crate::errore_json(format!("spawn_blocking fallita: {e}")),
-    }
+    esito_estrazione(tokio::task::spawn_blocking(move || extract_xlsx(&bytes, sheet_name)).await)
 }
 
 fn extract_xlsx(bytes: &[u8], sheet_name: Option<String>) -> Result<Value, String> {

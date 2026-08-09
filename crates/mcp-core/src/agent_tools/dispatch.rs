@@ -103,6 +103,15 @@ async fn esegui_tool_migrato(
         "git_push" => Some(git::tool_git_push(ctx).await),
         "git_pull" => Some(git::tool_git_pull(ctx).await),
         "git_remote_add" => Some(git::tool_git_remote_add(ctx, input).await),
+        // `document_tools.rs`: i tre estrattori avevano la stessa sequenza
+        // ripetuta e con essa gli stessi quattro rami d'errore, tutti degradati
+        // a un'unica natura implicita. Ora l'allegato inesistente (id sbagliato,
+        // rimediabile) e il file che il DB dichiara ma lo storage non consegna
+        // (del sistema) sono due cose distinte, e il messaggio del primo nomina
+        // il tool che restituisce gli id validi.
+        "nexus_extract_pdf_text" => Some(document_tools::tool_nexus_extract_pdf_text(ctx, input).await),
+        "nexus_extract_docx_text" => Some(document_tools::tool_nexus_extract_docx_text(ctx, input).await),
+        "nexus_extract_xlsx_data" => Some(document_tools::tool_nexus_extract_xlsx_data(ctx, input).await),
         // Ogni suo fallimento e' RIMEDIABILE e lo dichiara nel campo `natura`:
         // e' il primo tool a farlo, ed e' quello su cui la mancanza si
         // misurava (11% di `old_string non trovato` seguiti da una ripetizione
@@ -277,9 +286,6 @@ async fn esegui_tool_legacy(
         "nexus_read_archive_entry" => {
             archive_tools::tool_nexus_read_archive_entry(ctx, input).await
         }
-        "nexus_extract_pdf_text" => document_tools::tool_nexus_extract_pdf_text(ctx, input).await,
-        "nexus_extract_docx_text" => document_tools::tool_nexus_extract_docx_text(ctx, input).await,
-        "nexus_extract_xlsx_data" => document_tools::tool_nexus_extract_xlsx_data(ctx, input).await,
         "nexus_extract_figma_structure" => {
             figma_tools::tool_nexus_extract_figma_structure(ctx, input).await
         }
