@@ -12,6 +12,7 @@
 //! avviare la dev experience. L'utente puo' poi sostituirli con `shadcn add`
 //! reale quando il setup npm e' stabile.
 
+use nexus_types::tool_outcome::{NaturaFallimento, RispostaTool};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tokio::fs;
@@ -22,134 +23,255 @@ use super::ToolContextCore;
 /// piccola: copre i componenti usati nel 95% delle dashboard tipiche
 /// (login, tabella, form, alert). Per componenti rari, l'utente puo'
 /// passare a `npx shadcn@latest add ...` manuale.
-fn stub_content(name: &str) -> Option<&'static str> {
-    match name {
-        "button" => Some(BUTTON_TSX),
-        "input" => Some(INPUT_TSX),
-        "label" => Some(LABEL_TSX),
-        "card" => Some(CARD_TSX),
-        "alert" => Some(ALERT_TSX),
-        "tabs" => Some(TABS_TSX),
-        "table" => Some(TABLE_TSX),
-        "badge" => Some(BADGE_TSX),
-        "separator" => Some(SEPARATOR_TSX),
-        "sonner" => Some(SONNER_TSX),
-        "dialog" => Some(DIALOG_TSX),
-        "dropdown-menu" => Some(DROPDOWN_TSX),
-        "select" => Some(SELECT_TSX),
-        "popover" => Some(POPOVER_TSX),
-        "textarea" => Some(TEXTAREA_TSX),
-        _ => None,
-    }
-}
-
-const SUPPORTED_LIST: &[&str] = &[
-    "button",
-    "input",
-    "label",
-    "card",
-    "alert",
-    "tabs",
-    "table",
-    "badge",
-    "separator",
-    "sonner",
-    "dialog",
-    "dropdown-menu",
-    "select",
-    "popover",
-    "textarea",
+///
+/// UNA sola lista (regola L): i nomi vivevano anche in una costante a parte,
+/// ricopiata a mano accanto al `match` che li riconosceva — due risposte alla
+/// stessa domanda («quale componente sappiamo scrivere?») che nessun
+/// compilatore teneva allineate. Il nome che il modello legge fra i supportati
+/// e quello che l'handler sa scrivere ora nascono dalla stessa riga.
+const STUB_DISPONIBILI: &[(&str, &str)] = &[
+    ("button", BUTTON_TSX),
+    ("input", INPUT_TSX),
+    ("label", LABEL_TSX),
+    ("card", CARD_TSX),
+    ("alert", ALERT_TSX),
+    ("tabs", TABS_TSX),
+    ("table", TABLE_TSX),
+    ("badge", BADGE_TSX),
+    ("separator", SEPARATOR_TSX),
+    ("sonner", SONNER_TSX),
+    ("dialog", DIALOG_TSX),
+    ("dropdown-menu", DROPDOWN_TSX),
+    ("select", SELECT_TSX),
+    ("popover", POPOVER_TSX),
+    ("textarea", TEXTAREA_TSX),
 ];
 
+/// Il set che la descrizione del tool promette quando `components` e' omesso.
+const SET_DI_BASE: &[&str] = &[
+    "button", "input", "label", "card", "alert", "tabs", "sonner",
+];
+
+/// Dove shadcn mette i componenti per convenzione.
+const TARGET_DIR_DEFAULT: &str = "src/components/ui";
+
+/// Il seguito che la risposta suggerisce dopo la creazione degli stub.
+const NEXT_STEP: &str = "import nei file applicativi: import { Button } from '@/components/ui/button' \
+     (o path relativo). Gli stub usano solo Tailwind classes base. Per UI ricca, \
+     sostituiscili con shadcn ufficiale quando npm install e' stabile.";
+
+fn stub_content(name: &str) -> Option<&'static str> {
+    STUB_DISPONIBILI
+        .iter()
+        .find(|(nome, _)| *nome == name)
+        .map(|(_, contenuto)| *contenuto)
+}
+
+/// I nomi supportati, nell'ordine in cui la risposta li elenca.
+fn nomi_supportati() -> Vec<&'static str> {
+    STUB_DISPONIBILI.iter().map(|(nome, _)| *nome).collect()
+}
+
+/// `nexus_install_shadcn_components(components?, target_dir?, overwrite?)`.
+/// MIGRATO al contratto d'ingresso e a [`RispostaTool`] (regola Q).
 pub async fn tool_nexus_install_shadcn_components(
     ctx: &ToolContextCore,
     input: &Value,
-) -> String {
-    // components: array opzionale; se vuoto, installa il set di base
-    let components: Vec<String> = match input.get("components") {
-        Some(Value::Array(arr)) => arr
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| s.trim().to_ascii_lowercase()))
-            .filter(|s| !s.is_empty())
-            .collect(),
-        _ => vec![
-            "button".into(),
-            "input".into(),
-            "label".into(),
-            "card".into(),
-            "alert".into(),
-            "tabs".into(),
-            "sonner".into(),
-        ],
+) -> RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::NexusInstallShadcnComponentsInput};
+
+    let params = match NexusInstallShadcnComponentsInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
-
-    // target_dir relativo al project root. Default: src/components/ui (convenzione shadcn).
-    // Per progetti con src/app/components/ui (figma export) passare explicit.
-    let target_rel = input
-        .get("target_dir")
-        .and_then(Value::as_str)
+    let components = match componenti_richiesti(params.components.as_deref()) {
+        Ok(c) => c,
+        Err(risposta) => return risposta,
+    };
+    // target_dir relativo al project root. Default: src/components/ui (convenzione
+    // shadcn). Per progetti con src/app/components/ui (figma export) passare explicit.
+    let target_rel = params
+        .target_dir
+        .as_deref()
         .map(|s| s.trim().trim_start_matches('/'))
-        .unwrap_or("src/components/ui");
-    // Punto unico (regola L): de-duplica la root se l'agente l'ha inclusa nel
-    // path e blocca il traversal ".." (normalize_into_root).
-    let project_root: &Path = &ctx.root_path;
-    let target_dir: PathBuf =
-        match nexus_types::workspace_paths::normalize_into_root(project_root, target_rel) {
-            Ok(clean) => project_root.join(&clean),
-            Err(e) => {
-                return crate::errore_json(format!("target_dir non valido: {}", e.message()))
-            }
-        };
-
+        .unwrap_or(TARGET_DIR_DEFAULT);
+    let target_dir = match risolvi_target(&ctx.root_path, target_rel) {
+        Ok(dir) => dir,
+        Err(risposta) => return risposta,
+    };
     if let Err(e) = fs::create_dir_all(&target_dir).await {
-        return crate::errore_json(format!(
-            "creazione directory '{}' fallita: {e}",
-            target_dir.display()
-        ));
+        // La natura non si sceglie a mano: la legge il `ErrorKind` (regola M),
+        // perche' il messaggio del sistema operativo e' localizzato e cambia fra
+        // Windows e Linux. Un permesso negato e' del sistema, un percorso
+        // inesistente lo corregge l'agente.
+        let natura = NaturaFallimento::da_errore_io(&e);
+        return crate::errore_tool(
+            format!("creazione directory '{}' fallita: {e}", target_dir.display()),
+            natura,
+        );
     }
 
-    let mut written: Vec<String> = Vec::new();
-    let mut skipped_existing: Vec<String> = Vec::new();
-    let mut unsupported: Vec<String> = Vec::new();
-    let overwrite = input
-        .get("overwrite")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let overwrite = params.overwrite.unwrap_or(false);
+    scrivi_stub(&target_dir, &components, overwrite)
+        .await
+        .risposta(target_rel)
+}
 
-    for name in &components {
+/// I componenti da creare: quelli chiesti (normalizzati) oppure il set di base.
+///
+/// Il vuoto ESPLICITO non e' il set di base. Chi scrive `components: []` — o una
+/// lista di soli nomi vuoti — sta chiedendo zero componenti, e prima riceveva un
+/// JSON di successo in cui non era stato fatto nulla: un nulla di fatto vestito
+/// da risultato. Rimediabile, e il messaggio dice come rimediare (omettere il
+/// campo, oppure nominare i componenti).
+fn componenti_richiesti(chiesti: Option<&[String]>) -> Result<Vec<String>, RispostaTool> {
+    let Some(chiesti) = chiesti else {
+        return Ok(SET_DI_BASE.iter().map(|s| (*s).to_string()).collect());
+    };
+    let normalizzati: Vec<String> = chiesti
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if normalizzati.is_empty() {
+        let messaggio = format!(
+            "'components' non nomina alcun componente. Ometti il campo per installare il set di \
+             base ({}), oppure elenca i nomi da creare fra: {}.",
+            SET_DI_BASE.join(", "),
+            nomi_supportati().join(", ")
+        );
+        return Err(crate::errore_tool(messaggio, NaturaFallimento::Rimediabile));
+    }
+    Ok(normalizzati)
+}
+
+/// Risolve `target_dir` dentro la root. Punto unico (regola L): de-duplica la
+/// root se l'agente l'ha inclusa nel path e blocca il traversal ".."
+/// (`normalize_into_root`).
+fn risolvi_target(root: &Path, target_rel: &str) -> Result<PathBuf, RispostaTool> {
+    match nexus_types::workspace_paths::normalize_into_root(root, target_rel) {
+        Ok(clean) => Ok(root.join(&clean)),
+        // Il percorso e' un parametro e il messaggio dice cosa non va: correggere
+        // `target_dir` e' cosa che l'agente puo' fare da solo.
+        Err(e) => Err(crate::errore_tool(
+            format!("target_dir '{target_rel}' non valido: {}", e.message()),
+            NaturaFallimento::Rimediabile,
+        )),
+    }
+}
+
+/// Cio' che il giro di scrittura ha prodotto, in campi distinti (regola Q).
+///
+/// «Componente che non conosciamo» e «scrittura fallita» finivano nella stessa
+/// lista `unsupported`, con un suffisso `(write_error)` appiccicato al nome: due
+/// cause opposte rese indistinguibili, e nessuna delle due dichiarata come
+/// fallimento.
+#[derive(Default)]
+struct EsitoInstallazione {
+    written: Vec<String>,
+    skipped_existing: Vec<String>,
+    unsupported: Vec<String>,
+    write_errors: Vec<String>,
+    /// La natura del PRIMO errore di scrittura, letta dal `ErrorKind` (regola M).
+    /// La prima basta: gli stub finiscono tutti nella stessa directory, quindi
+    /// cio' che fa fallire una scrittura fa fallire anche le altre.
+    natura_scrittura: Option<NaturaFallimento>,
+}
+
+impl EsitoInstallazione {
+    /// Registra una scrittura fallita.
+    ///
+    /// RAMO NUDO chiuso: prima finiva in un `tracing::warn!` piu' una voce in
+    /// `unsupported`, e il tool rispondeva un JSON senza alcuna dichiarazione
+    /// d'esito. Su un target in sola lettura il modello riceveva `written: []` e
+    /// nessun errore, cioe' un fallimento totale letto come successo.
+    fn registra_errore(&mut self, name: &str, file_path: &Path, e: &std::io::Error) {
+        tracing::warn!(
+            "nexus_install_shadcn_components: write {} fallita: {e}",
+            file_path.display()
+        );
+        self.write_errors.push(format!("{name}: {e}"));
+        if self.natura_scrittura.is_none() {
+            self.natura_scrittura = Some(NaturaFallimento::da_errore_io(e));
+        }
+    }
+
+    /// La risposta: corpo JSON composto DAI campi, natura dichiarata da chi
+    /// conosce la causa.
+    fn risposta(&self, target_rel: &str) -> RispostaTool {
+        let mut corpo = self.corpo(target_rel);
+        if let Some(natura) = self.natura_scrittura {
+            corpo["write_errors"] = Value::from(self.write_errors.clone());
+            corpo["error"] = Value::String(self.messaggio_scritture_fallite(target_rel));
+            return crate::errore_tool_con_dettagli(corpo, natura);
+        }
+        // Nessuno stub creato ne' gia' presente, e dei nomi non riconosciuti: la
+        // chiamata non ha prodotto nulla. Rimediabile, e il corpo porta gia'
+        // l'elenco dei supportati con cui l'agente corregge `components`.
+        let nulla_di_fatto = self.written.is_empty() && self.skipped_existing.is_empty();
+        if nulla_di_fatto && !self.unsupported.is_empty() {
+            corpo["error"] = Value::String(self.messaggio_nomi_ignoti());
+            return crate::errore_tool_con_dettagli(corpo, NaturaFallimento::Rimediabile);
+        }
+        // Uno stub gia' presente e saltato non e' un fallimento: il file c'e', ed
+        // e' cio' che era stato chiesto (criterio della directory vuota).
+        RispostaTool::riuscito(corpo.to_string())
+    }
+
+    fn corpo(&self, target_rel: &str) -> Value {
+        json!({
+            "target_dir": target_rel,
+            "written": self.written,
+            "skipped_existing": self.skipped_existing,
+            "unsupported": self.unsupported,
+            "supported_full_list": nomi_supportati(),
+            "next_step": NEXT_STEP,
+        })
+    }
+
+    fn messaggio_scritture_fallite(&self, target_rel: &str) -> String {
+        format!(
+            "scrittura di {} stub su {} fallita in '{target_rel}': {}. Controlla 'target_dir' e \
+             ripeti la chiamata con i soli componenti mancanti.",
+            self.write_errors.len(),
+            self.write_errors.len() + self.written.len(),
+            self.write_errors.join("; ")
+        )
+    }
+
+    fn messaggio_nomi_ignoti(&self) -> String {
+        format!(
+            "nessuno dei componenti richiesti e' fra quelli disponibili ({}). Passa in \
+             'components' uno o piu' di: {}.",
+            self.unsupported.join(", "),
+            nomi_supportati().join(", ")
+        )
+    }
+}
+
+/// Scrive gli stub richiesti nella directory gia' risolta e creata.
+async fn scrivi_stub(
+    target_dir: &Path,
+    components: &[String],
+    overwrite: bool,
+) -> EsitoInstallazione {
+    let mut esito = EsitoInstallazione::default();
+    for name in components {
         let Some(content) = stub_content(name) else {
-            unsupported.push(name.clone());
+            esito.unsupported.push(name.clone());
             continue;
         };
         let file_path = target_dir.join(format!("{name}.tsx"));
-        let exists = fs::metadata(&file_path).await.is_ok();
-        if exists && !overwrite {
-            skipped_existing.push(name.clone());
+        if fs::metadata(&file_path).await.is_ok() && !overwrite {
+            esito.skipped_existing.push(name.clone());
             continue;
         }
         match fs::write(&file_path, content).await {
-            Ok(()) => written.push(name.clone()),
-            Err(e) => {
-                tracing::warn!(
-                    "nexus_install_shadcn_components: write {} fallita: {e}",
-                    file_path.display()
-                );
-                unsupported.push(format!("{name} (write_error)"));
-            }
+            Ok(()) => esito.written.push(name.clone()),
+            Err(e) => esito.registra_errore(name, &file_path, &e),
         }
     }
-
-    json!({
-        "target_dir": target_rel,
-        "written": written,
-        "skipped_existing": skipped_existing,
-        "unsupported": unsupported,
-        "supported_full_list": SUPPORTED_LIST,
-        "next_step": "import nei file applicativi: import { Button } from '@/components/ui/button' \
-                       (o path relativo). Gli stub usano solo Tailwind classes base. Per UI ricca, \
-                       sostituiscili con shadcn ufficiale quando npm install e' stabile."
-    })
-    .to_string()
+    esito
 }
 
 // ── Stub TSX (Tailwind minimi, no @radix-ui, no cva) ────────────────────────

@@ -25,47 +25,78 @@
 use std::io::{Cursor, Read};
 
 use serde_json::{json, Value};
-use uuid::Uuid;
 
-use super::attachment_inspector::load_attachment;
+use super::attachment_inspector::{documento_da_allegato, uuid_allegato};
 use super::attachment_settings::{self, AttachmentLimits};
 use super::ToolContextCore;
+use nexus_types::tool_outcome::{NaturaFallimento, RispostaTool};
 use nexus_types::workspace_paths::resolve_workspace_target;
 
 /// Lunghezza minima di una stringa leggibile considerata "interessante"
 /// nel fallback `figma_binary_legacy`.
 const MIN_STRING_LEN: usize = 4;
 
+/// L'azione con cui l'agente rimedia quando l'allegato non e' un Figma
+/// leggibile dal tool di STRUTTURA.
+const HINT_STRUTTURA: &str = "Verifica l'id con nexus_list_attachments e il tipo reale del file con \
+     nexus_inspect_attachment: se non e' un Figma, quel tool indica \
+     l'estrattore giusto.";
+
+/// La stessa domanda per il tool di CODICE: li' esiste anche una seconda strada
+/// dentro lo stesso allegato (la specifica chat), e va nominata.
+const HINT_CODICE: &str = "Usa nexus_extract_figma_structure per leggere la specifica chat del \
+     .make, o nexus_inspect_attachment per il tipo reale dell'allegato.";
+
+/// Il fallimento di un'estrazione Figma: il payload dell'allegato non e' un
+/// Figma leggibile (non-ZIP senza struttura, archivio corrotto, `ai_chat.json`
+/// non parsabile).
+///
+/// RIMEDIABILE perche' l'agente puo' correggere la chiamata — cambiare allegato
+/// o passare a un altro estrattore — e perche' quella promessa sia mantenuta il
+/// corpo porta un `hint` che nomina il tool con cui farlo. Il messaggio grezzo
+/// resta in `error`: e' composto DAI campi, non riletto da nessuno.
+fn estrazione_rifiutata(errore: String, hint: &str) -> RispostaTool {
+    let corpo = json!({ "error": errore, "hint": hint });
+    crate::errore_tool_con_dettagli(corpo, NaturaFallimento::Rimediabile)
+}
+
 /// `nexus_extract_figma_structure(attachment_id)`.
 pub async fn tool_nexus_extract_figma_structure(
     ctx: &ToolContextCore,
     input: &Value,
-) -> String {
-    let attachment_id = match input
-        .get("attachment_id")
-        .and_then(Value::as_str)
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        Some(id) => id,
-        None => return crate::errore_json("Parametro 'attachment_id' obbligatorio."),
+) -> RispostaTool {
+    use crate::input_contract::InputTool;
+    use crate::tool_inputs::NexusExtractFigmaStructureInput;
+
+    let params = match NexusExtractFigmaStructureInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
+    };
+    // DIVERGENZA CHIUSA: un attachment_id PRESENTE ma non-UUID usciva come
+    // "Parametro 'attachment_id' obbligatorio", che era falso — il parametro
+    // c'era. `uuid_allegato` distingue i due casi e nomina il tool che
+    // restituisce gli id validi.
+    let attachment_id = match uuid_allegato(&params.attachment_id) {
+        Ok(id) => id,
+        Err(risposta) => return risposta,
     };
 
-    let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
-        Ok(r) => r,
-        Err(e) => return crate::errore_json(e),
+    let bytes = match documento_da_allegato(ctx, attachment_id).await {
+        Ok(b) => b,
+        Err(risposta) => return risposta,
     };
     let limits = attachment_settings::current(&ctx.db).await;
 
-    let bytes = match tokio::fs::read(&record.file_path).await {
-        Ok(b) => b,
-        Err(e) => return crate::errore_json(format!("read fallita: {e}")),
-    };
-
     let result = tokio::task::spawn_blocking(move || extract_figma(&bytes, limits)).await;
     match result {
-        Ok(Ok(v)) => v.to_string(),
-        Ok(Err(e)) => crate::errore_json(e),
-        Err(e) => crate::errore_json(format!("spawn_blocking fallita: {e}")),
+        Ok(Ok(v)) => RispostaTool::riuscito(v.to_string()),
+        Ok(Err(e)) => estrazione_rifiutata(e, HINT_STRUTTURA),
+        // Il task non e' arrivato in fondo: non e' l'allegato a essere
+        // sbagliato, e ripetere la stessa chiamata non cambia nulla.
+        Err(e) => crate::errore_tool(
+            format!("spawn_blocking fallita: {e}"),
+            NaturaFallimento::DelSistema,
+        ),
     }
 }
 
@@ -78,129 +109,205 @@ const DEFAULT_FIGMA_EXPORT_SUBDIR: &str = "figma_export";
 /// Estrae il code-snapshot finale dal .make e lo scrive su disco sotto la
 /// project_root (default `figma_export/`). Ritorna SOLO un manifest JSON con
 /// metadati: niente contenuto file, per non saturare il contesto del modello.
-pub async fn tool_nexus_extract_figma_code(ctx: &ToolContextCore, input: &Value) -> String {
+pub async fn tool_nexus_extract_figma_code(ctx: &ToolContextCore, input: &Value) -> RispostaTool {
+    use crate::input_contract::InputTool;
+    use crate::tool_inputs::NexusExtractFigmaCodeInput;
+
     if !ctx.can_write {
-        return crate::errore_json(
-            "Permesso di scrittura non concesso su questo progetto: \
-             impossibile estrarre il code-snapshot Figma su disco.",
+        // DEL SISTEMA: il permesso non e' un parametro della chiamata, quindi
+        // non c'e' nulla da correggere; il messaggio manda sull'altra strada,
+        // che non scrive niente.
+        return crate::errore_tool(
+            "Permesso di scrittura non concesso su questo progetto: impossibile \
+             estrarre il code-snapshot Figma su disco. Usa \
+             nexus_extract_figma_structure per leggere la specifica senza scrivere.",
+            NaturaFallimento::DelSistema,
         );
     }
 
-    let attachment_id = match input
-        .get("attachment_id")
-        .and_then(Value::as_str)
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        Some(id) => id,
-        None => return crate::errore_json("Parametro 'attachment_id' obbligatorio."),
+    let params = match NexusExtractFigmaCodeInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
+    };
+    let attachment_id = match uuid_allegato(&params.attachment_id) {
+        Ok(id) => id,
+        Err(risposta) => return risposta,
+    };
+    let target_subdir = normalizza_subdir(params.target_subdir.as_deref());
+
+    let bytes = match documento_da_allegato(ctx, attachment_id).await {
+        Ok(b) => b,
+        Err(risposta) => return risposta,
+    };
+    let limits = attachment_settings::current(&ctx.db).await;
+
+    // Parsing pesante in spawn_blocking: produce la mappa path->content.
+    let atteso = tokio::task::spawn_blocking(move || extract_code_from_make(&bytes, limits)).await;
+    let snapshot = match atteso {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return estrazione_rifiutata(e, HINT_CODICE),
+        Err(e) => {
+            return crate::errore_tool(
+                format!("spawn_blocking fallita: {e}"),
+                NaturaFallimento::DelSistema,
+            )
+        }
     };
 
-    let target_subdir = input
-        .get("target_subdir")
-        .and_then(Value::as_str)
+    if snapshot.files.is_empty() {
+        return esito_senza_file(&snapshot, &target_subdir);
+    }
+
+    let scritture = match scrivi_snapshot(ctx, &snapshot, &target_subdir).await {
+        Ok(s) => s,
+        Err(risposta) => return risposta,
+    };
+    manifest_scritture(&snapshot, &target_subdir, scritture)
+}
+
+/// Normalizza `target_subdir` come il catalogo lo promette: assente o vuoto
+/// significa il default `figma_export`, e gli slash ai bordi non contano.
+fn normalizza_subdir(grezzo: Option<&str>) -> String {
+    grezzo
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_FIGMA_EXPORT_SUBDIR)
         .trim_matches('/')
-        .to_string();
+        .to_string()
+}
 
-    let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
-        Ok(r) => r,
-        Err(e) => return crate::errore_json(e),
-    };
-    let limits = attachment_settings::current(&ctx.db).await;
-
-    let bytes = match tokio::fs::read(&record.file_path).await {
-        Ok(b) => b,
-        Err(e) => return crate::errore_json(format!("read fallita: {e}")),
-    };
-
-    // Parsing pesante in spawn_blocking: produce la mappa path->content.
-    let snapshot = match tokio::task::spawn_blocking(move || extract_code_from_make(&bytes, limits))
-        .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return crate::errore_json(e),
-        Err(e) => return crate::errore_json(format!("spawn_blocking fallita: {e}")),
-    };
-
-    if snapshot.files.is_empty() {
-        let empty_samples: Vec<Value> = snapshot
-            .unrecognized
-            .iter()
-            .map(|u| json!({ "tool_name": u.tool_name, "outer_keys": u.outer_keys }))
-            .collect();
-        let mut empty_notes = String::from(
-            "Nessuna scrittura file (fast_apply_tool/write_tool) trasformata in \
-             (path, content) nel thread ai_chat.json: questo .make non contiene un \
-             code-snapshot ricostruibile. Usa nexus_extract_figma_structure per la \
-             specifica chat e implementa l'app dalla descrizione.",
-        );
-        if snapshot.unrecognized_total > 0 {
-            let sample = snapshot.unrecognized.first();
-            let tool_hint = sample.map(|u| u.tool_name.as_str()).unwrap_or("?");
-            let keys_hint = sample.map(|u| u.outer_keys.join(",")).unwrap_or_default();
-            empty_notes.push_str(&format!(
-                " ATTENZIONE: {} scritture file con toolName noto ma formato sconosciuto \
-                 (toolName={}, campi=[{}]): l'estrattore non le ha sapute leggere. \
-                 Ispeziona manualmente questi tool nel .make o aggiorna l'estrattore.",
-                snapshot.unrecognized_total, tool_hint, keys_hint
-            ));
-        }
-        return json!({
-            "format": "figma_make_code",
-            "total_files": 0,
-            "files_written": [],
-            "target_dir": target_subdir,
-            "partial": snapshot.partial,
-            "extraction_residuals": json!({
-                "write_attempts": snapshot.write_attempts,
-                "recognized": snapshot.recognized,
-                "unrecognized": snapshot.unrecognized_total,
-                "unrecognized_samples": empty_samples,
-            }),
-            "notes": empty_notes,
-        })
-        .to_string();
+/// La nota "loud on residuals": le scritture con `toolName` noto ma formato
+/// outer ignoto, cioe' file potenzialmente persi.
+///
+/// `None` quando non ce ne sono. Punto unico del testo: prima ne esistevano due
+/// versioni quasi identiche, una per il manifest vuoto e una per quello pieno.
+fn nota_residui(snapshot: &CodeSnapshot) -> Option<String> {
+    if snapshot.unrecognized_total == 0 {
+        return None;
     }
+    let sample = snapshot.unrecognized.first();
+    let tool_hint = sample.map(|u| u.tool_name.as_str()).unwrap_or("?");
+    let keys_hint = sample.map(|u| u.outer_keys.join(",")).unwrap_or_default();
+    Some(format!(
+        " ATTENZIONE: {} scritture file con toolName noto ma formato sconosciuto \
+         (toolName={tool_hint}, campi=[{keys_hint}]): l'estrattore non le ha sapute \
+         leggere. Il code-snapshot puo' essere INCOMPLETO: ispeziona manualmente \
+         questi tool nel .make o aggiorna l'estrattore.",
+        snapshot.unrecognized_total
+    ))
+}
 
-    // Calcolo dipendenze ed entrypoint prima di scrivere (sui content in RAM).
-    let detected_dependencies = detect_dependencies(&snapshot.files);
-    let entrypoints = detect_entrypoints(&snapshot.files);
+/// Telemetria dell'estrazione, dichiarata nel manifest cosi' un formato ignoto
+/// e' visibile invece di sparire in silenzio.
+fn residui_estrazione(snapshot: &CodeSnapshot) -> Value {
+    let campioni: Vec<Value> = snapshot
+        .unrecognized
+        .iter()
+        .map(|u| json!({ "tool_name": u.tool_name, "outer_keys": u.outer_keys }))
+        .collect();
+    json!({
+        "write_attempts": snapshot.write_attempts,
+        "recognized": snapshot.recognized,
+        "unrecognized": snapshot.unrecognized_total,
+        "unrecognized_samples": campioni,
+    })
+}
 
-    // Scrittura su disco con guardia path-safety del workspace.
-    // Politica "mai troncare-e-buttare": scriviamo TUTTI i file estratti,
-    // qualunque sia la dimensione totale (nessun cap sui byte scritti).
-    let mut files_written: Vec<Value> = Vec::new();
-    let mut total_bytes: usize = 0;
-    let mut rejected_paths = false;
+/// L'esito quando dal .make non e' uscito NESSUN file.
+///
+/// RAMO NUDO CHIUSO: erano due casi distinti che uscivano entrambi come
+/// successo. Se il thread non conteneva nessuna scrittura file il tool ha fatto
+/// il suo lavoro e non c'era nulla da scrivere — elenco vuoto e' un successo,
+/// come una directory vuota. Se invece le scritture c'erano e l'estrattore non
+/// ne ha saputa leggere NEMMENO UNA, il code-snapshot dell'app e' perso per
+/// intero e il manifest diceva ugualmente "questo .make non contiene un
+/// code-snapshot ricostruibile": l'agente proseguiva credendo che il codice non
+/// ci fosse, mentre c'era. DEL SISTEMA perche' non esiste parametro da
+/// correggere (il formato e' ignoto all'estrattore) e il messaggio manda
+/// sull'altra strada, la specifica chat.
+fn esito_senza_file(snapshot: &CodeSnapshot, target_subdir: &str) -> RispostaTool {
+    let mut notes = String::from(
+        "Nessuna scrittura file (fast_apply_tool/write_tool) trasformata in \
+         (path, content) nel thread ai_chat.json: questo .make non contiene un \
+         code-snapshot ricostruibile. Usa nexus_extract_figma_structure per la \
+         specifica chat e implementa l'app dalla descrizione.",
+    );
+    if let Some(residuo) = nota_residui(snapshot) {
+        notes.push_str(&residuo);
+    }
+    let mut corpo = json!({
+        "format": "figma_make_code",
+        "total_files": 0,
+        "files_written": [],
+        "target_dir": target_subdir,
+        "partial": snapshot.partial,
+        "extraction_residuals": residui_estrazione(snapshot),
+        "notes": notes,
+    });
+    if snapshot.unrecognized_total == 0 {
+        return RispostaTool::riuscito(corpo.to_string());
+    }
+    let dichiarazione = format!(
+        "{} scritture file erano presenti nel .make e nessuna e' stata estratta: \
+         il code-snapshot NON e' stato scritto su disco.",
+        snapshot.unrecognized_total
+    );
+    if let Some(obj) = corpo.as_object_mut() {
+        obj.insert("error".into(), Value::String(dichiarazione));
+    }
+    crate::errore_tool_con_dettagli(corpo, NaturaFallimento::DelSistema)
+}
+
+/// Cio' che la scrittura su disco ha davvero prodotto.
+struct ScrittureEffettuate {
+    /// Un oggetto `{path, bytes}` per file scritto.
+    files: Vec<Value>,
+    total_bytes: usize,
+    /// True se almeno un path e' stato rifiutato dalla guardia path-safety.
+    rejected_paths: bool,
+}
+
+/// Scrive i file del code-snapshot sotto `target_subdir`, con la guardia
+/// path-safety del workspace.
+///
+/// Politica "mai troncare-e-buttare": scriviamo TUTTI i file estratti,
+/// qualunque sia la dimensione totale (nessun cap sui byte scritti).
+async fn scrivi_snapshot(
+    ctx: &ToolContextCore,
+    snapshot: &CodeSnapshot,
+    target_subdir: &str,
+) -> Result<ScrittureEffettuate, RispostaTool> {
+    let mut esito = ScrittureEffettuate {
+        files: Vec::new(),
+        total_bytes: 0,
+        rejected_paths: false,
+    };
 
     for (rel_path, content) in &snapshot.files {
-        let content_len = content.len();
-
         let joined = format!("{target_subdir}/{rel_path}");
         let (clean_rel, abs_target) = match resolve_workspace_target(&ctx.root_path, &joined) {
             Ok(p) => p,
             Err(_) => {
                 // Path rifiutato dalla guardia path-safety: lo salto e segnalo
                 // il risultato come parziale.
-                rejected_paths = true;
+                esito.rejected_paths = true;
                 continue;
             }
         };
 
         if let Some(parent) = abs_target.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                return crate::errore_json(format!(
-                    "creazione directory '{}' fallita: {e}",
-                    parent.display()
-                ));
-            }
+            // La natura di un errore di I/O non si sceglie a mano: la legge il
+            // `ErrorKind` (regola M), perche' il messaggio del sistema operativo
+            // e' localizzato e diverso fra Windows e Linux.
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                let testo = format!("creazione directory '{}' fallita: {e}", parent.display());
+                crate::errore_tool(testo, NaturaFallimento::da_errore_io(&e))
+            })?;
         }
-
-        if let Err(e) = tokio::fs::write(&abs_target, content).await {
-            return crate::errore_json(format!("scrittura '{clean_rel}' fallita: {e}"));
-        }
+        tokio::fs::write(&abs_target, content).await.map_err(|e| {
+            let testo = format!("scrittura '{clean_rel}' fallita: {e}");
+            crate::errore_tool(testo, NaturaFallimento::da_errore_io(&e))
+        })?;
 
         nexus_events::dispatcher::emit(
             &ctx.project_channels,
@@ -211,27 +318,37 @@ pub async fn tool_nexus_extract_figma_code(ctx: &ToolContextCore, input: &Value)
             },
         );
 
-        total_bytes += content_len;
-        files_written.push(json!({ "path": clean_rel, "bytes": content_len }));
+        esito.total_bytes += content.len();
+        esito.files.push(json!({ "path": clean_rel, "bytes": content.len() }));
     }
+    Ok(esito)
+}
 
-    let partial = snapshot.partial || rejected_paths;
-    let mut notes = String::from(
-        "Code-snapshot React/TS estratto dal .make e scritto su disco: NON e' \
-         incluso nel contesto (solo metadati qui). Leggi i file con read_file \
-         quando ti servono. Genera package.json da detected_dependencies. \
-         IMPORTANTE: gli export Figma hanno bug noti di scaffolding (import dei \
-         simboli router da 'react-router' v7 mentre in deps c'e' 'react-router-dom' \
-         v6; main.tsx che avvolge in <BrowserRouter> un'App che usa <RouterProvider> \
-         -> doppio router: l'app NON monta e resta a SCHERMO BIANCO anche se `npm \
-         run build` passa senza errori; wrapper UI mancanti come \
-         components/ui/sonner). PRIMA di build/avvio chiama \
-         nexus_verify_scaffold(target_dir=\"<root del progetto>\"): il tool RILEVA e \
-         APPLICA da se' i fix deterministici (write_file/edit_file, idempotenti) e \
-         ritorna il campo 'applied'. NON riapplicarli a mano: controlla solo \
-         'apply_errors' e le eventuali azioni manuali residue (run_command/blocker).",
-    );
-    if rejected_paths {
+/// Il testo che accompagna un code-snapshot scritto: cosa c'e' su disco e quali
+/// bug noti di scaffolding vanno verificati prima di build/avvio.
+const NOTE_CODE_SNAPSHOT: &str = "Code-snapshot React/TS estratto dal .make e scritto su disco: NON e' \
+     incluso nel contesto (solo metadati qui). Leggi i file con read_file \
+     quando ti servono. Genera package.json da detected_dependencies. \
+     IMPORTANTE: gli export Figma hanno bug noti di scaffolding (import dei \
+     simboli router da 'react-router' v7 mentre in deps c'e' 'react-router-dom' \
+     v6; main.tsx che avvolge in <BrowserRouter> un'App che usa <RouterProvider> \
+     -> doppio router: l'app NON monta e resta a SCHERMO BIANCO anche se `npm \
+     run build` passa senza errori; wrapper UI mancanti come \
+     components/ui/sonner). PRIMA di build/avvio chiama \
+     nexus_verify_scaffold(target_dir=\"<root del progetto>\"): il tool RILEVA e \
+     APPLICA da se' i fix deterministici (write_file/edit_file, idempotenti) e \
+     ritorna il campo 'applied'. NON riapplicarli a mano: controlla solo \
+     'apply_errors' e le eventuali azioni manuali residue (run_command/blocker).";
+
+/// Il manifest dei file scritti. E' un SUCCESSO anche quando e' parziale: i
+/// file sono su disco, e cio' che manca lo dichiarano `partial` e le note.
+fn manifest_scritture(
+    snapshot: &CodeSnapshot,
+    target_subdir: &str,
+    scritture: ScrittureEffettuate,
+) -> RispostaTool {
+    let mut notes = String::from(NOTE_CODE_SNAPSHOT);
+    if scritture.rejected_paths {
         notes.push_str(
             " ATTENZIONE: alcuni path sono stati rifiutati dalla guardia di \
              path-safety del workspace e non sono stati scritti.",
@@ -243,46 +360,23 @@ pub async fn tool_nexus_extract_figma_code(ctx: &ToolContextCore, input: &Value)
              patologico): il code-snapshot potrebbe essere incompleto.",
         );
     }
-
-    // Telemetria estrazione: scritture non riconosciute = file potenzialmente
-    // persi. Le dichiariamo nel manifest (loud on residuals) cosi' un formato
-    // ignoto e' visibile invece di sparire in silenzio.
-    let unrecognized_samples: Vec<Value> = snapshot
-        .unrecognized
-        .iter()
-        .map(|u| json!({ "tool_name": u.tool_name, "outer_keys": u.outer_keys }))
-        .collect();
-    let extraction_residuals = json!({
-        "write_attempts": snapshot.write_attempts,
-        "recognized": snapshot.recognized,
-        "unrecognized": snapshot.unrecognized_total,
-        "unrecognized_samples": unrecognized_samples,
-    });
-    if snapshot.unrecognized_total > 0 {
-        let sample = snapshot.unrecognized.first();
-        let tool_hint = sample.map(|u| u.tool_name.as_str()).unwrap_or("?");
-        let keys_hint = sample.map(|u| u.outer_keys.join(",")).unwrap_or_default();
-        notes.push_str(&format!(
-            " ATTENZIONE: {} scritture file non riconosciute (formato sconosciuto: \
-             toolName={}, campi=[{}]). Il code-snapshot potrebbe essere INCOMPLETO: \
-             ispeziona manualmente questi tool nel .make o aggiorna l'estrattore.",
-            snapshot.unrecognized_total, tool_hint, keys_hint
-        ));
+    if let Some(residuo) = nota_residui(snapshot) {
+        notes.push_str(&residuo);
     }
 
-    json!({
+    let corpo = json!({
         "format": "figma_make_code",
-        "files_written": files_written,
-        "total_files": files_written.len(),
-        "total_bytes": total_bytes,
+        "total_files": scritture.files.len(),
+        "files_written": scritture.files,
+        "total_bytes": scritture.total_bytes,
         "target_dir": target_subdir,
-        "entrypoints": entrypoints,
-        "detected_dependencies": detected_dependencies,
-        "partial": partial,
-        "extraction_residuals": extraction_residuals,
+        "entrypoints": detect_entrypoints(&snapshot.files),
+        "detected_dependencies": detect_dependencies(&snapshot.files),
+        "partial": snapshot.partial || scritture.rejected_paths,
+        "extraction_residuals": residui_estrazione(snapshot),
         "notes": notes,
-    })
-    .to_string()
+    });
+    RispostaTool::riuscito(corpo.to_string())
 }
 
 /// Apre il .make, carica `ai_chat.json` (rispettando il limite di load),
@@ -961,10 +1055,18 @@ fn detect_dependencies(files: &std::collections::BTreeMap<String, String>) -> Ve
 
 /// Estrae la sorgente di un import/require da una riga: il contenuto tra
 /// virgolette dopo `from` o dentro `require(...)` / `import(...)`.
+///
+/// La riga deve essere una FORMA di import: il secondo ramo diceva
+/// `starts_with("import ") && contains('"') || contains('\'')`, e in Rust `&&`
+/// lega piu' stretto di `||` — quindi QUALUNQUE riga contenente un apice
+/// singolo entrava. Un `const saluto = 'ciao';` faceva finire `ciao` fra le
+/// `detected_dependencies` del manifest, cioe' dentro il `package.json` che il
+/// tool dice all'agente di generare da quel campo. Il testo del commento
+/// descriveva gia' l'intenzione giusta; era la condizione a non dirla.
 fn extract_import_source(line: &str) -> Option<String> {
     let needle = if line.contains(" from ") {
         " from "
-    } else if line.starts_with("import ") && line.contains('"') || line.contains('\'') {
+    } else if line.starts_with("import ") || line.contains("require(") || line.contains("import(") {
         // forme `import "pkg"` / dynamic import / require
         ""
     } else {
@@ -1574,6 +1676,73 @@ mod tests {
             Some("export const X = 1;"),
             "il file scritto con write_tool (Formato B) deve essere estratto"
         );
+    }
+
+    #[test]
+    fn snapshot_vuoto_senza_residui_e_un_successo() {
+        // Nessuna scrittura file nel thread: il tool ha fatto il suo lavoro e
+        // non c'era nulla da estrarre. Elenco vuoto = successo, come una
+        // directory vuota.
+        let snap = CodeSnapshot::default();
+        let out = esito_senza_file(&snap, "figma_export");
+        assert!(!out.esito.e_fallito(), "atteso successo, ottenuto {out:?}");
+        assert_eq!(out.natura, None);
+    }
+
+    #[test]
+    fn snapshot_vuoto_con_tutte_le_scritture_perse_e_un_fallimento() {
+        // RAMO NUDO: le scritture c'erano e l'estrattore non ne ha letta
+        // nessuna, quindi il code-snapshot dell'app e' perso per intero. Prima
+        // usciva come successo, indistinguibile dal .make che davvero non
+        // contiene codice.
+        let mut snap = CodeSnapshot {
+            write_attempts: 3,
+            unrecognized_total: 3,
+            ..Default::default()
+        };
+        snap.unrecognized.push(UnrecognizedWrite {
+            tool_name: "write_tool".to_string(),
+            outer_keys: vec!["toolName".to_string(), "weirdField".to_string()],
+        });
+        let out = esito_senza_file(&snap, "figma_export");
+        assert!(out.esito.e_fallito(), "atteso fallimento, ottenuto {out:?}");
+        assert_eq!(
+            out.natura,
+            Some(NaturaFallimento::DelSistema),
+            "formato ignoto all'estrattore: nessun parametro da correggere"
+        );
+        assert!(
+            out.testo.contains("write_tool"),
+            "il corpo deve nominare il tool ignoto: {}",
+            out.testo
+        );
+    }
+
+    #[test]
+    fn una_stringa_qualunque_non_e_una_dipendenza() {
+        // Solo le FORME di import producono una sorgente: una riga con un
+        // apice singolo qualsiasi entrava per un errore di precedenza fra
+        // `&&` e `||`, e il suo letterale finiva in detected_dependencies.
+        assert_eq!(extract_import_source("const saluto = 'ciao';"), None);
+        assert_eq!(
+            extract_import_source("import { toast } from \"sonner\";").as_deref(),
+            Some("sonner")
+        );
+        assert_eq!(
+            extract_import_source("import './styles.css';").as_deref(),
+            Some("./styles.css")
+        );
+        assert_eq!(
+            extract_import_source("const fs = require('node:fs');").as_deref(),
+            Some("node:fs")
+        );
+    }
+
+    #[test]
+    fn subdir_vuota_ricade_sul_default_dichiarato() {
+        assert_eq!(normalizza_subdir(None), DEFAULT_FIGMA_EXPORT_SUBDIR);
+        assert_eq!(normalizza_subdir(Some("   ")), DEFAULT_FIGMA_EXPORT_SUBDIR);
+        assert_eq!(normalizza_subdir(Some("/out/dir/")), "out/dir");
     }
 
     #[test]

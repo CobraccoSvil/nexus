@@ -111,6 +111,27 @@ async fn migrati_esecuzione(
         "run_lint_fix" => Some(testing::tool_run_lint_fix(ctx, input).await),
         "format_file" => Some(testing::tool_format_file(ctx, input).await),
         "run_tests" => Some(command::tool_run_tests(ctx, input).await),
+        // Catena di verifica post-modifica (ADR 0019 L3): gli step del profilo
+        // per-ambiente, fail-fast al primo rosso. Sta fra chi ESEGUE perche'
+        // lancia N processi, ma non ha un `exit_code` sull'aggregato: uno solo
+        // per N comandi andrebbe inventato, e gli stati d'uscita veri stanno
+        // per step nel report. RAMO NUDO CHIUSO: `scope: quick` su un profilo
+        // in cui nessuno step e' marcato per il gate percorreva una catena
+        // VUOTA e usciva `passed: true` con `steps: []` — un verde che nessuno
+        // aveva misurato, consegnato come prova che la modifica compila.
+        "nexus_verify_change" => Some(verify::tool_nexus_verify_change(ctx, input).await),
+        // FASE 2 "resa Figma Make": screenshot dell'app viva contro il design.
+        // Sta qui per la stessa ragione di `nexus_verify_change` — lancia un
+        // processo (node che pilota Chromium) — e come quello non ha un
+        // `exit_code` da riportare: lo stato d'uscita dello script e' un
+        // dettaglio interno, non l'esito del confronto. RAMO NUDO CHIUSO: una
+        // risposta vision FUORI dal formato imposto usciva come successo con
+        // `similarity_score: null`, cioe' il confronto — l'intero compito della
+        // chiamata — non era stato fatto e il modello leggeva "riuscito". E i
+        // tre modi di non ottenere lo screenshot (ambiente senza Chromium, url
+        // che non risponde, pagina troppo lenta) condividevano un unico
+        // suggerimento, che su due casi su tre mandava dalla parte sbagliata.
+        "nexus_visual_compare" => Some(visual_compare::tool_nexus_visual_compare(ctx, input).await),
         // `git.rs`: CINQUE handler su sei componevano `[git <verbo> error: ...]`
         // senza marker, cioe' un commit rifiutato, un push respinto e un pull in
         // conflitto arrivavano all'agente come esecuzioni riuscite. Anche il
@@ -209,6 +230,154 @@ async fn migrati_contenuti(
         // costruzione, ed e' il tool a saperlo.
         "fs_copy" => Some(files::tool_fs_copy(ctx, input).await),
         "fs_move" => Some(files::tool_fs_move(ctx, input).await),
+        // I due estrattori Figma. Il secondo aveva un ramo NUDO che si vede solo
+        // mettendo insieme due campi del suo stesso manifest: quando l'estrattore
+        // non sa leggere NESSUNA delle scritture file presenti nel .make, il
+        // code-snapshot dell'app e' perso per intero e il tool rispondeva
+        // ugualmente "questo .make non contiene un code-snapshot ricostruibile" —
+        // cioe' un successo. Ora quel caso e' DEL SISTEMA (il formato e' ignoto,
+        // non c'e' parametro da correggere) e resta distinto dal .make che
+        // davvero non contiene codice, che e' un successo con zero file.
+        "nexus_extract_figma_structure" => {
+            Some(figma_tools::tool_nexus_extract_figma_structure(ctx, input).await)
+        }
+        "nexus_extract_figma_code" => {
+            Some(figma_tools::tool_nexus_extract_figma_code(ctx, input).await)
+        }
+        // La descrizione di un'immagine allegata. Il ramo NUDO era la risposta
+        // VUOTA del modello vision: usciva come successo con `description: ""`,
+        // cioe' l'agente leggeva «questa immagine non contiene nulla» dove il
+        // modello non aveva prodotto nulla — su un mockup o uno screenshot e' una
+        // conclusione falsa su cui prosegue, e il gateway non la puo' distinguere
+        // (HTTP 200 come per una risposta piena). Gli altri cinque esiti erano
+        // gia' dichiarati ma tutti con la stessa natura implicita: ora l'id
+        // sbagliato e il kind non-immagine sono rimediabili e nominano il tool con
+        // cui rimediare, il limite di `settings` e lo storage muto sono del
+        // sistema, e il gateway esaurito e' transitorio.
+        "nexus_describe_image_attachment" => {
+            Some(vision_tools::tool_nexus_describe_image_attachment(ctx, input).await)
+        }
+        // I due tool audio. Nessun ramo NUDO da chiudere — ogni fallimento era
+        // gia' dichiarato — ma due messaggi mentivano, e il campo `natura` li ha
+        // resi visibili: una dimensione NEGATIVA in DB cadeva nello stesso ramo
+        // del limite e usciva come «audio troppo grande», invitando ad alzare un
+        // limite che nessuna dimensione negativa rispetta; e il limite stesso,
+        // quando `settings` non era leggibile o portava un valore non numerico,
+        // veniva ripiegato in silenzio sul default e poi CITATO nel messaggio
+        // come se fosse configurato. Ora l'ignoto e' dichiarato invece di
+        // degradare a un numero (regola Q), e «non e' un audio» nomina
+        // `nexus_inspect_attachment` invece di rimandare a un tool senza nome.
+        "nexus_transcribe_audio" => Some(audio_tools::tool_nexus_transcribe_audio(ctx, input).await),
+        "nexus_text_to_speech" => Some(audio_tools::tool_nexus_text_to_speech(ctx, input).await),
+        // I due tool sui profili utente: non eseguono processi, scrivono una
+        // riga di `user_profiles`. I loro due esiti piu' probabili — nome gia'
+        // preso, profilo inesistente — uscivano NUDI, cioe' come successi, e ora
+        // dichiarano il fallimento nel campo insieme al tool che lo rimedia.
+        "create_profile" => Some(tool_create_profile(ctx, input).await),
+        "update_profile" => Some(tool_update_profile(ctx, input).await),
+        // Legge un log e lo confronta coi pattern di `nexus_dev_diagnostics`:
+        // nessun processo eseguito, quindi nessun exit_code. Il suo ramo senza
+        // pattern attivi usciva NUDO — `findings: []` come un successo, cioe'
+        // indistinguibile dalla diagnosi vera in cui i pattern ci sono e nessuno
+        // matcha — e ora dichiara `DelSistema`, che e' quel che l'agente puo'
+        // farci: niente, se non leggere il log da solo.
+        "nexus_dev_server_diagnose" => {
+            Some(dev_diagnostics::tool_nexus_dev_server_diagnose(ctx, input).await)
+        }
+        // Scrive stub TSX: tocca il filesystem ma non esegue processi. Chiudeva
+        // NUDO il ramo che conta — una `fs::write` fallita finiva in un warn di
+        // log e in `unsupported`, la stessa lista dei componenti che non
+        // esistono, e la risposta restava un JSON senza dichiarazione d'esito:
+        // su un target in sola lettura il modello leggeva `written: []` come un
+        // successo. Ora la natura viene dal `ErrorKind` (regola M), e «nome
+        // sconosciuto» resta distinto da «non sono riuscito a scrivere».
+        "nexus_install_shadcn_components" => {
+            Some(shadcn_setup::tool_nexus_install_shadcn_components(ctx, input).await)
+        }
+        // ── Dispatcher centrale (pilotaggio pannelli) ──────────────────────
+        // Emettono eventi e scrivono un flag: nessun processo, quindi nessun
+        // exit_code da riportare. Non avevano rami nudi; cio' che la migrazione
+        // chiude sta all'INGRESSO — `severity` obbligatoria per catalogo e
+        // ripiegata su "info" dall'handler, `payload` promesso oggetto e
+        // accettato come qualunque JSON, le due durate lette con `as_u64` che
+        // su un negativo faceva sparire il parametro invece di rifiutarlo.
+        "dispatcher_emit_event" => Some(dispatcher::tool_dispatcher_emit_event(ctx, input).await),
+        "dispatcher_post_notification" => {
+            Some(dispatcher::tool_dispatcher_post_notification(ctx, input).await)
+        }
+        "dispatcher_set_flag" => Some(dispatcher::tool_dispatcher_set_flag(ctx, input).await),
+        "dispatcher_update_monitor" => {
+            Some(dispatcher::tool_dispatcher_update_monitor(ctx, input).await)
+        }
+        "dispatcher_highlight_panel" => {
+            Some(dispatcher::tool_dispatcher_highlight_panel(ctx, input).await)
+        }
+        // `quality_tools.rs`. Il ramo che cambia di piu' e' la lettura dei
+        // findings di progetto: `match rows { Ok(non vuoto) => ..., _ => ... }`
+        // dava lo STESSO testo a uno scan senza risultati (successo) e a una
+        // query fallita (DB giu'), quindi un guasto invitava l'agente a rifare
+        // una scansione dal pannello. `severity_filter` inoltre e' un ENUM che
+        // l'handler leggeva come stringa libera, e la lente SQL lo ignorava.
+        "scan_code_quality" => Some(tool_scan_code_quality(ctx, input).await),
+        // Il `task` del batch e' obbligatorio per catalogo e l'handler ripiegava
+        // su "analyze": una richiesta di documentazione poteva tornare una
+        // revisione. E un batch terminato con TUTTE le richieste in errore
+        // usciva come successo, perche' il testo non era vuoto.
+        "batch_analyze_code" => Some(tool_batch_analyze_code(ctx, input).await),
+        // `scaffold_verifier.rs`. Scrive file (auto-apply dei fix deterministici)
+        // ma non esegue processi, quindi non ha un `exit_code` da riportare.
+        // RAMO NUDO CHIUSO: senza package.json ritornava un report che DICEVA
+        // "blocker" nel testo e usciva come successo — una verifica mai eseguita
+        // che l'agente riceveva come superata. Idem per i fix che il verifier
+        // promette di applicare e non riesce a scrivere: lo scaffold resta rotto
+        // e il turno proseguiva verso `npm start`.
+        "nexus_verify_scaffold" => {
+            Some(scaffold_verifier::tool_nexus_verify_scaffold(ctx, input).await)
+        }
+        // `todos.rs`: la TODO list del piano. Scrive righe, non esegue processi,
+        // quindi non ha un `exit_code`. Le sue nature sono due e prima
+        // arrivavano indistinte: un vocabolario violato o un `run_id` sbagliato
+        // sono RIMEDIABILI e il messaggio porta i valori ammessi, mentre un DB
+        // che non risponde e' DEL SISTEMA. La distinzione non era cosmetica —
+        // due letture inghiottivano l'errore di query e lo raccontavano come
+        // «run_id non trovato» e «piano inesistente», mandando l'agente a
+        // correggere cio' che era gia' giusto.
+        "nexus_todo_write" => Some(todos::tool_nexus_todo_write(ctx, input).await),
+        // La magic-byte detection di un allegato: legge 32 KB e classifica,
+        // nessun processo eseguito. Il ramo che la migrazione corregge non era
+        // nudo ma BUGIARDO: la lookup dell'id per NOME appiattiva «nessun
+        // allegato con quel nome» e «query non eseguita» nella stessa stringa, e
+        // l'handler le rendeva col medesimo messaggio — «passa l'UUID oppure il
+        // nome esatto del file» — cioe' davanti a un DB muto mandava l'agente a
+        // correggere una chiamata gia' giusta, e a ripeterla.
+        "nexus_inspect_attachment" => {
+            Some(attachment_inspector::tool_nexus_inspect_attachment(ctx, input).await)
+        }
+        // `project_db_query.rs`: i tre tool sul DB APPLICATIVO del progetto.
+        // Eseguono SQL, non processi, quindi non hanno un `exit_code`. Ogni loro
+        // fallimento era gia' dichiarato da un marker, ma tutti con la stessa
+        // natura implicita: ora una connessione non configurata e una query
+        // fallita su `information_schema` sono DEL SISTEMA (ripeterle non cambia
+        // nulla), mentre l'SQL sbagliato, il timeout e la tabella inesistente
+        // sono RIMEDIABILI e nominano il tool con cui rimediare. Il timeout in
+        // particolare NON e' transitorio: ritentare la stessa query pesante la fa
+        // scadere di nuovo dopo altri 30 secondi. Chiuso anche un errore
+        // inghiottito: una `pg_indexes` fallita usciva come "questa tabella non
+        // ha indici".
+        "nexus_db_query" => Some(project_db_query::tool_nexus_db_query(ctx, input).await),
+        "nexus_db_tables" => Some(project_db_query::tool_nexus_db_tables(ctx, input).await),
+        "nexus_db_describe" => Some(project_db_query::tool_nexus_db_describe(ctx, input).await),
+        // La ricerca semantica: interroga un indice, non esegue processi. Il ramo
+        // NUDO era lo zero hit con una o piu' collection FALLITE — usciva come
+        // successo, e la sola traccia del guasto era un campo `hint` dentro il
+        // JSON, che nessuno dei consumatori dell'esito legge. "Non ho trovato
+        // niente" e "non ho potuto guardare" portano a decisioni opposte, e con
+        // un hit trovato la fonte muta resta un successo: i risultati ci sono.
+        // All'ingresso si chiudono i due filtri che venivano SCARTATI in
+        // silenzio (`filter_session_id` non-UUID, `filter_attachment_id` vuoto)
+        // e il `top_k` negativo, che diventava il default: in tutti e tre i casi
+        // il modello credeva di aver ristretto la ricerca e riceveva altro.
+        "nexus_search_semantic" => Some(rag_search::tool_nexus_search_semantic(ctx, input).await),
         _ => None,
     }
 }
@@ -225,8 +394,6 @@ async fn esegui_tool_legacy(
         "request_port" => ports::tool_request_port(ctx, input).await,
         // Tool read-only per verifica/audit dello stato porte (bucket + allocazioni).
         "nexus_list_ports" => ports::tool_nexus_list_ports(ctx, input).await,
-        // PR-1 Plan/Act/Verify: emette/aggiorna la TODO list del planner.
-        "nexus_todo_write" => todos::tool_nexus_todo_write(ctx, input).await,
         // Sub-agents NATIVI (zero-Python): il sub-run gira sul grafo Rust
         // (crate::native_engine::run_native) in-process, niente piu' chiamata al
         // brain /agent/subagent-run. L'orchestrazione vive in mcp-core perche'
@@ -238,16 +405,10 @@ async fn esegui_tool_legacy(
         // Poll (DB-only) + resume (ri-esecuzione nativa) dei sub-agent.
         "nexus_subagent_poll" => subagent_native::tool_nexus_subagent_poll(ctx, input).await,
         "nexus_subagent_resume" => subagent_native::tool_nexus_subagent_resume(ctx, input).await,
-        // Catena di verifica post-modifica (ADR 0019 L3): typecheck -> build ->
-        // lint -> test con fail-fast e VerifyReport strutturato.
-        "nexus_verify_change" => verify::tool_nexus_verify_change(ctx, input).await,
         // Tool dedicato ai cicli test-fix-test: esecuzione sincrona con
         // timeout esteso (raccomandato dai prompt al posto di run_command).
-        "create_profile" => tool_create_profile(ctx, input).await,
-        "update_profile" => tool_update_profile(ctx, input).await,
         "set_sandbox_config" => sandbox::tool_set_sandbox_config(ctx, input).await,
         "get_sandbox_config" => sandbox::tool_get_sandbox_config(ctx).await,
-        "scan_code_quality" => tool_scan_code_quality(ctx, input).await,
         "search_codebase_semantic" => {
             let query = input
                 .get("query")
@@ -302,17 +463,6 @@ async fn esegui_tool_legacy(
                 .min(10) as usize;
             tool_recall_context(ctx, &query, &source, limit).await
         }
-        "batch_analyze_code" => tool_batch_analyze_code(ctx, input).await,
-        // ── Dispatcher centrale (pilotaggio pannelli) ──────────────────────
-        "dispatcher_emit_event" => dispatcher::tool_dispatcher_emit_event(ctx, input).await,
-        "dispatcher_post_notification" => {
-            dispatcher::tool_dispatcher_post_notification(ctx, input).await
-        }
-        "dispatcher_set_flag" => dispatcher::tool_dispatcher_set_flag(ctx, input).await,
-        "dispatcher_update_monitor" => dispatcher::tool_dispatcher_update_monitor(ctx, input).await,
-        "dispatcher_highlight_panel" => {
-            dispatcher::tool_dispatcher_highlight_panel(ctx, input).await
-        }
         // Unico tool che guarda FUORI dal progetto: cio' che torna e' DATO, e
         // arriva gia' dichiarato come non fidato (vedi il modulo).
         // ── Knowledge Base per-progetto ────────────────────────────────────
@@ -328,38 +478,11 @@ async fn esegui_tool_legacy(
         "nexus_list_attachments" => attachments::tool_nexus_list_attachments(ctx, input).await,
         "nexus_read_attachment" => attachments::tool_nexus_read_attachment(ctx, input).await,
         // ── Ingestion intelligente allegati (ADR 0011) ─────────────────────
-        "nexus_inspect_attachment" => {
-            attachment_inspector::tool_nexus_inspect_attachment(ctx, input).await
-        }
         "nexus_read_archive_entry" => {
             archive_tools::tool_nexus_read_archive_entry(ctx, input).await
         }
-        "nexus_extract_figma_structure" => {
-            figma_tools::tool_nexus_extract_figma_structure(ctx, input).await
-        }
-        "nexus_extract_figma_code" => figma_tools::tool_nexus_extract_figma_code(ctx, input).await,
-        "nexus_describe_image_attachment" => {
-            vision_tools::tool_nexus_describe_image_attachment(ctx, input).await
-        }
         // PR6b-2: genera un'immagine dal prompt e la salva path-safe nel progetto.
-        // PR6c: trascrive un audio allegato (speech-to-text) via gateway.
-        "nexus_transcribe_audio" => audio_tools::tool_nexus_transcribe_audio(ctx, input).await,
-        // PR6d: sintetizza un testo in audio (text-to-speech) e lo salva nel progetto.
-        "nexus_text_to_speech" => audio_tools::tool_nexus_text_to_speech(ctx, input).await,
         // PR6e: genera un video dal prompt (text-to-video, Veo async) e lo salva nel progetto.
-        "nexus_install_shadcn_components" => {
-            shadcn_setup::tool_nexus_install_shadcn_components(ctx, input).await
-        }
-        "nexus_dev_server_diagnose" => {
-            dev_diagnostics::tool_nexus_dev_server_diagnose(ctx, input).await
-        }
-        "nexus_verify_scaffold" => scaffold_verifier::tool_nexus_verify_scaffold(ctx, input).await,
-        "nexus_db_query" => project_db_query::tool_nexus_db_query(ctx, input).await,
-        "nexus_db_tables" => project_db_query::tool_nexus_db_tables(ctx, input).await,
-        "nexus_db_describe" => project_db_query::tool_nexus_db_describe(ctx, input).await,
-        // FASE 2 "resa Figma Make": verifica visiva (screenshot vs design).
-        "nexus_visual_compare" => visual_compare::tool_nexus_visual_compare(ctx, input).await,
-        "nexus_search_semantic" => rag_search::tool_nexus_search_semantic(ctx, input).await,
         // Worklog di sessione (mig 0411): drill-down on-demand della storia di
         // lavoro — il digest compatto sta nel system, il dettaglio vive qui.
         // VINCOLO: deve restare in _ALWAYS_ON_TOOLS (profile_loader.py) cosi'
