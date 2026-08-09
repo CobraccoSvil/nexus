@@ -119,3 +119,123 @@ gate_pretende_turbo() {
         "materializza sono ASSOLUTI, quindi un node_modules condiviso farebbe" \
         "compilare i sorgenti dell'ALTRO albero (regola O)."
 }
+
+# Premessa delle fasi che eseguono JavaScript: il Node in esecuzione deve
+# soddisfare il minimo che il repo dichiara in package.json (`engines.node`).
+#
+# IL DIFETTO CHE CHIUDE, e perche' e' della stessa famiglia dei due sopra.
+#
+#   `.github/workflows/verify.yml` dichiarava `node-version: "20"` dal
+#   2026-06-15 (commit a7c7fa68). Il 2026-07-03 (commit 81d1b921) i test della
+#   web-ide sono diventati `node --test "lib/**/*.test.ts"`: file TypeScript
+#   eseguiti col type-stripping nativo, elencati da un glob. Node 20 non sa fare
+#   ne' l'uno ne' l'altro. Da quel giorno il gate CI e' morto SEMPRE nello stesso
+#   punto, e mai una volta ha eseguito clippy o nextest — che nel gate vengono
+#   dopo. Cioe' le fasi Rust in CI non giravano da oltre un mese.
+#
+#   MISURATO in locale l'08/08/2026, lo stesso comando dello script `test`:
+#     node 20.19.5 : Could not find '<...>/lib/**/*.test.ts'   (glob non espanso)
+#     node 22.11.0 : glob OK, ERR_UNKNOWN_FILE_EXTENSION ".ts" (niente stripping)
+#     node 22.18.0 : 105 pass, 0 fail                          (primo che regge)
+#     node 24.14.0 : 229 pass, 0 fail                          (versione locale)
+#
+#   Il messaggio che il CI stampava — "Could not find lib/**/*.test.ts" — accusa
+#   un percorso mancante: chi lo legge cerca un file, non una versione di Node.
+#   E' lo stesso schema del `.env` e di `node_modules`: una premessa non
+#   soddisfatta che si presenta come un difetto del codice, perche' nessuno la
+#   pretendeva prima di misurare.
+#
+# LA VERSIONE HA ORA UN PUNTO UNICO (regola L): `.nvmrc` dichiara quella USATA
+# — la leggono i workflow via `node-version-file` e nvm in locale — e
+# `engines.node` il MINIMO tollerato, che e' cio' che questa premessa verifica.
+# Prima la versione era scritta a mano in due workflow e in nessun altro posto:
+# il locale girava su 24 e la CI su 20 senza che niente dichiarasse la
+# differenza.
+#
+# Forma ammessa per `engines.node`: `>=X.Y.Z`. Un range piu' ricco (unioni,
+# caret) richiederebbe un parser semver, che qui sarebbe una seconda verita'
+# rispetto a quello di npm; se il campo non e' in questa forma il gate si ferma
+# dicendolo, invece di indovinare un confronto.
+gate_pretende_node() {
+    local root="${NEXUS_GATE_ROOT:-$(pwd)}"
+
+    if ! command -v node >/dev/null 2>&1; then
+        gate_stop_configurazione \
+            "node non e' nel PATH: nessuna fase JavaScript del gate e' eseguibile." \
+            "albero: ${root}" \
+            "" \
+            "Rimedio: installa Node. La versione da usare la dichiara ${root}/.nvmrc" \
+            "(nvm: 'nvm use'; CI: node-version-file nei workflow)."
+    fi
+
+    local minimo corrente
+    # `./package.json` relativo alla cwd, non un path assoluto interpolato nel
+    # sorgente JS: NEXUS_GATE_ROOT e' in forma POSIX anche su Windows e
+    # `require()` non la risolve.
+    minimo="$(cd "$root" && node -p "require('./package.json').engines?.node ?? ''" 2>/dev/null || true)"
+    corrente="$(node -p 'process.versions.node' 2>/dev/null || true)"
+
+    # Nessun minimo dichiarato: non c'e' niente da pretendere. Non si inventa un
+    # valore di ripiego (regola G): un default nascosto renderebbe il gate
+    # silenziosamente piu' permissivo il giorno in cui il campo sparisse.
+    [[ -n "$minimo" ]] || return 0
+
+    if [[ ! "$minimo" =~ ^\>=[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        gate_stop_configurazione \
+            "engines.node vale '${minimo}', che questo gate non sa confrontare." \
+            "forma ammessa: '>=X.Y.Z' (vedi il commento in scripts/gate-premesse.sh)" \
+            "" \
+            "Rimedio: riportalo a quella forma in ${root}/package.json, oppure" \
+            "insegna il range nuovo a gate_pretende_node."
+    fi
+
+    if node -e '
+        const [min, cur] = process.argv.slice(1);
+        const parti = (s) => {
+            const n = s.replace(/^[^0-9]*/, "").split(".").map((x) => Number(x) || 0);
+            return [n[0] || 0, n[1] || 0, n[2] || 0];
+        };
+        const [a, b, c] = parti(min);
+        const [x, y, z] = parti(cur);
+        process.exit(x > a || (x === a && (y > b || (y === b && z >= c))) ? 0 : 1);
+    ' "$minimo" "$corrente"; then
+        return 0
+    fi
+
+    gate_stop_configurazione \
+        "node ${corrente} non soddisfa il minimo dichiarato dal repo (${minimo})." \
+        "albero: ${root}" \
+        "" \
+        "Cosa si romperebbe senza questo stop: i test della web-ide sono file" \
+        ".ts eseguiti da 'node --test' col type-stripping nativo ed elencati da" \
+        "un glob. Sotto 22.18.0 Node non fa ne' l'uno ne' l'altro, e il rosso che" \
+        "ne esce dice \"Could not find lib/**/*.test.ts\": accusa un percorso" \
+        "mancante, non la versione." \
+        "" \
+        "Rimedio: usa la versione dichiarata in ${root}/.nvmrc ('nvm use')."
+}
+
+# Premessa delle fasi di test Rust: l'esecutore del gate e' cargo-nextest.
+#
+# Sta qui, e con il codice 78, per la ragione di questo file: "l'esecutore dei
+# test non e' installato" e "i test sono rossi" sono due cause opposte, e finche'
+# uscivano entrambe come 1 il consumatore non aveva un campo da leggere. Il
+# messaggio c'era gia' ed era corretto (verify.sh lo stampava prima di
+# `exit 1`), ma valeva quanto quello del `.env`: sopra ne veniva stampato un
+# altro, statico, che affermava il contrario con la stessa autorevolezza.
+#
+# Il ripiego su `cargo test` resta escluso: locale e CI devono misurare la
+# stessa cosa, e nextest non esegue i doctest — un gate che ripiegasse
+# cambierebbe copertura senza dirlo (regola O).
+gate_pretende_nextest() {
+    if cargo nextest --version >/dev/null 2>&1; then
+        return 0
+    fi
+    gate_stop_configurazione \
+        "cargo-nextest non e' installato: e' l'esecutore dei test del gate." \
+        "albero: ${NEXUS_GATE_ROOT:-$(pwd)}" \
+        "" \
+        "Rimedio: 'cargo install cargo-nextest --locked'." \
+        "In CI lo installa taiki-e/install-action@nextest (binario precompilato)." \
+        "Nessun ripiego su 'cargo test': misurerebbe una cosa diversa dalla CI."
+}
