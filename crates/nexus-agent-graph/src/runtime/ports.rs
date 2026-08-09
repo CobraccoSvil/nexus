@@ -770,7 +770,17 @@ pub struct PendingStepInfo {
     pub tool_use_id: String,
     pub tool_name: String,
     pub tool_input: Value,
+    /// La regola lessicale che ha ALZATO il livello, se ce n'e' una.
     pub matched_category: Option<String>,
+    /// Che cosa il passo RAGGIUNGE (punto unico `decisions::step_reach`).
+    ///
+    /// Viaggia accanto alla categoria perche' da quando il pavimento nasce
+    /// dalla portata (mig 0688) la maggioranza dei passi convocati NON ha
+    /// categoria: nessuna regola li nomina, ed e' esattamente il motivo per cui
+    /// prima non arrivavano ai giudici. Senza questo campo il loro prompt
+    /// direbbe «categoria: -» proprio dove deve spiegare perche' li sta
+    /// guardando (regola Q: il motivo e' un campo, non un vuoto).
+    pub reach: crate::decisions::step_reach::StepReach,
 }
 
 /// Il verdetto di UN validatore, con la sua identita' (chi ha votato E' parte
