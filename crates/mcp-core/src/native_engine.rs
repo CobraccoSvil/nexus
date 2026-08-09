@@ -2442,8 +2442,7 @@ async fn load_tool_dispatch_config(
     fs_mutator_tools: Vec<String>,
 ) -> ToolDispatchConfig {
     let d = ToolDispatchConfig::default();
-    let (step_gate_mode, step_gate_rules, step_gate_max_rejections, rebuildable_artifacts) =
-        load_step_gate_dispatch(db, d.step_gate_max_rejections).await;
+    let gate = load_step_gate_dispatch(db, d.step_gate_max_rejections).await;
     let (tool_result_max_chars, attachment_budget_bytes) =
         load_dispatch_limits(db, provider, model, &d).await;
     ToolDispatchConfig {
@@ -2511,10 +2510,11 @@ async fn load_tool_dispatch_config(
         // CLAMP alla deadline residua del run (fase 3): una barriera che attende
         // oltre la deadline produrrebbe un `time_budget` mascherato da gate.
         advisory_gate_timeout_s: advisory_gate_timeout(db).await,
-        step_gate_mode,
-        step_gate_rules,
-        step_gate_max_rejections,
-        rebuildable_artifacts,
+        step_gate_mode: gate.mode,
+        step_gate_rules: gate.rules,
+        step_gate_max_rejections: gate.max_rejections,
+        rebuildable_artifacts: gate.rebuildable_artifacts,
+        observation_commands: gate.observation_commands,
     }
 }
 
@@ -2537,19 +2537,26 @@ async fn load_dispatch_limits(
     (tool_result_max_chars, attachment_budget_bytes)
 }
 
-/// I tre campi del gate duale (mig 0677) per la [`ToolDispatchConfig`]. Il
-/// mode passa dallo stesso parse dell'adapter (`load_mode`, punto unico del
+/// I campi del gate duale (migg 0677, 0684, 0688) per la
+/// [`ToolDispatchConfig`]. Struct e non tupla: sono cinque valori di cui due
+/// `Vec<String>` — `rebuildable_artifacts` e `observation_commands` — che a
+/// posizione sono indistinguibili, e scambiarli darebbe un gate che assolve
+/// `dist` e giudica `ls`.
+struct StepGateDispatch {
+    mode: nexus_agent_graph::decisions::step_gate::StepGateMode,
+    rules: Vec<nexus_agent_graph::decisions::step_gate::CriticalityRule>,
+    max_rejections: u32,
+    rebuildable_artifacts: Vec<String>,
+    observation_commands: Vec<String>,
+}
+
+/// Il mode passa dallo stesso parse dell'adapter (`load_mode`, punto unico del
 /// vocabolario); le regole rotte sono scartate una a una con WARN da
 /// `parse_rules`.
 async fn load_step_gate_dispatch(
     db: &PgPool,
     default_max_rejections: u32,
-) -> (
-    nexus_agent_graph::decisions::step_gate::StepGateMode,
-    Vec<nexus_agent_graph::decisions::step_gate::CriticalityRule>,
-    u32,
-    Vec<String>,
-) {
+) -> StepGateDispatch {
     let mode = crate::agent_graph_adapter::step_validation::load_mode(db).await;
     let rules = nexus_agent_graph::decisions::step_gate::parse_rules(
         &nexus_auth::get_setting(db, "orchestrator.critical_step_rules")
@@ -2567,7 +2574,18 @@ async fn load_step_gate_dispatch(
     // framework, e un elenco nel codice sarebbe da rincorrere a ogni novita'.
     // Vuoto = nessun declassamento, cioe' il comportamento di prima.
     let rebuildable = nexus_auth::get_csv_setting(db, "orchestrator.rebuildable_artifacts").await;
-    (mode, rules, max_rejections, rebuildable)
+    // La soglia sul COSTO del gate (mig 0688). Unico elenco che ASSOLVE: cio'
+    // che non nomina viene giudicato, quindi la sua incompletezza costa
+    // convocazioni e mai un buco. Vuoto = nulla e' provatamente innocuo.
+    let osservazione =
+        nexus_auth::get_csv_setting(db, "orchestrator.step_reach.observation_commands").await;
+    StepGateDispatch {
+        mode,
+        rules,
+        max_rejections,
+        rebuildable_artifacts: rebuildable,
+        observation_commands: osservazione,
+    }
 }
 
 /// Costruisce la [`ClarifyConfig`] DB-driven (regola G, prefisso `clarify.`).

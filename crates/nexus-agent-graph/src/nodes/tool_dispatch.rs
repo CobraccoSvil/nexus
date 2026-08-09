@@ -343,6 +343,14 @@ pub struct ToolDispatchConfig {
     /// pulizia di cache da una cancellazione definitiva: vedi
     /// `step_gate::declassa_se_rigenerabile`. Vuoto = nessun declassamento.
     pub rebuildable_artifacts: Vec<String>,
+    /// Prefissi di comando che ASSOLVONO una riga di shell
+    /// (`orchestrator.step_reach.observation_commands`, mig 0688). E' la soglia
+    /// sul COSTO del gate duale: senza, ogni `ls` pagherebbe due chiamate LLM.
+    ///
+    /// Unico elenco del gate la cui incompletezza costa denaro e non sicurezza:
+    /// cio' che non nomina viene GIUDICATO. Vuoto = nulla e' provatamente
+    /// innocuo, cioe' tutto viene giudicato — vedi `decisions::step_reach`.
+    pub observation_commands: Vec<String>,
     /// Rimandi massimi del gate duale prima di degradare a NeedsHuman
     /// (`orchestrator.critical_step_max_rejections`): il cap anti ping-pong
     /// fra modello e validatori.
@@ -375,6 +383,9 @@ impl Default for ToolDispatchConfig {
             step_gate_mode: crate::decisions::step_gate::StepGateMode::Off,
             step_gate_rules: Vec::new(),
             rebuildable_artifacts: Vec::new(),
+            // Vuoto: nessun comando e' provatamente innocuo finche' il DB non
+            // lo dichiara. Fallisce verso il giudizio, mai verso il passaggio.
+            observation_commands: Vec::new(),
             step_gate_max_rejections: 2,
         }
     }
@@ -1401,6 +1412,11 @@ impl ToolDispatchNode {
     /// Critical), il gate non ha nulla da dire. Ritorna il livello massimo, i
     /// passi al livello alto (quelli che i validatori vedono) e la loro forma
     /// slim per il payload del meta_step.
+    ///
+    /// La costruzione del passo e la sua forma slim stanno fuori
+    /// ([`passo_da_validare`], [`forma_slim`]): la seconda DERIVA dalla prima,
+    /// e tenerle adiacenti e' cio' che impedisce di ricostruire l'accoppiamento
+    /// passo<->classificazione una seconda volta (vedi [`forma_slim`]).
     fn classifica_batch(
         &self,
         pending: &[Value],
@@ -1419,6 +1435,7 @@ impl ToolDispatchNode {
                     &self.cfg.fs_mutator_tools,
                     &self.cfg.step_gate_rules,
                     &self.cfg.rebuildable_artifacts,
+                    &self.cfg.observation_commands,
                 )
             })
             .collect();
@@ -1430,25 +1447,9 @@ impl ToolDispatchNode {
             .iter()
             .zip(&classificati)
             .filter(|(_, c)| c.level >= StepCriticality::Critical)
-            .map(|(p, c)| ports::PendingStepInfo {
-                tool_use_id: p
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                tool_name: p
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                tool_input: p.get("input").cloned().unwrap_or(Value::Null),
-                matched_category: c.matched_category.clone(),
-            })
+            .map(|(p, c)| passo_da_validare(p, c))
             .collect();
-        let steps_slim: Vec<Value> = critici
-            .iter()
-            .map(|s| json!({"tool_name": s.tool_name, "category": s.matched_category}))
-            .collect();
+        let steps_slim = critici.iter().map(forma_slim).collect();
         Some((level, critici, steps_slim))
     }
 
@@ -2708,6 +2709,48 @@ fn tool_content_as_object(content: &Value) -> Option<Value> {
             .filter(Value::is_object),
         _ => None,
     }
+}
+
+/// UN passo del batch nella forma che i validatori ricevono: il tool_use
+/// grezzo piu' cio' che la classificazione ha stabilito su di lui.
+fn passo_da_validare(
+    p: &Value,
+    c: &crate::decisions::step_gate::StepClassification,
+) -> ports::PendingStepInfo {
+    let stringa = |k: &str| {
+        p.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    ports::PendingStepInfo {
+        tool_use_id: stringa("id"),
+        tool_name: stringa("name"),
+        tool_input: p.get("input").cloned().unwrap_or(Value::Null),
+        matched_category: c.matched_category.clone(),
+        reach: c.reach,
+    }
+}
+
+/// La forma slim di un passo per il payload del meta_step `step_validation`.
+///
+/// La PORTATA entra accanto alla categoria: un passo notato senza che nessuna
+/// regola lo nomini ha `category: null`, e senza questo campo sarebbe
+/// indistinguibile da un passo che nessuno ha guardato (regola Q). E' il
+/// segnale che prima mancava del tutto.
+///
+/// Prende un [`ports::PendingStepInfo`] e non la coppia
+/// (tool_use, classificazione): la portata sta gia' nel campo, e ri-filtrare
+/// le classificazioni con lo STESSO predicato per riappaiarle con uno `zip`
+/// rifarebbe un accoppiamento che esiste gia'. Il giorno in cui i due
+/// predicati divergessero, il payload attribuirebbe a un passo la portata di
+/// un altro, in silenzio (regola L).
+fn forma_slim(s: &ports::PendingStepInfo) -> Value {
+    json!({
+        "tool_name": s.tool_name,
+        "category": s.matched_category,
+        "reach": s.reach.as_str(),
+    })
 }
 
 /// PUNTO UNICO (regola L) dell'enforcement advisory: usato da `dispatch_subagent(s)`
@@ -4575,6 +4618,128 @@ mod tests {
         }
     }
 
+    // ── (2a) La portata come pavimento del gate (mig 0688) ───────────────────
+
+    /// La config del gate COME LA DEPLOYA la mig 0688: mode `enforce`, le
+    /// regole lessicali che il DB porta gia', e il vocabolario che assolve.
+    fn cfg_gate_0688() -> ToolDispatchConfig {
+        ToolDispatchConfig {
+            step_gate_mode: crate::decisions::step_gate::StepGateMode::Enforce,
+            step_gate_rules: regole_kill(),
+            // Sottoinsieme letterale della mig 0688: qui basta che copra i
+            // comandi del test, non che sia l'elenco intero.
+            observation_commands: ["ls", "cat", "git status", "pwd"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            fs_mutator_tools: vec!["run_command".to_string(), "edit_file".to_string()],
+            ..ToolDispatchConfig::default()
+        }
+    }
+
+    /// I `pending_tool_uses` COME LI PRODUCE l'executor dalla risposta del
+    /// gateway, non un oggetto JSON ricostruito a mano (regola O, punto 1): il
+    /// campo su cui il gate decide nasce li', e un test che se lo fabbrica
+    /// fissa esattamente l'assunto che deve verificare.
+    fn pending_dal_gateway(chiamate: &[(&str, Value)]) -> Vec<Value> {
+        let resp = crate::runtime::ports::LlmResponse {
+            tool_calls: chiamate
+                .iter()
+                .enumerate()
+                .map(|(i, (nome, input))| crate::state::message::ToolUse {
+                    id: format!("toolu_{i}"),
+                    name: (*nome).to_string(),
+                    input: input.clone(),
+                    thought_signature: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        crate::nodes::executor::tool_uses_da_risposta(&resp)
+    }
+
+    /// IL CASO MISURATO il 09/08/2026 su gestione-corsi, portato fino alla
+    /// CONSEGUENZA (regola O, punto 2): non «`classify_step` ritorna la parola
+    /// critical», ma «il gate ha qualcosa da dire su questo batch».
+    ///
+    /// `classifica_batch` ritorna `None` quando il batch e' sotto soglia, cioe'
+    /// quando il passo 2a e' inerte e i validatori non vengono mai convocati.
+    /// Prima di questo criterio `dotnet ef database update` usciva `Mutating` e
+    /// questa funzione ritornava `None`: e' precisamente la ragione per cui
+    /// `nexus_agent_meta_steps` ha 45 righe `step_validation` in tutto lo
+    /// storico, l'ultima dello sviluppo del gate.
+    ///
+    /// MUTAZIONE: riportare il pavimento a `is_mutator_tool_name` (`Mutating`
+    /// per ogni mutatore) fa ritornare `None` e la prima `expect` fallisce col
+    /// messaggio del difetto reale.
+    #[test]
+    fn il_gate_convoca_sulla_migrazione_di_schema() {
+        let (n, _s, _rc) = node(cfg_gate_0688(), Arc::new(MapToolExecutor::new()));
+        let pending = pending_dal_gateway(&[(
+            "run_command",
+            json!({"command": "dotnet ef database update --project SchoolCoursesApi"}),
+        )]);
+
+        let (level, critici, slim) = n
+            .classifica_batch(&pending)
+            .expect("una migrazione di schema deve arrivare ai giudici");
+        assert_eq!(level, crate::decisions::step_gate::StepCriticality::Critical);
+        assert_eq!(critici.len(), 1);
+        assert_eq!(critici[0].tool_use_id, "toolu_0");
+        assert_eq!(
+            critici[0].matched_category, None,
+            "nessuna regola lessicale la nomina, ed e' esattamente il punto"
+        );
+        // Il payload DICHIARA la portata: senza, un passo notato fuori dalle
+        // regole sarebbe indistinguibile da uno che nessuno ha guardato.
+        assert_eq!(slim[0]["reach"], "unconfined");
+        assert_eq!(slim[0]["category"], Value::Null);
+    }
+
+    /// LA SOGLIA SUL COSTO, sullo stesso banco e per la stessa strada: il
+    /// batch fatto di sole osservazioni resta sotto soglia, quindi il passo 2a
+    /// non convoca nessuno. Senza questa meta' il criterio metterebbe due
+    /// chiamate LLM davanti a un `ls`, e un gate insostenibile e' un gate che
+    /// verra' spento.
+    ///
+    /// MUTAZIONE: far assolvere `riga_e_osservazione` per default (vocabolario
+    /// che non riconosce -> `true`) NON rompe questo test ma rompe
+    /// `il_gate_convoca_sulla_migrazione_di_schema`; toglierlo del tutto rompe
+    /// questo. I due si tengono per i capelli, ed e' voluto: sono le due meta'
+    /// della stessa soglia.
+    #[test]
+    fn il_gate_non_convoca_sulle_osservazioni() {
+        let (n, _s, _rc) = node(cfg_gate_0688(), Arc::new(MapToolExecutor::new()));
+        let pending = pending_dal_gateway(&[
+            ("run_command", json!({"command": "ls -la src"})),
+            ("run_command", json!({"command": "git status --short"})),
+            // Una write ordinaria resta `Mutating`: coperta da snapshot e
+            // review, fuori dal gate duale per la decisione del 04/08.
+            ("edit_file", json!({"path": "src/app.ts"})),
+        ]);
+        assert!(
+            n.classifica_batch(&pending).is_none(),
+            "due giudici davanti a `ls` renderebbero il gate insostenibile"
+        );
+
+        // E il batch MISTO non si assolve per maggioranza: basta il passo non
+        // confinato perche' il gate abbia qualcosa da dire, e solo QUELLO
+        // finisce davanti ai validatori.
+        let mut misto = pending;
+        misto.extend(pending_dal_gateway(&[(
+            "run_command",
+            json!({"command": "dotnet ef database update"}),
+        )]));
+        let (_l, critici, _slim) = n
+            .classifica_batch(&misto)
+            .expect("un passo non confinato nel batch basta a convocare");
+        assert_eq!(
+            critici.len(),
+            1,
+            "solo il passo sopra soglia va ai giudici: gli altri sono contorno"
+        );
+    }
+
     fn ctx_con_gate(gate: Arc<StubStepGate>) -> AgentNodeCtx {
         AgentNodeCtx {
             step_gate: Some(gate),
@@ -5052,6 +5217,7 @@ mod golden {
             step_gate_mode: d.step_gate_mode,
             step_gate_rules: d.step_gate_rules,
             rebuildable_artifacts: d.rebuildable_artifacts,
+            observation_commands: d.observation_commands,
             step_gate_max_rejections: d.step_gate_max_rejections,
         }
     }

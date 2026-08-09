@@ -2259,7 +2259,12 @@ fn risposta_vuota_a_turno_forzato(
 }
 
 /// Blocchi `tool_use` della risposta nella forma Value usata dallo stato.
-fn tool_uses_da_risposta(resp: &crate::runtime::ports::LlmResponse) -> Vec<Value> {
+/// `pub(crate)` per una ragione sola: i test del gate duale
+/// (`nodes::tool_dispatch`) devono raggiungere `classifica_batch` con i
+/// `pending_tool_uses` COME LI PRODUCE questa funzione, non con un oggetto
+/// JSON ricostruito a mano. Un test che fabbrica il proprio input fissa
+/// l'assunto che dovrebbe verificare (regola O, punto 1).
+pub(crate) fn tool_uses_da_risposta(resp: &crate::runtime::ports::LlmResponse) -> Vec<Value> {
     resp.tool_calls
         .iter()
         .map(|t| json!({"type": "tool_use", "id": t.id, "name": t.name, "input": t.input}))

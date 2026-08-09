@@ -1813,6 +1813,72 @@ assert_single "esecutore-suite-playwright" 'fn invocazione_suite' \
 assert_single "scomposizione-riga-shell" 'pub fn comandi' \
   'crates/nexus-agent-graph/src/decisions/shell_command.rs' crates
 
+# ── portata-del-passo (2026-08-09) ──────────────────────────────────────────
+# «Che cosa raggiunge questo passo, e chi lo puo' disfare?» ha UN punto unico:
+# e' il pavimento di criticita' del gate duale, al posto del dentro/fuori dal
+# vocabolario dei mutatori. Il difetto che ha chiuso: `run_command` cadeva in
+# `Mutating` come una `edit_file`, e `Mutating` non convoca in nessuna
+# modalita' — misurato il 09/08/2026, `dotnet ef database update` eseguito 5
+# volte senza che nessun giudice lo vedesse, e 45 sole righe `step_validation`
+# in tutto lo storico del progetto, l'ultima dello sviluppo del gate.
+assert_single "portata-del-passo" 'pub fn classifica_portata' \
+  'crates/nexus-agent-graph/src/decisions/step_reach.rs' crates
+
+# La collocazione di un path rispetto all'albero e' la stessa domanda per la
+# portata e per il declassamento degli irreversibili: due normalizzazioni
+# darebbero due idee diverse di «dentro».
+assert_single "portata-del-passo" 'pub fn colloca_path' \
+  'crates/nexus-agent-graph/src/decisions/step_reach.rs' crates
+
+# Il livello base di classify_step NON torna a nascere dal vocabolario dei
+# mutatori: e' esattamente la conflazione che rendeva il gate inerte. Cerca la
+# risalita diretta dentro step_gate.rs, dove la delega deve passare da
+# step_reach::classifica_portata.
+# Il filtro toglie le righe di commento: la documentazione del modulo CITA il
+# difetto per spiegarlo, e un guard che confonde la spiegazione con la
+# regressione costringerebbe a non documentarla.
+if grep -nE 'is_mutator_tool_name' crates/nexus-agent-graph/src/decisions/step_gate.rs \
+   | grep -vE '^[0-9]+: *(//|/\*|\*)' >/dev/null 2>&1; then
+  echo "!! portata-del-passo: step_gate torna a derivare il livello base dal" >&2
+  echo "   vocabolario dei mutatori. E' la conflazione misurata il 09/08/2026:" >&2
+  echo "   una run_command che esegue una migrazione di schema finisce nello" >&2
+  echo "   stesso livello di una edit_file, e quel livello non convoca mai." >&2
+  echo "   Il pavimento deve venire da step_reach::classifica_portata." >&2
+  fail=1
+else
+  echo "OK portata-del-passo: il pavimento di step_gate viene dalla portata"
+fi
+
+# La SOGLIA sul costo e' l'unico elenco che ASSOLVE, e vive nel DB (regola G).
+# Un vocabolario cablato nel codice sarebbe due verita': l'operatore ne
+# modificherebbe una e il gate leggerebbe l'altra. Il criterio non deve nominare
+# nessun comando: li riceve dal chiamante.
+if grep -nE '"(ls|cat|pwd|git status|git diff|git log)"' \
+     crates/nexus-agent-graph/src/decisions/step_reach.rs \
+   | grep -vE '^[0-9]+: *(//|/\*|\*)' \
+   | awk -v inizio="$(grep -n '#\[cfg(test)\]' crates/nexus-agent-graph/src/decisions/step_reach.rs | head -1 | cut -d: -f1)" \
+         -F: '$1 < inizio' | grep . >/dev/null 2>&1; then
+  echo "!! vocabolario-osservazione: step_reach nomina un comando concreto fuori" >&2
+  echo "   dai test. La soglia sul costo e' un DATO nel DB" >&2
+  echo "   (orchestrator.step_reach.observation_commands, mig 0688): cablarla nel" >&2
+  echo "   codice creerebbe una seconda verita' che l'operatore non puo' correggere." >&2
+  fail=1
+else
+  echo "OK vocabolario-osservazione: il criterio non nomina nessun comando"
+fi
+
+# L'assoluzione e' per RICONOSCIMENTO: un vocabolario vuoto non assolve nessuno.
+# E' il verso che distingue questo elenco da critical_step_rules, e senza la
+# guardia sul vuoto un DB non seminato renderebbe il gate di nuovo inerte —
+# nella direzione opposta, e altrettanto silenziosa.
+if grep -q 'if vocabolario.is_empty() {' crates/nexus-agent-graph/src/decisions/step_reach.rs; then
+  echo "OK vocabolario-osservazione: il vocabolario vuoto non assolve nessuno"
+else
+  echo "!! vocabolario-osservazione: sparita la guardia sul vocabolario vuoto." >&2
+  echo "   Senza, un DB non seminato deciderebbe da solo chi e' innocuo." >&2
+  fail=1
+fi
+
 # Regressione diretta: la registrazione a posteriori non deve tornare. Cerca la
 # DEFINIZIONE, non il nome: il commento che ne spiega la rimozione lo cita.
 if grep -rEln --include='*.rs' --exclude-dir=target 'fn record_playwright_job' crates >/dev/null 2>&1; then

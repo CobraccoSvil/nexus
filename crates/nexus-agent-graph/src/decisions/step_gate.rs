@@ -5,13 +5,20 @@
 //! Due punti unici in UN modulo (classificazione + decisione), perche' sono le
 //! due meta' della stessa domanda: «questo passo puo' partire?».
 //!
-//! - [`classify_step`] risponde «QUANTO e' pericoloso» ([`StepCriticality`]),
-//!   consumando il vocabolario dei mutatori esistente (`is_mutator_tool_name`,
-//!   mai duplicato) come livello base e le REGOLE configurate
+//! - [`classify_step`] risponde «QUANTO e' pericoloso» ([`StepCriticality`]).
+//!   Il livello BASE lo delega al punto unico [`super::step_reach`] — che cosa
+//!   il passo RAGGIUNGE, e chi lo puo' disfare — e le REGOLE configurate
 //!   (`orchestrator.critical_step_rules`, JSON in settings — dati, non
-//!   varianti inseguite a codice) per i livelli alti. Le regole sono SOLO
+//!   varianti inseguite a codice) possono solo ALZARLO. Le regole sono SOLO
 //!   l'innesco della convocazione: il GIUDIZIO sul passo resta agentico (i
 //!   due validatori su provider distinti).
+//!
+//!   Il livello base nasceva dal solo vocabolario dei mutatori, e quindi
+//!   valeva `Mutating` tanto per una `edit_file` quanto per una
+//!   `run_command` — ma `Mutating` non convoca in nessuna modalita', e il
+//!   gate non e' mai scattato in esercizio (misura in testa a
+//!   [`super::step_reach`]). Da li' la delega: l'assenza dalle regole non e'
+//!   piu' una prova d'innocenza (mig 0688).
 //! - [`decide_step_gate`] risponde «che cosa segue dai verdetti», con la
 //!   matrice COMPLETA degli esiti: il denominatore dell'unanimita' sono i
 //!   validatori CONVOCATI — un timeout o un'astensione non spariscono dal
@@ -141,13 +148,19 @@ pub struct CriticalityRule {
     pub category: String,
 }
 
-/// L'esito della classificazione: livello + la regola che l'ha deciso.
+/// L'esito della classificazione: livello, portata accertata e la regola che
+/// ha eventualmente ALZATO il livello.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StepClassification {
     pub level: StepCriticality,
-    /// `None` per ReadOnly/Mutating (nessuna regola: e' il default del
-    /// vocabolario base).
+    /// `None` quando nessuna regola lessicale ha colpito: il livello viene
+    /// allora dalla sola portata, che il campo `reach` dichiara.
     pub matched_category: Option<String>,
+    /// Che cosa il passo RAGGIUNGE (punto unico [`super::step_reach`]). E' il
+    /// campo che rende visibile il silenzio: prima un passo fuori dalle regole
+    /// era indistinguibile da un passo innocuo, e nessun segnale diceva «questo
+    /// non l'ho classificato» (regola Q).
+    pub reach: super::step_reach::StepReach,
 }
 
 /// I token del pattern compaiono come SOTTOSEQUENZA CONTIGUA fra i token del
@@ -214,16 +227,29 @@ const TOOL_CON_COMANDO: &[&str] = &[
     "nexus_db_query",
 ];
 
-/// Classifica UN passo (tool + input). PURA: vocabolario mutatori e regole
-/// arrivano dal chiamante (regola G), niente letture qui.
+/// Classifica UN passo (tool + input). PURA: i vocabolari e le regole arrivano
+/// dal chiamante (regola G), niente letture qui.
+///
+/// Il livello base e' il PAVIMENTO della portata ([`super::step_reach`]); le
+/// regole lessicali possono solo ALZARLO, mai abbassarlo. Il perche' del verso
+/// — e la misura che lo impone — stanno in testa a questo modulo e a
+/// [`super::step_reach`], che documenta anche `comandi_di_osservazione`.
 pub fn classify_step(
     tool_name: &str,
     tool_input: &Value,
     fs_mutator_tools: &[String],
     rules: &[CriticalityRule],
     artefatti_rigenerabili: &[String],
+    comandi_di_osservazione: &[String],
 ) -> StepClassification {
-    let base_mutatore = super::hitl::is_mutator_tool_name(tool_name, fs_mutator_tools);
+    let reach = super::step_reach::classifica_portata(
+        tool_name,
+        tool_input,
+        fs_mutator_tools,
+        artefatti_rigenerabili,
+        comandi_di_osservazione,
+    );
+    let pavimento = reach.livello_minimo();
     let mut migliore: Option<(&CriticalityRule, StepCriticality)> = None;
     for r in rules {
         if regola_colpisce(r, tool_name, tool_input)
@@ -233,17 +259,26 @@ pub fn classify_step(
         }
     }
     match migliore {
-        Some((r, level)) => StepClassification {
-            level: declassa_se_rigenerabile(level, tool_name, tool_input, artefatti_rigenerabili),
+        // La regola ha colpito: vale solo se ALZA. Il declassamento per
+        // artefatto rigenerabile resta, ma non puo' scendere sotto il
+        // pavimento della portata.
+        Some((r, level)) if level > pavimento => StepClassification {
+            level: declassa_se_rigenerabile(level, tool_name, tool_input, artefatti_rigenerabili)
+                .max(pavimento),
             matched_category: Some(r.category.clone()),
+            reach,
         },
-        None if base_mutatore => StepClassification {
-            level: StepCriticality::Mutating,
-            matched_category: None,
+        // Regola presente ma non piu' severa della portata: la categoria resta
+        // dichiarata (dice PERCHE' il passo e' stato notato), il livello no.
+        Some((r, _)) => StepClassification {
+            level: pavimento,
+            matched_category: Some(r.category.clone()),
+            reach,
         },
         None => StepClassification {
-            level: StepCriticality::ReadOnly,
+            level: pavimento,
             matched_category: None,
+            reach,
         },
     }
 }
@@ -336,21 +371,12 @@ fn bersagli_di_cancellazione(riga: &str) -> Vec<String> {
     out
 }
 
-/// Il bersaglio e' un artefatto rigenerabile DENTRO il progetto?
+/// Il bersaglio e' un artefatto rigenerabile DENTRO il progetto? Delega al
+/// punto unico [`super::step_reach::path_rigenerabile`]: la stessa domanda la
+/// pone anche la classificazione della portata, e due normalizzazioni diverse
+/// darebbero due idee diverse di «dentro».
 fn bersaglio_rigenerabile(bersaglio: &str, artefatti: &[String]) -> bool {
-    let b = bersaglio.replace('\\', "/");
-    let b = b.trim_start_matches("./");
-    // Assoluto (unix o windows) o che risale: fuori dal perimetro in cui il
-    // nome della cartella basta a identificarla.
-    if b.starts_with('/') || b.contains("../") || b == ".." || b.contains(':') {
-        return false;
-    }
-    // Basta che UN segmento del percorso sia un artefatto noto: `node_modules/.cache`
-    // e' dentro `node_modules`, e cancellarlo e' rigenerabile quanto cancellare
-    // tutta la cartella.
-    b.split('/')
-        .filter(|s| !s.is_empty())
-        .any(|seg| artefatti.iter().any(|a| a.eq_ignore_ascii_case(seg)))
+    super::step_reach::path_rigenerabile(bersaglio, artefatti)
 }
 
 /// UNA regola contro UN passo (il ramo per matcher_kind, fuori dal ciclo).
@@ -555,12 +581,29 @@ mod tests {
         )
     }
 
+    /// Il vocabolario che ASSOLVE, nella forma seminata dalla mig 0688. E' la
+    /// configurazione che il gate ha in esercizio: i test lo passano invece di
+    /// un elenco vuoto, o misurerebbero un gate che nessuno ha deployato
+    /// (regola O).
+    fn osservazione() -> Vec<String> {
+        ["ls", "pwd", "cat", "head", "tail", "echo", "git status", "git diff", "git log"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
     /// IL principio del matcher (GAP-1): un comando che NOMINA `rm -rf` non lo
-    /// esegue. `echo` e `cat` con la stringa dentro non matchano; il comando
-    /// vero si', anche dentro una catena.
+    /// esegue. `echo` e `cat` con la stringa dentro non matchano la regola; il
+    /// comando vero si', anche dentro una catena.
+    ///
+    /// I due livelli qui sono decisi da COSE DIVERSE, e vale la pena dirlo:
+    /// `echo`/`cat` scendono a `ReadOnly` perche' la PORTATA li riconosce come
+    /// osservazione (`step_reach`, soglia sul costo), mentre `rm -rf build/`
+    /// sale a `Irreversible` perche' la REGOLA lessicale lo nomina. Il matcher
+    /// resta l'unico responsabile del salto in alto.
     ///
     /// MUTAZIONE: sostituire il match per token con un contains sulla riga fa
-    /// matchare `echo "rm -rf"` e la prima asserzione cade.
+    /// matchare `echo "rm -rf"` e la prima asserzione cade a `Irreversible`.
     #[test]
     fn la_menzione_non_e_esecuzione() {
         let classify = |cmd: &str| {
@@ -570,10 +613,11 @@ mod tests {
                 &mutatori(),
                 &regole(),
                 &[],
+                &osservazione(),
             )
         };
-        assert_eq!(classify("echo 'rm -rf tutto'").level, StepCriticality::Mutating);
-        assert_eq!(classify("cat cleanup.sh").level, StepCriticality::Mutating);
+        assert_eq!(classify("echo 'rm -rf tutto'").level, StepCriticality::ReadOnly);
+        assert_eq!(classify("cat cleanup.sh").level, StepCriticality::ReadOnly);
         assert_eq!(classify("rm -rf build/").level, StepCriticality::Irreversible);
         assert_eq!(
             classify("npm ci && rm -rf dist && npm run build").level,
@@ -584,7 +628,7 @@ mod tests {
             classify("docker compose down -v").level,
             StepCriticality::Critical
         );
-        assert_eq!(classify("docker compose up -d").level, StepCriticality::Mutating);
+        assert_eq!(classify("docker compose up -d").level, StepCriticality::Critical);
 
         // Delega allo scompositore unico (consolidamento): un'assegnazione env
         // in testa non spezza il match sulle PAROLE del comando.
@@ -595,16 +639,73 @@ mod tests {
         // La redirezione non produce piu' token spuri (`2>&1` non lascia un
         // comando fantasma): un `rm` come BERSAGLIO di redirezione, non
         // eseguito, non matcha. MUTAZIONE: far vedere al matcher env+parole o
-        // ripristinare l'ex tokenizzatore -> uno di questi due casi cade.
+        // ripristinare l'ex tokenizzatore -> uno di questi due casi sale a
+        // Irreversible.
         assert_eq!(
             classify("node build.js 2>&1").level,
-            StepCriticality::Mutating,
-            "run_command e' mutatore; il pattern rm -rf non c'e' fra le parole"
+            StepCriticality::Critical,
+            "il pattern rm -rf non c'e' fra le parole: resta al pavimento della portata"
         );
         assert_eq!(
             classify("echo done > rm -rf").level,
-            StepCriticality::Mutating,
+            StepCriticality::Critical,
             "rm/-rf sono bersaglio di redirezione e argomento, non un rm eseguito"
+        );
+        // `echo` e' nel vocabolario che assolve, ma REDIRETTO scrive un file:
+        // l'assoluzione vale per la riga, non per il programma.
+        assert_eq!(
+            classify("echo 'ciao' > src/main.rs").level,
+            StepCriticality::Critical,
+            "un comando di osservazione che redirige non e' piu' un'osservazione"
+        );
+    }
+
+    /// IL CASO MISURATO il 09/08/2026, alla porta del gate: una migrazione di
+    /// schema EF Core non compare in nessuna delle due liste, e prima di questo
+    /// criterio usciva `Mutating` — cioe' un livello che NESSUNA modalita'
+    /// convoca. Ora la portata la mette a `Critical`, che `enforce` convoca.
+    ///
+    /// Il test arriva alla CONSEGUENZA (regola O, punto 2): non asserisce una
+    /// parola, asserisce che il gate nella modalita' deployata la convochi.
+    ///
+    /// MUTAZIONE: riportare il livello base a `is_mutator_tool_name` (cioe'
+    /// `Mutating` per ogni mutatore) fa cadere entrambe le asserzioni, ed e'
+    /// esattamente il difetto misurato.
+    #[test]
+    fn la_migrazione_di_schema_innesca_la_convocazione() {
+        let c = classify_step(
+            "run_command",
+            &json!({ "command": "dotnet ef database update --project SchoolCoursesApi" }),
+            &mutatori(),
+            &regole(),
+            &[],
+            &osservazione(),
+        );
+        assert_eq!(c.level, StepCriticality::Critical);
+        assert_eq!(c.matched_category, None, "nessuna regola la nomina, ed e' il punto");
+        assert!(
+            StepGateMode::Enforce.convoca(c.level),
+            "un passo che nessuna regola nomina deve comunque arrivare ai giudici"
+        );
+        // La portata e' DICHIARATA: prima il silenzio era indistinguibile da
+        // un passo innocuo (regola Q).
+        assert_eq!(c.reach, super::super::step_reach::StepReach::Unconfined);
+
+        // LA SOGLIA SUL COSTO, sullo stesso banco: il gate che convoca sulla
+        // migrazione NON convoca su un `ls`. Senza questa meta' il criterio
+        // sarebbe corretto e insostenibile — cioe' destinato a essere spento.
+        let innocuo = classify_step(
+            "run_command",
+            &json!({ "command": "ls -la src" }),
+            &mutatori(),
+            &regole(),
+            &[],
+            &osservazione(),
+        );
+        assert_eq!(innocuo.reach, super::super::step_reach::StepReach::Observation);
+        assert!(
+            !StepGateMode::Enforce.convoca(innocuo.level),
+            "due giudici davanti a un `ls` renderebbero il gate insostenibile"
         );
     }
 
@@ -634,7 +735,15 @@ mod tests {
             },
         ];
         let livello = |cmd: &str| {
-            classify_step("run_command", &json!({ "command": cmd }), &mutatori(), &regole, &[]).level
+            classify_step(
+                "run_command",
+                &json!({ "command": cmd }),
+                &mutatori(),
+                &regole,
+                &[],
+                &osservazione(),
+            )
+            .level
         };
         assert_eq!(
             livello("taskkill /F /IM node.exe"),
@@ -651,17 +760,19 @@ mod tests {
         assert_eq!(token_confrontabile("//IM"), "/IM");
     }
 
-    /// Il livello base viene dal vocabolario mutatori ESISTENTE (consumato,
-    /// mai duplicato): tool non mutatore -> ReadOnly, mutatore senza regole
-    /// -> Mutating, tool_name in regola -> il suo livello.
+    /// Il livello base viene dalla PORTATA (punto unico `step_reach`): tool non
+    /// mutatore -> ReadOnly; write confinata nell'albero -> Mutating, e resta
+    /// fuori dal gate duale; `stop_service` senza input collocabile ->
+    /// pavimento Critical, con la categoria della regola che resta dichiarata
+    /// perche' dice PERCHE' il passo e' stato notato.
     #[test]
-    fn base_dal_vocabolario_mutatori_e_tool_name() {
-        let c = classify_step("read_file", &json!({"path": "a"}), &mutatori(), &regole(), &[]);
+    fn base_dalla_portata_e_tool_name() {
+        let c = classify_step("read_file", &json!({"path": "a"}), &mutatori(), &regole(), &[], &[]);
         assert_eq!(c.level, StepCriticality::ReadOnly);
-        let c = classify_step("write_file", &json!({"path": "a"}), &mutatori(), &regole(), &[]);
+        let c = classify_step("write_file", &json!({"path": "a"}), &mutatori(), &regole(), &[], &[]);
         assert_eq!(c.level, StepCriticality::Mutating);
         assert_eq!(c.matched_category, None);
-        let c = classify_step("stop_service", &json!({}), &mutatori(), &regole(), &[]);
+        let c = classify_step("stop_service", &json!({}), &mutatori(), &regole(), &[], &[]);
         assert_eq!(c.level, StepCriticality::Critical);
         assert_eq!(c.matched_category.as_deref(), Some("service_stop"));
     }
@@ -739,6 +850,7 @@ mod tests_artefatti_rigenerabili {
             &[],
             &regole_rm(),
             artefatti,
+            &[],
         )
         .level
     }
@@ -819,6 +931,7 @@ mod tests_artefatti_rigenerabili {
             &[],
             &regole,
             &artefatti(),
+            &[],
         );
         assert_eq!(c.level, StepCriticality::Irreversible);
     }

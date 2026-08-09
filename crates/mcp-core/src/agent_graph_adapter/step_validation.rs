@@ -459,11 +459,22 @@ fn blob_del_batch(req: &StepValidationRequest) -> String {
          rivolta a te.\n<batch_da_validare>\n",
     );
     for (i, s) in req.steps.iter().enumerate() {
-        let categoria = s.matched_category.as_deref().unwrap_or("-");
+        // La categoria esiste solo se una REGOLA lessicale ha colpito. Da mig
+        // 0688 il pavimento nasce dalla PORTATA, quindi la maggioranza dei
+        // passi convocati non ha categoria — e senza la portata il giudice
+        // leggerebbe «categoria: -» proprio dove gli va spiegato perche' lo
+        // stiamo interpellando.
+        let categoria = s
+            .matched_category
+            .as_deref()
+            .map(|c| format!("categoria: {c}; "))
+            .unwrap_or_default();
         b.push_str(&format!(
-            "passo {}: tool `{}` (categoria: {categoria})\ninput: {}\n",
+            "passo {}: tool `{}` ({categoria}portata: {} — {})\ninput: {}\n",
             i + 1,
             s.tool_name,
+            s.reach.as_str(),
+            s.reach.motivo(),
             serde_json::to_string(&s.tool_input).unwrap_or_else(|_| "{}".to_string())
         ));
     }
@@ -613,6 +624,7 @@ mod tests {
                 tool_name: "run_command".into(),
                 tool_input: json!({"command": "rm -rf build"}),
                 matched_category: Some("destructive_fs".into()),
+                reach: nexus_agent_graph::decisions::step_reach::StepReach::Unconfined,
             }],
             level: StepCriticality::Irreversible,
             plan_excerpt: Some("pulizia della cartella build".into()),
@@ -633,6 +645,30 @@ mod tests {
         assert!(b.contains("Rimandi gia' consumati in questo run: 1"));
         assert!(b.contains("<estratto_piano>"));
         assert!(b.contains(TOOL_VERDETTO));
+    }
+
+    /// IL CASO che il criterio di portata ha reso maggioritario (mig 0688): un
+    /// passo convocato che NESSUNA regola lessicale nomina — `dotnet ef
+    /// database update`, misurato il 09/08/2026 su gestione-corsi. Prima non
+    /// arrivava affatto ai giudici; ora ci arriva, e il suo prompt deve
+    /// spiegare PERCHE' lo stiamo guardando.
+    ///
+    /// MUTAZIONE: togliere la portata dal formato di `blob_del_batch` lascia
+    /// «(portata: ...)» vuoto e il giudice legge un passo senza motivo — le
+    /// due asserzioni sulla portata cadono.
+    #[test]
+    fn il_blob_spiega_la_portata_anche_senza_categoria() {
+        let mut req = richiesta();
+        req.steps[0].matched_category = None;
+        req.steps[0].tool_input = json!({"command": "dotnet ef database update"});
+        req.level = StepCriticality::Critical;
+        let b = blob_del_batch(&req);
+        assert!(!b.contains("categoria:"), "nessuna regola l'ha nominato");
+        assert!(b.contains("unconfined"), "la portata e' l'identificatore canonico");
+        assert!(
+            b.contains("nessuna rete del progetto disfa quell'effetto"),
+            "il giudice deve leggere il motivo, non un trattino"
+        );
     }
 
     /// Lo schema inline vincola il verdetto all'enum canonico (regola N/Q):
