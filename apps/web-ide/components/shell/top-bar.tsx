@@ -59,7 +59,10 @@ function ProviderStatusIndicator({
   // Dettaglio testuale mostrato SOLO per stati non-ok (i provider verdi non hanno
   // riga di dettaglio: il nome + pallino bastano).
   const detailText = (state: ProviderHealthState): string => {
-    if (state.ok === null) return "Stato sconosciuto";
+    // "Stato sconosciuto" resta solo dove lo stato e' DAVVERO ignoto (gateway
+    // irraggiungibile): quando il backend dichiara perche' non c'e' ancora una
+    // misura, si mostra quella causa.
+    if (state.ok === null) return state.reason ?? "Stato sconosciuto";
     if (state.billing) return summarizeProviderReason(state.reason) ?? "Crediti/quota esauriti";
     return summarizeProviderReason(state.reason) ?? "Non disponibile";
   };

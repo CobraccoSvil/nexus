@@ -2808,6 +2808,28 @@ if [[ "$deleghe_ok" -eq 1 ]]; then
   echo "OK path-processo-esterno: argv ed echo usano la stessa resa"
 fi
 
+# Prontezza di un fornitore (2026-08-09). `healthy: Option<bool>` faceva di
+# «mai interrogato», «nessuno lo interroghera'», «non configurato» e «gateway
+# spento» un unico `null`, reso come un unico pallino grigio: quattro situazioni
+# con rimedi opposti. Il classificatore vive in un modulo solo e, soprattutto,
+# NON ricopia i criteri dei due cicli di verifica — li interroga.
+assert_single "prontezza-fornitore" 'pub fn classifica(' \
+  'crates/mcp-core/src/provider_readiness.rs' crates
+
+prontezza="crates/mcp-core/src/provider_readiness.rs"
+if [[ ! -f "$prontezza" ]]; then
+  echo "!! prontezza-fornitore: $prontezza non esiste piu'" >&2
+  fail=1
+elif ! grep -q 'model_health_probe::is_reprobe_candidate' "$prontezza"; then
+  echo "!! prontezza-fornitore: il classificatore non delega piu' a" >&2
+  echo "   is_reprobe_candidate. Con una copia del criterio, un fornitore che" >&2
+  echo "   il re-probe ha smesso di guardare continuerebbe a dichiararsi 'in" >&2
+  echo "   attesa' per sempre: lo stallo tornerebbe invisibile (regola L/O)." >&2
+  fail=1
+else
+  echo "OK prontezza-fornitore: l'ignoto e' una variante, e i cicli si interrogano"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

@@ -943,6 +943,13 @@ mod provider_names_tests {
         assert_eq!(ordine, vec!["a", "b", "c"]);
     }
 
+    /// Catalogo vuoto: questi test misurano la resa dell'OSSERVAZIONE, che ha
+    /// la precedenza sulla prontezza — il classificatore non li tocca.
+    fn catalog_facts(
+    ) -> std::collections::HashMap<String, Vec<crate::provider_readiness::ModelFact>> {
+        std::collections::HashMap::new()
+    }
+
     fn health_row(healthy: bool, error_kind: Option<&str>, error_message: Option<&str>) -> ProviderHealthRow {
         ProviderHealthRow {
             provider: "deepseek".to_string(),
@@ -970,7 +977,7 @@ mod provider_names_tests {
         let cooldown_map = std::collections::HashMap::new(); // cooldown scaduto/mai applicato
         let api_keys = std::collections::HashMap::new();
 
-        let entry = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys);
+        let entry = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys, &catalog_facts());
 
         assert_eq!(entry["healthy"], json!(false));
         assert_eq!(entry["error_kind"], json!("timeout"));
@@ -994,7 +1001,7 @@ mod provider_names_tests {
         );
         let api_keys = std::collections::HashMap::new();
 
-        let entry = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys);
+        let entry = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys, &catalog_facts());
 
         assert_eq!(entry["error"], json!("rate limit raggiunto ora"));
         assert_eq!(entry["cooldown_seconds_remaining"], json!(42));
@@ -1008,7 +1015,7 @@ mod provider_names_tests {
         let cooldown_map = std::collections::HashMap::new();
         let api_keys = std::collections::HashMap::new();
 
-        let entry = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys);
+        let entry = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys, &catalog_facts());
 
         assert_eq!(entry["healthy"], json!(true));
         assert!(entry.get("error").is_none());
@@ -1045,6 +1052,7 @@ fn build_providers_fallback(
     health_map: &std::collections::HashMap<String, ProviderHealthRow>,
     api_key_configured: &std::collections::HashMap<String, bool>,
     cooldown_map: &std::collections::HashMap<String, (u64, Option<String>)>,
+    catalog_facts: &std::collections::HashMap<String, Vec<crate::provider_readiness::ModelFact>>,
 ) -> Vec<serde_json::Value> {
     names
         .iter()
@@ -1056,6 +1064,18 @@ fn build_providers_fallback(
                 "configured": configured,
                 "healthy": serde_json::Value::Null,
             });
+            // Stessa prontezza dell'altro ramo: il gateway spento non cambia
+            // cio' che sappiamo della salute di un fornitore, e l'entry deve
+            // dire le stesse cose per non mostrare due stati diversi a seconda
+            // di quale servizio ha risposto.
+            crate::provider_readiness::scrivi_prontezza(
+                &mut p,
+                &crate::provider_readiness::classifica(
+                    configured,
+                    catalog_facts.get(name).map(Vec::as_slice).unwrap_or(&[]),
+                    health_map.get(name).map(|h| h.healthy),
+                ),
+            );
             if let Some(h) = health_map.get(name) {
                 p["healthy"] = json!(h.healthy);
                 p["last_health_check_at"] = json!(h.checked_at.to_rfc3339());
@@ -1069,6 +1089,7 @@ fn build_providers_fallback(
             }
             if let Some((secs, reason)) = cooldown_map.get(name) {
                 p["healthy"] = json!(false);
+                p["readiness"] = json!("down");
                 p["cooldown_seconds_remaining"] = json!(secs);
                 p["error"] = json!(reason.clone().unwrap_or_else(|| format!(
                     "In cooldown ({}s rimanenti) — l'AI userà un altro provider",
@@ -1129,6 +1150,7 @@ fn apply_cooldown_or_billing(
 ) {
     if let Some((secs, reason)) = cooldown_map.get(name) {
         p["healthy"] = json!(false);
+        p["readiness"] = json!("down");
         p["cooldown_seconds_remaining"] = json!(secs);
         p["error"] = json!(reason.clone().unwrap_or_else(|| format!(
             "In cooldown ({}s rimanenti) — l'AI userà un altro provider",
@@ -1150,6 +1172,7 @@ fn apply_cooldown_or_billing(
         // Aggiorna il JSON di risposta per coerenza immediata
         let cooldown_duration_secs: u64 = 6 * 3600;
         p["healthy"] = json!(false);
+        p["readiness"] = json!("down");
         p["cooldown_seconds_remaining"] = json!(cooldown_duration_secs);
         p["error"] = json!(billing_msg);
     }
@@ -1219,6 +1242,37 @@ async fn build_patched_providers(
     providers_patched
 }
 
+/// Le CINQUE fonti da cui si compone lo stato dei provider. Stanno insieme
+/// perche' i due handler che lo espongono le vogliono tutte e cinque, e
+/// caricarle a mano in due punti significa che il giorno in cui se ne aggiunge
+/// una — com'e' appena successo con i fatti di catalogo — uno dei due risponde
+/// con meno informazione dell'altro senza che nulla fallisca (regola L).
+struct FontiStatoProvider {
+    health_map: std::collections::HashMap<String, ProviderHealthRow>,
+    api_key_configured: std::collections::HashMap<String, bool>,
+    cooldown_map: std::collections::HashMap<String, (u64, Option<String>)>,
+    provider_names: Vec<String>,
+    catalog_facts: std::collections::HashMap<String, Vec<crate::provider_readiness::ModelFact>>,
+}
+
+impl FontiStatoProvider {
+    async fn carica(db: &sqlx::PgPool) -> Self {
+        let health_map = fetch_provider_health_map(db).await;
+        let api_key_configured = fetch_api_key_configured(db).await;
+        let cooldown_map = fetch_cooldown_map();
+        // Dipende dalle chiavi appena lette: l'ordine non e' cosmetico.
+        let provider_names = provider_names_for_status(db, &api_key_configured).await;
+        let catalog_facts = crate::provider_readiness::carica_fatti_catalogo(db).await;
+        Self {
+            health_map,
+            api_key_configured,
+            cooldown_map,
+            provider_names,
+            catalog_facts,
+        }
+    }
+}
+
 pub async fn gateway_providers_handler(
     axum::extract::State(state): axum::extract::State<crate::AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
@@ -1228,16 +1282,15 @@ pub async fn gateway_providers_handler(
         .build()
         .unwrap_or_default();
 
-    let cooldown_map = fetch_cooldown_map();
-    let health_map = fetch_provider_health_map(&state.db).await;
-    let api_key_configured = fetch_api_key_configured(&state.db).await;
-    let provider_names = provider_names_for_status(&state.db, &api_key_configured).await;
+    let f = FontiStatoProvider::carica(&state.db).await;
     let providers_fallback = build_providers_fallback(
-        &provider_names,
-        &health_map,
-        &api_key_configured,
-        &cooldown_map,
+        &f.provider_names,
+        &f.health_map,
+        &f.api_key_configured,
+        &f.cooldown_map,
+        &f.catalog_facts,
     );
+    let (health_map, cooldown_map) = (f.health_map, f.cooldown_map);
 
     // Nessun header di autorizzazione: `/providers` e' una rotta ESENTE nel
     // gateway (come `/health`). Prima si mandava un bearer statico, che qui non
@@ -1536,14 +1589,20 @@ pub async fn providers_status_internal(
     // mcp-core quando classify provider_error riconosce billing/rate_limit/
     // overloaded). Lo stesso dato e' esposto da
     // `/api/neural/providers/billing-cooldown`.
-    let health_map = fetch_provider_health_map(&state.db).await;
-    let api_key_configured = fetch_api_key_configured(&state.db).await;
-    let cooldown_map = fetch_cooldown_map();
-    let provider_names = provider_names_for_status(&state.db, &api_key_configured).await;
+    let f = FontiStatoProvider::carica(&state.db).await;
 
-    let providers: Vec<Value> = provider_names
+    let providers: Vec<Value> = f
+        .provider_names
         .iter()
-        .map(|name| build_provider_status_entry(name, &health_map, &cooldown_map, &api_key_configured))
+        .map(|name| {
+            build_provider_status_entry(
+                name,
+                &f.health_map,
+                &f.cooldown_map,
+                &f.api_key_configured,
+                &f.catalog_facts,
+            )
+        })
         .collect();
 
     Json(json!({ "providers": providers }))
@@ -1558,12 +1617,25 @@ fn build_provider_status_entry(
     health_map: &std::collections::HashMap<String, ProviderHealthRow>,
     cooldown_map: &std::collections::HashMap<String, (u64, Option<String>)>,
     api_key_configured: &std::collections::HashMap<String, bool>,
+    catalog_facts: &std::collections::HashMap<String, Vec<crate::provider_readiness::ModelFact>>,
 ) -> Value {
+    let configured = api_key_configured.get(name).copied().unwrap_or(false);
     let mut p = json!({
         "name": name,
-        "configured": api_key_configured.get(name).copied().unwrap_or(false),
+        "configured": configured,
         "healthy": serde_json::Value::Null,
     });
+    // `healthy: null` non dice PERCHE' non si sa nulla. La prontezza lo dichiara
+    // in un campo (regola Q), delegando al punto unico che interroga i due cicli
+    // di verifica reali.
+    crate::provider_readiness::scrivi_prontezza(
+        &mut p,
+        &crate::provider_readiness::classifica(
+            configured,
+            catalog_facts.get(name).map(Vec::as_slice).unwrap_or(&[]),
+            health_map.get(name).map(|h| h.healthy),
+        ),
+    );
     if let Some(h) = health_map.get(name) {
         p["healthy"] = json!(h.healthy);
         p["last_check"] = json!(h.checked_at.to_rfc3339());
@@ -1581,6 +1653,9 @@ fn build_provider_status_entry(
     }
     if let Some((secs, reason)) = cooldown_map.get(name) {
         p["healthy"] = json!(false);
+        // Il cooldown E' un'osservazione: due campi che raccontano lo stesso
+        // fornitore non possono contraddirsi nella stessa risposta.
+        p["readiness"] = json!("down");
         p["cooldown_seconds_remaining"] = json!(secs);
         if let Some(r) = reason {
             p["error"] = json!(r);

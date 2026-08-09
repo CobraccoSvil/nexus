@@ -47,7 +47,7 @@ const FALLBACK_PROBED_PROVIDERS: &[&str] = &["anthropic", "openai", "google", "d
 /// Provider da sondare in un round, derivati dal catalog (regola G/L): i
 /// provider con almeno un modello abilitato. Un provider nuovo (es. onboardato
 /// con la sua migrazione catalog) entra nel probe senza modifiche al codice.
-async fn probed_providers(db: &PgPool) -> Vec<String> {
+pub(crate) async fn probed_providers(db: &PgPool) -> Vec<String> {
     let from_db: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT provider FROM ai_price_catalog WHERE is_enabled = true ORDER BY provider",
     )

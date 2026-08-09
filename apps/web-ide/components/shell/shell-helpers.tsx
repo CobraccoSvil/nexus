@@ -287,9 +287,39 @@ export function summarizeProviderReason(reason?: string): string | undefined {
   return firstLine.length > 220 ? `${firstLine.slice(0, 217)}...` : firstLine;
 }
 
+/**
+ * Frase per un provider CONFIGURATO che non ha ancora una misura, ma che un
+ * ciclo di verifica raggiunge. Il testo si compone DAI campi che il backend
+ * dichiara (regola Q): qui non si deduce nulla, si traduce.
+ */
+export function awaitingReason(
+  cycle?: "periodic_probe" | "reprobe",
+  models?: number,
+): string {
+  const quanti = models && models > 0 ? ` (${models} modelli)` : "";
+  return cycle === "reprobe"
+    ? `In attesa della prima verifica${quanti}: i modelli sono in coda al re-probe, che gira ogni 30 minuti.`
+    : `In attesa del primo health probe${quanti}: gira ogni 5 minuti.`;
+}
+
+/**
+ * Frase per un provider CONFIGURATO che nessun ciclo di verifica raggiunge:
+ * non arrivera' nessuna misura da sola, serve un intervento.
+ */
+export function stalledReason(
+  cause?: "no_models" | "no_verification_cycle",
+  models?: number,
+): string {
+  if (cause === "no_models") {
+    return "Chiave configurata ma nessun modello a catalogo: nessun ciclo ne crea, serve la migrazione di onboarding o il discovery.";
+  }
+  const quanti = models && models > 0 ? `${models} modelli` : "I modelli";
+  return `${quanti} a catalogo, tutti disabilitati e nessuno in coda a un ciclo di verifica: il provider non tornera' su da solo.`;
+}
+
 export function providerTitle(label: string, state: ProviderHealthState): string {
   if (state.ok === null) {
-    return `${label} stato sconosciuto`;
+    return state.reason ? `${label}: ${state.reason}` : `${label} stato sconosciuto`;
   }
   if (state.ok) {
     return state.status ? `${label} disponibile (${state.status})` : `${label} disponibile`;
