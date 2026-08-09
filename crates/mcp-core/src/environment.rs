@@ -1058,24 +1058,9 @@ fn build_providers_fallback(
         .iter()
         .map(|name| {
             let name = name.as_str();
-            let configured = api_key_configured.get(name).copied().unwrap_or(false);
-            let mut p = json!({
-                "name": name,
-                "configured": configured,
-                "healthy": serde_json::Value::Null,
-            });
-            // Stessa prontezza dell'altro ramo: il gateway spento non cambia
-            // cio' che sappiamo della salute di un fornitore, e l'entry deve
-            // dire le stesse cose per non mostrare due stati diversi a seconda
-            // di quale servizio ha risposto.
-            crate::provider_readiness::scrivi_prontezza(
-                &mut p,
-                &crate::provider_readiness::classifica(
-                    configured,
-                    catalog_facts.get(name).map(Vec::as_slice).unwrap_or(&[]),
-                    health_map.get(name).map(|h| h.healthy),
-                ),
-            );
+            // Stessa prontezza dell'altro ramo, dallo stesso punto: il gateway
+            // spento non cambia cio' che sappiamo della salute di un fornitore.
+            let mut p = entry_con_prontezza(name, health_map, api_key_configured, catalog_facts);
             if let Some(h) = health_map.get(name) {
                 p["healthy"] = json!(h.healthy);
                 p["last_health_check_at"] = json!(h.checked_at.to_rfc3339());
@@ -1088,13 +1073,10 @@ fn build_providers_fallback(
                 apply_health_error(&mut p, h);
             }
             if let Some((secs, reason)) = cooldown_map.get(name) {
-                p["healthy"] = json!(false);
-                p["readiness"] = json!("down");
-                p["cooldown_seconds_remaining"] = json!(secs);
-                p["error"] = json!(reason.clone().unwrap_or_else(|| format!(
-                    "In cooldown ({}s rimanenti) — l'AI userà un altro provider",
-                    secs
-                )));
+                let testo = reason
+                    .clone()
+                    .unwrap_or_else(|| testo_cooldown_predefinito(*secs));
+                marca_cooldown(&mut p, *secs, Some(testo));
             }
             p
         })
@@ -1149,13 +1131,10 @@ fn apply_cooldown_or_billing(
     new_billing: &mut Vec<(String, String)>,
 ) {
     if let Some((secs, reason)) = cooldown_map.get(name) {
-        p["healthy"] = json!(false);
-        p["readiness"] = json!("down");
-        p["cooldown_seconds_remaining"] = json!(secs);
-        p["error"] = json!(reason.clone().unwrap_or_else(|| format!(
-            "In cooldown ({}s rimanenti) — l'AI userà un altro provider",
-            secs
-        )));
+        let testo = reason
+            .clone()
+            .unwrap_or_else(|| testo_cooldown_predefinito(*secs));
+        marca_cooldown(p, *secs, Some(testo));
     } else if let Some(billing_msg) = p.get("billing_error").and_then(|v| v.as_str()) {
         // Il gateway TypeScript ha rilevato un errore di billing:
         // imposta cooldown lungo e raccogliamo per la persistenza Redis.
@@ -1171,10 +1150,7 @@ fn apply_cooldown_or_billing(
         }
         // Aggiorna il JSON di risposta per coerenza immediata
         let cooldown_duration_secs: u64 = 6 * 3600;
-        p["healthy"] = json!(false);
-        p["readiness"] = json!("down");
-        p["cooldown_seconds_remaining"] = json!(cooldown_duration_secs);
-        p["error"] = json!(billing_msg);
+        marca_cooldown(p, cooldown_duration_secs, Some(billing_msg));
     }
 }
 
@@ -1619,23 +1595,7 @@ fn build_provider_status_entry(
     api_key_configured: &std::collections::HashMap<String, bool>,
     catalog_facts: &std::collections::HashMap<String, Vec<crate::provider_readiness::ModelFact>>,
 ) -> Value {
-    let configured = api_key_configured.get(name).copied().unwrap_or(false);
-    let mut p = json!({
-        "name": name,
-        "configured": configured,
-        "healthy": serde_json::Value::Null,
-    });
-    // `healthy: null` non dice PERCHE' non si sa nulla. La prontezza lo dichiara
-    // in un campo (regola Q), delegando al punto unico che interroga i due cicli
-    // di verifica reali.
-    crate::provider_readiness::scrivi_prontezza(
-        &mut p,
-        &crate::provider_readiness::classifica(
-            configured,
-            catalog_facts.get(name).map(Vec::as_slice).unwrap_or(&[]),
-            health_map.get(name).map(|h| h.healthy),
-        ),
-    );
+    let mut p = entry_con_prontezza(name, health_map, api_key_configured, catalog_facts);
     if let Some(h) = health_map.get(name) {
         p["healthy"] = json!(h.healthy);
         p["last_check"] = json!(h.checked_at.to_rfc3339());
@@ -1652,16 +1612,66 @@ fn build_provider_status_entry(
         apply_health_error(&mut p, h);
     }
     if let Some((secs, reason)) = cooldown_map.get(name) {
-        p["healthy"] = json!(false);
-        // Il cooldown E' un'osservazione: due campi che raccontano lo stesso
-        // fornitore non possono contraddirsi nella stessa risposta.
-        p["readiness"] = json!("down");
-        p["cooldown_seconds_remaining"] = json!(secs);
-        if let Some(r) = reason {
-            p["error"] = json!(r);
-        }
+        marca_cooldown(&mut p, *secs, reason.clone());
     }
     p
+}
+
+/// Entry di base di un provider: identita', `configured` e la PRONTEZZA.
+///
+/// Punto unico delle due rese dello stato provider (regola L). Divergono dopo
+/// — quella interna usa `last_check`/`latency_ms`/`error_kind`, quella di
+/// ripiego `last_health_*`/`last_known_*` — ma partono dagli stessi tre fatti,
+/// e tenerne due copie e' il modo in cui, aggiungendo la prontezza, una delle
+/// due sarebbe potuta restare indietro senza che nulla fallisse.
+///
+/// `healthy: null` da solo non dice PERCHE' non si sa nulla: la prontezza lo
+/// dichiara in un campo (regola Q), delegando al punto unico che interroga i
+/// due cicli di verifica reali.
+fn entry_con_prontezza(
+    name: &str,
+    health_map: &std::collections::HashMap<String, ProviderHealthRow>,
+    api_key_configured: &std::collections::HashMap<String, bool>,
+    catalog_facts: &std::collections::HashMap<String, Vec<crate::provider_readiness::ModelFact>>,
+) -> Value {
+    let configured = api_key_configured.get(name).copied().unwrap_or(false);
+    let mut p = json!({
+        "name": name,
+        "configured": configured,
+        "healthy": serde_json::Value::Null,
+    });
+    crate::provider_readiness::scrivi_prontezza(
+        &mut p,
+        &crate::provider_readiness::classifica(
+            configured,
+            catalog_facts.get(name).map(Vec::as_slice).unwrap_or(&[]),
+            health_map.get(name).map(|h| h.healthy),
+        ),
+    );
+    p
+}
+
+/// Marca l'entry come non disponibile per un cooldown attivo. Punto unico dei
+/// TRE call site (regola L): `healthy` e `readiness` raccontano lo stesso
+/// fornitore e non possono contraddirsi nella stessa risposta — un cooldown E'
+/// un'osservazione — e prima l'unico modo di tenerli allineati era ricordarsene
+/// in ogni ramo. `error` resta opzionale perche' la resa interna lo omette
+/// quando il cooldown non porta una reason.
+fn marca_cooldown(p: &mut Value, secs: u64, error: Option<String>) {
+    p["healthy"] = json!(false);
+    crate::provider_readiness::scrivi_prontezza(
+        p,
+        &crate::provider_readiness::ProviderReadiness::Observed { healthy: false },
+    );
+    p["cooldown_seconds_remaining"] = json!(secs);
+    if let Some(e) = error {
+        p["error"] = json!(e);
+    }
+}
+
+/// Testo di ripiego quando il cooldown non porta una reason propria.
+fn testo_cooldown_predefinito(secs: u64) -> String {
+    format!("In cooldown ({secs}s rimanenti) — l'AI userà un altro provider")
 }
 
 /// POST /api/admin/routing-matrix/auto-promote-now
