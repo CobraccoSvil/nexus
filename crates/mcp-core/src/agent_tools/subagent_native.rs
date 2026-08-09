@@ -2488,6 +2488,11 @@ async fn candidati_revisori(
         n,
         1,
         REVIEW_PANEL_DIVERSITY,
+        // Nessun veto qui: per il panel di review il fornitore del padre lo
+        // esclude gia' `veto_del_giudice`, sul percorso che risolve il modello
+        // di OGNI revisore (selezione + ripiego). Passarlo anche qui sarebbe
+        // una seconda espressione della stessa regola (regola L).
+        &[],
     )
     .await
     .unwrap_or_else(|resolution| {
@@ -5712,6 +5717,7 @@ mod tests {
             1,
             // Il criterio della PRODUZIONE, non uno scelto qui.
             REVIEW_PANEL_DIVERSITY,
+            &[],
         )
         .await
         .expect("candidati revisori");
