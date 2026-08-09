@@ -129,6 +129,9 @@ pub use nexus_tool_kit::sandbox;
 mod security;
 mod services_watchdog;
 mod session_autocommit;
+/// Punto unico del perimetro contabile del contatore di chat: quali run
+/// compongono l'insieme di cui si dichiara token e costo.
+mod session_usage;
 mod session_worklog;
 mod settings;
 mod static_preview;

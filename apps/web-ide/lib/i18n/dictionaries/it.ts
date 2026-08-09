@@ -1020,6 +1020,7 @@ export const it: PartialDictionary = {
     "chat.dettaglioSessione": "Dettaglio sessione",
     "chat.tokenTotali": "Token totali",
     "chat.costoTotale": "Costo totale",
+    "chat.diCuiRunCorrente": "Di cui il run corrente",
     "chat.budget": "Budget",
     "chat.ultimoInput": "Ultimo input",
     "radice.annulla": "Annulla",

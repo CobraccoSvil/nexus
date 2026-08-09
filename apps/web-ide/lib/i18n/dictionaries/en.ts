@@ -1027,6 +1027,7 @@ export const en = {
     "chat.dettaglioSessione": "Session details",
     "chat.tokenTotali": "Total tokens",
     "chat.costoTotale": "Total cost",
+    "chat.diCuiRunCorrente": "Of which the current run",
     "chat.budget": "Budget",
     "chat.ultimoInput": "Last input",
     "radice.annulla": "Cancel",
