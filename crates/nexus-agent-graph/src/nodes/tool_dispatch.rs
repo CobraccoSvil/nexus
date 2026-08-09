@@ -1360,7 +1360,7 @@ impl ToolDispatchNode {
 
         let esito = self.decidi(&report, level, prior_rejections);
         let payload = payload_convocazione(&esito, level, steps_slim, &report, prior_rejections);
-        self.emetti_meta_validazione(ctx, state, esito.decision(), level, &report, payload.clone())
+        self.emetti_meta_validazione(ctx, state, &esito, level, &report, payload.clone())
             .await;
 
         self.esito_decisione(esito, state, pending, &report, prior_rejections, run_id, payload)
@@ -1602,7 +1602,7 @@ impl ToolDispatchNode {
         &self,
         ctx: &AgentNodeCtx,
         state: &AgentState,
-        decision: &crate::decisions::step_gate::StepGateDecision,
+        esito: &EsitoGate,
         level: crate::decisions::step_gate::StepCriticality,
         report: &ports::StepValidationReport,
         payload: Value,
@@ -1612,7 +1612,7 @@ impl ToolDispatchNode {
             ctx.emit.as_ref(),
             self.meta_steps.as_ref(),
             crate::decisions::step_gate::STEP_VALIDATION_META_KIND,
-            titolo_per_umano(decision, level, report, interpella),
+            titolo_per_umano(esito, level, report, interpella),
             payload,
         )
         .await;
@@ -2445,7 +2445,7 @@ pub fn tool_target_from_input(input: &Value) -> Option<String> {
 /// distinti: nessun giudice disponibile (fatto d'ambiente, oggi il caso piu'
 /// frequente per credito esaurito), giudizi non unanimi, rifiuto motivato.
 fn titolo_per_umano(
-    decision: &crate::decisions::step_gate::StepGateDecision,
+    esito: &EsitoGate,
     level: crate::decisions::step_gate::StepCriticality,
     report: &ports::StepValidationReport,
     interpella_umano: bool,
@@ -2456,7 +2456,17 @@ fn titolo_per_umano(
     } else {
         "critico"
     };
-    match decision {
+    // La chiusura del run e' l'esito piu' forte e va detta per prima: e' la
+    // sola riga da cui l'utente capisce che non sta piu' aspettando nulla. In
+    // Conferma la stessa condizione e' invece una domanda, e li' il titolo
+    // resta quello della domanda.
+    if esito.blocco().is_some_and(|b| b.ferma_il_run()) && !interpella_umano {
+        return format!(
+            "Passo {passo} NON autorizzato e run FERMATO: {}",
+            crate::decisions::step_gate::GateBlock::RetriesExhausted.motivo()
+        );
+    }
+    match esito.decision() {
         StepGateDecision::Approved => {
             format!("Passo {passo} approvato dai validatori: l'esecuzione prosegue")
         }
@@ -2694,30 +2704,10 @@ fn testo_rimando(
     report: &ports::StepValidationReport,
     blocco: crate::decisions::step_gate::GateBlock,
 ) -> String {
-    use crate::decisions::step_gate::StepVerdict;
-    let mut motivi: Vec<String> = Vec::new();
-    for v in report.verdicts.iter().filter(|v| v.verdict == StepVerdict::Reject) {
-        for r in &v.reasons {
-            motivi.push(format!(
-                "[{}] {} ({})",
-                r.get("severity").and_then(Value::as_str).unwrap_or("-"),
-                r.get("description").and_then(Value::as_str).unwrap_or("-"),
-                v.provider
-            ));
-        }
-    }
     let mut testo = format!(
         "{}\nMotivi:\n{}",
         intestazione_rimando(report, blocco),
-        if motivi.is_empty() {
-            "- (nessun verdetto espresso dai validatori)".to_string()
-        } else {
-            motivi
-                .iter()
-                .map(|m| format!("- {m}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
+        motivi_di_rifiuto(report)
     );
     if let Some(a) = report
         .verdicts
@@ -2726,12 +2716,44 @@ fn testo_rimando(
     {
         testo.push_str(&format!("\nAlternativa piu' sicura proposta: {a}"));
     }
-    // Cosa FARE ora dipende dalla natura del blocco, ed e' la meta' che
-    // mancava: «rivedi il passo» davanti a un quorum mancante manda l'agente a
-    // correggere qualcosa che nessuno gli ha contestato — che e' precisamente
-    // il giro dei nove script.
+    testo.push_str(prossima_mossa(blocco));
+    testo
+}
+
+/// L'elenco dei motivi dichiarati da chi ha RIFIUTATO, gia' impaginato. Vuoto
+/// quando nessuno ha espresso un verdetto: e' la forma in cui il modello legge
+/// che il blocco non nasce da un giudizio sul suo passo.
+fn motivi_di_rifiuto(report: &ports::StepValidationReport) -> String {
+    use crate::decisions::step_gate::StepVerdict;
+    let motivi: Vec<String> = report
+        .verdicts
+        .iter()
+        .filter(|v| v.verdict == StepVerdict::Reject)
+        .flat_map(|v| {
+            v.reasons.iter().map(move |r| {
+                format!(
+                    "- [{}] {} ({})",
+                    r.get("severity").and_then(Value::as_str).unwrap_or("-"),
+                    r.get("description").and_then(Value::as_str).unwrap_or("-"),
+                    v.provider
+                )
+            })
+        })
+        .collect();
+    if motivi.is_empty() {
+        "- (nessun verdetto espresso dai validatori)".to_string()
+    } else {
+        motivi.join("\n")
+    }
+}
+
+/// Che cosa il modello deve FARE ora, e dipende dalla natura del blocco: e' la
+/// meta' che mancava. «Rivedi il passo» davanti a un quorum mancante manda
+/// l'agente a correggere qualcosa che nessuno gli ha contestato — che e'
+/// precisamente il giro dei nove script del 09/08/2026.
+fn prossima_mossa(blocco: crate::decisions::step_gate::GateBlock) -> &'static str {
     use crate::decisions::step_gate::GateBlock;
-    testo.push_str(match blocco {
+    match blocco {
         GateBlock::StepRejected => {
             "\nRivedi il passo: proponi una variante piu' sicura o motiva nel piano \
              perche' il passo e' necessario cosi'."
@@ -2743,8 +2765,7 @@ fn testo_rimando(
         GateBlock::RetriesExhausted => {
             "\nNessun altro tentativo verra' valutato in questo run."
         }
-    });
-    testo
+    }
 }
 
 /// `created_at` resta `None` (come `planner_node`): il timestamp e' assegnato a
@@ -4957,8 +4978,13 @@ mod tests {
             verdicts: vec![verdetto("gatekeeper", StepVerdict::Approve), astenuto],
             degraded: None,
         };
+        use crate::decisions::step_gate::GateBlock;
+        let fermo = |blocco| EsitoGate::Fermo {
+            decision: StepGateDecision::NeedsHuman,
+            blocco,
+        };
         let con_umano = titolo_per_umano(
-            &StepGateDecision::NeedsHuman,
+            &fermo(GateBlock::NotJudgeable),
             StepCriticality::Irreversible,
             &report,
             true,
@@ -4968,7 +4994,7 @@ mod tests {
             "in Conferma la domanda viene posta davvero: {con_umano}"
         );
         let in_autonomia = titolo_per_umano(
-            &StepGateDecision::NeedsHuman,
+            &fermo(GateBlock::NotJudgeable),
             StepCriticality::Irreversible,
             &report,
             false,
@@ -4978,6 +5004,33 @@ mod tests {
                 && !in_autonomia.contains("serve la tua conferma"),
             "in autonomia il titolo dichiara il passo non autorizzato, non una \
              conferma che nessuno chiedera': {in_autonomia}"
+        );
+
+        // Il terzo caso, che prima non esisteva: in autonomia il run non
+        // prosegue affatto. Dire «passo non autorizzato» e basta lascerebbe
+        // credere che il run stia continuando senza quel passo — che e'
+        // esattamente cio' che accadeva, nove volte di fila.
+        let chiuso = titolo_per_umano(
+            &fermo(GateBlock::RetriesExhausted),
+            StepCriticality::Critical,
+            &report,
+            false,
+        );
+        assert!(
+            chiuso.contains("run FERMATO"),
+            "quando il run si chiude il nastro deve dirlo: {chiuso}"
+        );
+        // In Conferma la stessa condizione resta una DOMANDA, e il titolo non
+        // deve annunciare una chiusura che non avviene.
+        let chiesto = titolo_per_umano(
+            &fermo(GateBlock::RetriesExhausted),
+            StepCriticality::Critical,
+            &report,
+            true,
+        );
+        assert!(
+            chiesto.contains("serve la tua conferma") && !chiesto.contains("run FERMATO"),
+            "dove un umano c'e', il tetto dei rimandi e' una domanda: {chiesto}"
         );
     }
 
