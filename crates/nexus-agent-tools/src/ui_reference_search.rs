@@ -25,6 +25,7 @@
 //!    porta con se' contesto del progetto. Nulla del codice o dei dati
 //!    dell'utente esce da qui.
 
+use nexus_types::tool_outcome::{NaturaFallimento, RispostaTool};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
@@ -106,18 +107,28 @@ async fn provider_di_ricerca(db: &PgPool) -> Result<(String, String), String> {
 /// Input: `{ query: string }`.
 /// Output: `{ query, results, model_used }`, dove `results` e' testo esterno
 /// gia' dichiarato come tale.
-pub async fn tool_ui_reference_search(ctx: &ToolContextCore, input: &Value) -> String {
-    let query = match input.get("query").and_then(Value::as_str) {
-        Some(q) => normalizza_query(q),
-        None => String::new(),
+pub async fn tool_ui_reference_search(ctx: &ToolContextCore, input: &Value) -> RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::UiReferenceSearchInput};
+
+    let params = match UiReferenceSearchInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
+    // Il contratto pretende che il campo ci sia; che sia NON VUOTO dopo la
+    // normalizzazione lo puo' dire solo qui.
+    let query = normalizza_query(&params.query);
     if query.is_empty() {
-        return crate::errore_json("parametro 'query' obbligatorio e non vuoto");
+        return crate::errore_tool(
+            "parametro 'query' obbligatorio e non vuoto",
+            NaturaFallimento::Rimediabile,
+        );
     }
 
     let (provider, model) = match provider_di_ricerca(&ctx.db).await {
         Ok(pm) => pm,
-        Err(e) => return crate::errore_json(e),
+        // Nessun provider configurato per questa ricerca: e' configurazione di
+        // piattaforma, e riformulare la query non la cambia.
+        Err(e) => return crate::errore_tool(e, NaturaFallimento::DelSistema),
     };
 
     match nexus_types::gateway_client::gateway_text_complete(
@@ -130,19 +141,31 @@ pub async fn tool_ui_reference_search(ctx: &ToolContextCore, input: &Value) -> S
     )
     .await
     {
-        Ok(testo) if testo.trim().is_empty() => json!({
-            "query": query,
-            "results": Value::Null,
-            "message": "la ricerca non ha prodotto risultati",
-        })
-        .to_string(),
-        Ok(testo) => json!({
-            "query": query,
-            "results": avvolgi_contenuto_esterno(testo.trim()),
-            "model_used": model,
-        })
-        .to_string(),
-        Err(e) => crate::errore_json(format!("ricerca fallita: {e}")),
+        // Nessun risultato e' una RISPOSTA, non un fallimento: la ricerca ha
+        // funzionato e non ha trovato nulla.
+        Ok(testo) if testo.trim().is_empty() => RispostaTool::riuscito(
+            json!({
+                "query": query,
+                "results": Value::Null,
+                "message": "la ricerca non ha prodotto risultati",
+            })
+            .to_string(),
+        ),
+        Ok(testo) => RispostaTool::riuscito(
+            json!({
+                "query": query,
+                "results": avvolgi_contenuto_esterno(testo.trim()),
+                "model_used": model,
+            })
+            .to_string(),
+        ),
+        // La chiamata al gateway non e' arrivata a destinazione: TRANSITORIO —
+        // un fornitore momentaneamente saturo o un timeout sono la causa
+        // tipica, e ritentare la stessa query e' la strategia giusta.
+        Err(e) => crate::errore_tool(
+            format!("ricerca fallita: {e}"),
+            NaturaFallimento::Transitorio,
+        ),
     }
 }
 

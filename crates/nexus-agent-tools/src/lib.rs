@@ -103,9 +103,15 @@ pub(crate) fn errore_tool(
     messaggio: impl std::fmt::Display,
     natura: nexus_types::tool_outcome::NaturaFallimento,
 ) -> nexus_types::tool_outcome::RispostaTool {
-    nexus_types::tool_outcome::RispostaTool::fallito(
-        serde_json::json!({ "error": messaggio.to_string() }).to_string(),
-    )
-    .con_natura(natura)
+    errore_tool_con_dettagli(serde_json::json!({ "error": messaggio.to_string() }), natura)
+}
+
+/// Come [`errore_tool`] quando il corpo porta anche campi oltre `error` — il
+/// verdetto di un audit, un `hint` con l'azione corretta.
+pub(crate) fn errore_tool_con_dettagli(
+    dettagli: serde_json::Value,
+    natura: nexus_types::tool_outcome::NaturaFallimento,
+) -> nexus_types::tool_outcome::RispostaTool {
+    nexus_types::tool_outcome::RispostaTool::fallito(dettagli.to_string()).con_natura(natura)
 }
 

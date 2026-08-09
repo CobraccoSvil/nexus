@@ -42,6 +42,7 @@
 //! ([`collect_evidence`]): il criterio si testa senza filesystem, e i test del
 //! criterio passano dal produttore vero invece di fabbricare l'evidenza a mano.
 
+use nexus_types::tool_outcome::{NaturaFallimento, RispostaTool};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -982,36 +983,70 @@ pub fn parse_frameworks(grezzo: &Option<String>) -> Vec<UtilityFramework> {
 /// Sola lettura, nessun effetto. Ritorna il verdetto strutturato, l'evidenza che
 /// lo sostiene e il passo successivo: chi legge non deve dedurre nulla dal testo
 /// (regola M).
-pub async fn tool_ui_styling_audit(ctx: &ToolContextCore, input: &Value) -> String {
-    let target_rel = input
-        .get("target_dir")
-        .and_then(Value::as_str)
+/// MIGRATO al contratto d'ingresso e a `RispostaTool` (regola Q).
+///
+/// Tre esiti che prima erano due. Un verdetto NEGATIVO non e' un tool fallito:
+/// la misura e' riuscita, e cio' che dichiara e' lo stato del progetto —
+/// confonderli manderebbe l'agente a ripetere l'audit invece di correggere lo
+/// stile che l'audit ha appena descritto.
+///
+/// `VocabolarioAssente` invece SI', ed e' la distinzione che questo modulo
+/// esiste per tenere: non e' un verdetto sullo stile, e' l'assenza dello
+/// strumento con cui lo si giudica. Usciva come un successo il cui corpo portava
+/// un campo `error`, cioe' proprio la forma che rende un difetto invisibile a
+/// chi legge l'esito invece del testo. DEL SISTEMA: manca una migrazione, non un
+/// parametro.
+///
+/// Un `target_dir` invalido o inesistente resta RIMEDIABILE: e' un parametro che
+/// l'agente controlla, e i messaggi dicono cosa non va.
+pub async fn tool_ui_styling_audit(ctx: &ToolContextCore, input: &Value) -> RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::UiStylingAuditInput};
+
+    let params = match UiStylingAuditInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
+    };
+    let target_rel = params
+        .target_dir
+        .as_deref()
         .map(|s| s.trim().trim_start_matches('/'))
         .filter(|s| !s.is_empty())
         .unwrap_or(".");
     let root = match nexus_types::workspace_paths::normalize_into_root(&ctx.root_path, target_rel) {
         Ok(clean) => ctx.root_path.join(&clean),
-        Err(e) => return crate::errore_json(format!("target_dir non valido: {}", e.message())),
+        // Percorso rifiutato dal normalizzatore: rimediabile, e il messaggio
+        // dell'errore dice gia' che cosa non va nel valore passato.
+        Err(e) => {
+            return crate::errore_tool(
+                format!("target_dir non valido: {}", e.message()),
+                NaturaFallimento::Rimediabile,
+            )
+        }
     };
     if !root.is_dir() {
-        return crate::errore_json(format!("target_dir '{target_rel}' non esiste nel progetto"));
+        return crate::errore_tool(
+            format!("target_dir '{target_rel}' non esiste nel progetto"),
+            NaturaFallimento::Rimediabile,
+        );
     }
 
     let voc = load_vocabulary(&ctx.db).await;
     if !voc.e_utilizzabile() {
-        return json!({
-            "verdict": StylingVerdict::VocabolarioAssente.key(),
-            "error": format!(
-                "vocabolario di riconoscimento non configurato ({K_SOURCE} / {K_SHEET}): \
-                 applicare la migrazione che lo introduce prima di usare questo tool"
-            ),
-        })
-        .to_string();
+        return crate::errore_tool_con_dettagli(
+            json!({
+                "verdict": StylingVerdict::VocabolarioAssente.key(),
+                "error": format!(
+                    "vocabolario di riconoscimento non configurato ({K_SOURCE} / {K_SHEET}): \
+                     applicare la migrazione che lo introduce prima di usare questo tool"
+                ),
+            }),
+            NaturaFallimento::DelSistema,
+        );
     }
 
     let ev = collect_evidence(&root, &voc).await;
     let verdict = classify_styling(&ev, &voc);
-    render(&verdict, &ev, target_rel)
+    RispostaTool::riuscito(render(&verdict, &ev, target_rel))
 }
 
 /// Serializza verdetto ed evidenza. Il campo `next_step` non e' cortesia: e'

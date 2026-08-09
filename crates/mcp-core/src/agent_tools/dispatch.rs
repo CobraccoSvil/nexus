@@ -116,6 +116,14 @@ async fn esegui_tool_migrato(
         // estrattori di documenti, ora condivisi (`documento_da_allegato`,
         // `uuid_allegato`, accanto a `load_attachment`).
         "nexus_list_archive_entries" => Some(archive_tools::tool_nexus_list_archive_entries(ctx, input).await),
+        // I tre tool di lente UI. `ui_styling_audit` e' quello dove l'esito nel
+        // campo cambia una lettura: `VocabolarioAssente` non e' un verdetto
+        // sullo stile del progetto, e' l'assenza dello strumento con cui lo si
+        // giudica — e usciva come un successo il cui corpo portava un campo
+        // `error`.
+        "ui_layout_patterns" => Some(ui_patterns::tool_ui_layout_patterns(&ctx.core.db, input).await),
+        "ui_reference_search" => Some(ui_reference_search::tool_ui_reference_search(&ctx.core, input).await),
+        "ui_styling_audit" => Some(ui_styling::tool_ui_styling_audit(&ctx.core, input).await),
         // Ogni suo fallimento e' RIMEDIABILE e lo dichiara nel campo `natura`:
         // e' il primo tool a farlo, ed e' quello su cui la mancanza si
         // misurava (11% di `old_string non trovato` seguiti da una ripetizione
@@ -254,17 +262,8 @@ async fn esegui_tool_legacy(
         "dispatcher_highlight_panel" => {
             dispatcher::tool_dispatcher_highlight_panel(ctx, input).await
         }
-        // ── Catalogo pattern di layout (trasversale ai progetti) ───────────
-        "ui_layout_patterns" => ui_patterns::tool_ui_layout_patterns(&ctx.core.db, input).await,
-        // Lo stile DICHIARATO dal codice e' applicato? Fatto misurabile, non
-        // giudizio di gusto: e' la sola voce della lente di interfaccia che un
-        // revisore non puo' verificare leggendo un file per volta.
-        "ui_styling_audit" => ui_styling::tool_ui_styling_audit(&ctx.core, input).await,
         // Unico tool che guarda FUORI dal progetto: cio' che torna e' DATO, e
         // arriva gia' dichiarato come non fidato (vedi il modulo).
-        "ui_reference_search" => {
-            ui_reference_search::tool_ui_reference_search(&ctx.core, input).await
-        }
         // ── Knowledge Base per-progetto ────────────────────────────────────
         "knowledge_search" => knowledge::tool_knowledge_search(ctx, input).await,
         "code_doc" => knowledge::tool_code_doc(ctx, input).await,
