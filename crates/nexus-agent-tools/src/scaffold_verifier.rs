@@ -5,10 +5,21 @@
 //!
 //! Scopo: evitare il loop iterativo "avvia → 404/import error → diagnose →
 //! fix → riavvia" eliminando i bug noti PRIMA del primo run.
+//!
+//! DIVERGENZA CHIUSA: l'handler leggeva anche un campo `apply` (default true)
+//! per la sola ispezione senza scritture, ma quel campo non e' mai stato
+//! dichiarato ne' nel contratto d'ingresso ne' nel catalogo che il modello
+//! legge — nessun chiamante poteva impostarlo, e il ramo "sola ispezione" era
+//! irraggiungibile per costruzione. Ora l'handler legge esattamente cio' che il
+//! contratto dichiara. Ridare quella capacita' significa DICHIARARLA (contratto
+//! in `tool_inputs.rs` piu' catalogo in `tool_schema.rs`), non rileggerla di
+//! nascosto dall'input grezzo aggirando il contratto.
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tokio::fs;
+
+use nexus_types::tool_outcome::{NaturaFallimento, RispostaTool};
 
 use super::ToolContextCore;
 
@@ -34,22 +45,35 @@ struct InconsistentImport {
     suggested_path: Option<String>,
 }
 
-pub async fn tool_nexus_verify_scaffold(ctx: &ToolContextCore, input: &Value) -> String {
-    let target_rel = input
-        .get("target_dir")
-        .and_then(Value::as_str)
+pub async fn tool_nexus_verify_scaffold(ctx: &ToolContextCore, input: &Value) -> RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::NexusVerifyScaffoldInput};
+
+    let params = match NexusVerifyScaffoldInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
+    };
+    // `filter` PRIMA di `unwrap_or`, non dopo: con `target_dir: "/"` (o "" o soli
+    // spazi) il trim lascia una stringa VUOTA, e il ripiego non scattava perche'
+    // il campo era `Some`. Il percorso composto piu' avanti diventava allora
+    // `/index.html` — assoluto — che `normalize_into_root` respinge come fuori
+    // dalla radice: l'agente riceveva `DelSistema` («cambia strada») per un
+    // parametro che gli bastava riscrivere.
+    let target_rel = params
+        .target_dir
+        .as_deref()
         .map(|s| s.trim().trim_start_matches('/'))
+        .filter(|s| !s.is_empty())
         .unwrap_or(".");
     let target = match resolve_target_dir(&ctx.root_path, target_rel) {
         Ok(t) => t,
-        Err(err_json) => return err_json,
+        Err(risposta) => return risposta,
     };
 
     // Rileva project kind (oggi: vite+react+ts; estendibile)
-    let pkg_json_path = target.join("package.json");
-    if !pkg_json_path.exists() {
-        return missing_package_json_report();
-    }
+    let pkg = match carica_package_json(&target.join("package.json")).await {
+        Ok(pkg) => pkg,
+        Err(risposta) => return risposta,
+    };
 
     let mut result = VerifyResult {
         project_kind: "vite-react-ts".into(),
@@ -58,9 +82,6 @@ pub async fn tool_nexus_verify_scaffold(ctx: &ToolContextCore, input: &Value) ->
         package_json_issues: Vec::new(),
         suggested_fixes: Vec::new(),
     };
-
-    let pkg_content = fs::read_to_string(&pkg_json_path).await.unwrap_or_default();
-    let pkg: Value = serde_json::from_str(&pkg_content).unwrap_or(json!({}));
     check_package_scripts(&pkg, &mut result);
     let all_deps = collect_all_deps(&pkg);
 
@@ -73,45 +94,100 @@ pub async fn tool_nexus_verify_scaffold(ctx: &ToolContextCore, input: &Value) ->
 
     build_suggested_fixes(target_rel, &mut result);
 
-    let apply = input.get("apply").and_then(Value::as_bool).unwrap_or(true);
-    let (applied, apply_errors) = run_auto_apply(&ctx.root_path, &target, &result, apply).await;
-    render_report(&result, target_rel, &applied, &apply_errors, apply)
+    // Il verifier non si limita a SUGGERIRE: applica i fix deterministici e
+    // idempotenti (regola H). Motivo: il bug del doppio router NON rompe il
+    // build (vite compila lo stesso), quindi l'agente vede "build OK" e chiude
+    // il turno lasciando l'app a schermo bianco. Applicare qui toglie la
+    // dipendenza dalla convergenza dell'agente nel loop diagnose->fix.
+    let (applied, apply_errors) =
+        apply_fixes(&ctx.root_path, &target, &result.suggested_fixes).await;
+    render_report(&result, target_rel, &applied, &apply_errors)
 }
 
 /// Risolve `target_dir` dentro la root del workspace. Punto unico (regola L):
 /// de-duplica la root se l'agente l'ha inclusa nel path e blocca il traversal
-/// ".." (normalize_into_root). `Err` contiene il JSON d'errore gia' serializzato,
-/// pronto per essere ritornato al chiamante.
-fn resolve_target_dir(root_path: &Path, target_rel: &str) -> Result<PathBuf, String> {
+/// ".." (normalize_into_root). `Err` porta gia' il fallimento da restituire al
+/// chiamante, con la natura nel campo invece che nel testo (regola Q).
+///
+/// Entrambi i fallimenti sono `Rimediabile` perche' nascono da cio' che l'agente
+/// ha CHIESTO, e il messaggio nomina il campo da correggere: dire «rimediabile»
+/// senza dire come sarebbe una promessa non mantenuta.
+fn resolve_target_dir(root_path: &Path, target_rel: &str) -> Result<PathBuf, RispostaTool> {
     let clean = match nexus_types::workspace_paths::normalize_into_root(root_path, target_rel) {
         Ok(clean) => clean,
         Err(e) => {
-            return Err(crate::errore_json(format!(
-                "target_dir non valido: {}",
+            let messaggio = format!(
+                "target_dir '{target_rel}' non valido: {}. Passa un path RELATIVO \
+                 alla root del progetto (default '.').",
                 e.message()
-            )))
+            );
+            return Err(crate::errore_tool(messaggio, NaturaFallimento::Rimediabile));
         }
     };
     let target = root_path.join(&clean);
     if !target.exists() {
-        return Err(crate::errore_json(format!("target_dir '{}' non esiste", target.display())));
+        let messaggio = format!(
+            "target_dir '{}' non esiste. Elenca le sottocartelle con list_files e \
+             ri-chiama nexus_verify_scaffold col path giusto.",
+            target.display()
+        );
+        return Err(crate::errore_tool(messaggio, NaturaFallimento::Rimediabile));
     }
     Ok(target)
 }
 
-/// Report di blocco: senza package.json non c'e' nulla da verificare.
-fn missing_package_json_report() -> String {
-    json!({
+/// Legge e interpreta il manifest npm del progetto.
+///
+/// ERRORE INGHIOTTITO CHIUSO: la lettura era `unwrap_or_default()` e il parse
+/// `unwrap_or(json!({}))`, quindi un package.json illeggibile o malformato
+/// diventava un manifest VUOTO — e il report che ne usciva accusava il progetto
+/// di non avere ne' lo script `dev` ne' alcuna dipendenza, cioe' inventava
+/// problemi che non esistono a partire da un errore che nessuno dichiarava.
+/// I tre esiti ora sono distinti, e nessuno di loro e' «manifest vuoto».
+async fn carica_package_json(path: &Path) -> Result<Value, RispostaTool> {
+    let contenuto = match fs::read_to_string(path).await {
+        Ok(c) => c,
+        // Il caso «assente» resta il blocco storico: senza manifest non c'e'
+        // nulla da verificare. Chiesto alla read invece che a un `exists()`
+        // precedente, cosi' la domanda al filesystem e' una sola.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(manifest_assente()),
+        Err(e) => {
+            // La natura la legge il `ErrorKind` (regola M): il messaggio del
+            // sistema operativo e' localizzato e cambia fra Windows e Linux.
+            let natura = NaturaFallimento::da_errore_io(&e);
+            let messaggio = format!("package.json '{}' non leggibile: {e}", path.display());
+            return Err(crate::errore_tool(messaggio, natura));
+        }
+    };
+    serde_json::from_str(&contenuto).map_err(|e| {
+        let messaggio = format!(
+            "package.json '{}' non e' JSON valido ({e}): correggilo con edit_file, \
+             poi ri-chiama nexus_verify_scaffold.",
+            path.display()
+        );
+        crate::errore_tool(messaggio, NaturaFallimento::Rimediabile)
+    })
+}
+
+/// Blocco: senza package.json non c'e' nulla da verificare.
+///
+/// RAMO NUDO CHIUSO: il corpo dichiarava il blocco nel TESTO (`"type":
+/// "blocker"`) e usciva come SUCCESSO, quindi il sistema leggeva una verifica
+/// mai eseguita come una verifica superata. La natura e' `Rimediabile` perche'
+/// l'agente ha due uscite e il messaggio le nomina entrambe: creare il manifest,
+/// oppure puntare `target_dir` alla sottocartella che lo contiene.
+fn manifest_assente() -> RispostaTool {
+    let rimedio = "Non posso verificare lo scaffolding senza package.json: crealo con \
+                   write_file, oppure passa target_dir con la sottocartella che lo contiene.";
+    let corpo = json!({
+        "error": rimedio,
         "project_kind": "unknown",
         "missing_files": [{"path": "package.json", "purpose": "manifest npm", "template_id": null}],
         "inconsistent_imports": [],
         "package_json_issues": ["package.json mancante"],
-        "suggested_fixes": [{
-            "type": "blocker",
-            "message": "Non posso verificare scaffolding senza package.json. Crealo prima."
-        }]
-    })
-    .to_string()
+        "suggested_fixes": [{"type": "blocker", "message": rimedio}],
+    });
+    crate::errore_tool_con_dettagli(corpo, NaturaFallimento::Rimediabile)
 }
 
 /// File critici che un progetto Vite+React+TS deve avere per partire: quelli
@@ -467,26 +543,6 @@ fn build_suggested_fixes(target_rel: &str, result: &mut VerifyResult) {
     result.suggested_fixes.extend(from_imports);
 }
 
-/// Auto-apply dei fix deterministici (regola H). Il verifier non si limita a
-/// SUGGERIRE: APPLICA i fix sicuri e idempotenti (write_file di template/stub,
-/// edit_file di normalizzazione import router). Motivo: il bug del doppio router
-/// NON rompe il build (vite compila lo stesso), quindi l'agente vede "build OK" e
-/// conclude il turno lasciando l'app a schermo bianco. Applicare lato verifier
-/// toglie la dipendenza dalla convergenza dell'agente nel loop diagnose->fix.
-/// run_command/blocker/manual_review NON sono auto-applicati (richiedono comandi
-/// o giudizio). Disattivabile con apply=false per sola ispezione.
-async fn run_auto_apply(
-    root_path: &Path,
-    target: &Path,
-    result: &VerifyResult,
-    apply: bool,
-) -> (Vec<Value>, Vec<String>) {
-    if !apply {
-        return (Vec::new(), Vec::new());
-    }
-    apply_fixes(root_path, target, &result.suggested_fixes).await
-}
-
 /// Fix che restano a carico dell'agente: richiedono esecuzione di comandi o
 /// giudizio, quindi il verifier non li auto-applica.
 fn count_manual_fixes(fixes: &[Value]) -> usize {
@@ -503,7 +559,6 @@ fn count_manual_fixes(fixes: &[Value]) -> usize {
 
 /// Segnali che scelgono il suggerimento di prossimo passo, in ordine di priorita'.
 struct HintSignals {
-    apply: bool,
     has_apply_errors: bool,
     manual_remaining: usize,
     has_applied: bool,
@@ -512,9 +567,7 @@ struct HintSignals {
 
 /// Prossimo passo suggerito all'agente, dal caso piu' bloccante al piu' sereno.
 fn next_step_hint(s: &HintSignals) -> &'static str {
-    if !s.apply {
-        "apply=false: sola ispezione. Applica i suggested_fixes (write_file/edit_file/run_command), poi ri-chiama."
-    } else if s.has_apply_errors {
+    if s.has_apply_errors {
         "Alcuni fix automatici sono FALLITI (vedi apply_errors): risolvili a mano, poi build."
     } else if s.manual_remaining > 0 {
         "Fix deterministici applicati automaticamente. Restano azioni manuali (run_command/blocker) in suggested_fixes: eseguile, poi build."
@@ -527,25 +580,31 @@ fn next_step_hint(s: &HintSignals) -> &'static str {
     }
 }
 
-/// Serializza il report finale del verifier.
+/// Serializza il report finale del verifier e ne DICHIARA l'esito.
+///
+/// Il report in se' non e' un fallimento nemmeno quando elenca problemi: quelli
+/// sono il suo prodotto, e trovarli significa che il tool ha funzionato. A
+/// fallire e' il caso in cui il verifier ha PROMESSO una riparazione e non e'
+/// riuscito a scriverla (`apply_errors`): li' lo scaffold resta rotto, e senza
+/// una dichiarazione nel campo l'agente prosegue verso il primo `npm start`
+/// credendo il contrario.
 fn render_report(
     result: &VerifyResult,
     target_rel: &str,
     applied: &[Value],
-    apply_errors: &[String],
-    apply: bool,
-) -> String {
+    apply_errors: &[ErroreApply],
+) -> RispostaTool {
     let ok = result.missing_files.is_empty()
         && result.inconsistent_imports.is_empty()
         && result.package_json_issues.is_empty();
     let hint = next_step_hint(&HintSignals {
-        apply,
         has_apply_errors: !apply_errors.is_empty(),
         manual_remaining: count_manual_fixes(&result.suggested_fixes),
         has_applied: !applied.is_empty(),
         ok,
     });
-    json!({
+    let messaggi: Vec<&str> = apply_errors.iter().map(|e| e.messaggio.as_str()).collect();
+    let corpo = json!({
         "ok": ok,
         "project_kind": result.project_kind,
         "target_dir": target_rel,
@@ -559,10 +618,43 @@ fn render_report(
         "package_json_issues": result.package_json_issues,
         "suggested_fixes": result.suggested_fixes,
         "applied": applied,
-        "apply_errors": apply_errors,
+        "apply_errors": messaggi,
         "next_step_hint": hint,
-    })
-    .to_string()
+    });
+    esito_report(corpo, apply_errors)
+}
+
+/// L'esito del report: riuscito, oppure fallito con la natura che governa i fix
+/// non applicati. Separata da [`render_report`] perche' li' la composizione del
+/// corpo e la dichiarazione dell'esito sono due lavori distinti, e il secondo
+/// deve poter aggiungere al corpo il campo `error` che il primo non ha.
+fn esito_report(mut corpo: Value, apply_errors: &[ErroreApply]) -> RispostaTool {
+    let Some(natura) = natura_peggiore(apply_errors) else {
+        return RispostaTool::riuscito(corpo.to_string());
+    };
+    let avviso = format!(
+        "{} fix automatici NON applicati: lo scaffold non e' riparato del tutto \
+         (vedi apply_errors), non avviarlo prima di averli sistemati.",
+        apply_errors.len()
+    );
+    if let Some(oggetto) = corpo.as_object_mut() {
+        oggetto.insert("error".to_string(), Value::String(avviso));
+    }
+    crate::errore_tool_con_dettagli(corpo, natura)
+}
+
+/// La natura che governa l'esito quando piu' fix falliscono insieme: prevale
+/// quella che chiude piu' strade. `DelSistema` per prima (l'agente deve cercare
+/// un'altra via), poi `Transitorio` (ritentare identico e' corretto), infine
+/// `Rimediabile` (l'agente corregge e ri-chiama). `None` = nessun fix fallito.
+fn natura_peggiore(errori: &[ErroreApply]) -> Option<NaturaFallimento> {
+    [
+        NaturaFallimento::DelSistema,
+        NaturaFallimento::Transitorio,
+        NaturaFallimento::Rimediabile,
+    ]
+    .into_iter()
+    .find(|natura| errori.iter().any(|e| e.natura == *natura))
 }
 
 /// Applica i fix deterministici e idempotenti prodotti dalla verifica:
@@ -575,54 +667,83 @@ async fn apply_fixes(
     root_path: &Path,
     target: &Path,
     fixes: &[Value],
-) -> (Vec<Value>, Vec<String>) {
+) -> (Vec<Value>, Vec<ErroreApply>) {
     let mut applied: Vec<Value> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors: Vec<ErroreApply> = Vec::new();
     for fix in fixes {
-        match fix.get("type").and_then(Value::as_str).unwrap_or("") {
-            "write_file" => {
-                let path = fix.get("path").and_then(Value::as_str).unwrap_or("");
-                let content = fix.get("content").and_then(Value::as_str).unwrap_or("");
-                match nexus_types::workspace_paths::normalize_into_root(
-                    root_path,
-                    path.trim_start_matches("./"),
-                ) {
-                    Ok(clean) => {
-                        let abs = root_path.join(&clean);
-                        if let Some(parent) = abs.parent() {
-                            let _ = fs::create_dir_all(parent).await;
-                        }
-                        match fs::write(&abs, content).await {
-                            Ok(_) => applied.push(json!({"type": "write_file", "path": path})),
-                            Err(e) => errors.push(format!("write_file {}: {}", path, e)),
-                        }
-                    }
-                    Err(e) => {
-                        errors.push(format!("write_file {} path invalido: {}", path, e.message()))
-                    }
-                }
-            }
-            "edit_file" => {
-                let file = fix.get("file").and_then(Value::as_str).unwrap_or("");
-                let from = fix.get("from").and_then(Value::as_str).unwrap_or("");
-                let to = fix.get("to").and_then(Value::as_str).unwrap_or("");
-                let abs = target.join(file);
-                match fs::read_to_string(&abs).await {
-                    Ok(c) if c.contains(from) => {
-                        match fs::write(&abs, c.replace(from, to)).await {
-                            Ok(_) => applied.push(json!({"type": "edit_file", "file": file})),
-                            Err(e) => errors.push(format!("edit_file {}: {}", file, e)),
-                        }
-                    }
-                    // `from` assente: gia' applicato (idempotente), non un errore.
-                    Ok(_) => {}
-                    Err(e) => errors.push(format!("edit_file read {}: {}", file, e)),
-                }
-            }
-            _ => {}
+        let esito = match fix.get("type").and_then(Value::as_str).unwrap_or("") {
+            "write_file" => applica_write_file(root_path, fix).await,
+            "edit_file" => applica_edit_file(target, fix).await,
+            _ => continue,
+        };
+        match esito {
+            Ok(Some(v)) => applied.push(v),
+            // Niente da fare: il fix era gia' applicato (idempotenza).
+            Ok(None) => {}
+            Err(e) => errors.push(e),
         }
     }
     (applied, errors)
+}
+
+/// Un fix auto-applicabile che NON e' andato a buon fine: il messaggio per
+/// l'umano e la natura del fallimento, che viaggia in un CAMPO fino all'esito
+/// del tool invece di restare implicita nella stringa (regola Q).
+#[derive(Debug)]
+struct ErroreApply {
+    messaggio: String,
+    natura: NaturaFallimento,
+}
+
+/// Scrive il file di un fix `write_file` (template o stub). Ritorna sempre
+/// `Some` quando riesce: una scrittura o avviene o fallisce.
+async fn applica_write_file(root_path: &Path, fix: &Value) -> Result<Option<Value>, ErroreApply> {
+    let path = fix.get("path").and_then(Value::as_str).unwrap_or("");
+    let content = fix.get("content").and_then(Value::as_str).unwrap_or("");
+    let grezzo = path.trim_start_matches("./");
+    let clean = nexus_types::workspace_paths::normalize_into_root(root_path, grezzo).map_err(
+        |e| ErroreApply {
+            messaggio: format!("write_file {path} path invalido: {}", e.message()),
+            // Il path lo compone il verifier dai propri template, non l'agente:
+            // se e' invalido non c'e' nessun parametro che l'agente possa
+            // correggere, ed e' il tool a essere da riparare.
+            natura: NaturaFallimento::DelSistema,
+        },
+    )?;
+    let abs = root_path.join(&clean);
+    if let Some(parent) = abs.parent() {
+        let _ = fs::create_dir_all(parent).await;
+    }
+    // La natura viene dal `ErrorKind` (regola M): permesso negato e disco pieno
+    // non sono la stessa cosa di un percorso inesistente, e il messaggio del
+    // sistema operativo che li distingue e' localizzato.
+    fs::write(&abs, content).await.map_err(|e| ErroreApply {
+        messaggio: format!("write_file {path}: {e}"),
+        natura: NaturaFallimento::da_errore_io(&e),
+    })?;
+    Ok(Some(json!({"type": "write_file", "path": path})))
+}
+
+/// Sostituisce il pattern di un fix `edit_file`. `Ok(None)` = pattern assente,
+/// cioe' fix gia' applicato: e' l'idempotenza, non un errore.
+async fn applica_edit_file(target: &Path, fix: &Value) -> Result<Option<Value>, ErroreApply> {
+    let file = fix.get("file").and_then(Value::as_str).unwrap_or("");
+    let from = fix.get("from").and_then(Value::as_str).unwrap_or("");
+    let to = fix.get("to").and_then(Value::as_str).unwrap_or("");
+    let abs = target.join(file);
+    let contenuto = fs::read_to_string(&abs).await.map_err(|e| ErroreApply {
+        messaggio: format!("edit_file read {file}: {e}"),
+        natura: NaturaFallimento::da_errore_io(&e),
+    })?;
+    if !contenuto.contains(from) {
+        return Ok(None);
+    }
+    let nuovo = contenuto.replace(from, to);
+    fs::write(&abs, nuovo).await.map_err(|e| ErroreApply {
+        messaggio: format!("edit_file {file}: {e}"),
+        natura: NaturaFallimento::da_errore_io(&e),
+    })?;
+    Ok(Some(json!({"type": "edit_file", "file": file})))
 }
 
 /// Regex per estrarre import: `import X from "Y"` / `import "Y"`.
@@ -825,5 +946,66 @@ mod tests {
         assert_eq!(applied2.len(), 1, "al 2o giro solo write_file (edit_file gia' fatto)");
 
         let _ = fs::remove_dir_all(&root).await;
+    }
+
+    /// Il blocco per manifest assente e' un FALLIMENTO dichiarato nel campo, non
+    /// un report che esce come successo.
+    ///
+    /// MUTAZIONE: riportando `manifest_assente` a `RispostaTool::riuscito` col
+    /// solo corpo JSON, questo test rosseggia — ed e' la firma del difetto
+    /// originale, dove una verifica MAI eseguita arrivava all'agente come
+    /// verifica superata.
+    #[test]
+    fn senza_manifest_il_tool_dichiara_il_blocco_nel_campo() {
+        let risposta = manifest_assente();
+        assert!(risposta.esito.e_fallito(), "e' un blocco: {risposta:?}");
+        assert_eq!(
+            risposta.natura,
+            Some(NaturaFallimento::Rimediabile),
+            "creare package.json o correggere target_dir e' cosa che l'agente puo' fare"
+        );
+        assert!(
+            risposta.testo.contains("write_file") && risposta.testo.contains("target_dir"),
+            "il messaggio nomina entrambe le uscite: {}",
+            risposta.testo
+        );
+    }
+
+    /// Un fix promesso e non scritto e' un fallimento, e la natura che governa
+    /// l'esito e' quella che chiude piu' strade.
+    ///
+    /// MUTAZIONE: facendo ritornare a `esito_report` sempre `riuscito`, oppure
+    /// invertendo l'ordine in `natura_peggiore`, questo test rosseggia — e senza
+    /// di lui l'agente prosegue verso `npm start` con lo scaffold ancora rotto.
+    #[test]
+    fn un_fix_non_scritto_non_esce_come_successo() {
+        let corpo = json!({"ok": false, "apply_errors": ["write_file x: accesso negato"]});
+        let errori = vec![
+            ErroreApply {
+                messaggio: "edit_file y: non trovato".into(),
+                natura: NaturaFallimento::Rimediabile,
+            },
+            ErroreApply {
+                messaggio: "write_file x: accesso negato".into(),
+                natura: NaturaFallimento::DelSistema,
+            },
+        ];
+        let risposta = esito_report(corpo.clone(), &errori);
+        assert!(risposta.esito.e_fallito(), "scaffold non riparato: {risposta:?}");
+        assert_eq!(
+            risposta.natura,
+            Some(NaturaFallimento::DelSistema),
+            "un permesso negato non lo rimedia l'agente ripetendo la chiamata"
+        );
+        assert!(
+            risposta.testo.contains("apply_errors"),
+            "il corpo resta il report, col rimando ai fix falliti: {}",
+            risposta.testo
+        );
+
+        // Senza fix falliti il report resta un successo, anche se elenca
+        // problemi: trovarli e' il prodotto del tool, non il suo fallimento.
+        let sereno = esito_report(corpo, &[]);
+        assert!(!sereno.esito.e_fallito(), "un report con problemi e' comunque un report");
     }
 }

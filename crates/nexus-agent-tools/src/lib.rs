@@ -58,47 +58,31 @@ pub mod vision_tools;
 pub use context_core::ToolContextCore;
 
 /// Il risultato di un tool di questo crate che ha FALLITO, col messaggio per
-/// l'umano nel campo `error` del corpo JSON.
+/// l'umano nel campo `error` del corpo JSON e l'esito in un CAMPO (regola Q).
 ///
 /// Punto unico (regola L) del "come si dichiara un fallimento" per i tool che
 /// rispondono in JSON: il corpo resta l'oggetto che il modello legge, e la
-/// dichiarazione d'esito viaggia nel marker che
-/// `nexus_types::tool_outcome::is_tool_failure` riconosce. Senza il marker la
-/// catena a valle (`RispostaTool::da_testo_legacy` -> `is_error` ->
-/// `repeated_action_failed`) legge un `{"error": ...}` come tool RIUSCITO: un
-/// allegato che rifiuta l'estrazione a ogni tentativo diventa cosi' una
-/// ripetizione produttiva, e l'anti-loop la classifica come stallo invece che
-/// come causa radice da diagnosticare (regola M).
-pub(crate) fn errore_json(messaggio: impl std::fmt::Display) -> String {
-    errore_json_con_dettagli(serde_json::json!({ "error": messaggio.to_string() }))
-}
-
-/// Come [`errore_json`] quando il corpo porta anche campi oltre `error` (tipico:
-/// `hint` con l'azione corretta).
+/// natura la DICHIARA chi conosce la causa invece di restare implicita.
 ///
-/// Conseguenza VOLUTA di entrambe: la stringa di errore non e' piu' un documento
-/// JSON integro, perche' il marker sta in testa. Il percorso di SUCCESSO non e'
-/// toccato, ed e' l'unico che i consumatori strutturati leggano: il presidio del
-/// budget letture allegati
-/// (`nexus-agent-graph::decisions::tool_dispatch::extract_returned_bytes`) cerca
-/// l'intero `length` di primo livello, che solo una lettura RIUSCITA emette — su
-/// un errore contava gia' zero byte, con o senza marker.
-pub(crate) fn errore_json_con_dettagli(dettagli: serde_json::Value) -> String {
-    nexus_types::tool_outcome::tool_failure(dettagli.to_string())
-}
-
-/// La versione TIPIZZATA di [`errore_json`], per i tool gia' migrati a
-/// [`nexus_types::tool_outcome::RispostaTool`] (regola Q).
+/// # Cio' che stava qui accanto, e non c'e' piu'
 ///
-/// Stesso corpo JSON — quello e' il documento che il modello legge, e cambiarlo
-/// sarebbe un contratto diverso — ma senza marker: l'esito sta nel campo, e la
-/// natura la DICHIARA chi conosce la causa invece di restare implicita. Effetto
-/// collaterale gradito: il corpo torna a essere un JSON integro, che il marker
-/// in testa spezzava.
+/// Accanto a questa viveva `errore_json`, che l'esito lo metteva in un MARKER
+/// anteposto al testo perche' la firma `-> String` non aveva un campo dove
+/// metterlo. Era il difetto della regola Q visto dal lato del produttore, e il
+/// suo doc prometteva che sarebbe sparita col primo giorno in cui nessuno la
+/// chiamava piu': quel giorno e' arrivato, e non c'e' piu'.
 ///
-/// Le due forme convivono finche' la migrazione dei tool JSON non e' completa.
-/// Quando l'ultimo sara' migrato, `errore_json`/`errore_json_con_dettagli`
-/// spariscono insieme al marker.
+/// I suoi ultimi chiamanti erano TRE, non uno — `archive_tools.rs`,
+/// `attachments.rs` e `knowledge.rs` — migrati in parallelo. Il vincolo che ne
+/// discende e' di ORDINE, non di codice: la rimozione da qui non puo' arrivare
+/// in `main` prima delle tre migrazioni, perche' senza di loro questo crate non
+/// compila; e non puo' restare indietro, perche' una funzione `pub(crate)` senza
+/// chiamanti e' `dead_code` sotto `-D warnings`. Le quattro modifiche sono un
+/// commit solo.
+///
+/// Il marker resta in `nexus_types::tool_outcome` per i tool degli ALTRI crate
+/// che devono ancora migrare; in questo, un fallimento non e' piu' una stringa
+/// da rileggere.
 pub(crate) fn errore_tool(
     messaggio: impl std::fmt::Display,
     natura: nexus_types::tool_outcome::NaturaFallimento,

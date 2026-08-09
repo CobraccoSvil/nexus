@@ -250,6 +250,35 @@ async fn migration_only_block(ctx: &AgentToolContext, command: &str) -> Option<S
 /// contratto: qui non si guarda cosa c'e' scritto, si guarda cosa e' stato
 /// dichiarato. Finche' lo prendeva, qualcuno poteva rimetterci un
 /// riconoscimento sul nome senza cambiare la firma.
+/// Traduce l'input di `run_command` in quello di `run_service`.
+///
+/// REGRESSIONE CHIUSA. Il ramo inoltrava l'input GREZZO, e quell'input contiene
+/// `background` per costruzione — e' la condizione stessa che attiva
+/// l'instradamento. Finche' `tool_run_service` leggeva i campi a mano il
+/// sovrappiu' veniva ignorato; da quando legge il proprio contratto tipizzato,
+/// `deny_unknown_fields` lo rifiuta e la lettura fallisce PRIMA di allocare la
+/// porta e fare lo spawn. Effetto: `run_command` con `background: true` — l'unico
+/// percorso di instradamento a servizio rimasto — non avviava piu' niente, e la
+/// premessa anteposta continuava ad annunciare un avvio mai avvenuto.
+///
+/// Il rimedio non e' allargare `RunServiceInput`: `background` non e' un suo
+/// parametro, e' la domanda che ha portato qui. Chi instrada verso un altro tool
+/// compone l'input SECONDO IL CONTRATTO DI QUEL TOOL, e i tre campi si nominano
+/// una volta sola — qui.
+///
+/// I due contratti dichiarano `working_dir` con lo stesso nome e `run_command`
+/// non ha `label`, quindi la traduzione e' una proiezione: si copiano i campi
+/// che esistono da entrambe le parti e si lascia fuori il resto.
+fn input_per_run_service(input: &Value) -> Value {
+    let mut fuori = serde_json::Map::new();
+    for campo in ["command", "working_dir", "label"] {
+        if let Some(v) = input.get(campo) {
+            fuori.insert(campo.to_string(), v.clone());
+        }
+    }
+    Value::Object(fuori)
+}
+
 async fn maybe_route_to_service(ctx: &AgentToolContext, input: &Value) -> Option<RispostaTool> {
     let explicit_bg = input
         .get("background")
@@ -258,7 +287,7 @@ async fn maybe_route_to_service(ctx: &AgentToolContext, input: &Value) -> Option
 
     // ── Livello 1: parametro background esplicito dall'AI ──
     if explicit_bg {
-        let routed = service::tool_run_service(ctx, input, "service").await;
+        let routed = service::tool_run_service(ctx, &input_per_run_service(input), "service").await;
         // `run_service` e' migrato: l'esito sta nel campo, quindi la premessa si
         // concatena al solo testo e non puo' piu' coprire nulla. Serviva
         // `prepend_preserving_failure` finche' il fallimento viveva in testa
@@ -1678,6 +1707,62 @@ mod tests {
         assert!(
             std::sync::Arc::ptr_eq(&pkg_manager_lock(progetto), &pkg_manager_lock(progetto)),
             "lo stesso progetto deve condividere UNA sola sezione critica"
+        );
+    }
+
+    /// LA REGRESSIONE, e il test attraversa i DUE contratti veri invece di
+    /// fabbricare un input a mano (regola O): quello di `run_command`, che
+    /// dichiara `background`, e quello di `run_service`, che non lo dichiara.
+    ///
+    /// `maybe_route_to_service` inoltrava l'input grezzo, e quell'input contiene
+    /// `background` per costruzione — e' la condizione che attiva
+    /// l'instradamento. Da quando `tool_run_service` legge il proprio contratto
+    /// tipizzato, `deny_unknown_fields` lo rifiuta: `run_command` con
+    /// `background: true` non avviava piu' alcun servizio, e la premessa
+    /// anteposta annunciava comunque l'avvio.
+    ///
+    /// COSA COPRE, E COSA NO. Copre la proprieta' su cui il difetto si regge —
+    /// i due contratti sono incompatibili, e la traduzione li riconcilia — ma
+    /// NON copre la giunzione: chiama `input_per_run_service` direttamente,
+    /// quindi resta verde anche rimettendo l'inoltro grezzo nel chiamante.
+    /// MISURATO, non supposto: eseguita quella mutazione, questo test passa.
+    ///
+    /// Il buco e' quello che la regola O descrive: la giunzione vive dentro
+    /// `maybe_route_to_service`, e arrivarci significa attraversare
+    /// `tool_run_service`, che alloca porte e interroga il DB del progetto. Un
+    /// test che lo faccia davvero e' un test di integrazione con un contesto
+    /// vero, non un caso in piu' qui.
+    ///
+    /// Resta perche' e' il documento del difetto: chi rimettesse l'inoltro
+    /// grezzo trova scritto, accanto al codice, perche' non funziona.
+    #[test]
+    fn l_instradamento_a_servizio_compone_l_input_del_contratto_di_destinazione() {
+        use nexus_agent_tools::input_contract::InputTool;
+        use nexus_agent_tools::tool_inputs::{RunCommandInput, RunServiceInput};
+
+        // L'input come lo produce il modello seguendo il catalogo di run_command,
+        // dove `background` E' dichiarato.
+        let grezzo = serde_json::json!({
+            "command": "npm run dev",
+            "working_dir": "frontend",
+            "background": true,
+        });
+        RunCommandInput::leggi(&grezzo).expect("e' un input valido per run_command");
+
+        // Inoltrato tale e quale, il contratto di run_service lo rifiuta: e'
+        // esattamente cio' che accadeva in esercizio.
+        RunServiceInput::leggi(&grezzo)
+            .expect_err("run_service non dichiara 'background': inoltrarlo grezzo fallisce");
+
+        // Tradotto, passa — e conserva i campi che i due contratti condividono.
+        let tradotto = input_per_run_service(&grezzo);
+        let params = RunServiceInput::leggi(&tradotto)
+            .expect("l'input tradotto rispetta il contratto di run_service");
+        assert_eq!(params.command, "npm run dev");
+        assert_eq!(params.working_dir.as_deref(), Some("frontend"));
+        assert!(
+            tradotto.get("background").is_none(),
+            "background non e' un parametro di run_service: e' la domanda che ha portato qui"
         );
     }
 }

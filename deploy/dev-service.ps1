@@ -28,34 +28,54 @@ $PIDFILE = Join-Path $RUNTIME 'nexus-dev.pids.json'
 . (Join-Path $PSScriptRoot 'lib\nexus-process.ps1')
 # Lettura dei manifest: punto unico condiviso con dev-start.ps1/nexus-publish.ps1.
 . (Join-Path $PSScriptRoot 'lib\nexus-manifest.ps1')
+# FORMA del pidfile: campi, lettura, scrittura, costruzione di una voce e
+# completamento delle prove mancanti. Punto unico condiviso con dev-start/dev-stop.
+. (Join-Path $PSScriptRoot 'lib\nexus-pidfile.ps1')
 
 function Write-Info([string]$msg) { Write-Output $msg }
 function Fail([string]$msg) { [Console]::Error.WriteLine($msg); exit 1 }
 
-# ── Pidfile: array JSON di {id,pid}, stessa fonte di dev-start/dev-stop ────────
-function Read-PidMap {
-  $map = @{}
-  if (Test-Path $PIDFILE) {
-    try {
-      $procs = Get-Content $PIDFILE -Raw | ConvertFrom-Json
-      foreach ($p in @($procs)) { if ($p.id) { $map[[string]$p.id] = [int]$p.pid } }
-    }
-    # Write-Warning (stream 3), NON Write-Output: qui il valore di ritorno e'
-    # $map e un messaggio su stdout lo trasformerebbe in un array.
-    catch { Write-Warning "pidfile illeggibile ($($_.Exception.Message)); procedo senza." }
+# ── Pidfile: VOCI INTERE, mai una vista ridotta ───────────────────────────────
+#
+# QUI STAVA IL DIFETTO (misurato il 09/08/2026). Questo script leggeva il pidfile
+# in una hashtable `id -> pid` e lo RISCRIVEVA tutto da quella: ogni azione su un
+# SOLO servizio — e mcp-core ne innesca a comando (endpoint
+# /api/system/services/<id>/<action>) e da solo (services_watchdog) — cancellava
+# `start` ed `exe` da TUTTE e nove le voci. Da li' in poi nessun pid era piu'
+# identificabile, quindi nessuno era dichiarabile morto, quindi dev-stop.ps1
+# usciva 1 e deploy-local.ps1 si fermava con gli eseguibili lockati.
+#
+# Il rimedio non e' ricordarsi di ricopiare i campi: e' non avere piu' una forma
+# ridotta da cui riscrivere. Si legge un array di voci intere, si sostituisce la
+# sola voce toccata (Set-NexusPidEntry) e si riscrive l'array — e comunque
+# Write-NexusPidFile proietta sui campi canonici, cosi' una voce impoverita non
+# puo' piu' arrivare su disco da nessun percorso.
+#
+# `$script:voci` e' lo stato condiviso invece di un valore di ritorno: queste
+# funzioni scrivono anche su stdout (Write-Info, che mcp-core legge), e in
+# PowerShell un `return` si mescolerebbe a quell'output.
+$script:voci = @()
+
+function Read-Voci {
+  if (-not (Test-Path $PIDFILE)) { $script:voci = @(); return }
+  try { $lette = Read-NexusPidFile -Path $PIDFILE }
+  catch {
+    # Un pidfile illeggibile non e' «nessun processo in giro»: proseguire
+    # spawnerebbe un secondo servizio sopra uno vivo. Stessa condotta della
+    # guardia di dev-start.
+    Fail "pidfile illeggibile ($($_.Exception.Message)): non so cosa sia in esecuzione. Eseguire .\deploy\dev-stop.ps1 e riprovare."
   }
-  return $map
+  $script:voci = Resolve-NexusPidEntries -Voci @($lette) -WinswRoot $WINSW
 }
 
-function Write-PidMap([hashtable]$map) {
-  $arr = @()
-  foreach ($k in $map.Keys) { $arr += [pscustomobject]@{ id = $k; pid = $map[$k] } }
-  # PS 5.1: ConvertTo-Json con 1 solo elemento produce un OGGETTO, non un array.
-  # Forziamo le parentesi quadre come fa dev-start.ps1 (altrimenti dev-stop itera male).
-  $json = $arr | ConvertTo-Json -Depth 3
-  if ($json -and $json -notmatch '^\s*\[') { $json = "[`n$json`n]" }
-  if (-not $json) { $json = '[]' }
-  Set-Content -Path $PIDFILE -Value $json -Encoding utf8
+# Il verdetto sulla voce di un servizio, o $null se non e' registrato. Delega al
+# criterio unico: `Test-NexusProcessAlive` risponde alla domanda RISTRETTA «esiste
+# un pid?», che la sua stessa libreria dichiara sbagliata per un pid letto da un
+# registro — un pid riciclato passerebbe per il servizio.
+function Get-Verdetto([string]$id) {
+  $voce = Get-NexusPidEntry -Voci $script:voci -Id $id
+  if (-not $voce) { return $null }
+  return (Get-NexusStackLiveness -Voci @($voce))[0]
 }
 
 # ── Rotazione log (3 generazioni), come dev-start.ps1 ─────────────────────────
@@ -130,18 +150,43 @@ function Start-FromManifest([string]$id) {
 # mcp-core restituisce come `stderr` dell'endpoint (system_services.rs).
 # Il PID resta nel pidfile se il processo e' vivo: rimuoverlo lo renderebbe un
 # orfano non piu' rintracciabile, e il pidfile mentirebbe come mentiva l'output.
-function Stop-ProcessModel([string]$id, [hashtable]$map) {
-  $processId = $map[$id]
-  if (-not $processId) {
+function Stop-ProcessModel([string]$id) {
+  $v = Get-Verdetto $id
+  if (-not $v) {
     Write-Info "$id gia' fermo (nessun pid registrato)"
   }
-  else {
-    $res = Stop-NexusProcessTree -ProcessId $processId -Label $id -KillTree:($id -ne 'nexus-mcp-core')
+  elseif ($v.Vivo) {
+    $res = Stop-NexusProcessTree -ProcessId $v.ProcessId -Label $id -KillTree:($id -ne 'nexus-mcp-core')
     if (-not $res.Stopped) { Fail $res.Message }
     Write-Info $res.Message
   }
-  $map.Remove($id) | Out-Null
-  Write-PidMap $map
+  elseif ($v.AutorizzaDichiararloMorto) {
+    Write-Info "$id gia' fermo (pid $($v.ProcessId) non e' piu' il nostro processo: $($v.Causa))"
+  }
+  else {
+    # Non si uccide l'albero di un pid che non si e' potuto identificare: e'
+    # l'errore nella direzione in cui fa danno invece di bloccare.
+    Fail "$id pid $($v.ProcessId): non tocco questo pid, $($v.Dettaglio)"
+  }
+  $script:voci = Remove-NexusPidEntry -Voci $script:voci -Id $id
+  Write-NexusPidFile -Path $PIDFILE -Voci $script:voci
+}
+
+function Start-ProcessModel([string]$id) {
+  $v = Get-Verdetto $id
+  if ($v -and $v.Vivo) {
+    Write-Info "$id gia' in esecuzione (pid $($v.ProcessId))"
+    return
+  }
+  if ($v -and -not $v.AutorizzaDichiararloMorto) {
+    Fail "$id pid $($v.ProcessId): non avvio un secondo processo, $($v.Dettaglio)"
+  }
+  $newPid = Start-FromManifest $id
+  # La voce nasce dal costruttore unico, che MISURA le prove d'identita' sul
+  # processo appena nato. Le altre voci passano intatte.
+  $script:voci = Set-NexusPidEntry -Voci $script:voci -Voce (New-NexusPidEntry -Id $id -ProcessId $newPid)
+  Write-NexusPidFile -Path $PIDFILE -Voci $script:voci
+  Write-Info "avviato $id (pid $newPid)"
 }
 
 # ── Servizio Windows (WinSW/SCM) presente? ────────────────────────────────────
@@ -164,30 +209,21 @@ try {
   }
 
   # Modello a processi (canonico in dev).
-  $map = Read-PidMap
+  Read-Voci
   switch ($Action) {
     'stop' {
-      Stop-ProcessModel $Service $map
+      Stop-ProcessModel $Service
     }
     'start' {
-      if (Test-NexusProcessAlive $map[$Service]) {
-        Write-Info "$Service gia' in esecuzione (pid $($map[$Service]))"
-      }
-      else {
-        $newPid = Start-FromManifest $Service
-        $map[$Service] = $newPid
-        Write-PidMap $map
-        Write-Info "avviato $Service (pid $newPid)"
-      }
+      Start-ProcessModel $Service
     }
     'restart' {
-      Stop-ProcessModel $Service $map
+      Stop-ProcessModel $Service
       Start-Sleep -Milliseconds 500
-      $map = Read-PidMap
-      $newPid = Start-FromManifest $Service
-      $map[$Service] = $newPid
-      Write-PidMap $map
-      Write-Info "riavviato $Service (pid $newPid)"
+      # Rilettura: fra lo stop e lo start un altro attore puo' aver toccato il
+      # file (il watchdog, un altro servizio). Si riparte dai fatti su disco.
+      Read-Voci
+      Start-ProcessModel $Service
     }
   }
   exit 0

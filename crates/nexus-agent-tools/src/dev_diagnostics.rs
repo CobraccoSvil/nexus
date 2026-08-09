@@ -12,9 +12,14 @@
 
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use nexus_types::tool_outcome::{NaturaFallimento, RispostaTool};
+
+use crate::input_contract::InputTool;
+use crate::tool_inputs::NexusDevServerDiagnoseInput;
 
 use super::ToolContextCore;
 
@@ -146,137 +151,217 @@ fn render_fix_template(template: &str, caps: &regex::Captures, log_path: Option<
 }
 
 /// Legge il file log troncando a MAX_LOG_BYTES (tail, gli errori utili sono recenti).
-async fn read_log_tail(path: &Path) -> Result<String, String> {
-    let meta = tokio::fs::metadata(path)
-        .await
-        .map_err(|e| format!("stat fallita su '{}': {e}", path.display()))?;
+///
+/// Ritorna l'errore di I/O INTERO invece di un messaggio gia' appiattito in
+/// `String`: la natura del fallimento la legge `NaturaFallimento::da_errore_io`
+/// dal `ErrorKind` (regola M — un file inesistente e un permesso negato mandano
+/// l'agente su due strade diverse, e il testo del sistema operativo che li
+/// distingue e' localizzato e cambia fra Windows e Linux). Appiattendo, quel
+/// segnale strutturato spariva prima di poter essere letto.
+async fn read_log_tail(path: &Path) -> Result<String, std::io::Error> {
+    let meta = tokio::fs::metadata(path).await?;
     let size = meta.len() as usize;
     let start = size.saturating_sub(MAX_LOG_BYTES);
-    let bytes = if start == 0 {
-        tokio::fs::read(path)
-            .await
-            .map_err(|e| format!("read fallita: {e}"))?
-    } else {
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        let mut f = tokio::fs::File::open(path)
-            .await
-            .map_err(|e| e.to_string())?;
-        f.seek(std::io::SeekFrom::Start(start as u64))
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut buf = Vec::with_capacity(MAX_LOG_BYTES);
-        f.read_to_end(&mut buf).await.map_err(|e| e.to_string())?;
-        buf
+    if start == 0 {
+        let bytes = tokio::fs::read(path).await?;
+        return Ok(String::from_utf8_lossy(&bytes).to_string());
+    }
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut f = tokio::fs::File::open(path).await?;
+    f.seek(std::io::SeekFrom::Start(start as u64)).await?;
+    let mut buf = Vec::with_capacity(MAX_LOG_BYTES);
+    f.read_to_end(&mut buf).await?;
+    Ok(String::from_utf8_lossy(&buf).to_string())
+}
+
+/// L'azione con cui l'agente rimedia quando la sorgente del log non e' leggibile.
+/// Costante perche' i due rami che la nominano (percorso invalido, lettura
+/// fallita) rimediano nello stesso modo, e due copie divergerebbero.
+const HINT_SORGENTE: &str = "Passa log_path assoluto o relativo alla project root, \
+                             oppure passa 'log' (stringa di log inline).";
+
+/// Il log da diagnosticare e il FILE da cui proviene, quando proviene da un file.
+///
+/// I due nascono INSIEME perche' la provenienza e' parte del risultato: con
+/// `log` e `log_path` entrambi valorizzati il contenuto veniva dall'inline, ma
+/// il risultato dichiarava `log_path` come `log_source` e il placeholder
+/// `{log_path}` dei fix nominava un file che nessuno aveva letto.
+struct SorgenteLog {
+    contenuto: String,
+    /// `None` quando il log e' arrivato inline: non c'e' nessun file da nominare.
+    file: Option<String>,
+}
+
+/// Risolve `log_path` in un percorso assoluto dentro la project root.
+fn risolvi_path(ctx: &ToolContextCore, log_path: &str) -> Result<PathBuf, RispostaTool> {
+    let p = Path::new(log_path);
+    if p.is_absolute() {
+        return Ok(p.to_path_buf());
+    }
+    // Il relativo passa dal punto unico (regola L), che de-duplica la root se
+    // inclusa dall'agente e blocca "..".
+    let errore = match nexus_types::workspace_paths::normalize_into_root(&ctx.root_path, log_path) {
+        Ok(clean) => return Ok(ctx.root_path.join(&clean)),
+        Err(e) => e,
     };
-    Ok(String::from_utf8_lossy(&bytes).to_string())
+    // RIMEDIABILE: e' il parametro a essere sbagliato, e l'hint nomina le due
+    // forme accettate piu' l'alternativa inline.
+    let corpo = json!({
+        "error": format!("log_path non valido: {}", errore.message()),
+        "hint": HINT_SORGENTE,
+    });
+    Err(crate::errore_tool_con_dettagli(
+        corpo,
+        NaturaFallimento::Rimediabile,
+    ))
+}
+
+/// Porta il log fino al diagnosticatore, da qualunque delle due sorgenti.
+async fn carica_log(
+    ctx: &ToolContextCore,
+    params: &NexusDevServerDiagnoseInput,
+) -> Result<SorgenteLog, RispostaTool> {
+    // L'inline vince: e' il contenuto che l'agente ha gia' in mano.
+    if let Some(inline) = params.log.clone() {
+        return Ok(SorgenteLog {
+            contenuto: inline,
+            file: None,
+        });
+    }
+    let log_path = params
+        .log_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(lp) = log_path else {
+        // RIMEDIABILE: mancano entrambi i parametri e il messaggio dice quali
+        // sono e come ottenerli.
+        let corpo = json!({
+            "error": "Specifica almeno uno tra 'log_path' (file) o 'log' (stringa inline).",
+            "hint": "Tipico uso: dopo run_service salva l'output in /tmp/<label>.log e passa \
+                     log_path=/tmp/<label>.log, oppure passa in 'log' l'output di read_service_output.",
+        });
+        return Err(crate::errore_tool_con_dettagli(
+            corpo,
+            NaturaFallimento::Rimediabile,
+        ));
+    };
+    let resolved = risolvi_path(ctx, lp)?;
+    let errore = match read_log_tail(&resolved).await {
+        Ok(contenuto) => {
+            return Ok(SorgenteLog {
+                contenuto,
+                file: Some(lp.to_string()),
+            })
+        }
+        Err(e) => e,
+    };
+    // La natura NON si sceglie a mano: viene dal `ErrorKind` (regola M).
+    let corpo = json!({
+        "error": format!("lettura log fallita su '{}': {errore}", resolved.display()),
+        "hint": HINT_SORGENTE,
+    });
+    Err(crate::errore_tool_con_dettagli(
+        corpo,
+        NaturaFallimento::da_errore_io(&errore),
+    ))
+}
+
+/// Confronta il log con i pattern attivi e compone i findings.
+///
+/// `file` e' la sorgente EFFETTIVAMENTE letta: alimenta il placeholder
+/// `{log_path}` dei fix, che altrimenti nominerebbe un file mai aperto.
+fn componi_findings(diagnostics: &[Diagnostic], log: &str, file: Option<&str>) -> Vec<Value> {
+    let mut findings: Vec<Value> = Vec::new();
+    // Dedup per (category + fix renderizzato): lo stesso fix piu' volte e'
+    // rumore. Era una HashMap di contatori usata come insieme.
+    let mut visti: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for diag in diagnostics {
+        if findings.len() >= MAX_FINDINGS {
+            break;
+        }
+        // Prendi il PRIMO match (i pattern sono ordinati per confidence DESC).
+        let Some(caps) = diag.pattern.captures(log) else {
+            continue;
+        };
+        let rendered_fix = render_fix_template(&diag.fix_template, &caps, file);
+        if !visti.insert(format!("{}|{}", diag.category, rendered_fix)) {
+            continue;
+        }
+        let matched_text = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
+        let finding = json!({
+            "category": diag.category,
+            "severity": diag.severity,
+            "confidence": diag.confidence,
+            "description": diag.description,
+            "matched_excerpt": matched_text.chars().take(200).collect::<String>(),
+            "fix_template_raw": diag.fix_template,
+            "suggested_fix_action": parse_fix_action(&rendered_fix),
+        });
+        findings.push(finding);
+    }
+    findings
+}
+
+/// Il corpo del RAMO NUDO chiuso dalla migrazione: senza pattern attivi questo
+/// tool non ha nulla con cui diagnosticare, e prima lo dichiarava come un
+/// successo con `findings: []` — indistinguibile dal caso in cui i pattern ci
+/// sono e nessuno matcha, che invece e' una diagnosi vera.
+///
+/// DEL SISTEMA e non `Rimediabile`: popolare `nexus_dev_diagnostics` e' un
+/// INSERT dell'admin, e ripetere la chiamata rifallira' identica. Copre anche
+/// il caso in cui la tabella non sia leggibile (vedi `load_diagnostics`): in
+/// entrambi la strada per l'agente e' la stessa, leggere il log da solo.
+fn corpo_senza_pattern() -> Value {
+    json!({
+        "error": "Nessun pattern attivo in nexus_dev_diagnostics: questo tool non ha con che cosa \
+                  diagnosticare il log.",
+        "hint": "Leggi il log direttamente (read_file, oppure read_service_output se il servizio e' \
+                 in esecuzione). L'aggiunta di pattern e' un INSERT in nexus_dev_diagnostics, fuori \
+                 dalla portata dell'agente.",
+    })
 }
 
 /// Tool entry point.
 pub async fn tool_nexus_dev_server_diagnose(
     ctx: &ToolContextCore,
     input: &Value,
-) -> String {
-    // Input opzionali: log_path (file da scansionare), inline_log (stringa), port (per nota)
-    let log_path = input
-        .get("log_path")
-        .and_then(Value::as_str)
-        .map(|s| s.trim().to_string());
-    let inline_log = input
-        .get("log")
-        .and_then(Value::as_str)
-        .map(|s| s.to_string());
-    let port = input.get("port").and_then(Value::as_i64);
-
-    let log_content = if let Some(s) = inline_log {
-        s
-    } else if let Some(lp) = log_path.as_ref() {
-        // Path assoluto usato cosi com'e; relativo passa dal punto unico (regola L)
-        // che de-duplica la root se inclusa dall'agente e blocca "..".
-        let p = Path::new(lp);
-        let resolved = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            match nexus_types::workspace_paths::normalize_into_root(&ctx.root_path, lp) {
-                Ok(clean) => ctx.root_path.join(&clean),
-                Err(e) => {
-                    return crate::errore_json_con_dettagli(json!({
-                        "error": format!("log_path non valido: {}", e.message()),
-                        "hint": "Passa log_path assoluto o relativo a project root, oppure passa 'log' (stringa inline)."
-                    }));
-                }
-            }
-        };
-        match read_log_tail(&resolved).await {
-            Ok(s) => s,
-            Err(e) => {
-                return crate::errore_json_con_dettagli(json!({
-                    "error": format!("lettura log fallita: {e}"),
-                    "hint": "Passa log_path assoluto o relativo a project root, oppure passa 'log' (stringa inline)."
-                }));
-            }
-        }
-    } else {
-        return crate::errore_json_con_dettagli(json!({
-            "error": "Specifica almeno uno tra 'log_path' (file) o 'log' (stringa inline).",
-            "hint": "Tipico uso: dopo run_service salva l'output in /tmp/<label>.log e passa log_path=/tmp/<label>.log"
-        }));
+) -> RispostaTool {
+    let params = match NexusDevServerDiagnoseInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
+    };
+    let sorgente = match carica_log(ctx, &params).await {
+        Ok(s) => s,
+        Err(risposta) => return risposta,
     };
 
     let diagnostics = get_diagnostics(&ctx.db).await;
     if diagnostics.is_empty() {
-        return json!({
-            "findings": [],
-            "note": "Nessun pattern in nexus_dev_diagnostics. L'admin puo' aggiungere pattern via INSERT in DB."
-        })
-        .to_string();
+        return crate::errore_tool_con_dettagli(
+            corpo_senza_pattern(),
+            NaturaFallimento::DelSistema,
+        );
     }
 
-    let mut findings: Vec<Value> = Vec::new();
-    let mut seen_categories: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for diag in &diagnostics {
-        if findings.len() >= MAX_FINDINGS {
-            break;
-        }
-        // Match: prendi il PRIMO match (i pattern sono ordinati per confidence DESC)
-        if let Some(caps) = diag.pattern.captures(&log_content) {
-            // Dedup per (category + fix renderizzato): stesso fix piu' volte e' rumore
-            let rendered_fix = render_fix_template(&diag.fix_template, &caps, log_path.as_deref());
-            let dedup_key = format!("{}|{}", diag.category, rendered_fix);
-            let prev_count = seen_categories.get(&dedup_key).copied().unwrap_or(0);
-            if prev_count >= 1 {
-                continue;
-            }
-            seen_categories.insert(dedup_key.clone(), prev_count + 1);
-
-            let matched_text = caps
-                .get(0)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            findings.push(json!({
-                "category": diag.category,
-                "severity": diag.severity,
-                "confidence": diag.confidence,
-                "description": diag.description,
-                "matched_excerpt": matched_text.chars().take(200).collect::<String>(),
-                "fix_template_raw": diag.fix_template,
-                "suggested_fix_action": parse_fix_action(&rendered_fix),
-            }));
-        }
-    }
-
-    json!({
-        "log_source": log_path.unwrap_or_else(|| "inline".to_string()),
-        "port_hint": port,
+    let findings = componi_findings(&diagnostics, &sorgente.contenuto, sorgente.file.as_deref());
+    // Un log che non matcha nessun pattern e' una diagnosi RIUSCITA con esito
+    // negativo, non un fallimento: la ricerca e' andata a buon fine.
+    let next_step_hint = if findings.is_empty() {
+        "Nessun pattern noto matchato. Leggi l'output manualmente o aggiungi un pattern in \
+         nexus_dev_diagnostics."
+    } else {
+        "Applica i fix in ordine di confidence (DESC). Dopo ogni fix, riavvia il servizio e \
+         ri-chiama questo tool per verificare residui."
+    };
+    let corpo = json!({
+        "log_source": sorgente.file.unwrap_or_else(|| "inline".to_string()),
+        "port_hint": params.port,
         "findings_count": findings.len(),
         "findings": findings,
-        "next_step_hint": if findings.is_empty() {
-            "Nessun pattern noto matchato. Leggi l'output manualmente o aggiungi un pattern in nexus_dev_diagnostics."
-        } else {
-            "Applica i fix in ordine di confidence (DESC). Dopo ogni fix, riavvia il servizio e ri-chiama questo tool per verificare residui."
-        }
-    })
-    .to_string()
+        "next_step_hint": next_step_hint,
+    });
+    RispostaTool::riuscito(corpo.to_string())
 }
 
 /// Parsa un fix_template renderizzato in un'azione strutturata che il modello

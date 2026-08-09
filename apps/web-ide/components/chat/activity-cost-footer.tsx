@@ -118,8 +118,12 @@ export function ActivityCostFooter({
           </span>
         );
       })}
+      {/* Il totale portava il solo importo: accanto a tre cifre per fornitore
+          nella stessa riga, l'ultima si leggeva come un quarto fornitore senza
+          nome invece che come la loro somma. L'etichetta e' letterale come il
+          "tok" qui sopra -- questo footer non passa da i18n. */}
       <span style={{ marginLeft: "auto" }}>
-        <b style={{ color: tc.text }}>${totalCostUsd.toFixed(4)}</b>
+        tot. <b style={{ color: tc.text }}>${totalCostUsd.toFixed(4)}</b>
       </span>
     </div>
   );

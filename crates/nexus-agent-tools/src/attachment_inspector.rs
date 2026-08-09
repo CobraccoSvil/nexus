@@ -93,12 +93,21 @@ pub struct AttachmentRecord {
 ///    del progetto, prendendo il piu' recente.
 /// 3. Match case-sensitive sul nome esatto. Match parziale rifiutato per evitare
 ///    ambiguita' (es. "report.pdf" non risolve a "weekly_report.pdf").
+///
+/// Le due cause di fallimento erano appiattite nella stessa `String` e il solo
+/// chiamante le rendeva col medesimo messaggio — «passa l'UUID dell'allegato
+/// oppure il nome esatto del file» — anche quando la query non era stata
+/// eseguita affatto: davanti a un DB muto l'agente veniva mandato a correggere
+/// una chiamata che era gia' giusta, e a ripeterla. Ora il nome che non risulta
+/// e' RIMEDIABILE (e il messaggio nomina il tool che elenca id e nomi veri),
+/// mentre la lookup che non ha potuto girare e' DEL SISTEMA: nessuna
+/// riformulazione della chiamata la aggira.
 pub async fn resolve_attachment_id_by_name(
     db: &PgPool,
     file_name: &str,
     project_id: Uuid,
     session_id: Option<Uuid>,
-) -> Result<Uuid, String> {
+) -> Result<Uuid, RispostaTool> {
     if let Some(sid) = session_id {
         let row = sqlx::query(
             "SELECT cma.id FROM chat_message_attachments cma \
@@ -111,10 +120,9 @@ pub async fn resolve_attachment_id_by_name(
         .bind(sid)
         .fetch_optional(db)
         .await
-        .map_err(|e| format!("query lookup by name fallita: {e}"))?;
+        .map_err(|e| lookup_non_eseguita("sessione corrente", e))?;
         if let Some(r) = row {
-            let id: Uuid = r.try_get("id").map_err(|e| e.to_string())?;
-            return Ok(id);
+            return id_di_riga(&r, "sessione corrente");
         }
     }
     let row = sqlx::query(
@@ -126,12 +134,41 @@ pub async fn resolve_attachment_id_by_name(
     .bind(project_id)
     .fetch_optional(db)
     .await
-    .map_err(|e| format!("query lookup by name fallback fallita: {e}"))?;
-    let row = row.ok_or_else(|| {
-        format!("nessun allegato con file_name='{file_name}' nel progetto corrente")
-    })?;
-    let id: Uuid = row.try_get("id").map_err(|e| e.to_string())?;
-    Ok(id)
+    .map_err(|e| lookup_non_eseguita("progetto", e))?;
+    match row {
+        Some(r) => id_di_riga(&r, "progetto"),
+        None => Err(nome_non_trovato(file_name)),
+    }
+}
+
+/// La lookup per nome non e' stata ESEGUITA: e' un guasto del DB, non della
+/// chiamata. DEL SISTEMA — ripetere identico rifallisce, e non c'e' parametro
+/// da correggere.
+fn lookup_non_eseguita(dove: &str, e: impl std::fmt::Display) -> RispostaTool {
+    crate::errore_tool(
+        format!("lookup dell'allegato per nome ({dove}) non eseguita: {e}"),
+        NaturaFallimento::DelSistema,
+    )
+}
+
+/// La ricerca e' andata a buon fine e nessun allegato porta quel nome.
+/// RIMEDIABILE, e il messaggio dice COME: `nexus_list_attachments` restituisce
+/// gli id e i nomi che esistono davvero in questa sessione.
+fn nome_non_trovato(file_name: &str) -> RispostaTool {
+    crate::errore_tool(
+        format!(
+            "Nessun allegato di nome '{file_name}' nel progetto corrente. Usa \
+             nexus_list_attachments per gli id e i nomi degli allegati di questa sessione."
+        ),
+        NaturaFallimento::Rimediabile,
+    )
+}
+
+/// L'id di una riga gia' trovata. Un fallimento qui non e' il nome sbagliato —
+/// la riga c'e' — ma la lettura della colonna, che e' lo stesso guasto della
+/// query e riceve percio' la stessa natura.
+fn id_di_riga(row: &sqlx::postgres::PgRow, dove: &str) -> Result<Uuid, RispostaTool> {
+    row.try_get("id").map_err(|e| lookup_non_eseguita(dove, e))
 }
 
 pub async fn load_attachment(
@@ -422,48 +459,67 @@ fn kind_is_text(kind: &str) -> bool {
     )
 }
 
+/// L'id dell'allegato da ispezionare, dal parametro che il contratto legge come
+/// stringa.
+///
+/// DIVERGENZA DICHIARATA e non chiusa: il catalogo promette un UUID, l'handler
+/// accetta ANCHE il nome del file. Non e' un alias di comodo — e' la
+/// compatibilita' coi checkpoint dei thread pre-fix
+/// `enrich_attachments_with_ids`, dove il blocco `<allegati>` non esponeva
+/// l'UUID e il modello era costretto a indovinare (osservato 30/05/2026: Vertex
+/// passava sia il filename "PL.make" sia un UUID allucinato). Toglierla sarebbe
+/// un cambio di comportamento, non una migrazione; dichiararla al modello
+/// richiede il contratto e il catalogo, che vivono altrove.
+///
+/// Il campo vuoto resta un controllo di qui: il contratto pretende che il campo
+/// CI SIA e sia una stringa, che non sia bianca non lo puo' dire — ed e' la
+/// stessa divisione di [`uuid_allegato`], che qui non si usa perche' un id non
+/// interpretabile come UUID e' l'ingresso del fallback, non un errore.
+async fn risolvi_id_allegato(ctx: &ToolContextCore, grezzo: &str) -> Result<Uuid, RispostaTool> {
+    if grezzo.is_empty() {
+        return Err(crate::errore_tool(
+            "Parametro 'attachment_id' vuoto: passa l'UUID dell'allegato (visibile nel \
+             blocco <allegati>) oppure il nome esatto del file. Usa \
+             nexus_list_attachments per gli id disponibili.",
+            NaturaFallimento::Rimediabile,
+        ));
+    }
+    if let Ok(uuid) = Uuid::parse_str(grezzo) {
+        return Ok(uuid);
+    }
+    resolve_attachment_id_by_name(&ctx.db, grezzo, ctx.project_id, ctx.session_id).await
+}
+
 /// Tool `nexus_inspect_attachment`.
 ///
-/// Accetta `attachment_id` in due forme:
-/// 1. UUID (canonico)
-/// 2. nome file (fallback) — risolto con lookup `file_name = $1 AND project_id = $2`
-///    sulla sessione corrente. Indispensabile per i checkpoint LangGraph dei thread
-///    pre-fix `enrich_attachments_with_ids` dove il blocco `<allegati>` non
-///    esponeva l'UUID e il modello e' costretto a guessare (osservato 30/05/2026:
-///    Vertex passava sia il filename "PL.make" sia un UUID allucinato).
-pub async fn tool_nexus_inspect_attachment(ctx: &ToolContextCore, input: &Value) -> String {
-    let raw_id = match input.get("attachment_id").and_then(Value::as_str) {
-        Some(s) if !s.trim().is_empty() => s.trim(),
-        _ => {
-            return crate::errore_json(
-                "Parametro 'attachment_id' obbligatorio (UUID valido o nome file).",
-            );
-        }
+/// Accetta `attachment_id` in due forme (UUID canonico, nome file come
+/// fallback): la scelta e le sue ragioni stanno in [`risolvi_id_allegato`].
+pub async fn tool_nexus_inspect_attachment(ctx: &ToolContextCore, input: &Value) -> RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::NexusInspectAttachmentInput};
+
+    let params = match NexusInspectAttachmentInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
+    };
+    let resolved_id = match risolvi_id_allegato(ctx, params.attachment_id.trim()).await {
+        Ok(id) => id,
+        Err(risposta) => return risposta,
     };
 
-    let resolved_id = if let Ok(uuid) = Uuid::parse_str(raw_id) {
-        uuid
-    } else {
-        match resolve_attachment_id_by_name(&ctx.db, raw_id, ctx.project_id, ctx.session_id).await {
-            Ok(uuid) => uuid,
-            Err(e) => {
-                return crate::errore_json(format!(
-                    "Impossibile risolvere attachment '{raw_id}': {e}. Passa l'UUID \
-                     dell'allegato (visibile nel blocco <allegati>) oppure il nome esatto \
-                     del file."
-                ));
-            }
-        }
-    };
-
+    // Stessa scelta di `documento_da_allegato`: l'helper appiattisce in una
+    // `String` sia «non trovato» sia «query fallita», e fra i due il caso vivo e'
+    // l'id sbagliato — che `nexus_list_attachments` risolve.
     let record = match load_attachment(&ctx.db, resolved_id, ctx.project_id).await {
         Ok(r) => r,
-        Err(e) => return crate::errore_json(e),
+        Err(e) => return crate::errore_tool(e, NaturaFallimento::Rimediabile),
     };
 
+    // DEL SISTEMA e non derivata dal `ErrorKind`: `read_header` ha gia'
+    // appiattito l'errore di I/O in una `String`, quindi il kind qui non c'e'
+    // piu' e ricavarlo dal messaggio sarebbe la regola M al contrario.
     let header = match read_header(&record.file_path).await {
         Ok(h) => h,
-        Err(e) => return crate::errore_json(e),
+        Err(e) => return crate::errore_tool(e, NaturaFallimento::DelSistema),
     };
 
     let (kind, mime_reale, ext_reale) = detect_kind(&header, &record.file_name, &record.mime_type);
@@ -471,16 +527,16 @@ pub async fn tool_nexus_inspect_attachment(ctx: &ToolContextCore, input: &Value)
     // FASE 1 resa Figma Make: se e' un Figma .make il cui ai_chat.json contiene
     // scritture file (fast_apply_tool), il code-snapshot React e' gia' dentro:
     // l'azione raccomandata diventa nexus_extract_figma_code, non solo structure.
-    let figma_has_code = if kind == "figma" {
-        figma_make_has_fast_apply(&record.file_path).await
-    } else {
-        false
-    };
+    let figma_has_code = kind == "figma" && figma_make_has_fast_apply(&record.file_path).await;
 
     let (tools, hint) = extraction_tools_for_kind(&kind);
     let next_action = next_action_recommended(&kind, &record.id, figma_has_code);
 
-    json!({
+    // Un kind opaco (`binary`, `next_action_recommended` nullo) NON e' un
+    // fallimento: la classificazione e' riuscita e la sua risposta e' «di questo
+    // formato non so dire altro». Chi legge deve poterlo distinguere da un
+    // allegato che non si e' potuto guardare, che sopra esce col campo `esito`.
+    let corpo = json!({
         "id": record.id.to_string(),
         "name": record.file_name,
         "size_bytes": record.size_bytes,
@@ -492,8 +548,8 @@ pub async fn tool_nexus_inspect_attachment(ctx: &ToolContextCore, input: &Value)
         "extraction_tools": tools,
         "hint": hint,
         "next_action_recommended": next_action,
-    })
-    .to_string()
+    });
+    RispostaTool::riuscito(corpo.to_string())
 }
 
 /// Byte massimi letti dall'inizio di ai_chat.json per rilevare la presenza di
@@ -506,6 +562,14 @@ const FIGMA_FAST_APPLY_PROBE_BYTES: u64 = 4 * 1024 * 1024;
 /// e legge un prefisso decompresso di ai_chat.json cercando la sottostringa.
 /// Tollerante: qualunque errore I/O o ZIP ritorna `false` (nessun routing
 /// speciale, fallback a structure).
+///
+/// Il `bool` qui NON e' il canale a due valori che la regola Q vieta, e resta
+/// tale a ragion veduta: questa sonda non decide un ESITO, sceglie fra due
+/// raccomandazioni entrambe valide — `nexus_extract_figma_code` quando il
+/// codice c'e', `nexus_extract_figma_structure` sempre. L'ignoto (file non
+/// apribile, ZIP illeggibile, task che non arriva in fondo) ricade sulla
+/// seconda, che funziona comunque; propagarlo trasformerebbe un'ispezione
+/// RIUSCITA in un fallimento, che e' l'errore opposto e piu' caro.
 async fn figma_make_has_fast_apply(path: &std::path::Path) -> bool {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {

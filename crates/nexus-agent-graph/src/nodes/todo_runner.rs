@@ -1041,7 +1041,14 @@ fn end_turn_no_active() -> OpaqueDelta {
 ///
 /// `write_scope` e' un `Value` gia' pronto (array): la wave lo ha come
 /// `Vec<String>` dalla struct del passo, il ramo singolo dal Value opaco.
-fn subagent_task_json(kind: &str, task: &str, context_blob: &str, write_scope: Value) -> Value {
+///
+/// PUBBLICA per il CONSUMATORE, non per comodita': la voce prodotta qui la legge
+/// `mcp-core::agent_tools::subagent_native::parse_batch_tasks`, in un altro
+/// crate, e quella giunzione ha un test che deve attraversare il produttore VERO
+/// (regola O). Costruire la stessa forma a mano nel test avrebbe fissato
+/// l'assunto da verificare: il giorno in cui si aggiunge un campo qui, il test
+/// resterebbe verde misurando la propria copia.
+pub fn subagent_task_json(kind: &str, task: &str, context_blob: &str, write_scope: Value) -> Value {
     json!({
         "kind": kind,
         "task": task,

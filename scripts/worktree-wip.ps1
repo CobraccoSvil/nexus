@@ -57,6 +57,46 @@
     2. prima di ogni pulizia, come gate (exit 1 se c'e' lavoro non salvato):
          powershell -File scripts\worktree-wip.ps1 -Report
 
+  COSA CONTA COME LAVORO A RISCHIO. Censimento e salvataggio rispondono a due
+  domande diverse e usano due criteri diversi, apposta. Il salvataggio cattura i
+  BYTE del working tree (`add -A`): li' non si sceglie, si conserva tutto. Il
+  censimento invece produce il NUMERO su cui si decide se archiviare una sessione,
+  e un file il cui contenuto e' identico e cambiano solo i fine-riga non e' lavoro
+  da perdere: non c'e' niente da perdere.
+
+  Misurato il 09/08/2026 su due alberi nello stesso istante: 'cool-brattain'
+  dichiarato «30 file» con modifiche reali ZERO, 'D:\IDEAI' dichiarato «1305 file»
+  con reali 27 -- i 1278 fantasma erano l'artefatto dello stash+ripristino che
+  lefthook esegue durante il pre-commit. Con 1305 al posto di 27 il numero e'
+  inservibile in ENTRAMBE le direzioni: fa sembrare a rischio un albero pulito, e
+  nasconde le 27 modifiche vere nel rumore.
+
+  IL CRITERIO E' '--ignore-cr-at-eol', NON '--ignore-all-space'. Misurati entrambi
+  sullo stesso repo di prova (tre file: uno coi soli fine-riga cambiati, uno col
+  contenuto cambiato, uno con la sola indentazione cambiata):
+
+    git status --porcelain        -> 3 file   (cio' che questo script contava)
+    git diff --ignore-cr-at-eol   -> 2 file   (scarta il solo fantasma)
+    git diff --ignore-all-space   -> 1 file   (scarta anche la reindentazione)
+
+  '--ignore-all-space' sbaglia nel verso che conta: una reindentazione e' lavoro
+  vero, e uno strumento il cui mestiere e' dire «qui c'e' lavoro a rischio» non
+  puo' nasconderla. '--ignore-cr-at-eol' e' invece l'esatto corrispettivo di
+  EsitoFineRiga::SoloFineRiga.
+
+  VOCABOLARIO CONDIVISO, NON UN SECONDO CRITERIO. La domanda «questi due contenuti
+  differiscono solo nei fine-riga?» ha il suo punto unico in
+  crates/nexus-migrations/src/fine_riga.rs (`classifica_contenuto` ->
+  EsitoFineRiga{Identici|SoloFineRiga|ContenutoDiverso}). PowerShell non puo'
+  chiamarlo: vale il precedente di deploy/lib/nexus-liveness.ps1, gemello che
+  condivide il VOCABOLARIO e il criterio, mai una seconda idea di cosa sia una
+  differenza. Qui il confronto lo fa git, che quei byte li ha gia' in mano.
+
+  COSA NON VIENE FILTRATO, verificato caso per caso su un repo di prova: i file
+  NON TRACCIATI (nessun diff li vede -- si leggono da 'ls-files --others'), le
+  CANCELLAZIONI (una cancellazione non e' un fine-riga e resta nel diff filtrato)
+  e i fantasmi in STAGING (filtrati anche quelli, con '--cached').
+
   Cosa questo script NON puo' fare: rifiutare l'archiviazione di una sessione.
   Rimuovere il worktree e' un'azione dello strumento di sessione (CCD), fuori dal
   repo: nessun hook git viene eseguito e non esiste un punto lato repo in cui
@@ -72,6 +112,15 @@
 
 .PARAMETER List
   Elenca i salvataggi esistenti.
+
+.PARAMETER Census
+  Per ogni salvataggio in refs/wip: il suo contenuto e' gia' in main? NON cancella
+  niente -- potare un salvataggio e' irreversibile e alcuni potrebbero essere
+  l'unica copia di qualcosa. Con -Markdown emette il report versionabile
+  (docs/tech-debt-wip.md).
+
+.PARAMETER Markdown
+  Con -Census: emette il censimento in Markdown invece che a tabella.
 
 .PARAMETER Restore
   Nome del salvataggio (label o ref) da riapplicare. Verifica il proprio esito
@@ -93,6 +142,8 @@ param(
   [Parameter(ParameterSetName = 'Report')][switch]$Report,
   [Parameter(ParameterSetName = 'Save')][switch]$Save,
   [Parameter(ParameterSetName = 'List')][switch]$List,
+  [Parameter(ParameterSetName = 'Census')][switch]$Census,
+  [Parameter(ParameterSetName = 'Census')][switch]$Markdown,
   [Parameter(ParameterSetName = 'Restore', Mandatory = $true)][string]$Restore,
   [Parameter(ParameterSetName = 'Restore')][string]$Into
 )
@@ -101,6 +152,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $WipPrefix = 'refs/wip/'
+# L'albero vuoto di git: base del confronto quando HEAD non esiste ancora.
+$EmptyTree = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 
 # git con stdout e stderr SEPARATI. Non si usa '2>&1': su Windows PowerShell la
 # redirezione dello stderr di un eseguibile nativo produce un NativeCommandError
@@ -215,33 +268,84 @@ function Get-Worktrees {
   return $res
 }
 
+# Elenco di percorsi da un comando git, oppure $null se il comando NON e' riuscito.
+# Il fallimento non degrada a "nessun percorso": un elenco vuoto e un comando che
+# non ha potuto rispondere sono due cose diverse, e collassarle direbbe "pulito" su
+# un worktree illeggibile (regola Q). L'array si restituisce con la virgola
+# davanti, o PowerShell srotola quello vuoto in $null e i due casi tornano a
+# confondersi proprio qui.
+function Get-GitPaths {
+  param([string]$WorktreePath, [string[]]$Arguments)
+  $r = Invoke-Git -Arguments (@('-C', $WorktreePath) + $Arguments)
+  if (-not $r.Ok) { return $null }
+  if ([string]::IsNullOrWhiteSpace($r.Output)) { return , @() }
+  return , @($r.Output -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+}
+
 # Conteggi PER CATEGORIA, non un totale: "staging" e "non tracciati" sono le due
 # categorie che i due recuperi sbagliati perdono ciascuno per conto proprio
 # ('git diff' perde la prima, 'git diff HEAD' la seconda). Tenerle distinte e'
 # l'unico modo di vedere quanto costerebbe il recupero fatto male.
+#
+# Le tre categorie si chiedono a git una per una invece di contare le colonne di
+# 'status --porcelain', perche' e' l'unico modo di applicare a ciascuna il criterio
+# sui fine-riga: porcelain non ha un modo di dire "modificato, ma solo nei
+# fine-riga". Il perche' del criterio -- e perche' NON '--ignore-all-space' -- sta
+# in testa al file.
 function Get-DirtyState {
   param([string]$WorktreePath)
-  $porcelain = Invoke-Git -Arguments @('-C', $WorktreePath, 'status', '--porcelain')
-  if (-not $porcelain.Ok) {
+
+  # Base del confronto con l'index. Su un branch orfano HEAD non esiste ancora: si
+  # parte dall'albero vuoto, cosi' cio' che e' in staging risulta staged invece di
+  # rendere "non leggibile" un worktree che si legge benissimo.
+  $base = 'HEAD'
+  $head = Invoke-Git -Arguments @('-C', $WorktreePath, 'rev-parse', '--verify', '--quiet', 'HEAD')
+  if (-not $head.Ok -or [string]::IsNullOrWhiteSpace($head.Output)) { $base = $EmptyTree }
+
+  $untracked  = Get-GitPaths $WorktreePath @('ls-files', '--others', '--exclude-standard')
+  $stagedReal = Get-GitPaths $WorktreePath @('diff', '--cached', '--name-only', '--ignore-cr-at-eol', $base)
+  $modReal    = Get-GitPaths $WorktreePath @('diff', '--name-only', '--ignore-cr-at-eol')
+
+  if ($null -eq $untracked -or $null -eq $stagedReal -or $null -eq $modReal) {
     return [pscustomobject]@{
-      Readable = $false; Error = $porcelain.Err
-      Staged = 0; Modified = 0; Untracked = 0; Total = 0; IsDirty = $false
+      Readable = $false; Error = 'git non ha potuto leggere lo stato del worktree'
+      Staged = 0; Modified = 0; Untracked = 0; SoloFineRiga = 0; Total = 0; IsDirty = $false
     }
   }
-  $staged = 0; $modified = 0; $untracked = 0
-  foreach ($line in ($porcelain.Output -split "`r?`n")) {
-    if ([string]::IsNullOrWhiteSpace($line)) { continue }
-    if ($line.Length -lt 2) { continue }
-    $x = $line[0]; $y = $line[1]
-    if ($x -eq '?' -and $y -eq '?') { $untracked++; continue }
-    if ($x -ne ' ') { $staged++ }
-    if ($y -ne ' ') { $modified++ }
+
+  # I fantasmi arrivano da DUE meccanismi distinti, e servono entrambi i filtri:
+  #   1. il file e' normalizzato dagli attributi (o da autocrlf), quindi 'git diff'
+  #      non lo mostra affatto mentre 'status' lo segna modificato -- lo esclude
+  #      il fatto stesso di partire da 'diff' invece che da 'status';
+  #   2. il blob differisce davvero nei byte CR e 'git diff' lo mostra -- lo
+  #      esclude '--ignore-cr-at-eol'.
+  # Il conteggio dichiarato li copre entrambi perche' e' una differenza fra cio'
+  # che 'status' conta e cio' che resta: e' esattamente il 1305-contro-27 misurato.
+  $porcelain = Invoke-Git -Arguments @('-C', $WorktreePath, 'status', '--porcelain')
+  $statusTracked = 0
+  if ($porcelain.Ok) {
+    foreach ($line in ($porcelain.Output -split "`r?`n")) {
+      if ([string]::IsNullOrWhiteSpace($line) -or $line.Length -lt 2) { continue }
+      if ($line[0] -eq '?' -and $line[1] -eq '?') { continue }
+      $statusTracked++
+    }
   }
+  # Distinti: un file sia in staging sia modificato e' UN percorso, mentre le due
+  # categorie qui sotto lo contano una volta per ciascuna (e' voluto: dicono cosa
+  # perderebbe ognuno dei due recuperi sbagliati). Confondere i due modi di contare
+  # farebbe comparire fantasmi che non esistono.
+  $realTracked = @( (@($stagedReal) + @($modReal)) | Select-Object -Unique ).Count
+
+  $total = $stagedReal.Count + $modReal.Count + $untracked.Count
   return [pscustomobject]@{
     Readable = $true; Error = ''
-    Staged = $staged; Modified = $modified; Untracked = $untracked
-    Total = ($staged + $modified + $untracked)
-    IsDirty = (($staged + $modified + $untracked) -gt 0)
+    Staged = $stagedReal.Count; Modified = $modReal.Count; Untracked = $untracked.Count
+    # Dichiarato, non nascosto: un numero senza la sua premessa e' un'opinione
+    # (regola O). Senza questo campo un "pulito" su un albero con 1278 differenze
+    # di soli fine-riga sarebbe indistinguibile da un albero mai toccato.
+    SoloFineRiga = [Math]::Max(0, $statusTracked - $realTracked)
+    Total = $total
+    IsDirty = ($total -gt 0)
   }
 }
 
@@ -357,12 +461,19 @@ function Invoke-Report {
       continue
     }
     if (-not $state.IsDirty) {
-      $rows += [pscustomobject]@{ Worktree = $wt.Label; Stato = 'pulito'; Salvataggio = '-'; Nota = 'archiviabile senza perdite' }
+      # Il filtro dichiara sempre cosa ha tolto: senza, un albero con 1278
+      # differenze di soli fine-riga e uno mai toccato darebbero la stessa riga.
+      $nota = 'archiviabile senza perdite'
+      if ($state.SoloFineRiga -gt 0) {
+        $nota = "archiviabile senza perdite ($($state.SoloFineRiga) file differiscono solo nei fine-riga)"
+      }
+      $rows += [pscustomobject]@{ Worktree = $wt.Label; Stato = 'pulito'; Salvataggio = '-'; Nota = $nota }
       continue
     }
 
     $dirty++
     $desc = "$($state.Total) file (staging $($state.Staged), mod $($state.Modified), nuovi $($state.Untracked))"
+    if ($state.SoloFineRiga -gt 0) { $desc += " +$($state.SoloFineRiga) solo fine-riga" }
 
     if ($DoSave) {
       $res = Save-Worktree -Worktree $wt -State $state
@@ -440,6 +551,191 @@ function Invoke-List {
   return 0
 }
 
+# «Il contenuto di questo salvataggio e' gia' in main?»
+#
+# Il criterio e' il confronto degli ALBERI, mai il messaggio di commit: un
+# salvataggio porta il nome del worktree che l'ha prodotto e non dice niente su
+# cosa contenga.
+#
+# DUE alberi non bastano, ed e' la trappola piu' facile: «differisce da main» NON
+# significa «contiene lavoro che main non ha», perche' nel frattempo main si e'
+# mosso. Misurato il 09/08/2026 su 70 salvataggi: col confronto a due alberi 68
+# risultavano «lavoro non in main», compreso 'unruffled-albattani' che era gia'
+# stato accertato ridondante -- il residuo era `crates/mcp-core/src/lib.rs`, un
+# file che main aveva evoluto per conto suo.
+#
+# Servono TRE alberi -- la BASE da cui il salvataggio e' nato, il SALVATAGGIO e
+# MAIN -- e il verdetto si da' per PATH:
+#
+#   main == salvataggio            il contenuto e' li': niente da perdere
+#   main == base (e salv. != base) main non ha MAI toccato quel file, quindi la
+#                                  modifica non e' arrivata. E' l'unico caso in
+#                                  cui il confronto degli alberi PROVA che il
+#                                  lavoro e' unico
+#   altrimenti                     main ha evoluto quel file per conto suo: se la
+#                                  modifica sia stata incorporata o superata,
+#                                  nessun confronto di alberi lo puo' dire
+#
+# La terza categoria resta DICHIARATA e non degrada a nessuna delle altre (regola
+# Q): da un censimento si decide se potare, potare e' irreversibile, e «non l'ho
+# potuto stabilire» non e' ne' «e' salvo» ne' «e' da buttare».
+function Get-CensusRow {
+  param([string]$Label, [string]$Sha, [string]$When, [hashtable]$BaseCache)
+
+  $vuoto = [pscustomobject]@{
+    Salvataggio = $Label; Data = $When; Verdetto = 'non-valutabile'
+    Tocca = 0; SoloQui = 0; DaVerificare = 0; Nota = ''
+  }
+
+  $p = Invoke-Git -Arguments @('-C', $RepoRoot, 'rev-parse', '--verify', '--quiet', "$Sha^")
+  if (-not $p.Ok -or [string]::IsNullOrWhiteSpace($p.Output)) {
+    $vuoto.Nota = 'salvataggio senza base: non c e un albero di partenza'
+    return $vuoto
+  }
+  $base = $p.Output.Trim()
+
+  # --no-renames su tutti e tre: con la rilevazione dei rename attiva i tre diff
+  # possono nominare lo stesso file in modi diversi, e l'intersezione fra insiemi
+  # di percorsi non sarebbe piu' confrontabile.
+  $tocca  = Get-GitPaths $RepoRoot @('diff', '--name-only', '--no-renames', $base, $Sha)
+  $vsMain = Get-GitPaths $RepoRoot @('diff', '--name-only', '--no-renames', $Sha, 'main')
+  if ($null -eq $tocca -or $null -eq $vsMain) {
+    $vuoto.Nota = 'git non ha potuto confrontare gli alberi'
+    return $vuoto
+  }
+  # I salvataggi nascono a grappoli dalla stessa base: senza cache lo stesso
+  # confronto base-main verrebbe rifatto decine di volte.
+  if (-not $BaseCache.ContainsKey($base)) {
+    $BaseCache[$base] = Get-GitPaths $RepoRoot @('diff', '--name-only', '--no-renames', $base, 'main')
+  }
+  $baseVsMain = $BaseCache[$base]
+  if ($null -eq $baseVsMain) {
+    $vuoto.Nota = 'git non ha potuto confrontare la base con main'
+    return $vuoto
+  }
+
+  if ($tocca.Count -eq 0) {
+    return [pscustomobject]@{
+      Salvataggio = $Label; Data = $When; Verdetto = 'vuoto'
+      Tocca = 0; SoloQui = 0; DaVerificare = 0; Nota = 'non conserva alcuna modifica'
+    }
+  }
+
+  $inMain = @{}; foreach ($x in $vsMain)     { $inMain[$x] = $true }
+  $mossi  = @{}; foreach ($x in $baseVsMain) { $mossi[$x]  = $true }
+
+  $soloQui = @(); $daVerificare = @()
+  foreach ($path in $tocca) {
+    if (-not $inMain.ContainsKey($path)) { continue }              # main ha gia' quel contenuto
+    if (-not $mossi.ContainsKey($path))  { $soloQui += $path }     # main non l'ha mai toccato
+    else                                 { $daVerificare += $path }
+  }
+
+  $verdetto = 'gia-in-main'
+  if     ($soloQui.Count      -gt 0) { $verdetto = 'lavoro-solo-qui' }
+  elseif ($daVerificare.Count -gt 0) { $verdetto = 'da-verificare' }
+
+  return [pscustomobject]@{
+    Salvataggio = $Label; Data = $When; Verdetto = $verdetto
+    Tocca = $tocca.Count; SoloQui = $soloQui.Count; DaVerificare = $daVerificare.Count
+    Nota = (($soloQui + $daVerificare) | Select-Object -First 3) -join ' '
+  }
+}
+
+function Invoke-Census {
+  param([switch]$AsMarkdown)
+
+  $mainSha = Invoke-Git -Arguments @('-C', $RepoRoot, 'rev-parse', '--verify', '--quiet', 'main')
+  if (-not $mainSha.Ok -or [string]::IsNullOrWhiteSpace($mainSha.Output)) {
+    throw "Nessun branch 'main': il censimento non ha un termine di confronto."
+  }
+  $main = $mainSha.Output.Trim()
+
+  $refs = Assert-Git -Arguments @('-C', $RepoRoot, 'for-each-ref', '--sort=-committerdate',
+    '--format=%(refname:short)|%(objectname)|%(committerdate:short)', "$WipPrefix*") -What 'elenco salvataggi'
+
+  $live = @{}
+  foreach ($wt in (Get-Worktrees)) { $live[$wt.Label] = $true }
+
+  $cache = @{}
+  $rows = @()
+  foreach ($line in ($refs -split "`r?`n")) {
+    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+    $f = $line -split '\|'
+    $label = $f[0] -replace '^wip/', ''
+    $row = Get-CensusRow -Label $label -Sha $f[1] -When $f[2] -BaseCache $cache
+    Add-Member -InputObject $row -NotePropertyName 'WorktreeVivo' -NotePropertyValue ($live.ContainsKey($label))
+    $rows += $row
+  }
+
+  $conta = { param($v) @($rows | Where-Object { $_.Verdetto -eq $v }).Count }
+  $nGia = & $conta 'gia-in-main'
+  $nSolo = & $conta 'lavoro-solo-qui'
+  $nVer = & $conta 'da-verificare'
+  $nNo  = & $conta 'non-valutabile'
+  $nVuoto = & $conta 'vuoto'
+
+  if ($AsMarkdown) {
+    $out = New-Object System.Collections.Generic.List[string]
+    $out.Add('# Censimento dei salvataggi refs/wip')
+    $out.Add('')
+    $out.Add("Generato da ``powershell -File scripts/worktree-wip.ps1 -Census -Markdown``.")
+    $out.Add("Repo osservato: ``$RepoRoot``. Confronto contro ``main`` = ``$($main.Substring(0,8))``.")
+    $out.Add('')
+    $out.Add('## Criterio')
+    $out.Add('')
+    $out.Add('Confronto degli ALBERI, mai dei messaggi di commit. Due alberi non bastano:')
+    $out.Add('«differisce da main» non significa «contiene lavoro che main non ha», perche'' main')
+    $out.Add('nel frattempo si e'' mosso. Il verdetto si da'' per path, su TRE alberi (base del')
+    $out.Add('salvataggio, salvataggio, main):')
+    $out.Add('')
+    $out.Add('| verdetto | significato |')
+    $out.Add('|---|---|')
+    $out.Add('| `gia-in-main` | ogni file toccato ha in main esattamente quel contenuto: niente da perdere |')
+    $out.Add('| `lavoro-solo-qui` | almeno un file che main non ha MAI toccato: la modifica non e'' arrivata, ed e'' l''unico caso PROVATO dagli alberi |')
+    $out.Add('| `da-verificare` | main ha evoluto quei file per conto suo: se il lavoro sia incorporato o superato, nessun confronto di alberi lo puo'' dire |')
+    $out.Add('| `non-valutabile` | manca la base o git non ha potuto confrontare |')
+    $out.Add('| `vuoto` | il salvataggio non conserva alcuna modifica |')
+    $out.Add('')
+    $out.Add('## Conteggio')
+    $out.Add('')
+    $out.Add('| verdetto | quanti |')
+    $out.Add('|---|---|')
+    $out.Add("| gia-in-main | $nGia |")
+    $out.Add("| lavoro-solo-qui | $nSolo |")
+    $out.Add("| da-verificare | $nVer |")
+    $out.Add("| non-valutabile | $nNo |")
+    $out.Add("| vuoto | $nVuoto |")
+    $out.Add("| **totale** | **$($rows.Count)** |")
+    $out.Add('')
+    $out.Add('## NON si pota da qui')
+    $out.Add('')
+    $out.Add('Cancellare un salvataggio e'' irreversibile e alcuni sono l''unica copia del loro')
+    $out.Add('lavoro (regola P). Questo file e'' un CENSIMENTO: dice cosa c''e'', non cosa buttare.')
+    $out.Add('Un `gia-in-main` e'' potabile senza perdite; per gli altri serve leggere il')
+    $out.Add('contenuto, e il modo di leggerlo e''')
+    $out.Add('`powershell -File scripts/worktree-wip.ps1 -Restore <nome> -Into <directory>`.')
+    $out.Add('')
+    $out.Add('## Dettaglio')
+    $out.Add('')
+    $out.Add('| salvataggio | data | verdetto | file toccati | solo qui | da verificare | worktree vivo |')
+    $out.Add('|---|---|---|---:|---:|---:|---|')
+    foreach ($r in ($rows | Sort-Object Verdetto, Data)) {
+      $vivo = if ($r.WorktreeVivo) { 'si' } else { 'no' }
+      $out.Add("| ``$($r.Salvataggio)`` | $($r.Data) | $($r.Verdetto) | $($r.Tocca) | $($r.SoloQui) | $($r.DaVerificare) | $vivo |")
+    }
+    $out.Add('')
+    return ($out -join "`n")
+  }
+
+  Show-Header
+  $rows | Sort-Object Verdetto, Data | Format-Table -AutoSize Salvataggio, Data, Verdetto, Tocca, SoloQui, DaVerificare, WorktreeVivo |
+    Out-String -Width 220 | Write-Host
+  Write-Host "Totale $($rows.Count): gia-in-main $nGia, lavoro-solo-qui $nSolo, da-verificare $nVer, non-valutabile $nNo, vuoto $nVuoto" -ForegroundColor Cyan
+  Write-Host 'Nessun salvataggio e stato toccato: potare e irreversibile, e questo comando censisce soltanto.' -ForegroundColor Yellow
+  return 0
+}
+
 function Invoke-Restore {
   param([string]$Label, [string]$Target)
   Show-Header
@@ -501,6 +797,10 @@ function Invoke-Restore {
 switch ($PSCmdlet.ParameterSetName) {
   'Save' { exit (Invoke-Report -DoSave) }
   'List' { exit (Invoke-List) }
+  'Census' {
+    if ($Markdown) { Invoke-Census -AsMarkdown | Write-Output; exit 0 }
+    exit (Invoke-Census)
+  }
   'Restore' { exit (Invoke-Restore -Label $Restore -Target $Into) }
   default { exit (Invoke-Report) }
 }

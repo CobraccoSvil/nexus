@@ -27,22 +27,28 @@ const PROVIDER_LABELS: Record<string, string> = {
   kimi: "Kimi", vllm: "vLLM", ollama: "Ollama",
 };
 // Ordine di visualizzazione preferito (storici prima, poi il resto in coda).
-const PROVIDER_ORDER = ["openai", "anthropic", "google", "deepseek", "mistral", "groq", "openrouter", "perplexity", "kimi", "vllm", "ollama"];
-
 export function providerDisplayLabel(name: string): string {
   return PROVIDER_LABELS[name] ?? (name.charAt(0).toUpperCase() + name.slice(1));
 }
 
-/** Ordina i nomi provider: quelli noti nell'ordine preferito, gli altri in coda alfabetica. */
+/**
+ * Ordina i provider per ETICHETTA VISUALIZZATA, che e' cio' che il lettore
+ * scorre: chi cerca "Mistral" lo cerca fra la M, non nella posizione che un
+ * elenco redazionale gli ha assegnato.
+ *
+ * Prima l'ordine veniva da una lista fissa (`PROVIDER_ORDER`), con ripiego
+ * alfabetico per i nomi non elencati. Due difetti: un provider nuovo finiva in
+ * coda finche' qualcuno non lo aggiungeva a mano, e la posizione degli altri
+ * non seguiva alcuna regola che il lettore potesse indovinare.
+ *
+ * Si ordina per label e non per chiave perche' le due divergono dove conta:
+ * la chiave `openrouter` sta dopo `openai`, ma le etichette "OpenAI" e
+ * "OpenRouter" si confrontano diversamente, e il lettore vede solo le seconde.
+ */
 export function sortProviderNames(names: string[]): string[] {
-  return [...names].sort((a, b) => {
-    const ia = PROVIDER_ORDER.indexOf(a);
-    const ib = PROVIDER_ORDER.indexOf(b);
-    if (ia !== -1 && ib !== -1) return ia - ib;
-    if (ia !== -1) return -1;
-    if (ib !== -1) return 1;
-    return a.localeCompare(b);
-  });
+  return [...names].sort((a, b) =>
+    providerDisplayLabel(a).localeCompare(providerDisplayLabel(b), "it", { sensitivity: "base" }),
+  );
 }
 
 export const sidebarItems: Array<{ key: SidebarView; label: string; icon: string }> = [

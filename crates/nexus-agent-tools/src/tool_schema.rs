@@ -193,7 +193,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "nexus_list_ports",
-    "description": "Tool di SOLA LETTURA: elenca lo stato porte del progetto senza allocare nulla. Ritorna il bucket deterministico assegnato (start/end), il range Nexus (20000-39999) e le allocazioni registrate in nexus_port_allocations (port, label, allocation_mode, service_unit, created_at). Usalo per VERIFICARE o AUDITARE la gestione delle porte: non dedurre mai le porte leggendo solo i sorgenti. Per ottenere una NUOVA porta usa request_port.",
+    "description": "Tool di SOLA LETTURA: elenca lo stato porte del progetto senza allocare nulla. Ritorna il bucket deterministico assegnato (start/end), il range Nexus (20000-39999) e le allocazioni registrate in nexus_port_allocations (port, label, allocation_mode, created_at). Usalo per VERIFICARE o AUDITARE la gestione delle porte: non dedurre mai le porte leggendo solo i sorgenti. Per ottenere una NUOVA porta usa request_port.",
     "input_schema": {
       "type": "object",
       "properties": {}
