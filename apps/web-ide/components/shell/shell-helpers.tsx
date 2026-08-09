@@ -24,10 +24,10 @@ export type ProviderHealthState = {
 const PROVIDER_LABELS: Record<string, string> = {
   openai: "OpenAI", anthropic: "Anthropic", google: "Google", deepseek: "DeepSeek",
   mistral: "Mistral", groq: "Groq", openrouter: "OpenRouter", perplexity: "Perplexity",
-  vllm: "vLLM", ollama: "Ollama",
+  kimi: "Kimi", vllm: "vLLM", ollama: "Ollama",
 };
 // Ordine di visualizzazione preferito (storici prima, poi il resto in coda).
-const PROVIDER_ORDER = ["openai", "anthropic", "google", "deepseek", "mistral", "groq", "openrouter", "perplexity", "vllm", "ollama"];
+const PROVIDER_ORDER = ["openai", "anthropic", "google", "deepseek", "mistral", "groq", "openrouter", "perplexity", "kimi", "vllm", "ollama"];
 
 export function providerDisplayLabel(name: string): string {
   return PROVIDER_LABELS[name] ?? (name.charAt(0).toUpperCase() + name.slice(1));

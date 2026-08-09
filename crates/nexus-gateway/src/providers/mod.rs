@@ -14,6 +14,7 @@ pub mod deepseek;
 pub mod gcp_auth;
 pub mod generic;
 pub mod google;
+pub mod kimi;
 pub mod mistral;
 pub mod openai;
 pub mod vllm;
@@ -22,6 +23,7 @@ pub use anthropic::AnthropicProvider;
 pub use deepseek::DeepSeekProvider;
 pub use generic::GenericOpenAiProvider;
 pub use google::GoogleProvider;
+pub use kimi::KimiProvider;
 pub use mistral::MistralProvider;
 pub use openai::OpenAiProvider;
 pub use openai_compat::{

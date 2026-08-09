@@ -45,6 +45,20 @@ test("providerBaseColor: alias del brand ricondotti allo stesso colore", () => {
   assert.equal(providerBaseColor("vertex"), providerBaseColor("google"));
 });
 
+test("kimi: colore e nome propri, e i due nomi del fornitore convergono", () => {
+  // Senza la chiave di brand kimi cadrebbe in "unknown": grigio, etichetta "?",
+  // e — peggio — indistinguibile da un provider che il frontend non conosce.
+  assert.notEqual(providerBaseColor("kimi"), providerBaseColor("acme-llm"));
+  assert.equal(providerLabel("kimi"), "Kimi");
+  // Il prodotto e' Kimi, l'azienda Moonshot AI: se il backend riportasse l'uno
+  // o l'altro, le righe della stessa conversazione cambierebbero colore.
+  assert.equal(providerBaseColor("moonshot"), providerBaseColor("kimi"));
+  assert.equal(providerBaseColor("moonshotai"), providerBaseColor("kimi"));
+  // Nessun logo ufficiale: il mark resta il pallino con l'iniziale, tinto col
+  // colore del brand. Non si inventa un marchio altrui.
+  assert.equal(providerMarkKey("kimi"), "generic");
+});
+
 test("providerBaseColor/providerLabel: provider ignoto -> fallback stabile", () => {
   assert.equal(providerBaseColor("acme-llm"), "#94a3b8");
   assert.equal(providerBaseColor(null), "#94a3b8");

@@ -2724,6 +2724,50 @@ else
   echo "OK confine-wire-session-usage: fixture condivisa e i suoi due lati"
 fi
 
+# --- governance-sql-connessione ---------------------------------------------
+# "Quale database sta toccando questa query?" ha UN punto di controllo, ed e' la
+# CONNESSIONE: `classifica_connessione` in nexus-project-db, chiamata da
+# `resolve_project_conn`. Il guard sul TESTO della statement
+# (`check_dangerous_sql`) risponde a un'altra domanda — "questa statement puo'
+# girare?" — e non deve tornare a rispondere alla prima indovinandola dai nomi
+# che la query cita.
+#
+# MISURATO il 09/08/2026 su gestione-corsi: `information_schema` era vietato per
+# SOTTOSTRINGA, quindi l'agente non poteva verificare la migrazione che aveva
+# appena applicato al DB del progetto — mentre sulla STESSA connessione i tool
+# nativi e il pannello SQL quel catalogo lo leggevano gia'.
+assert_single "classifica_connessione" 'fn classifica_connessione' \
+  'crates/nexus-project-db/src/exec.rs' crates
+assert_single "check_dangerous_sql" 'pub fn check_dangerous_sql' \
+  'crates/mcp-core/src/security/resource_governance.rs' crates
+
+gov="crates/mcp-core/src/security/resource_governance.rs"
+exec_rs="crates/nexus-project-db/src/exec.rs"
+# Il giudizio e' per STATEMENT, sulle stesse che l'esecutore eseguira' (regola O):
+# senza questa delega la regola di massa torna a guardare il primo token del
+# blocco e `SELECT 1; DELETE FROM users` non viene vista.
+if ! grep -q 'split_statements' "$gov" || ! grep -q 'is_read_only' "$gov"; then
+  echo "!! governance-sql-connessione: check_dangerous_sql non delega piu' a" >&2
+  echo "   split_statements/is_read_only (nexus_project_db::exec): il guard" >&2
+  echo "   giudicherebbe il testo come blocco unico, non le statement eseguite." >&2
+  fail=1
+# Il divieto sull'infrastruttura non si riscrive come needle incondizionato sul
+# catalogo: se `information_schema` ricompare senza il ramo di sola lettura, il
+# difetto del 09/08 e' tornato.
+elif ! grep -q 'e_sola_lettura' "$gov"; then
+  echo "!! governance-sql-connessione: sparito il ramo di sola lettura sui" >&2
+  echo "   cataloghi: leggere information_schema/pg_catalog del DB applicativo" >&2
+  echo "   e' legittimo, e' l'unico modo di verificare una migrazione." >&2
+  fail=1
+elif ! grep -q 'classifica_connessione' "$exec_rs"; then
+  echo "!! governance-sql-connessione: resolve_project_conn non passa piu' dal" >&2
+  echo "   criterio di connessione: il DB metadati per-progetto tornerebbe" >&2
+  echo "   raggiungibile via nexus_db_query(connection: 'nexus_metadata')." >&2
+  fail=1
+else
+  echo "OK governance-sql-connessione: la connessione decide il database, il testo no"
+fi
+
 # Resa di un path per un PROCESSO ESTERNO (2026-08-09). `canonicalize` su
 # Windows produce la forma verbatim `\\?\D:\...`: le API del filesystem la
 # accettano, l'argv di un processo esterno no. E il runtime MSYS di `grep.exe`

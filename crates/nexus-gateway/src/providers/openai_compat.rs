@@ -52,6 +52,33 @@ pub enum ReasoningDialect {
     /// `max_tokens` e accetta `reasoning_effort`; non espone il reasoning come
     /// testo, solo i `reasoning_tokens` in `completion_tokens_details`.
     OpenAiReasoning,
+    /// Moonshot/Kimi: il pensiero e' SEMPRE acceso e non si spegne, quindi il
+    /// dialetto non e' una preferenza da esprimere ma un contratto da rispettare.
+    /// Tre differenze dal dialetto base, tutte documentate:
+    ///
+    /// - `temperature` e' FISSA sui modelli moderni e "passing any other value
+    ///   returns an error" (doc `/docs/api/models-overview`): non si invia. Non e'
+    ///   una precauzione — tre call site interni mandano `Some(0.0)`
+    ///   (`summary_store`, `next_actions_deriver`, `wizard`) e prenderebbero 400
+    ///   su ogni chiamata;
+    /// - `max_tokens` e' deprecato in favore di `max_completion_tokens`
+    ///   (doc `/docs/api/chat`);
+    /// - Preserved Thinking: per `kimi-k3` e `kimi-k2.7-code` la doc prescrive
+    ///   di rimandare indietro l'assistant "completo e inalterato,
+    ///   `reasoning_content` compreso" (`/docs/guide/use-thinking-models`).
+    ///   MISURATO il 09/08/2026 su `kimi-k2.6` e `kimi-k2.7-code`: l'API NON
+    ///   rifiuta il turno che lo omette — il vincolo e' meno duro di quello
+    ///   DeepSeek, che risponde 400. Il round-trip resta perche' e' il punto del
+    ///   meccanismo: quel campo E' il ragionamento del turno precedente, e
+    ///   toglierlo lo fa ricominciare da capo su un modello che pensa sempre.
+    ///   Non e' una difesa da un errore, e' la continuita' del pensiero.
+    ///
+    /// Non emette `thinking` ne' `reasoning_effort`: i default del fornitore sono
+    /// dichiarati (k3 `max`, k2.x `enabled`) e nessun chiamante esprime oggi una
+    /// preferenza. Un ramo senza produttore sarebbe codice morto (regola O), e
+    /// per giunta rischioso: su `kimi-k2.7-code` un `thinking` esplicito diverso
+    /// da `{"type":"enabled","keep":"all"}` e' un errore.
+    Kimi,
 }
 
 /// Configurazione di reasoning risolta per una richiesta. `dialect` indica come
@@ -901,14 +928,25 @@ fn build_request_body(
 ) -> ChatCompletionRequest {
     let mut messages: Vec<WireMessage> = req.messages.iter().map(to_wire_message).collect();
 
-    // ROUND-TRIP reasoning_content (DeepSeek): per gli assistant message generati
-    // in thinking mode l'API DeepSeek IMPONE che il `reasoning_content` venga
+    // ROUND-TRIP reasoning_content (DeepSeek, Kimi): per gli assistant message
+    // generati in thinking mode l'API IMPONE che il `reasoning_content` venga
     // ri-passato nelle richieste successive, altrimenti HTTP 400. Lo facciamo
-    // viaggiare SOLO verso DeepSeek: per ogni coppia (wire, sorgente) con
+    // viaggiare SOLO verso quei dialetti: per ogni coppia (wire, sorgente) con
     // role=="assistant" e `reasoning` non vuoto, copiamo il reasoning della
     // history nel campo wire. Gli altri dialetti non vedono mai il campo (resta
     // None -> omesso). Speculare al round-trip `thinking_signature` di Anthropic.
-    if reasoning.dialect == ReasoningDialect::DeepSeek {
+    //
+    // La differenza fra i due sta nella FORZA del vincolo, e va detta con
+    // precisione: DeepSeek risponde 400 se il campo manca, e la sua via di fuga
+    // e' spegnere il pensiero (cio' che fa `deepseek::resolve_reasoning` coi
+    // tool). Kimi non rifiuta — misurato su k2.6 e k2.7-code — ma il pensiero
+    // non si spegne, quindi ogni turno ne produce uno nuovo: senza il
+    // round-trip il modello riparte ogni volta senza il proprio ragionamento
+    // precedente. Li' e' continuita', non protezione da un errore.
+    if matches!(
+        reasoning.dialect,
+        ReasoningDialect::DeepSeek | ReasoningDialect::Kimi
+    ) {
         for (wire, src) in messages.iter_mut().zip(req.messages.iter()) {
             if wire.role == "assistant" {
                 if let Some(r) = src.reasoning.as_ref().filter(|r| !r.is_empty()) {
@@ -933,20 +971,32 @@ fn build_request_body(
             .collect()
     });
 
-    // o-series: tetto di output via max_completion_tokens; max_tokens omesso e
-    // temperatura non inviata (l'API la rifiuta sui modelli reasoning).
-    let is_openai_reasoning = reasoning.dialect == ReasoningDialect::OpenAiReasoning;
-    let (max_tokens, max_completion_tokens) = if is_openai_reasoning {
+    // Tetto di output via `max_completion_tokens` invece di `max_tokens`, e
+    // temperatura NON inviata: due dialetti lo pretendono per ragioni diverse e
+    // il codice le tiene distinte, perche' il giorno in cui una delle due
+    // cambia si tocca un predicato solo. o-series: l'API rifiuta la temperatura
+    // sui modelli reasoning. Kimi: la temperatura e' un valore FISSO del modello
+    // e "passing any other value returns an error", mentre `max_tokens` e'
+    // deprecato (doc Moonshot, vedi [`ReasoningDialect::Kimi`]).
+    let tetto_su_completion = matches!(
+        reasoning.dialect,
+        ReasoningDialect::OpenAiReasoning | ReasoningDialect::Kimi
+    );
+    let temperatura_rifiutata = tetto_su_completion;
+    let (max_tokens, max_completion_tokens) = if tetto_su_completion {
         (None, req.max_tokens)
     } else {
         (req.max_tokens, None)
     };
-    let temperature = if is_openai_reasoning {
+    let temperature = if temperatura_rifiutata {
         None
     } else {
         req.temperature
     };
-    let reasoning_effort = if is_openai_reasoning {
+    // `reasoning_effort` resta del solo dialetto o-series: su Kimi e' accettato
+    // dal solo `kimi-k3` e nessun chiamante lo esprime oggi (vedi il commento
+    // della variante), quindi qui non avrebbe un produttore.
+    let reasoning_effort = if reasoning.dialect == ReasoningDialect::OpenAiReasoning {
         reasoning.effort.clone()
     } else {
         None
@@ -1587,13 +1637,6 @@ fn classify_by_status_code(status: u16, code: Option<&str>) -> ProviderErrorKind
     // Conservativo: solo codici inequivocabili, cosi' non si scambia un
     // rate-limit (429) per un provider "down per credito".
     if let Some(c) = code {
-        if c.contains("insufficient_quota")
-            || c.contains("billing")
-            || c.contains("payment_required")
-            || c.contains("account_deactivated")
-        {
-            return ProviderErrorKind::Billing;
-        }
         // Rate-limit DICHIARATO dal provider: vince sullo status, perche' lo
         // status da solo mente. groq manda 413 (non 429) quando la richiesta
         // supera il tetto token/minuto del piano: "on tokens per minute (TPM):
@@ -1602,8 +1645,33 @@ fn classify_by_status_code(status: u16, code: Option<&str>) -> ProviderErrorKind
         // il motore fa failover cross-provider su un altro provider, mentre la
         // cura giusta e' aspettare: il provider e' sano e la stessa richiesta
         // passera' fra un minuto.
+        //
+        // Va PRIMA del credito perche' i due vocabolari possono sfiorarsi: chi
+        // dichiara di essere un limite di FREQUENZA lo e', anche se nel nome
+        // compare la parola quota. La precedenza esplicita costa una riga; a
+        // ordine invertito sarebbe una coincidenza di stringhe a deciderla.
         if c.contains("rate_limit") {
             return ProviderErrorKind::Transient;
+        }
+        // Credito/fatturazione: qui il rimedio e' ricaricare, non attendere, e
+        // scambiare i due significa ritentare all'infinito un account sospeso.
+        //
+        // `quota` invece del piu' stretto `insufficient_quota`: MISURATO il
+        // 09/08/2026 sull'API Moonshot con un account a saldo zero — HTTP 429,
+        // `type: "exceeded_current_quota_error"`, "account is suspended due to
+        // insufficient balance, please recharge". Nessuno dei quattro termini
+        // riconosciuti vi compare, quindi cadeva sullo status: 429 -> Transient,
+        // cioe' un account sospeso trattato come una saturazione passeggera.
+        // La doc Moonshot distingue apposta tre 429 con rimedi opposti
+        // (`engine_overloaded_error`, `rate_limit_reached_error`,
+        // `exceeded_current_quota_error`): il primo e il secondo sono attese, il
+        // terzo no.
+        if c.contains("quota")
+            || c.contains("billing")
+            || c.contains("payment_required")
+            || c.contains("account_deactivated")
+        {
+            return ProviderErrorKind::Billing;
         }
     }
     // Mappatura verificata sulle tabelle ufficiali (Anthropic/OpenAI, 2026):
@@ -1916,17 +1984,38 @@ struct WireUsage {
     /// OpenAI: dettaglio dei token di input, con `cached_tokens`.
     #[serde(default)]
     prompt_tokens_details: Option<PromptTokensDetails>,
+    /// Moonshot/Kimi: lo STESSO nome di OpenAI, ma al PRIMO livello di `usage`.
+    /// E' la sola forma che lo schema ufficiale dell'endpoint chat dichiara:
+    /// `{prompt_tokens, completion_tokens, total_tokens, cached_tokens}`.
+    ///
+    /// MISURATO il 09/08/2026 su `kimi-k2.6` (tre chiamate a prefisso identico da
+    /// 4267 token): l'API ne espone DUE, `usage.cached_tokens` e
+    /// `usage.prompt_tokens_details.cached_tokens`, entrambi a 4096 — quindi oggi
+    /// il ramo OpenAI qui sopra basterebbe da solo. Il campo resta perche' lo
+    /// scarto e' fra la doc e l'implementazione, e a colmarsi puo' essere l'una o
+    /// l'altra: se il fornitore allineasse la risposta al proprio schema, questo
+    /// e' l'unico ramo che continuerebbe a leggere. Costa un `Option` e copre il
+    /// verso in cui il difetto sarebbe MUTO — `cache_read_tokens` a zero per
+    /// sempre, hit-rate 0%, sconto mai applicato, e nessun errore da nessuna
+    /// parte (la firma del `thoughtsTokenCount` di Google).
+    #[serde(default)]
+    cached_tokens: Option<u32>,
 }
 
 impl WireUsage {
     /// Token di input serviti da cache, normalizzati cross-provider: DeepSeek li
     /// espone in `prompt_cache_hit_tokens`, OpenAI in
-    /// `prompt_tokens_details.cached_tokens`. Ritorna `None` se entrambi assenti
-    /// o a zero.
+    /// `prompt_tokens_details.cached_tokens`, Moonshot/Kimi in `cached_tokens`
+    /// al primo livello. Ritorna `None` se tutti assenti o a zero.
+    ///
+    /// I tre nomi si interrogano in cascata e non per provider: un dialetto
+    /// che riusasse uno di questi nomi verrebbe letto senza toccare nulla, e un
+    /// `match provider` qui sarebbe la logica dispersa che la regola L vieta.
     fn cached_input_tokens(&self) -> Option<u32> {
         let hit = self
             .prompt_cache_hit_tokens
-            .or_else(|| self.prompt_tokens_details.as_ref().and_then(|d| d.cached_tokens));
+            .or_else(|| self.prompt_tokens_details.as_ref().and_then(|d| d.cached_tokens))
+            .or(self.cached_tokens);
         hit.filter(|&n| n > 0)
     }
 }
@@ -2958,6 +3047,53 @@ mod tests {
         assert_eq!(resp.usage.cache_read_tokens, Some(12));
     }
 
+    /// La cache di Moonshot/Kimi si legge in entrambe le forme che l'API usa, e
+    /// i token letti restano DENTRO il prompt.
+    ///
+    /// La seconda meta' non e' un'assunzione: la documentazione non lo dice da
+    /// nessuna parte, ed e' stata MISURATA il 09/08/2026 su `kimi-k2.6` con tre
+    /// chiamate consecutive a prefisso identico. `prompt_tokens` e' rimasto 4267
+    /// in tutti e tre i giri mentre `cached_tokens` passava da assente a 4096, e
+    /// `prompt + completion == total` sempre: se i token serviti da cache fossero
+    /// FUORI dal prompt, al secondo giro il prompt sarebbe sceso a 171. Da qui
+    /// [`PromptCacheReporting::CachedIncludedInPrompt`]; con la dichiarazione
+    /// opposta il sistema conterebbe il prefisso due volte.
+    ///
+    /// I due blocchi `usage` sono le due forme reali osservate: la prima e' lo
+    /// schema che la doc dichiara, la seconda quella che l'API emette oggi (con
+    /// entrambi i campi, allo stesso valore).
+    ///
+    /// MUTAZIONE DI CONTROLLO: togliendo il campo `cached_tokens` da
+    /// [`WireUsage`] rosseggia il primo caso; togliendo il ramo
+    /// `prompt_tokens_details` rosseggia il gemello gia' presente per OpenAI.
+    #[test]
+    fn deserializza_cache_kimi_in_entrambe_le_forme() {
+        // Forma dichiarata dallo schema ufficiale: solo il primo livello.
+        let raw = r#"{
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 19, "completion_tokens": 21, "total_tokens": 40, "cached_tokens": 10}
+        }"#;
+        let parsed: ChatCompletion = serde_json::from_str(raw).unwrap();
+        let resp = from_chat_completion(parsed, "kimi-k3".to_string(), "kimi", 1).unwrap();
+        assert_eq!(resp.usage.cache_read_tokens, Some(10));
+        // Il prompt resta il LORDO dichiarato dal wire: sommare qui i cached li
+        // conterebbe due volte, come gia' fissato per gli altri dialetti.
+        assert_eq!(resp.usage.input_tokens, 19);
+
+        // Forma emessa oggi dall'API, verbatim dalla misura: entrambi i campi.
+        let reale = r#"{
+            "choices": [{"message": {"content": "ok", "reasoning_content": "..."}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 4267, "completion_tokens": 16, "total_tokens": 4283,
+                      "cached_tokens": 4096,
+                      "completion_tokens_details": {"reasoning_tokens": 15},
+                      "prompt_tokens_details": {"cached_tokens": 4096}}
+        }"#;
+        let parsed: ChatCompletion = serde_json::from_str(reale).unwrap();
+        let resp = from_chat_completion(parsed, "kimi-k2.6".to_string(), "kimi", 1).unwrap();
+        assert_eq!(resp.usage.cache_read_tokens, Some(4096));
+        assert_eq!(resp.usage.input_tokens, 4267, "il prompt lordo non cambia sui cache hit");
+    }
+
     /// La RELAZIONE fra i conteggi, non solo la loro presenza.
     ///
     /// I dialetti OpenAI-compatibili contano i cache hit DENTRO `prompt_tokens`,
@@ -3539,6 +3675,47 @@ mod tests {
              la stessa richiesta passa fra un minuto. Trattarlo come ContextTooLong \
              lo attribuisce al modello e lo fa squalificare"
         );
+    }
+
+    /// Il 429 di Moonshot per CREDITO ESAURITO e' fatturazione, non attesa.
+    ///
+    /// Corpo VERBATIM da una chiamata reale del 09/08/2026 con un account a saldo
+    /// zero (`/v1/users/me/balance` -> `available_balance: 0`). Il test parte dal
+    /// body e passa da `ProviderHttpError::from_response`, cioe' dal produttore
+    /// reale: costruire a mano il codice proverebbe che il `match` ritorna cio'
+    /// che c'e' scritto, non che l'estrattore quel codice lo produca (e' l'errore
+    /// che rese cieco per mesi il guard sul 413 di groq, qui sopra).
+    ///
+    /// Prima del fix nessuno dei quattro termini riconosciuti compariva in
+    /// `exceeded_current_quota_error`, quindi si cadeva sullo status 429 ->
+    /// `Transient`: un account SOSPESO trattato come saturazione passeggera,
+    /// cioe' ritentato per sempre invece di essere messo in cooldown.
+    ///
+    /// MUTAZIONE DI CONTROLLO: riportando il predicato a `insufficient_quota`,
+    /// questo test rosseggia con `Transient`.
+    #[test]
+    fn il_429_di_credito_esaurito_kimi_e_billing_dal_body_alla_classe() {
+        let body = r#"{"error":{"message":"Your account org-7870205d5982417a8a69c72cb690a1bb <ak-fbw7dp3on7u111gx4j6i> is suspended due to insufficient balance, please recharge your account or check your plan and billing details","type":"exceeded_current_quota_error"}}"#;
+        let err: anyhow::Error =
+            ProviderHttpError::from_response("kimi", 429, body.to_string()).into();
+        assert_eq!(
+            classify_provider_error(&err),
+            ProviderErrorKind::Billing,
+            "un account sospeso per saldo zero non si risolve aspettando: va in \
+             cooldown di fatturazione, non in coda di retry"
+        );
+
+        // Gli altri due 429 che Moonshot documenta restano attese, ed e' la
+        // ragione per cui il predicato non puo' essere lo status da solo.
+        for transitorio in ["engine_overloaded_error", "rate_limit_reached_error"] {
+            let body = format!(r#"{{"error":{{"message":"...","type":"{transitorio}"}}}}"#);
+            let err: anyhow::Error = ProviderHttpError::from_response("kimi", 429, body).into();
+            assert_eq!(
+                classify_provider_error(&err),
+                ProviderErrorKind::Transient,
+                "{transitorio}: il rimedio e' attendere, non ricaricare"
+            );
+        }
     }
 
     #[test]

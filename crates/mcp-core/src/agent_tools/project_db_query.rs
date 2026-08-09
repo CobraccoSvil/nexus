@@ -16,7 +16,10 @@
 //! Sicurezza (regola E CLAUDE.md - isolamento progetti):
 //!   - La connessione viene SEMPRE risolta da `project_database_config` del
 //!     progetto attivo (via `crate::project_db::exec::resolve_project_conn`).
-//!   - Guard-rail anti-contaminazione verso il DB infrastruttura Nexus.
+//!     E' li' che si decide QUALE database si tocca: `classifica_connessione`
+//!     rifiuta il DB META e il DB metadati per-progetto. Il guard sul testo
+//!     della statement (`check_dangerous_sql`) NON risponde a quella domanda e
+//!     non deve provarci: leggere il catalogo del DB applicativo e' legittimo.
 //!   - Limiti: timeout query 30s, max 1000 righe ritornate.
 
 use serde_json::{json, Value};
@@ -95,30 +98,37 @@ pub(super) async fn tool_nexus_db_query(ctx: &AgentToolContext, input: &Value) -
         .and_then(Value::as_u64)
         .map(|n| n as usize);
 
-    // Guard SQL per-query (governance db/sql_injection): blocca le query
-    // distruttive di massa (DELETE/UPDATE senza WHERE) e l'accesso a oggetti di
-    // sistema/infra. Solo blocco + audit (decisione utente: niente auto-fix su
-    // DB). Il blocco del DB Nexus a livello connessione resta in
-    // resolve_project_conn (ortogonale).
+    // Guard SQL per-statement (governance db/sql_injection): blocca le query
+    // distruttive di massa (DELETE/UPDATE senza WHERE), le SCRITTURE sui
+    // cataloghi di sistema e gli oggetti di infrastruttura Nexus. Solo blocco +
+    // audit (decisione utente: niente auto-fix su DB).
+    //
+    // NON decide "su quale DB si sta lavorando": quello lo decide la
+    // connessione, in `resolve_project_conn` -> `classifica_connessione`, che
+    // rifiuta sia il DB META sia il DB metadati per-progetto. E' il motivo per
+    // cui la LETTURA di `information_schema`/`pg_catalog` e' consentita: il
+    // catalogo che l'agente puo' raggiungere e' quello del DB applicativo del
+    // progetto, cioe' del proprio lavoro.
     if crate::security::resource_governance::policy(&ctx.db, "db", "sql_injection")
         .await
         .enabled
     {
-        if let Some(reason) = crate::security::resource_governance::check_dangerous_sql(&sql) {
+        if let Some(motivo) = crate::security::resource_governance::check_dangerous_sql(&sql) {
             let mut entry = crate::security::AuditEntry::blocked(
                 ctx.project_id,
                 "db_dangerous_statement_blocked",
                 "db",
             )
             .with_resource(sql.chars().take(120).collect::<String>())
-            .with_details(json!({ "reason": reason }))
+            .with_details(json!({ "rule": motivo.regola(), "reason": motivo.motivo() }))
             .with_actor_user(ctx.user_id);
             if let Some(s) = ctx.session_id {
                 entry = entry.with_actor_session(s);
             }
             crate::security::record_audit(entry);
             return db_tool_failure(json!({
-                "error": format!("Query rifiutata dalla governance DB: {reason}"),
+                "error": format!("Query rifiutata dalla governance DB: {}", motivo.motivo()),
+                "rule": motivo.regola(),
                 "blocked": true,
             }));
         }
@@ -335,6 +345,97 @@ pub(super) async fn tool_nexus_db_describe(ctx: &AgentToolContext, input: &Value
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    /// La query REALE dell'incidente, letta da `agent_steps.tool_input` del
+    /// DB-progetto di gestione-corsi (passo `nexus_db_query`, `status='failed'`,
+    /// 2026-08-09 13:34:40 UTC). Byte per byte, punto e virgola compreso: e'
+    /// l'input che la produzione ha respinto, non una sua parafrasi.
+    const SQL_INCIDENTE: &str =
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name;";
+
+    /// Registra una connessione per il progetto. Scrive nella tabella REALE
+    /// della migrazione (regola O): se `connection_role` cambiasse vincolo o
+    /// nome, questo test lo vedrebbe, una fixture `CREATE TABLE` no.
+    async fn registra_connessione(pool: &PgPool, project_id: Uuid, nome: &str, url: &str, ruolo: &str) {
+        sqlx::query(
+            "INSERT INTO project_database_config \
+                (project_id, name, engine, hosting_mode, connection_secret, is_primary, connection_role) \
+             VALUES ($1, $2, 'postgres', 'internal', $3::bytea, $4, $5)",
+        )
+        .bind(project_id)
+        .bind(nome)
+        .bind(url.as_bytes())
+        .bind(ruolo == "app")
+        .bind(ruolo)
+        .execute(pool)
+        .await
+        .expect("registra connessione");
+    }
+
+    /// I due casi speculari dell'incidente, presi per la strada della
+    /// produzione: la STESSA query, e a decidere e' la CONNESSIONE.
+    ///
+    /// Il DB metadati per-progetto era raggiungibile: `nexus_metadata` e' una
+    /// riga vera di `project_database_config` (mig 0494), la sua URL non e'
+    /// quella del DB META (stesso cluster applicativo, database
+    /// `<slug>_nexus`), e `resolve_project_conn` filtra per nome o per
+    /// `is_primary` senza guardare il ruolo. Bastava
+    /// `nexus_db_query(connection: "nexus_metadata")`.
+    ///
+    /// Mutazione che rende rosso: togliere il ramo `MetadatiDiProgetto` da
+    /// `classifica_connessione` -> la seconda asserzione cade e il tool apre un
+    /// pool su `agent_steps`.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_catalogo_si_legge_sul_db_del_progetto_mai_su_quello_di_nexus(pool: PgPool) {
+        let (_user, project_id) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+
+        registra_connessione(
+            &pool,
+            project_id,
+            "primary",
+            "postgres://app:pw@127.0.0.1:5434/gestione_corsi_app",
+            "app",
+        )
+        .await;
+        registra_connessione(
+            &pool,
+            project_id,
+            "nexus_metadata",
+            "postgres://nexus_admin:pw@127.0.0.1:5434/gestione_corsi_nexus",
+            "nexus_metadata",
+        )
+        .await;
+
+        // Il testo della query non e' cio' che decide: e' lo stesso nei due casi.
+        assert_eq!(
+            crate::security::resource_governance::check_dangerous_sql(SQL_INCIDENTE),
+            None,
+            "la lettura del catalogo non e' piu' respinta dal guard sul testo"
+        );
+
+        // Connessione applicativa: risolta, la query puo' partire.
+        let applicativa = resolve_project_conn(&pool, project_id, None).await;
+        assert!(
+            applicativa.is_ok(),
+            "il DB applicativo del progetto deve restare raggiungibile: {applicativa:?}"
+        );
+
+        // Connessione di infrastruttura: rifiutata PRIMA di aprire qualunque pool.
+        let metadati = resolve_project_conn(&pool, project_id, Some("nexus_metadata")).await;
+        assert!(
+            metadati.is_err(),
+            "il DB metadati Nexus del progetto non e' un DB applicativo"
+        );
+
+        // E la stessa query, instradata li', non arriva al database.
+        let esito = execute_query(&pool, project_id, SQL_INCIDENTE, &[], None, Some("nexus_metadata")).await;
+        assert!(
+            matches!(esito, Err(QueryExecError::ConnectionError(_))),
+            "atteso rifiuto di connessione, ottenuto {esito:?}"
+        );
+    }
 
     #[test]
     fn db_tool_failure_dichiara_il_fallimento_e_preserva_il_payload() {

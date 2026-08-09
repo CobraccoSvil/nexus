@@ -123,11 +123,29 @@ pub enum PolicyError {
     Load(String),
 }
 
-/// Provider considerati cloud (inviano dati a servizi esterni). Fonte unica per
-/// il filtro tenant e per l'enforcement dei flag DLP per-tier. Non sono "nomi di
-/// modello" (regola G), ma l'insieme strutturale dei provider non-locali, allineato
-/// alla costante `CLOUD_PROVIDERS` del TS.
-const CLOUD_PROVIDERS: [&str; 5] = ["anthropic", "openai", "mistral", "deepseek", "google"];
+/// Provider LOCALI / self-hosted: i dati non lasciano l'infrastruttura. L'insieme
+/// CLOUD e' il loro COMPLEMENTO, e il verso non e' un dettaglio di stile.
+///
+/// Prima qui c'era l'elenco dei cloud, cinque nomi, e un provider che non vi
+/// comparisse risultava NON-cloud: cioe' esente dal gate che vieta il cloud ai
+/// tier riservati. Nessuno dei tre provider aggiunti dopo (groq, openrouter,
+/// perplexity) vi e' mai entrato, quindi da mesi un pin su uno di loro a tier 3
+/// passava il gate con `dlp_allow_cloud_tier3=false`, e il contenuto partiva
+/// verso un servizio esterno senza che nulla lo dicesse. Aggiungere il sesto
+/// nome avrebbe chiuso l'istanza lasciando aperta la classe (regola H): la lista
+/// dei cloud e' incompleta per costruzione, perche' cresce ogni volta che si
+/// registra un fornitore.
+///
+/// I locali invece sono un insieme piccolo, chiuso e strutturale — self-hosted o
+/// on-premise — e non cresce con i fornitori di mercato. Con questo verso un
+/// provider nuovo e' cloud PER COSTRUZIONE e il gate fallisce verso la cautela.
+/// Stesso vocabolario di `mcp-core::dlp`.
+///
+/// Effetto sulla configurazione esistente: NESSUNO. Le catene dei tre profili
+/// nominano solo anthropic/openai/deepseek/google/mistral/vllm, quindi il filtro
+/// produce le stesse liste di prima; cambia solo per i provider che l'elenco
+/// vecchio non conosceva.
+const LOCAL_PROVIDERS: [&str; 4] = ["vllm", "ollama", "local", "onprem"];
 
 /// TTL della cache override DB (60s, come il TS `DB_TTL_MS`).
 const DB_TTL: Duration = Duration::from_secs(60);
@@ -210,9 +228,10 @@ impl PolicyEngine {
     }
 
     /// `true` se `name` e' un provider cloud (invia dati a servizi esterni).
-    /// Espone la fonte unica [`CLOUD_PROVIDERS`] ai caller del gate.
+    /// Punto unico del gate: e' il complemento di [`LOCAL_PROVIDERS`], quindi un
+    /// provider sconosciuto e' cloud e non esente.
     pub fn is_cloud_provider(name: &str) -> bool {
-        CLOUD_PROVIDERS.contains(&name)
+        !LOCAL_PROVIDERS.contains(&name)
     }
 
     /// Ricarica i flag DLP dai settings DB con cache TTL 60s. Se il DB e'
@@ -317,7 +336,7 @@ impl PolicyEngine {
         let filtered: Vec<String> = if exclude_cloud {
             ordered
                 .into_iter()
-                .filter(|p| !CLOUD_PROVIDERS.contains(&p.as_str()))
+                .filter(|p| !Self::is_cloud_provider(p.as_str()))
                 .collect()
         } else {
             ordered
@@ -440,6 +459,31 @@ routing:
         assert!(!e.cloud_blocked_for_tier(0));
         assert!(PolicyEngine::is_cloud_provider("deepseek"));
         assert!(!PolicyEngine::is_cloud_provider("vllm"));
+    }
+
+    /// Il gate riconosce come cloud anche i provider registrati DOPO che la
+    /// costante e' stata scritta. E' la proprieta' che l'elenco dei cloud non
+    /// poteva avere: groq, openrouter e perplexity sono a registro da mesi e
+    /// nessuno vi era mai stato aggiunto, quindi un pin su di loro a tier 3
+    /// passava il gate con `dlp_allow_cloud_tier3=false`.
+    ///
+    /// MUTAZIONE DI CONTROLLO: tornando a un elenco di cloud, le quattro
+    /// asserzioni sui provider non elencati rosseggiano.
+    #[test]
+    fn un_provider_non_previsto_e_cloud_per_costruzione() {
+        for cloud in ["kimi", "groq", "openrouter", "perplexity", "anthropic"] {
+            assert!(
+                PolicyEngine::is_cloud_provider(cloud),
+                "{cloud} non riconosciuto come cloud: il gate DLP per-tier lo esenta"
+            );
+        }
+        // I soli esenti sono quelli che girano nella nostra infrastruttura.
+        for locale in ["vllm", "ollama", "local", "onprem"] {
+            assert!(
+                !PolicyEngine::is_cloud_provider(locale),
+                "{locale} classificato cloud: verrebbe escluso dai profili onprem"
+            );
+        }
     }
 
     #[test]

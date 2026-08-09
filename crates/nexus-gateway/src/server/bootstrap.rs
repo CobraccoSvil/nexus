@@ -20,8 +20,8 @@ use crate::model_alias_resolver::ModelAliasResolver;
 use crate::policy_engine::PolicyEngine;
 use crate::provider::LlmProvider;
 use crate::providers::{
-    AnthropicProvider, DeepSeekProvider, GenericOpenAiProvider, GoogleProvider, MistralProvider,
-    OpenAiProvider, VllmProvider,
+    AnthropicProvider, DeepSeekProvider, GenericOpenAiProvider, GoogleProvider, KimiProvider,
+    MistralProvider, OpenAiProvider, VllmProvider,
 };
 use crate::redaction::presidio_client::PresidioClient;
 use crate::types::SensitivityTier;
@@ -292,6 +292,11 @@ fn construct_provider(
             Some(db.clone()),
         ))),
         "mistral" => Some(Arc::new(MistralProvider::new(http.clone(), k, base_url))),
+        // Adapter dedicato come mistral: `api_format='openai_compat'` nel
+        // registry, ma il ramo per nome precede il controllo sul formato. I
+        // quirk (temperatura fissa, max_completion_tokens, Preserved Thinking)
+        // sono nel dialetto, non qui.
+        "kimi" => Some(Arc::new(KimiProvider::new(http.clone(), k, base_url))),
         "vllm" => {
             // vLLM: base_url obbligatoria (l'attivazione 'base_url' l'ha garantita).
             let url = base_url?;

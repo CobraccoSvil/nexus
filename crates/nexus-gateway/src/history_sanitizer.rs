@@ -146,8 +146,20 @@ fn normalize_provider(p: &str) -> String {
     p.split('/').next().unwrap_or(p).trim().to_ascii_lowercase()
 }
 
+/// Provider sui cui assistant il `reasoning` va CONSERVATO, non ripulito.
+///
+/// I due ci stanno per ragioni di forza diversa, e vale la pena distinguerle
+/// perche' decidono cosa succede quando il campo manca:
+/// - DeepSeek lo PRETENDE: senza, l'API risponde 400 ("must be passed back").
+/// - Kimi lo PRESCRIVE nella doc (Preserved Thinking: l'assistant va rimandato
+///   "completo e inalterato") ma non rifiuta — MISURATO il 09/08/2026 su
+///   `kimi-k2.6` e `kimi-k2.7-code`, entrambi accettano il turno che lo omette.
+///   Li' il campo si conserva perche' il pensiero non si spegne mai: e' il
+///   ragionamento del turno precedente, e toglierlo lo fa ricominciare da capo.
+///
+/// In entrambi i casi la sanificazione non lo tocca, nemmeno in Aggressive.
 fn provider_keeps_reasoning(provider: &str) -> bool {
-    provider == "deepseek"
+    matches!(provider, "deepseek" | "kimi")
 }
 
 fn provider_keeps_thinking_signature(provider: &str) -> bool {
@@ -440,6 +452,29 @@ mod tests {
         let r = sanitize_history(&mut msgs, "deepseek", SanitizeMode::Standard);
         assert_eq!(r.stripped_reasoning, 0);
         assert!(msgs[0].reasoning.is_some());
+    }
+
+    /// Su Kimi il pensiero e' sempre acceso e la doc prescrive di rimandarlo
+    /// indietro: la sanificazione non deve toglierlo, in nessuna modalita'.
+    ///
+    /// Il test sta QUI, accanto ai gemelli, e non nell'adapter: il round-trip che
+    /// `build_request_body` esegue copierebbe un campo che questo sanitizer ha
+    /// gia' rimosso. Sono due tagli sulla stessa catena, e provarne uno solo
+    /// lascerebbe l'altro senza copertura.
+    ///
+    /// MUTAZIONE DI CONTROLLO: togliendo `"kimi"` da `provider_keeps_reasoning`
+    /// entrambe le asserzioni rosseggiano.
+    #[test]
+    fn kimi_mantiene_reasoning_in_entrambe_le_modalita() {
+        for modalita in [SanitizeMode::Standard, SanitizeMode::Aggressive] {
+            let mut msgs = vec![assistant_with_tools("c1", "get_time")];
+            let r = sanitize_history(&mut msgs, "kimi", modalita);
+            assert_eq!(
+                r.stripped_reasoning, 0,
+                "{modalita:?}: senza il pensiero di ritorno il turno successivo e' rifiutato"
+            );
+            assert!(msgs[0].reasoning.is_some());
+        }
     }
 
     // NOTA: qui viveva `aggressive_strip_tutti_i_campi_provider_specifici`, che

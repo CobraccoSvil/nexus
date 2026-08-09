@@ -20,6 +20,7 @@ export type ProviderBrandKey =
   | "google"
   | "deepseek"
   | "mistral"
+  | "kimi"
   | "vllm"
   | "ollama"
   | "local"
@@ -50,6 +51,14 @@ export function normalizeProviderKey(
       return "deepseek";
     case "mistral":
       return "mistral";
+    // Il prodotto si chiama Kimi, l'azienda Moonshot AI, e l'host dell'API e'
+    // ancora api.moonshot.ai: entrambi i nomi circolano, e un provider_used che
+    // dicesse "moonshot" finirebbe altrimenti in "unknown" con un colore diverso
+    // dalle sue stesse righe.
+    case "kimi":
+    case "moonshot":
+    case "moonshotai":
+      return "kimi";
     case "vllm":
       return "vllm";
     case "ollama":
@@ -90,6 +99,11 @@ const PROVIDER_COLORS: Record<ProviderBrandKey, { base: string; label: string }>
   google: { base: "#4285f4", label: "Google" },
   deepseek: { base: "#7c3aed", label: "DeepSeek" },
   mistral: { base: "#ff7000", label: "Mistral" },
+  // Magenta scelto per DISTINGUIBILITA' nella palette, non dal brand: nella
+  // documentazione ufficiale non c'e' un colore dichiarato, e i toni vicini sono
+  // gia' presi (blu Google, viola DeepSeek, i due arancioni). In un pallino da
+  // 12px l'unica cosa che conta e' non confondersi con gli altri cinque.
+  kimi: { base: "#db2777", label: "Kimi" },
   vllm: { base: "#737373", label: "vLLM" },
   ollama: { base: "#737373", label: "Ollama" },
   local: { base: "#737373", label: "Local" },
