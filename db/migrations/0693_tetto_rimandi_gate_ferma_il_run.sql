@@ -1,4 +1,4 @@
--- 0692: il tetto dei rimandi del gate duale FERMA il run, invece di contare a vuoto
+-- 0693: il tetto dei rimandi del gate duale FERMA il run, invece di contare a vuoto
 --
 -- ROOT CAUSE
 -- La sera del 09/08/2026, prima serata con il gate in `enforce` (mig 0689), un
@@ -70,7 +70,7 @@ UPDATE settings
                      'Rejected e degradava a NeedsHuman, che in autonomia tornava a '
                      'essere lo stesso rimando: contava e non fermava nulla (nove '
                      'ripetizioni misurate il 09/08/2026). Punto unico: '
-                     'decisions::step_gate::classify_block -> GateBlock (mig 0692).',
+                     'decisions::step_gate::classify_block -> GateBlock (mig 0693).',
        updated_at = NOW()
  WHERE key = 'orchestrator.critical_step_max_rejections';
 
@@ -83,8 +83,8 @@ BEGIN
    WHERE key = 'orchestrator.critical_step_max_rejections';
 
   IF v_tetto IS NULL THEN
-    RAISE NOTICE '0692: chiave critical_step_max_rejections ASSENTE: il gate usa il default di codice. Verificare la mig 0677 che la introduce.';
+    RAISE NOTICE '0693: chiave critical_step_max_rejections ASSENTE: il gate usa il default di codice. Verificare la mig 0677 che la introduce.';
   ELSE
-    RAISE NOTICE '0692: tetto dei rimandi = % (invariato: cambia la conseguenza, non il numero).', v_tetto;
+    RAISE NOTICE '0693: tetto dei rimandi = % (invariato: cambia la conseguenza, non il numero).', v_tetto;
   END IF;
 END $$;
