@@ -3080,8 +3080,11 @@ gamma
         )
         .await;
 
-        // `out.testo`, non `out`: la firma del tool e' migrata a `RispostaTool`
-        // (regola Q, l'esito in un campo) e il testo e' uno dei suoi campi.
+        // Il tool e' stato migrato a `RispostaTool` mentre questo test viveva su
+        // un altro branch: l'asserzione guarda ora i CAMPI, che e' il contratto
+        // che il tool ha adottato (regola Q). Il messaggio per il modello resta
+        // `testo`, e lo si passa come diagnostica dell'assert: quando fallisce,
+        // il motivo e' proprio quel testo.
         assert_eq!(out.esito, EsitoTool::Fallito, "{}", out.testo);
         assert!(
             out.testo.contains("school-courses-fe/SchoolCoursesApi"),

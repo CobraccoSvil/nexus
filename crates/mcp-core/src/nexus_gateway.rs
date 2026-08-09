@@ -23,6 +23,13 @@ pub struct NexusGatewayClient {
     /// su ogni richiesta cosi' il gateway dimensiona i propri budget sullo stesso
     /// cronometro del chiamante.
     run_timeout_secs: Option<u64>,
+    /// IDENTITA' del run, quando il costruttore la conosce. Serve a una sola
+    /// domanda: se questo run scade, quanto del suo budget se n'e' andato in
+    /// CODA verso un fornitore saturo invece che in attesa del modello
+    /// (`provider_inflight`). `None` = attesa non attribuibile a nessun run, che
+    /// e' il caso legittimo delle chiamate senza budget proprio (classificatore,
+    /// wizard, discovery) e non un ripiego.
+    run_id: Option<uuid::Uuid>,
 }
 
 /// Messaggio della conversazione inviato al gateway.
@@ -604,6 +611,7 @@ impl NexusGatewayClient {
     ) -> Self {
         Self {
             run_timeout_secs,
+            run_id: None,
             // Resilienza connessioni morte post-sleep (regola H): niente riuso di
             // socket idle dal pool + keepalive. Il default keep-alive faceva fallire
             // le chiamate mcp-core -> gateway con "error sending request" dopo che la
@@ -650,6 +658,61 @@ impl NexusGatewayClient {
         )
     }
 
+    /// Chiede al registro il permesso di occupare il fornitore, accodandosi se
+    /// e' saturo. La guardia ritornata tiene la chiamata «in volo» finche' vive.
+    ///
+    /// `None` quando il fornitore NON e' dichiarato sulla richiesta
+    /// (`pin_provider` assente): li' e' il gateway a scegliere la destinazione, e
+    /// attribuire il carico a un fornitore indovinato dal nome del modello
+    /// significherebbe contare le chiamate di qualcun altro. Meglio un carico
+    /// sottostimato e vero che uno completo e inventato — e' la stessa ragione
+    /// per cui `attesa_del_run` distingue «non misurata» da «zero».
+    async fn governo_del_carico(
+        &self,
+        req: &GwRequest,
+    ) -> Option<crate::provider_inflight::PermessoChiamata> {
+        let provider = req.pin_provider.as_deref()?.trim();
+        if provider.is_empty() {
+            return None;
+        }
+        let registro = crate::provider_inflight::registro_da_settings(&self.db).await;
+        let (permesso, esito) = registro.permesso(provider, &req.model, self.run_id).await;
+        match esito {
+            crate::provider_inflight::EsitoAttesa::Immediato => {}
+            crate::provider_inflight::EsitoAttesa::Atteso { attesa } => {
+                tracing::debug!(
+                    target: "provider_inflight",
+                    provider = %provider, model = %req.model,
+                    attesa_ms = attesa.as_millis() as u64,
+                    "chiamata accodata: il fornitore era saturo, permesso ottenuto"
+                );
+            }
+            crate::provider_inflight::EsitoAttesa::CodaScaduta { atteso, in_volo } => {
+                // WARN e non errore: la chiamata parte comunque (tetto di
+                // scheduling). E' il segnale che il fornitore e' sotto-dimensionato
+                // per il carico corrente, cioe' esattamente il fatto che la sera
+                // dell'08/08 nessuno poteva vedere.
+                tracing::warn!(
+                    target: "provider_inflight",
+                    provider = %provider, model = %req.model,
+                    atteso_s = atteso.as_secs(), in_volo,
+                    "attesa in coda scaduta: la chiamata parte comunque sul fornitore saturo"
+                );
+            }
+        }
+        Some(permesso)
+    }
+
+    /// Dichiara di quale run e' il client, per l'attribuzione del tempo di coda.
+    ///
+    /// Fluente e non un parametro di [`from_db_for_run`] perche' i costruttori
+    /// hanno gia' ~30 call site che il run non lo conoscono e non devono
+    /// conoscerlo: chi lo sa lo dice, gli altri restano com'erano.
+    pub fn per_run(mut self, run_id: uuid::Uuid) -> Self {
+        self.run_id = Some(run_id);
+        self
+    }
+
     /// Timbra sulla richiesta il run per cui il client e' stato costruito.
     ///
     /// Sta QUI e non nei costruttori di [`GwRequest`] perche' chi compone la
@@ -662,6 +725,18 @@ impl NexusGatewayClient {
     }
 
     pub async fn complete(&self, req: GwRequest) -> Result<GwResponse> {
+        // GOVERNO DEL CARICO (regola L, punto unico `provider_inflight`). Sta
+        // QUI perche' questo e' il confine: ogni chiamata al modello di mcp-core
+        // passa da `complete`, quindi il conteggio vede il carico VERO — le
+        // figure di un fan-out, ma anche il classificatore, il wizard e le altre
+        // sessioni, che verso il fornitore pesano esattamente quanto le figure.
+        // Contarlo piu' in alto (nel fan-out) avrebbe misurato una convocazione,
+        // non un fornitore.
+        //
+        // La guardia vive fino a fine funzione: dal momento in cui la richiesta
+        // parte a quando la risposta e' letta. Se il task viene cancellato nel
+        // mezzo — cioe' ogni volta che una figura scade — il `Drop` decrementa.
+        let _carico = self.governo_del_carico(&req).await;
         let resp = self
             .http
             .post(format!("{}/v1/complete", self.base_url))

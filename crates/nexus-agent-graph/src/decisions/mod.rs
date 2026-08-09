@@ -161,7 +161,9 @@ pub use context_reduction::{
 pub use correction_progress::{
     classify_correction_progress, CorrectionProgress, WriteFact,
 };
-pub use timeout_cause::{classifica_causa_timeout, CausaTimeout, TentativoOsservato};
+pub use timeout_cause::{
+    classifica_causa_timeout, AttesaInCoda, CausaTimeout, TentativoOsservato,
+};
 pub use requirement_conformance::{
     compose_conformance, conformance_senza_progetto, requirements_from_synthesis,
     ConformanceReport, Direction, FileEvidence, RequirementCriterion, RequirementOutcome,
