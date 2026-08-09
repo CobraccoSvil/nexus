@@ -27,6 +27,7 @@
 //! provider non genera video o il poll va in timeout, l'errore risale onestamente
 //! al modello.
 
+use nexus_types::tool_outcome::{NaturaFallimento, RispostaTool};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde_json::{json, Value};
 
@@ -44,31 +45,38 @@ const GENERATED_SUBDIR: &str = ".nexus/generated";
 /// Estensione di salvataggio (gli endpoint video-gen del gateway emettono MP4).
 const OUTPUT_EXT: &str = "mp4";
 
-pub async fn tool_nexus_generate_video(ctx: &ToolContextCore, input: &Value) -> String {
+pub async fn tool_nexus_generate_video(ctx: &ToolContextCore, input: &Value) -> RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::NexusGenerateVideoInput};
+
     // 1) Permesso di scrittura obbligatorio: il tool PRODUCE un file su disco.
     if !ctx.can_write {
-        return crate::errore_json(
+        // DEL SISTEMA: decisione del progetto sul run, non un parametro.
+        return crate::errore_tool(
             "Permesso di scrittura non concesso: impossibile salvare il video \
              generato su disco. Esegui in una modalita' che consente la scrittura file.",
+            NaturaFallimento::DelSistema,
         );
     }
 
-    // 2) Prompt obbligatorio + parametri opzionali.
-    let prompt = match input.get("prompt").and_then(Value::as_str).map(str::trim) {
-        Some(p) if !p.is_empty() => p.to_string(),
-        _ => {
-            return crate::errore_json(
-                "Parametro 'prompt' obbligatorio (descrizione testuale del video da generare).",
-            );
-        }
+    // 2) Parametri dal contratto.
+    let params = match NexusGenerateVideoInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
-    let duration_seconds = input
-        .get("duration_seconds")
-        .and_then(Value::as_u64)
-        .map(|d| d as u32);
-    let filename = input
-        .get("filename")
-        .and_then(Value::as_str)
+    let prompt = params.prompt.trim().to_string();
+    if prompt.is_empty() {
+        return crate::errore_tool(
+            "Parametro 'prompt' obbligatorio (descrizione testuale del video da generare).",
+            NaturaFallimento::Rimediabile,
+        );
+    }
+    // `max(0)` prima del cast: il contratto dichiara `i64`, e un negativo
+    // passando da `as u32` diventerebbe una durata enorme. `as_u64` lo scartava
+    // insieme al parametro, con lo stesso effetto ma senza dirlo.
+    let duration_seconds = params.duration_seconds.map(|d| d.max(0) as u32);
+    let filename = params
+        .filename
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
@@ -78,11 +86,16 @@ pub async fn tool_nexus_generate_video(ctx: &ToolContextCore, input: &Value) -> 
     let (provider, model) = match resolve_purpose_via_http(&ctx.db, VIDEO_PURPOSE).await {
         Ok(pm) => pm,
         Err(e) => {
-            return crate::errore_json(format!(
+            // Configurazione di piattaforma: nessun parametro della chiamata la
+            // aggira, e il messaggio nomina la migrazione da verificare.
+            return crate::errore_tool(
+                format!(
                     "modello video-gen non risolvibile (purpose '{VIDEO_PURPOSE}'): {e}. \
                      Verifica nexus_purpose_model.generate_video (mig 0482) e che un modello \
                      video-gen sia abilitato nel catalog (mig 0482)."
-                ));
+                ),
+                NaturaFallimento::DelSistema,
+            );
         }
     };
 
@@ -105,7 +118,12 @@ pub async fn tool_nexus_generate_video(ctx: &ToolContextCore, input: &Value) -> 
     {
         Ok(r) => r,
         Err(e) => {
-            return crate::errore_json(format!("generazione video via gateway fallita: {e}"));
+            // TRANSITORIO come nel gemello image: quel che arriva qui e'
+            // l'esaurimento di cooldown e failover del gateway.
+            return crate::errore_tool(
+                format!("generazione video via gateway fallita: {e}"),
+                NaturaFallimento::Transitorio,
+            );
         }
     };
 
@@ -113,33 +131,54 @@ pub async fn tool_nexus_generate_video(ctx: &ToolContextCore, input: &Value) -> 
     //    gcsUri (niente bytes), non possiamo salvare path-safe: ritorniamo l'url
     //    con nota (regola H: niente fetch nascosto di una URL esterna).
     let Some(b64) = result.video_base64.as_deref() else {
-        return json!({
-            "note": "il provider ha restituito solo una URL (gcsUri), non il video inline: \
-                     impossibile salvarlo nel progetto. Scarica il video manualmente dall'URL.",
+        // DIVERGENZA CHIUSA, e si vedeva solo mettendo i due gemelli accanto:
+        // `image_tools` dichiara questo identico caso come fallimento, qui
+        // usciva un JSON con `note` e nessun marker — cioe' un SUCCESSO, per un
+        // tool il cui compito era salvare il video nel progetto e che non l'ha
+        // salvato. L'URL resta nel corpo: e' l'unica cosa che l'agente puo'
+        // ancora fare, e il messaggio glielo dice.
+        let dettagli = json!({
+            "error": "il provider ha restituito solo una URL (gcsUri), non il video inline: \
+                      impossibile salvarlo nel progetto. Scarica il video manualmente dall'URL.",
             "video_url": result.url.unwrap_or_default(),
             "model_used": result.model_used,
-        })
-        .to_string();
+        });
+        return crate::errore_tool_con_dettagli(dettagli, NaturaFallimento::DelSistema);
     };
+    // Base64 malformato: e' il provider ad aver risposto male, non l'agente ad
+    // aver chiesto male.
     let bytes = match B64.decode(b64) {
         Ok(b) => b,
         Err(e) => {
-            return crate::errore_json(format!("decodifica video base64 fallita: {e}"));
+            return crate::errore_tool(
+                format!("decodifica video base64 fallita: {e}"),
+                NaturaFallimento::DelSistema,
+            );
         }
     };
 
     // 6) Salva path-safe sotto la project_root.
     let (video_path, provider_used) = match save_video(&ctx.root_path, &bytes, filename).await {
         Ok(p) => (p, provider),
-        Err(e) => return crate::errore_json(format!("salvataggio video fallito: {e}")),
+        // Come nel gemello image: `save_video` appiattisce gia' l'errore di I/O
+        // in una `String`, quindi il `ErrorKind` qui non c'e' piu' e ricavarlo
+        // dal messaggio sarebbe la regola M al contrario.
+        Err(e) => {
+            return crate::errore_tool(
+                format!("salvataggio video fallito: {e}"),
+                NaturaFallimento::DelSistema,
+            )
+        }
     };
 
-    json!({
-        "video_path": video_path,
-        "model_used": result.model_used,
-        "provider_used": provider_used,
-    })
-    .to_string()
+    RispostaTool::riuscito(
+        json!({
+            "video_path": video_path,
+            "model_used": result.model_used,
+            "provider_used": provider_used,
+        })
+        .to_string(),
+    )
 }
 
 /// Costruisce un nome file sicuro per il video generato. Se l'agente passa

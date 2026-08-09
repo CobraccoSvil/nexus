@@ -124,6 +124,16 @@ async fn esegui_tool_migrato(
         "ui_layout_patterns" => Some(ui_patterns::tool_ui_layout_patterns(&ctx.core.db, input).await),
         "ui_reference_search" => Some(ui_reference_search::tool_ui_reference_search(&ctx.core, input).await),
         "ui_styling_audit" => Some(ui_styling::tool_ui_styling_audit(&ctx.core, input).await),
+        // I due generatori di media. Sono GEMELLI, e metterli accanto ha fatto
+        // vedere la divergenza: sul caso "il provider ha restituito solo una
+        // URL" `generate_image` dichiarava il fallimento e `generate_video`
+        // ritornava un JSON con `note` e nessun marker — cioe' un successo, per
+        // un tool il cui compito era salvare il file nel progetto e che non
+        // l'aveva salvato. `size` inoltre e' un ENUM nel catalogo che l'handler
+        // leggeva come stringa libera: i valori non promessi passavano di qui e
+        // fallivano un salto piu' in la', dal provider.
+        "nexus_generate_image" => Some(image_tools::tool_nexus_generate_image(&ctx.core, input).await),
+        "nexus_generate_video" => Some(video_tools::tool_nexus_generate_video(&ctx.core, input).await),
         // Ogni suo fallimento e' RIMEDIABILE e lo dichiara nel campo `natura`:
         // e' il primo tool a farlo, ed e' quello su cui la mancanza si
         // misurava (11% di `old_string non trovato` seguiti da una ripetizione
@@ -294,13 +304,11 @@ async fn esegui_tool_legacy(
             vision_tools::tool_nexus_describe_image_attachment(ctx, input).await
         }
         // PR6b-2: genera un'immagine dal prompt e la salva path-safe nel progetto.
-        "nexus_generate_image" => image_tools::tool_nexus_generate_image(ctx, input).await,
         // PR6c: trascrive un audio allegato (speech-to-text) via gateway.
         "nexus_transcribe_audio" => audio_tools::tool_nexus_transcribe_audio(ctx, input).await,
         // PR6d: sintetizza un testo in audio (text-to-speech) e lo salva nel progetto.
         "nexus_text_to_speech" => audio_tools::tool_nexus_text_to_speech(ctx, input).await,
         // PR6e: genera un video dal prompt (text-to-video, Veo async) e lo salva nel progetto.
-        "nexus_generate_video" => video_tools::tool_nexus_generate_video(ctx, input).await,
         "nexus_install_shadcn_components" => {
             shadcn_setup::tool_nexus_install_shadcn_components(ctx, input).await
         }
