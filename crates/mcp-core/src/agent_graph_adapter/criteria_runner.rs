@@ -1587,15 +1587,14 @@ fn esito_resa(
     risorse: &VerdettoRisorse,
 ) -> (CriterionOutcome, Value) {
     use static_render::VerdettoResa;
-    let risorse = risorse.evidenza();
-    match verdetto {
+    let (esito, mut evidenza) = match verdetto {
         VerdettoResa::Resa { elementi } => (
             CriterionOutcome::Passed,
-            json!({ "url": url, "elements_rendered": elementi, "resources": risorse }),
+            json!({ "url": url, "elements_rendered": elementi }),
         ),
         VerdettoResa::NonConcludente { motivo } => (
             CriterionOutcome::Inconclusive,
-            json!({ "url": url, "skipped_reason": motivo, "resources": risorse }),
+            json!({ "url": url, "skipped_reason": motivo }),
         ),
         VerdettoResa::NonResa { cause } => {
             let descrizioni: Vec<String> = cause.iter().take(5).map(|c| c.descrizione()).collect();
@@ -1610,11 +1609,18 @@ fn esito_resa(
                     ),
                     "causes": descrizioni,
                     "console_errors": prove.errori_console.iter().take(3).collect::<Vec<_>>(),
-                    "resources": risorse,
                 }),
             )
         }
+    };
+    // Le risorse si allegano QUI, fuori dal match, ed e' la forma che rende
+    // vera la promessa scritta nel chiamante: si riportano SEMPRE, anche a
+    // verdetto positivo. Ripetere la chiave in ogni ramo la renderebbe
+    // omissibile per distrazione proprio nel ramo che passa.
+    if let Value::Object(m) = &mut evidenza {
+        m.insert("resources".to_string(), risorse.evidenza());
     }
+    (esito, evidenza)
 }
 
 /// Promuove l'esito di un criterio che ha DAVVERO misurato (`bool`) alla forma

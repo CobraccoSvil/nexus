@@ -337,31 +337,41 @@ impl VerdettoRisorse {
     /// il dato con cui si decidera' un domani se abbassare la soglia, e senza
     /// di esso quella decisione si prenderebbe a intuito.
     pub fn evidenza(&self) -> serde_json::Value {
-        use serde_json::json;
+        use serde_json::{json, Map, Value};
+        let mut m = Map::new();
+        // Il verdetto c'e' SEMPRE, e si scrive una volta sola: e' il campo da
+        // cui chi legge l'evidenza capisce quale delle cinque risposte ha in
+        // mano, e ripeterlo per ramo lo renderebbe omissibile per distrazione.
+        m.insert("verdict".to_string(), json!(self.key()));
+        let mut aggiungi = |k: &str, v: Value| {
+            m.insert(k.to_string(), v);
+        };
         match self {
-            Self::TutteCaricate { osservate } => {
-                json!({ "verdict": self.key(), "observed": osservate })
-            }
+            Self::TutteCaricate { osservate } => aggiungi(K_OSSERVATE, json!(osservate)),
             Self::AlcuneMancanti {
                 mancanti,
                 osservate,
-            } => json!({
-                "verdict": self.key(),
-                "observed": osservate,
-                "missing": descrizioni(mancanti),
-            }),
-            Self::TipiCompromessi { tipi, mancanti } => json!({
-                "verdict": self.key(),
-                "compromised_types": tipi.iter().map(TipoCompromesso::descrizione).collect::<Vec<_>>(),
-                "missing": descrizioni(mancanti),
-            }),
-            Self::NessunaDichiarata => json!({ "verdict": self.key() }),
-            Self::NonOsservabile { motivo } => {
-                json!({ "verdict": self.key(), "reason": motivo })
+            } => {
+                aggiungi(K_OSSERVATE, json!(osservate));
+                aggiungi(K_MANCANTI, json!(descrizioni(mancanti)));
             }
+            Self::TipiCompromessi { tipi, mancanti } => {
+                let quali: Vec<String> = tipi.iter().map(TipoCompromesso::descrizione).collect();
+                aggiungi("compromised_types", json!(quali));
+                aggiungi(K_MANCANTI, json!(descrizioni(mancanti)));
+            }
+            Self::NessunaDichiarata => {}
+            Self::NonOsservabile { motivo } => aggiungi("reason", json!(motivo)),
         }
+        Value::Object(m)
     }
 }
+
+/// Chiavi dell'evidenza che compaiono in piu' rami, scritte in un posto solo:
+/// due rami che nominassero diversamente lo stesso dato darebbero a chi legge
+/// il gate due campi per la stessa cosa.
+const K_OSSERVATE: &str = "observed";
+const K_MANCANTI: &str = "missing";
 
 /// Quante risorse mancanti si nominano: bastano a riconoscere il difetto senza
 /// riversare l'intera pagina nel contesto di ogni turno.
