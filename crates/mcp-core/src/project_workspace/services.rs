@@ -3580,6 +3580,24 @@ async fn pid_progetto_confermati(db: &sqlx::PgPool) -> std::collections::HashMap
     pid_to_project
 }
 
+/// `#[cfg(windows)]` come le QUATTRO funzioni che chiama
+/// (`windows_scan_listening_ports`, `pid_progetto_confermati`,
+/// `windows_process_parents`, `resolve_project_ancestor`): senza, su Linux
+/// questo corpo veniva compilato e cercava simboli che li' non esistono —
+/// `mcp-core` non compilava affatto, quattro E0425.
+///
+/// Su Windows non si vedeva: i simboli ci sono. Il solo posto da cui il difetto
+/// era osservabile era il CI Linux, che dal 03/07/2026 all'09/08/2026 non e' mai
+/// arrivato a compilare Rust (moriva nella prima fase del gate, su una versione
+/// di Node insufficiente). E' il difetto che il primo run tornato a girare ha
+/// trovato: non dead code — cioe' cio' che una misura fatta DA Windows sa
+/// cercare — ma un simbolo che su Linux non esiste, che da Windows e'
+/// invisibile per costruzione.
+///
+/// Il dispatch del chiamante era gia' corretto: `detect_all_port_bindings` la
+/// invoca dentro `#[cfg(windows)]` e sull'altro ramo usa `ss`/`/proc`. Mancava
+/// il cfg su questa definizione, non un ramo.
+#[cfg(windows)]
 async fn detect_all_port_bindings_windows(db: &sqlx::PgPool) -> Result<Vec<PortBinding>, String> {
     // Fail-closed (regola M): una tabella non letta NON e' "nessuno ascolta".
     // `Err` fa abortire l'iterazione del `port_enforcer` — che altrimenti
