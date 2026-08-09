@@ -1879,6 +1879,52 @@ else
   fail=1
 fi
 
+# ── natura-del-blocco-gate (2026-08-09) ─────────────────────────────────────
+# «Di che natura e' questo blocco del gate duale, e ripetere puo' cambiarlo?»
+# ha UN punto unico. Il difetto che ha chiuso: ogni esito che non fosse
+# `Approved`/`UnavailableDeclared` diventava lo stesso rimando al modello, e in
+# autonomia il ciclo non finiva — MISURATO il 09/08/2026, prima serata di
+# `enforce`: nove script di correzione (apply_fixes.js, final_fix.js,
+# complete_fix.js, batch_fix.js, final_batch_fix.js, ...) scritti uno dopo
+# l'altro perche' la write passava e la run_command no.
+assert_single "natura-del-blocco-gate" 'pub fn classify_block' \
+  'crates/nexus-agent-graph/src/decisions/step_gate.rs' crates
+
+assert_single "natura-del-blocco-gate" 'pub enum GateBlock' \
+  'crates/nexus-agent-graph/src/decisions/step_gate.rs' crates
+
+# Il tetto dei rimandi NON torna a calcolarsi sui soli Rejected (difetto #19):
+# con approve+astensione — la combinazione dell'incidente — non si calcolava
+# mai, e quando scattava degradava a NeedsHuman, che in autonomia e' di nuovo
+# lo stesso rimando. Cerca la risalita in tool_dispatch, dove la delega deve
+# passare da step_gate::classify_block.
+if grep -nE 'StepGateDecision::Rejected[[:space:]]*&&|cap_raggiunto' \
+     crates/nexus-agent-graph/src/nodes/tool_dispatch.rs \
+   | grep -vE '^[0-9]+: *(//|/\*|\*)' >/dev/null 2>&1; then
+  echo "!! natura-del-blocco-gate: tool_dispatch torna a calcolare il tetto dei" >&2
+  echo "   rimandi per conto proprio sui soli Rejected. E' il difetto #19: il" >&2
+  echo "   contatore saliva e la conseguenza restava identica, all'infinito." >&2
+  echo "   Il tetto e' una delle nature di step_gate::classify_block." >&2
+  fail=1
+else
+  echo "OK natura-del-blocco-gate: il tetto viene dalla natura del blocco"
+fi
+
+# Il blocker con cui il run si chiude NON e' un letterale scritto nel nodo: lo
+# stesso run fermato dallo stesso gate non puo' dichiarare due cause diverse a
+# seconda di quale strada l'ha chiuso (chiusura in autonomia vs sospensione
+# scaduta). Deve delegare a GateBlock::blocker -> SuspensionOrigin::StepGate.
+if grep -nE '"blocker"[[:space:]]*:[[:space:]]*"' \
+     crates/nexus-agent-graph/src/nodes/tool_dispatch.rs \
+   | grep -vE '^[0-9]+: *(//|/\*|\*)' >/dev/null 2>&1; then
+  echo "!! natura-del-blocco-gate: tool_dispatch scrive un blocker letterale." >&2
+  echo "   Deve venire da GateBlock::blocker, che delega al punto unico" >&2
+  echo "   decisions::suspension_watch::SuspensionOrigin::StepGate." >&2
+  fail=1
+else
+  echo "OK natura-del-blocco-gate: il blocker della chiusura e' delegato"
+fi
+
 # Regressione diretta: la registrazione a posteriori non deve tornare. Cerca la
 # DEFINIZIONE, non il nome: il commento che ne spiega la rimozione lo cita.
 if grep -rEln --include='*.rs' --exclude-dir=target 'fn record_playwright_job' crates >/dev/null 2>&1; then

@@ -488,8 +488,136 @@ pub fn decide_step_gate(verdicts: &[StepVerdict], level: StepCriticality) -> Ste
     StepGateDecision::NeedsHuman
 }
 
+/// Che cosa ha fermato il batch, e se RIPETERE puo' cambiarlo.
+///
+/// [`decide_step_gate`] risponde «il batch passa?». Questa e' la SECONDA
+/// domanda, e ha un altro consumatore: il nodo, che deve scegliere fra
+/// rimandare al modello e chiudere il run. Prima non esisteva — ogni esito che
+/// non fosse `Approved` o `UnavailableDeclared` diventava lo stesso tool_result
+/// sintetico — e in autonomia il modello riceveva «non autorizzato» senza alcun
+/// modo di sapere se il problema fosse il SUO passo o il gate.
+///
+/// MISURATO il 09/08/2026, prima serata di `enforce` (mig 0689): un run di
+/// riparazione ha prodotto NOVE script di correzione — `apply_fixes.js`,
+/// `final_fix.js`, `complete_fix.js`, `batch_fix.js`, `final_batch_fix.js`, ...
+/// — perche' la `write_file` che li scriveva passava e la `run_command` che li
+/// eseguiva no. Il rimando e' la risposta giusta a un GIUDIZIO sul passo, ed e'
+/// quella sbagliata a una condizione del SISTEMA: ripetere non la cambia,
+/// e l'agente non aveva modo di saperlo. Le conseguenze osservate sono tre e
+/// tutte cattive: lavoro non fatto, nove file spazzatura nel progetto, budget
+/// speso in tentativi.
+///
+/// Il fail-closed NON cambia: il passo critico resta non eseguito in ogni
+/// variante. Cambia CHI riceve la conseguenza — il passo o il run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateBlock {
+    /// Almeno un validatore ha ESPRESSO un verdetto contrario (reject, o un
+    /// needs_human deliberato): il blocco e' un giudizio su QUESTO passo, e
+    /// proporne un altro puo' cambiare l'esito. Rimando al modello.
+    StepRejected,
+    /// Nessun validatore ha espresso un verdetto: solo astensioni. Il gate non
+    /// ha GIUDICATO, e cio' che manca non e' una proprieta' del passo — e' una
+    /// condizione dell'ambiente (credito, cooldown, timeout del fornitore).
+    /// Rimando al modello, ma DICHIARATO come tale: e' l'unica informazione che
+    /// gli permette di non riproporre la stessa strada con un altro nome.
+    NotJudgeable,
+    /// Il gate ha gia' speso in questo run i rimandi ammessi
+    /// (`orchestrator.critical_step_max_rejections`): la prova che rimandare
+    /// non sta producendo una strada diversa e' stata fatta. Il run si ferma.
+    RetriesExhausted,
+}
+
+impl GateBlock {
+    /// Identificatore canonico (regola N), lo stesso che serde scrive nel
+    /// payload del meta_step.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StepRejected => "step_rejected",
+            Self::NotJudgeable => "not_judgeable",
+            Self::RetriesExhausted => "retries_exhausted",
+        }
+    }
+
+    /// Il RUN si ferma (`true`), oppure il batch torna al modello (`false`)?
+    ///
+    /// E' la sola conseguenza che il nodo deve derivare da qui: dove un umano
+    /// c'e' la stessa condizione diventa una sospensione, e quel discriminante
+    /// e' della modalita' ([`super::hitl::automation_requires_hitl`]), non di
+    /// questo vocabolario.
+    pub fn ferma_il_run(self) -> bool {
+        matches!(self, Self::RetriesExhausted)
+    }
+
+    /// La causa in una riga. Unico punto in cui questa misura diventa testo
+    /// (regola Q, punto 3): il rimando al modello e il riassunto del run
+    /// chiuso la compongono da qui, non a mano.
+    pub fn motivo(self) -> &'static str {
+        match self {
+            Self::StepRejected => {
+                "almeno un validatore ha espresso un verdetto contrario a questo passo"
+            }
+            Self::NotJudgeable => {
+                "nessun validatore indipendente ha potuto esprimere un verdetto (solo \
+                 astensioni): non e' un giudizio su questo passo, e' una condizione \
+                 dell'ambiente — riproporre lo stesso passo, o un equivalente scritto \
+                 in un altro file, non la cambia"
+            }
+            Self::RetriesExhausted => {
+                "il gate ha gia' rimandato al modello tutti i tentativi ammessi per \
+                 questo run senza che si arrivasse a un'approvazione"
+            }
+        }
+    }
+
+    /// `blocker` ADR 0034 con cui il run si chiude quando si ferma qui.
+    ///
+    /// DELEGATO (regola L): «cosa ha fermato il run quando e' stato il gate
+    /// duale» ha gia' il suo punto unico in
+    /// [`super::suspension_watch::SuspensionOrigin`], che lo usa per le
+    /// sospensioni scadute. Due strade per lo stesso run fermato dallo stesso
+    /// gate non possono dichiarare due blocker diversi.
+    pub fn blocker(self) -> &'static str {
+        super::suspension_watch::SuspensionOrigin::StepGate.blocker()
+    }
+}
+
+/// Di che NATURA e' il blocco, dai verdetti e dai rimandi gia' spesi.
+///
+/// Il cap viene PRIMA della causa perche' la sua conseguenza le sovrasta
+/// entrambe: raggiunto il tetto il run si ferma comunque. La causa vera non si
+/// perde — col tetto di default (2) il PRIMO blocco non e' mai
+/// `RetriesExhausted`, quindi viene dichiarata e persistita nel meta_step
+/// `step_validation` prima che il secondo chiuda il run; e i verdetti restano
+/// nel payload in ogni caso. Con un tetto di 1 l'admin ha detto «nessun
+/// rimando», e li' la causa la portano i soli verdetti.
+///
+/// «Ha giudicato» significa aver espresso un verdetto CONTRARIO: un `Approve`
+/// accanto a un'astensione non e' un giudizio sul passo — e' un quorum
+/// mancante, cioe' esattamente la condizione d'ambiente che `NotJudgeable`
+/// nomina. Trattarlo come un rifiuto rimanderebbe l'agente a cercare un difetto
+/// nel proprio passo che nessuno gli ha contestato.
+pub fn classify_block(
+    verdicts: &[StepVerdict],
+    prior_rejections: u32,
+    max_rejections: u32,
+) -> GateBlock {
+    if prior_rejections.saturating_add(1) >= max_rejections.max(1) {
+        return GateBlock::RetriesExhausted;
+    }
+    let qualcuno_ha_giudicato = verdicts
+        .iter()
+        .any(|v| matches!(v, StepVerdict::Reject | StepVerdict::NeedsHuman));
+    if qualcuno_ha_giudicato {
+        GateBlock::StepRejected
+    } else {
+        GateBlock::NotJudgeable
+    }
+}
+
 /// Chiave `extra` del contatore dei rimandi del gate duale nel run (cap anti
-/// ping-pong: oltre `critical_step_max_rejections` si degrada a NeedsHuman).
+/// ping-pong: al tetto `critical_step_max_rejections` il run si ferma —
+/// [`GateBlock::RetriesExhausted`]).
 pub const STEP_GATE_REJECTIONS_EXTRA_KEY: &str = "step_gate_rejections";
 
 /// Chiave `extra` dei verdetti allegati a una sospensione HITL nata dal gate
@@ -809,6 +937,115 @@ mod tests {
         // dall'all-Approve -> il primo assert va ad Approved -> rosso.
         assert_eq!(decide_step_gate(&[Approve], Irreversible), D::NeedsHuman);
         assert_eq!(decide_step_gate(&[Approve], Critical), D::Approved);
+    }
+
+    /// LA SECONDA DOMANDA, quella che il 09/08 non esisteva: di che natura e'
+    /// il blocco. Un giudizio contrario e' del PASSO (il modello puo' cambiare
+    /// strada); sole astensioni sono dell'AMBIENTE (ripetere non le cambia).
+    ///
+    /// MUTAZIONE: contare anche `Approve` fra i verdetti «che giudicano» (cioe'
+    /// classificare `approve + astensione` come `StepRejected`) fa cadere la
+    /// terza asserzione — ed e' proprio la combinazione che in esercizio ha
+    /// prodotto i nove script, rimandata al modello come se fosse colpa sua.
+    #[test]
+    fn la_natura_del_blocco_distingue_il_passo_dall_ambiente() {
+        use StepVerdict::{Abstained, Approve, NeedsHuman, Reject};
+        const CAP: u32 = 2;
+        assert_eq!(
+            classify_block(&[Approve, Reject], 0, CAP),
+            GateBlock::StepRejected
+        );
+        assert_eq!(
+            classify_block(&[Approve, NeedsHuman], 0, CAP),
+            GateBlock::StepRejected,
+            "un needs_human deliberato e' un giudizio sul passo, non un'assenza"
+        );
+        assert_eq!(
+            classify_block(&[Approve, Abstained], 0, CAP),
+            GateBlock::NotJudgeable,
+            "un solo approve accanto a un'astensione e' quorum mancante, non un rifiuto"
+        );
+        assert_eq!(
+            classify_block(&[Abstained, Abstained], 0, CAP),
+            GateBlock::NotJudgeable
+        );
+        assert_eq!(
+            classify_block(&[], 0, CAP),
+            GateBlock::NotJudgeable,
+            "nessun convocato: il gate non ha giudicato"
+        );
+        // Solo `RetriesExhausted` ferma il run: le altre due rimandano.
+        assert!(GateBlock::RetriesExhausted.ferma_il_run());
+        assert!(!GateBlock::StepRejected.ferma_il_run());
+        assert!(!GateBlock::NotJudgeable.ferma_il_run());
+    }
+
+    /// IL CAP CHE NON AGIVA (difetto #19). Col tetto di default il primo blocco
+    /// dichiara la causa vera e il secondo FERMA il run: prima il tetto si
+    /// calcolava solo sui `Rejected` e, quando scattava, degradava a
+    /// `NeedsHuman` — che in autonomia tornava a essere lo stesso rimando.
+    /// Contava fino a due e poi non faceva nulla, all'infinito.
+    ///
+    /// MUTAZIONE: togliere il controllo del tetto (o rimetterlo dopo la causa
+    /// senza conseguenza) -> il secondo blocco resta `NotJudgeable`, che non
+    /// ferma il run, e le nove ripetizioni tornano possibili.
+    #[test]
+    fn il_tetto_dei_rimandi_ferma_il_run_invece_di_contare_a_vuoto() {
+        use StepVerdict::{Abstained, Approve, Reject};
+        const CAP: u32 = 2;
+        assert!(!classify_block(&[Approve, Abstained], 0, CAP).ferma_il_run());
+        assert_eq!(
+            classify_block(&[Approve, Abstained], 1, CAP),
+            GateBlock::RetriesExhausted,
+            "speso il secondo rimando il run si ferma, qualunque sia la causa"
+        );
+        assert_eq!(
+            classify_block(&[Approve, Reject], 1, CAP),
+            GateBlock::RetriesExhausted
+        );
+        // Tetto 0 o 1 = «nessun rimando»: il primo blocco chiude gia'.
+        for tetto in [0, 1] {
+            assert_eq!(
+                classify_block(&[Approve, Reject], 0, tetto),
+                GateBlock::RetriesExhausted,
+                "tetto {tetto}: l'admin ha detto nessun rimando"
+            );
+        }
+    }
+
+    /// Il blocker con cui il run si chiude e' lo STESSO che una sospensione
+    /// scaduta del gate dichiara: due strade per lo stesso run fermato dallo
+    /// stesso gate non possono nominare due cause diverse. Mutazione: scrivere
+    /// qui un letterale invece di delegare -> il giorno in cui `SuspensionOrigin`
+    /// cambia, questo resta indietro e il test lo dice.
+    #[test]
+    fn il_blocker_e_quello_del_gate_non_un_letterale() {
+        use super::super::suspension_watch::SuspensionOrigin;
+        for b in [
+            GateBlock::StepRejected,
+            GateBlock::NotJudgeable,
+            GateBlock::RetriesExhausted,
+        ] {
+            assert_eq!(b.blocker(), SuspensionOrigin::StepGate.blocker());
+            assert!(
+                super::super::meta_reason::VALID_BLOCKERS.contains(&b.blocker()),
+                "il blocker di {b:?} non e' nel vocabolario ADR 0034"
+            );
+        }
+    }
+
+    /// Il vocabolario sul WIRE (serde, payload del meta_step) e quello del
+    /// codice dicono la stessa parola: le query di taratura leggono il primo.
+    #[test]
+    fn la_natura_del_blocco_dice_la_stessa_parola_sul_wire() {
+        for b in [
+            GateBlock::StepRejected,
+            GateBlock::NotJudgeable,
+            GateBlock::RetriesExhausted,
+        ] {
+            let wire = serde_json::to_string(&b).expect("serializza");
+            assert_eq!(wire, format!("\"{}\"", b.as_str()));
+        }
     }
 
     /// Le regole malformate cadono UNA a una, mai il vocabolario intero.
