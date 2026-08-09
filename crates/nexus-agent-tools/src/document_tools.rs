@@ -7,11 +7,10 @@ use std::io::{Cursor, Read};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde_json::{json, Value};
-use uuid::Uuid;
 
-use nexus_types::tool_outcome::{NaturaFallimento, RispostaTool};
+use nexus_types::tool_outcome::RispostaTool;
 
-use super::attachment_inspector::load_attachment;
+use super::attachment_inspector::{documento_da_allegato, uuid_allegato};
 use super::ToolContextCore;
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -63,27 +62,12 @@ pub async fn extract_docx_text_inline(file_path: &std::path::Path) -> Result<Str
 // e `esito_estrazione`: un ramo in meno da dimenticare, e la natura dichiarata
 // in un posto solo invece che in dodici.
 
-/// Carica i byte dell'allegato: lookup del record + lettura del file.
-///
-/// Punto unico dei due rami che i tre tool ripetevano identici. Le due nature
-/// sono DIVERSE e per questo la funzione le distingue invece di darne una sola:
-/// un allegato che non risulta nel progetto e' un id sbagliato — RIMEDIABILE, e
-/// `nexus_list_attachments` dice quali esistono; un file che il DB dichiara ma
-/// il filesystem non consegna e' un guasto dello storage, che nessuna
-/// riformulazione della chiamata aggira.
-async fn documento_da_allegato(
-    ctx: &ToolContextCore,
-    attachment_id: Uuid,
-) -> Result<Vec<u8>, RispostaTool> {
-    let record = load_attachment(&ctx.db, attachment_id, ctx.project_id)
-        .await
-        .map_err(|e| crate::errore_tool(e, NaturaFallimento::Rimediabile))?;
-    tokio::fs::read(&record.file_path)
-        .await
-        .map_err(|e| crate::errore_tool(format!("read fallita: {e}"), NaturaFallimento::da_errore_io(&e)))
-}
-
 /// L'esito di un'estrazione eseguita in `spawn_blocking`.
+///
+/// Resta in questo modulo — a differenza di `documento_da_allegato`, che e'
+/// salito accanto a `load_attachment` perche' lo chiedono anche archivi e
+/// ispezione — perche' l'estrazione di un DOCUMENTO e' cio' che i tre tool di
+/// qui hanno in comune, e nessun altro.
 ///
 /// I tre casi restano tre: il documento estratto, l'estrattore che rifiuta il
 /// contenuto (RIMEDIABILE — un range di pagine invalido o un foglio inesistente
@@ -92,6 +76,7 @@ async fn documento_da_allegato(
 fn esito_estrazione(
     result: Result<Result<Value, String>, tokio::task::JoinError>,
 ) -> RispostaTool {
+    use nexus_types::tool_outcome::NaturaFallimento;
     match result {
         Ok(Ok(v)) => RispostaTool::riuscito(v.to_string()),
         Ok(Err(e)) => crate::errore_tool(e, NaturaFallimento::Rimediabile),
@@ -211,23 +196,6 @@ pub async fn tool_nexus_extract_docx_text(ctx: &ToolContextCore, input: &Value) 
     esito_estrazione(tokio::task::spawn_blocking(move || extract_docx(&bytes)).await)
 }
 
-/// L'uuid di un allegato, dal parametro che il contratto ha letto come stringa.
-///
-/// Il contratto pretende che il campo CI SIA e sia una stringa; che sia un uuid
-/// non lo puo' dire, e quel controllo resta qui. RIMEDIABILE, e il messaggio
-/// nomina il tool che restituisce gli id validi — prima diceva soltanto
-/// «obbligatorio», che davanti a un id malformato era anche falso: il parametro
-/// c'era, non era un uuid.
-fn uuid_allegato(grezzo: &str) -> Result<Uuid, RispostaTool> {
-    Uuid::parse_str(grezzo).map_err(|_| {
-        crate::errore_tool(
-            format!(
-                "attachment_id '{grezzo}' non e' un UUID valido.                  Usa nexus_list_attachments per gli id degli allegati di questa sessione."
-            ),
-            NaturaFallimento::Rimediabile,
-        )
-    })
-}
 
 fn extract_docx(bytes: &[u8]) -> Result<Value, String> {
     let reader = Cursor::new(bytes);

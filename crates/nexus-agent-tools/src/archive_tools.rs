@@ -10,7 +10,9 @@ use base64::Engine;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::attachment_inspector::load_attachment;
+use nexus_types::tool_outcome::{NaturaFallimento, RispostaTool};
+
+use super::attachment_inspector::{documento_da_allegato, load_attachment, uuid_allegato};
 use super::read_cache::{self, ReadCacheKey, ReadKind};
 use super::ToolContextCore;
 
@@ -39,26 +41,22 @@ fn detect_format(bytes: &[u8]) -> ArchiveFormat {
 pub async fn tool_nexus_list_archive_entries(
     ctx: &ToolContextCore,
     input: &Value,
-) -> String {
-    let attachment_id = match input
-        .get("attachment_id")
-        .and_then(Value::as_str)
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        Some(id) => id,
-        None => {
-            return crate::errore_json("Parametro 'attachment_id' obbligatorio (UUID).")
-        }
+) -> RispostaTool {
+    use crate::input_contract::InputTool;
+    use crate::tool_inputs::NexusListArchiveEntriesInput;
+
+    let params = match NexusListArchiveEntriesInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
+    };
+    let attachment_id = match uuid_allegato(&params.attachment_id) {
+        Ok(id) => id,
+        Err(risposta) => return risposta,
     };
 
-    let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
-        Ok(r) => r,
-        Err(e) => return crate::errore_json(e),
-    };
-
-    let bytes = match tokio::fs::read(&record.file_path).await {
+    let bytes = match documento_da_allegato(ctx, attachment_id).await {
         Ok(b) => b,
-        Err(e) => return crate::errore_json(format!("read fallita: {e}")),
+        Err(risposta) => return risposta,
     };
 
     // Politica "mai troncare-e-buttare": elenca SEMPRE tutte le entry, nessun cap.
@@ -75,9 +73,15 @@ pub async fn tool_nexus_list_archive_entries(
     .await;
 
     match result {
-        Ok(Ok(v)) => v.to_string(),
-        Ok(Err(e)) => crate::errore_json(e),
-        Err(e) => crate::errore_json(format!("spawn_blocking fallita: {e}")),
+        Ok(Ok(v)) => RispostaTool::riuscito(v.to_string()),
+        // Un formato non riconosciuto o un archivio corrotto: RIMEDIABILE, e il
+        // messaggio dice quali formati sono attesi — l'agente puo' passare un
+        // altro allegato o usare l'estrattore giusto per quel tipo.
+        Ok(Err(e)) => crate::errore_tool(e, NaturaFallimento::Rimediabile),
+        Err(e) => crate::errore_tool(
+            format!("spawn_blocking fallita: {e}"),
+            NaturaFallimento::DelSistema,
+        ),
     }
 }
 

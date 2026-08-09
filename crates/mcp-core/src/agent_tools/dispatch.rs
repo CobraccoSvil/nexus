@@ -112,6 +112,10 @@ async fn esegui_tool_migrato(
         "nexus_extract_pdf_text" => Some(document_tools::tool_nexus_extract_pdf_text(ctx, input).await),
         "nexus_extract_docx_text" => Some(document_tools::tool_nexus_extract_docx_text(ctx, input).await),
         "nexus_extract_xlsx_data" => Some(document_tools::tool_nexus_extract_xlsx_data(ctx, input).await),
+        // L'elenco delle entry di un archivio: stessi due helper degli
+        // estrattori di documenti, ora condivisi (`documento_da_allegato`,
+        // `uuid_allegato`, accanto a `load_attachment`).
+        "nexus_list_archive_entries" => Some(archive_tools::tool_nexus_list_archive_entries(ctx, input).await),
         // Ogni suo fallimento e' RIMEDIABILE e lo dichiara nel campo `natura`:
         // e' il primo tool a farlo, ed e' quello su cui la mancanza si
         // misurava (11% di `old_string non trovato` seguiti da una ripetizione
@@ -279,9 +283,6 @@ async fn esegui_tool_legacy(
         // ── Ingestion intelligente allegati (ADR 0011) ─────────────────────
         "nexus_inspect_attachment" => {
             attachment_inspector::tool_nexus_inspect_attachment(ctx, input).await
-        }
-        "nexus_list_archive_entries" => {
-            archive_tools::tool_nexus_list_archive_entries(ctx, input).await
         }
         "nexus_read_archive_entry" => {
             archive_tools::tool_nexus_read_archive_entry(ctx, input).await

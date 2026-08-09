@@ -351,10 +351,6 @@ mod tests {
                 "nexus_read_attachment",
                 tool_nexus_read_attachment(&ctx, &json!({})).await,
             ),
-            (
-                "nexus_list_archive_entries",
-                crate::archive_tools::tool_nexus_list_archive_entries(&ctx, &json!({})).await,
-            ),
         ];
 
         for (nome, uscita) in legacy {
@@ -376,10 +372,16 @@ mod tests {
         // perdere. Il marker non c'e' piu' e non deve esserci — il corpo torna
         // a essere un JSON integro — quindi il criterio e' il CAMPO, e in piu'
         // c'e' la natura, che il canale legacy non poteva trasportare.
-        let migrati: Vec<(&str, RispostaTool)> = vec![(
-            "nexus_extract_pdf_text",
-            crate::document_tools::tool_nexus_extract_pdf_text(&ctx, &json!({})).await,
-        )];
+        let migrati: Vec<(&str, RispostaTool)> = vec![
+            (
+                "nexus_extract_pdf_text",
+                crate::document_tools::tool_nexus_extract_pdf_text(&ctx, &json!({})).await,
+            ),
+            (
+                "nexus_list_archive_entries",
+                crate::archive_tools::tool_nexus_list_archive_entries(&ctx, &json!({})).await,
+            ),
+        ];
 
         for (nome, uscita) in migrati {
             assert_eq!(
