@@ -2724,6 +2724,46 @@ else
   echo "OK confine-wire-session-usage: fixture condivisa e i suoi due lati"
 fi
 
+# Resa di un path per un PROCESSO ESTERNO (2026-08-09). `canonicalize` su
+# Windows produce la forma verbatim `\\?\D:\...`: le API del filesystem la
+# accettano, l'argv di un processo esterno no. E il runtime MSYS di `grep.exe`
+# non la RIFIUTA — il `?` del prefisso rende l'argomento un pattern di glob, i
+# backslash diventano escape e vengono consumati, cosi' che il processo cerchi
+# un percorso DIVERSO da quello chiesto: `\?D:IDEAI-projectsgestione-corsi...`,
+# misurato in esercizio il 09/08/2026 su due `agent_steps` falliti.
+assert_single "path-processo-esterno" 'fn path_per_processo_esterno' \
+  'crates/nexus-types/src/workspace_paths.rs' crates
+
+# I DUE lati di quel confine devono usare la stessa resa: chi scrive l'argv e
+# chi rilegge l'echo che torna in testa a ogni riga di output. Se uno solo
+# smette di delegare non si rompe niente in modo visibile — le righe restano
+# assolute, e l'agente riceve percorsi che non sa piu' rendere relativi.
+# Si guardano le due CHIAMATE per il loro argomento, non il conteggio del nome:
+# il file lo nomina anche in prosa (i commenti che spiegano le mutazioni), e un
+# conteggio resterebbe verde con una delle due deleghe rimossa.
+ricerca_file="crates/nexus-agent-tools/src/files.rs"
+deleghe_ok=1
+for chiamata in "path_per_processo_esterno(search_path)" \
+                "path_per_processo_esterno(root_path)"; do
+  if ! grep -qF "$chiamata" "$ricerca_file" 2>/dev/null; then
+    echo "!! path-processo-esterno: manca la delega '$chiamata' in $ricerca_file" >&2
+    echo "   I due lati del confine sono l'argv consegnato alla ricerca e la" >&2
+    echo "   root con cui se ne rendono relative le righe di output: con rese" >&2
+    echo "   diverse il prefisso non viene riconosciuto e l'agente riceve" >&2
+    echo "   percorsi assoluti, senza che nulla fallisca." >&2
+    deleghe_ok=0
+    fail=1
+  fi
+done
+# L'OK solo se lo e' davvero: stamparlo comunque metterebbe una riga verde
+# accanto a una rossa sullo stesso check, che e' il modo piu' rapido di far
+# leggere «passato» a un gate fallito. `if` e non `[[ ... ]] &&`: sotto
+# `set -e` la forma con `&&` fa USCIRE lo script quando la condizione e' falsa,
+# saltando il riepilogo finale.
+if [[ "$deleghe_ok" -eq 1 ]]; then
+  echo "OK path-processo-esterno: argv ed echo usano la stessa resa"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

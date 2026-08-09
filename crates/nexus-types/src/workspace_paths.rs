@@ -70,6 +70,60 @@ pub fn path_for_storage(path: &Path) -> String {
     strip_windows_verbatim(&path.to_string_lossy()).into_owned()
 }
 
+/// Rende `path` nella forma da CONSEGNARE A UN PROCESSO ESTERNO (un argomento
+/// di `Command`), che non e' la forma con cui lo si passa a `std::fs`.
+///
+/// PUNTO UNICO (regola L). Le API del filesystem di Windows accettano la forma
+/// verbatim `\\?\D:\...` che `canonicalize` produce; un processo esterno no, e
+/// il modo in cui non l'accetta non e' un errore di percorso: e' un percorso
+/// DIVERSO, che nessuno ha scritto. MISURATO il 09/08/2026 su `grep.exe` di Git
+/// for Windows (runtime MSYS), il consumatore reale di `search_in_files`:
+///
+/// ```text
+/// argv consegnato  \\?\D:\IDEAI-projects\gestione-corsi\SchoolCoursesApi
+/// argv ricevuto      \?D:IDEAI-projectsgestione-corsiSchoolCoursesApi
+/// ```
+///
+/// I due guasti visibili in quella riga — il prefisso incomprensibile e i
+/// separatori spariti — hanno UNA causa sola, ed e' il prefisso: il `?` fa
+/// dell'argomento un pattern di glob per il runtime MSYS, che da quel momento
+/// rilegge i backslash come escape e li consuma. NON e' l'escaping di
+/// `Command::arg`, che su Windows consegna verbatim un argomento senza spazi:
+/// e' il parser di argv dall'altra parte, e nessuna quotatura da questo lato lo
+/// raggiunge. La prova che la causa e' una sola e' costruttiva: tolto il solo
+/// prefisso, gli STESSI backslash arrivano intatti e grep trova il file (exit
+/// 0), mentre un `?` che segua una lettera di drive (`D:\a?b\c\d`) non consuma
+/// nulla — e' l'assenza del drive in testa a togliere ai backslash il ruolo di
+/// separatore.
+///
+/// NON converte i separatori in `/`: non comprerebbe niente (misurato,
+/// `D:/x/ab{c}/d` perde le graffe esattamente come la forma con backslash — la
+/// brace expansion e' un'altra cosa e resta) e consegnerebbe al processo una
+/// forma diversa da quella che il resto del progetto usa, che e' poi la stessa
+/// che il processo riecheggia nel proprio output.
+///
+/// NON accorcia nulla: dove il prefisso serviva davvero (percorsi oltre
+/// MAX_PATH) toglierlo puo' rendere il path irraggiungibile, ma la forma
+/// verbatim non e' un'alternativa — il processo esterno non la accetta in
+/// nessun caso. Meglio un errore del processo su cio' che gli si e' davvero
+/// chiesto che un errore su un percorso che nessuno ha nominato.
+pub fn path_per_processo_esterno(path: &Path) -> std::ffi::OsString {
+    let lossy = path.to_string_lossy();
+    let pulito = strip_windows_verbatim(&lossy);
+    // Lo strip accorcia sempre, quindi la lunghezza dice se ha tolto qualcosa
+    // senza che questo punto debba conoscere la FORMA del prefisso: saperla in
+    // due posti sarebbe la duplicazione che il punto unico esiste per evitare.
+    if pulito.len() == lossy.len() {
+        // Niente da togliere: si restituisce il path ORIGINALE, non il giro di
+        // ritorno da `to_string_lossy`, che su un nome non-UTF8 sostituirebbe i
+        // byte invalidi con U+FFFD — cioe' consegnerebbe al processo esterno un
+        // percorso che non esiste. Riconoscere il prefisso sulla forma lossy
+        // resta lecito: e' ASCII puro, e la sostituzione non lo tocca mai.
+        return path.as_os_str().to_os_string();
+    }
+    std::ffi::OsString::from(pulito.into_owned())
+}
+
 /// Normalizza `raw` in un percorso RELATIVO pulito confinato a `root`, SENZA IO.
 /// PUNTO UNICO (regola L / ADR 0026) condiviso da lettura (`resolve_relative_path`)
 /// e scrittura (`resolve_write_target`) in mcp-core.
@@ -294,6 +348,47 @@ mod tests {
             r"D:\IDEAI-projects\Beaty-Book"
         );
         assert_eq!(path_for_storage(Path::new("/srv/progetto")), "/srv/progetto");
+    }
+
+    #[test]
+    fn path_per_processo_esterno_parte_dal_produttore_vero() {
+        // Il caso reale nasce da `canonicalize`, non da una stringa scritta a
+        // mano (regola O): e' quello il produttore che in produzione mette il
+        // prefisso, e su Unix la stessa riga prova che la resa e' un no-op.
+        let canonico = std::env::current_dir()
+            .and_then(|d| d.canonicalize())
+            .expect("cwd canonicalizzabile");
+        let reso = path_per_processo_esterno(&canonico);
+        let reso = reso.to_string_lossy();
+        assert!(
+            !reso.starts_with(r"\\?\"),
+            "un processo esterno non puo' ricevere la forma verbatim: {reso}"
+        );
+        // La resa non inventa un altro percorso: e' il canonico meno il prefisso.
+        assert_eq!(reso, strip_windows_verbatim(&canonico.to_string_lossy()));
+    }
+
+    #[test]
+    fn path_per_processo_esterno_forme() {
+        use std::ffi::OsString;
+        assert_eq!(
+            path_per_processo_esterno(Path::new(r"\\?\D:\IDEAI-projects\gestione-corsi")),
+            OsString::from(r"D:\IDEAI-projects\gestione-corsi")
+        );
+        // UNC verbatim -> UNC vera, mai un componente "?" fantasma.
+        assert_eq!(
+            path_per_processo_esterno(Path::new(r"\\?\UNC\server\share\x.ts")),
+            OsString::from(r"\\server\share\x.ts")
+        );
+        // No-op su cio' che un processo esterno gia' capisce.
+        assert_eq!(
+            path_per_processo_esterno(Path::new("/srv/progetto")),
+            OsString::from("/srv/progetto")
+        );
+        assert_eq!(
+            path_per_processo_esterno(Path::new(r"D:\x\y.ts")),
+            OsString::from(r"D:\x\y.ts")
+        );
     }
 
     #[test]
