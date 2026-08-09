@@ -470,9 +470,9 @@ pub const REASON_UNVERIFIED_NO_PROBE: &str = "unverified_no_probe";
 /// Riga candidata al RE-PROBE: modello disabilitato per un QUIRK GATEWAY
 /// ri-testabile (tool-probe fallito / malformed tool calls), da riprovare dopo
 /// il backoff per riabilitarlo quando il quirk e' stato corretto in produzione.
-struct ReprobeCandidate {
-    provider: String,
-    model: String,
+pub(crate) struct ReprobeCandidate {
+    pub(crate) provider: String,
+    pub(crate) model: String,
     /// Reason che lo ha disabilitato (per audit log).
     reason: String,
     /// Timestamp dell'ultimo tentativo (= auto_disabled_at): governa il backoff.
@@ -488,7 +488,11 @@ struct ReprobeCandidate {
 /// (billing/quota -> cooldown; missing_from_api -> non esiste piu'; policy ->
 /// decisione amministrativa; lock manuale). Punto unico (regola L) del criterio
 /// di inclusione/esclusione: la query SQL e i test usano questa funzione.
-fn is_reprobe_candidate(is_enabled: bool, capability_source: &str, reason: Option<&str>) -> bool {
+pub(crate) fn is_reprobe_candidate(
+    is_enabled: bool,
+    capability_source: &str,
+    reason: Option<&str>,
+) -> bool {
     if is_enabled {
         return false;
     }
@@ -568,7 +572,7 @@ fn reprobe_due(
 /// altri reason del ciclo is_enabled — billing/quota cooldown, missing_from_api,
 /// %policy%, hollow_completion, not_chat_compatible — che NON vanno ri-probati
 /// cosi').
-async fn load_reprobe_candidates(db: &PgPool) -> sqlx::Result<Vec<ReprobeCandidate>> {
+pub(crate) async fn load_reprobe_candidates(db: &PgPool) -> sqlx::Result<Vec<ReprobeCandidate>> {
     let predicate = crate::tool_capability::TOOL_REASON_PREDICATE_SQL;
     // Replica di `is_reprobe_candidate` (regola L: stesso criterio, due rese).
     // Il ramo `unverified_no_probe` (marchio del gate 0629) ignora il lock
@@ -680,7 +684,18 @@ async fn reprobe_chat_step(
     provider: &str,
     model: &str,
 ) -> Option<ReprobeResult> {
-    match probe_model_on_insert(orchestrator, provider, model).await {
+    let started = std::time::Instant::now();
+    let esito = probe_model_on_insert(orchestrator, provider, model).await;
+    // Il tentativo diventa un FATTO leggibile: vedi `classification_da_reprobe`.
+    persist_probe_history(
+        db,
+        provider,
+        model,
+        &classification_da_reprobe(&esito),
+        started.elapsed().as_millis() as i32,
+    )
+    .await;
+    match esito {
         ProbeOnInsertResult::Healthy => None,
         ProbeOnInsertResult::ProviderDown(kind) => {
             tracing::debug!(
@@ -1665,6 +1680,50 @@ pub(crate) async fn probe_model_on_insert(
             on_insert_from_classification(classification_from_error_class(&ec))
         }
         Err(_timeout) => ProbeOnInsertResult::Inconclusive(format!("timeout {PROBE_TIMEOUT_S}s")),
+    }
+}
+
+/// Inversa di [`on_insert_from_classification`]: riporta l'esito di un
+/// re-probe nella forma con cui lo storico e' GIA' scritto dal giro principale
+/// (`persist_probe_history`, regola L), cosi' un tentativo di re-probe si legge
+/// accanto agli altri invece di avere una tabella o un vocabolario suoi.
+///
+/// `Inconclusive` (timeout del probe) entra fra i transitori: la colonna
+/// `error_kind` prefissa gia' `transient:` per distinguere cio' che non e' una
+/// prova di guasto, ed e' esattamente cio' che un timeout e'. Il verdetto del
+/// CICLO resta invariato — questa funzione decide come si SCRIVE il tentativo,
+/// non cosa se ne conclude.
+///
+/// PERCHE' il tentativo va scritto. Prima l'unica traccia era un `debug!` sotto
+/// il livello di log attivo piu' un contatore aggregato nella riga di riepilogo:
+/// per un fornitore i cui modelli sono TUTTI in attesa di prima verifica —
+/// cioe' il solo caso in cui questo ciclo e' l'unico che lo guarda — dopo N
+/// tentativi non restava una riga da leggere. MISURATO il 09/08/2026: kimi, 4
+/// modelli re-probati nel round delle 16:10 UTC, zero righe in
+/// `ai_model_health_history` e zero in `nexus_provider_health_history`, causa
+/// dei quattro esiti non piu' recuperabile da nessuna fonte.
+///
+/// Le righe entrano nella tabella dei probe del giro principale, quindi le
+/// vedono i suoi due lettori. E' voluto in entrambi i casi:
+/// `governance_telemetry` valuta i soli candidati al routing, che un modello
+/// disabilitato non e' — e se il re-probe lo riabilita, quello storico e' il
+/// suo record onesto; `catalog_sync::salute_modello_recente` chiede «e' ancora
+/// sano?» e per questi modelli rispondeva senza dati proprio perche'
+/// l'osservazione veniva buttata. Un tentativo fallito che rende `NonSano` un
+/// modello che ha appena fallito una chiamata reale non e' un effetto
+/// collaterale: e' la risposta giusta, arrivata prima.
+fn classification_da_reprobe(r: &ProbeOnInsertResult) -> Classification {
+    match r {
+        ProbeOnInsertResult::Healthy => Classification::Ok,
+        ProbeOnInsertResult::ProviderDown(kind) => {
+            Classification::ProviderWide(kind.clone(), None)
+        }
+        ProbeOnInsertResult::ModelBroken(kind) => {
+            Classification::ModelSpecific(kind.clone(), None)
+        }
+        ProbeOnInsertResult::Transient(kind) | ProbeOnInsertResult::Inconclusive(kind) => {
+            Classification::Transient(kind.clone(), None)
+        }
     }
 }
 
