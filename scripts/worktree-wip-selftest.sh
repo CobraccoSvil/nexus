@@ -101,5 +101,74 @@ check "tree ripristinato identico al salvato" "$TREE_DOPO" "$TREE_SALVATO"
 check "exit di -Restore" "$restore_exit" "0"
 
 echo
+echo "### 8. il censimento non conta i fine-riga come lavoro a rischio"
+# Il numero di -Report e' il segnale su cui si decide se archiviare una sessione.
+# MISURATO il 09/08/2026 su due alberi nello stesso istante: 'cool-brattain'
+# dichiarato «30 file» con modifiche reali ZERO, 'D:\IDEAI' dichiarato «1305» con
+# reali 27 -- i 1278 fantasma erano l'artefatto dello stash+ripristino che
+# lefthook esegue nel pre-commit. Con quei numeri il segnale e' inservibile in
+# ENTRAMBE le direzioni: allarma su un albero pulito e annega le modifiche vere.
+#
+# I tre file coprono i due meccanismi con cui nasce un fantasma PIU' la scelta del
+# criterio, e sono deterministici su qualunque core.autocrlf (misurato con
+# autocrlf sia true sia false):
+#   .sql          eol=lf negli attributi -> git NORMALIZZA: 'diff' non lo mostra
+#                 affatto, solo 'status' lo segna
+#   binario.txt   '-text' -> nessuna normalizzazione: il blob differisce davvero
+#                 nei byte CR e a filtrarlo e' '--ignore-cr-at-eol'
+#   indentato.txt modifica di sola INDENTAZIONE -> e' lavoro VERO e deve restare
+#                 contata. E' la guardia sulla SCELTA del criterio: misurato,
+#                 '--ignore-all-space' la fa sparire insieme ai fantasmi.
+# Index E working tree riallineati a HEAD. Non basta 'checkout -- .' (ripristina
+# dall'INDEX, quindi la modifica in staging del caso (a) sopravvive) e non basta
+# 'checkout HEAD -- .' (tocca i soli path presenti in HEAD, mentre -Restore ha
+# lasciato il modulo nuovo AGGIUNTO nell'index, dove 'clean' non arriva).
+git -C "$WT" read-tree --reset -u HEAD >/dev/null 2>&1
+git -C "$WT" clean -fdq >/dev/null 2>&1
+residuo=$(git -C "$WT" status --porcelain)
+if [ -n "$residuo" ]; then
+  echo "  PREMESSA NON VALIDA: albero non pulito, il caso 8 non misura nulla:"
+  printf '%s\n' "$residuo" | sed 's/^/    /'
+  exit 1
+fi
+SQL_PROVA=$(git -C "$WT" ls-files '*.sql' | head -1)
+if [ -z "$SQL_PROVA" ]; then echo "  PREMESSA NON VALIDA: nessun .sql tracciato"; exit 1; fi
+
+mkdir -p "$WT/prova-eol"
+printf '* -text\n' > "$WT/prova-eol/.gitattributes"
+printf 'x1\nx2\n'  > "$WT/prova-eol/binario.txt"
+printf 'y1\ny2\n'  > "$WT/prova-eol/indentato.txt"
+git -C "$WT" add prova-eol >/dev/null 2>&1
+# Identita' inline e hooksPath verso una directory vuota: il commit di prova non
+# tocca la configurazione condivisa (un selftest ha gia' riscritto l'identita' git
+# di tutte le sessioni, fix a8a311b7) e non fa partire il gate di lefthook, che
+# non e' cio' che questo test misura.
+mkdir -p "$WT/.no-hooks"
+git -C "$WT" -c "core.hooksPath=$WT/.no-hooks" \
+    -c user.email=selftest@nexus.local -c user.name='wip selftest' \
+    commit -qm 'selftest: base per il censimento fine-riga' >/dev/null 2>&1
+rmdir "$WT/.no-hooks" 2>/dev/null
+
+crlf() { sed -e 's/\r$//' -e 's/$/\r/' "$1" > "$1.eoltmp" && mv "$1.eoltmp" "$1"; }
+crlf "$WT/$SQL_PROVA"                 # fantasma per NORMALIZZAZIONE
+crlf "$WT/prova-eol/binario.txt"      # fantasma per BYTE CR
+printf '    y1\ny2\n' > "$WT/prova-eol/indentato.txt"   # lavoro VERO
+
+printf '  %-44s %s\n' "git status conta:" "$(git -C "$WT" status --porcelain | wc -l)"
+printf '  %-44s %s\n' "modifiche reali:" "$(git -C "$WT" diff --name-only --ignore-cr-at-eol | tr '\n' ' ')"
+
+riga=$(run_ps -Report 2>&1 | grep -E '^wip-selftest' | head -1)
+stato=$(printf '%s' "$riga" | grep -oE '[0-9]+ file \(staging [0-9]+, mod [0-9]+, nuovi [0-9]+\)( \+[0-9]+ solo fine-riga)?')
+check "(e) 1 modifica vera contata, 2 fantasmi dichiarati" \
+  "$stato" "1 file (staging 0, mod 1, nuovi 0) +2 solo fine-riga"
+
+# Il caso cool-brattain puro: tolta l'unica modifica vera restano i soli fantasmi,
+# e un albero cosi' e' archiviabile senza perdere niente.
+printf 'y1\ny2\n' > "$WT/prova-eol/indentato.txt"
+riga2=$(run_ps -Report 2>&1 | grep -E '^wip-selftest' | head -1)
+check "(f) soli fantasmi -> pulito (caso cool-brattain)" \
+  "$(printf '%s' "$riga2" | grep -qE 'pulito' && echo pulito || echo "sporco: $riga2")" "pulito"
+
+echo
 echo "  risultato: $ok superati, $ko rotti"
 [ "$ko" -eq 0 ] || exit 1

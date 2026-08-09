@@ -708,6 +708,7 @@ chiamante a parsare, e' rifiutato come una toppa (regola H).
 - `docs/tech-debt-dup.md` — metrica duplicazione e baseline ratchet (regola L)
 - `docs/tech-debt-markers.md` — marker di debito e frasi di inerzia, gate ratchet (regola O)
 - `scripts/worktree-wip.ps1` — censimento e messa in sicurezza del lavoro non committato dei worktree (regola P)
+- `docs/tech-debt-wip.md` — censimento dei salvataggi `refs/wip`: quali sono gia' in main e quali no (`-Census`, confronto a TRE alberi). Non e' una lista di potatura: potare un salvataggio e' irreversibile
 - `scripts/cache-sweep.ps1` — tetto alla cache incrementale di Cargo (`-Report` / `-Sweep [-GiorniMax N]`). Serve perche' `gate-env.sh` tiene `CARGO_INCREMENTAL=1` in locale: quella cache viene riusata davvero (81s -> 23s su una riga cambiata in `mcp-core`, misurato il 2026-08-05) ma non ha un tetto nativo — il 2026-08-05 erano 154 GB su 8 target. Pota per ETA' e solo `*/incremental`, mai `deps`. Da registrare come attivita' settimanale
 - `docs/.nexus-vault/adr/0026-punto-unico-de-duplicazione.md` — catalogo punti unici + meccanismo
 - `config/policies/` — profili cloud/onprem/hybrid (contratto gateway LLM)
