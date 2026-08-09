@@ -5714,9 +5714,14 @@ async fn run_cost_budget_sotto_soglia_prosegue() {
 
 #[tokio::test]
 async fn run_time_budget_oltre_deadline_chiude_diretto() {
-    // Deadline del run (fase 3, mig 0604): epoch di avvio nel PASSATO oltre il
-    // budget -> chiusura d'autorita' (close_runaway, reason canonico
-    // "time_budget"), senza chiamare il modello. Gemello del cap di spesa.
+    // TETTO ASSOLUTO del run: epoch di avvio nel PASSATO oltre il tetto ->
+    // chiusura d'autorita' (close_runaway, reason canonico "absolute_ceiling"),
+    // senza chiamare il modello. Gemello del cap di spesa.
+    //
+    // Dal 09/08/2026 il reason NON e' piu' `time_budget`: il tempo ha smesso di
+    // essere il CRITERIO (lo e' il progresso, punto unico
+    // `decisions::avanzamento_figura`) ed e' rimasto l'ultima difesa. Il nome
+    // cambia perche' e' cambiato cio' che dichiara.
     let rc = Arc::new(StubRunControlStore::default());
     let cfg = ExecutorConfig {
         run_token_budget: 0,
@@ -5749,10 +5754,10 @@ async fn run_time_budget_oltre_deadline_chiude_diretto() {
         .meta_steps
         .iter()
         .find(|m| m.kind == "anti_runaway")
-        .expect("meta_step anti_runaway (time)");
+        .expect("meta_step anti_runaway (tetto)");
     assert_eq!(
         ms.payload.get("reason").and_then(Value::as_str),
-        Some("time_budget")
+        Some("absolute_ceiling")
     );
     assert!(llm.seen.lock().unwrap().is_empty());
 }
@@ -6727,9 +6732,9 @@ async fn sotto_soglia_il_modello_viene_interrogato_ma_la_chiusura_muta_no() {
     );
 }
 
-/// Con la grazia GIA' concessa e il budget esaurito, il ramo di chiusura resta
-/// quello di prima: si chiude d'autorita' con reason `time_budget` (il sollecito
-/// e' una-tantum, non un modo per vivere per sempre).
+/// Con la grazia GIA' concessa e il tetto esaurito, il ramo di chiusura resta
+/// quello di prima: si chiude d'autorita' (il sollecito e' una-tantum, non un
+/// modo per vivere per sempre).
 #[tokio::test]
 async fn grazia_gia_concessa_a_budget_esaurito_chiude_time_budget() {
     let rc = Arc::new(StubRunControlStore::default());
@@ -6751,10 +6756,355 @@ async fn grazia_gia_concessa_a_budget_esaurito_chiude_time_budget() {
     assert!(
         out.meta_steps
             .iter()
-            .any(|m| m.kind == "anti_runaway" || format!("{m:?}").contains("time_budget")),
-        "a budget esaurito, con la grazia gia' usata, si chiude"
+            .any(|m| m.kind == "anti_runaway" || format!("{m:?}").contains("absolute_ceiling")),
+        "a tetto esaurito, con la grazia gia' usata, si chiude"
     );
     assert!(llm.seen.lock().unwrap().is_empty(), "nessuna chiamata al modello");
+}
+
+// ── Il gate di deadline delega al CRITERIO DI PROGRESSO (09/08/2026) ─────────
+//
+// I test qui sotto misurano la GIUNZIONE, non il criterio (che ha i suoi in
+// `decisions::avanzamento_figura`): provano che l'executor interroga davvero la
+// porta e agisce sul verdetto. Senza, il criterio potrebbe essere perfetto e non
+// essere raggiunto da nessuno — il difetto che la regola O descrive.
+
+/// Porta di avanzamento a fatti fissi, con conteggio delle interrogazioni.
+#[derive(Default)]
+struct StubAvanzamento {
+    fatti: crate::decisions::FattiAvanzamento,
+    /// `true` -> la porta e' in guasto (il criterio deve dichiarare l'ignoto).
+    in_errore: bool,
+    interrogata: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::runtime::ports::AvanzamentoPort for StubAvanzamento {
+    async fn fatti_avanzamento(
+        &self,
+    ) -> Result<crate::decisions::FattiAvanzamento, crate::runtime::ports::PortError> {
+        self.interrogata
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.in_errore {
+            return Err(crate::runtime::ports::PortError::Tool("DB giu'".into()));
+        }
+        Ok(self.fatti.clone())
+    }
+}
+
+/// Un passo, con la firma costruita dal punto unico (regola O): la stessa
+/// funzione che la porta di produzione usa sui record di `agent_steps`.
+fn passo_avanzamento(
+    tool: &str,
+    input: Value,
+    istante_s: i64,
+) -> crate::decisions::PassoOsservato {
+    crate::decisions::PassoOsservato {
+        firma: crate::decisions::loop_signatures::build_signature(tool, &input),
+        istante_s,
+    }
+}
+
+fn nodo_con_avanzamento(
+    cfg: ExecutorConfig,
+    porta: Arc<StubAvanzamento>,
+) -> (ExecutorNode, Arc<StubMetaStepStore>) {
+    let meta = Arc::new(StubMetaStepStore::default());
+    let n = ExecutorNode::new(
+        cfg,
+        Arc::new(StubRunControlStore::default()),
+        meta.clone(),
+        Arc::new(StubAgentStepStore::default()),
+        Arc::new(StubEscalationPort::default()),
+        Arc::new(StubNextActionsDeriver::default()),
+        Arc::new(StubBillingCooldownPort::default()),
+        Arc::new(StubModelUpscalePort::default()),
+        Arc::new(StubSummaryStore::default()),
+    )
+    .with_avanzamento(porta);
+    (n, meta)
+}
+
+/// IL CASO MISURATO (09/08/2026), alla giunzione: una figura che ha prodotto
+/// passi su strade diverse e' OLTRE il tempo che la uccideva, e il turno
+/// prosegue — il modello viene interrogato.
+///
+/// MUTAZIONE: togliere l'interrogazione della porta da `gate_deadline_run`
+/// rende questo test rosso sull'asserzione `interrogata`, che e' cio' che qui si
+/// misura — il gate guarda i FATTI e non l'orologio.
+///
+/// Cio' che questo test NON puo' vedere, e che percio' e' provato altrove
+/// (`subagent_native::il_tetto_di_una_figura_eccede_il_suo_timeout`): che il
+/// tetto valga 960 e non 240. Qui il budget arriva gia' risolto nella `cfg`, e
+/// il gate non ha modo di sapere che il numero che riceve era il timeout della
+/// figura — con `run_time_budget_s: 240` anche il criterio nuovo chiuderebbe,
+/// perche' il tetto assoluto precede tutto. Le due meta' del difetto misurato
+/// stanno in due punti e vogliono due test: dichiararne uno solo qui darebbe una
+/// copertura che non c'e' (regola O).
+#[tokio::test]
+async fn una_figura_che_avanza_supera_il_tempo_che_la_uccideva() {
+    let adesso = started_epoch_fa(0);
+    // 240s fa e' partita; l'ultimo passo e' di 10 secondi fa.
+    let porta = Arc::new(StubAvanzamento {
+        fatti: crate::decisions::FattiAvanzamento {
+            passi: vec![
+                passo_avanzamento("read_file", json!({"path": "a.rs"}), adesso - 200),
+                passo_avanzamento("read_file", json!({"path": "b.rs"}), adesso - 10),
+            ],
+            scritture: Vec::new(),
+        },
+        ..Default::default()
+    });
+    let cfg = ExecutorConfig {
+        run_token_budget: 0,
+        run_token_hard_cap: 0,
+        run_cost_budget_usd: 0.0,
+        // Tetto = 4x il vecchio timeout di 240s. Inattivita' 90s.
+        run_time_budget_s: 960,
+        progresso_inattivita_max_s: 90,
+        time_grace_pct: 0,
+        ..cfg_resolved()
+    };
+    let (n, _m) = nodo_con_avanzamento(cfg, porta.clone());
+    let llm = Arc::new(StubLlmGateway::with_text("continuo a lavorare"));
+    let ctx = ctx_with(llm.clone());
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("analizza l'auth")],
+        // 250s: OLTRE il tetto storico di 240s che l'aveva uccisa.
+        run_started_at_epoch_s: Some(started_epoch_fa(250)),
+        iterations: Some(15),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+
+    assert!(
+        porta.interrogata.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "il gate deve interrogare la porta, non l'orologio"
+    );
+    assert!(
+        !out.meta_steps.iter().any(|m| m.kind == "anti_runaway"),
+        "una figura che avanza non viene fermata: {:?}",
+        out.meta_steps
+    );
+    assert!(
+        !llm.seen.lock().unwrap().is_empty(),
+        "il turno prosegue e il modello viene interrogato"
+    );
+}
+
+/// L'altra meta' alla giunzione: chi RIPETE si ferma molto prima del tetto, e la
+/// causa dichiarata e' `no_progress` — non `absolute_ceiling`, che manderebbe a
+/// cercare un tetto stretto invece di una figura bloccata.
+#[tokio::test]
+async fn una_figura_che_ripete_si_ferma_prima_del_tetto() {
+    let adesso = started_epoch_fa(0);
+    let porta = Arc::new(StubAvanzamento {
+        fatti: crate::decisions::FattiAvanzamento {
+            // Sei volte la STESSA chiamata: una strada sola, l'ultima novita'
+            // risale a 150s fa.
+            passi: (0..6)
+                .map(|i| {
+                    passo_avanzamento(
+                        "run_command",
+                        json!({"command": "npm test"}),
+                        adesso - 150 + i * 20,
+                    )
+                })
+                .collect(),
+            scritture: Vec::new(),
+        },
+        ..Default::default()
+    });
+    let cfg = ExecutorConfig {
+        run_token_budget: 0,
+        run_token_hard_cap: 0,
+        run_cost_budget_usd: 0.0,
+        run_time_budget_s: 960,
+        progresso_inattivita_max_s: 90,
+        // Grazia spenta: qui si misura la chiusura, il sollecito ha i suoi test.
+        time_grace_pct: 0,
+        ..cfg_resolved()
+    };
+    let (n, _m) = nodo_con_avanzamento(cfg, porta);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone());
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("analizza l'auth")],
+        // 160s: MOLTO sotto il tetto di 960s, e sotto il vecchio 240s.
+        run_started_at_epoch_s: Some(started_epoch_fa(160)),
+        iterations: Some(15),
+        tools_json: Some(vec![json!({"name": "run_command"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+
+    let ms = out
+        .meta_steps
+        .iter()
+        .find(|m| m.kind == "anti_runaway")
+        .expect("chi ripete si ferma");
+    assert_eq!(
+        ms.payload.get("reason").and_then(Value::as_str),
+        Some("no_progress"),
+        "la causa deve nominare l'assenza di progresso, non il tetto"
+    );
+    // `close_runaway` annida i campi della causa sotto `detail`: la misura ci
+    // arriva INTERA (regola Q), non appiattita in una frase.
+    let detail = ms.payload.get("detail").expect("dettaglio della causa");
+    assert_eq!(
+        detail.get("passi_a_vuoto").and_then(Value::as_u64),
+        Some(5),
+        "il referto porta la MISURA, non solo l'affermazione: {detail:?}"
+    );
+    assert_eq!(detail.get("kind").and_then(Value::as_str), Some("no_progress"));
+    assert_eq!(
+        detail.get("soglia_s").and_then(Value::as_u64),
+        Some(90),
+        "la soglia superata e' parte della misura"
+    );
+    assert!(llm.seen.lock().unwrap().is_empty(), "nessuna chiamata al modello");
+}
+
+/// Un guasto della porta non uccide nessuno: si dichiara l'ignoto e si prosegue.
+/// Un DB che non risponde non e' una prova che la figura sia ferma.
+///
+/// MUTAZIONE: trattare l'`Err` della porta come "nessun fatto" e farlo cadere nel
+/// ramo dell'inattivita' fa chiudere questo run con `no_progress` — una figura
+/// uccisa da un singhiozzo del DB.
+#[tokio::test]
+async fn un_guasto_della_porta_non_ferma_il_run() {
+    let porta = Arc::new(StubAvanzamento {
+        in_errore: true,
+        ..Default::default()
+    });
+    let cfg = ExecutorConfig {
+        run_token_budget: 0,
+        run_token_hard_cap: 0,
+        run_cost_budget_usd: 0.0,
+        run_time_budget_s: 960,
+        progresso_inattivita_max_s: 90,
+        time_grace_pct: 0,
+        ..cfg_resolved()
+    };
+    let (n, _m) = nodo_con_avanzamento(cfg, porta.clone());
+    let llm = Arc::new(StubLlmGateway::with_text("proseguo"));
+    let ctx = ctx_with(llm.clone());
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("analizza l'auth")],
+        run_started_at_epoch_s: Some(started_epoch_fa(300)),
+        iterations: Some(15),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert!(
+        !out.meta_steps.iter().any(|m| m.kind == "anti_runaway"),
+        "guasto della porta = ignoto dichiarato, non arresto"
+    );
+    assert!(!llm.seen.lock().unwrap().is_empty());
+}
+
+/// Il tetto assoluto resta l'ultima difesa anche con la porta in guasto: senza,
+/// un DB che non risponde renderebbe le figure immortali.
+#[tokio::test]
+async fn col_tetto_superato_il_guasto_della_porta_non_salva_il_run() {
+    let porta = Arc::new(StubAvanzamento {
+        in_errore: true,
+        ..Default::default()
+    });
+    let cfg = ExecutorConfig {
+        run_token_budget: 0,
+        run_token_hard_cap: 0,
+        run_cost_budget_usd: 0.0,
+        run_time_budget_s: 200,
+        progresso_inattivita_max_s: 90,
+        time_grace_pct: 0,
+        ..cfg_resolved()
+    };
+    let (n, _m) = nodo_con_avanzamento(cfg, porta);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone());
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("analizza l'auth")],
+        run_started_at_epoch_s: Some(started_epoch_fa(300)),
+        iterations: Some(15),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    let ms = out
+        .meta_steps
+        .iter()
+        .find(|m| m.kind == "anti_runaway")
+        .expect("il tetto e' l'ultima difesa");
+    assert_eq!(
+        ms.payload.get("reason").and_then(Value::as_str),
+        Some("absolute_ceiling")
+    );
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+/// La figura fermata dal criterio NON muore muta: il sollecito al canale di
+/// ruolo precede la chiusura anche quando l'arresto arriva molto prima della
+/// soglia a tempo del sollecito (70% del tetto = 672s, qui siamo a 160s).
+///
+/// MUTAZIONE: togliere la chiamata a `maybe_advisory_grace_delta` dal ramo di
+/// arresto rende questo test rosso — la figura chiude senza aver mai avuto un
+/// turno per dichiarare il proprio parere, cioe' il difetto che il turno di
+/// grazia era nato per chiudere, ricomparso da una porta nuova.
+#[tokio::test]
+async fn la_figura_fermata_dal_criterio_riceve_comunque_il_sollecito() {
+    let adesso = started_epoch_fa(0);
+    let porta = Arc::new(StubAvanzamento {
+        fatti: crate::decisions::FattiAvanzamento {
+            passi: (0..6)
+                .map(|i| {
+                    passo_avanzamento(
+                        "run_command",
+                        json!({"command": "npm test"}),
+                        adesso - 150 + i * 20,
+                    )
+                })
+                .collect(),
+            scritture: Vec::new(),
+        },
+        ..Default::default()
+    });
+    let cfg = ExecutorConfig {
+        run_token_budget: 0,
+        run_token_hard_cap: 0,
+        run_cost_budget_usd: 0.0,
+        run_time_budget_s: 960,
+        progresso_inattivita_max_s: 90,
+        time_grace_pct: 70, // soglia a tempo: 672s, MAI raggiunta qui
+        ..cfg_resolved()
+    };
+    let (n, _m) = nodo_con_avanzamento(cfg, porta);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone());
+    let state = figura_muta_da(160);
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+
+    assert!(
+        !out.meta_steps.iter().any(|m| m.kind == "anti_runaway"),
+        "il sollecito precede la chiusura: {:?}",
+        out.meta_steps
+    );
+    assert_eq!(
+        out.extra.get("advisory_grace_used").and_then(Value::as_bool),
+        Some(true),
+        "la figura fermata dal criterio riceve il turno per dichiarare"
+    );
 }
 
 // ── Tetto sui fallimenti gateway deterministici (mig 0619) ────────────────────

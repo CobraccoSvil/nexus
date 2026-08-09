@@ -1960,6 +1960,39 @@ if [[ -z "$(awk '
 else
   echo "OK causa-timeout: la chiusura in scadenza dichiara su cosa e' finito il budget"
 fi
+# Il criterio di TERMINAZIONE di una figura e' il progresso (2026-08-09, ADR 0044)
+#
+# Il tetto fisso per kind rispondeva alla domanda sbagliata: MISURATO il
+# 09/08/2026 su gestione-corsi, quattro figure su nove uccise mentre lavoravano
+# (4, 5, 17 e 22 passi persistiti, tutte con causa `NoFailureAtEnd`). Alzare il
+# numero e' la toppa che la regola H vieta per nome.
+#
+# 1. Il criterio vive nel punto unico. Un secondo posto che decidesse "questa
+#    figura non sta avanzando" darebbe due verdetti sullo stesso run.
+assert_single "avanzamento-figura" 'fn decidi_prosecuzione|fn classifica_avanzamento' \
+  'crates/nexus-agent-graph/src/decisions/avanzamento_figura.rs' crates
+# 2. Il gate di deadline deve INTERROGARLO. Senza, torna al confronto
+#    `elapsed >= budget` — con tutti i test verdi, perche' un run chiuso a tempo
+#    resta un run chiuso. E' il difetto misurato, e rientrerebbe in silenzio.
+if [[ -z "$(awk '
+  /async fn gate_deadline_run/ { dentro = 1 }
+  dentro && /prosecuzione_del_run/ { print "trovato"; exit }
+  dentro && /^    }/ { exit }
+' crates/nexus-agent-graph/src/nodes/executor.rs 2>/dev/null)" ]]; then
+  echo "!! avanzamento-figura: il gate di deadline non chiede piu' se la figura avanza." >&2
+  echo "   gate_deadline_run deve interrogare prosecuzione_del_run: senza, il" >&2
+  echo "   criterio torna a essere l'orologio e una figura che lavora muore al tetto." >&2
+  fail=1
+else
+  echo "OK avanzamento-figura: il gate di deadline chiede se la figura sta avanzando"
+fi
+# 3. Il tetto assoluto si calcola in UN posto: e' il numero su cui il timeout
+#    esterno e il budget del motore devono concordare. Se divergessero, il piu'
+#    stretto vincerebbe in silenzio e il criterio sarebbe inerte proprio nel caso
+#    per cui esiste.
+assert_single "tetto-assoluto-figura" 'fn tetto_assoluto_s' \
+  'crates/mcp-core/src/agent_tools/subagent_native.rs' crates
+
 # La RESA dell'elenco servizi si compone in un punto solo (2026-08-02, regole L+Q)
 #
 # `list_active_services` componeva la riga a mano, un `push_str` per colonna, con

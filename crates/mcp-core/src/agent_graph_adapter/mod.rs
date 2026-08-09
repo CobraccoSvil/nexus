@@ -30,6 +30,7 @@
 
 // --- 8 impl FASE 2a (cablate da native_engine) ---
 pub mod agent_step_store;
+pub mod avanzamento;
 pub mod billing_cooldown_port;
 pub mod event_sink;
 pub mod meta_step_store;

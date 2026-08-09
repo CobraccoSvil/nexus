@@ -89,6 +89,32 @@ struct SubagentSettings {
     /// Heartbeat "al lavoro" nei silenzi del sub-run (secondi, mig 0535).
     /// 0 -> heartbeat disabilitato (restano avvio/progressi/chiusura).
     narration_heartbeat_s: i64,
+    /// Per quanto il TETTO ASSOLUTO di una figura eccede il suo timeout
+    /// (`orchestrator.progresso_tetto_moltiplicatore`, mig 0687).
+    ///
+    /// Dal 09/08/2026 il timeout della figura non e' piu' il criterio di morte ma
+    /// l'intervallo di lavoro che ci si aspetta: chi AVANZA puo' eccederlo fino a
+    /// questo multiplo, chi non avanza muore molto prima (vedi
+    /// `nexus_agent_graph::decisions::avanzamento_figura`). Il moltiplicatore e'
+    /// clampato a >= 1 dal punto unico [`tetto_assoluto_s`]: un tetto piu'
+    /// stretto del timeout riporterebbe il difetto misurato da un'altra porta.
+    tetto_moltiplicatore: i64,
+}
+
+/// Il TETTO ASSOLUTO di una figura, dal suo timeout e dal moltiplicatore.
+///
+/// PUNTO UNICO del calcolo (regola L): lo usano i DUE lati che devono
+/// concordare — la rete di sicurezza `tokio::time::timeout` FUORI dal run e il
+/// gate di deadline DENTRO l'executor. Se divergessero, il piu' stretto dei due
+/// vincerebbe in silenzio e il criterio di progresso sarebbe inerte proprio nel
+/// caso per cui esiste.
+///
+/// Il clamp a `>= 1` non e' difensivo per abitudine: un moltiplicatore sotto 1
+/// renderebbe il tetto nuovo piu' stretto di quello di oggi, cioe' farebbe
+/// tornare — peggiorato — il difetto che il criterio chiude. La configurazione
+/// puo' allargare, mai stringere sotto il timeout della figura.
+fn tetto_assoluto_s(timeout_s: i64, moltiplicatore: i64) -> i64 {
+    timeout_s.max(0).saturating_mul(moltiplicatore.max(1))
 }
 
 async fn read_subagent_settings(ctx: &AgentToolContext) -> Result<SubagentSettings, String> {
@@ -100,7 +126,8 @@ async fn read_subagent_settings(ctx: &AgentToolContext) -> Result<SubagentSettin
             'orchestrator.subagent_cost_cap_per_run_usd',
             'orchestrator.subagent_default_timeout_s',
             'orchestrator.subagent_narration_enabled',
-            'orchestrator.subagent_narration_heartbeat_s'
+            'orchestrator.subagent_narration_heartbeat_s',
+            'orchestrator.progresso_tetto_moltiplicatore'
         )",
     )
     .fetch_all(&*ctx.core.db)
@@ -115,6 +142,11 @@ async fn read_subagent_settings(ctx: &AgentToolContext) -> Result<SubagentSettin
         default_timeout_s: 300,
         narration_enabled: true,
         narration_heartbeat_s: 20,
+        // 1 = tetto assoluto COINCIDENTE col timeout della figura, cioe' il
+        // comportamento a tempo storico. Il valore di esercizio vive nel DB
+        // (mig 0687): qui il safe-default non deve MAI concedere piu' tempo di
+        // quanto la configurazione dica (regola G).
+        tetto_moltiplicatore: 1,
     };
     for row in rows {
         let k: String = row.get("key");
@@ -148,6 +180,9 @@ fn apply_subagent_setting(s: &mut SubagentSettings, key: &str, value: &str) {
         "orchestrator.subagent_narration_enabled" => s.narration_enabled = settings_flag(v),
         "orchestrator.subagent_narration_heartbeat_s" => {
             s.narration_heartbeat_s = v.parse().unwrap_or(20)
+        }
+        "orchestrator.progresso_tetto_moltiplicatore" => {
+            s.tetto_moltiplicatore = v.parse().unwrap_or(1)
         }
         _ => {}
     }
@@ -3852,6 +3887,7 @@ async fn prepare_subagent_run(
         tools_json,
         current_depth,
         timeout_s,
+        tetto_s: tetto_assoluto_s(timeout_s, settings.tetto_moltiplicatore),
         narration_enabled: settings.narration_enabled,
         narration_heartbeat_s: settings.narration_heartbeat_s,
         // Il ramo background NON supporta isolamento (vedi doc su tool_dispatch_*):
@@ -3921,7 +3957,15 @@ struct SubagentExecInputs {
     mandate: SubagentMandate,
     tools_json: Value,
     current_depth: i64,
+    /// Intervallo di lavoro atteso per questa figura (il vecchio tetto fisso).
+    /// Dal 09/08/2026 NON e' piu' il criterio di morte: resta la misura che
+    /// narrazione, ledger e referto di scadenza dichiarano.
     timeout_s: i64,
+    /// Tetto ASSOLUTO oltre cui la figura si ferma comunque, dal punto unico
+    /// [`tetto_assoluto_s`]. E' il backstop del criterio di progresso, e lo
+    /// leggono i due lati che devono concordare: il `tokio::time::timeout`
+    /// esterno e il `run_time_budget_s` del motore.
+    tetto_s: i64,
     narration_enabled: bool,
     narration_heartbeat_s: i64,
     /// Root del sub-run (worktree isolato) o `None` (root condivisa / background).
@@ -3969,6 +4013,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         tools_json,
         current_depth,
         timeout_s,
+        tetto_s,
         narration_enabled,
         narration_heartbeat_s,
         working_root,
@@ -4092,7 +4137,19 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         // esterno qui sotto) entra nel motore: senza, il gate a tempo dell'executor
         // userebbe il setting globale `agent.run_time_budget_s` (0 per policy) e
         // resterebbe inerte, lasciando la figura morire muta allo scadere.
-        run_time_budget_s: Some(timeout_s.max(0) as u64),
+        // Il TETTO ASSOLUTO della figura (lo stesso del `tokio::time::timeout`
+        // esterno qui sotto) entra nel motore: senza, il gate di deadline
+        // dell'executor userebbe il setting globale `agent.run_time_budget_s`
+        // (0 per policy) e resterebbe inerte, lasciando la figura morire muta
+        // allo scadere della rete di sicurezza.
+        //
+        // Dal 09/08/2026 e' il TETTO e non piu' il `timeout_s`: dentro il gate
+        // il criterio non e' piu' il tempo ma il PROGRESSO (punto unico
+        // `nexus_agent_graph::decisions::avanzamento_figura`), e questo valore
+        // fa da ultima difesa. Passare qui il `timeout_s` renderebbe il criterio
+        // inerte — il gate chiuderebbe all'ora esatta di prima, e la figura che
+        // avanza morirebbe come prima.
+        run_time_budget_s: Some(tetto_s.max(0) as u64),
         // FASE 2: override root del sub-run. `None` (ramo sequenziale/condiviso o
         // background) -> scrive sulla root del progetto, comportamento invariato.
         // `Some(worktree)` (ramo ISOLATO, valorizzato dal batch parallelo di
@@ -4112,7 +4169,19 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         advisory_gate: None,
     };
 
-    // Timeout duro sull'esecuzione del sub-run (parita' col brain `asyncio.wait_for`).
+    // RETE DI SICUREZZA sull'esecuzione del sub-run, non piu' il criterio.
+    //
+    // Fino al 09/08/2026 questo `timeout` scattava al `timeout_s` della figura ed
+    // ERA il modo in cui una figura moriva: e' cio' che ha ucciso quattro figure
+    // su nove mentre lavoravano (vedi `decisions::avanzamento_figura`). Ora
+    // scatta al TETTO ASSOLUTO, e nel mezzo decide il criterio di progresso
+    // dentro il gate di deadline dell'executor — che chiude PULITO (sollecito al
+    // canale di ruolo + esito dichiarato) invece di cancellare un future.
+    //
+    // Questo resta armato perche' copre l'unico caso che il gate non puo'
+    // vedere: un run wedged DENTRO una singola chiamata al modello, che non
+    // raggiunge mai un confine di iterazione e quindi non viene mai interrogato.
+    //
     // In OGNI ramo il ponte e' fermato e ATTESO (`stop_bridge`) prima del meta-step
     // di chiusura: senza l'await, abort() e' cooperativo (cancella al prossimo poll)
     // e un progress/heartbeat gia' dentro persist_meta_step potrebbe ottenere un
@@ -4128,7 +4197,8 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
     // due cause opposte con la stessa faccia.
     let t_budget_start = std::time::Instant::now();
     let outcome: anyhow::Result<NativeRunOutcome> =
-        match tokio::time::timeout(std::time::Duration::from_secs(timeout_s as u64), run_fut).await
+        match tokio::time::timeout(std::time::Duration::from_secs(tetto_s.max(0) as u64), run_fut)
+            .await
         {
             Ok(res) => res,
             Err(_) => {
@@ -4136,27 +4206,33 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
                 // attesa (il ponte, il ledger, una connessione dal pool) sposta
                 // solo la scrittura, non lo scatto.
                 let scatto_ms = t_budget_start.elapsed().as_millis() as u64;
-                let ritardo_ms = ritardo_scatto_ms(scatto_ms, timeout_s);
+                let ritardo_ms = ritardo_scatto_ms(scatto_ms, tetto_s);
                 tracing::warn!(
                     sub_run_id = %subagent_run_id,
                     kind = %kind,
                     timeout_s,
+                    tetto_s,
                     scatto_ms,
                     ritardo_ms,
-                    "sub-run scaduto: ritardo dello scatto rispetto al budget"
+                    "sub-run scaduto al TETTO ASSOLUTO: il gate di progresso non lo ha \
+                     mai interrogato (nessun confine di iterazione raggiunto)"
                 );
                 stop_bridge(bridge).await;
                 // Il timeout marca comunque la riga TERMINALE (status='timeout'):
                 // deve passare per l'enqueue fan-in come gli altri rami (senza,
                 // un parent con l'ultimo figlio andato in timeout resterebbe
                 // sospeso per sempre). Non esce con return diretto.
+                // Il budget REALMENTE scaduto e' il tetto, non l'intervallo di
+                // lavoro: il referto deve nominare il tempo che la figura ha
+                // davvero avuto, o la diagnosi manderebbe a cercare un tetto
+                // stretto che non e' quello che ha scattato.
                 let out = finalize_timeout(
                     &proj_pool,
                     &ctx.core.db,
                     narrator.as_deref(),
                     subagent_run_id,
                     &kind,
-                    timeout_s,
+                    tetto_s,
                     &provider_resolved,
                     &model_resolved,
                 )
@@ -5509,6 +5585,50 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// IL CASO MISURATO (09/08/2026), sul numero che lo produceva: una figura del
+    /// Consiglio con timeout 240s riceve un tetto di 960s, quindi le quattro
+    /// fermate a 240s con 4, 5, 17 e 22 passi in corso avrebbero avuto il tempo
+    /// che stavano usando.
+    ///
+    /// E' QUI che vive la meta' permissiva del criterio, non nell'executor: il
+    /// gate di deadline non puo' sapere che il budget che riceve era il timeout
+    /// della figura. Se questa funzione tornasse a consegnare `timeout_s`, il
+    /// gate chiuderebbe all'ora esatta di prima e il criterio di progresso non
+    /// avrebbe mai occasione di parlare.
+    ///
+    /// MUTAZIONE: `timeout_s.max(0)` senza il moltiplicatore rende questo test
+    /// rosso con 240 al posto di 960, cioe' col valore del difetto reale.
+    #[test]
+    fn il_tetto_di_una_figura_eccede_il_suo_timeout() {
+        assert_eq!(
+            tetto_assoluto_s(240, 4),
+            960,
+            "il tetto e' un MULTIPLO del timeout: chi avanza eccede l'intervallo atteso"
+        );
+        assert_eq!(tetto_assoluto_s(300, 4), 1200, "vale per ogni kind, non solo per 240s");
+    }
+
+    /// Il clamp non e' difensivo per abitudine: un moltiplicatore sotto 1
+    /// renderebbe il tetto nuovo piu' STRETTO di quello di oggi, cioe' farebbe
+    /// rientrare da un'altra porta il difetto che il criterio chiude. La
+    /// configurazione puo' allargare, mai stringere.
+    ///
+    /// MUTAZIONE: togliere `.max(1)` fa uscire 0 da entrambe le righe — e 0, sul
+    /// `tokio::time::timeout` esterno, e' una figura uccisa all'istante.
+    #[test]
+    fn la_configurazione_non_puo_stringere_il_tetto_sotto_il_timeout() {
+        assert_eq!(
+            tetto_assoluto_s(240, 0),
+            240,
+            "moltiplicatore 0 (o assente): il tetto resta il timeout, mai meno"
+        );
+        assert_eq!(
+            tetto_assoluto_s(240, -3),
+            240,
+            "un valore negativo in DB non puo' produrre un tetto piu' stretto"
+        );
+    }
 
     /// REGRESSIONE (2026-07-26, osservata sul progetto e2e-todo): con openai e
     /// anthropic in cooldown billing restava il solo openrouter, la selezione
