@@ -6,6 +6,7 @@ pub mod compose_ports;
 pub mod execute_cmd;
 pub mod logs;
 pub mod monitor_seed;
+pub(crate) mod origine_frontend;
 pub mod playwright_install;
 pub mod port_recovery;
 pub(crate) mod problem_aggregation;

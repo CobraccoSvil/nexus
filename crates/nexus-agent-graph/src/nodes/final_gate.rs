@@ -715,10 +715,20 @@ impl FinalGateNode {
             // rinunciato a guardare, invece di un silenzio che somiglia a un
             // «tutto a posto».
             if criterio.is_none() {
+                // Il testo NON afferma piu' una causa che qui non si conosce.
+                // Fino al 09/08/2026 diceva «il progetto non ha un servizio
+                // frontend con porta allocata», e su gestione-corsi era falso:
+                // il frontend c'era, vivo e con la sua porta: a non riconoscerlo
+                // era il criterio di risoluzione dell'origine, che cercava la
+                // parola «frontend» nella label. Chi leggeva il log andava a
+                // cercare un servizio mancante. Il verdetto con la sua causa lo
+                // dichiara chi l'origine la risolve (punto unico
+                // `decisions::origine_frontend`, log in
+                // `mcp_core::native_engine`).
                 tracing::info!(
                     target: "nexus_agent_graph::final_gate",
-                    "dialogo browser non misurato: il progetto non ha un servizio \
-                     frontend con porta allocata (nessuna origine da caricare)"
+                    "dialogo browser non misurato: nessuna origine frontend risolta \
+                     (il verdetto e la sua causa sono nel log di origine_frontend)"
                 );
             }
             criteria.extend(criterio);
