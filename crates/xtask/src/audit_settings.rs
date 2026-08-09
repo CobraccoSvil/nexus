@@ -1270,16 +1270,78 @@ fn run_gate(baseline_path: &str, res: &Classes) -> Result<i32> {
     let base: Value = serde_json::from_str(&base_text)
         .with_context(|| format!("parse baseline {baseline_path}"))?;
 
-    Ok(compare_gate_counts(&base, cur_morta, cur_fantasma, cur_invisibile))
+    // Le CHIAVI, non solo i conteggi: chi legge il verdetto deve poter agire.
+    // Vedi il commento di `compare_gate_counts`.
+    // `order` per le OrderedMap (l'ordine d'inserimento e' quello del report,
+    // non uno alfabetico inventato qui); `keys()` per la BTreeMap dei fantasma.
+    let elenchi: [(&str, Vec<String>); 3] = [
+        ("morta", res.morta.order.clone()),
+        ("fantasma", res.fantasma.keys().cloned().collect()),
+        ("invisibile", res.invisibile.order.clone()),
+    ];
+
+    Ok(compare_gate_counts(
+        &base,
+        cur_morta,
+        cur_fantasma,
+        cur_invisibile,
+        &elenchi,
+    ))
+}
+
+/// Le righe che nominano le chiavi delle sole classi in REGRESSIONE.
+///
+/// Funzione a se' e pura perche' sia verificabile: il ramo che la usa scatta
+/// solo quando il gate fallisce, cioe' mai in un albero sano, e un ramo che
+/// nessuno esercita e' un ramo che si scopre rotto il giorno in cui serve.
+/// Compone il testo DAI dati (regola Q), non il contrario.
+///
+/// Cap a 20 per non seppellire il verdetto quando la regressione e' larga; oltre
+/// quella soglia il conteggio dichiara quante ne restano, cosi' l'elenco non
+/// sembra mai completo quando non lo e' (regola O).
+fn righe_chiavi_in_regressione(
+    regress: &[(&str, usize, usize)],
+    elenchi: &[(&str, Vec<String>)],
+) -> Vec<String> {
+    const MAX: usize = 20;
+    let mut righe = Vec::new();
+    for (classe, _, _) in regress {
+        let Some((_, chiavi)) = elenchi.iter().find(|(nome, _)| nome == classe) else {
+            continue;
+        };
+        if chiavi.is_empty() {
+            continue;
+        }
+        righe.push(format!("  {classe}:"));
+        for k in chiavi.iter().take(MAX) {
+            righe.push(format!("    - {k}"));
+        }
+        if chiavi.len() > MAX {
+            righe.push(format!("    ... e altre {}", chiavi.len() - MAX));
+        }
+    }
+    righe
 }
 
 /// Confronta i conteggi correnti con la baseline: exit 1 (con dettaglio delle
 /// regressioni su stderr) se una metrica e' salita, 0 altrimenti.
+///
+/// `elenchi` porta le CHIAVI per classe, e non e' un di piu': finche' il gate
+/// diceva soltanto `{'fantasma': (1, 0)}`, chi lo leggeva sapeva che una chiave
+/// era di troppo e non quale — e per scoprirlo doveva riprodurre l'ambiente in
+/// cui il gate aveva misurato. MISURATO l'09/08/2026: questo gate e' rosso in CI
+/// e verde in locale, perche' il CI ha un DB creato dalle sole migrazioni (597
+/// chiavi) mentre il DB di sviluppo ne ha 765; dedurre la chiave da locale
+/// significa ricostruire il criterio di `detect_ghost_keys` invece di
+/// interrogarlo, che e' il difetto che la regola O vieta. Il produttore ha
+/// l'elenco (`run_gate` riceve `&Classes`): passarlo a valle e' l'unico punto in
+/// cui il verdetto smette di essere un numero senza il suo dato (regola Q).
 fn compare_gate_counts(
     base: &Value,
     cur_morta: usize,
     cur_fantasma: usize,
     cur_invisibile: usize,
+    elenchi: &[(&str, Vec<String>)],
 ) -> i32 {
     let base_get = |k: &str| base.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
@@ -1308,6 +1370,9 @@ fn compare_gate_counts(
             "GATE FALLITO (regressioni vs baseline): {{{}}}",
             inner.join(", ")
         );
+        for riga in righe_chiavi_in_regressione(&regress, elenchi) {
+            eprintln!("{riga}");
+        }
         return 1;
     }
 
@@ -1416,5 +1481,48 @@ mod tests {
              test sopra non sta misurando quel ramo"
         );
     }
-}
 
+    /// Il verdetto del gate nomina le CHIAVI, non solo quante sono.
+    ///
+    /// Il ramo scatta solo su un albero con regressioni — mai in locale — e per
+    /// questo la composizione del testo sta in una funzione pura: qui si
+    /// verifica cio' che il CI stampera' il giorno in cui fallisce, senza
+    /// doverlo far fallire. Il difetto che presidia: `{'fantasma': (1, 0)}` dice
+    /// che una chiave e' di troppo e non quale, e per scoprirlo bisognava
+    /// riprodurre l'ambiente in cui il gate aveva misurato.
+    #[test]
+    fn il_verdetto_nomina_le_chiavi_delle_classi_in_regressione() {
+        let elenchi: [(&str, Vec<String>); 3] = [
+            ("morta", vec!["a.morta".into()]),
+            ("fantasma", vec!["agent.nuova_chiave".into()]),
+            ("invisibile", vec![]),
+        ];
+        let regress = [("fantasma", 1usize, 0usize)];
+
+        let righe = righe_chiavi_in_regressione(&regress, &elenchi);
+
+        assert_eq!(
+            righe,
+            vec!["  fantasma:".to_string(), "    - agent.nuova_chiave".to_string()],
+            "il verdetto deve nominare la chiave, e solo quella della classe in regressione"
+        );
+        assert!(
+            !righe.iter().any(|r| r.contains("a.morta")),
+            "una classe NON in regressione non entra nel verdetto: {righe:?}"
+        );
+    }
+
+    /// Oltre il cap l'elenco dichiara quante ne restano: un elenco troncato che
+    /// sembri completo e' peggio di un conteggio (regola O).
+    #[test]
+    fn oltre_il_cap_il_verdetto_dichiara_quante_ne_restano() {
+        let chiavi: Vec<String> = (0..25).map(|i| format!("agent.k{i}")).collect();
+        let elenchi: [(&str, Vec<String>); 1] = [("fantasma", chiavi)];
+        let regress = [("fantasma", 25usize, 0usize)];
+
+        let righe = righe_chiavi_in_regressione(&regress, &elenchi);
+
+        assert_eq!(righe.len(), 1 + 20 + 1, "intestazione + 20 chiavi + la coda");
+        assert_eq!(righe.last().unwrap(), "    ... e altre 5");
+    }
+}
