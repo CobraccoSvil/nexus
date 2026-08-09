@@ -143,6 +143,10 @@ use serde_json::{json, Map, Value};
 use nexus_graph::node::{GraphNode, NodeError, NodeId};
 use nexus_graph::StateDelta as OpaqueDelta;
 
+use crate::decisions::avanzamento_figura::{
+    decidi_prosecuzione, CausaArresto, FattiAvanzamento, MotivoNonOsservabile, Prosecuzione,
+    SoglieAvanzamento,
+};
 use crate::decisions::context_reduction::{
     self as ctxr, CompressParams, CtxMgmtConfig, HistoryMessage, TokenBrakeConfig,
 };
@@ -192,7 +196,8 @@ use crate::routing::signals::{
 };
 use crate::runtime::ports::RecoveryMove;
 use crate::runtime::ports::{
-    AgentStepStore, BillingCooldownPort, ContextOffload, EmbeddingStore, EscalationPort,
+    AgentStepStore, AvanzamentoPort, BillingCooldownPort, ContextOffload, EmbeddingStore,
+    EscalationPort,
     LlmMessage, LlmRequest, LlmResponse, MetaStepStore, ModelUpscalePort, NextActionsDeriver,
     OffloadKind, PortError, RunControlStore, ScaleMove, ScaleTier, SizingOverrides, SseEvent,
     StallBudgetPort, SummaryStore, TokenCounter, TurnShape,
@@ -369,6 +374,18 @@ pub struct ExecutorConfig {
     /// chiamate: se una singola chiamata dura quanto il residuo, il turno di grazia
     /// non fa in tempo e va abbassata (regola G: si tara dal DB, non nel codice).
     pub time_grace_pct: u64,
+    /// Secondi senza un AVANZAMENTO oltre i quali (`>=`) la figura si ferma,
+    /// anche col tetto assoluto lontano
+    /// (`orchestrator.progresso_inattivita_max_s`). `0` = criterio di progresso
+    /// spento -> governa il solo [`Self::run_time_budget_s`], cioe' il
+    /// comportamento a tempo storico.
+    ///
+    /// E' la meta' SEVERA del criterio: chi ripete la stessa chiamata muore qui,
+    /// molto prima del tetto. La meta' permissiva e' il tetto stesso, che dal
+    /// 09/08/2026 non e' piu' il timeout della figura ma un suo multiplo — vedi
+    /// [`crate::decisions::avanzamento_figura`] per il difetto misurato.
+    /// Regola G: DB-driven, mai hardcoded.
+    pub progresso_inattivita_max_s: u64,
     /// Turni CONSECUTIVI falliti al gateway sulla STESSA coppia provider/model
     /// con causa DETERMINISTICA (risposta degenere `empty_completion`,
     /// `client_error` fuori dalla whitelist di recupero) oltre cui (`>=`) il run
@@ -641,6 +658,12 @@ impl Default for ExecutorConfig {
             // Turno di grazia al 70% del budget: il default vive nel DB (mig 0614),
             // qui e' solo la rete di sicurezza documentata del costruttore.
             time_grace_pct: 70,
+            // 0 = criterio di progresso spento (bit-identico allo storico a
+            // tempo): lo accende il setting DB
+            // `orchestrator.progresso_inattivita_max_s` (mig 0687). Il default
+            // NON e' il valore di esercizio (regola G): senza porta iniettata il
+            // criterio non e' comunque interrogabile.
+            progresso_inattivita_max_s: 0,
             gateway_deterministic_streak_max: 3,
             max_consecutive_text_only_turns: 3,
             // 3.4 default OFF -> comportamento bit-identico (chiusura backstop).
@@ -824,6 +847,14 @@ pub struct ExecutorNode {
     /// [`Self::with_context_offload`]. Gata dai flag `cfg.compress_offload_enabled`
     /// / `cfg.rolling_summary_offload_enabled`.
     offload: Option<Arc<dyn ContextOffload>>,
+    /// Porta I/O dei fatti su cui si decide se la figura merita ancora tempo
+    /// (`agent_steps` + `file_mutations`). OPZIONALE (`None` -> il criterio di
+    /// progresso non e' interrogabile e [`Self::gate_deadline_run`] ricade sul
+    /// solo tetto assoluto, cioe' sul comportamento a tempo storico): iniettata
+    /// col builder [`Self::with_avanzamento`]. La DECISIONE e' del modulo puro
+    /// [`crate::decisions::avanzamento_figura`] (regola L); qui la porta fornisce
+    /// solo i fatti.
+    avanzamento: Option<Arc<dyn AvanzamentoPort>>,
 }
 
 
@@ -914,7 +945,18 @@ impl ExecutorNode {
             stall_budget: None,
             embedding_store: None,
             offload: None,
+            avanzamento: None,
         }
+    }
+
+    /// Inietta la porta dei fatti di avanzamento (passi persistiti + scritture).
+    /// Senza iniezione (default) il criterio di progresso non e' interrogabile e
+    /// la deadline ricade sul solo tetto assoluto: comportamento a tempo,
+    /// identico allo storico. E' il caso dei test che non lo esercitano e del
+    /// run PRIMARIO, che non ha un tetto per figura.
+    pub fn with_avanzamento(mut self, port: Arc<dyn AvanzamentoPort>) -> Self {
+        self.avanzamento = Some(port);
+        self
     }
 
     /// Inietta il contatore token REALE (ADR 0016 D1, es. tiktoken cl100k via
@@ -5011,12 +5053,35 @@ modo piu' specifico, oppure riprova con un modello piu' economico.",
         ))
     }
 
-    /// Deadline dell'INTERO run in tempo di parete (fase 3 paradigma
-    /// orchestrazione): epoch di avvio CHECKPOINTATO nello stato -> la misura
-    /// sopravvive ai resume e copre il run intero. `0` = disabilitato; run
+    /// Il run merita ancora tempo? Epoch di avvio CHECKPOINTATO nello stato -> la
+    /// misura sopravvive ai resume e copre il run intero. `0` = disabilitato; run
     /// senza epoch (avviati prima della fase 3) -> nessun enforcement, mai un
-    /// default inventato. Chiusura PULITA con reason canonico `time_budget`
+    /// default inventato. Chiusura PULITA col reason canonico della causa
     /// (regola M/N), gemella del cap di spesa.
+    ///
+    /// ## Dal TEMPO al PROGRESSO (09/08/2026)
+    ///
+    /// Fino a questa data la risposta era una sottrazione: `elapsed >= budget`.
+    /// Il difetto misurato su gestione-corsi — quattro figure su nove uccise
+    /// mentre lavoravano, tutte con causa `no_failure_at_end` — non era il valore
+    /// del budget ma la domanda: un tetto fisso tratta identicamente chi ha
+    /// prodotto 4 passi e chi ne ha prodotti 22.
+    ///
+    /// Ora la decisione la prende il punto unico
+    /// [`crate::decisions::avanzamento_figura`] sui FATTI PERSISTITI portati da
+    /// [`AvanzamentoPort`], e [`ExecutorConfig::run_time_budget_s`] cambia ruolo:
+    /// non e' piu' il criterio, e' il TETTO ASSOLUTO che il criterio usa come
+    /// ultima difesa (chi lo calcola lo deriva dal timeout della figura per un
+    /// moltiplicatore, vedi `subagent_native`).
+    ///
+    /// ## Perche' la grazia precede la chiusura in ENTRAMBI i rami
+    ///
+    /// Il sollecito era gia' agganciato al tempo (`time_grace_pct` del budget):
+    /// col criterio nuovo una figura puo' fermarsi molto PRIMA di quella soglia,
+    /// e senza il secondo aggancio morirebbe muta proprio nel caso che il
+    /// criterio esiste per cogliere. Percio' un arresto passa comunque per
+    /// [`Self::maybe_advisory_grace_delta`] — one-shot, quindi al giro successivo
+    /// il gate chiude davvero e non si cicla.
     async fn gate_deadline_run(
         &self,
         state: &AgentState,
@@ -5032,45 +5097,106 @@ modo piu' specifico, oppure riprova con un modello piu' economico.",
             .map(|d| d.as_secs() as i64)
             .unwrap_or(started);
         let elapsed_s = now_s.saturating_sub(started).max(0) as u64;
+
+        let prosecuzione = self.prosecuzione_del_run(started, now_s).await;
+        let Some(causa) = prosecuzione.causa() else {
+            // Prosegue. Il sollecito a tempo resta INVARIATO: e' l'aggancio
+            // storico (percentuale del tetto) e copre la figura che arriva viva
+            // fino in fondo.
+            return self
+                .maybe_time_grace_delta(state, iters_in, ctx, elapsed_s)
+                .await;
+        };
+
         // SOLLECITO DI CHIUSURA prima del kill (interattivo, regola H): col
-        // budget quasi esaurito e il canale di ruolo ancora muto, invece di
+        // criterio esaurito e il canale di ruolo ancora muto, invece di
         // uccidere si CHIEDE alla figura di chiudere col parere che ha. Cosi'
-        // una figura che scade non muore n/d: dichiara un parere reale, magari
+        // una figura che si ferma non muore n/d: dichiara un parere reale, magari
         // parziale, che il consiglio puo' comporre. Punto unico riusato
         // (regola L): lo stesso `maybe_advisory_grace_delta` del backstop
         // text-only, gia' one-shot e gia' con gli azzeramenti dei detector.
         // `None` (non e' un ruolo / grazia gia' concessa) -> si prosegue al
-        // ramo di chiusura sotto, bit-identico.
+        // ramo di chiusura sotto.
         if let Some(delta) = self
-            .maybe_time_grace_delta(state, iters_in, ctx, elapsed_s)
+            .maybe_advisory_grace_delta(state, iters_in, ctx)
             .await
         {
             return Some(delta);
         }
-        if elapsed_s < self.cfg.run_time_budget_s {
-            return None;
-        }
-        let time_text = format!(
-            "Raggiunta la deadline del run ({elapsed_s}s trascorsi, budget {}s). \
-Interrompo d'autorita' per rispettare il tempo massimo: riformula la richiesta in modo \
-piu' specifico, oppure alza agent.run_time_budget_s se il task richiede piu' tempo.",
-            self.cfg.run_time_budget_s
-        );
         tracing::error!(
             target: "nexus_agent_graph::executor",
             elapsed_s,
-            run_time_budget_s = self.cfg.run_time_budget_s,
-            "DEADLINE del run raggiunta -> chiusura d'autorita' (tempo di parete)"
+            causa = causa.key(),
+            tetto_assoluto_s = self.cfg.run_time_budget_s,
+            inattivita_max_s = self.cfg.progresso_inattivita_max_s,
+            "il run non merita altro tempo -> chiusura d'autorita'"
         );
-        Some(self.close_runaway(
-            iters_in,
-            time_text,
-            "time_budget",
-            json!({
-                "elapsed_s": elapsed_s,
-                "run_time_budget_s": self.cfg.run_time_budget_s,
-            }),
-        ))
+        let mut payload = serde_json::to_value(causa).unwrap_or_else(|_| json!({}));
+        if let Some(o) = payload.as_object_mut() {
+            o.insert("elapsed_s".into(), json!(elapsed_s));
+            o.insert(
+                "tetto_assoluto_s".into(),
+                json!(self.cfg.run_time_budget_s),
+            );
+        }
+        Some(self.close_runaway(iters_in, causa.nota(), causa.key(), payload))
+    }
+
+    /// Interroga il criterio di avanzamento sui fatti della porta.
+    ///
+    /// Senza porta iniettata i fatti sono VUOTI: il criterio li dichiara
+    /// [`crate::decisions::MotivoNonOsservabile::NessunFatto`] e prosegue, quindi
+    /// resta in piedi il solo tetto assoluto — cioe' esattamente il comportamento
+    /// a tempo di prima. E' il caso del run primario e dei test che non
+    /// esercitano il progresso.
+    ///
+    /// Un guasto della porta NON e' un arresto (regola Q: l'ignoto e' una
+    /// variante, non un degrado): si dichiara `LetturaFallita` e si prosegue. Un
+    /// DB che non risponde non e' una prova che la figura sia ferma, e il tetto
+    /// assoluto continua a coprire il caso peggiore.
+    async fn prosecuzione_del_run(&self, avvio_s: i64, adesso_s: i64) -> Prosecuzione {
+        let soglie = SoglieAvanzamento {
+            inattivita_max_s: self.cfg.progresso_inattivita_max_s,
+            tetto_assoluto_s: self.cfg.run_time_budget_s,
+        };
+        let fatti = match self.avanzamento.as_ref() {
+            None => FattiAvanzamento::default(),
+            Some(port) => match port.fatti_avanzamento().await {
+                Ok(f) => f,
+                Err(e) => return Self::prosecuzione_al_buio(&e, avvio_s, adesso_s, soglie),
+            },
+        };
+        decidi_prosecuzione(&fatti, avvio_s, adesso_s, soglie)
+    }
+
+    /// I fatti non si sono potuti leggere: si dichiara l'ignoto e si prosegue.
+    ///
+    /// Il tetto assoluto va comunque verificato PRIMA, perche' e' l'unica difesa
+    /// che non dipende dall'osservazione: un guasto della porta non deve
+    /// diventare il modo di restare vivi per sempre.
+    fn prosecuzione_al_buio(
+        errore: &PortError,
+        avvio_s: i64,
+        adesso_s: i64,
+        soglie: SoglieAvanzamento,
+    ) -> Prosecuzione {
+        tracing::warn!(
+            target: "nexus_agent_graph::executor",
+            error = %errore,
+            "fatti di avanzamento non leggibili: il criterio prosegue e lo dichiara"
+        );
+        let eta_s = adesso_s.saturating_sub(avvio_s).max(0) as u64;
+        if soglie.tetto_assoluto_s > 0 && eta_s >= soglie.tetto_assoluto_s {
+            return Prosecuzione::Ferma {
+                causa: CausaArresto::TettoAssoluto {
+                    eta_s,
+                    tetto_s: soglie.tetto_assoluto_s,
+                },
+            };
+        }
+        Prosecuzione::ProseguePerIgnoto {
+            motivo: MotivoNonOsservabile::LetturaFallita,
+        }
     }
 
     /// ── (4d) BUDGET TOKEN cumulativo: safety net anti-runaway per COSTO ────

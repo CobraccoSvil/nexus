@@ -864,6 +864,32 @@ pub trait MutationProgressPort: Send + Sync {
     async fn scan_writes(&self, after: Option<i64>) -> Result<WriteScan, PortError>;
 }
 
+/// Porta dei FATTI su cui si decide se una figura merita ancora tempo: i passi
+/// che ha lasciato e le scritture che ha prodotto, ciascuno col proprio istante.
+///
+/// CONFINE (regola L): qui SOLO l'I/O. Il CRITERIO ("questo conta come
+/// avanzamento?") e' del modulo puro [`crate::decisions::avanzamento_figura`],
+/// che il chiamante interroga sui fatti ritornati. L'impl NON deve filtrare:
+/// nemmeno i passi ripetuti, nemmeno le riscritture a contenuto invariato. Se lo
+/// facesse, il criterio vivrebbe in due posti — la query SQL e il modulo puro —
+/// e proprio i fatti che dicono "non sta avanzando" sparirebbero prima di essere
+/// contati come tali, cioe' il caso che la misura esiste per vedere.
+///
+/// NIENTE FAIL-OPEN INVENTATO (regola G/M). Un guasto di lettura propaga
+/// `PortError`: il chiamante lo dichiara come
+/// [`crate::decisions::MotivoNonOsservabile::LetturaFallita`] e PROSEGUE, perche'
+/// un DB che non risponde non e' una prova che la figura sia ferma. Un
+/// `Ok(vuoto)` di ripiego direbbe "nessun fatto", che qui e' la stessa cosa —
+/// ma nel log direbbe "non ha prodotto niente" invece di "non ho potuto
+/// guardare", e sono due diagnosi diverse.
+#[async_trait]
+pub trait AvanzamentoPort: Send + Sync {
+    /// I fatti persistiti del run, in ordine cronologico.
+    async fn fatti_avanzamento(
+        &self,
+    ) -> Result<crate::decisions::FattiAvanzamento, PortError>;
+}
+
 /// Esito di UN run del verifier da persistere su `nexus_agent_verifier_runs`
 /// (`verifier_node._persist_verifier_run`, `verifier_node.py:584-601`). Forma
 /// minimale: i campi della INSERT (`run_id`/`todo_id`/`cycle`/`criteria_results`/

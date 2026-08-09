@@ -83,6 +83,15 @@
 //!     `nexus_types::tool_outcome::RispostaTool`), mai dal testo (regola M);
 //!     l'I/O (leggere `agent_steps`) sta in `mcp-core`, che porta i fatti e non
 //!     li giudica. E' una MISURA: non allunga budget e non riavvia nulla.
+//!   - [`avanzamento_figura`]: PUNTO UNICO di "questa figura merita ancora
+//!     tempo?". Gemello ATTIVO del precedente: quello dichiara la causa DOPO la
+//!     morte, questo decide se la morte debba avvenire. Il criterio e' il
+//!     PROGRESSO letto dai fatti persistiti (una scrittura che cambia contenuto,
+//!     un passo su una strada mai tentata), mai l'orologio; il tempo resta solo
+//!     come tetto assoluto. Il silenzio non ferma nessuno — e' un ignoto
+//!     dichiarato (regola Q), perche' una figura dentro una chiamata al modello
+//!     non lascia passi. L'I/O e' la porta
+//!     [`crate::runtime::ports::AvanzamentoPort`].
 //!   - [`requirement_conformance`]: PUNTO UNICO di "i requisiti emessi dal
 //!     Consiglio sono stati applicati?". Il criterio e' il CONTENUTO del file
 //!     (regola M), mai la dichiarazione dell'agente; l'incertezza degrada sempre
@@ -103,6 +112,7 @@
 
 pub mod adversarial_review;
 pub mod advisory_panel;
+pub mod avanzamento_figura;
 pub mod browser_dialogue;
 pub mod clarify_signature;
 pub mod context_reduction;
@@ -163,6 +173,11 @@ pub use correction_progress::{
 };
 pub use timeout_cause::{
     classifica_causa_timeout, AttesaInCoda, CausaTimeout, TentativoOsservato,
+};
+pub use avanzamento_figura::{
+    classifica_avanzamento, decidi_prosecuzione, Avanzamento, CausaArresto, FattiAvanzamento,
+    MotivoNonOsservabile, PassoOsservato, Prosecuzione, ProvaAvanzamento, ScritturaOsservata,
+    SoglieAvanzamento,
 };
 pub use requirement_conformance::{
     compose_conformance, conformance_senza_progetto, requirements_from_synthesis,

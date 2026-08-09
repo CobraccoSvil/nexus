@@ -1828,6 +1828,17 @@ async fn load_executor_config(
         time_grace_pct: setting_i64(db, "agent.time_grace_pct", d.time_grace_pct as i64)
             .await
             .clamp(0, 100) as u64,
+        // Criterio di PROGRESSO (mig 0687): secondi senza un avanzamento oltre i
+        // quali la figura si ferma, indipendentemente dal tetto. E' cio' che ha
+        // sostituito il tetto fisso come CRITERIO — il tetto resta come backstop
+        // (vedi `nexus_agent_graph::decisions::avanzamento_figura`). 0 = spento.
+        progresso_inattivita_max_s: setting_i64(
+            db,
+            "orchestrator.progresso_inattivita_max_s",
+            d.progresso_inattivita_max_s as i64,
+        )
+        .await
+        .max(0) as u64,
         // Tetto sui turni consecutivi falliti al gateway con causa deterministica
         // (mig 0619): oltre, si chiude con esito onesto invece di ritentare la
         // stessa chiamata fino al budget. 0 = disabilitato.
@@ -3292,6 +3303,20 @@ async fn build_native_engine(
             executor = executor
                 .with_embedding_store(Arc::new(PgEmbeddingStore::new()))
                 .with_context_offload(offload.clone());
+            // Fatti su cui si decide se una figura merita ancora tempo (mig
+            // 0687): passi persistiti dal DB del progetto, scritture dal META.
+            // La porta e' SEMPRE iniettata; a governare se il criterio scatta
+            // sono il setting `orchestrator.progresso_inattivita_max_s` e la
+            // presenza di un tetto (`run_time_budget_s`, che per il run primario
+            // e' 0 -> il gate non e' raggiunto affatto). Regola G.
+            executor = executor.with_avanzamento(Arc::new(
+                crate::agent_graph_adapter::avanzamento::AvanzamentoAdapter::new(
+                    run_db.clone(),
+                    db.clone(),
+                    input.run_id,
+                    input.session_id,
+                ),
+            ));
             Arc::new(executor)
         },
         tool_dispatch: Arc::new(ToolDispatchNode::new(
