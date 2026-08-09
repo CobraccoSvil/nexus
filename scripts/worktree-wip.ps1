@@ -57,6 +57,46 @@
     2. prima di ogni pulizia, come gate (exit 1 se c'e' lavoro non salvato):
          powershell -File scripts\worktree-wip.ps1 -Report
 
+  COSA CONTA COME LAVORO A RISCHIO. Censimento e salvataggio rispondono a due
+  domande diverse e usano due criteri diversi, apposta. Il salvataggio cattura i
+  BYTE del working tree (`add -A`): li' non si sceglie, si conserva tutto. Il
+  censimento invece produce il NUMERO su cui si decide se archiviare una sessione,
+  e un file il cui contenuto e' identico e cambiano solo i fine-riga non e' lavoro
+  da perdere: non c'e' niente da perdere.
+
+  Misurato il 09/08/2026 su due alberi nello stesso istante: 'cool-brattain'
+  dichiarato «30 file» con modifiche reali ZERO, 'D:\IDEAI' dichiarato «1305 file»
+  con reali 27 -- i 1278 fantasma erano l'artefatto dello stash+ripristino che
+  lefthook esegue durante il pre-commit. Con 1305 al posto di 27 il numero e'
+  inservibile in ENTRAMBE le direzioni: fa sembrare a rischio un albero pulito, e
+  nasconde le 27 modifiche vere nel rumore.
+
+  IL CRITERIO E' '--ignore-cr-at-eol', NON '--ignore-all-space'. Misurati entrambi
+  sullo stesso repo di prova (tre file: uno coi soli fine-riga cambiati, uno col
+  contenuto cambiato, uno con la sola indentazione cambiata):
+
+    git status --porcelain        -> 3 file   (cio' che questo script contava)
+    git diff --ignore-cr-at-eol   -> 2 file   (scarta il solo fantasma)
+    git diff --ignore-all-space   -> 1 file   (scarta anche la reindentazione)
+
+  '--ignore-all-space' sbaglia nel verso che conta: una reindentazione e' lavoro
+  vero, e uno strumento il cui mestiere e' dire «qui c'e' lavoro a rischio» non
+  puo' nasconderla. '--ignore-cr-at-eol' e' invece l'esatto corrispettivo di
+  EsitoFineRiga::SoloFineRiga.
+
+  VOCABOLARIO CONDIVISO, NON UN SECONDO CRITERIO. La domanda «questi due contenuti
+  differiscono solo nei fine-riga?» ha il suo punto unico in
+  crates/nexus-migrations/src/fine_riga.rs (`classifica_contenuto` ->
+  EsitoFineRiga{Identici|SoloFineRiga|ContenutoDiverso}). PowerShell non puo'
+  chiamarlo: vale il precedente di deploy/lib/nexus-liveness.ps1, gemello che
+  condivide il VOCABOLARIO e il criterio, mai una seconda idea di cosa sia una
+  differenza. Qui il confronto lo fa git, che quei byte li ha gia' in mano.
+
+  COSA NON VIENE FILTRATO, verificato caso per caso su un repo di prova: i file
+  NON TRACCIATI (nessun diff li vede -- si leggono da 'ls-files --others'), le
+  CANCELLAZIONI (una cancellazione non e' un fine-riga e resta nel diff filtrato)
+  e i fantasmi in STAGING (filtrati anche quelli, con '--cached').
+
   Cosa questo script NON puo' fare: rifiutare l'archiviazione di una sessione.
   Rimuovere il worktree e' un'azione dello strumento di sessione (CCD), fuori dal
   repo: nessun hook git viene eseguito e non esiste un punto lato repo in cui
@@ -101,6 +141,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $WipPrefix = 'refs/wip/'
+# L'albero vuoto di git: base del confronto quando HEAD non esiste ancora.
+$EmptyTree = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 
 # git con stdout e stderr SEPARATI. Non si usa '2>&1': su Windows PowerShell la
 # redirezione dello stderr di un eseguibile nativo produce un NativeCommandError
@@ -215,33 +257,84 @@ function Get-Worktrees {
   return $res
 }
 
+# Elenco di percorsi da un comando git, oppure $null se il comando NON e' riuscito.
+# Il fallimento non degrada a "nessun percorso": un elenco vuoto e un comando che
+# non ha potuto rispondere sono due cose diverse, e collassarle direbbe "pulito" su
+# un worktree illeggibile (regola Q). L'array si restituisce con la virgola
+# davanti, o PowerShell srotola quello vuoto in $null e i due casi tornano a
+# confondersi proprio qui.
+function Get-GitPaths {
+  param([string]$WorktreePath, [string[]]$Arguments)
+  $r = Invoke-Git -Arguments (@('-C', $WorktreePath) + $Arguments)
+  if (-not $r.Ok) { return $null }
+  if ([string]::IsNullOrWhiteSpace($r.Output)) { return , @() }
+  return , @($r.Output -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+}
+
 # Conteggi PER CATEGORIA, non un totale: "staging" e "non tracciati" sono le due
 # categorie che i due recuperi sbagliati perdono ciascuno per conto proprio
 # ('git diff' perde la prima, 'git diff HEAD' la seconda). Tenerle distinte e'
 # l'unico modo di vedere quanto costerebbe il recupero fatto male.
+#
+# Le tre categorie si chiedono a git una per una invece di contare le colonne di
+# 'status --porcelain', perche' e' l'unico modo di applicare a ciascuna il criterio
+# sui fine-riga: porcelain non ha un modo di dire "modificato, ma solo nei
+# fine-riga". Il perche' del criterio -- e perche' NON '--ignore-all-space' -- sta
+# in testa al file.
 function Get-DirtyState {
   param([string]$WorktreePath)
-  $porcelain = Invoke-Git -Arguments @('-C', $WorktreePath, 'status', '--porcelain')
-  if (-not $porcelain.Ok) {
+
+  # Base del confronto con l'index. Su un branch orfano HEAD non esiste ancora: si
+  # parte dall'albero vuoto, cosi' cio' che e' in staging risulta staged invece di
+  # rendere "non leggibile" un worktree che si legge benissimo.
+  $base = 'HEAD'
+  $head = Invoke-Git -Arguments @('-C', $WorktreePath, 'rev-parse', '--verify', '--quiet', 'HEAD')
+  if (-not $head.Ok -or [string]::IsNullOrWhiteSpace($head.Output)) { $base = $EmptyTree }
+
+  $untracked  = Get-GitPaths $WorktreePath @('ls-files', '--others', '--exclude-standard')
+  $stagedReal = Get-GitPaths $WorktreePath @('diff', '--cached', '--name-only', '--ignore-cr-at-eol', $base)
+  $modReal    = Get-GitPaths $WorktreePath @('diff', '--name-only', '--ignore-cr-at-eol')
+
+  if ($null -eq $untracked -or $null -eq $stagedReal -or $null -eq $modReal) {
     return [pscustomobject]@{
-      Readable = $false; Error = $porcelain.Err
-      Staged = 0; Modified = 0; Untracked = 0; Total = 0; IsDirty = $false
+      Readable = $false; Error = 'git non ha potuto leggere lo stato del worktree'
+      Staged = 0; Modified = 0; Untracked = 0; SoloFineRiga = 0; Total = 0; IsDirty = $false
     }
   }
-  $staged = 0; $modified = 0; $untracked = 0
-  foreach ($line in ($porcelain.Output -split "`r?`n")) {
-    if ([string]::IsNullOrWhiteSpace($line)) { continue }
-    if ($line.Length -lt 2) { continue }
-    $x = $line[0]; $y = $line[1]
-    if ($x -eq '?' -and $y -eq '?') { $untracked++; continue }
-    if ($x -ne ' ') { $staged++ }
-    if ($y -ne ' ') { $modified++ }
+
+  # I fantasmi arrivano da DUE meccanismi distinti, e servono entrambi i filtri:
+  #   1. il file e' normalizzato dagli attributi (o da autocrlf), quindi 'git diff'
+  #      non lo mostra affatto mentre 'status' lo segna modificato -- lo esclude
+  #      il fatto stesso di partire da 'diff' invece che da 'status';
+  #   2. il blob differisce davvero nei byte CR e 'git diff' lo mostra -- lo
+  #      esclude '--ignore-cr-at-eol'.
+  # Il conteggio dichiarato li copre entrambi perche' e' una differenza fra cio'
+  # che 'status' conta e cio' che resta: e' esattamente il 1305-contro-27 misurato.
+  $porcelain = Invoke-Git -Arguments @('-C', $WorktreePath, 'status', '--porcelain')
+  $statusTracked = 0
+  if ($porcelain.Ok) {
+    foreach ($line in ($porcelain.Output -split "`r?`n")) {
+      if ([string]::IsNullOrWhiteSpace($line) -or $line.Length -lt 2) { continue }
+      if ($line[0] -eq '?' -and $line[1] -eq '?') { continue }
+      $statusTracked++
+    }
   }
+  # Distinti: un file sia in staging sia modificato e' UN percorso, mentre le due
+  # categorie qui sotto lo contano una volta per ciascuna (e' voluto: dicono cosa
+  # perderebbe ognuno dei due recuperi sbagliati). Confondere i due modi di contare
+  # farebbe comparire fantasmi che non esistono.
+  $realTracked = @( (@($stagedReal) + @($modReal)) | Select-Object -Unique ).Count
+
+  $total = $stagedReal.Count + $modReal.Count + $untracked.Count
   return [pscustomobject]@{
     Readable = $true; Error = ''
-    Staged = $staged; Modified = $modified; Untracked = $untracked
-    Total = ($staged + $modified + $untracked)
-    IsDirty = (($staged + $modified + $untracked) -gt 0)
+    Staged = $stagedReal.Count; Modified = $modReal.Count; Untracked = $untracked.Count
+    # Dichiarato, non nascosto: un numero senza la sua premessa e' un'opinione
+    # (regola O). Senza questo campo un "pulito" su un albero con 1278 differenze
+    # di soli fine-riga sarebbe indistinguibile da un albero mai toccato.
+    SoloFineRiga = [Math]::Max(0, $statusTracked - $realTracked)
+    Total = $total
+    IsDirty = ($total -gt 0)
   }
 }
 
@@ -357,12 +450,19 @@ function Invoke-Report {
       continue
     }
     if (-not $state.IsDirty) {
-      $rows += [pscustomobject]@{ Worktree = $wt.Label; Stato = 'pulito'; Salvataggio = '-'; Nota = 'archiviabile senza perdite' }
+      # Il filtro dichiara sempre cosa ha tolto: senza, un albero con 1278
+      # differenze di soli fine-riga e uno mai toccato darebbero la stessa riga.
+      $nota = 'archiviabile senza perdite'
+      if ($state.SoloFineRiga -gt 0) {
+        $nota = "archiviabile senza perdite ($($state.SoloFineRiga) file differiscono solo nei fine-riga)"
+      }
+      $rows += [pscustomobject]@{ Worktree = $wt.Label; Stato = 'pulito'; Salvataggio = '-'; Nota = $nota }
       continue
     }
 
     $dirty++
     $desc = "$($state.Total) file (staging $($state.Staged), mod $($state.Modified), nuovi $($state.Untracked))"
+    if ($state.SoloFineRiga -gt 0) { $desc += " +$($state.SoloFineRiga) solo fine-riga" }
 
     if ($DoSave) {
       $res = Save-Worktree -Worktree $wt -State $state
