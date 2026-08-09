@@ -254,7 +254,27 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
             </div>
 
             {/* Project list */}
-            <div style={{ display: "flex", flexDirection: "column", gap: 2, maxHeight: 280, overflowY: "auto" }}>
+            {/* `maxHeight` da sola difende il massimo e non il minimo: dentro un
+                modale limitato a 86vh, con sotto "Nuovo progetto" e la lista dei
+                repo GitHub, il flex comprimeva questa lista fino a UNA riga
+                tagliata a meta' (misurato il 09/08/2026: si vedeva solo il primo
+                progetto, e i cestini degli altri erano irraggiungibili).
+                `flexShrink: 0` la sottrae alla compressione e `minHeight` le
+                garantisce tre righe: e' l'elenco su cui si sceglie quale
+                progetto aprire o CANCELLARE, quindi e' la parte del modale che
+                deve restare leggibile quando lo spazio manca -- non quella che
+                cede per prima. */}
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: 2,
+                flexShrink: 0,
+                minHeight: 108,
+                maxHeight: 280,
+                overflowY: "auto",
+              }}
+            >
               {projects.length === 0 && (
                 <div style={{ fontSize: 12, color: tc.textMuted, padding: "8px 0" }}>
                   {t("radice.nessunProgettoClonaUn")}
