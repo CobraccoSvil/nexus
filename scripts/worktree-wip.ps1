@@ -113,6 +113,15 @@
 .PARAMETER List
   Elenca i salvataggi esistenti.
 
+.PARAMETER Census
+  Per ogni salvataggio in refs/wip: il suo contenuto e' gia' in main? NON cancella
+  niente -- potare un salvataggio e' irreversibile e alcuni potrebbero essere
+  l'unica copia di qualcosa. Con -Markdown emette il report versionabile
+  (docs/tech-debt-wip.md).
+
+.PARAMETER Markdown
+  Con -Census: emette il censimento in Markdown invece che a tabella.
+
 .PARAMETER Restore
   Nome del salvataggio (label o ref) da riapplicare. Verifica il proprio esito
   confrontando i tree: dichiara "ripristinato" solo se il contenuto dell'albero
@@ -133,6 +142,8 @@ param(
   [Parameter(ParameterSetName = 'Report')][switch]$Report,
   [Parameter(ParameterSetName = 'Save')][switch]$Save,
   [Parameter(ParameterSetName = 'List')][switch]$List,
+  [Parameter(ParameterSetName = 'Census')][switch]$Census,
+  [Parameter(ParameterSetName = 'Census')][switch]$Markdown,
   [Parameter(ParameterSetName = 'Restore', Mandatory = $true)][string]$Restore,
   [Parameter(ParameterSetName = 'Restore')][string]$Into
 )
@@ -540,6 +551,191 @@ function Invoke-List {
   return 0
 }
 
+# «Il contenuto di questo salvataggio e' gia' in main?»
+#
+# Il criterio e' il confronto degli ALBERI, mai il messaggio di commit: un
+# salvataggio porta il nome del worktree che l'ha prodotto e non dice niente su
+# cosa contenga.
+#
+# DUE alberi non bastano, ed e' la trappola piu' facile: «differisce da main» NON
+# significa «contiene lavoro che main non ha», perche' nel frattempo main si e'
+# mosso. Misurato il 09/08/2026 su 70 salvataggi: col confronto a due alberi 68
+# risultavano «lavoro non in main», compreso 'unruffled-albattani' che era gia'
+# stato accertato ridondante -- il residuo era `crates/mcp-core/src/lib.rs`, un
+# file che main aveva evoluto per conto suo.
+#
+# Servono TRE alberi -- la BASE da cui il salvataggio e' nato, il SALVATAGGIO e
+# MAIN -- e il verdetto si da' per PATH:
+#
+#   main == salvataggio            il contenuto e' li': niente da perdere
+#   main == base (e salv. != base) main non ha MAI toccato quel file, quindi la
+#                                  modifica non e' arrivata. E' l'unico caso in
+#                                  cui il confronto degli alberi PROVA che il
+#                                  lavoro e' unico
+#   altrimenti                     main ha evoluto quel file per conto suo: se la
+#                                  modifica sia stata incorporata o superata,
+#                                  nessun confronto di alberi lo puo' dire
+#
+# La terza categoria resta DICHIARATA e non degrada a nessuna delle altre (regola
+# Q): da un censimento si decide se potare, potare e' irreversibile, e «non l'ho
+# potuto stabilire» non e' ne' «e' salvo» ne' «e' da buttare».
+function Get-CensusRow {
+  param([string]$Label, [string]$Sha, [string]$When, [hashtable]$BaseCache)
+
+  $vuoto = [pscustomobject]@{
+    Salvataggio = $Label; Data = $When; Verdetto = 'non-valutabile'
+    Tocca = 0; SoloQui = 0; DaVerificare = 0; Nota = ''
+  }
+
+  $p = Invoke-Git -Arguments @('-C', $RepoRoot, 'rev-parse', '--verify', '--quiet', "$Sha^")
+  if (-not $p.Ok -or [string]::IsNullOrWhiteSpace($p.Output)) {
+    $vuoto.Nota = 'salvataggio senza base: non c e un albero di partenza'
+    return $vuoto
+  }
+  $base = $p.Output.Trim()
+
+  # --no-renames su tutti e tre: con la rilevazione dei rename attiva i tre diff
+  # possono nominare lo stesso file in modi diversi, e l'intersezione fra insiemi
+  # di percorsi non sarebbe piu' confrontabile.
+  $tocca  = Get-GitPaths $RepoRoot @('diff', '--name-only', '--no-renames', $base, $Sha)
+  $vsMain = Get-GitPaths $RepoRoot @('diff', '--name-only', '--no-renames', $Sha, 'main')
+  if ($null -eq $tocca -or $null -eq $vsMain) {
+    $vuoto.Nota = 'git non ha potuto confrontare gli alberi'
+    return $vuoto
+  }
+  # I salvataggi nascono a grappoli dalla stessa base: senza cache lo stesso
+  # confronto base-main verrebbe rifatto decine di volte.
+  if (-not $BaseCache.ContainsKey($base)) {
+    $BaseCache[$base] = Get-GitPaths $RepoRoot @('diff', '--name-only', '--no-renames', $base, 'main')
+  }
+  $baseVsMain = $BaseCache[$base]
+  if ($null -eq $baseVsMain) {
+    $vuoto.Nota = 'git non ha potuto confrontare la base con main'
+    return $vuoto
+  }
+
+  if ($tocca.Count -eq 0) {
+    return [pscustomobject]@{
+      Salvataggio = $Label; Data = $When; Verdetto = 'vuoto'
+      Tocca = 0; SoloQui = 0; DaVerificare = 0; Nota = 'non conserva alcuna modifica'
+    }
+  }
+
+  $inMain = @{}; foreach ($x in $vsMain)     { $inMain[$x] = $true }
+  $mossi  = @{}; foreach ($x in $baseVsMain) { $mossi[$x]  = $true }
+
+  $soloQui = @(); $daVerificare = @()
+  foreach ($path in $tocca) {
+    if (-not $inMain.ContainsKey($path)) { continue }              # main ha gia' quel contenuto
+    if (-not $mossi.ContainsKey($path))  { $soloQui += $path }     # main non l'ha mai toccato
+    else                                 { $daVerificare += $path }
+  }
+
+  $verdetto = 'gia-in-main'
+  if     ($soloQui.Count      -gt 0) { $verdetto = 'lavoro-solo-qui' }
+  elseif ($daVerificare.Count -gt 0) { $verdetto = 'da-verificare' }
+
+  return [pscustomobject]@{
+    Salvataggio = $Label; Data = $When; Verdetto = $verdetto
+    Tocca = $tocca.Count; SoloQui = $soloQui.Count; DaVerificare = $daVerificare.Count
+    Nota = (($soloQui + $daVerificare) | Select-Object -First 3) -join ' '
+  }
+}
+
+function Invoke-Census {
+  param([switch]$AsMarkdown)
+
+  $mainSha = Invoke-Git -Arguments @('-C', $RepoRoot, 'rev-parse', '--verify', '--quiet', 'main')
+  if (-not $mainSha.Ok -or [string]::IsNullOrWhiteSpace($mainSha.Output)) {
+    throw "Nessun branch 'main': il censimento non ha un termine di confronto."
+  }
+  $main = $mainSha.Output.Trim()
+
+  $refs = Assert-Git -Arguments @('-C', $RepoRoot, 'for-each-ref', '--sort=-committerdate',
+    '--format=%(refname:short)|%(objectname)|%(committerdate:short)', "$WipPrefix*") -What 'elenco salvataggi'
+
+  $live = @{}
+  foreach ($wt in (Get-Worktrees)) { $live[$wt.Label] = $true }
+
+  $cache = @{}
+  $rows = @()
+  foreach ($line in ($refs -split "`r?`n")) {
+    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+    $f = $line -split '\|'
+    $label = $f[0] -replace '^wip/', ''
+    $row = Get-CensusRow -Label $label -Sha $f[1] -When $f[2] -BaseCache $cache
+    Add-Member -InputObject $row -NotePropertyName 'WorktreeVivo' -NotePropertyValue ($live.ContainsKey($label))
+    $rows += $row
+  }
+
+  $conta = { param($v) @($rows | Where-Object { $_.Verdetto -eq $v }).Count }
+  $nGia = & $conta 'gia-in-main'
+  $nSolo = & $conta 'lavoro-solo-qui'
+  $nVer = & $conta 'da-verificare'
+  $nNo  = & $conta 'non-valutabile'
+  $nVuoto = & $conta 'vuoto'
+
+  if ($AsMarkdown) {
+    $out = New-Object System.Collections.Generic.List[string]
+    $out.Add('# Censimento dei salvataggi refs/wip')
+    $out.Add('')
+    $out.Add("Generato da ``powershell -File scripts/worktree-wip.ps1 -Census -Markdown``.")
+    $out.Add("Repo osservato: ``$RepoRoot``. Confronto contro ``main`` = ``$($main.Substring(0,8))``.")
+    $out.Add('')
+    $out.Add('## Criterio')
+    $out.Add('')
+    $out.Add('Confronto degli ALBERI, mai dei messaggi di commit. Due alberi non bastano:')
+    $out.Add('«differisce da main» non significa «contiene lavoro che main non ha», perche'' main')
+    $out.Add('nel frattempo si e'' mosso. Il verdetto si da'' per path, su TRE alberi (base del')
+    $out.Add('salvataggio, salvataggio, main):')
+    $out.Add('')
+    $out.Add('| verdetto | significato |')
+    $out.Add('|---|---|')
+    $out.Add('| `gia-in-main` | ogni file toccato ha in main esattamente quel contenuto: niente da perdere |')
+    $out.Add('| `lavoro-solo-qui` | almeno un file che main non ha MAI toccato: la modifica non e'' arrivata, ed e'' l''unico caso PROVATO dagli alberi |')
+    $out.Add('| `da-verificare` | main ha evoluto quei file per conto suo: se il lavoro sia incorporato o superato, nessun confronto di alberi lo puo'' dire |')
+    $out.Add('| `non-valutabile` | manca la base o git non ha potuto confrontare |')
+    $out.Add('| `vuoto` | il salvataggio non conserva alcuna modifica |')
+    $out.Add('')
+    $out.Add('## Conteggio')
+    $out.Add('')
+    $out.Add('| verdetto | quanti |')
+    $out.Add('|---|---|')
+    $out.Add("| gia-in-main | $nGia |")
+    $out.Add("| lavoro-solo-qui | $nSolo |")
+    $out.Add("| da-verificare | $nVer |")
+    $out.Add("| non-valutabile | $nNo |")
+    $out.Add("| vuoto | $nVuoto |")
+    $out.Add("| **totale** | **$($rows.Count)** |")
+    $out.Add('')
+    $out.Add('## NON si pota da qui')
+    $out.Add('')
+    $out.Add('Cancellare un salvataggio e'' irreversibile e alcuni sono l''unica copia del loro')
+    $out.Add('lavoro (regola P). Questo file e'' un CENSIMENTO: dice cosa c''e'', non cosa buttare.')
+    $out.Add('Un `gia-in-main` e'' potabile senza perdite; per gli altri serve leggere il')
+    $out.Add('contenuto, e il modo di leggerlo e''')
+    $out.Add('`powershell -File scripts/worktree-wip.ps1 -Restore <nome> -Into <directory>`.')
+    $out.Add('')
+    $out.Add('## Dettaglio')
+    $out.Add('')
+    $out.Add('| salvataggio | data | verdetto | file toccati | solo qui | da verificare | worktree vivo |')
+    $out.Add('|---|---|---|---:|---:|---:|---|')
+    foreach ($r in ($rows | Sort-Object Verdetto, Data)) {
+      $vivo = if ($r.WorktreeVivo) { 'si' } else { 'no' }
+      $out.Add("| ``$($r.Salvataggio)`` | $($r.Data) | $($r.Verdetto) | $($r.Tocca) | $($r.SoloQui) | $($r.DaVerificare) | $vivo |")
+    }
+    $out.Add('')
+    return ($out -join "`n")
+  }
+
+  Show-Header
+  $rows | Sort-Object Verdetto, Data | Format-Table -AutoSize Salvataggio, Data, Verdetto, Tocca, SoloQui, DaVerificare, WorktreeVivo |
+    Out-String -Width 220 | Write-Host
+  Write-Host "Totale $($rows.Count): gia-in-main $nGia, lavoro-solo-qui $nSolo, da-verificare $nVer, non-valutabile $nNo, vuoto $nVuoto" -ForegroundColor Cyan
+  Write-Host 'Nessun salvataggio e stato toccato: potare e irreversibile, e questo comando censisce soltanto.' -ForegroundColor Yellow
+  return 0
+}
+
 function Invoke-Restore {
   param([string]$Label, [string]$Target)
   Show-Header
@@ -601,6 +797,10 @@ function Invoke-Restore {
 switch ($PSCmdlet.ParameterSetName) {
   'Save' { exit (Invoke-Report -DoSave) }
   'List' { exit (Invoke-List) }
+  'Census' {
+    if ($Markdown) { Invoke-Census -AsMarkdown | Write-Output; exit 0 }
+    exit (Invoke-Census)
+  }
   'Restore' { exit (Invoke-Restore -Label $Restore -Target $Into) }
   default { exit (Invoke-Report) }
 }
