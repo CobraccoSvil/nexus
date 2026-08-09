@@ -50,6 +50,24 @@ async fn esegui_tool_migrato(
     name: &str,
     input: &Value,
 ) -> Option<nexus_types::tool_outcome::RispostaTool> {
+    // Spezzato per FAMIGLIA e non per comodita' di lettura: questo match cresce
+    // di un braccio a ogni tool migrato, quindi senza una divisione la funzione
+    // supera le soglie del gate qualita' per costruzione — e ricompattarla a
+    // ogni lotto sarebbe rimandare la stessa domanda.
+    if let Some(risposta) = migrati_esecuzione(ctx, name, input).await {
+        return Some(risposta);
+    }
+    migrati_contenuti(ctx, name, input).await
+}
+
+/// I tool migrati che ESEGUONO qualcosa: comandi, servizi, suite di test, git.
+/// Cio' che li accomuna e' il campo `exit_code` e la distinzione fra «il tool ha
+/// fatto il suo lavoro» e «il comando e' andato bene».
+async fn migrati_esecuzione(
+    ctx: &AgentToolContext,
+    name: &str,
+    input: &Value,
+) -> Option<nexus_types::tool_outcome::RispostaTool> {
     match name {
         // Lo stato d'uscita di un comando e' il dato su cui decidono il
         // final_gate e la catena di verifica: viaggia nel campo `exit_code`,
@@ -60,6 +78,103 @@ async fn esegui_tool_migrato(
         // vive in `esito`. Un marker in testa alla prosa qui sarebbe tornato a
         // essere un campo travestito.
         "list_active_services" => Some(service::tool_list_active_services(ctx, input).await),
+        // Il resto di `service.rs`. Il lancio di un servizio e' il caso in cui
+        // l'esito nel campo cambia di piu': i due rami di quota ritornavano un
+        // messaggio senza marker, cioe' un avvio BLOCCATO che l'agente riceveva
+        // come conferma.
+        //
+        // `run_in_terminal` e' un alias storico che il catalogo non dichiara —
+        // il modello non lo puo' invocare — ma che il dispatch accetta e altre
+        // parti del sistema nominano (step_gate, cache dei mutatori, UI). Resta,
+        // e il contratto d'ingresso lo legge col NOME INVOCATO, cosi' un errore
+        // di parametri non rimanda allo schema di un tool diverso.
+        "run_in_terminal" => Some(service::tool_run_service(ctx, input, "task").await),
+        "run_service" => Some(service::tool_run_service(ctx, input, "service").await),
+        "read_terminal_output" => Some(service::tool_read_service_output(ctx, input).await),
+        // DIVERGENZA CHIUSA: l'handler ripiegava sull'ultimo processo quando
+        // `process_id` mancava, mentre il catalogo lo dichiara obbligatorio. La
+        // capacita' resta dove e' PROMESSA, in `tail_service_logs`.
+        "read_service_output" => Some(service::tool_read_service_output(ctx, input).await),
+        "stop_service" => Some(service::tool_stop_service(ctx, input).await),
+        "service_restart" => Some(service::tool_service_restart(ctx, input).await),
+        "tail_service_logs" => Some(service::tool_tail_service_logs(ctx, input).await),
+        "build_project_image" => Some(service::tool_build_project_image(ctx).await),
+        // `testing.rs` e i due tool di comando che condividono la sua catena.
+        // Qui l'esito nel campo recupera un dato che era MUTO: lo stato d'uscita
+        // finiva nel testo come "Exit code: N" e "(exit code: N)", mentre il
+        // ponte legacy cerca "EXIT CODE: " MAIUSCOLO. Le due scritture non si
+        // sono mai incontrate, quindi per questi quattro tool il campo su cui il
+        // final_gate decide se rieseguire un criterio o correggere il codice e'
+        // stato `None` sempre.
+        "run_playwright_tests" => Some(testing::tool_run_playwright_tests(ctx, input).await),
+        "run_specific_test" => Some(testing::tool_run_specific_test(ctx, input).await),
+        "run_lint_fix" => Some(testing::tool_run_lint_fix(ctx, input).await),
+        "format_file" => Some(testing::tool_format_file(ctx, input).await),
+        "run_tests" => Some(command::tool_run_tests(ctx, input).await),
+        // `git.rs`: CINQUE handler su sei componevano `[git <verbo> error: ...]`
+        // senza marker, cioe' un commit rifiutato, un push respinto e un pull in
+        // conflitto arrivavano all'agente come esecuzioni riuscite. Anche il
+        // rifiuto "non e' un repository git" usciva nudo, da tutti e sei.
+        "git_status" => Some(git::tool_git_status(ctx).await),
+        "git_stage" => Some(git::tool_git_stage(ctx, input).await),
+        "git_commit" => Some(git::tool_git_commit(ctx, input).await),
+        "git_push" => Some(git::tool_git_push(ctx).await),
+        "git_pull" => Some(git::tool_git_pull(ctx).await),
+        "git_remote_add" => Some(git::tool_git_remote_add(ctx, input).await),
+        // `document_tools.rs`: i tre estrattori avevano la stessa sequenza
+        // ripetuta e con essa gli stessi quattro rami d'errore, tutti degradati
+        // a un'unica natura implicita. Ora l'allegato inesistente (id sbagliato,
+        // rimediabile) e il file che il DB dichiara ma lo storage non consegna
+        // (del sistema) sono due cose distinte, e il messaggio del primo nomina
+        // il tool che restituisce gli id validi.
+        "nexus_extract_pdf_text" => Some(document_tools::tool_nexus_extract_pdf_text(ctx, input).await),
+        "nexus_extract_docx_text" => Some(document_tools::tool_nexus_extract_docx_text(ctx, input).await),
+        "nexus_extract_xlsx_data" => Some(document_tools::tool_nexus_extract_xlsx_data(ctx, input).await),
+        // L'elenco delle entry di un archivio: stessi due helper degli
+        // estrattori di documenti, ora condivisi (`documento_da_allegato`,
+        // `uuid_allegato`, accanto a `load_attachment`).
+        "nexus_list_archive_entries" => Some(archive_tools::tool_nexus_list_archive_entries(ctx, input).await),
+        // I tre tool di lente UI. `ui_styling_audit` e' quello dove l'esito nel
+        // campo cambia una lettura: `VocabolarioAssente` non e' un verdetto
+        // sullo stile del progetto, e' l'assenza dello strumento con cui lo si
+        // giudica — e usciva come un successo il cui corpo portava un campo
+        // `error`.
+        "ui_layout_patterns" => Some(ui_patterns::tool_ui_layout_patterns(&ctx.core.db, input).await),
+        "ui_reference_search" => Some(ui_reference_search::tool_ui_reference_search(&ctx.core, input).await),
+        "ui_styling_audit" => Some(ui_styling::tool_ui_styling_audit(&ctx.core, input).await),
+        // I due generatori di media. Sono GEMELLI, e metterli accanto ha fatto
+        // vedere la divergenza: sul caso "il provider ha restituito solo una
+        // URL" `generate_image` dichiarava il fallimento e `generate_video`
+        // ritornava un JSON con `note` e nessun marker — cioe' un successo, per
+        // un tool il cui compito era salvare il file nel progetto e che non
+        // l'aveva salvato. `size` inoltre e' un ENUM nel catalogo che l'handler
+        // leggeva come stringa libera: i valori non promessi passavano di qui e
+        // fallivano un salto piu' in la', dal provider.
+        "nexus_generate_image" => Some(image_tools::tool_nexus_generate_image(&ctx.core, input).await),
+        "nexus_generate_video" => Some(video_tools::tool_nexus_generate_video(&ctx.core, input).await),
+        // I tre handler AUTONOMI di `knowledge.rs` (gli altri sei dipendono da
+        // helper che inghiottono gli errori del DB con `.unwrap_or_default()`, e
+        // vanno portati a `Result` prima di poter dichiarare un esito onesto).
+        // Due promesse del catalogo restano tali e sono annotate nel codice:
+        // `knowledge_set_relevance` dichiara `relevance_score` e non lo legge,
+        // `knowledge_get_note` annuncia di aggiornare `access_count` e fa una
+        // sola SELECT — quella colonna non esiste in nessuna migrazione.
+        "code_doc" => Some(knowledge::tool_code_doc(&ctx.core, input).await),
+        "knowledge_get_note" => Some(knowledge::tool_knowledge_get_note(&ctx.core, input).await),
+        "knowledge_set_relevance" => Some(knowledge::tool_knowledge_set_relevance(&ctx.core, input).await),
+        _ => None,
+    }
+}
+
+/// I tool migrati che LEGGONO o TRASFORMANO contenuti: file, documenti,
+/// archivi, media, lenti UI, note della KB. Nessuno di loro esegue processi,
+/// quindi nessuno ha un `exit_code` da riportare.
+async fn migrati_contenuti(
+    ctx: &AgentToolContext,
+    name: &str,
+    input: &Value,
+) -> Option<nexus_types::tool_outcome::RispostaTool> {
+    match name {
         // Ogni suo fallimento e' RIMEDIABILE e lo dichiara nel campo `natura`:
         // e' il primo tool a farlo, ed e' quello su cui la mancanza si
         // misurava (11% di `old_string non trovato` seguiti da una ripetizione
@@ -106,12 +221,6 @@ async fn esegui_tool_legacy(
     input: &Value,
 ) -> nexus_types::tool_outcome::RispostaTool {
     let testo = match name {
-        "git_status" => git::tool_git_status(ctx).await,
-        "git_stage" => git::tool_git_stage(ctx, input).await,
-        "git_commit" => git::tool_git_commit(ctx, input).await,
-        "git_push" => git::tool_git_push(ctx).await,
-        "git_pull" => git::tool_git_pull(ctx).await,
-        "git_remote_add" => git::tool_git_remote_add(ctx, input).await,
         // Fix M51: tool dedicato per allocazione porta (evita curl via run_command).
         "request_port" => ports::tool_request_port(ctx, input).await,
         // Tool read-only per verifica/audit dello stato porte (bucket + allocazioni).
@@ -129,27 +238,15 @@ async fn esegui_tool_legacy(
         // Poll (DB-only) + resume (ri-esecuzione nativa) dei sub-agent.
         "nexus_subagent_poll" => subagent_native::tool_nexus_subagent_poll(ctx, input).await,
         "nexus_subagent_resume" => subagent_native::tool_nexus_subagent_resume(ctx, input).await,
-        "run_in_terminal" => service::tool_run_service(ctx, input, "task").await,
-        "run_service" => service::tool_run_service(ctx, input, "service").await,
-        "read_terminal_output" => service::tool_read_service_output(ctx, input).await,
-        "read_service_output" => service::tool_read_service_output(ctx, input).await,
-        "stop_service" => service::tool_stop_service(ctx, input).await,
-        "service_restart" => service::tool_service_restart(ctx, input).await,
-        "tail_service_logs" => service::tool_tail_service_logs(ctx, input).await,
-        "run_specific_test" => testing::tool_run_specific_test(ctx, input).await,
-        "run_lint_fix" => testing::tool_run_lint_fix(ctx, input).await,
-        "format_file" => testing::tool_format_file(ctx, input).await,
         // Catena di verifica post-modifica (ADR 0019 L3): typecheck -> build ->
         // lint -> test con fail-fast e VerifyReport strutturato.
         "nexus_verify_change" => verify::tool_nexus_verify_change(ctx, input).await,
         // Tool dedicato ai cicli test-fix-test: esecuzione sincrona con
         // timeout esteso (raccomandato dai prompt al posto di run_command).
-        "run_tests" => command::tool_run_tests(ctx, input).await,
         "create_profile" => tool_create_profile(ctx, input).await,
         "update_profile" => tool_update_profile(ctx, input).await,
         "set_sandbox_config" => sandbox::tool_set_sandbox_config(ctx, input).await,
         "get_sandbox_config" => sandbox::tool_get_sandbox_config(ctx).await,
-        "build_project_image" => service::tool_build_project_image(ctx).await,
         "scan_code_quality" => tool_scan_code_quality(ctx, input).await,
         "search_codebase_semantic" => {
             let query = input
@@ -205,7 +302,6 @@ async fn esegui_tool_legacy(
                 .min(10) as usize;
             tool_recall_context(ctx, &query, &source, limit).await
         }
-        "run_playwright_tests" => testing::tool_run_playwright_tests(ctx, input).await,
         "batch_analyze_code" => tool_batch_analyze_code(ctx, input).await,
         // ── Dispatcher centrale (pilotaggio pannelli) ──────────────────────
         "dispatcher_emit_event" => dispatcher::tool_dispatcher_emit_event(ctx, input).await,
@@ -217,27 +313,15 @@ async fn esegui_tool_legacy(
         "dispatcher_highlight_panel" => {
             dispatcher::tool_dispatcher_highlight_panel(ctx, input).await
         }
-        // ── Catalogo pattern di layout (trasversale ai progetti) ───────────
-        "ui_layout_patterns" => ui_patterns::tool_ui_layout_patterns(&ctx.core.db, input).await,
-        // Lo stile DICHIARATO dal codice e' applicato? Fatto misurabile, non
-        // giudizio di gusto: e' la sola voce della lente di interfaccia che un
-        // revisore non puo' verificare leggendo un file per volta.
-        "ui_styling_audit" => ui_styling::tool_ui_styling_audit(&ctx.core, input).await,
         // Unico tool che guarda FUORI dal progetto: cio' che torna e' DATO, e
         // arriva gia' dichiarato come non fidato (vedi il modulo).
-        "ui_reference_search" => {
-            ui_reference_search::tool_ui_reference_search(&ctx.core, input).await
-        }
         // ── Knowledge Base per-progetto ────────────────────────────────────
         "knowledge_search" => knowledge::tool_knowledge_search(ctx, input).await,
-        "code_doc" => knowledge::tool_code_doc(ctx, input).await,
-        "knowledge_get_note" => knowledge::tool_knowledge_get_note(ctx, input).await,
         "knowledge_create_note" => knowledge::tool_knowledge_create_note(ctx, input).await,
         // Comp.0: navigazione/modifica del grafo KB (link, sottografo, pertinenza)
         "knowledge_get_links" => knowledge::tool_knowledge_get_links(ctx, input).await,
         "knowledge_get_subgraph" => knowledge::tool_knowledge_get_subgraph(ctx, input).await,
         "knowledge_create_link" => knowledge::tool_knowledge_create_link(ctx, input).await,
-        "knowledge_set_relevance" => knowledge::tool_knowledge_set_relevance(ctx, input).await,
         // Comp.2: import di grafi esterni nella KB (JSON node-link / Mermaid / DOT)
         "knowledge_import_graph" => knowledge::tool_knowledge_import_graph(ctx, input).await,
         // ── Allegati chat (ADR 0010) ───────────────────────────────────────
@@ -247,15 +331,9 @@ async fn esegui_tool_legacy(
         "nexus_inspect_attachment" => {
             attachment_inspector::tool_nexus_inspect_attachment(ctx, input).await
         }
-        "nexus_list_archive_entries" => {
-            archive_tools::tool_nexus_list_archive_entries(ctx, input).await
-        }
         "nexus_read_archive_entry" => {
             archive_tools::tool_nexus_read_archive_entry(ctx, input).await
         }
-        "nexus_extract_pdf_text" => document_tools::tool_nexus_extract_pdf_text(ctx, input).await,
-        "nexus_extract_docx_text" => document_tools::tool_nexus_extract_docx_text(ctx, input).await,
-        "nexus_extract_xlsx_data" => document_tools::tool_nexus_extract_xlsx_data(ctx, input).await,
         "nexus_extract_figma_structure" => {
             figma_tools::tool_nexus_extract_figma_structure(ctx, input).await
         }
@@ -264,13 +342,11 @@ async fn esegui_tool_legacy(
             vision_tools::tool_nexus_describe_image_attachment(ctx, input).await
         }
         // PR6b-2: genera un'immagine dal prompt e la salva path-safe nel progetto.
-        "nexus_generate_image" => image_tools::tool_nexus_generate_image(ctx, input).await,
         // PR6c: trascrive un audio allegato (speech-to-text) via gateway.
         "nexus_transcribe_audio" => audio_tools::tool_nexus_transcribe_audio(ctx, input).await,
         // PR6d: sintetizza un testo in audio (text-to-speech) e lo salva nel progetto.
         "nexus_text_to_speech" => audio_tools::tool_nexus_text_to_speech(ctx, input).await,
         // PR6e: genera un video dal prompt (text-to-video, Veo async) e lo salva nel progetto.
-        "nexus_generate_video" => video_tools::tool_nexus_generate_video(ctx, input).await,
         "nexus_install_shadcn_components" => {
             shadcn_setup::tool_nexus_install_shadcn_components(ctx, input).await
         }

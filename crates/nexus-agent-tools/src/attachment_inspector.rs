@@ -17,7 +17,55 @@ use sqlx::{PgPool, Row};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
+use nexus_types::tool_outcome::{NaturaFallimento, RispostaTool};
+
 use super::ToolContextCore;
+
+/// I byte di un allegato: lookup del record + lettura del file.
+///
+/// PUNTO UNICO (regola L) della sequenza che ogni tool di estrazione ripeteva —
+/// documenti, archivi, ispezione — e con essa dei suoi due rami d'errore. Vive
+/// accanto a [`load_attachment`], che e' la meta' di cui e' fatta.
+///
+/// Le due nature sono DIVERSE, e per questo la funzione le distingue invece di
+/// darne una sola: un allegato che non risulta nel progetto e' un id sbagliato —
+/// RIMEDIABILE, e `nexus_list_attachments` dice quali esistono; un file che il
+/// DB dichiara ma il filesystem non consegna e' un guasto dello storage, che
+/// nessuna riformulazione della chiamata aggira. La seconda la deriva
+/// `NaturaFallimento::da_errore_io` dal `ErrorKind` (regola M), non dal messaggio
+/// del sistema operativo, che e' localizzato e diverso fra Windows e Linux.
+pub async fn documento_da_allegato(
+    ctx: &ToolContextCore,
+    attachment_id: Uuid,
+) -> Result<Vec<u8>, RispostaTool> {
+    let record = load_attachment(&ctx.db, attachment_id, ctx.project_id)
+        .await
+        .map_err(|e| crate::errore_tool(e, NaturaFallimento::Rimediabile))?;
+    tokio::fs::read(&record.file_path).await.map_err(|e| {
+        crate::errore_tool(
+            format!("read fallita: {e}"),
+            NaturaFallimento::da_errore_io(&e),
+        )
+    })
+}
+
+/// L'uuid di un allegato, dal parametro che il contratto ha letto come stringa.
+///
+/// Il contratto pretende che il campo CI SIA e sia una stringa; che sia un uuid
+/// non lo puo' dire, e quel controllo resta qui. RIMEDIABILE, e il messaggio
+/// nomina il tool che restituisce gli id validi — prima diceva soltanto
+/// «obbligatorio», che davanti a un id malformato era anche falso: il parametro
+/// c'era, non era un uuid.
+pub fn uuid_allegato(grezzo: &str) -> Result<Uuid, RispostaTool> {
+    Uuid::parse_str(grezzo).map_err(|_| {
+        crate::errore_tool(
+            format!(
+                "attachment_id '{grezzo}' non e' un UUID valido.                  Usa nexus_list_attachments per gli id degli allegati di questa sessione."
+            ),
+            NaturaFallimento::Rimediabile,
+        )
+    })
+}
 
 /// Bytes letti per la magic byte detection. 32 KB e' sufficiente per:
 /// - ZIP/PDF/PNG/JPEG/GIF (firma in primi 8 byte)

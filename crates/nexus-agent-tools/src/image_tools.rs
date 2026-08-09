@@ -21,6 +21,7 @@
 //! Niente magic fallback: se il purpose non risolve, il gateway e' giu' o il
 //! provider non genera immagini, l'errore risale onestamente al modello.
 
+use nexus_types::tool_outcome::{NaturaFallimento, RispostaTool};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde_json::{json, Value};
 
@@ -38,33 +39,38 @@ const GENERATED_SUBDIR: &str = ".nexus/generated";
 /// Estensione/MIME di salvataggio (gli endpoint image-gen del gateway emettono PNG).
 const OUTPUT_EXT: &str = "png";
 
-pub async fn tool_nexus_generate_image(ctx: &ToolContextCore, input: &Value) -> String {
+pub async fn tool_nexus_generate_image(ctx: &ToolContextCore, input: &Value) -> RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::NexusGenerateImageInput};
+
     // 1) Permesso di scrittura obbligatorio: il tool PRODUCE un file su disco.
+    //    DEL SISTEMA: e' una decisione del progetto sul run, non un parametro.
     if !ctx.can_write {
-        return crate::errore_json(
+        return crate::errore_tool(
             "Permesso di scrittura non concesso: impossibile salvare l'immagine \
              generata su disco. Esegui in una modalita' che consente la scrittura file.",
+            NaturaFallimento::DelSistema,
         );
     }
 
-    // 2) Prompt obbligatorio + parametri opzionali.
-    let prompt = match input.get("prompt").and_then(Value::as_str).map(str::trim) {
-        Some(p) if !p.is_empty() => p.to_string(),
-        _ => {
-            return crate::errore_json(
-                "Parametro 'prompt' obbligatorio (descrizione testuale dell'immagine da generare).",
-            );
-        }
+    // 2) Parametri dal contratto. `size` e' un ENUM nel catalogo: leggerlo come
+    //    stringa libera lasciava passare valori che il catalogo non promette,
+    //    inoltrati poi al provider che li rifiutava — un errore che nasceva qui
+    //    e si manifestava a un salto di distanza.
+    let params = match NexusGenerateImageInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
-    let size = input
-        .get("size")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
-    let filename = input
-        .get("filename")
-        .and_then(Value::as_str)
+    let prompt = params.prompt.trim().to_string();
+    if prompt.is_empty() {
+        return crate::errore_tool(
+            "Parametro 'prompt' obbligatorio (descrizione testuale dell'immagine da generare).",
+            NaturaFallimento::Rimediabile,
+        );
+    }
+    let size = params.size.map(|s| s.come_stringa().to_string());
+    let filename = params
+        .filename
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
@@ -74,11 +80,13 @@ pub async fn tool_nexus_generate_image(ctx: &ToolContextCore, input: &Value) -> 
     let (provider, model) = match resolve_purpose_via_http(&ctx.db, IMAGE_PURPOSE).await {
         Ok(pm) => pm,
         Err(e) => {
-            return crate::errore_json(format!(
+            // Configurazione di piattaforma: nessun parametro della chiamata
+            // la aggira, e il messaggio nomina le migrazioni da verificare.
+            return crate::errore_tool(format!(
                 "modello image-gen non risolvibile (purpose '{IMAGE_PURPOSE}'): {e}. \
                  Verifica nexus_purpose_model.generate_image (mig 0478) e che un modello \
                  image-gen sia abilitato nel catalog (mig 0479)."
-            ));
+            ), NaturaFallimento::DelSistema);
         }
     };
 
@@ -104,7 +112,13 @@ pub async fn tool_nexus_generate_image(ctx: &ToolContextCore, input: &Value) -> 
     {
         Ok(r) => r,
         Err(e) => {
-            return crate::errore_json(format!("generazione immagine via gateway fallita: {e}"));
+            // TRANSITORIO: il gateway gestisce gia' cooldown e failover, quindi
+            // cio' che arriva qui e' il loro esaurimento — un fornitore saturo o
+            // irraggiungibile, dove ritentare piu' tardi e' la strategia giusta.
+            return crate::errore_tool(
+                format!("generazione immagine via gateway fallita: {e}"),
+                NaturaFallimento::Transitorio,
+            );
         }
     };
 
@@ -112,32 +126,50 @@ pub async fn tool_nexus_generate_image(ctx: &ToolContextCore, input: &Value) -> 
     //    URL temporanea, non possiamo salvare path-safe: errore esplicito (regola
     //    H: niente fetch nascosto di una URL esterna).
     let Some(b64) = result.b64_json.as_deref() else {
-        return crate::errore_json_con_dettagli(json!({
+        // DEL SISTEMA: e' il provider a rispondere in una forma che non si puo'
+        // salvare, e nessuna riformulazione del prompt lo cambia.
+        return crate::errore_tool_con_dettagli(json!({
             "error": "il provider ha restituito solo una URL temporanea, non l'immagine inline: \
                       impossibile salvarla nel progetto.",
             "image_url": result.url.unwrap_or_default(),
             "model_used": result.model_used,
-        }));
+        }), NaturaFallimento::DelSistema);
     };
     let bytes = match B64.decode(b64) {
         Ok(b) => b,
         Err(e) => {
-            return crate::errore_json(format!("decodifica immagine base64 fallita: {e}"));
+            return crate::errore_tool(
+                format!("decodifica immagine base64 fallita: {e}"),
+                NaturaFallimento::DelSistema,
+            );
         }
     };
 
     // 6) Salva path-safe sotto la project_root.
     let (image_path, provider_used) = match save_image(&ctx.root_path, &bytes, filename).await {
         Ok(p) => (p, provider),
-        Err(e) => return crate::errore_json(format!("salvataggio immagine fallito: {e}")),
+        // DEL SISTEMA e non derivata dal `ErrorKind`: `save_image` appiattisce
+        // gia' l'errore di I/O in una `String`, quindi il kind qui non c'e' piu'
+        // e ricavarlo dal messaggio sarebbe la regola M al contrario. Fra le due
+        // letture possibili questa manda a cercare un'altra strada invece di far
+        // rigenerare l'immagine — che costa una chiamata al provider — contro un
+        // disco che non la accettera' comunque.
+        Err(e) => {
+            return crate::errore_tool(
+                format!("salvataggio immagine fallito: {e}"),
+                NaturaFallimento::DelSistema,
+            )
+        }
     };
 
-    json!({
-        "image_path": image_path,
-        "model_used": result.model_used,
-        "provider_used": provider_used,
-    })
-    .to_string()
+    RispostaTool::riuscito(
+        json!({
+            "image_path": image_path,
+            "model_used": result.model_used,
+            "provider_used": provider_used,
+        })
+        .to_string(),
+    )
 }
 
 /// Costruisce un nome file sicuro per l'immagine generata. Se l'agente passa

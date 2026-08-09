@@ -17,6 +17,7 @@
 //! OGNI progetto — N copie dello stesso testo, che divergono alla prima
 //! correzione: esattamente la duplicazione che la regola L vieta.
 
+use nexus_types::tool_outcome::{NaturaFallimento, RispostaTool};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 
@@ -141,20 +142,32 @@ pub async fn load_patterns(
 ///
 /// Un catalogo vuoto non e' un errore da inghiottire: lo dice, cosi' chi legge
 /// sa che la risposta e' "non c'e' nulla", non "non ho cercato" (regola M).
-pub async fn tool_ui_layout_patterns(db: &PgPool, input: &Value) -> String {
-    let app_type = input
-        .get("app_type")
-        .and_then(Value::as_str)
+pub async fn tool_ui_layout_patterns(db: &PgPool, input: &Value) -> RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::UiLayoutPatternsInput};
+
+    let params = match UiLayoutPatternsInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
+    };
+    let app_type = params
+        .app_type
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
     let patterns = match load_patterns(db, app_type).await {
         Ok(p) => p,
-        Err(e) => return crate::errore_json(e.to_string()),
+        // Il catalogo dei pattern vive nel DB: se non risponde non c'e' un
+        // parametro da correggere.
+        Err(e) => {
+            return crate::errore_tool(e.to_string(), NaturaFallimento::DelSistema)
+        }
     };
 
     if patterns.is_empty() {
-        return json!({
+        // Un catalogo che non ha pattern per quel tipo e' una RISPOSTA, non un
+        // fallimento: il messaggio dice come ottenere i tipi disponibili.
+        return RispostaTool::riuscito(json!({
             "patterns": [],
             "count": 0,
             "message": match app_type {
@@ -165,9 +178,19 @@ pub async fn tool_ui_layout_patterns(db: &PgPool, input: &Value) -> String {
                 None => "catalogo dei pattern di layout vuoto".to_string(),
             },
         })
-        .to_string();
+        .to_string());
     }
 
+    RispostaTool::riuscito(rendi_catalogo(app_type, &patterns))
+}
+
+/// Il corpo JSON del catalogo: scheda completa se il tipo e' gia' stato scelto,
+/// indice leggero altrimenti.
+///
+/// Estratta dall'handler perche' li' e' la RISPOSTA, e la risposta di questo
+/// tool ha due forme: tenerle nel corpo della funzione che legge i parametri
+/// mescola due domande — «cosa mi e' stato chiesto» e «cosa rispondo».
+fn rendi_catalogo(app_type: Option<&str>, patterns: &[UiLayoutPattern]) -> String {
     match app_type {
         // Dettaglio: si e' gia' scelto il tipo.
         Some(t) => json!({

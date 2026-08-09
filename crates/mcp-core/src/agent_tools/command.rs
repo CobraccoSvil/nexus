@@ -250,7 +250,7 @@ async fn migration_only_block(ctx: &AgentToolContext, command: &str) -> Option<S
 /// contratto: qui non si guarda cosa c'e' scritto, si guarda cosa e' stato
 /// dichiarato. Finche' lo prendeva, qualcuno poteva rimetterci un
 /// riconoscimento sul nome senza cambiare la firma.
-async fn maybe_route_to_service(ctx: &AgentToolContext, input: &Value) -> Option<String> {
+async fn maybe_route_to_service(ctx: &AgentToolContext, input: &Value) -> Option<RispostaTool> {
     let explicit_bg = input
         .get("background")
         .and_then(Value::as_bool)
@@ -259,14 +259,18 @@ async fn maybe_route_to_service(ctx: &AgentToolContext, input: &Value) -> Option
     // ── Livello 1: parametro background esplicito dall'AI ──
     if explicit_bg {
         let routed = service::tool_run_service(ctx, input, "service").await;
-        // La premessa NON deve coprire l'esito del tool inoltrato: `run_service`
-        // dichiara ancora il fallimento col marker in TESTA, e una concatenazione
-        // nuda lo spingerebbe in mezzo al testo rendendo un avvio fallito
-        // indistinguibile da uno riuscito (punto unico regola L).
-        return Some(nexus_types::tool_outcome::prepend_preserving_failure(
-            "[Background] Comando avviato come servizio server-side (background=true).",
-            &routed,
-        ));
+        // `run_service` e' migrato: l'esito sta nel campo, quindi la premessa si
+        // concatena al solo testo e non puo' piu' coprire nulla. Serviva
+        // `prepend_preserving_failure` finche' il fallimento viveva in testa
+        // alla stringa; ora non c'e' piu' niente da preservare, ed e' il
+        // secondo call site di quel punto unico a sparire.
+        return Some(RispostaTool {
+            testo: format!(
+                "[Background] Comando avviato come servizio server-side (background=true).\n{}",
+                routed.testo
+            ),
+            ..routed
+        });
     }
 
     // NESSUN livello 2. La natura di un comando non si indovina dal suo testo:
@@ -295,14 +299,16 @@ fn working_dir_param(input: &Value) -> Option<&str> {
 /// di progetto) o ricade sulla root. Ritorna `Err(messaggio)` se il path e'
 /// invalido. Punto unico (regola L): usato da `tool_run_command` e
 /// `tool_run_tests`.
-fn resolve_work_dir(ctx: &AgentToolContext, input: &Value) -> Result<PathBuf, String> {
+fn resolve_work_dir(ctx: &AgentToolContext, input: &Value) -> Result<PathBuf, RispostaTool> {
     if let Some(sub) = working_dir_param(input) {
         match resolve_relative_path(&ctx.root_path, sub) {
             Ok(p) => Ok(p),
-            Err(e) => Err(format!(
-                "\u{274C} [Errore percorso working_dir: {}]",
+            // Il percorso e' un parametro che l'agente controlla, e il
+            // resolver dice gia' fin dove esiste.
+            Err(e) => Err(RispostaTool::fallito_rimediabile(format!(
+                "[Errore percorso working_dir: {}]",
                 e.1["error"].as_str().unwrap_or("path error")
-            )),
+            ))),
         }
     } else {
         Ok(ctx.root_path.clone())
@@ -377,7 +383,9 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> R
     let work_dir = match resolve_work_dir(ctx, input) {
         Ok(p) => p,
         // Percorso invalido: il comando non parte, quindi nessun exit code.
-        Err(msg) => return RispostaTool::fallito(msg),
+        // `resolve_work_dir` dichiara gia' esito e natura (rimediabile: e' un
+        // parametro della chiamata), quindi si inoltra senza ricomporre nulla.
+        Err(risposta) => return risposta,
     };
 
     // Sezione critica dei package manager: due install concorrenti sulla stessa
@@ -427,7 +435,9 @@ async fn command_hints_and_routing(
         super::playwright_cli::intercetta_suite(ctx, NOME_TOOL, command, working_dir_param(input))
             .await
     {
-        return Err(inoltro_legacy(out));
+        // Nessun ponte: l'esecutore della suite e' migrato e la risposta arriva
+        // gia' coi campi valorizzati.
+        return Err(out);
     }
 
     // ── Command hints (migration 0230) ──────────────────────────────────────
@@ -466,8 +476,11 @@ async fn command_hints_and_routing(
 
     // ── Livelli 1-2: routing a run_service (background esplicito o comando noto
     // long-running/web-service). Se instradato ritorna il messaggio; None = prosegue. ──
-    if let Some(msg) = maybe_route_to_service(ctx, input).await {
-        return Err(inoltro_legacy(msg));
+    // Nessun ponte legacy: `run_service` e' migrato e la sua risposta arriva
+    // gia' coi campi valorizzati. Ricostruirne l'esito dal testo sarebbe ora
+    // una perdita — la natura del fallimento non e' deducibile dal marker.
+    if let Some(risposta) = maybe_route_to_service(ctx, input).await {
+        return Err(risposta);
     }
 
     Ok(hints_prefix)
@@ -755,14 +768,15 @@ async fn timeout_con_diagnosi(
 /// chiamante diretto (agent_loop.rs di mcp-core) e' stato smantellato col
 /// passaggio del loop al brain Python: il contenimento delle esecuzioni
 /// ripetute e' governato dall'anti-loop del brain, non da un contatore qui.
-pub(crate) async fn tool_run_tests(ctx: &AgentToolContext, input: &Value) -> String {
+pub(crate) async fn tool_run_tests(ctx: &AgentToolContext, input: &Value) -> RispostaTool {
     // 1. Determina comando test
     let command = resolve_test_command(ctx, input);
 
     if command.is_empty() {
-        return "\u{274C} [Errore: impossibile rilevare il comando test per questo progetto. \
-                Specifica il parametro 'command' (es. 'npm test', 'cargo test', 'pytest').]"
-            .to_string();
+        return RispostaTool::fallito_rimediabile(
+            "[Errore: impossibile rilevare il comando test per questo progetto. \
+             Specifica il parametro 'command' (es. 'npm test', 'cargo test', 'pytest').]",
+        );
     }
 
     // Stessa guardia di `run_command` e per la stessa ragione: questo tool
@@ -778,7 +792,7 @@ pub(crate) async fn tool_run_tests(ctx: &AgentToolContext, input: &Value) -> Str
     // 2. Working directory (punto unico resolve_work_dir, regola L)
     let work_dir = match resolve_work_dir(ctx, input) {
         Ok(p) => p,
-        Err(msg) => return msg,
+        Err(risposta) => return risposta,
     };
 
     // 3. Timeout (default 120s, max 300s)
@@ -796,7 +810,7 @@ pub(crate) async fn tool_run_tests(ctx: &AgentToolContext, input: &Value) -> Str
 /// shell isolata, drain parallelo stdout/stderr, attesa con timeout e
 /// formattazione dell'esito (o messaggio di timeout con kill). Estratto da
 /// `tool_run_tests` (behavior-preserving).
-async fn run_tests_execution(command: &str, work_dir: &Path, timeout: u64) -> String {
+async fn run_tests_execution(command: &str, work_dir: &Path, timeout: u64) -> RispostaTool {
     let child = crate::sandbox::isolated_command(&crate::sandbox::agent_shell())
         .arg("-c")
         .arg(super::helpers::shell_line(command))
@@ -807,7 +821,13 @@ async fn run_tests_execution(command: &str, work_dir: &Path, timeout: u64) -> St
 
     let mut child = match child {
         Ok(c) => c,
-        Err(e) => return format!("\u{274C} [Errore avvio test '{}': {}]", command, e),
+        // L'avvio dipende dalla shell isolata e dall'ambiente, non dalla riga
+        // che l'agente ha scritto.
+        Err(e) => {
+            return RispostaTool::fallito_di_sistema(format!(
+                "[Errore avvio test '{command}': {e}]"
+            ))
+        }
     };
 
     // Drain stdout/stderr in parallelo con child.wait() per evitare deadlock pipe (~64KB).
@@ -822,18 +842,30 @@ async fn run_tests_execution(command: &str, work_dir: &Path, timeout: u64) -> St
             let stderr_bytes = stderr_task.await.unwrap_or_default();
             let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
             let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
-            format_run_tests_output(command, exit_code, &stdout, &stderr)
+            // L'exit code nel CAMPO: `format_run_tests_output` lo scrive anche
+            // nel testo come "(exit code: N)", che il ponte legacy — il quale
+            // cerca "EXIT CODE: " maiuscolo — non ha mai riconosciuto. Il tool
+            // resta RIUSCITO: ha eseguito e ha riportato, e i test rossi sono
+            // l'esito del comando.
+            RispostaTool::comando(
+                format_run_tests_output(command, exit_code, &stdout, &stderr),
+                exit_code,
+            )
         }
-        Ok(Err(e)) => format!("\u{274C} [Errore attesa test '{}': {}]", command, e),
+        Ok(Err(e)) => {
+            RispostaTool::fallito_di_sistema(format!("[Errore attesa test '{command}': {e}]"))
+        }
         Err(_) => {
             let _ = child.kill().await;
-            format!(
-                "=== RUN TEST ===\nComando: {}\n\
-                 [TIMEOUT] I test non sono terminati entro {}s.\n\
+            // Usciva NUDO: una suite uccisa dal timeout arrivava all'agente come
+            // un'esecuzione riuscita di cui mancava solo l'esito. TRANSITORIO, e
+            // il testo nomina gia' il parametro che offre l'altra strada.
+            RispostaTool::fallito_transitorio(format!(
+                "=== RUN TEST ===\nComando: {command}\n\
+                 [TIMEOUT] I test non sono terminati entro {timeout}s.\n\
                  Suggerimento: usa il parametro 'filter' per eseguire un sottoinsieme di test specifici.\n\
-                 === FINE RUN TEST ===",
-                command, timeout
-            )
+                 === FINE RUN TEST ==="
+            ))
         }
     }
 }
@@ -1338,12 +1370,12 @@ mod tests {
         )
         .await;
         assert!(
-            out.contains(MARCA_ESECUTORE),
-            "la suite deve passare dall'esecutore unico, output: {out}"
+            out.testo.contains(MARCA_ESECUTORE),
+            "la suite deve passare dall'esecutore unico, output: {out:?}"
         );
         assert!(
-            !out.contains("=== RUN TEST ==="),
-            "run_tests non deve aver eseguito la riga in proprio: {out}"
+            !out.testo.contains("=== RUN TEST ==="),
+            "run_tests non deve aver eseguito la riga in proprio: {out:?}"
         );
     }
 

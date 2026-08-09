@@ -344,24 +344,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = ctx_di_prova(dir.path().to_path_buf());
 
-        // Un tool per famiglia di costruzione dell'errore: allegati (helper
-        // `err_json`), documenti e archivi (punti sparsi nel corpo del tool).
-        let casi: Vec<(&str, String)> = vec![
+        // I tool JSON ANCORA LEGACY: dichiarano col marker, e l'esito lo
+        // ricostruisce il ponte al confine del dispatch.
+        let legacy: Vec<(&str, String)> = vec![
             (
                 "nexus_read_attachment",
                 tool_nexus_read_attachment(&ctx, &json!({})).await,
             ),
-            (
-                "nexus_extract_pdf_text",
-                crate::document_tools::tool_nexus_extract_pdf_text(&ctx, &json!({})).await,
-            ),
-            (
-                "nexus_list_archive_entries",
-                crate::archive_tools::tool_nexus_list_archive_entries(&ctx, &json!({})).await,
-            ),
         ];
 
-        for (nome, uscita) in casi {
+        for (nome, uscita) in legacy {
             assert!(
                 is_tool_failure(&uscita),
                 "{nome} non dichiara il fallimento alla macchina: {uscita}"
@@ -374,6 +366,39 @@ mod tests {
             // Il messaggio per l'umano resta nel corpo: il marker aggiunge una
             // dichiarazione, non sostituisce la spiegazione.
             assert!(uscita.contains("attachment_id"), "{nome}: {uscita}");
+        }
+
+        // I tool MIGRATI: la stessa proprieta', dichiarata dove non si puo'
+        // perdere. Il marker non c'e' piu' e non deve esserci — il corpo torna
+        // a essere un JSON integro — quindi il criterio e' il CAMPO, e in piu'
+        // c'e' la natura, che il canale legacy non poteva trasportare.
+        let migrati: Vec<(&str, RispostaTool)> = vec![
+            (
+                "nexus_extract_pdf_text",
+                crate::document_tools::tool_nexus_extract_pdf_text(&ctx, &json!({})).await,
+            ),
+            (
+                "nexus_list_archive_entries",
+                crate::archive_tools::tool_nexus_list_archive_entries(&ctx, &json!({})).await,
+            ),
+        ];
+
+        for (nome, uscita) in migrati {
+            assert_eq!(
+                uscita.esito,
+                EsitoTool::Fallito,
+                "{nome} non dichiara il fallimento nel campo: {uscita:?}"
+            );
+            assert_eq!(
+                uscita.natura,
+                Some(nexus_types::tool_outcome::NaturaFallimento::Rimediabile),
+                "{nome}: un parametro mancante lo corregge l'agente: {uscita:?}"
+            );
+            assert!(uscita.testo.contains("attachment_id"), "{nome}: {uscita:?}");
+            assert!(
+                !is_tool_failure(&uscita.testo),
+                "{nome}: il marker non deve piu' comparire nel testo di un tool migrato,                  o il corpo JSON resta spezzato: {uscita:?}"
+            );
         }
     }
 

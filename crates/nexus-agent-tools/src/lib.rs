@@ -86,3 +86,32 @@ pub(crate) fn errore_json(messaggio: impl std::fmt::Display) -> String {
 pub(crate) fn errore_json_con_dettagli(dettagli: serde_json::Value) -> String {
     nexus_types::tool_outcome::tool_failure(dettagli.to_string())
 }
+
+/// La versione TIPIZZATA di [`errore_json`], per i tool gia' migrati a
+/// [`nexus_types::tool_outcome::RispostaTool`] (regola Q).
+///
+/// Stesso corpo JSON — quello e' il documento che il modello legge, e cambiarlo
+/// sarebbe un contratto diverso — ma senza marker: l'esito sta nel campo, e la
+/// natura la DICHIARA chi conosce la causa invece di restare implicita. Effetto
+/// collaterale gradito: il corpo torna a essere un JSON integro, che il marker
+/// in testa spezzava.
+///
+/// Le due forme convivono finche' la migrazione dei tool JSON non e' completa.
+/// Quando l'ultimo sara' migrato, `errore_json`/`errore_json_con_dettagli`
+/// spariscono insieme al marker.
+pub(crate) fn errore_tool(
+    messaggio: impl std::fmt::Display,
+    natura: nexus_types::tool_outcome::NaturaFallimento,
+) -> nexus_types::tool_outcome::RispostaTool {
+    errore_tool_con_dettagli(serde_json::json!({ "error": messaggio.to_string() }), natura)
+}
+
+/// Come [`errore_tool`] quando il corpo porta anche campi oltre `error` — il
+/// verdetto di un audit, un `hint` con l'azione corretta.
+pub(crate) fn errore_tool_con_dettagli(
+    dettagli: serde_json::Value,
+    natura: nexus_types::tool_outcome::NaturaFallimento,
+) -> nexus_types::tool_outcome::RispostaTool {
+    nexus_types::tool_outcome::RispostaTool::fallito(dettagli.to_string()).con_natura(natura)
+}
+
