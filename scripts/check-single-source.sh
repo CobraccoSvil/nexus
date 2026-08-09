@@ -2807,6 +2807,38 @@ done
 if [[ "$deleghe_ok" -eq 1 ]]; then
   echo "OK path-processo-esterno: argv ed echo usano la stessa resa"
 fi
+# ── veto-in-eleggibilita (2026-08-09) ───────────────────────────────────────
+# Il fornitore che il chiamante NON puo' usare va detto alla SELEZIONE, non
+# filtrato dopo. La tier-chain esce al primo anello che soddisfa la soglia di
+# fornitori distinti: se quell'anello contiene solo il fornitore vietato, la
+# catena si e' fermata su un pool che il chiamante buttera' via, e i tier
+# successivi non vengono mai interrogati. MISURATO il 09/08/2026 sul gate
+# duale: tier `medium` con capability `reasoning` popolato da tre fornitori,
+# due senza credito, l'esecutore il terzo -> `validators: []` e
+# `unavailable_declared`, con deepseek/google/openrouter sani un gradino sopra.
+if grep -nE 'exclude_providers: &\[\]' crates/mcp-core/src/internal_routing.rs \
+   | grep -vE '^[0-9]+: *(//|/\*|\*)' >/dev/null 2>&1; then
+  echo "!! veto-in-eleggibilita: la selezione dei candidati di un purpose torna" >&2
+  echo "   a ignorare il veto del chiamante (exclude_providers: &[] nella" >&2
+  echo "   ModelRequest). Il veto e' ELEGGIBILITA': senza, la condizione di" >&2
+  echo "   uscita della tier-chain conta fornitori che il chiamante scartera'." >&2
+  fail=1
+else
+  echo "OK veto-in-eleggibilita: il veto del chiamante entra nella selezione"
+fi
+
+# E il gate duale deve continuare a passarcelo, insieme alla soglia dei due
+# giudici: sono le due meta' dello stesso requisito, e una sola non basta.
+if ! grep -q 'VALIDATORI_RICHIESTI,' crates/mcp-core/src/agent_graph_adapter/step_validation.rs \
+   || ! grep -q '&veto,' crates/mcp-core/src/agent_graph_adapter/step_validation.rs; then
+  echo "!! veto-in-eleggibilita: il gate duale non chiede piu' alla selezione" >&2
+  echo "   DUE fornitori distinti dall'esecutore (soglia VALIDATORI_RICHIESTI +" >&2
+  echo "   veto). Con una sola delle due meta' il gate torna a dichiararsi" >&2
+  echo "   senza giudici mentre i giudici ci sono." >&2
+  fail=1
+else
+  echo "OK veto-in-eleggibilita: il gate duale dichiara soglia e veto"
+fi
 
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
