@@ -650,15 +650,27 @@ pub async fn get_session_usage(
     // I sub-run si raccolgono senza dover risalire la discendenza: la gemella
     // `agent_runs` del figlio porta la `session_id` del padre (verificato: 57 su
     // 57). Chiedere alla sessione i suoi run e' quindi la domanda completa.
-    let run_ids: Vec<Uuid> =
-        sqlx::query_scalar("SELECT id FROM agent_runs WHERE session_id = $1")
-            .bind(session_id)
-            .fetch_all(&session_pool)
-            .await
-            .unwrap_or_default();
+    //
+    // Quale insieme sia il perimetro lo dice il punto unico
+    // (`session_usage::Perimetro`), non una query scritta qui: la stessa domanda
+    // si pone ora su DUE insiemi (la conversazione e il run in corso) e due
+    // derivazioni sparse divergerebbero.
+    let errore_perimetro = |e: sqlx::Error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+    };
+    let run_ids = crate::session_usage::run_ids_del_perimetro(
+        &session_pool,
+        crate::session_usage::Perimetro::Sessione(session_id),
+    )
+    .await
+    .map_err(errore_perimetro)?;
 
     // La somma e la sua ripartizione le fa il punto unico (`nexus-ledger`): qui
-    // si stabilisce SU CHE COSA sommare, non come.
+    // si stabilisce SU CHE COSA sommare, non come. Totale e ripartizione ricevono
+    // lo STESSO elenco, o l'elenco non somma al totale che gli sta sopra.
     let errore_lettura = |e: anyhow::Error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -672,19 +684,86 @@ pub async fn get_session_usage(
         .await
         .map_err(errore_lettura)?;
 
+    // Perimetro del RUN, solo se richiesto. Il contatore mostra il totale della
+    // conversazione, ma la domanda su cui si decide se un run e' costato troppo
+    // e' un'altra: sullo stesso istante misurato l'08/08/2026 i due valevano
+    // $2,6024 e $0,1272. Il `run_id` deve essere un run DI QUESTA sessione — il
+    // controllo usa l'elenco gia' letto, cosi' la verifica di appartenenza e la
+    // definizione del perimetro non possono divergere.
+    let run_corrente = match params.get("run_id").and_then(|s| Uuid::parse_str(s).ok()) {
+        Some(run_id) if run_ids.contains(&run_id) => {
+            let ids_run = crate::session_usage::run_ids_del_perimetro(
+                &session_pool,
+                crate::session_usage::Perimetro::RunConDiscendenza(run_id),
+            )
+            .await
+            .map_err(errore_perimetro)?;
+            let consumo = nexus_ledger::usage_for_runs(&state.db, &ids_run)
+                .await
+                .map_err(errore_lettura)?;
+            Some((run_id, ids_run.len(), consumo))
+        }
+        // Un `run_id` che non appartiene alla sessione non e' un errore da 4xx
+        // (la chat lo passa a ogni refresh, e un run puo' essere appena nato o
+        // di un'altra sessione): il perimetro semplicemente non c'e', e il wire
+        // lo dichiara assente invece di attribuire al run il totale di sessione.
+        _ => None,
+    };
+
+    Ok(Json(corpo_session_usage(
+        session_id,
+        &totale,
+        &per_modello,
+        run_corrente,
+    )))
+}
+
+/// Il corpo della risposta di [`get_session_usage`].
+///
+/// Estratta dall'handler perche' e' il PRODUTTORE del wire che il frontend
+/// consuma, e un test deve poterla attraversare senza un DB: il difetto gemello
+/// gia' misurato su questo confine — un tipo TS in snake_case contro un wire
+/// camelCase, con un `?? 0` a valle che trasformava ogni campo mancante in «costo
+/// zero» — non era visibile ne' dal lato Rust ne' dal lato TS presi da soli
+/// (regola O). Il JSON che questa funzione produce e' la fixture che
+/// `lib/api/__wire__/session-usage.json` conserva e che l'adapter TS legge.
+///
+/// `current_run` e' `null`, non un oggetto a zeri: «non ho un perimetro di run»
+/// e «questo run non e' costato nulla» sono due cose diverse, e uno zero al posto
+/// dell'assenza e' esattamente il valore comodo che la regola Q vieta.
+fn corpo_session_usage(
+    session_id: Uuid,
+    totale: &nexus_ledger::Consumption,
+    per_modello: &[(String, nexus_ledger::Consumption)],
+    run_corrente: Option<(Uuid, usize, nexus_ledger::Consumption)>,
+) -> Value {
     let breakdown: Vec<Value> = per_modello
-        .into_iter()
+        .iter()
         .map(|(modello, c)| {
             json!({ "model": modello, "tokens": c.tokens, "cost_usd": c.cost })
         })
         .collect();
 
-    Ok(Json(json!({
+    let current_run = match run_corrente {
+        Some((run_id, run_count, consumo)) => json!({
+            "run_id": run_id,
+            "total_tokens": consumo.tokens,
+            "total_cost_usd": consumo.cost,
+            // Quanti run compongono il perimetro: 1 = nessuna delega. Il
+            // consumatore lo mostra perche' «$0,13 su 4 run» e «$0,13 su 1 run»
+            // dicono cose diverse a chi valuta se un run e' costato troppo.
+            "run_count": run_count,
+        }),
+        None => Value::Null,
+    };
+
+    json!({
         "session_id": session_id,
         "total_tokens": totale.tokens,
         "total_cost_usd": totale.cost,
         "breakdown": breakdown,
-    })))
+        "current_run": current_run,
+    })
 }
 
 async fn usage_report(db: &PgPool, query: UsageQuery) -> ApiResult {
@@ -958,5 +1037,96 @@ mod tests {
             );
             assert!(letto.audit(true).sospetta());
         }
+    }
+
+    // ── Il confine wire verso il frontend ────────────────────────────────────
+    //
+    // La fixture e' UNA SOLA e viaggia con `include_str!`, cioe' risolta a tempo
+    // di compilazione rispetto a QUESTO file: non dipende dalla directory da cui
+    // si lanciano i test (regola O — il precedente e' `quality-scan --root`, che
+    // misurava un albero e ne dichiarava un altro).
+    //
+    // Lo stesso file lo legge `lib/api/__wire__/session-usage.test.ts` e lo dà in
+    // pasto all'adapter TS reale. Rinominare un campo qui fa rosseggiare questo
+    // test; aggiornare la fixture per placarlo fa rosseggiare quello di là.
+    const WIRE_SESSION_USAGE: &str =
+        include_str!("../../../apps/web-ide/lib/api/__wire__/session-usage.json");
+
+    fn consumo(tokens: i64, cost: f64) -> nexus_ledger::Consumption {
+        nexus_ledger::Consumption { tokens, cost }
+    }
+
+    /// Il produttore del wire di `session-usage` e la fixture che il frontend
+    /// legge sono la stessa cosa.
+    ///
+    /// MUTAZIONE: rinominare `total_cost_usd` in `totalCostUsd` (o `current_run`
+    /// in `currentRun`) fa fallire questo test — ed e' esattamente la forma del
+    /// difetto gia' accaduto sul footer costo-per-provider, dove un tipo TS in
+    /// snake_case contro un wire camelCase produceva `$0.00` con entrambi i lati
+    /// verdi.
+    #[test]
+    fn il_wire_di_session_usage_e_quello_che_il_frontend_legge() {
+        let corpo = corpo_session_usage(
+            Uuid::parse_str("ec643216-d236-4a99-b47c-e6010ad6a809").expect("uuid sessione"),
+            &consumo(27_813_580, 2.6024),
+            &[
+                (
+                    "mistral/mistral-small-latest".to_string(),
+                    consumo(21_400_000, 1.9312),
+                ),
+                (
+                    "groq/openai/gpt-oss-20b".to_string(),
+                    consumo(6_413_580, 0.6712),
+                ),
+            ],
+            Some((
+                Uuid::parse_str("50187da9-a188-4861-a89a-67af5c1587b1").expect("uuid run"),
+                1,
+                consumo(720_874, 0.1272),
+            )),
+        );
+        let atteso: Value = serde_json::from_str(WIRE_SESSION_USAGE).expect("fixture leggibile");
+        assert_eq!(
+            corpo, atteso,
+            "il wire prodotto non e' quello che il frontend legge: aggiorna INSIEME \
+             produttore, fixture e adapter TS"
+        );
+    }
+
+    /// Senza un run richiesto il perimetro non c'e', e il wire lo dichiara
+    /// ASSENTE.
+    ///
+    /// MUTAZIONE: sostituire `Value::Null` con un oggetto a zeri fa rosseggiare
+    /// qui. Uno zero al posto dell'assenza direbbe al lettore «questo run non ha
+    /// consumato nulla», che e' un'affermazione — e su un contatore di spesa e'
+    /// l'affermazione piu' rassicurante che si possa fare senza aver misurato
+    /// niente (regola Q).
+    #[test]
+    fn nessun_run_richiesto_significa_assente_non_zero() {
+        let corpo = corpo_session_usage(Uuid::nil(), &consumo(1_000, 0.5), &[], None);
+        assert_eq!(corpo["current_run"], Value::Null);
+        assert!(
+            corpo["current_run"].get("total_tokens").is_none(),
+            "l'assenza non deve portare contatori a zero"
+        );
+    }
+
+    /// Il totale e la sua ripartizione escono dalla stessa lettura: la somma
+    /// delle voci e' il totale.
+    ///
+    /// Non e' una tautologia sul codice di questa funzione (che si limita a
+    /// impaginare): e' l'invariante che il chiamante puo' rompere passando due
+    /// insiemi di run diversi alle due query, ed e' il motivo per cui
+    /// `run_ids_del_perimetro` viene chiamata UNA volta e il suo elenco riusato.
+    #[test]
+    fn la_ripartizione_somma_al_totale_che_le_sta_sopra() {
+        let atteso: Value = serde_json::from_str(WIRE_SESSION_USAGE).expect("fixture leggibile");
+        let voci = atteso["breakdown"].as_array().expect("breakdown");
+        let somma_token: i64 = voci.iter().map(|v| v["tokens"].as_i64().unwrap_or(0)).sum();
+        assert_eq!(
+            somma_token,
+            atteso["total_tokens"].as_i64().expect("total_tokens"),
+            "la ripartizione non somma al totale: fonti o filtri diversi"
+        );
     }
 }

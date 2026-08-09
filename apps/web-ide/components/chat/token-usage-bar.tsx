@@ -3,11 +3,22 @@
 import { useState } from "react";
 import { useThemeColors } from "../../lib/theme";
 import { useI18n } from "../../lib/i18n";
+import {
+  usageBarView,
+  rapportoBarra,
+  costoLeggibile,
+  NON_MISURATO,
+  type SessionUsageState,
+} from "./token-usage-bar-logic";
 
 export interface TokenUsageBarProps {
   sessionId?: string;
-  totalTokens: number;
-  totalCostUsd: number;
+  /** Contabilita' della conversazione dal ledger, con l'ignoto come variante.
+   *  Prima erano due `number` sciolti, ed e' il motivo per cui il contatore ha
+   *  potuto mostrare per un intero run i token di una chiamata accanto al costo
+   *  della sessione: due numeri nudi non dicono a quale insieme appartengono, e
+   *  nessun tipo impediva di scriverli da fonti diverse. */
+  usage: SessionUsageState;
   budgetUsd?: number;
   /** Context window in token del modello corrente. Se presente, attiva l'indicatore di riempimento. */
   contextWindow?: number | null;
@@ -18,8 +29,7 @@ export interface TokenUsageBarProps {
 }
 
 export function TokenUsageBar({
-  totalTokens,
-  totalCostUsd,
+  usage,
   budgetUsd,
   contextWindow,
   lastInputTokens,
@@ -29,46 +39,36 @@ export function TokenUsageBar({
   const tc = useThemeColors();
   const [expanded, setExpanded] = useState(false);
 
-  if (totalTokens === 0 && totalCostUsd === 0) return null;
+  const view = usageBarView(usage);
+  if (!view.visibile) return null;
 
-  const hasBudget = budgetUsd != null && budgetUsd > 0;
+  const noto = usage.stato === "noto" ? usage : null;
+  const rapporto = rapportoBarra({
+    misurato: view.misurato,
+    totalCostUsd: noto?.sessione.totalCostUsd ?? 0,
+    budgetUsd,
+    contextWindow,
+    lastInputTokens,
+  });
+
+  const hasBudget = rapporto?.base === "budget";
   const hasContext =
     contextWindow != null &&
     contextWindow > 0 &&
     lastInputTokens != null &&
     lastInputTokens > 0;
-  const ratio = hasBudget
-    ? totalCostUsd / budgetUsd!
-    : hasContext
-      ? lastInputTokens! / contextWindow!
-      : null;
 
   let barColor = tc.textMuted;
-  if (ratio != null) {
-    if (ratio < 0.5) barColor = tc.success;
-    else if (ratio < 0.8) barColor = tc.warning;
+  if (rapporto != null) {
+    if (rapporto.valore < 0.5) barColor = tc.success;
+    else if (rapporto.valore < 0.8) barColor = tc.warning;
     else barColor = tc.error;
   }
+  // Un dato non misurato non prende il colore di una soglia: sarebbe un giudizio
+  // su un numero che non c'e'.
+  if (!view.misurato) barColor = tc.warning;
 
-  const fillPct = ratio != null ? Math.min(ratio * 100, 100) : null;
-
-  const label =
-    totalTokens >= 1_000_000
-      ? `${(totalTokens / 1_000_000).toFixed(1)}M token`
-      : totalTokens >= 1_000
-      ? `${(totalTokens / 1_000).toFixed(1)}K token`
-      : `${totalTokens ?? 0} token`;
-
-  // null-safe: per messaggi senza usage (es. disambiguazione, dove non gira un
-  // run) totalCostUsd puo' essere null. In JS `null < 0.01` e' true, quindi senza
-  // questa guardia si finiva in `null.toFixed(4)` -> crash client-side dell'intera
-  // app al processing live della risposta del send.
-  const costLabel =
-    totalCostUsd == null || totalCostUsd === 0
-      ? "$0.00"
-      : totalCostUsd < 0.01
-      ? `$${totalCostUsd.toFixed(4)}`
-      : `$${totalCostUsd.toFixed(2)}`;
+  const fillPct = rapporto != null ? Math.min(rapporto.valore * 100, 100) : null;
 
   return (
     <div style={{ position: "relative" }}>
@@ -77,10 +77,8 @@ export function TokenUsageBar({
         onClick={() => setExpanded((v) => !v)}
         title={
           hasBudget
-            ? `Budget: $${budgetUsd!.toFixed(2)}`
-            : hasContext
-              ? `Context window: ${lastInputTokens!.toLocaleString()} / ${contextWindow!.toLocaleString()} token`
-              : "Token consumati nella sessione"
+            ? `${view.titolo} Budget: $${budgetUsd!.toFixed(2)}`
+            : view.titolo
         }
         style={{
           display: "flex",
@@ -92,7 +90,7 @@ export function TokenUsageBar({
           border: `1px solid ${tc.border}`,
           background: tc.bgCard,
           cursor: "pointer",
-          color: ratio != null ? barColor : tc.textMuted,
+          color: rapporto != null || !view.misurato ? barColor : tc.textMuted,
           fontSize: 11,
           fontFamily: "inherit",
           whiteSpace: "nowrap",
@@ -116,10 +114,10 @@ export function TokenUsageBar({
           />
         )}
         <span style={{ position: "relative", zIndex: 1 }}>
-          {label} &bull; {costLabel}
-          {ratio != null && (
+          {view.tokensLabel} &bull; {view.costLabel}
+          {rapporto != null && (
             <span style={{ marginLeft: 4, opacity: 0.8 }}>
-              ({Math.round(ratio * 100)}% {hasBudget ? "budget" : "ctx"})
+              ({Math.round(rapporto.valore * 100)}% {hasBudget ? "budget" : "ctx"})
             </span>
           )}
         </span>
@@ -156,14 +154,44 @@ export function TokenUsageBar({
           <div style={{ fontWeight: 600, marginBottom: 6, color: tc.textMuted }}>
             {t("chat.dettaglioSessione")}
           </div>
+          {!view.misurato && (
+            <div style={{ marginBottom: 6, color: tc.warning, lineHeight: 1.4 }}>
+              {usage.stato === "non_disponibile"
+                ? `Contabilita' non leggibile (${usage.motivo}). Nessun numero mostrato: un valore vecchio sarebbe indistinguibile da uno fresco.`
+                : "Contabilita' non ancora letta."}
+            </div>
+          )}
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
             <span>{t("chat.tokenTotali")}</span>
-            <span style={{ color: barColor }}>{totalTokens.toLocaleString()}</span>
+            <span style={{ color: barColor }}>
+              {noto ? noto.sessione.totalTokens.toLocaleString("it-IT") : NON_MISURATO}
+            </span>
           </div>
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
             <span>{t("chat.costoTotale")}</span>
-            <span style={{ color: barColor }}>{costLabel}</span>
+            <span style={{ color: barColor }}>
+              {noto ? costoLeggibile(noto.sessione.totalCostUsd) : NON_MISURATO}
+            </span>
           </div>
+          {/* Il run corrente e' un PERIMETRO DIVERSO, e lo dice. Sulla sessione
+              misurata l'08/08/2026 valevano $2,6024 e $0,1272: senza questa riga
+              chi deve decidere se un run e' costato troppo legge il totale della
+              conversazione e conclude il contrario. */}
+          {view.runLabel && (
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                gap: 8,
+                marginTop: 4,
+                paddingTop: 4,
+                borderTop: `1px solid ${tc.border}`,
+              }}
+            >
+              <span>{t("chat.diCuiRunCorrente")}</span>
+              <span style={{ color: barColor, textAlign: "right" }}>{view.runLabel}</span>
+            </div>
+          )}
           {hasBudget && (
             <div style={{ display: "flex", justifyContent: "space-between" }}>
               <span>{t("chat.budget")}</span>
@@ -182,18 +210,18 @@ export function TokenUsageBar({
                 <span>Context window{modelLabel ? ` (${modelLabel})` : ""}</span>
                 <span>{contextWindow!.toLocaleString()} token</span>
               </div>
-              {ratio != null && ratio >= 0.7 && !hasBudget && (
+              {rapporto != null && rapporto.valore >= 0.7 && !hasBudget && (
                 <div
                   style={{
                     marginTop: 6,
                     paddingTop: 6,
                     borderTop: `1px solid ${tc.border}`,
-                    color: ratio >= 0.8 ? tc.error : tc.warning,
+                    color: rapporto.valore >= 0.8 ? tc.error : tc.warning,
                     fontSize: 10,
                     lineHeight: 1.4,
                   }}
                 >
-                  {ratio >= 0.8
+                  {rapporto.valore >= 0.8
                     ? "Context quasi pieno: compatta la chat (icona ⌁) per evitare perdita di informazioni."
                     : "Context sopra il 70%: valuta di compattare la chat a breve."}
                 </div>

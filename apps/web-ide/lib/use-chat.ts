@@ -38,6 +38,13 @@ import { upsertSyntheticAssistantMessage, isStatusTerminal, mergeIncomingStep } 
 import { createTerminalMessage } from "./use-chat/run-summary";
 import { formatChatError } from "./use-chat/errors";
 import { childRunIdsFromToolResult } from "./use-chat/subagent-runs";
+import type { SessionUsageState } from "../components/chat/token-usage-bar-logic";
+
+/** Intervallo minimo tra due letture della contabilita' innescate da un evento.
+ *  Durante un run gli eventi arrivano a ogni chiamata LLM; il ledger si popola
+ *  man mano e rileggerlo piu' spesso non produce un numero piu' vero, solo piu'
+ *  richieste. Il refresh di fine run non passa da qui. */
+const INTERVALLO_MINIMO_USAGE_MS = 4_000;
 
 /**
  * Rilegge dal DB le tracce gateway della sessione e le installa come timeline
@@ -119,7 +126,11 @@ export function useChat(
   const [metaStepsMap, setMetaStepsMap] = useState<
     Map<string, MetaStepEntry[]>
   >(new Map());
-  const [tokenUsage, setTokenUsage] = useState({ totalTokens: 0, totalCostUsd: 0 });
+  // Contabilita' mostrata dal contatore sotto la chat. Variante e non due numeri
+  // sciolti: l'ignoto deve essere rappresentabile (regola Q), altrimenti una
+  // lettura fallita lascia in video un numero vecchio che nessuno distingue da
+  // uno fresco.
+  const [tokenUsage, setTokenUsage] = useState<SessionUsageState>({ stato: "in_attesa" });
   const [traces, setTraces] = useState<AITraceEvent[]>([]);
   const [streamingToken, setStreamingToken] = useState<string>("");
   const streamingTokenRef = useRef<string>("");
@@ -194,58 +205,132 @@ export function useChat(
   }, [sessionId, pendingQueue, pendingQueueStorageKey]);
 
   // ── Punto unico contabilita' di sessione (regola L) ────────────────────────
-  // La TokenUsageBar (token totali + costo) DEVE leggere sempre dalla stessa
-  // fonte autoritativa: l'endpoint backend getSessionUsage
-  // (GET /api/billing/session-usage -> billing.rs::get_session_usage), che
-  // aggrega i metadata per-messaggio in DB con la semantica corretta:
-  //   - total_tokens: solo messaggi VIVI (deleted_at IS NULL) -> il context %
-  //     scende dopo un compact.
-  //   - total_cost: TUTTI i messaggi, inclusi i soft-deleted dalla compattazione
-  //     -> il costo e' CUMULATIVO (gia' speso) e non si azzera compattando.
-  // Prima del fix il reload ricalcolava il costo lato client filtrando i
-  // soft-deleted (e l'invio sincrono lo accumulava in modo incrementale),
-  // ri-introducendo il "bug storico" che il backend gia' risolve: live e reload
-  // divergevano (costo che SCENDE mentre i token SALGONO sulla stessa sessione).
-  // Ora reload, fine-run e send sincrono delegano tutti a questo punto unico.
-  // Ritorna i totali per i chiamanti che devono riusarli (es. patch del
-  // messaggio sintetico terminale), oppure null se la lettura fallisce.
+  //
+  // Il contatore ha UN SOLO scrittore, questo, e legge dalla fonte autoritativa:
+  // GET /api/billing/session-usage -> billing.rs::get_session_usage -> ledger
+  // (`nexus_ledger::usage_for_runs` su tutti i run della sessione, sub-run
+  // inclusi).
+  //
+  // PERCHE' UNO SOLO (MISURATO l'08/08/2026 su gestione-corsi, run in corso):
+  //
+  //     UI:      639 token  -  $2.14
+  //     ledger:  27.813.580 token  -  $2,6024   (758 righe finalizzate, 74 run)
+  //
+  // I token erano lo 0,0023% del reale e il costo andava nella direzione
+  // opposta. Non due sviste: QUATTRO produttori scrivevano questo stesso stato
+  // con quattro perimetri diversi.
+  //
+  //   1. questo refresh                -> sessione, dal ledger (corretto)
+  //   2. evento SSE `agent_usage`      -> i token del TURNO, nessun costo
+  //   3. evento `ChatMessageAdded`     -> i totali del turno di chat singolo
+  //   4. evento `ChatSessionCompacted` -> costo sommato dai metadata dei MESSAGGI
+  //
+  // Il secondo spiega da solo la coppia contraddittoria: sostituiva i token con
+  // quelli dell'ultima chiamata (`executor.rs` lo dichiara: «I valori sono del
+  // TURNO ... la cumulazione e' del finalize/ledger, non del grafo») e, non
+  // portando alcun costo, lasciava in video quello di sessione dell'ultima
+  // lettura autoritativa. Il commento che stava qui affermava il contrario
+  // («usage.* sono totali cumulativi di sessione»): una premessa falsa che
+  // nessun test poteva smentire, perche' i due lati non si incontravano mai.
+  //
+  // Ora 2, 3 e 4 sono SEGNALI DI AVANZAMENTO: innescano `richiediUsageFresco`,
+  // non scrivono un numero. Un evento dice QUANDO rileggere, mai QUANTO.
+  //
+  // `runId` chiede in piu' il perimetro di quel run (se stesso + i sub-run che
+  // ha dispatchato): e' la domanda su cui si decide se un run e' costato troppo,
+  // e sulla sessione misurata vale $0,1272 contro $2,6024 — venti volte, quindi
+  // i due non sono intercambiabili e la UI li mostra come righe distinte.
+  //
+  // Ritorna i totali di sessione per i chiamanti che devono riusarli, oppure
+  // null se la lettura non e' riuscita.
   const refreshSessionUsage = useCallback(
-    async (sid: string): Promise<{ totalTokens: number; totalCostUsd: number } | null> => {
+    async (sid: string, runId?: string): Promise<{ totalTokens: number; totalCostUsd: number } | null> => {
       try {
-        const usage = await getSessionUsage(sid);
+        const usage = await getSessionUsage(sid, runId);
         setTokenUsage({
-          totalTokens: usage.totalTokens,
-          totalCostUsd: usage.totalCostUsd,
+          stato: "noto",
+          sessione: { totalTokens: usage.totalTokens, totalCostUsd: usage.totalCostUsd },
+          run: usage.currentRun,
         });
         return { totalTokens: usage.totalTokens, totalCostUsd: usage.totalCostUsd };
-      } catch {
-        // best-effort: la barra resta sull'ultimo valore noto; il prossimo turno
-        // (o un reload) la riallinea. Mai bloccare il flusso chat per un
-        // fallimento di lettura della contabilita'.
+      } catch (e) {
+        // L'indisponibilita' si DICHIARA (regola Q). Prima si restava in
+        // silenzio sull'ultimo valore noto: e' il meccanismo per cui il costo di
+        // un altro insieme e' rimasto sullo schermo per l'intera durata di un
+        // run senza che nulla lo segnalasse. Il flusso chat non si blocca: cambia
+        // solo cio' che il contatore afferma di sapere.
+        setTokenUsage({
+          stato: "non_disponibile",
+          motivo: e instanceof Error ? e.message : "lettura fallita",
+        });
         return null;
       }
     },
     [],
   );
 
-  // ── Binding dispatcher: TokenUsageBar e tokenUsage si aggiornano in
-  // ── real-time SENZA refresh browser quando il backend emette eventi chat.
+  // Rilettura innescata da un evento, con un intervallo minimo: durante un run
+  // `agent_usage` arriva a ogni chiamata LLM (decine al minuto) e una GET per
+  // ciascuna sarebbe un martellamento senza guadagno — il ledger si popola man
+  // mano, non a ogni token. Il refresh di FINE RUN resta diretto e non passa di
+  // qui, cosi' l'ultimo valore e' sempre quello definitivo.
+  const ultimaLetturaUsageRef = useRef(0);
+  const letturaUsageProgrammataRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Il run di cui il pannello mostra il consumo. Sopravvive alla FINE del run
+  // perche' e' proprio dopo che ci si chiede se sia costato troppo; si azzera
+  // solo cambiando sessione. Senza, ogni innesco che non venga dallo stream del
+  // run (un messaggio inserito, un compact) farebbe sparire e ricomparire la
+  // riga, e una cifra che lampeggia si smette di guardarla.
+  const runMostratoRef = useRef<string | undefined>(undefined);
+  const richiediUsageFresco = useCallback(
+    (sid: string, runId?: string) => {
+      if (runId) runMostratoRef.current = runId;
+      const perimetroRun = runId ?? runMostratoRef.current;
+      const ora = Date.now();
+      const trascorso = ora - ultimaLetturaUsageRef.current;
+      if (trascorso >= INTERVALLO_MINIMO_USAGE_MS) {
+        ultimaLetturaUsageRef.current = ora;
+        void refreshSessionUsage(sid, perimetroRun);
+        return;
+      }
+      // Una sola lettura in coda: le successive sarebbero la stessa domanda.
+      if (letturaUsageProgrammataRef.current) return;
+      letturaUsageProgrammataRef.current = setTimeout(() => {
+        letturaUsageProgrammataRef.current = null;
+        ultimaLetturaUsageRef.current = Date.now();
+        // Il run si rilegge dal ref: fra la programmazione e lo scatto puo'
+        // esserne partito uno nuovo, e il perimetro giusto e' quello aggiornato.
+        void refreshSessionUsage(sid, runMostratoRef.current);
+      }, INTERVALLO_MINIMO_USAGE_MS - trascorso);
+    },
+    [refreshSessionUsage],
+  );
+
+  useEffect(
+    () => () => {
+      if (letturaUsageProgrammataRef.current) {
+        clearTimeout(letturaUsageProgrammataRef.current);
+        letturaUsageProgrammataRef.current = null;
+      }
+    },
+    [],
+  );
+
+  // ── Binding dispatcher: il contatore si aggiorna in real-time SENZA refresh
+  // ── browser quando il backend emette eventi chat.
   //
-  // - ChatSessionCompacted: il backend invia totali freschi dopo compact;
-  //   riallineiamo subito la barra (caso bug "percentuale solo dopo F5").
-  // - ChatMessageAdded: il backend invia totali assoluti aggiornati ad ogni
-  //   INSERT messaggio (emesso da chat_messages/run.rs, con i totali del
-  //   payload). Sui messaggi senza contabilita' i totali sono null e la barra
-  //   resta sull'ultimo valore noto.
+  // Gli eventi portano dei totali nel payload, ma quelli NON entrano nel
+  // contatore: `ChatSessionCompacted` somma i metadata dei messaggi (che
+  // perdono il lavoro dei sub-run: $0,9394 dichiarati contro $3,4741 reali,
+  // misurato il 06/08/2026) e `ChatMessageAdded` porta i totali del singolo
+  // turno. Sono buoni segnali di «e' cambiato qualcosa», pessime misure di
+  // «quanto e' costato»: qui servono solo come innesco.
   const lastCompact = useProjectStore(selectChatLastCompact(sessionId ?? null));
   const lastMessage = useProjectStore(selectChatLastMessage(sessionId ?? null));
 
   useEffect(() => {
     if (!lastCompact || !sessionId) return;
-    setTokenUsage({
-      totalTokens: lastCompact.totalTokens,
-      totalCostUsd: lastCompact.totalCostUsd,
-    });
+    richiediUsageFresco(sessionId);
     // Ricarica i messaggi dal DB cosi' i messaggi pre-compact (ora con
     // deleted_at valorizzato dal backend) vengano filtrati e il calcolo
     // di ratio/ctx% sul bottone Compatta usi solo i messaggi vivi.
@@ -261,8 +346,8 @@ export function useChat(
           setMessages(history.messages);
         }
       } catch {
-        // ignore: il TokenUsage e' gia' aggiornato; il refresh dei messaggi
-        // riavverra' al prossimo turno.
+        // ignore: la rilettura della contabilita' e' gia' partita; il refresh
+        // dei messaggi riavverra' al prossimo turno.
       }
     })();
     // Trigger solo sul timestamp di lastCompact (lo stesso oggetto cambia identita').
@@ -271,18 +356,9 @@ export function useChat(
 
   useEffect(() => {
     if (!lastMessage || !sessionId) return;
-    // Totali assoluti dal backend (idempotente, non incrementale).
-    // Il test e' sul TIPO, non su `!== undefined`: il backend manda `null` per i
-    // messaggi senza contabilita' (disambiguazione), e un null passava il vecchio
-    // controllo azzerando la barra a meta' conversazione.
-    if (typeof lastMessage.totalTokens === "number" && typeof lastMessage.totalCostUsd === "number") {
-      setTokenUsage({
-        totalTokens: lastMessage.totalTokens,
-        totalCostUsd: lastMessage.totalCostUsd,
-      });
-    }
-    // Trigger sul messageId; lastMessage stesso e' read solo per i totalTokens/cost
-    // del messaggio corrente.
+    richiediUsageFresco(sessionId);
+    // Trigger sul messageId: e' l'evento «e' stato inserito un messaggio», non
+    // il suo contenuto contabile.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastMessage?.messageId, sessionId]);
 
@@ -351,6 +427,11 @@ export function useChat(
       } catch {
         // best-effort: la chat funziona comunque, solo senza timeline storica
       }
+      // Il perimetro di run appartiene alla sessione che si sta lasciando. Il
+      // backend lo scarterebbe comunque (accetta solo un run DI questa
+      // sessione), ma chiederglielo sarebbe una domanda che sappiamo priva di
+      // senso.
+      runMostratoRef.current = undefined;
       // Contabilita' di sessione dalla fonte autoritativa (punto unico, regola
       // L). NON ri-sommare msg.totalCost lato client: lo faceva con un filtro
       // deletedAt che azzerava il costo dei turni compattati, divergendo dal
@@ -603,7 +684,12 @@ export function useChat(
                   // Era una toppa alla contabilita' che mancava sul run (i run
                   // chiusi da fuori restavano a zero), causa chiusa a monte dal
                   // punto unico `run_totals` lato backend.
-                  await refreshSessionUsage(sid);
+                  //
+                  // Diretto e non throttled: e' la lettura DEFINITIVA del run
+                  // appena chiuso, e passa `runId` perche' e' il momento in cui
+                  // il perimetro del run e' completo — anche i suoi sub-run
+                  // hanno finito di scrivere sul ledger.
+                  await refreshSessionUsage(sid, runId);
                 } catch {}
                 // Tracce dal DB: il run e' chiuso, quindi anche i suoi sub-run
                 // hanno finito di scrivere. E' il momento in cui la ripartizione
@@ -865,14 +951,14 @@ export function useChat(
           });
           if (isPrimary) {
             setAgentRun((prev) => (prev && prev.runId === runId ? applyUsage(prev) : prev));
-            // Propaga l'usage live anche al contatore globale (TokenUsageBar nel
-            // composer): senza questo, costo/token restano congelati al valore
-            // pre-run fino a fine run / refresh manuale. usage.* sono totali
-            // cumulativi di sessione (no doppi conteggi).
-            setTokenUsage((prev) => ({
-              totalTokens: usage.totalTokens ?? prev.totalTokens,
-              totalCostUsd: usage.totalCostUsd ?? prev.totalCostUsd,
-            }));
+            // Il contatore globale NON prende i suoi numeri da qui: questo evento
+            // porta i token del TURNO (`executor.rs` lo dichiara esplicitamente)
+            // e nessun costo. Scriverli nel contatore di sessione e' cio' che
+            // produceva «639 token - $2.14» su una sessione da 27,8M token e
+            // $2,6024: i token dell'ultima chiamata accanto al costo di tutta la
+            // conversazione, due insiemi diversi presentati come una coppia.
+            // L'evento dice QUANDO rileggere; QUANTO lo dice il ledger.
+            richiediUsageFresco(sid, runId);
           }
         },
       );
@@ -885,7 +971,7 @@ export function useChat(
         childSubCleanupsRef.current.set(runId, cleanup);
       }
     },
-    [projectId, refreshSessionUsage, stopPrimaryAgentStream],
+    [projectId, refreshSessionUsage, richiediUsageFresco, stopPrimaryAgentStream],
   );
 
   // Riaggancia un run attivo del backend non ancora noto al client (post-refresh,
@@ -1215,7 +1301,13 @@ export function useChat(
     setAgentRuns(new Map());
     setAgentStepsMap(new Map());
     setMetaStepsMap(new Map());
-    setTokenUsage({ totalTokens: 0, totalCostUsd: 0 });
+    // Non zeri: azzerare significherebbe affermare che non e' stato speso nulla.
+    // Qui la contabilita' semplicemente non e' stata ancora letta per la nuova
+    // sessione.
+    setTokenUsage({ stato: "in_attesa" });
+    // Il perimetro di run appartiene alla sessione che si sta lasciando: tenerlo
+    // farebbe chiedere alla prossima il consumo di un run che non e' suo.
+    runMostratoRef.current = undefined;
     setTraces([]);
   }, [stopPrimaryAgentStream]);
 

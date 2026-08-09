@@ -2446,6 +2446,63 @@ else
   echo "OK premesse-dei-gate: l'esito 'non eseguito' ha un punto unico e i gate lo pretendono"
 fi
 
+# contatore-di-spesa — «quanto e' costato cio' che sto guardando?»
+#
+# Il contatore sotto la chat ha UN SOLO scrittore, `refreshSessionUsage`, che
+# legge dal ledger. Non e' una preferenza di stile: MISURATO l'08/08/2026 su
+# gestione-corsi, quel contatore mostrava «639 token - $2.14» su una sessione da
+# 27.813.580 token e $2,6024, perche' QUATTRO produttori scrivevano lo stesso
+# stato con quattro perimetri diversi (il ledger, i token del TURNO dall'evento
+# SSE, i totali del turno singolo da ChatMessageAdded, il costo sommato dai
+# metadata dei messaggi da ChatSessionCompacted).
+#
+# Il difetto non si vedeva perche' ogni singolo produttore, preso da solo, era
+# plausibile. Quindi il guard non cerca un valore sbagliato: cerca la SECONDA
+# penna. Chi vuole aggiornare il contatore chiama il refresh (o il suo innesco
+# throttled), mai `setTokenUsage` per conto proprio.
+scrittori="$(grep -rn 'setTokenUsage(' apps/web-ide --include='*.ts' --include='*.tsx' \
+  --exclude-dir=node_modules --exclude-dir=.next 2>/dev/null || true)"
+scrittori_fuori="$(printf '%s\n' "$scrittori" | grep -v '^apps/web-ide/lib/use-chat\.ts:' || true)"
+# Dentro use-chat.ts le scritture ammesse sono solo tre: la dichiarazione dello
+# stato, il ramo «noto» e il ramo «non disponibile» di refreshSessionUsage, piu'
+# il reset a `in_attesa` di `clear`. Un `setTokenUsage` che scriva NUMERI presi
+# da altro (un payload di evento, un accumulo `prev + ...`) e' la regressione.
+scrittori_sospetti="$(printf '%s\n' "$scrittori" \
+  | grep -E 'setTokenUsage\(\(prev|setTokenUsage\(\{ *total(Tokens|CostUsd)' || true)"
+if [[ -n "${scrittori_fuori// /}" || -n "${scrittori_sospetti// /}" ]]; then
+  echo "!! contatore-di-spesa: un secondo produttore scrive il contatore di chat:" >&2
+  [[ -n "${scrittori_fuori// /}" ]] && printf '%s\n' "$scrittori_fuori" >&2
+  [[ -n "${scrittori_sospetti// /}" ]] && printf '%s\n' "$scrittori_sospetti" >&2
+  echo "   Il contatore ha un solo scrittore (refreshSessionUsage, che legge dal" >&2
+  echo "   ledger). Gli eventi dicono QUANDO rileggere, mai QUANTO: usa" >&2
+  echo "   richiediUsageFresco(). Vedi components/chat/token-usage-bar-logic.ts." >&2
+  fail=1
+else
+  echo "OK contatore-di-spesa: il contatore di chat ha un solo scrittore"
+fi
+
+# E la fixture del confine wire non deve restare orfana: se sparisce, il test
+# Rust non compila piu' (include_str!) ma quello TS fallirebbe a runtime con un
+# errore di file mancante, che e' un modo confuso di dire «il contratto non e'
+# piu' verificato».
+for lato in "crates/mcp-core/src/billing.rs:corpo_session_usage" \
+            "apps/web-ide/lib/api/session-usage-wire.ts:sessionUsageDalWire"; do
+  file="${lato%%:*}"; fn="${lato##*:}"
+  if [[ ! -f "$file" ]] || ! grep -q "$fn" "$file"; then
+    echo "!! confine-wire-session-usage: manca $fn in $file" >&2
+    echo "   I due lati del wire si verificano contro UNA fixture condivisa" >&2
+    echo "   (apps/web-ide/lib/api/__wire__/session-usage.json): se un lato" >&2
+    echo "   sparisce, il contratto non e' piu' misurato da nessuno." >&2
+    fail=1
+  fi
+done
+if [[ ! -f "apps/web-ide/lib/api/__wire__/session-usage.json" ]]; then
+  echo "!! confine-wire-session-usage: fixture condivisa assente" >&2
+  fail=1
+else
+  echo "OK confine-wire-session-usage: fixture condivisa e i suoi due lati"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

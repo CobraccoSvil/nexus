@@ -1,0 +1,15 @@
+{
+  "session_id": "ec643216-d236-4a99-b47c-e6010ad6a809",
+  "total_tokens": 27813580,
+  "total_cost_usd": 2.6024,
+  "breakdown": [
+    { "model": "mistral/mistral-small-latest", "tokens": 21400000, "cost_usd": 1.9312 },
+    { "model": "groq/openai/gpt-oss-20b", "tokens": 6413580, "cost_usd": 0.6712 }
+  ],
+  "current_run": {
+    "run_id": "50187da9-a188-4861-a89a-67af5c1587b1",
+    "total_tokens": 720874,
+    "total_cost_usd": 0.1272,
+    "run_count": 1
+  }
+}

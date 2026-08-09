@@ -1,4 +1,12 @@
 import { API_BASE, fetchJson } from "./_shared";
+import {
+  sessionUsageDalWire,
+  urlSessionUsage,
+  type SessionUsage,
+  type SessionUsageWire,
+} from "./session-usage-wire";
+
+export type { SessionUsage } from "./session-usage-wire";
 
 // --- Billing ---
 
@@ -93,27 +101,28 @@ export async function createBillingQuota(payload: {
   });
 }
 
-export async function getSessionUsage(sessionId: string): Promise<{
-  totalTokens: number;
-  totalCostUsd: number;
-  breakdown: Array<{ model: string; tokens: number; costUsd: number }>;
-}> {
-  const url = new URL(`${API_BASE}/api/billing/session-usage`, typeof window !== "undefined" ? window.location.origin : "http://localhost");
-  url.searchParams.set("session_id", sessionId);
-  const res = await fetchJson<{
-    total_tokens: number;
-    total_cost_usd: number;
-    breakdown: Array<{ model: string; tokens: number; cost_usd: number }>;
-  }>(url.toString());
-  return {
-    totalTokens: res.total_tokens,
-    totalCostUsd: res.total_cost_usd,
-    breakdown: (res.breakdown ?? []).map((b) => ({
-      model: b.model,
-      tokens: b.tokens,
-      costUsd: b.cost_usd,
-    })),
-  };
+/**
+ * Contabilita' della sessione dal ledger: il PUNTO UNICO che alimenta il
+ * contatore sotto la chat.
+ *
+ * `runId` chiede in piu' il perimetro di QUEL run (se stesso + i sub-run che ha
+ * dispatchato). Sono due domande distinte sullo stesso istante — misurate
+ * l'08/08/2026: $2,6024 la conversazione, $0,1272 il run — e il chiamante deve
+ * poterle mostrare come tali invece di scegliere a caso quale numero esibire.
+ *
+ * La forma del wire e la sua traduzione vivono in `session-usage-wire.ts`, senza
+ * dipendenze, cosi' che un test possa attraversarle con la fixture prodotta dal
+ * backend reale (regola O). Qui restano solo trasporto ed errori.
+ */
+export async function getSessionUsage(
+  sessionId: string,
+  runId?: string,
+): Promise<SessionUsage> {
+  const origin = typeof window !== "undefined" ? window.location.origin : "http://localhost";
+  const res = await fetchJson<SessionUsageWire>(
+    urlSessionUsage(API_BASE, origin, sessionId, runId),
+  );
+  return sessionUsageDalWire(res);
 }
 
 export async function getAdminBillingUsage(params?: {

@@ -1486,8 +1486,7 @@ export function ChatPanel({
         );
         const usageBar = (
           <TokenUsageBar
-            totalTokens={tokenUsage.totalTokens}
-            totalCostUsd={tokenUsage.totalCostUsd}
+            usage={tokenUsage}
             contextWindow={fill.ctxWindow}
             lastInputTokens={fill.lastInputTokens}
             modelLabel={fill.activeModel}
