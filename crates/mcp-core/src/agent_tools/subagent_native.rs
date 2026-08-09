@@ -56,12 +56,7 @@ use nexus_agent_graph::decisions::{
     AdvisoryPanelVerdict, AdvisoryPolicy, AdvisoryRoster, AdvisorySynthesis, CausaTimeout,
     QuorumPolicy,
 };
-
-/// Marker d'errore (stesso contratto di `subagent.rs`: prefisso U+274C ->
-/// `tool_result_is_error` deriva `is_error=true`).
-fn err(msg: &str) -> String {
-    format!("\u{274C} [dispatch_subagent] {msg}")
-}
+use nexus_types::tool_outcome::{NaturaFallimento, RispostaTool};
 
 // Chiavi ricorrenti dei payload di narrazione/tool_result del sub-run: un solo
 // literal per chiave (i consumatori — frontend e test — leggono le stesse).
@@ -73,6 +68,12 @@ const K_TARGET: &str = "target";
 const K_IS_ERROR: &str = "is_error";
 const K_PROVIDER: &str = "provider";
 const K_MODEL: &str = "model";
+
+/// Il `status` che un dispatch RIFIUTATO in fase prepare porta nel payload: la
+/// riga `nexus_subagent_runs` non e' mai nata, nessun grafo e' partito.
+const STATUS_PREPARE_FAILED: &str = "prepare_failed";
+/// Il `status` di un sub-run NATO e chiuso alla scadenza del proprio budget.
+const STATUS_TIMEOUT: &str = "timeout";
 
 /// Soglie sub-agent lette dal DB (regola G). I default coincidono coi default del
 /// brain (`orchestrator_config` + mig 0153): safe-default se la chiave manca, MAI
@@ -513,13 +514,6 @@ pub(crate) async fn cumulative_cost(pool: &sqlx::PgPool, anchor: Uuid) -> f64 {
 /// `dispatch_subagent`/`dispatch_subagents` (regola M: campo strutturato, mai
 /// parsing di prosa). Dalla Fase D turn-on il param E' nello schema del tool; la
 /// sua ATTIVAZIONE effettiva passa da [`background_active`] (kill-switch DB).
-fn read_background_flag(input: &Value) -> bool {
-    input
-        .get("background")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
 /// PUNTO UNICO (regola L) del "background EFFETTIVAMENTE attivo": il chiamante ha
 /// passato `background=true` E il kill-switch DB-driven
 /// `orchestrator.background_fanin_enabled` e' ON (stesso flag del worker fan-in,
@@ -527,36 +521,128 @@ fn read_background_flag(input: &Value) -> bool {
 /// viene IGNORATO e il dispatch resta SINCRONO: spegnere il flag riporta tutto a
 /// sincrono a runtime (60s, senza redeploy) senza lasciare padri appesi (regola
 /// G/H). Rete di sicurezza per il turn-on del fan-in async.
-async fn background_active(ctx: &AgentToolContext, input: &Value) -> bool {
-    read_background_flag(input) && crate::fanin_worker::background_fanin_enabled(&ctx.core.db).await
+///
+/// Il flag arriva gia' letto dal CONTRATTO d'ingresso del tool (campo
+/// `background`, regola M: un campo strutturato, mai prosa): qui resta la sola
+/// domanda che richiede il DB.
+async fn background_active(ctx: &AgentToolContext, richiesto: bool) -> bool {
+    richiesto && crate::fanin_worker::background_fanin_enabled(&ctx.core.db).await
+}
+
+/// Di chi e' il problema quando un dispatch viene RIFIUTATO in fase prepare.
+///
+/// Il discriminante e' il codice STRUTTURATO del rifiuto (regola M), mai la sua
+/// prosa.
+///
+/// UN SOLO codice e' `Rimediabile`, e lo e' per una ragione verificabile:
+/// `kind_not_whitelisted` e' l'unico il cui messaggio PORTA l'informazione per
+/// correggere — `prepare_subagent_run` vi stampa la whitelist per intero, quindi
+/// l'agente legge gli ammessi e ne sceglie un altro. La variante
+/// [`NaturaFallimento::Rimediabile`] lo pretende: «dire rimediabile senza dire
+/// come e' una promessa non mantenuta».
+///
+/// `kind_not_found` NON e' fra questi, e non per una sfumatura: il guard della
+/// whitelist PRECEDE la lettura del registry, quindi quel codice puo' nascere
+/// solo per un kind che la whitelist AMMETTE e che
+/// `nexus_subagent_definitions` non ha (o ha disabilitato). E' una divergenza
+/// fra due righe di configurazione — la stessa che rende quel kind assente
+/// dall'enum consegnato al modello (`convocable_kinds` = definizioni ∩
+/// whitelist) — non una scelta dell'agente, e il messaggio non elenca nulla con
+/// cui rimediare.
+///
+/// Tutto il resto (sub-agenti disabilitati, profondita' massima, tetto di spesa,
+/// prompt mancante, deadline del padre, DB muto) sono decisioni o guasti del
+/// sistema che ripetere la stessa chiamata non sposta.
+fn natura_del_rifiuto(error_code: &str) -> NaturaFallimento {
+    match error_code {
+        "kind_not_whitelisted" => NaturaFallimento::Rimediabile,
+        _ => NaturaFallimento::DelSistema,
+    }
+}
+
+/// L'esito del TOOL a partire dal payload del sub-run, che e' un'altra cosa
+/// dall'esito del SUB-RUN.
+///
+/// I due casi che il tool deve distinguere (e che finora arrivavano al modello
+/// come lo stesso identico successo, perche' il payload e' un JSON e il marker
+/// di fallimento vive in TESTA al testo — un oggetto serializzato comincia con
+/// `{`, quindi nessun rifiuto lo portava mai):
+///
+/// - **il sub-run non e' partito**: guard di prepare (whitelist, profondita',
+///   tetto di spesa, prompt assente, DB). Nessuna riga, nessun grafo, nessun
+///   budget speso: l'agente deve cambiare la richiesta o cambiare strada.
+/// - **e' partito e non ha consegnato**: chiuso alla scadenza, oppure schiantato
+///   nel motore. La riga esiste, il budget e' stato speso, e il riassunto per cui
+///   la figura era stata convocata non c'e'.
+///
+/// Un sub-run che CONSEGNA il proprio esito e' invece un tool RIUSCITO anche
+/// quando il verdetto e' negativo: il verdetto viaggia strutturato in `outcome`
+/// e lo legge il coordinatore. E' la stessa distinzione di
+/// [`RispostaTool::comando`], dove un comando che esce 1 e' un tool riuscito che
+/// riporta un build fallito.
+fn risposta_dal_dispatch(payload: Value) -> RispostaTool {
+    let status = payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let ha_errore = payload.get("error").is_some();
+    match status {
+        STATUS_PREPARE_FAILED => {
+            let codice = payload
+                .get("error_code")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let natura = natura_del_rifiuto(codice);
+            RispostaTool::fallito(payload.to_string()).con_natura(natura)
+        }
+        // Il payload porta `timeout_cause`: su CHE COSA il budget si e'
+        // esaurito. E' l'informazione con cui l'agente restringe il mandato e
+        // riconvoca, quindi il fallimento e' rimediabile per davvero.
+        STATUS_TIMEOUT => RispostaTool::fallito_rimediabile(payload.to_string()),
+        // Il caso NOTO e' `finalize_failure`, che non scrive alcun `status`: il
+        // grafo si e' schiantato prima di produrne uno, e riconvocare la stessa
+        // figura e' legittimo.
+        //
+        // Il guard e' sul CAMPO `error`, non sullo status vuoto, e la differenza
+        // non e' stilistica: `error` e' scritto da TUTTI e soli i rami che
+        // falliscono, mentre lo status ha gia' in questo file valori che questo
+        // match non nomina (`failed` del fan-out interrotto, `conflict` e
+        // `apply_failed` dell'apply isolato). Legandolo allo status vuoto, un
+        // payload con uno di quei valori sarebbe uscito RIUSCITO — cioe' il
+        // difetto che questa funzione esiste per chiudere, in una forma nuova e
+        // per un ramo che oggi non la raggiunge ma domani si'.
+        _ if ha_errore => RispostaTool::fallito_transitorio(payload.to_string()),
+        // `running` (background in volo), `completed`, `paused`: l'esito e' stato
+        // consegnato e il coordinatore lo legge dai campi.
+        _ => RispostaTool::riuscito(payload.to_string()),
+    }
 }
 
 /// Handler del tool `dispatch_subagent` (singolo sub-run nativo).
-pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> String {
-    let kind = match input.get("kind").and_then(Value::as_str) {
-        Some(k) if !k.is_empty() => k.to_string(),
-        _ => return err("parametro 'kind' obbligatorio"),
+pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> RispostaTool {
+    use nexus_agent_tools::{input_contract::InputTool, tool_inputs::DispatchSubagentInput};
+
+    let params = match DispatchSubagentInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
-    let task = match input.get("task").and_then(Value::as_str) {
-        Some(t) if !t.trim().is_empty() => t.to_string(),
-        _ => return err("parametro 'task' obbligatorio e non vuoto"),
-    };
-    let context_blob = input
-        .get("context")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let expected_format = input
-        .get("expected_output_format")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let kind = params.kind.come_stringa().trim().to_string();
+    let task = params.task;
+    if kind.is_empty() || task.trim().is_empty() {
+        return RispostaTool::fallito_rimediabile(
+            "[Errore: 'kind' e 'task' devono essere non vuoti. 'task' e' la descrizione \
+             COMPLETA e AUTONOMA del sotto-task: il sub-agent non vede questa \
+             conversazione.]",
+        );
+    }
+    let context_blob = params.context.unwrap_or_default();
+    let expected_format = params.expected_output_format.unwrap_or_default();
     // Fase D fan-in: dispatch asincrono opt-in dal param `background` (ora nello
     // schema del tool), gattato dal kill-switch DB (regola G/H). Default e flag-OFF
     // -> sincrono, comportamento invariato. Letto come CAMPO strutturato (regola M).
-    let background = background_active(ctx, input).await;
+    let background = background_active(ctx, params.background.unwrap_or(false)).await;
 
-    run_single_subagent(
+    let payload = run_single_subagent(
         ctx,
         &kind,
         &task,
@@ -569,19 +655,80 @@ pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> St
         // task. Qui non c'e' uno scope dichiarato da misurare.
         &[],
     )
-    .await
-    .to_string()
+    .await;
+    risposta_dal_dispatch(payload)
+}
+
+/// Scompone l'array `tasks` del batch nei task parsati, o dichiara quale voce
+/// non rispetta il contratto.
+///
+/// PERCHE' A MANO E NON DAL CONTRATTO D'INGRESSO. `DispatchSubagentsTask` non
+/// dichiara `write_scope`, che invece questo handler LEGGE (e' l'input del
+/// gating dell'isolamento) e che il chiamante interno — `todo_runner` in
+/// `nexus-agent-graph`, via `subagent_task_json` — mette in OGNI task che
+/// compone. Il contratto e' `deny_unknown_fields`: leggerlo con
+/// `DispatchSubagentsInput::leggi` rifiuterebbe ogni dispatch guidato dal
+/// piano, cioe' la totalita' del canale che porta gli scope. Togliere il campo
+/// al chiamante spegnerebbe l'isolamento per worktree. La divergenza sta nel
+/// CONTRATTO, che va allineato a cio' che l'handler legge — lavoro che tocca
+/// `tool_inputs.rs` e il catalogo, fuori da questo file.
+fn parse_batch_tasks(tasks: &[Value]) -> Result<Vec<ParsedTask>, RispostaTool> {
+    let mut parsed: Vec<ParsedTask> = Vec::with_capacity(tasks.len());
+    for (i, t) in tasks.iter().enumerate() {
+        let campo = |nome: &str| {
+            t.get(nome)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let kind = campo("kind");
+        let task = campo("task");
+        if kind.is_empty() || task.trim().is_empty() {
+            return Err(RispostaTool::fallito_rimediabile(format!(
+                "[Errore: tasks[{i}] deve avere 'kind' e 'task' non vuoti: \
+                 correggi quella voce e richiama il tool.]"
+            )));
+        }
+        // FASE 2: `write_scope` dichiarato dal task (aree file che il sub-run
+        // scrive). Assente/vuoto -> `subtasks_are_disjoint` degradera' a false ->
+        // ramo sequenziale (sicuro). Fonte: `Todo.write_scope` in `dispatch_wave`.
+        parsed.push(ParsedTask {
+            kind,
+            task,
+            context_blob: campo("context"),
+            expected: campo("expected_output_format"),
+            write_scope: write_scope_of(t),
+        });
+    }
+    Ok(parsed)
 }
 
 /// Handler del tool `dispatch_subagents` (batch parallelo di sub-run nativi).
-pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> String {
+///
+/// ESITO DEL BATCH, NON DEI SUB-RUN. Il tool e' `Fallito` solo quando il batch
+/// non e' MAI partito (input rifiutato, tetto di task superato); un batch
+/// dispatchato e' `Riuscito` anche se alcune figure sono andate male, perche'
+/// il verdetto per-task viaggia strutturato in `results[].outcome` e i suoi
+/// lettori — il coordinatore e il `todo_runner` — decidono da li' (blocked +
+/// cascade-skip). Collassare le due domande farebbe scartare al `todo_runner`,
+/// come "dispatch fallito", anche i task riusciti dell'ondata.
+pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> RispostaTool {
     let tasks = match input.get("tasks").and_then(|v| v.as_array()) {
         Some(a) if !a.is_empty() => a.clone(),
-        _ => return err("parametro 'tasks' (array non vuoto) obbligatorio"),
+        _ => {
+            return RispostaTool::fallito_rimediabile(
+                "[Errore: parametro 'tasks' mancante o vuoto: passa un array con almeno \
+                 un task {kind, task}.]",
+            )
+        }
     };
     let batch_max_tasks = read_batch_max_tasks(ctx).await;
     if tasks.len() as u64 > batch_max_tasks {
-        return err(&format!("troppi task in un batch (max {batch_max_tasks})"));
+        return RispostaTool::fallito_rimediabile(format!(
+            "[Errore: {} task in un solo batch, il massimo e' {batch_max_tasks}: \
+             spezza il batch in piu' chiamate.]",
+            tasks.len()
+        ));
     }
     let configured_max = read_max_parallel_subagents(ctx).await;
     let max_parallel = input
@@ -596,45 +743,16 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
     // `background=true` il batch salta l'isolamento e va sempre sul ramo
     // sequenziale con `is_background=true` (scelta piu' semplice e sicura). Letto
     // come CAMPO strutturato (regola M).
-    let background = background_active(ctx, input).await;
+    let richiesto = input
+        .get("background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let background = background_active(ctx, richiesto).await;
 
-    let mut parsed: Vec<ParsedTask> = Vec::with_capacity(tasks.len());
-    for (i, t) in tasks.iter().enumerate() {
-        let kind = t
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let task = t
-            .get("task")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        if kind.is_empty() || task.trim().is_empty() {
-            return err(&format!("task[{i}]: 'kind' e 'task' sono obbligatori"));
-        }
-        let context_blob = t
-            .get("context")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let expected = t
-            .get("expected_output_format")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        // FASE 2: `write_scope` dichiarato dal task (aree file che il sub-run
-        // scrive). Assente/vuoto -> `subtasks_are_disjoint` degradera' a false ->
-        // ramo sequenziale (sicuro). Fonte: `Todo.write_scope` in `dispatch_wave`.
-        let write_scope = write_scope_of(t);
-        parsed.push(ParsedTask {
-            kind,
-            task,
-            context_blob,
-            expected,
-            write_scope,
-        });
-    }
+    let parsed = match parse_batch_tasks(&tasks) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
+    };
 
     // ── Gating isolamento (regola G + L): il ramo ISOLATO scatta SOLO se
     //    (1) il flag DB `orchestrator.subagent_isolation_enabled` e' ON (cache 60s)
@@ -653,7 +771,9 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
     // sub-run terminati per l'apply serializzato, incompatibile con il fire-and-forget.
     let isolation_available = !background && compute_isolation_available(ctx).await;
     if should_isolate_batch(isolation_available, &scopes) {
-        return run_batch_isolated(ctx, &parsed, max_parallel).await;
+        // Il batch e' partito: l'esito per-task sta nei `results` dell'aggregato
+        // (compresi i conflitti di apply), come nel ramo condiviso qui sotto.
+        return RispostaTool::riuscito(run_batch_isolated(ctx, &parsed, max_parallel).await);
     }
 
     // ── Ramo sequenziale/condiviso (invariato con background=false) ────────────
@@ -802,7 +922,7 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
     ) {
         out["advisory_synthesis"] = synthesis.to_value();
     }
-    out.to_string()
+    RispostaTool::riuscito(out.to_string())
 }
 
 /// Un task del batch, parsato dall'input del tool. `write_scope` alimenta il gating
@@ -2043,7 +2163,7 @@ fn prepare_reject(error_code: &'static str, message: impl Into<String>) -> Value
     json!({
         "error": message.into(),
         "error_code": error_code,
-        "status": "prepare_failed",
+        "status": STATUS_PREPARE_FAILED,
         "outcome": terminal_verdict("failed", error_code, None),
     })
 }
@@ -5016,7 +5136,7 @@ async fn finalize_timeout(
     let mut out = json!({
         K_SUB_RUN_ID: sub_run_id.to_string(),
         "kind": kind,
-        "status": "timeout",
+        "status": STATUS_TIMEOUT,
         "error": errore,
         // Verdetto ESITO strutturato (regola M): il coordinatore legge
         // success/verdict/timeout_cause qui, mai dalla prosa di `error`.
@@ -5454,31 +5574,54 @@ async fn build_native_deps_for_tool(
     }
 }
 
-/// `nexus_subagent_poll` — stato di una sub-run da `nexus_subagent_runs` (DB-only,
-/// niente brain). Il main lo usa per i kind background.
-/// Pool del progetto per i tool sub-agent (poll/resume), o messaggio d'errore
-/// gia' formattato col marker del tool (il contratto dei tool_result e' la
-/// stringa). Punto unico locale del pattern (regola L): i due tool condividono
+/// Pool del progetto per i tool sub-agent (poll/resume), o il fallimento gia'
+/// costruito. Punto unico locale del pattern (regola L): i due tool condividono
 /// identica risoluzione e identico esito di indisponibilita'.
-async fn subagent_tool_pool(ctx: &AgentToolContext, tool: &str) -> Result<sqlx::PgPool, String> {
+///
+/// La natura e' [`NaturaFallimento::DelSistema`]: un DB di progetto irraggiungibile
+/// non dipende da cio' che l'agente ha chiesto, e riprovare la stessa chiamata non
+/// lo rende raggiungibile.
+async fn subagent_tool_pool(
+    ctx: &AgentToolContext,
+    tool: &str,
+) -> Result<sqlx::PgPool, RispostaTool> {
     crate::project_db_routes::project_data_pool_from(&ctx.core.db, ctx.core.project_id)
         .await
-        .map_err(|e| format!("\u{274C} [{tool}] DB progetto non disponibile: {e}"))
+        .map_err(|e| {
+            RispostaTool::fallito_di_sistema(format!(
+                "[Errore: {tool} non puo' leggere il DB del progetto: {e}]"
+            ))
+        })
 }
 
-pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> String {
-    let run_id = match input.get(K_SUB_RUN_ID).and_then(Value::as_str) {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => {
-            return "\u{274C} [nexus_subagent_poll] parametro 'subagent_run_id' obbligatorio"
-                .to_string()
-        }
+/// `nexus_subagent_poll` — stato di una sub-run da `nexus_subagent_runs` (DB-only,
+/// niente brain). Il main lo usa per i kind background.
+///
+/// ESITO DEL POLL, NON DEL SUB-RUN interrogato: riferire che una figura e'
+/// `failed` e' il lavoro di questo tool, e farlo e' un successo. Il verdetto del
+/// sub-run viaggia strutturato nel campo `outcome` del payload (regola M).
+pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> RispostaTool {
+    use nexus_agent_tools::{input_contract::InputTool, tool_inputs::NexusSubagentPollInput};
+
+    let params = match NexusSubagentPollInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
+    // Trim come in `nexus_subagent_resume`: la riga si cerca per `id::text = $1`,
+    // quindi uno spazio di troppo non produce "run non trovato" ma la stessa
+    // risposta di un id INESISTENTE — due cause diverse sotto lo stesso testo.
+    let run_id = params.subagent_run_id.trim().to_string();
+    if run_id.is_empty() {
+        return RispostaTool::fallito_rimediabile(
+            "[Errore: 'subagent_run_id' vuoto: passa l'UUID che dispatch_subagent ha \
+             ritornato nel campo subagent_run_id.]",
+        );
+    }
     // Routing separazione DB: nexus_subagent_runs e' migrata; il sub-run e' nel DB
     // del progetto corrente (stesso project_id che lo ha dispatchato).
     let proj_pool = match subagent_tool_pool(ctx, "nexus_subagent_poll").await {
         Ok(p) => p,
-        Err(msg) => return msg,
+        Err(risposta) => return risposta,
     };
     let row = sqlx::query(
         "SELECT id::text, status, kind, final_summary, artifacts, iterations,
@@ -5489,7 +5632,7 @@ pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> 
     .bind(&run_id)
     .fetch_optional(&proj_pool)
     .await;
-    match row {
+    let payload = match row {
         Ok(Some(r)) => json!({
             K_SUB_RUN_ID: r.try_get::<String, _>("id").unwrap_or_default(),
             "status": r.try_get::<String, _>("status").unwrap_or_default(),
@@ -5510,31 +5653,46 @@ pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> 
             // poll legge success/verdict qui senza dedurre l'esito dalla prosa
             // di `summary` (regola M).
             "outcome": r.try_get::<Option<Value>, _>("verdict").unwrap_or(None),
-        })
-        .to_string(),
-        Ok(None) => format!("\u{274C} [nexus_subagent_poll] sub-agent run '{run_id}' non trovato"),
-        Err(e) => format!("\u{274C} [nexus_subagent_poll] query fallita: {e}"),
-    }
+        }),
+        // Un id che non esiste e' un errore RIMEDIABILE, non un elenco vuoto:
+        // qui si interroga UNA riga per chiave, e la chiave e' sbagliata.
+        Ok(None) => {
+            return RispostaTool::fallito_rimediabile(format!(
+                "[Errore: nessun sub-agent run con id '{run_id}'. Usa il valore di \
+                 subagent_run_id ritornato dal dispatch di questo run.]"
+            ))
+        }
+        Err(e) => {
+            return RispostaTool::fallito_di_sistema(format!(
+                "[Errore: interrogazione di nexus_subagent_runs fallita: {e}]"
+            ))
+        }
+    };
+    RispostaTool::riuscito(payload.to_string())
 }
 
 /// `nexus_subagent_resume` — riprende una sub-run sul GRAFO NATIVO (niente brain).
 /// Il run nativo gira da capo dal task della row (i checkpoint del sub-run vivono
 /// su `nexus_graph_checkpoints`, ma la ripresa nativa qui ri-esegue il sub-run dal
 /// suo `run_id`: la stessa thread del grafo riprende dal checkpoint persistente).
-pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -> String {
-    let run_id_str = match input.get(K_SUB_RUN_ID).and_then(Value::as_str) {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => {
-            return "\u{274C} [nexus_subagent_resume] parametro 'subagent_run_id' obbligatorio"
-                .to_string()
-        }
+pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -> RispostaTool {
+    use nexus_agent_tools::{input_contract::InputTool, tool_inputs::NexusSubagentResumeInput};
+
+    let params = match NexusSubagentResumeInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
-    let run_id = match Uuid::parse_str(&run_id_str) {
+    let run_id_str = params.subagent_run_id;
+    // Il contratto dichiara una stringa (il tipo dell'UUID non e' nello schema
+    // che il modello legge): la forma la si controlla qui, ed e' rimediabile
+    // perche' il messaggio nomina il campo e da dove prenderne il valore.
+    let run_id = match Uuid::parse_str(run_id_str.trim()) {
         Ok(u) => u,
         Err(_) => {
-            return format!(
-                "\u{274C} [nexus_subagent_resume] subagent_run_id non valido: {run_id_str}"
-            )
+            return RispostaTool::fallito_rimediabile(format!(
+                "[Errore: 'subagent_run_id' non e' un UUID: '{run_id_str}'. Usa il valore \
+                 ritornato dal dispatch nel campo subagent_run_id.]"
+            ))
         }
     };
 
@@ -5542,7 +5700,7 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
     // e' nel DB del progetto corrente (stesso project_id che lo ha dispatchato).
     let proj_pool = match subagent_tool_pool(ctx, "nexus_subagent_resume").await {
         Ok(p) => p,
-        Err(msg) => return msg,
+        Err(risposta) => return risposta,
     };
     let row = sqlx::query(
         "SELECT kind, task_description, context_blob, expected_format, status, depth, parent_run_id
@@ -5554,14 +5712,25 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
     let row = match row {
         Ok(Some(r)) => r,
         Ok(None) => {
-            return format!("\u{274C} [nexus_subagent_resume] sub-agent run '{run_id}' non trovato")
+            return RispostaTool::fallito_rimediabile(format!(
+                "[Errore: nessun sub-agent run con id '{run_id}' in questo progetto. \
+                 Verifica il subagent_run_id con nexus_subagent_poll.]"
+            ))
         }
-        Err(e) => return format!("\u{274C} [nexus_subagent_resume] query fallita: {e}"),
+        Err(e) => {
+            return RispostaTool::fallito_di_sistema(format!(
+                "[Errore: interrogazione di nexus_subagent_runs fallita: {e}]"
+            ))
+        }
     };
     let status: String = row.get("status");
-    if !matches!(status.as_str(), "paused" | "running" | "timeout") {
-        return json!({"status": "noop", K_SUB_RUN_ID: run_id_str, "current_status": status})
-            .to_string();
+    if !matches!(status.as_str(), "paused" | "running" | STATUS_TIMEOUT) {
+        // Il sub-run e' gia' terminale: non c'e' niente da riprendere, e dirlo e'
+        // la risposta corretta alla domanda posta — non un fallimento del tool.
+        // Il payload porta `current_status`, che e' cio' su cui il chiamante
+        // decide (regola M).
+        let noop = json!({"status": "noop", K_SUB_RUN_ID: run_id_str, "current_status": status});
+        return RispostaTool::riuscito(noop.to_string());
     }
     let kind: String = row.get("kind");
     let task: String = row.get("task_description");
@@ -5582,9 +5751,22 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
     // ripresa di un singolo sub-run non e' un batch parallelo-che-scrive.
     // Il resume e' SINCRONO (bloccante): riprende un singolo sub-run e ne attende
     // l'esito, non e' un dispatch background.
-    let res =
-        run_single_subagent(ctx, &kind, &task, &context_blob, &expected, None, false, &[]).await;
-    res.to_string()
+    // Stessa classificazione del dispatch singolo (punto unico): la ripresa
+    // percorre lo stesso prepare + grafo, quindi puo' fallire per le stesse
+    // ragioni e le due domande — «e' ripartito?» e «ha consegnato?» — sono le
+    // stesse.
+    let payload = run_single_subagent(
+        ctx,
+        &kind,
+        &task,
+        &context_blob,
+        &expected,
+        None,
+        false,
+        &[],
+    )
+    .await;
+    risposta_dal_dispatch(payload)
 }
 
 #[cfg(test)]
@@ -5848,11 +6030,133 @@ mod tests {
         assert_eq!(ritardo_scatto_ms(5_000, -7), 5_000);
     }
 
+    /// I quattro tool sub-agent portano l'esito in un CAMPO (regola Q), e il
+    /// caso che il marker in testa al testo non poteva coprire e' il rifiuto in
+    /// fase prepare: il payload e' un JSON, quindi comincia con `{` e nessun
+    /// `is_tool_failure` lo avrebbe mai riconosciuto — un sub-run mai nato
+    /// arrivava al modello come un successo.
     #[test]
-    fn err_ha_marker_errore() {
-        let m = err("boom");
-        assert!(m.starts_with('\u{274C}'));
-        assert!(m.contains("dispatch_subagent"));
+    fn rifiuto_prepare_e_un_fallimento_dichiarato() {
+        let r = risposta_dal_dispatch(prepare_reject(
+            "kind_not_whitelisted",
+            "kind 'pippo' non in whitelist: [\"plan\"]",
+        ));
+        assert!(r.esito.e_fallito(), "{r:?}");
+        // Il kind sbagliato lo corregge l'agente: il messaggio elenca gli ammessi.
+        assert_eq!(r.natura, Some(NaturaFallimento::Rimediabile), "{r:?}");
+        // Il payload resta INTATTO: i suoi lettori leggono `error_code`.
+        assert!(r.testo.contains("kind_not_whitelisted"), "{r:?}");
+
+        let sistema = risposta_dal_dispatch(prepare_reject(
+            "cost_cap_reached",
+            "cost cap raggiunto per parent=X",
+        ));
+        assert_eq!(
+            sistema.natura,
+            Some(NaturaFallimento::DelSistema),
+            "{sistema:?}"
+        );
+
+        // `kind_not_found` NON e' rimediabile, e la differenza col caso qui sopra
+        // e' misurabile nel messaggio: quello elenca la whitelist, questo no —
+        // perche' non c'e' niente da elencare. Il guard della whitelist precede
+        // la lettura del registry, quindi il kind era AMMESSO e manca solo la sua
+        // definizione: una divergenza fra due righe di configurazione, non una
+        // scelta dell'agente. Dichiararlo `Rimediabile` avrebbe mandato il
+        // modello a «usare le informazioni qui sopra», che non ci sono.
+        let registro = risposta_dal_dispatch(prepare_reject(
+            "kind_not_found",
+            "kind 'plan' non trovato in nexus_subagent_definitions",
+        ));
+        assert_eq!(
+            registro.natura,
+            Some(NaturaFallimento::DelSistema),
+            "{registro:?}"
+        );
+    }
+
+    /// «Il sub-run non e' partito» e «e' partito e non ha consegnato» sono due
+    /// esiti diversi, e un sub-run che CONSEGNA e' un tool riuscito anche col
+    /// verdetto negativo (il verdetto e' un campo di `outcome`, non l'esito del
+    /// tool).
+    #[test]
+    fn esito_del_tool_distinto_da_quello_del_sub_run() {
+        // Background in volo: il dispatch e' riuscito, l'esito arrivera' al fan-in.
+        let volo = risposta_dal_dispatch(json!({
+            "background_dispatched": true, K_SUB_RUN_ID: "x", "status": "running",
+        }));
+        assert!(!volo.esito.e_fallito(), "{volo:?}");
+        // Consegnato: `completed` e `paused` (interrupt HITL) sono entrambi
+        // consegne, e `paused` NON ha `outcome.success` — leggerlo li' avrebbe
+        // trasformato un'attesa di conferma umana in un fallimento.
+        for status in ["completed", "paused"] {
+            let r = risposta_dal_dispatch(json!({"status": status, K_SUMMARY: "fatto"}));
+            assert!(!r.esito.e_fallito(), "{status}: {r:?}");
+        }
+        // Nato e chiuso alla scadenza: nessun riassunto consegnato.
+        let scaduto = risposta_dal_dispatch(json!({"status": STATUS_TIMEOUT, "error": "scaduto"}));
+        assert!(scaduto.esito.e_fallito(), "{scaduto:?}");
+        assert_eq!(
+            scaduto.natura,
+            Some(NaturaFallimento::Rimediabile),
+            "{scaduto:?}"
+        );
+        // Motore schiantato: `finalize_failure` non scrive alcun `status`.
+        let motore = risposta_dal_dispatch(json!({"error": "engine", K_SUB_RUN_ID: "x"}));
+        assert!(motore.esito.e_fallito(), "{motore:?}");
+        assert_eq!(
+            motore.natura,
+            Some(NaturaFallimento::Transitorio),
+            "{motore:?}"
+        );
+        // Il campo `error` decide ANCHE con uno status che questo match non
+        // nomina: gli altri rami di questo file ne scrivono gia' tre (`failed`
+        // del fan-out interrotto, `conflict` e `apply_failed` dell'apply
+        // isolato), e legare il guard allo status VUOTO li avrebbe fatti uscire
+        // riusciti.
+        //
+        // MUTAZIONE: riportando il braccio a `"" if ha_errore`, questo assert
+        // rosseggia con `e_fallito() == false`.
+        for status in ["failed", "conflict", "apply_failed"] {
+            let r = risposta_dal_dispatch(json!({"status": status, "error": "guasto"}));
+            assert!(r.esito.e_fallito(), "{status}: {r:?}");
+        }
+    }
+
+    /// Il batch accetta i task che il `todo_runner` compone davvero — compreso
+    /// `write_scope`, che il contratto d'ingresso non dichiara e che il gating
+    /// dell'isolamento legge.
+    ///
+    /// La voce arriva dal PRODUTTORE (`todo_runner::subagent_task_json`, punto
+    /// unico della forma per i suoi due rami), non da un `json!` ricopiato qui:
+    /// regola O — una copia locale fisserebbe l'assunto da verificare e
+    /// resterebbe verde il giorno in cui il produttore aggiunge un campo che
+    /// questo consumatore non conosce.
+    #[test]
+    fn il_batch_conserva_lo_scope_dichiarato_dal_piano() {
+        let tasks = vec![
+            nexus_agent_graph::nodes::todo_runner::subagent_task_json(
+                "implement",
+                "scrivi il backend",
+                "ctx",
+                json!(["backend/"]),
+            ),
+        ];
+        let parsed = parse_batch_tasks(&tasks).expect("task valido");
+        assert_eq!(parsed[0].kind, "implement");
+        assert_eq!(parsed[0].task, "scrivi il backend");
+        assert_eq!(parsed[0].context_blob, "ctx");
+        // Il formato atteso lo scrive il produttore, non questo test: si asserisce
+        // che sia ARRIVATO, non quale frase sia.
+        assert!(!parsed[0].expected.is_empty(), "{:?}", parsed[0].expected);
+        assert_eq!(parsed[0].write_scope, vec!["backend/".to_string()]);
+        // Voce senza `task`: fallimento rimediabile che NOMINA l'indice.
+        let rotti = vec![json!({"kind": "implement", "task": "  "})];
+        let Err(errore) = parse_batch_tasks(&rotti) else {
+            panic!("un task vuoto deve essere rifiutato");
+        };
+        assert!(errore.esito.e_fallito(), "{errore:?}");
+        assert!(errore.testo.contains("tasks[0]"), "{errore:?}");
     }
 
     /// Outcome minimo per i test dei contatori: tutti i campi a zero/None.

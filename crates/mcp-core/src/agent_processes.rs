@@ -375,7 +375,14 @@ pub async fn spawn_agent_process(
             .as_ref()
             .ok_or_else(|| "project_root mancante con use_docker=true".to_string())?;
         let cwd = PathBuf::from(working_dir);
-        let project_cfg = sandbox::load_project_sandbox_config(db, project_id).await;
+        // La lettura fallita non degrada ai default: gli override che non si
+        // sono potuti leggere comprendono `network_mode`, e partire con
+        // l'isolamento sbagliato produce un guasto molto piu' a valle (il
+        // servizio non raggiunge la rete, o la raggiunge quando non doveva) che
+        // nessun messaggio collegherebbe a questa lettura.
+        let project_cfg = sandbox::load_project_sandbox_config(db, project_id)
+            .await
+            .map_err(|e| format!("sandbox config del progetto non leggibile: {e}"))?;
         let mut config =
             SandboxConfig::new(root.clone(), process_id).with_project_config(&project_cfg);
         if let Some(img) = service_image {

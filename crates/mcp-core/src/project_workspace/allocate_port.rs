@@ -32,6 +32,71 @@ pub struct AllocatedPort {
     pub mode: &'static str, // "existing" | "dynamic" | "adopted" | "reallocated"
 }
 
+/// Perche' `find_or_allocate` non ha potuto dare una porta.
+///
+/// # Perche' un tipo e non la `String` di prima
+///
+/// I casi non si assomigliano: uno lo corregge il chiamante, uno passa da solo,
+/// gli altri no. Appiattiti in una stringa, il consumatore che deve
+/// scegliere la strategia — il tool `request_port`, che la traduce in
+/// [`nexus_types::tool_outcome::NaturaFallimento`] — aveva due sole uscite:
+/// dichiararli tutti dello stesso tipo, o rileggere il messaggio per
+/// distinguerli (regola M al contrario). Ha scelto la prima, e cosi' la
+/// condizione TRANSITORIA arrivava al modello con la direttiva «ripeterla non
+/// cambiera' l'esito», mentre il testo dello stesso errore diceva «riprova fra
+/// poco»: due istruzioni opposte nella stessa risposta.
+///
+/// # Cosa NON e' qui dentro, e perche'
+///
+/// Il bucket pieno non compare perche' non produce un errore: ripiega su
+/// `find_free_project_port`. Elencarlo qui lo farebbe sembrare gestito.
+#[derive(Debug, thiserror::Error)]
+pub enum ErroreAllocazione {
+    /// L'ha chiesta il chiamante senza dare un'identita' al servizio.
+    #[error("label vuota: specifica un nome (es. 'backend', 'frontend')")]
+    LabelVuota,
+    /// La porta e' stata scelta ma il REGISTRO non l'ha registrata.
+    ///
+    /// Non e' un dettaglio di persistenza: la postcondizione di
+    /// `find_or_allocate` — «la porta ritornata e' registrata a
+    /// `(project_id, label)`» — e' cio' su cui contano tutti quelli che vengono
+    /// dopo. `link_allocation_to_service_unit` non trova la riga da annotare, il
+    /// GC non ha nulla da proteggere, il resource_linter la vede come porta non
+    /// allocata e il port enforcer TERMINA il processo che ci ascolta. I tre
+    /// punti di scrittura la inghiottivano con un `tracing::warn!` e
+    /// ritornavano `Ok`: il chiamante riceveva un numero valido e un servizio
+    /// destinato a essere ucciso, senza che nessuno l'avesse dichiarato.
+    #[error("porta {porta} scelta ma non registrata in nexus_port_allocations: {causa}")]
+    RegistroNonScritto { porta: u16, causa: String },
+    /// La tabella dei listener del SO non e' interrogabile in questo momento
+    /// (pool di porte effimere esaurito, permessi, WSAENOBUFS): nessuna
+    /// allocazione e' stata toccata, e fra poco la stessa chiamata puo'
+    /// riuscire.
+    #[error(
+        "stato delle porte non interrogabile in questo momento: riprova fra poco \
+         (nessuna allocazione modificata)"
+    )]
+    StatoPorteNonInterrogabile,
+    /// Il progetto ha gia' allocato tutte le porte che la sua quota consente.
+    /// Ripetere non la alza.
+    #[error("{0}")]
+    QuotaSuperata(String),
+}
+
+impl ErroreAllocazione {
+    /// Di chi e' il problema, e quindi che cosa ha senso fare dopo. Lo dichiara
+    /// QUI chi conosce la causa: e' l'unico punto in cui l'informazione esiste
+    /// ancora in forma strutturata.
+    pub fn natura(&self) -> nexus_types::tool_outcome::NaturaFallimento {
+        use nexus_types::tool_outcome::NaturaFallimento as N;
+        match self {
+            Self::LabelVuota => N::Rimediabile,
+            Self::StatoPorteNonInterrogabile => N::Transitorio,
+            Self::RegistroNonScritto { .. } | Self::QuotaSuperata(_) => N::DelSistema,
+        }
+    }
+}
+
 /// Decisione PURA (testabile, regola L) su cosa fare quando la porta di una
 /// allocazione esistente risponde al probe TCP: la porta e' DAVVERO occupata,
 /// e la scelta dipende da CHI la occupa e dalla liberabilita'.
@@ -89,10 +154,10 @@ pub async fn find_or_allocate(
     registry: &PortRegistryCache,
     project_id: Uuid,
     label: &str,
-) -> Result<AllocatedPort, String> {
+) -> Result<AllocatedPort, ErroreAllocazione> {
     let label = label.trim();
     if label.is_empty() {
-        return Err("label vuota: specifica un nome (es. 'backend', 'frontend')".to_string());
+        return Err(ErroreAllocazione::LabelVuota);
     }
 
     // 1. Idempotenza: se esiste gia' una allocazione con questa label, riusala
@@ -135,11 +200,7 @@ pub async fn find_or_allocate(
                     label = %label,
                     "allocazione porte: tabella dei listener non interrogabile, la riga resta com'e'"
                 );
-                return Err(
-                    "stato delle porte non interrogabile in questo momento: riprova fra poco \
-                     (nessuna allocazione modificata)"
-                        .to_string(),
-                );
+                return Err(ErroreAllocazione::StatoPorteNonInterrogabile);
             }
         };
         if occupant.is_some() {
@@ -218,6 +279,10 @@ pub async fn find_or_allocate(
                         ownership = %ownership.reason(),
                         "find_or_allocate: la porta allocata e' occupata da un processo che non e' questo servizio, rialloco su porta nuova"
                     );
+                    // Se l'UPDATE non passa, la riga continua a puntare alla
+                    // porta OCCUPATA mentre noi ritorneremmo quella nuova: due
+                    // verita' sulla stessa label, e quella scritta e' la
+                    // sbagliata. Si dichiara.
                     if let Err(e) = sqlx::query(
                         "UPDATE nexus_port_allocations \
                          SET port = $1, allocation_mode = 'dynamic', updated_at = NOW() \
@@ -235,6 +300,10 @@ pub async fn find_or_allocate(
                             label,
                             e
                         );
+                        return Err(ErroreAllocazione::RegistroNonScritto {
+                            porta: new_port,
+                            causa: e.to_string(),
+                        });
                     }
                     record_audit(
                         AuditEntry::allowed(project_id, "port_realloc", "port")
@@ -438,6 +507,10 @@ pub async fn find_or_allocate(
         .bind(label)
         .execute(db)
         .await;
+        // Il servizio e' gia' in ascolto qui, ma senza la riga la sua porta e'
+        // «non allocata» per il resource_linter e per il port enforcer, che lo
+        // termina. Ritornare la porta comunque significherebbe consegnare al
+        // chiamante un servizio vivo e condannato, senza dirglielo.
         if let Err(e) = upsert {
             tracing::warn!(
                 "find_or_allocate: upsert existing fallito (porta {} label {}): {}",
@@ -445,6 +518,10 @@ pub async fn find_or_allocate(
                 label,
                 e
             );
+            return Err(ErroreAllocazione::RegistroNonScritto {
+                porta: existing_port,
+                causa: e.to_string(),
+            });
         }
         record_audit(
             AuditEntry::allowed(project_id, "port_reuse", "port")
@@ -468,7 +545,7 @@ pub async fn find_or_allocate(
                 .with_resource(label.to_string())
                 .with_details(serde_json::json!({"reason": reason})),
         );
-        return Err(reason);
+        return Err(ErroreAllocazione::QuotaSuperata(reason));
     }
 
     // 3. Prima allocazione: porta DETERMINISTICA per (project_id, label) nel bucket
@@ -498,6 +575,9 @@ pub async fn find_or_allocate(
     .bind(label)
     .execute(db)
     .await;
+    // Prima allocazione: senza questa riga la porta non esiste per nessuno dei
+    // consumatori del registro, e `request_port` dichiarava RIUSCITO
+    // l'ottenimento di una porta che il port enforcer avrebbe poi terminato.
     if let Err(e) = insert_result {
         tracing::warn!(
             "allocate_port: INSERT fallito (porta {} label {}): {}",
@@ -505,6 +585,10 @@ pub async fn find_or_allocate(
             label,
             e
         );
+        return Err(ErroreAllocazione::RegistroNonScritto {
+            porta: port,
+            causa: e.to_string(),
+        });
     }
 
     // 5. Audit allocato
@@ -868,7 +952,7 @@ pub async fn allocate_port(
 
     let result = find_or_allocate(&state.db, &state.port_registry, project_id, &body.label)
         .await
-        .map_err(|e| api_error(StatusCode::CONFLICT, &e))?;
+        .map_err(|e| api_error(StatusCode::CONFLICT, e.to_string()))?;
 
     Ok(Json(json!({
         "port": result.port,

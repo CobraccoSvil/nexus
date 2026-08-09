@@ -298,7 +298,17 @@ fn deterministic_point_id(project_id: Uuid, marker: &[u8], parts: &[&str]) -> St
 
 /// Costruisce il payload JSON di un punto dell'indice bootstrap. Gemello di
 /// `code_point_payload`. Estratto da `embed_and_upsert_bootstrap_docs`.
-fn bootstrap_point_payload(project_id: Uuid, key: &str, title: &str, text: &str) -> Value {
+///
+/// E' l'UNICO produttore della collection `project_context`, quindi le chiavi
+/// che scrive qui (`title`, `text`) sono le sole che un lettore di quella
+/// collection possa trovare: `agent_tools::semantic_tools` si prova contro
+/// questa funzione invece che contro un payload riscritto a mano (regola O).
+pub(crate) fn bootstrap_point_payload(
+    project_id: Uuid,
+    key: &str,
+    title: &str,
+    text: &str,
+) -> Value {
     json!({
         "project_id": project_id.to_string(),
         "type": "project_bootstrap",

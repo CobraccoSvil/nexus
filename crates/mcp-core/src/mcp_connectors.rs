@@ -22,6 +22,7 @@ use axum::{
     extract::{Extension, Path as AxumPath, State},
     Json,
 };
+use nexus_types::tool_outcome::tool_failure;
 use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
@@ -129,6 +130,27 @@ pub async fn load_mcp_tools_for_agent(
 }
 
 /// Esegue un tool MCP dato il server_id e il nome tool originale.
+///
+/// # I quattro fallimenti DICHIARANO di esserlo
+///
+/// Il testo che esce di qui e' il tool_result di `nexus_mcp_tool_call` sul suo
+/// percorso ESTERNO: unico chiamante `mcp_runtime::handle_mcp_tool_call`, unico
+/// chiamante di quello il dispatch del meta-tool. Li' il ponte
+/// [`nexus_types::tool_outcome::RispostaTool::da_testo_legacy`] ricostruisce
+/// l'esito dal marker — che e' l'unico canale rimasto a una firma `String` — e
+/// senza marker legge SUCCESSO.
+///
+/// I quattro rami sotto uscivano nudi: server disabilitato, tool bloccato dalla
+/// policy del plugin, errore DICHIARATO dal server MCP (`result.is_error`, un
+/// segnale strutturato del protocollo appiattito in prosa) ed errore di
+/// trasporto arrivavano tutti al modello come esecuzioni riuscite, col testo
+/// "Errore: ..." dentro il corpo di un successo.
+///
+/// Non e' un canale nuovo (regola Q): e' la meta' mancante di quello che il
+/// chiamante DIRETTO usa gia' un salto piu' su — `handle_mcp_tool_call`
+/// dichiara i propri quattro rifiuti con `mcp_tool_failure`, che e' lo stesso
+/// `tool_failure` di qui. Sparisce quando questa catena portera' l'esito in un
+/// campo.
 pub async fn execute_mcp_tool(
     db: &sqlx::PgPool,
     server_id: Uuid,
@@ -141,15 +163,26 @@ pub async fn execute_mcp_tool(
     )
     .bind(server_id)
     .fetch_optional(db)
-    .await
-    .ok()
-    .flatten();
+    .await;
+
+    // Le due cause NON sono la stessa: `.ok().flatten()` faceva di un registro
+    // illeggibile un "server non trovato", cioe' mandava a cercare una riga
+    // sbagliata chi aveva passato l'id giusto.
+    let row = match row {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, %server_id, "execute_mcp_tool: registro server non interrogabile");
+            return tool_failure(
+                "Errore: registro dei server MCP non interrogabile (DB). \
+                 Il server richiesto potrebbe esistere: riprovare non dipende dagli argomenti.",
+            );
+        }
+    };
 
     let Some(row) = row else {
-        return format!(
-            "Errore: server MCP {} non trovato o disabilitato",
-            server_id
-        );
+        return tool_failure(format!(
+            "Errore: server MCP {server_id} non trovato o disabilitato"
+        ));
     };
 
     let transport: String = row.try_get("transport").unwrap_or_default();
@@ -227,10 +260,9 @@ pub async fn execute_mcp_tool(
                 .execute(db)
                 .await;
 
-                return format!(
-                    "Errore: tool MCP '{}' non consentito dalla policy del plugin",
-                    tool_name
-                );
+                return tool_failure(format!(
+                    "Errore: tool MCP '{tool_name}' non consentito dalla policy del plugin"
+                ));
             }
         }
     }
@@ -258,11 +290,60 @@ pub async fn execute_mcp_tool(
                 .await;
             }
             if result.is_error {
-                format!("Errore dal server MCP '{}': {}", name, result.content)
+                // `is_error` e' il segnale STRUTTURATO del protocollo MCP: qui
+                // diventa testo perche' la firma non ha un campo, ma il marker
+                // lo conserva come esito leggibile dal ponte (regola M).
+                tool_failure(format!(
+                    "Errore dal server MCP '{}': {}",
+                    name, result.content
+                ))
             } else {
                 result.content
             }
         }
-        Err(e) => format!("Errore chiamata MCP '{}': {}", name, e),
+        Err(e) => tool_failure(format!("Errore chiamata MCP '{name}': {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexus_types::tool_outcome::RispostaTool;
+    use std::time::Duration;
+
+    /// Pool LAZY che fallisce SUBITO: `connect_lazy` non apre nulla alla
+    /// costruzione, e l'`acquire_timeout` corto evita i 30 secondi di default
+    /// quando la query prova davvero a collegarsi.
+    fn pool_che_fallisce() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://test:test@127.0.0.1:1/test")
+            .expect("connect_lazy non apre connessioni: basta l'URL ben formata")
+    }
+
+    /// Il fallimento arriva al modello DICHIARATO come tale.
+    ///
+    /// Si asserisce la CONSEGUENZA e non la stringa (regola O): il consumatore
+    /// vero e' il ponte del dispatch, che da questo testo ricostruisce l'esito
+    /// di `nexus_mcp_tool_call`. Senza marker leggeva `Riuscito`, cioe' il
+    /// modello riceveva "Errore: ..." dentro un successo e proseguiva come se
+    /// il tool esterno avesse lavorato.
+    ///
+    /// Il ramo raggiunto qui e' quello del registro non interrogabile — la
+    /// query fallisce perche' la porta e' chiusa — che prima non esisteva
+    /// affatto: `.ok().flatten()` lo confondeva con "server non trovato".
+    ///
+    /// MUTAZIONE: togliendo `tool_failure` da quel ramo, `e_fallito()` torna
+    /// falso e il test rosseggia.
+    #[tokio::test]
+    async fn il_fallimento_di_execute_mcp_tool_e_leggibile_dal_ponte() {
+        let db = pool_che_fallisce();
+        let testo = execute_mcp_tool(&db, Uuid::new_v4(), "qualsiasi", json!({})).await;
+        let risposta = RispostaTool::da_testo_legacy(testo);
+        assert!(
+            risposta.esito.e_fallito(),
+            "un fallimento senza marker torna al modello come successo: {}",
+            risposta.testo
+        );
     }
 }

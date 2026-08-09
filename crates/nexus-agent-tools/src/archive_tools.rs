@@ -8,13 +8,23 @@ use std::io::{Cursor, Read};
 
 use base64::Engine;
 use serde_json::{json, Value};
-use uuid::Uuid;
 
 use nexus_types::tool_outcome::{NaturaFallimento, RispostaTool};
 
-use super::attachment_inspector::{documento_da_allegato, load_attachment, uuid_allegato};
+use super::attachment_inspector::{documento_da_allegato, uuid_allegato};
 use super::read_cache::{self, ReadCacheKey, ReadKind};
 use super::ToolContextCore;
+
+/// Il messaggio che accompagna ogni rifiuto sul CONTENUTO di un archivio.
+///
+/// Sono tutti rimediabili — un percorso sbagliato, un allegato che non e' un
+/// archivio — e la direttiva senza il tool che elenca i percorsi veri sarebbe
+/// una promessa non mantenuta.
+const COME_TROVARE_LE_ENTRY: &str =
+    "Usa nexus_list_archive_entries per i percorsi esatti delle entry di questo archivio.";
+
+/// Formato non riconosciuto: lo dicono i magic bytes, non l'estensione.
+const FORMATO_IGNOTO: &str = "formato archivio non riconosciuto (atteso ZIP/TAR/TAR.GZ)";
 
 /// Formato archivio rilevato dai magic bytes.
 #[derive(Debug, Clone, Copy)]
@@ -66,9 +76,7 @@ pub async fn tool_nexus_list_archive_entries(
         ArchiveFormat::Zip => list_zip_entries(&bytes),
         ArchiveFormat::Tar => list_tar_entries(&bytes, /*gz=*/ false),
         ArchiveFormat::TarGz => list_tar_entries(&bytes, /*gz=*/ true),
-        ArchiveFormat::Unknown => {
-            Err("formato archivio non riconosciuto (atteso ZIP/TAR/TAR.GZ)".into())
-        }
+        ArchiveFormat::Unknown => Err(FORMATO_IGNOTO.into()),
     })
     .await;
 
@@ -149,37 +157,43 @@ fn list_tar_entries(bytes: &[u8], gz: bool) -> Result<Value, String> {
 }
 
 /// `nexus_read_archive_entry(attachment_id, entry_path, encoding?)`.
-pub async fn tool_nexus_read_archive_entry(ctx: &ToolContextCore, input: &Value) -> String {
-    let attachment_id = match input
-        .get("attachment_id")
-        .and_then(Value::as_str)
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        Some(id) => id,
-        None => return crate::errore_json("Parametro 'attachment_id' obbligatorio."),
+pub async fn tool_nexus_read_archive_entry(
+    ctx: &ToolContextCore,
+    input: &Value,
+) -> RispostaTool {
+    use crate::input_contract::InputTool;
+    use crate::tool_inputs::NexusReadArchiveEntryInput;
+
+    let params = match NexusReadArchiveEntryInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
-    let entry_path = match input.get("entry_path").and_then(Value::as_str) {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => return crate::errore_json("Parametro 'entry_path' obbligatorio."),
+    let attachment_id = match uuid_allegato(&params.attachment_id) {
+        Ok(id) => id,
+        Err(risposta) => return risposta,
     };
-    let encoding_req = input
-        .get("encoding")
-        .and_then(Value::as_str)
-        .unwrap_or("auto")
-        .to_lowercase();
-    if !matches!(encoding_req.as_str(), "auto" | "text" | "base64") {
-        return crate::errore_json("encoding deve essere uno di: auto|text|base64");
+    // Il contratto pretende che il campo CI SIA e sia una stringa; che non sia
+    // vuota non lo puo' dire, e quel controllo resta qui.
+    if params.entry_path.is_empty() {
+        return crate::errore_tool(
+            format!("Parametro 'entry_path' vuoto. {COME_TROVARE_LE_ENTRY}"),
+            NaturaFallimento::Rimediabile,
+        );
     }
+    // Il vocabolario dell'encoding viene dal contratto: un valore fuori elenco
+    // non arriva qui, lo ferma la deserializzazione.
+    let encoding_req = params
+        .encoding
+        .map(|e| e.come_stringa())
+        .unwrap_or("auto")
+        .to_string();
+    let entry_path = params.entry_path;
 
-    let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
-        Ok(r) => r,
-        Err(e) => return crate::errore_json(e),
-    };
-
-    let bytes = match tokio::fs::read(&record.file_path).await {
+    let bytes = match documento_da_allegato(ctx, attachment_id).await {
         Ok(b) => b,
-        Err(e) => return crate::errore_json(format!("read fallita: {e}")),
+        Err(risposta) => return risposta,
     };
+
     // Politica "mai troncare-e-buttare": leggiamo l'INTERA entry, nessun cap.
     // FIX 2 (ADR 0012): deduplica via read_cache. La chiave usa una lunghezza
     // sentinella (u64::MAX = "tutto") cosi' la stessa identica richiesta e'
@@ -192,37 +206,49 @@ pub async fn tool_nexus_read_archive_entry(ctx: &ToolContextCore, input: &Value)
         length: u64::MAX,
         encoding: encoding_req.clone(),
     };
-    let db = ctx.db.clone();
-    let entry_path_for_compute = entry_path.clone();
-    let encoding_for_compute = encoding_req.clone();
     read_cache::get_or_compute(&ctx.db, cache_key, move || async move {
-        let format = detect_format(&bytes);
-        let entry_clone = entry_path_for_compute.clone();
-        let result = tokio::task::spawn_blocking(move || match format {
-            ArchiveFormat::Zip => extract_zip_entry(&bytes, &entry_clone),
-            ArchiveFormat::Tar => extract_tar_entry(&bytes, &entry_clone, false),
-            ArchiveFormat::TarGz => extract_tar_entry(&bytes, &entry_clone, true),
-            ArchiveFormat::Unknown => Err("formato archivio non riconosciuto".into()),
-        })
-        .await;
-
-        let (payload, total_size) = match result {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => return crate::errore_json(e),
-            Err(e) => {
-                return crate::errore_json(format!("spawn_blocking fallita: {e}"))
-            }
-        };
-
-        let _ = db; // shut up unused
-        encode_payload(
-            &entry_path_for_compute,
-            payload,
-            total_size,
-            &encoding_for_compute,
-        )
+        estrai_entry(bytes, entry_path, encoding_req).await
     })
     .await
+}
+
+/// Decomprime la entry richiesta e la codifica.
+///
+/// Vive fuori dal tool perche' e' cio' che la cache CALCOLA: un fallimento qui
+/// non viene memorizzato, quindi il chiamante successivo lo incontra di nuovo
+/// invece di ricevere l'invito a «cambiare strategia» che spetta a una lettura
+/// davvero ripetuta.
+async fn estrai_entry(bytes: Vec<u8>, entry_path: String, encoding: String) -> RispostaTool {
+    let format = detect_format(&bytes);
+    let entry_clone = entry_path.clone();
+    let result = tokio::task::spawn_blocking(move || match format {
+        ArchiveFormat::Zip => extract_zip_entry(&bytes, &entry_clone),
+        ArchiveFormat::Tar => extract_tar_entry(&bytes, &entry_clone, false),
+        ArchiveFormat::TarGz => extract_tar_entry(&bytes, &entry_clone, true),
+        ArchiveFormat::Unknown => Err(FORMATO_IGNOTO.into()),
+    })
+    .await;
+
+    let (payload, total_size) = match result {
+        Ok(Ok(v)) => v,
+        // Entry inesistente, archivio corrotto, formato non riconosciuto:
+        // RIMEDIABILE, e il messaggio nomina il tool che elenca i percorsi veri.
+        Ok(Err(e)) => {
+            return crate::errore_tool(
+                format!("{e}. {COME_TROVARE_LE_ENTRY}"),
+                NaturaFallimento::Rimediabile,
+            )
+        }
+        // Il task non e' arrivato in fondo: non e' l'archivio a essere sbagliato.
+        Err(e) => {
+            return crate::errore_tool(
+                format!("spawn_blocking fallita: {e}"),
+                NaturaFallimento::DelSistema,
+            )
+        }
+    };
+
+    RispostaTool::riuscito(encode_payload(&entry_path, payload, total_size, &encoding))
 }
 
 fn extract_zip_entry(bytes: &[u8], entry_path: &str) -> Result<(Vec<u8>, u64), String> {

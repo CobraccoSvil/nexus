@@ -18,19 +18,35 @@
 //! `nexus_text_to_speech` fa l'inverso (OUTPUT audio, gemello di
 //! image_tools::tool_nexus_generate_image): converte un testo in un file audio e
 //! lo salva path-safe nel progetto (`.nexus/generated/<nome>.<ext>`), risolvendo
-//! il modello dal purpose `text_to_speech`.
+//! il modello dal purpose `text_to_speech`. Il formato e' fissato a mp3: il
+//! catalogo non dichiara un parametro con cui l'agente possa sceglierlo, e
+//! l'estensione di salvataggio deve restare coerente col MIME prodotto.
 //!
 //! Niente hardcoded (regola G): il modello arriva dal purpose via routing
 //! (resolve_purpose_via_http), il limite size da settings, l'URL del gateway
 //! dalla porta nel DB. Il gateway possiede routing/cooldown/privacy e mappa la
 //! richiesta al dialetto del provider (regola L: punto unico gateway).
+//!
+//! MIGRATI al contratto d'ingresso e a `RispostaTool` (regola Q): l'esito sta
+//! nel campo `esito` e la NATURA del fallimento accanto, invece che in un marker
+//! anteposto al testo. Le nature seguono il gemello gia' migrato
+//! `image_tools::tool_nexus_generate_image`, perche' la domanda e' la stessa
+//! (regola L): permesso negato e purpose non risolvibile sono del SISTEMA, un
+//! parametro sbagliato e' RIMEDIABILE, cio' che arriva dal gateway e'
+//! l'esaurimento del suo cooldown/failover ed e' TRANSITORIO.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::attachment_inspector::{detect_kind, load_attachment, read_header};
-use super::gateway_client::{gateway_text_to_speech, gateway_transcribe_audio, GwCaller};
+use nexus_types::tool_outcome::{NaturaFallimento, RispostaTool};
+
+use super::attachment_inspector::{
+    detect_kind, load_attachment, read_header, uuid_allegato, AttachmentRecord,
+};
+use super::gateway_client::{
+    gateway_text_to_speech, gateway_transcribe_audio, GwCaller, GwTranscribeOut, GwTtsOut,
+};
 use super::ToolContextCore;
 use nexus_auth::get_setting_checked;
 use nexus_types::routing_client::resolve_purpose_via_http;
@@ -43,6 +59,9 @@ const AUDIO_PURPOSE: &str = "transcribe_audio";
 /// Default safe se il setting agent.attachment.audio_max_bytes non e' impostato.
 /// 25 MB e' il limite dell'API OpenAI /audio/transcriptions.
 const AUDIO_MAX_BYTES_DEFAULT: usize = 25 * 1024 * 1024;
+/// Chiave del limite in `settings`. Costante perche' la nominano sia il lettore
+/// sia i messaggi che mandano a correggerla: tre letterali divergerebbero.
+const AUDIO_MAX_BYTES_KEY: &str = "agent.attachment.audio_max_bytes";
 
 /// Purpose che mappa al modello audio-out (mig 0481, tier=light,
 /// required_capability=audio_out). Punto unico di selezione del modello TTS:
@@ -55,112 +74,155 @@ const GENERATED_SUBDIR: &str = ".nexus/generated";
 /// non specificato altrimenti). Documentato, non un magic fallback di modello.
 const TTS_DEFAULT_FORMAT: &str = "mp3";
 
-pub async fn tool_nexus_transcribe_audio(ctx: &ToolContextCore, input: &Value) -> String {
-    let attachment_id = match input
-        .get("attachment_id")
-        .and_then(Value::as_str)
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        Some(id) => id,
-        None => {
-            return crate::errore_json("Parametro 'attachment_id' obbligatorio (UUID valido).");
-        }
+/// `nexus_transcribe_audio(attachment_id, language?)`.
+pub async fn tool_nexus_transcribe_audio(ctx: &ToolContextCore, input: &Value) -> RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::NexusTranscribeAudioInput};
+
+    let params = match NexusTranscribeAudioInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
-    let language = input
-        .get("language")
-        .and_then(Value::as_str)
+    let attachment_id = match uuid_allegato(&params.attachment_id) {
+        Ok(id) => id,
+        Err(risposta) => return risposta,
+    };
+    // Una lingua fatta di soli spazi equivale a non averla dichiarata: inoltrarla
+    // al provider come codice ISO vuoto e' un modo di sbagliare in silenzio.
+    let language = params
+        .language
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    // 1) Lookup allegato (scoped al project_id corrente, regola E).
-    let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
-        Ok(r) => r,
-        Err(e) => return crate::errore_json(e),
+    let (record, mime_reale) = match audio_trascrivibile(ctx, attachment_id).await {
+        Ok(coppia) => coppia,
+        Err(risposta) => return risposta,
     };
 
-    // 2) Inspect: deve essere audio_*.
-    let header = match read_header(&record.file_path).await {
-        Ok(h) => h,
-        Err(e) => return crate::errore_json(e),
-    };
-    let (kind, mime_reale, _ext) = detect_kind(&header, &record.file_name, &record.mime_type);
-    if !is_audio_kind(&kind) {
-        return crate::errore_json_con_dettagli(json!({
-            "error": format!(
-                "L'allegato non e' un audio (kind rilevato: '{}'). Usa il tool di estrazione corretto per quel kind.",
-                kind
-            ),
-            "kind": kind,
-        }));
-    }
-
-    // 3) Limite size dal DB (no fallback nascosto: default safe documentato).
-    let max_bytes = audio_max_bytes(&ctx.db).await;
-    if record.size_bytes < 0 || (record.size_bytes as usize) > max_bytes {
-        return crate::errore_json_con_dettagli(json!({
-            "error": format!(
-                "Audio troppo grande ({} byte, limite {} byte). Configura 'agent.attachment.audio_max_bytes' in settings se devi alzare il limite.",
-                record.size_bytes, max_bytes
-            ),
-            "size_bytes": record.size_bytes,
-            "max_bytes": max_bytes,
-        }));
-    }
-
-    // 4) Leggi e codifica base64 (il gateway invia il binario come multipart).
+    // Qui il `ErrorKind` c'e' ancora, quindi la natura la legge lui (regola M) e
+    // non il messaggio del sistema operativo, che e' localizzato e cambia fra
+    // Windows e Linux.
     let bytes = match tokio::fs::read(&record.file_path).await {
         Ok(b) => b,
-        Err(e) => return crate::errore_json(format!("read fallita: {e}")),
-    };
-    let audio_base64 = B64.encode(&bytes);
-
-    // 5) Risolvi provider/model dal purpose (regola G: niente modello hardcoded).
-    //    resolve_purpose_via_http e' il punto unico cross-processo che interroga
-    //    il routing tier-only di mcp-core (capability='audio_in').
-    let (provider, model) = match resolve_purpose_via_http(&ctx.db, AUDIO_PURPOSE).await {
-        Ok(pm) => pm,
         Err(e) => {
-            return crate::errore_json(format!(
-                "modello audio-in non risolvibile (purpose '{AUDIO_PURPOSE}'): {e}. \
-                 Verifica nexus_purpose_model.transcribe_audio (mig 0480) e che un modello \
-                 audio-in sia abilitato nel catalog."
-            ));
+            let natura = NaturaFallimento::da_errore_io(&e);
+            return crate::errore_tool(format!("read fallita: {e}"), natura);
         }
     };
 
-    // 6) Trascrivi via gateway (pin del provider risolto). Il gateway gestisce
-    //    routing/cooldown/privacy e mappa la richiesta al dialetto del provider
-    //    (regola L: punto unico gateway).
-    let result = match gateway_transcribe_audio(
-        &ctx.db,
-        &provider,
-        &model,
-        audio_base64,
-        Some(mime_reale.clone()),
-        language,
-        AUDIO_PURPOSE,
-        &GwCaller {
-            user_id: ctx.user_id,
-            project_id: ctx.project_id,
-            run_id: ctx.run_id,
-        },
-    )
-    .await
-    {
+    let result = match trascrivi(ctx, B64.encode(&bytes), mime_reale.clone(), language).await {
         Ok(r) => r,
-        Err(e) => {
-            return crate::errore_json(format!("trascrizione audio via gateway fallita: {e}"));
-        }
+        Err(risposta) => return risposta,
     };
 
-    json!({
-        "attachment_id": record.id.to_string(),
-        "file_name": record.file_name,
-        "mime_type": mime_reale,
-        "text": result.text,
-        "model_used": result.model_used,
-    })
-    .to_string()
+    RispostaTool::riuscito(
+        json!({
+            "attachment_id": record.id.to_string(),
+            "file_name": record.file_name,
+            "mime_type": mime_reale,
+            "text": result.text,
+            "model_used": result.model_used,
+        })
+        .to_string(),
+    )
+}
+
+/// L'allegato e' un audio che si puo' mandare al gateway? Ritorna il record e il
+/// MIME REALE (quello dei magic byte, non quello dichiarato dall'upload).
+///
+/// Le nature sono diverse e per questo la funzione le distingue invece di darne
+/// una sola: un id che non risulta nel progetto lo corregge l'agente, un file
+/// che il DB dichiara e il filesystem non consegna e' un guasto dello storage,
+/// un allegato che non e' audio e' rimediabile PERCHE' il messaggio nomina il
+/// tool con cui scoprire l'estrattore giusto.
+async fn audio_trascrivibile(
+    ctx: &ToolContextCore,
+    attachment_id: Uuid,
+) -> Result<(AttachmentRecord, String), RispostaTool> {
+    // Stessa scelta di `documento_da_allegato`: l'helper appiattisce in una
+    // `String` sia «non trovato» sia «query fallita», e fra i due il caso vivo e'
+    // l'id sbagliato — che `nexus_list_attachments` risolve.
+    let record = load_attachment(&ctx.db, attachment_id, ctx.project_id)
+        .await
+        .map_err(|e| crate::errore_tool(e, NaturaFallimento::Rimediabile))?;
+
+    // DEL SISTEMA e non derivata dal `ErrorKind`: `read_header` ha gia'
+    // appiattito l'errore di I/O in una `String`, quindi il kind qui non c'e'
+    // piu' e ricavarlo dal messaggio sarebbe la regola M al contrario.
+    let header = read_header(&record.file_path)
+        .await
+        .map_err(|e| crate::errore_tool(e, NaturaFallimento::DelSistema))?;
+    let (kind, mime_reale, _ext) = detect_kind(&header, &record.file_name, &record.mime_type);
+    if !is_audio_kind(&kind) {
+        return Err(kind_non_audio(&kind));
+    }
+    limite_dimensione(&ctx.db, &record).await?;
+    Ok((record, mime_reale))
+}
+
+/// Il fallimento di un allegato che non e' audio.
+///
+/// RIMEDIABILE, e il messaggio dice COME: prima mandava a «usare il tool di
+/// estrazione corretto» senza nominarne nessuno, cioe' prometteva un rimedio e
+/// non lo consegnava. `nexus_inspect_attachment` risponde con
+/// `next_action_recommended`, che e' esattamente il dato mancante.
+fn kind_non_audio(kind: &str) -> RispostaTool {
+    let dettagli = json!({
+        "error": format!(
+            "L'allegato non e' un audio (kind rilevato: '{kind}'). Chiama \
+             nexus_inspect_attachment su questo attachment_id: il campo \
+             next_action_recommended nomina il tool di estrazione per questo kind."
+        ),
+        "kind": kind,
+    });
+    crate::errore_tool_con_dettagli(dettagli, NaturaFallimento::Rimediabile)
+}
+
+/// La dimensione dichiarata dal DB sta dentro il limite configurato?
+async fn limite_dimensione(
+    db: &sqlx::PgPool,
+    record: &AttachmentRecord,
+) -> Result<(), RispostaTool> {
+    let max_bytes = audio_max_bytes(db).await?;
+    if record.size_bytes < 0 {
+        return Err(dimensione_non_attendibile(record.size_bytes));
+    }
+    if record.size_bytes as usize > max_bytes {
+        return Err(audio_oltre_limite(record.size_bytes, max_bytes));
+    }
+    Ok(())
+}
+
+/// Dimensione negativa in DB: NON e' «troppo grande».
+///
+/// Il ramo esisteva gia' (`size_bytes < 0` cadeva nello stesso `if` del limite)
+/// ma diceva il falso: mostrava una dimensione negativa accanto a un limite e
+/// mandava ad alzarlo, quando nessun limite ammette una dimensione negativa.
+/// DEL SISTEMA: il dato in colonna e' inattendibile e l'agente non lo scrive.
+fn dimensione_non_attendibile(size_bytes: i64) -> RispostaTool {
+    let dettagli = json!({
+        "error": format!(
+            "L'allegato dichiara una dimensione negativa in DB ({size_bytes} byte): dato \
+             non attendibile, l'audio non viene inviato al provider."
+        ),
+        "size_bytes": size_bytes,
+    });
+    crate::errore_tool_con_dettagli(dettagli, NaturaFallimento::DelSistema)
+}
+
+/// Audio oltre il limite configurato. DEL SISTEMA: ne' alzare una setting ne'
+/// rimpicciolire un allegato gia' caricato sono cose che l'agente possa fare, e
+/// ripetere la chiamata rifallirebbe identica.
+fn audio_oltre_limite(size_bytes: i64, max_bytes: usize) -> RispostaTool {
+    let dettagli = json!({
+        "error": format!(
+            "Audio troppo grande ({size_bytes} byte, limite {max_bytes} byte). Il limite e' \
+             la setting '{AUDIO_MAX_BYTES_KEY}': alzarlo e' una decisione di configurazione, \
+             non un parametro di questa chiamata."
+        ),
+        "size_bytes": size_bytes,
+        "max_bytes": max_bytes,
+    });
+    crate::errore_tool_con_dettagli(dettagli, NaturaFallimento::DelSistema)
 }
 
 /// True se il kind rilevato dal magic-byte detection e' audio (parita' con i kind
@@ -169,28 +231,94 @@ fn is_audio_kind(kind: &str) -> bool {
     matches!(kind, "mp3" | "wav" | "audio")
 }
 
-/// Legge agent.attachment.audio_max_bytes da settings. Se mancante o DB down,
-/// ritorna il default safe documentato (25 MB) e logga WARN. Gemella di
-/// `vision_tools::image_max_bytes` (regola L: stesso pattern di lettura setting).
-async fn audio_max_bytes(db: &sqlx::PgPool) -> usize {
-    match get_setting_checked(db, "agent.attachment.audio_max_bytes").await {
-        Ok(Some(raw)) => match raw.trim().parse::<usize>() {
-            Ok(v) if v > 0 => v,
-            _ => {
-                tracing::warn!(
-                    raw = %raw,
-                    "audio_tools: 'agent.attachment.audio_max_bytes' non parsabile, uso default {}",
-                    AUDIO_MAX_BYTES_DEFAULT
-                );
-                AUDIO_MAX_BYTES_DEFAULT
-            }
-        },
-        Ok(None) => AUDIO_MAX_BYTES_DEFAULT,
-        Err(e) => {
-            tracing::warn!(error = %e, "audio_tools: lettura settings fallita, uso default");
-            AUDIO_MAX_BYTES_DEFAULT
-        }
+/// Il limite in byte da `settings`, oppure il fallimento che lo spiega.
+///
+/// La chiave ASSENTE resta il default documentato: 25 MB e' il limite dell'API
+/// /audio/transcriptions, quindi non configurarla e' una scelta legittima e il
+/// default non e' un fallback nascosto. Gli altri due casi NON ricadono piu' li'
+/// (regola Q: l'ignoto non degrada a «va bene»). Un valore non numerico e' un
+/// errore dell'operatore che il WARN nascondeva applicando un limite che nessuno
+/// aveva chiesto; un DB che non risponde renderebbe comunque impossibili i due
+/// passi successivi (`resolve_purpose_via_http` e la risoluzione porta/token del
+/// gateway leggono entrambi dal DB), quindi dichiararlo qui e' la stessa
+/// interruzione, detta prima e con la causa giusta invece che con un limite
+/// inventato scritto nel messaggio d'errore.
+async fn audio_max_bytes(db: &sqlx::PgPool) -> Result<usize, RispostaTool> {
+    match get_setting_checked(db, AUDIO_MAX_BYTES_KEY).await {
+        Ok(None) => Ok(AUDIO_MAX_BYTES_DEFAULT),
+        Ok(Some(raw)) => raw
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|v| *v > 0)
+            .ok_or_else(|| limite_non_configurato(&raw)),
+        Err(e) => Err(crate::errore_tool(
+            format!("lettura della setting '{AUDIO_MAX_BYTES_KEY}' fallita: {e}"),
+            NaturaFallimento::DelSistema,
+        )),
     }
+}
+
+/// Il limite c'e' in tabella ma non e' un numero di byte positivo. DEL SISTEMA:
+/// e' configurazione di piattaforma, fuori dalla portata dell'agente.
+fn limite_non_configurato(raw: &str) -> RispostaTool {
+    crate::errore_tool(
+        format!(
+            "la setting '{AUDIO_MAX_BYTES_KEY}' non contiene un numero di byte positivo \
+             (valore in DB: '{raw}'): va corretta prima di poter trascrivere un audio."
+        ),
+        NaturaFallimento::DelSistema,
+    )
+}
+
+/// Risolve il modello audio-in dal purpose e trascrive via gateway.
+///
+/// Le due nature sono diverse: un purpose che non risolve e' configurazione di
+/// piattaforma e nessun parametro della chiamata la aggira; cio' che arriva dal
+/// gateway e' invece l'esaurimento del suo cooldown/failover — un fornitore
+/// saturo o irraggiungibile, dove ritentare piu' tardi e' la strategia giusta.
+/// Stessa lettura del gemello `image_tools::tool_nexus_generate_image`.
+async fn trascrivi(
+    ctx: &ToolContextCore,
+    audio_base64: String,
+    mime: String,
+    language: Option<String>,
+) -> Result<GwTranscribeOut, RispostaTool> {
+    let (provider, model) = resolve_purpose_via_http(&ctx.db, AUDIO_PURPOSE)
+        .await
+        .map_err(|e| {
+            crate::errore_tool(
+                format!(
+                    "modello audio-in non risolvibile (purpose '{AUDIO_PURPOSE}'): {e}. \
+                     Verifica nexus_purpose_model.transcribe_audio (mig 0480) e che un \
+                     modello audio-in sia abilitato nel catalog."
+                ),
+                NaturaFallimento::DelSistema,
+            )
+        })?;
+    gateway_transcribe_audio(
+        &ctx.db,
+        &provider,
+        &model,
+        audio_base64,
+        Some(mime),
+        language,
+        AUDIO_PURPOSE,
+        // Identita' del chiamante: senza, il gateway scarta la riga di ledger e
+        // le trascrizioni restano fuori dalla contabilita'.
+        &GwCaller {
+            user_id: ctx.user_id,
+            project_id: ctx.project_id,
+            run_id: ctx.run_id,
+        },
+    )
+    .await
+    .map_err(|e| {
+        crate::errore_tool(
+            format!("trascrizione audio via gateway fallita: {e}"),
+            NaturaFallimento::Transitorio,
+        )
+    })
 }
 
 // ── nexus_text_to_speech (OUTPUT audio) ──────────────────────────────────────
@@ -198,71 +326,99 @@ async fn audio_max_bytes(db: &sqlx::PgPool) -> usize {
 /// Converte un testo in un file audio e lo salva path-safe nel progetto.
 ///
 /// Flusso gemello di image_tools::tool_nexus_generate_image (OUTPUT-file):
-///   1) Gate ctx.can_write (il tool PRODUCE un file su disco): senza permesso,
-///      errore esplicito (regola H).
+///   1) Gate ctx.can_write (il tool PRODUCE un file su disco).
 ///   2) Risolve provider/model dal purpose `text_to_speech` via routing
 ///      (resolve_purpose_via_http): NESSUN nome modello hardcoded (regola G).
 ///   3) Chiama il gateway (`POST /v1/audio/speech`) pinnando il provider risolto.
 ///   4) Decodifica il base64 e salva l'audio path-safe sotto la project_root
-///      (resolve_workspace_target, regola E), con estensione coerente col
-///      response_format richiesto (default mp3).
+///      (resolve_workspace_target, regola E), con estensione coerente col MIME
+///      prodotto dal provider.
 ///   5) Ritorna { audio_path, model_used }.
-pub async fn tool_nexus_text_to_speech(ctx: &ToolContextCore, input: &Value) -> String {
+pub async fn tool_nexus_text_to_speech(ctx: &ToolContextCore, input: &Value) -> RispostaTool {
+    use crate::{input_contract::InputTool, tool_inputs::NexusTextToSpeechInput};
+
     // 1) Permesso di scrittura obbligatorio: il tool PRODUCE un file su disco.
+    //    DEL SISTEMA: e' una decisione del progetto sul run, non un parametro.
     if !ctx.can_write {
-        return crate::errore_json(
-            "Permesso di scrittura non concesso: impossibile salvare l'audio \
-             generato su disco. Esegui in una modalita' che consente la scrittura file.",
+        return crate::errore_tool(
+            "Permesso di scrittura non concesso: impossibile salvare l'audio generato su \
+             disco. Esegui in una modalita' che consente la scrittura file.",
+            NaturaFallimento::DelSistema,
         );
     }
 
-    // 2) Testo obbligatorio + parametri opzionali.
-    let text = match input.get("text").and_then(Value::as_str).map(str::trim) {
-        Some(t) if !t.is_empty() => t.to_string(),
-        _ => {
-            return crate::errore_json(
-                "Parametro 'text' obbligatorio (testo da convertire in audio).",
-            );
-        }
+    let params = match NexusTextToSpeechInput::leggi(input) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
-    let voice = input
-        .get("voice")
-        .and_then(Value::as_str)
+    // Il contratto pretende che il campo CI SIA; che non sia fatto di soli spazi
+    // non lo puo' dire, e quel controllo resta qui.
+    let text = params.text.trim().to_string();
+    if text.is_empty() {
+        return crate::errore_tool(
+            "Parametro 'text' vuoto: serve il testo da convertire in audio.",
+            NaturaFallimento::Rimediabile,
+        );
+    }
+    let voice = params
+        .voice
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    let filename = input
-        .get("filename")
-        .and_then(Value::as_str)
+    let filename = params
+        .filename
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    // 3) Risolvi provider/model dal purpose (regola G: niente modello hardcoded).
-    let (provider, model) = match resolve_purpose_via_http(&ctx.db, TTS_PURPOSE).await {
-        Ok(pm) => pm,
-        Err(e) => {
-            return crate::errore_json(format!(
-                    "modello audio-out non risolvibile (purpose '{TTS_PURPOSE}'): {e}. \
-                     Verifica nexus_purpose_model.text_to_speech (mig 0481) e che un modello \
-                     audio-out sia abilitato nel catalog."
-                ));
-        }
+    let result = match sintetizza(ctx, &text, voice).await {
+        Ok(r) => r,
+        Err(risposta) => return risposta,
+    };
+    let audio_path = match salva_audio_generato(ctx, &result, filename).await {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
 
-    // Formato audio fissato a mp3 (default endpoint): l'estensione di salvataggio
-    // deve essere coerente con cio' che il provider produce.
-    let response_format = TTS_DEFAULT_FORMAT.to_string();
+    RispostaTool::riuscito(
+        json!({
+            "audio_path": audio_path,
+            "model_used": result.model_used,
+        })
+        .to_string(),
+    )
+}
 
-    // 4) Sintetizza via gateway (pin del provider risolto). Il gateway gestisce
-    //    routing/cooldown/privacy e mappa la richiesta al dialetto del provider
-    //    (regola L: punto unico gateway).
-    let result = match gateway_text_to_speech(
+/// Risolve il modello audio-out dal purpose e sintetizza via gateway. Nature
+/// come in [`trascrivi`]: configurazione contro esaurimento dei fornitori.
+async fn sintetizza(
+    ctx: &ToolContextCore,
+    text: &str,
+    voice: Option<String>,
+) -> Result<GwTtsOut, RispostaTool> {
+    let (provider, model) = resolve_purpose_via_http(&ctx.db, TTS_PURPOSE)
+        .await
+        .map_err(|e| {
+            crate::errore_tool(
+                format!(
+                    "modello audio-out non risolvibile (purpose '{TTS_PURPOSE}'): {e}. \
+                     Verifica nexus_purpose_model.text_to_speech (mig 0481) e che un \
+                     modello audio-out sia abilitato nel catalog."
+                ),
+                NaturaFallimento::DelSistema,
+            )
+        })?;
+    gateway_text_to_speech(
         &ctx.db,
         &provider,
         &model,
-        &text,
+        text,
         voice,
-        Some(response_format.clone()),
+        // Formato fissato: l'estensione di salvataggio deve restare coerente con
+        // cio' che il provider produce, e il catalogo non dichiara un parametro
+        // con cui l'agente possa sceglierlo.
+        Some(TTS_DEFAULT_FORMAT.to_string()),
         TTS_PURPOSE,
         &GwCaller {
             user_id: ctx.user_id,
@@ -271,41 +427,67 @@ pub async fn tool_nexus_text_to_speech(ctx: &ToolContextCore, input: &Value) -> 
         },
     )
     .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            return crate::errore_json(format!("sintesi vocale via gateway fallita: {e}"));
-        }
-    };
-
-    // 5) Decodifica base64 -> bytes.
-    let bytes = match B64.decode(result.audio_base64.trim()) {
-        Ok(b) => b,
-        Err(e) => {
-            return crate::errore_json(format!("decodifica audio base64 fallita: {e}"));
-        }
-    };
-    if bytes.is_empty() {
-        return crate::errore_json_con_dettagli(json!({
-            "error": "il gateway ha restituito un audio vuoto.",
-            "model_used": result.model_used,
-        }));
-    }
-
-    // 6) Estensione coerente col MIME reale (fallback al formato richiesto).
-    let ext = ext_from_mime(&result.mime).unwrap_or(&response_format);
-
-    // 7) Salva path-safe sotto la project_root.
-    let audio_path = match save_audio(&ctx.root_path, &bytes, filename, ext).await {
-        Ok(p) => p,
-        Err(e) => return crate::errore_json(format!("salvataggio audio fallito: {e}")),
-    };
-
-    json!({
-        "audio_path": audio_path,
-        "model_used": result.model_used,
+    .map_err(|e| {
+        crate::errore_tool(
+            format!("sintesi vocale via gateway fallita: {e}"),
+            NaturaFallimento::Transitorio,
+        )
     })
-    .to_string()
+}
+
+/// Decodifica l'audio ricevuto dal gateway e lo salva path-safe nel progetto.
+async fn salva_audio_generato(
+    ctx: &ToolContextCore,
+    result: &GwTtsOut,
+    filename: Option<&str>,
+) -> Result<String, RispostaTool> {
+    let bytes = byte_audio(result)?;
+    // Estensione dal MIME REALE prodotto dal provider; il formato richiesto e'
+    // il ripiego quando quel MIME non e' fra quelli noti.
+    let ext = ext_from_mime(&result.mime).unwrap_or(TTS_DEFAULT_FORMAT);
+    save_audio(&ctx.root_path, &bytes, filename, ext)
+        .await
+        .map_err(|e| {
+            // DEL SISTEMA e non derivata dal `ErrorKind`: `save_audio`
+            // appiattisce gia' l'errore di I/O in una `String`, quindi il kind
+            // qui non c'e' piu'. Fra le due letture possibili questa manda a
+            // cercare un'altra strada invece di far risintetizzare l'audio —
+            // che costa una chiamata al provider — contro un disco che non lo
+            // accettera' comunque. Stessa scelta del gemello image_tools.
+            crate::errore_tool(
+                format!("salvataggio audio fallito: {e}"),
+                NaturaFallimento::DelSistema,
+            )
+        })
+}
+
+/// I byte dell'audio dal base64 del gateway.
+///
+/// Entrambi i casi sono DEL SISTEMA: un base64 malformato e un audio vuoto sono
+/// cio' che il provider ha risposto, e nessuna riformulazione del testo li
+/// cambia. Stessa famiglia del «solo una URL temporanea» del gemello
+/// image_tools: il tool non puo' salvare cio' che non ha ricevuto.
+fn byte_audio(result: &GwTtsOut) -> Result<Vec<u8>, RispostaTool> {
+    let bytes = B64.decode(result.audio_base64.trim()).map_err(|e| {
+        crate::errore_tool(
+            format!("decodifica audio base64 fallita: {e}"),
+            NaturaFallimento::DelSistema,
+        )
+    })?;
+    if bytes.is_empty() {
+        return Err(audio_vuoto(&result.model_used));
+    }
+    Ok(bytes)
+}
+
+/// Il gateway ha risposto senza audio: fallimento che il codice dichiarava gia',
+/// qui con la natura accanto invece che nel solo testo.
+fn audio_vuoto(model_used: &str) -> RispostaTool {
+    let dettagli = json!({
+        "error": "il gateway ha restituito un audio vuoto.",
+        "model_used": model_used,
+    });
+    crate::errore_tool_con_dettagli(dettagli, NaturaFallimento::DelSistema)
 }
 
 /// Estensione file dal MIME audio prodotto dal provider. `None` per MIME non
@@ -392,6 +574,7 @@ async fn save_audio(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nexus_types::tool_outcome::EsitoTool;
 
     #[test]
     fn is_audio_kind_riconosce_audio_e_scarta_altro() {
@@ -405,6 +588,52 @@ mod tests {
         assert!(!is_audio_kind("video"));
     }
 
+    /// Un allegato che non e' audio e' RIMEDIABILE, e il messaggio nomina cio'
+    /// che serve per rimediare.
+    ///
+    /// MUTAZIONE: togliendo il nome del tool dal messaggio, la natura resta
+    /// «rimediabile» ma la promessa non e' piu' mantenuta — e questo test
+    /// rosseggia sulla riga che lo cerca.
+    #[test]
+    fn un_allegato_non_audio_dice_come_rimediare() {
+        let out = kind_non_audio("pdf");
+        assert_eq!(out.esito, EsitoTool::Fallito);
+        assert_eq!(out.natura, Some(NaturaFallimento::Rimediabile));
+        assert!(
+            out.testo.contains("nexus_inspect_attachment"),
+            "il messaggio nomina il tool con cui rimediare: {}",
+            out.testo
+        );
+    }
+
+    /// Limite e dimensione inattendibile sono DUE fallimenti, non uno: prima
+    /// cadevano nello stesso ramo e una dimensione negativa veniva raccontata
+    /// come «troppo grande» con l'invito ad alzare il limite.
+    #[test]
+    fn dimensione_negativa_e_oltre_limite_restano_distinti() {
+        let negativa = dimensione_non_attendibile(-1);
+        assert_eq!(negativa.natura, Some(NaturaFallimento::DelSistema));
+        assert!(
+            !negativa.testo.contains("troppo grande"),
+            "un dato inattendibile non e' un file troppo grande: {}",
+            negativa.testo
+        );
+
+        let oltre = audio_oltre_limite(30_000_000, AUDIO_MAX_BYTES_DEFAULT);
+        assert_eq!(oltre.natura, Some(NaturaFallimento::DelSistema));
+        assert!(oltre.testo.contains(AUDIO_MAX_BYTES_KEY), "{}", oltre.testo);
+    }
+
+    /// Un limite scritto male in tabella e' un errore di configurazione
+    /// DICHIARATO, non un WARN seguito da un limite che nessuno ha chiesto.
+    #[test]
+    fn un_limite_non_numerico_e_del_sistema() {
+        let out = limite_non_configurato("tanti");
+        assert_eq!(out.esito, EsitoTool::Fallito);
+        assert_eq!(out.natura, Some(NaturaFallimento::DelSistema));
+        assert!(out.testo.contains("tanti"), "{}", out.testo);
+    }
+
     #[test]
     fn ext_from_mime_mappa_audio_out() {
         assert_eq!(ext_from_mime("audio/mpeg"), Some("mp3"));
@@ -415,6 +644,20 @@ mod tests {
         assert_eq!(ext_from_mime("audio/flac"), Some("flac"));
         // MIME sconosciuto -> None (il chiamante ricade sul formato richiesto).
         assert_eq!(ext_from_mime("application/octet-stream"), None);
+    }
+
+    /// Un audio vuoto dal gateway resta un FALLIMENTO, ora dichiarato nel campo.
+    #[test]
+    fn un_audio_vuoto_non_diventa_un_successo() {
+        let result = GwTtsOut {
+            audio_base64: String::new(),
+            mime: "audio/mpeg".to_string(),
+            model_used: "prov/modello".to_string(),
+        };
+        let errore = byte_audio(&result).expect_err("un audio vuoto non e' salvabile");
+        assert_eq!(errore.esito, EsitoTool::Fallito);
+        assert_eq!(errore.natura, Some(NaturaFallimento::DelSistema));
+        assert!(errore.testo.contains("prov/modello"), "{}", errore.testo);
     }
 
     #[test]

@@ -21,6 +21,11 @@
 //!     della statement (`check_dangerous_sql`) NON risponde a quella domanda e
 //!     non deve provarci: leggere il catalogo del DB applicativo e' legittimo.
 //!   - Limiti: timeout query 30s, max 1000 righe ritornate.
+//!
+//! Esito (regola Q): i tre tool ritornano [`RispostaTool`] — il payload JSON sta
+//! nel testo, l'esito e la NATURA del fallimento stanno nei campi. Prima il
+//! fallimento viaggiava come marker anteposto al JSON: spezzava il payload, e
+//! chi doveva sapere com'era andata era costretto a rileggere il testo.
 
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -30,194 +35,282 @@ use crate::project_db::exec::{
     self, archive_ddl, execute_query, open_pool, outcome_to_json, resolve_project_conn,
     QueryExecError,
 };
-use nexus_types::tool_outcome::tool_failure;
+use nexus_agent_tools::input_contract::InputTool;
+use nexus_agent_tools::tool_inputs::{NexusDbDescribeInput, NexusDbQueryInput, NexusDbTablesInput};
+use nexus_types::tool_outcome::{NaturaFallimento, RispostaTool};
 
-/// Costruisce l'esito FALLITO di uno dei tool `nexus_db_*`: marker + payload
-/// JSON (contratto `nexus_types::tool_outcome`), qualunque sia la forma del
-/// payload. Senza il marker in testa questi fallimenti erano indistinguibili
-/// da un risultato riuscito per anti-loop/supervisore/final_gate, che leggono
-/// solo `is_tool_failure`.
-fn db_tool_failure(payload: Value) -> String {
-    tool_failure(payload.to_string())
+/// Costruisce l'esito FALLITO di uno dei tool `nexus_db_*`: il payload JSON nel
+/// testo, l'esito e la natura nei campi.
+fn db_tool_failure(payload: Value, natura: NaturaFallimento) -> RispostaTool {
+    RispostaTool::fallito(payload.to_string()).con_natura(natura)
+}
+
+/// Il caso comune: il payload porta il solo campo `error`.
+fn db_tool_error(messaggio: impl std::fmt::Display, natura: NaturaFallimento) -> RispostaTool {
+    db_tool_failure(json!({ "error": messaggio.to_string() }), natura)
+}
+
+/// Toglie `connection` dall'input e lo restituisce a parte, insieme al resto.
+///
+/// DIVERGENZA fra i due cataloghi che portano a questo handler, e la ragione
+/// per cui il campo non passa dal contratto d'ingresso. Il catalogo del dispatch
+/// agente (`nexus-agent-tools::tool_schema` + `tool_inputs`) NON promette
+/// `connection`; il catalogo BUILTIN (`crate::nexus_builtin::catalog`) lo
+/// promette per `nexus_db_query`, e quella strada arriva qui passando da
+/// `nexus_mcp_tool_call` con `server_id="builtin"`. Poiche' il contratto e'
+/// `deny_unknown_fields`, leggerlo prima della deserializzazione e' cio' che
+/// evita di respingere come "parametri non validi" una chiamata che un catalogo
+/// ha promesso. La divergenza si chiude allineando i due cataloghi, non qui.
+fn separa_connection(input: &Value) -> (Option<String>, Value) {
+    let mut resto = input.clone();
+    let connection = resto
+        .as_object_mut()
+        .and_then(|map| map.remove("connection"))
+        .and_then(|v| v.as_str().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty());
+    (connection, resto)
+}
+
+/// I parametri di `nexus_db_query` gia' letti dal contratto e validati.
+struct QueryInput {
+    sql: String,
+    params: Vec<Option<String>>,
+    max_rows: Option<usize>,
+    connection: Option<String>,
+}
+
+/// Legge l'input di `nexus_db_query` dal contratto d'ingresso e ne valida i
+/// campi che lo schema non puo' vincolare da solo (stringa non vuota, intero
+/// positivo). Ogni rifiuto e' RIMEDIABILE e nomina il campo da correggere.
+fn leggi_query_input(input: &Value) -> Result<QueryInput, RispostaTool> {
+    let (connection, resto) = separa_connection(input);
+    let letto = NexusDbQueryInput::leggi(&resto)?;
+    let sql = letto.sql.trim().to_string();
+    if sql.is_empty() {
+        return Err(db_tool_error(
+            "Il campo 'sql' e' vuoto: passa UNA statement SQL da eseguire \
+             (es. \"SELECT * FROM users LIMIT 10\").",
+            NaturaFallimento::Rimediabile,
+        ));
+    }
+    // Prima `max_rows` era letto con `as_u64`: un valore negativo diventava
+    // silenziosamente "campo assente", cioe' il default. Il contratto lo
+    // dichiara `integer`, quindi il negativo arriva fin qui ed e' un errore
+    // della chiamata: dirlo e' meglio che ignorarlo. Il `min` non e' il cap
+    // (quello lo applica `execute_query`): rende sicura la conversione a
+    // `usize` di un i64 arbitrariamente grande.
+    let max_rows = match letto.max_rows {
+        None => None,
+        Some(n) if n > 0 => Some(n.min(exec::MAX_ROWS as i64) as usize),
+        Some(n) => {
+            let msg = format!(
+                "'max_rows' deve essere un intero positivo (ricevuto {n}). \
+                 Omettilo per il default di {} righe.",
+                exec::MAX_ROWS
+            );
+            return Err(db_tool_error(msg, NaturaFallimento::Rimediabile));
+        }
+    };
+    let params = letto
+        .params
+        .unwrap_or_default()
+        .iter()
+        .map(|v| match v {
+            Value::Null => None,
+            Value::String(s) => Some(s.clone()),
+            other => Some(other.to_string()),
+        })
+        .collect();
+    Ok(QueryInput {
+        sql,
+        params,
+        max_rows,
+        connection,
+    })
+}
+
+/// Le guardie che precedono l'esecuzione. Ritorna `Some(fallimento)` se la
+/// query non deve partire.
+async fn guardie_query(ctx: &AgentToolContext, q: &QueryInput) -> Option<RispostaTool> {
+    // Placeholder di redazione copiati come valori (incidente Beaty-Book:
+    // [REDACTED:email_pii] persistito nel DB applicativo). Punto unico:
+    // security::redaction_guard (regola L). Il controllo copre il testo SQL E
+    // ogni bind param: un placeholder passato come parametro bypasserebbe il
+    // check sul solo SQL. RIMEDIABILE perche' il messaggio del guard dice da
+    // dove prendere il valore vero (env gia' iniettate, `request_port`).
+    let campi = std::iter::once(("sql", q.sql.as_str()))
+        .chain(q.params.iter().flatten().map(|p| ("params", p.as_str())));
+    for (campo, testo) in campi {
+        let rifiuto = crate::security::redaction_guard::enforce_no_redacted_placeholder(
+            ctx,
+            "nexus_db_query",
+            campo,
+            testo,
+        )
+        .await;
+        if let Some(msg) = rifiuto {
+            return Some(db_tool_error(msg, NaturaFallimento::Rimediabile));
+        }
+    }
+    governance_query(ctx, &q.sql).await
+}
+
+/// Guard SQL per-statement (governance db/sql_injection): blocca le query
+/// distruttive di massa (DELETE/UPDATE senza WHERE), le SCRITTURE sui cataloghi
+/// di sistema e gli oggetti di infrastruttura Nexus. Solo blocco + audit
+/// (decisione utente: niente auto-fix su DB).
+///
+/// NON decide "su quale DB si sta lavorando": quello lo decide la connessione,
+/// in `resolve_project_conn` -> `classifica_connessione`, che rifiuta sia il DB
+/// META sia il DB metadati per-progetto. E' il motivo per cui la LETTURA di
+/// `information_schema`/`pg_catalog` e' consentita: il catalogo che l'agente
+/// puo' raggiungere e' quello del DB applicativo del progetto, cioe' del
+/// proprio lavoro.
+///
+/// RIMEDIABILE: ogni [`MotivoBlocco`](crate::security::resource_governance::MotivoBlocco)
+/// nomina cio' che va cambiato nella query (aggiungi un WHERE, non scrivere sul
+/// catalogo), e riscriverla e' nella portata dell'agente.
+async fn governance_query(ctx: &AgentToolContext, sql: &str) -> Option<RispostaTool> {
+    let policy = crate::security::resource_governance::policy(&ctx.db, "db", "sql_injection").await;
+    if !policy.enabled {
+        return None;
+    }
+    let motivo = crate::security::resource_governance::check_dangerous_sql(sql)?;
+    let mut entry = crate::security::AuditEntry::blocked(
+        ctx.project_id,
+        "db_dangerous_statement_blocked",
+        "db",
+    )
+    .with_resource(sql.chars().take(120).collect::<String>())
+    .with_details(json!({ "rule": motivo.regola(), "reason": motivo.motivo() }))
+    .with_actor_user(ctx.user_id);
+    if let Some(s) = ctx.session_id {
+        entry = entry.with_actor_session(s);
+    }
+    crate::security::record_audit(entry);
+    let payload = json!({
+        "error": format!("Query rifiutata dalla governance DB: {}", motivo.motivo()),
+        "rule": motivo.regola(),
+        "blocked": true,
+    });
+    Some(db_tool_failure(payload, NaturaFallimento::Rimediabile))
+}
+
+/// La natura di un fallimento di `execute_query`, letta dalla VARIANTE
+/// dell'errore (segnale strutturato, regola M) e non dal suo messaggio.
+fn fallimento_query(e: &QueryExecError, sql: &str) -> RispostaTool {
+    let estratto = sql.chars().take(200).collect::<String>();
+    match e {
+        // La connessione del progetto non e' configurata, non e' raggiungibile
+        // o il guard-rail anti-Nexus e' scattato: nessun campo della chiamata la
+        // cambia. L'errore arriva gia' appiattito in `String` da
+        // `resolve_project_conn` / `open_pool`, quindi non c'e' un kind da
+        // leggere — e DEL SISTEMA e' anche la scelta prudente, perche' manda a
+        // cercare un'altra strada invece di far ripetere una chiamata che
+        // rifallira' identica.
+        QueryExecError::ConnectionError(m) => db_tool_error(m, NaturaFallimento::DelSistema),
+        // NON transitorio: ritentare la stessa query pesante la fa scadere di
+        // nuovo dopo altri 30s. Cio' che rimedia lo dice il messaggio, ed e'
+        // nella portata dell'agente.
+        QueryExecError::Timeout => {
+            let payload = json!({
+                "error": e.message(),
+                "hint": "Restringi la query (WHERE piu' selettivo, LIMIT, meno JOIN) \
+                         oppure spezzala in piu' statement.",
+                "sql_excerpt": estratto,
+            });
+            db_tool_failure(payload, NaturaFallimento::Rimediabile)
+        }
+        // Sintassi, colonna inesistente, vincolo violato: l'errore Postgres e'
+        // nel messaggio e dice cosa correggere; i due tool che danno lo schema
+        // esatto sono nominati, cosi' il "rimediabile" porta con se' il come.
+        QueryExecError::Sql(_) => {
+            let payload = json!({
+                "error": e.message(),
+                "hint": "Verifica nomi e tipi con nexus_db_describe (colonne di una tabella) \
+                         o nexus_db_tables (tabelle esistenti).",
+                "sql_excerpt": estratto,
+            });
+            db_tool_failure(payload, NaturaFallimento::Rimediabile)
+        }
+    }
+}
+
+/// Esegue la query e compone il payload di successo, con l'eventuale archivio
+/// della DDL.
+async fn esegui_query(ctx: &AgentToolContext, q: &QueryInput) -> RispostaTool {
+    let conn = q.connection.as_deref();
+    let esito = execute_query(&ctx.db, ctx.project_id, &q.sql, &q.params, q.max_rows, conn).await;
+    let outcome = match esito {
+        Ok(o) => o,
+        Err(e) => return fallimento_query(&e, &q.sql),
+    };
+    // Simmetria con l'endpoint REST: archivio le DDL fatte dall'agente come
+    // nota KB + file migration, separate per connessione in caso di multi-DB.
+    // Best effort: errori solo loggati.
+    let archive = archive_ddl(&ctx.db, ctx.project_id, &q.sql, &outcome, conn).await;
+    let mut payload = outcome_to_json(&outcome);
+    if let (Some(archived), Value::Object(ref mut map)) = (archive, &mut payload) {
+        let dettaglio = json!({
+            "note_id": archived.note_id.to_string(),
+            "migration_filename": archived.migration_filename,
+            "migration_abs_path": archived.migration_abs_path,
+        });
+        map.insert("archived_ddl".to_string(), dettaglio);
+    }
+    RispostaTool::riuscito(payload.to_string())
 }
 
 /// Tool `nexus_db_query`. Thin wrapper sopra `crate::project_db::exec::execute_query`.
-pub(super) async fn tool_nexus_db_query(ctx: &AgentToolContext, input: &Value) -> String {
-    let sql = match input.get("sql").and_then(Value::as_str) {
-        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => {
-            return db_tool_failure(
-                json!({"error": "Parametro 'sql' obbligatorio (stringa non vuota)."}),
-            );
-        }
+pub(super) async fn tool_nexus_db_query(ctx: &AgentToolContext, input: &Value) -> RispostaTool {
+    let q = match leggi_query_input(input) {
+        Ok(v) => v,
+        Err(risposta) => return risposta,
     };
-
-    // Placeholder di redazione copiati come valori (incidente Beaty-Book:
-    // [REDACTED:email_pii] persistito nel DB applicativo). Punto unico:
-    // security::redaction_guard (regola L). Copre sql e params piu' sotto.
-    if let Some(msg) = crate::security::redaction_guard::enforce_no_redacted_placeholder(
-        ctx,
-        "nexus_db_query",
-        "sql",
-        &sql,
-    )
-    .await
-    {
-        return db_tool_failure(json!({ "error": msg }));
+    if let Some(rifiuto) = guardie_query(ctx, &q).await {
+        return rifiuto;
     }
-
-    let params: Vec<Option<String>> = match input.get("params") {
-        Some(Value::Array(arr)) => arr
-            .iter()
-            .map(|v| match v {
-                Value::Null => None,
-                Value::String(s) => Some(s.clone()),
-                other => Some(other.to_string()),
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
-
-    // Stesso guard sui valori parametrizzati: un placeholder passato come
-    // bind param bypasserebbe il check sul testo SQL.
-    for p in params.iter().flatten() {
-        if let Some(msg) = crate::security::redaction_guard::enforce_no_redacted_placeholder(
-            ctx,
-            "nexus_db_query",
-            "params",
-            p,
-        )
-        .await
-        {
-            return db_tool_failure(json!({ "error": msg }));
-        }
-    }
-
-    let max_rows = input
-        .get("max_rows")
-        .and_then(Value::as_u64)
-        .map(|n| n as usize);
-
-    // Guard SQL per-statement (governance db/sql_injection): blocca le query
-    // distruttive di massa (DELETE/UPDATE senza WHERE), le SCRITTURE sui
-    // cataloghi di sistema e gli oggetti di infrastruttura Nexus. Solo blocco +
-    // audit (decisione utente: niente auto-fix su DB).
-    //
-    // NON decide "su quale DB si sta lavorando": quello lo decide la
-    // connessione, in `resolve_project_conn` -> `classifica_connessione`, che
-    // rifiuta sia il DB META sia il DB metadati per-progetto. E' il motivo per
-    // cui la LETTURA di `information_schema`/`pg_catalog` e' consentita: il
-    // catalogo che l'agente puo' raggiungere e' quello del DB applicativo del
-    // progetto, cioe' del proprio lavoro.
-    if crate::security::resource_governance::policy(&ctx.db, "db", "sql_injection")
-        .await
-        .enabled
-    {
-        if let Some(motivo) = crate::security::resource_governance::check_dangerous_sql(&sql) {
-            let mut entry = crate::security::AuditEntry::blocked(
-                ctx.project_id,
-                "db_dangerous_statement_blocked",
-                "db",
-            )
-            .with_resource(sql.chars().take(120).collect::<String>())
-            .with_details(json!({ "rule": motivo.regola(), "reason": motivo.motivo() }))
-            .with_actor_user(ctx.user_id);
-            if let Some(s) = ctx.session_id {
-                entry = entry.with_actor_session(s);
-            }
-            crate::security::record_audit(entry);
-            return db_tool_failure(json!({
-                "error": format!("Query rifiutata dalla governance DB: {}", motivo.motivo()),
-                "rule": motivo.regola(),
-                "blocked": true,
-            }));
-        }
-    }
-
-    // Connessione: se "connection" e' presente nel payload, esegue su quella
-    // (es. "analytics", "legacy_replica"); altrimenti usa la primary del
-    // progetto. Permette al modello di lavorare su DB multipli senza dover
-    // switchare il flag is_primary.
-    let connection = input
-        .get("connection")
-        .and_then(Value::as_str)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    match execute_query(
-        &ctx.db,
-        ctx.project_id,
-        &sql,
-        &params,
-        max_rows,
-        connection.as_deref(),
-    )
-    .await
-    {
-        Ok(outcome) => {
-            // Simmetria con l'endpoint REST: archivio le DDL fatte
-            // dall'agente come nota KB + file migration, separate per
-            // connessione in caso di multi-DB. Best effort: errori solo
-            // loggati.
-            let archive = archive_ddl(
-                &ctx.db,
-                ctx.project_id,
-                &sql,
-                &outcome,
-                connection.as_deref(),
-            )
-            .await;
-            let mut payload = outcome_to_json(&outcome);
-            if let (Some(archived), Value::Object(ref mut map)) = (archive, &mut payload) {
-                map.insert(
-                    "archived_ddl".to_string(),
-                    json!({
-                        "note_id": archived.note_id.to_string(),
-                        "migration_filename": archived.migration_filename,
-                        "migration_abs_path": archived.migration_abs_path,
-                    }),
-                );
-            }
-            payload.to_string()
-        }
-        Err(e) => match e {
-            QueryExecError::ConnectionError(m) => db_tool_failure(json!({"error": m})),
-            QueryExecError::Timeout => db_tool_failure(json!({"error": e.message()})),
-            QueryExecError::Sql(_) => db_tool_failure(json!({
-                "error": e.message(),
-                "sql_excerpt": sql.chars().take(200).collect::<String>(),
-            })),
-        },
-    }
+    esegui_query(ctx, &q).await
 }
 
-/// Estrae `schema` (default "public") + `connection` opzionale dall'input, risolve
-/// la connessione del progetto e apre il pool. Punto unico (regola L) per i tool
-/// `nexus_db_tables` / `nexus_db_describe`: prima il blocco era duplicato pari-pari.
-async fn resolve_schema_and_pool(
+/// Normalizza `schema` (default "public"), risolve la connessione del progetto e
+/// apre il pool. Punto unico (regola L) per i tool `nexus_db_tables` /
+/// `nexus_db_describe`: prima il blocco era duplicato pari-pari.
+///
+/// DEL SISTEMA: l'errore che ne esce viene da `resolve_project_conn` /
+/// `open_pool`, cioe' dalla configurazione DB del progetto o dalla sua
+/// raggiungibilita'. Nessun campo della chiamata lo corregge.
+async fn apri_pool_progetto(
     ctx: &AgentToolContext,
-    input: &Value,
-) -> Result<(String, sqlx::PgPool), String> {
-    let schema = input
-        .get("schema")
-        .and_then(Value::as_str)
+    schema: Option<String>,
+    connection: Option<&str>,
+) -> Result<(String, sqlx::PgPool), RispostaTool> {
+    // Uno `schema` presente ma vuoto valeva come schema vuoto, e produceva un
+    // elenco di zero tabelle indistinguibile da uno schema davvero vuoto: qui
+    // vale come "non specificato", che e' cio' che il catalogo dichiara.
+    let schema = schema
         .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "public".to_string());
-    let connection = input
-        .get("connection")
-        .and_then(Value::as_str)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let conn = resolve_project_conn(&ctx.db, ctx.project_id, connection.as_deref()).await?;
-    let pool = open_pool(&conn).await?;
+    let conn = resolve_project_conn(&ctx.db, ctx.project_id, connection)
+        .await
+        .map_err(|e| db_tool_error(e, NaturaFallimento::DelSistema))?;
+    let pool = open_pool(&conn)
+        .await
+        .map_err(|e| db_tool_error(e, NaturaFallimento::DelSistema))?;
     Ok((schema, pool))
 }
 
 /// Tool `nexus_db_tables`: lista tabelle + righe stimate dello schema.
-pub(super) async fn tool_nexus_db_tables(ctx: &AgentToolContext, input: &Value) -> String {
-    let (schema, pool) = match resolve_schema_and_pool(ctx, input).await {
+pub(super) async fn tool_nexus_db_tables(ctx: &AgentToolContext, input: &Value) -> RispostaTool {
+    let (connection, resto) = separa_connection(input);
+    let letto = match NexusDbTablesInput::leggi(&resto) {
         Ok(v) => v,
-        Err(e) => return db_tool_failure(json!({"error": e})),
+        Err(risposta) => return risposta,
+    };
+    let (schema, pool) = match apri_pool_progetto(ctx, letto.schema, connection.as_deref()).await {
+        Ok(v) => v,
+        Err(risposta) => return risposta,
     };
 
     let rows = sqlx::query(
@@ -231,12 +324,15 @@ pub(super) async fn tool_nexus_db_tables(ctx: &AgentToolContext, input: &Value) 
     .bind(&schema)
     .fetch_all(&pool)
     .await;
+    pool.close().await;
 
     let tables_result = match rows {
         Ok(r) => r,
+        // La query e' NOSTRA e interroga information_schema: se fallisce non c'e'
+        // nulla che l'agente possa correggere nella propria chiamata.
         Err(e) => {
-            pool.close().await;
-            return db_tool_failure(json!({"error": format!("errore listing tabelle: {e}")}));
+            let msg = format!("errore listing tabelle: {e}");
+            return db_tool_error(msg, NaturaFallimento::DelSistema);
         }
     };
     let tables: Vec<Value> = tables_result
@@ -248,74 +344,74 @@ pub(super) async fn tool_nexus_db_tables(ctx: &AgentToolContext, input: &Value) 
             })
         })
         .collect();
+    // Zero tabelle e' un SUCCESSO: la lettura e' riuscita e lo schema e' vuoto
+    // (stesso criterio dei file: una directory vuota e' un successo, una
+    // directory assente e' un errore).
     let result = json!({"ok": true, "schema": schema, "table_count": tables.len(), "tables": tables});
-    pool.close().await;
-    result.to_string()
+    RispostaTool::riuscito(result.to_string())
 }
 
-/// Tool `nexus_db_describe`: colonne, tipi, vincoli e indici di una tabella.
-pub(super) async fn tool_nexus_db_describe(ctx: &AgentToolContext, input: &Value) -> String {
-    let table = match input.get("table").and_then(Value::as_str) {
-        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => return db_tool_failure(json!({"error": "Parametro 'table' obbligatorio."})),
-    };
-    let (schema, pool) = match resolve_schema_and_pool(ctx, input).await {
-        Ok(v) => v,
-        Err(e) => return db_tool_failure(json!({"error": e})),
-    };
-
-    let col_rows = sqlx::query(
+/// Le colonne della tabella, nell'ordine dichiarato. Un `Ok(vec![])` significa
+/// "la tabella non esiste o non ha colonne": la distinzione fra assenza ed
+/// errore la fa il chiamante, che qui riceve l'errore come tale.
+async fn colonne_tabella(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<Value>, String> {
+    let rows = sqlx::query(
         r#"SELECT column_name, data_type, is_nullable, column_default,
                   character_maximum_length
            FROM information_schema.columns
            WHERE table_schema = $1 AND table_name = $2
            ORDER BY ordinal_position"#,
     )
-    .bind(&schema)
-    .bind(&table)
-    .fetch_all(&pool)
-    .await;
-
-    let columns: Vec<Value> = match col_rows {
-        Ok(r) => r
-            .iter()
-            .map(|row| {
-                json!({
-                    "name": row.try_get::<String, _>("column_name").unwrap_or_default(),
-                    "type": row.try_get::<String, _>("data_type").unwrap_or_default(),
-                    "nullable": row.try_get::<String, _>("is_nullable").map(|s| s == "YES").unwrap_or(true),
-                    "default": row.try_get::<Option<String>, _>("column_default").unwrap_or(None),
-                    "max_length": row.try_get::<Option<i32>, _>("character_maximum_length").unwrap_or(None),
-                })
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("errore descrizione colonne: {e}"))?;
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let nullable = row
+                .try_get::<String, _>("is_nullable")
+                .map(|s| s == "YES")
+                .unwrap_or(true);
+            json!({
+                "name": row.try_get::<String, _>("column_name").unwrap_or_default(),
+                "type": row.try_get::<String, _>("data_type").unwrap_or_default(),
+                "nullable": nullable,
+                "default": row.try_get::<Option<String>, _>("column_default").unwrap_or(None),
+                "max_length": row.try_get::<Option<i32>, _>("character_maximum_length").unwrap_or(None),
             })
-            .collect(),
-        Err(e) => {
-            pool.close().await;
-            return db_tool_failure(json!({"error": format!("errore descrizione colonne: {e}")}));
-        }
-    };
+        })
+        .collect())
+}
 
-    if columns.is_empty() {
-        pool.close().await;
-        return db_tool_failure(json!({
-            "error": format!("Tabella '{schema}.{table}' non trovata o senza colonne."),
-            "hint": "Usa nexus_db_tables per vedere le tabelle disponibili."
-        }));
-    }
-
-    let idx_rows = sqlx::query(
+/// Gli indici della tabella.
+///
+/// L'errore RISALE invece di essere inghiottito: prima un `unwrap_or_default()`
+/// trasformava una `pg_indexes` fallita in una lista vuota, cioe' il tool
+/// AFFERMAVA "questa tabella non ha indici" dove non aveva potuto guardare — e
+/// su quella affermazione un agente decide di crearne uno che esiste gia'.
+async fn indici_tabella(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<Value>, String> {
+    let rows = sqlx::query(
         r#"SELECT indexname, indexdef
            FROM pg_indexes
            WHERE schemaname = $1 AND tablename = $2
            ORDER BY indexname"#,
     )
-    .bind(&schema)
-    .bind(&table)
-    .fetch_all(&pool)
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
     .await
-    .unwrap_or_default();
-
-    let indexes: Vec<Value> = idx_rows
+    .map_err(|e| format!("errore lettura indici: {e}"))?;
+    Ok(rows
         .iter()
         .map(|row| {
             json!({
@@ -323,10 +419,32 @@ pub(super) async fn tool_nexus_db_describe(ctx: &AgentToolContext, input: &Value
                 "definition": row.try_get::<String, _>("indexdef").unwrap_or_default(),
             })
         })
-        .collect();
+        .collect())
+}
 
-    pool.close().await;
-    json!({
+/// Compone la descrizione della tabella. Separata dal tool perche' il pool va
+/// chiuso una volta sola, dal chiamante, qualunque sia l'esito.
+async fn descrivi_tabella(pool: &sqlx::PgPool, schema: &str, table: &str) -> RispostaTool {
+    let columns = match colonne_tabella(pool, schema, table).await {
+        Ok(c) => c,
+        // Query nostra su information_schema: fuori dalla portata dell'agente.
+        Err(e) => return db_tool_error(e, NaturaFallimento::DelSistema),
+    };
+    if columns.is_empty() {
+        // Una tabella ASSENTE e' un errore, non un risultato vuoto: e' il nome
+        // passato a essere sbagliato, e il messaggio dice con quale tool
+        // trovarlo — quindi rimediabile davvero.
+        let payload = json!({
+            "error": format!("Tabella '{schema}.{table}' non trovata o senza colonne."),
+            "hint": "Usa nexus_db_tables per vedere le tabelle disponibili."
+        });
+        return db_tool_failure(payload, NaturaFallimento::Rimediabile);
+    }
+    let indexes = match indici_tabella(pool, schema, table).await {
+        Ok(i) => i,
+        Err(e) => return db_tool_error(e, NaturaFallimento::DelSistema),
+    };
+    let payload = json!({
         "ok": true,
         "schema": schema,
         "table": table,
@@ -338,8 +456,32 @@ pub(super) async fn tool_nexus_db_describe(ctx: &AgentToolContext, input: &Value
             "query_timeout_secs": exec::QUERY_TIMEOUT_SECS,
             "max_cell_chars": exec::MAX_CELL_CHARS,
         }
-    })
-    .to_string()
+    });
+    RispostaTool::riuscito(payload.to_string())
+}
+
+/// Tool `nexus_db_describe`: colonne, tipi, vincoli e indici di una tabella.
+pub(super) async fn tool_nexus_db_describe(ctx: &AgentToolContext, input: &Value) -> RispostaTool {
+    let (connection, resto) = separa_connection(input);
+    let letto = match NexusDbDescribeInput::leggi(&resto) {
+        Ok(v) => v,
+        Err(risposta) => return risposta,
+    };
+    let table = letto.table.trim().to_string();
+    if table.is_empty() {
+        return db_tool_error(
+            "Il campo 'table' e' vuoto: passa il nome della tabella da descrivere \
+             (nexus_db_tables elenca quelle esistenti).",
+            NaturaFallimento::Rimediabile,
+        );
+    }
+    let (schema, pool) = match apri_pool_progetto(ctx, letto.schema, connection.as_deref()).await {
+        Ok(v) => v,
+        Err(risposta) => return risposta,
+    };
+    let esito = descrivi_tabella(&pool, &schema, &table).await;
+    pool.close().await;
+    esito
 }
 
 #[cfg(test)]
@@ -437,26 +579,100 @@ mod tests {
         );
     }
 
+    /// Il rifiuto di [`leggi_query_input`].
+    ///
+    /// Esiste al posto di `expect_err` perche' [`QueryInput`] non implementa
+    /// `Debug` di proposito: porta il testo SQL e i bind param, che possono
+    /// contenere dati personali, e `expect_err` li stamperebbe nell'output dei
+    /// test in chiaro.
+    fn rifiuto(input: Value) -> RispostaTool {
+        match leggi_query_input(&input) {
+            Ok(_) => panic!("un input che doveva essere rifiutato e' passato"),
+            Err(e) => e,
+        }
+    }
+
     #[test]
-    fn db_tool_failure_dichiara_il_fallimento_e_preserva_il_payload() {
-        // Chiama il PRODUTTORE reale usato da tutti i rami di errore dei 3
-        // tool `nexus_db_*`: senza il marker in testa questi fallimenti erano
-        // indistinguibili da un risultato riuscito per anti-loop/supervisore/
-        // final_gate (regola M).
-        let out = db_tool_failure(json!({
-            "error": "sql fallita",
-            "sql_excerpt": "SELECT 1",
-        }));
-        assert!(nexus_types::tool_outcome::is_tool_failure(&out));
-        assert!(out.contains("sql fallita"));
-        assert!(out.contains("sql_excerpt"));
-        // Il payload resta JSON valido dopo il marker: chi vuole ri-estrarlo
-        // strutturalmente puo' farlo togliendo il solo prefisso.
-        let after_marker = out
-            .trim_start_matches(nexus_types::tool_outcome::TOOL_FAILURE_MARKER)
-            .trim_start();
-        let parsed: Value =
-            serde_json::from_str(after_marker).expect("payload dopo il marker e' JSON valido");
+    fn db_tool_failure_dichiara_il_fallimento_nei_campi_e_preserva_il_payload() {
+        // Chiama il PRODUTTORE reale usato da tutti i rami di errore dei 3 tool
+        // `nexus_db_*`. L'esito e la natura stanno nei campi: nessun consumatore
+        // deve rileggere il testo per sapere com'e' andata (regola Q).
+        let out = db_tool_failure(
+            json!({"error": "sql fallita", "sql_excerpt": "SELECT 1"}),
+            NaturaFallimento::Rimediabile,
+        );
+        assert!(out.esito.e_fallito(), "{out:?}");
+        assert_eq!(out.natura, Some(NaturaFallimento::Rimediabile));
+        // Il payload resta un JSON INTEGRO: il marker in testa lo spezzava.
+        let parsed: Value = serde_json::from_str(&out.testo).expect("payload JSON valido");
         assert_eq!(parsed["error"], "sql fallita");
+        assert_eq!(parsed["sql_excerpt"], "SELECT 1");
+    }
+
+    #[test]
+    fn connection_non_passa_dal_contratto_ma_non_fa_fallire_la_lettura() {
+        // Il contratto d'ingresso e' `deny_unknown_fields` e non dichiara
+        // `connection`; il catalogo builtin invece lo promette. Se il campo
+        // arrivasse alla deserializzazione, questa chiamata fallirebbe come
+        // "parametri non validi" — che e' cio' che `separa_connection` evita.
+        let input = json!({"sql": "SELECT 1", "connection": " analytics "});
+        let q = leggi_query_input(&input).expect("input valido");
+        assert_eq!(q.connection.as_deref(), Some("analytics"));
+        assert_eq!(q.sql, "SELECT 1");
+    }
+
+    #[test]
+    fn sql_vuoto_e_max_rows_non_positivo_sono_rimediabili_e_nominano_il_campo() {
+        let vuoto = rifiuto(json!({"sql": "   "}));
+        assert_eq!(vuoto.natura, Some(NaturaFallimento::Rimediabile));
+        assert!(vuoto.testo.contains("'sql'"), "{vuoto:?}");
+        // Prima `as_u64` faceva sparire il negativo nel default, in silenzio.
+        let negativo = rifiuto(json!({"sql": "SELECT 1", "max_rows": -5}));
+        assert_eq!(negativo.natura, Some(NaturaFallimento::Rimediabile));
+        assert!(negativo.testo.contains("max_rows"), "{negativo:?}");
+    }
+
+    #[test]
+    fn max_rows_resta_entro_il_cap_e_i_params_diventano_bind_testuali() {
+        let input = json!({
+            "sql": "SELECT $1, $2, $3",
+            "params": ["ciao", null, 42],
+            "max_rows": 99_999_999_999_i64,
+        });
+        let q = leggi_query_input(&input).expect("input valido");
+        assert_eq!(q.max_rows, Some(exec::MAX_ROWS));
+        assert_eq!(
+            q.params,
+            vec![Some("ciao".to_string()), None, Some("42".to_string())]
+        );
+    }
+
+    #[test]
+    fn params_non_array_e_campo_ignoto_sono_rifiutati_invece_che_ignorati() {
+        // Prima un `params` non-array cadeva nel ramo `_ => Vec::new()`: la
+        // query partiva senza i bind che il modello credeva di aver passato.
+        let err = rifiuto(json!({"sql": "SELECT $1", "params": "ciao"}));
+        assert_eq!(err.natura, Some(NaturaFallimento::Rimediabile));
+        let ignoto = rifiuto(json!({"sql": "SELECT 1", "limit": 3}));
+        assert!(ignoto.testo.contains("limit"), "{ignoto:?}");
+    }
+
+    #[test]
+    fn fallimento_query_legge_la_natura_dalla_variante_non_dal_testo() {
+        // Regola M: la variante e' il segnale strutturato. La connessione e'
+        // fuori dalla portata dell'agente, la query sbagliata no.
+        let conn = fallimento_query(
+            &QueryExecError::ConnectionError("DB progetto non configurato".into()),
+            "SELECT 1",
+        );
+        assert_eq!(conn.natura, Some(NaturaFallimento::DelSistema));
+        let sql = fallimento_query(&QueryExecError::Sql("colonna inesistente".into()), "SELECT x");
+        assert_eq!(sql.natura, Some(NaturaFallimento::Rimediabile));
+        assert!(sql.testo.contains("nexus_db_describe"), "{sql:?}");
+        // Il timeout NON e' transitorio: ripetere la stessa query pesante la fa
+        // scadere di nuovo, e cio' che rimedia sta nel messaggio.
+        let scaduta = fallimento_query(&QueryExecError::Timeout, "SELECT pg_sleep(60)");
+        assert_eq!(scaduta.natura, Some(NaturaFallimento::Rimediabile));
+        assert!(scaduta.testo.contains("sql_excerpt"), "{scaduta:?}");
     }
 }
