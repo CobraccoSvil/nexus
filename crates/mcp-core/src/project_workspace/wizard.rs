@@ -1604,7 +1604,10 @@ async fn scegli_porta_bucket(
     short: &str,
     existing: Option<u16>,
     reserved: &std::collections::HashSet<u16>,
-) -> u16 {
+) -> Result<u16, super::allocate_port::ErroreAllocazione> {
+    // Una porta ESPLICITA e ancora libera si rispetta: chi installa il servizio
+    // l'ha scelta, e `find_or_allocate` piu' sotto la ritrovera' comunque nel
+    // ramo idempotente se e' gia' registrata a questa label.
     if let Some(p) = existing {
         let ok = !reserved.contains(&p)
             && state.port_registry.is_port_available(p).await
@@ -1613,28 +1616,15 @@ async fn scegli_porta_bucket(
                 super::port_recovery::PortBind::Libera
             );
         if ok {
-            return p;
+            return Ok(p);
         }
-        return services::find_free_project_port(project_id, &state.port_registry).await;
+        // Non piu' `find_free_project_port`: quella trova un numero libero e non
+        // lo REGISTRA. Si passa dal punto unico che alloca E registra, come per
+        // il caso senza porta esplicita.
     }
-    match super::allocate_port::find_or_allocate(
-        &state.db,
-        &state.port_registry,
-        *project_id,
-        short,
-    )
-    .await
-    {
-        Ok(a) => a.port,
-        Err(e) => {
-            tracing::warn!(
-                "wizard: find_or_allocate fallita per {} ({}), fallback find_free",
-                short,
-                e
-            );
-            services::find_free_project_port(project_id, &state.port_registry).await
-        }
-    }
+    super::allocate_port::find_or_allocate(&state.db, &state.port_registry, *project_id, short)
+        .await
+        .map(|a| a.port)
 }
 
 /// Helper di `install_service_systemd`: se il servizio vuole una porta, la sceglie
@@ -1650,12 +1640,12 @@ async fn alloca_porta_servizio(
     wants_port: bool,
     reserved: &std::collections::HashSet<u16>,
     env_map: &mut std::collections::HashMap<String, String>,
-) -> Option<u16> {
+) -> Result<Option<u16>, super::allocate_port::ErroreAllocazione> {
     if !wants_port {
-        return None;
+        return Ok(None);
     }
     let existing_port = env_map.get("PORT").and_then(|v| parse_port_token(v));
-    let actual = scegli_porta_bucket(state, project_id, short, existing_port, reserved).await;
+    let actual = scegli_porta_bucket(state, project_id, short, existing_port, reserved).await?;
     env_map.insert("PORT".to_string(), actual.to_string());
     // .NET: usa ASPNETCORE_URLS per forzare la porta (PORT da solo non basta).
     if kind == "dotnet" && !env_map.contains_key("ASPNETCORE_URLS") {
@@ -1664,7 +1654,7 @@ async fn alloca_porta_servizio(
             format!("http://0.0.0.0:{}", actual),
         );
     }
-    Some(actual)
+    Ok(Some(actual))
 }
 
 /// Helper di `install_service_systemd`: riscrive l'ExecStart per la porta `p`,
@@ -2086,6 +2076,11 @@ async fn install_service_systemd(
     let kind = body["kind"].as_str().unwrap_or("");
     let wants_port = matches!(kind, "npm" | "pnpm" | "dotnet" | "static")
         || looks_like_web_server_command(&exec_start);
+    // Un'allocazione fallita FERMA l'installazione. Prima si ripiegava su
+    // `find_free_project_port`, che trova un numero libero e NON lo registra: il
+    // servizio nasceva con una porta fantasma, e il port enforcer — che uccide
+    // cio' che ascolta su una porta non allocata — se lo sarebbe ripreso poco
+    // dopo. Meglio non installarlo e dirlo.
     let final_port = alloca_porta_servizio(
         &state,
         &project_id,
@@ -2095,7 +2090,13 @@ async fn install_service_systemd(
         &reserved,
         &mut env_map,
     )
-    .await;
+    .await
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("porta non allocabile per il servizio '{short}': {e}"),
+        )
+    })?;
 
     let exec_start = match final_port {
         Some(p) => costruisci_exec_start_con_porta(cwd, &exec_start, p),

@@ -50,6 +50,18 @@ const MIG_SEED: &str = "0677";
 /// Purpose dei validatori in `nexus_purpose_model` (tier-only, mig 0677).
 const PURPOSE: &str = "step_validator";
 
+/// Quanti giudici il gate PRETENDE, su fornitori distinti fra loro e
+/// dall'esecutore. Costante NOMINATA e non un numero scritto nei punti di
+/// chiamata: e' insieme la SOGLIA che la selezione deve raggiungere scendendo
+/// la tier-chain e il TETTO dei convocati, e le due meta' non possono
+/// divergere (regola L). Il test la legge da qui invece di ricopiarla
+/// (regola O).
+const VALIDATORI_RICHIESTI: usize = 2;
+
+/// Quanti candidati chiedere al purpose: piu' larghi della soglia, cosi' se un
+/// fornitore cade fra la selezione e la chiamata ne resta uno di scorta.
+const CANDIDATI_RICHIESTI: usize = 6;
+
 /// Chiavi di configurazione (seed in mig 0677; regola G: mai env var).
 const CHIAVE_MODE: &str = "orchestrator.critical_step_gate_mode";
 const CHIAVE_TIMEOUT: &str = "orchestrator.critical_step_gate_timeout_s";
@@ -194,7 +206,7 @@ impl StepValidationPort for StepGateAdapter {
         // Selezione: candidati del purpose, MAI l'esecutore. La convocazione
         // impossibile e' un ESITO del report (il nodo applica la matrice
         // della doppia astensione), mai un errore che spegne il gate.
-        let candidati = match risolvi_candidati(&self.setup.db).await {
+        let candidati = match risolvi_candidati(&self.setup.db, &executor).await {
             Ok(c) => c,
             Err(report) => return Ok(report),
         };
@@ -276,18 +288,43 @@ async fn attendi_verdetto(
 }
 
 /// La risoluzione del purpose, con la convocazione impossibile gia' in forma
-/// di report degradato (il chiamante la ritorna cosi' com'e'). Il limite
-/// largo (6) sopravvive al filtro sull'esecutore; la diversita' PerProvider
-/// garantisce provider distinti fra i primi due.
+/// di report degradato (il chiamante la ritorna cosi' com'e'). La diversita'
+/// PerProvider garantisce provider distinti fra i convocati.
+///
+/// L'esecutore viaggia fin QUI, dentro la selezione, e non e' un dettaglio di
+/// implementazione: e' cio' che rende la CONDIZIONE DI USCITA della tier-chain
+/// coerente con quello che il gate potra' davvero usare. Con la soglia a 1 e
+/// senza veto, la catena si fermava al primo anello non vuoto e consegnava
+/// l'unico fornitore che il gate avrebbe scartato — MISURATO il 09/08/2026:
+/// tier `medium` con capability `reasoning` popolato da anthropic, mistral e
+/// openai, i primi due... anzi il primo e il terzo in cooldown billing,
+/// esecutore mistral, `validators: []` e `unavailable_declared` mentre
+/// deepseek, google e openrouter erano sani un gradino sopra.
+///
+/// Esecutore vuoto = nessun veto (stessa scelta di `veto_del_giudice`):
+/// escludere un nome vuoto non escluderebbe nessuno, o tutti, a seconda del
+/// confronto — e in nessuno dei due casi il motivo si leggerebbe.
 async fn risolvi_candidati(
     db: &PgPool,
+    executor_provider: &str,
 ) -> Result<Vec<PurposeProviderCandidate>, StepValidationReport> {
-    resolve_purpose_provider_candidates_db_by(db, PURPOSE, 6, 1, CandidateDiversity::PerProvider)
-        .await
-        .map_err(|risoluzione| StepValidationReport {
-            verdicts: Vec::new(),
-            degraded: Some(format!("purpose {PURPOSE} non risolvibile: {risoluzione:?}")),
-        })
+    let veto: Vec<String> = match executor_provider.trim() {
+        "" => Vec::new(),
+        p => vec![p.to_string()],
+    };
+    resolve_purpose_provider_candidates_db_by(
+        db,
+        PURPOSE,
+        CANDIDATI_RICHIESTI,
+        VALIDATORI_RICHIESTI,
+        CandidateDiversity::PerProvider,
+        &veto,
+    )
+    .await
+    .map_err(|risoluzione| StepValidationReport {
+        verdicts: Vec::new(),
+        degraded: Some(format!("purpose {PURPOSE} non risolvibile: {risoluzione:?}")),
+    })
 }
 
 /// UNA chiamata one-shot: system del ruolo, batch nel messaggio utente (il
@@ -420,9 +457,15 @@ fn estrai_verdetto(
     }
 }
 
-/// Selezione dei convocati fra gli eleggibili (veto sull'esecutore gia' come
-/// FILTRO): il degrado sotto i due provider e' DICHIARATO nel report, mai
-/// silenzioso.
+/// Selezione dei convocati fra gli eleggibili: il degrado sotto i due provider
+/// e' DICHIARATO nel report, mai silenzioso.
+///
+/// Il veto sull'esecutore e' gia' ELEGGIBILITA' dentro `risolvi_candidati`, e
+/// qui resta come GARANZIA del panel, non come sua unica applicazione: e' la
+/// stessa disciplina di `giudici_distinti` — chi compone un panel non assume
+/// che la selezione abbia gia' escluso cio' che a lui non serve (regola O).
+/// Le due non sono la stessa decisione: la selezione sceglie DOVE cercare, il
+/// panel dichiara COSA accetta.
 fn seleziona_convocati(
     candidati: Vec<PurposeProviderCandidate>,
     executor_provider: &str,
@@ -445,7 +488,10 @@ fn seleziona_convocati(
                  convocato il solo gatekeeper"
             )),
         ),
-        _ => (eleggibili.into_iter().take(2).collect(), None),
+        _ => (
+            eleggibili.into_iter().take(VALIDATORI_RICHIESTI).collect(),
+            None,
+        ),
     }
 }
 
@@ -697,6 +743,147 @@ mod tests {
         assert_eq!(v.role, "challenger");
     }
 
+    /// Prefisso dei fornitori di questo test. `provider_cooldown` tiene uno
+    /// stato GLOBALE di processo (`OnceLock<Mutex<HashMap>>`) e la convenzione
+    /// del modulo e' di non toccarlo con nomi reali: mettere `openai` in
+    /// cooldown qui farebbe rosseggiare, a caso, i test del routing che
+    /// seminano quello stesso nome (regola F). I RUOLI restano quelli
+    /// dell'incidente e si leggono dal nome.
+    fn forn(nome: &str) -> String {
+        format!("sv0908_{nome}")
+    }
+
+    /// Il parco dell'incidente del 09/08/2026, tier per tier, come misurato su
+    /// `ai_price_catalog` (modelli agentici con `reasoning` PROVATA):
+    /// `medium` = anthropic + mistral + openai, `high` = openai + openrouter,
+    /// `heavy` = anthropic + deepseek + google + openai.
+    const PARCO: &[(&str, &str, &str, f64)] = &[
+        ("anthropic", "claude-opus-4-8", "medium", 5.0),
+        ("mistral", "magistral-small-latest", "medium", 0.5),
+        ("openai", "gpt-4o", "medium", 2.5),
+        ("openai", "gpt-5.4", "high", 3.0),
+        ("openrouter", "z-ai/glm-4.7-flash", "high", 0.07),
+        ("anthropic", "claude-opus-4-6", "heavy", 15.0),
+        ("deepseek", "deepseek-v4-pro", "heavy", 0.4),
+        ("google", "gemini-2.5-pro", "heavy", 1.25),
+        ("openai", "o3", "heavy", 10.0),
+    ];
+
+    /// I tre fornitori senza credito quella notte
+    /// (`nexus_provider_health.billing_cooldown_until > NOW()`).
+    const SENZA_CREDITO: &[&str] = &["anthropic", "openai", "perplexity"];
+
+    /// L'INCIDENTE del 09/08/2026, riprodotto dallo stato che lo ha prodotto:
+    /// sette fornitori attivi, tre esclusi per credito (fra cui quello scritto
+    /// nella riga del purpose), esecutore del turno `mistral`.
+    ///
+    /// Il gate dichiarava `unavailable_declared` con `validators: []` e il
+    /// degrado «nessun provider candidato distinto dall'esecutore mistral»,
+    /// mentre tre fornitori leciti — deepseek, google, openrouter — erano sani
+    /// un gradino sopra e non sono mai stati guardati. La causa non era la
+    /// riga di `nexus_purpose_model` (le sue colonne `provider`/`model_id` non
+    /// vengono lette da questo percorso: `fetch_purpose_tier_rule_db` seleziona
+    /// solo `tier`/`required_capability`/`requires_tool_use`), ma la CONDIZIONE
+    /// DI USCITA della tier-chain: con soglia 1 e senza veto in eleggibilita',
+    /// la catena si fermava sul tier `medium`, dove l'unico fornitore rimasto
+    /// era proprio l'esecutore.
+    ///
+    /// STRADA DELLA PRODUZIONE (regola O): il test non fabbrica una lista di
+    /// candidati. Semina lo schema REALE (`META_MIGRATOR`), porta i tre
+    /// fornitori in cooldown passando dal boot vero
+    /// (`restore_billing_cooldowns_from_db`, che legge la colonna persistente)
+    /// e chiama `risolvi_candidati` — la stessa funzione che il gate invoca —
+    /// seguita da `seleziona_convocati`.
+    ///
+    /// MUTAZIONI che la fanno rosseggiare, tutte e tre col difetto reale:
+    ///   - `VALIDATORI_RICHIESTI` -> 1 come soglia: la catena esce su `high` e
+    ///     consegna un solo fornitore, il gate convoca il solo gatekeeper;
+    ///   - veto non passato alla selezione (`&[]`): `medium` torna l'esecutore,
+    ///     e dopo il filtro del panel resta un fornitore solo;
+    ///   - entrambe (il codice del 09/08): zero convocati e
+    ///     «nessun provider candidato distinto dall'esecutore».
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_gate_scende_di_tier_invece_di_dichiararsi_senza_giudici(pool: PgPool) {
+        for tabella in ["ai_price_catalog", "nexus_purpose_model", "nexus_provider_health"] {
+            sqlx::query(&format!("DELETE FROM {tabella}"))
+                .execute(&pool)
+                .await
+                .expect("pulizia");
+        }
+        // La riga REALE del purpose: tier `medium`, capability `reasoning`,
+        // tool use. Le colonne provider/model_id restano valorizzate come in
+        // produzione, proprio per mostrare che non partecipano alla decisione.
+        sqlx::query(
+            "INSERT INTO nexus_purpose_model \
+               (purpose, provider, model_id, tier, required_capability, requires_tool_use) \
+             VALUES ($1, 'openai', 'gpt-4o-mini', 'medium', 'reasoning', true)",
+        )
+        .bind(PURPOSE)
+        .execute(&pool)
+        .await
+        .expect("purpose");
+
+        for (nome, model, tier, costo) in PARCO {
+            sqlx::query(
+                "INSERT INTO ai_price_catalog \
+                   (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
+                    performance_tier, capabilities, qualified_capabilities, \
+                    input_cost_per_million_tokens, output_cost_per_million_tokens, \
+                    qualification_state, qualification_expires_at, currency, last_probe_healthy_at) \
+                 VALUES ($1, $2, true, true, 'none', $3, '[\"reasoning\"]'::jsonb, \
+                         '[\"reasoning\"]'::jsonb, $4, $4, 'qualified', \
+                         now() + interval '30 days', 'USD', now())",
+            )
+            .bind(forn(nome))
+            .bind(model)
+            .bind(tier)
+            .bind(costo)
+            .execute(&pool)
+            .await
+            .expect("catalog");
+        }
+
+        for nome in SENZA_CREDITO {
+            sqlx::query(
+                "INSERT INTO nexus_provider_health (provider, billing_cooldown_until, last_error) \
+                 VALUES ($1, now() + interval '6 hours', 'credit balance too low')",
+            )
+            .bind(forn(nome))
+            .execute(&pool)
+            .await
+            .expect("health");
+        }
+        // Il percorso VERO con cui lo stato persistente diventa esclusione
+        // dal routing (boot di mcp-core), non una lista scritta a mano.
+        crate::provider_cooldown::restore_billing_cooldowns_from_db(&pool).await;
+
+        let esecutore = forn("mistral");
+        let candidati = risolvi_candidati(&pool, &esecutore)
+            .await
+            .unwrap_or_else(|r| panic!("purpose non risolvibile: {:?}", r.degraded));
+        let mut trovati: Vec<String> = candidati.iter().map(|c| c.provider.clone()).collect();
+        trovati.sort();
+        assert_eq!(
+            trovati,
+            vec![forn("deepseek"), forn("google"), forn("openrouter")],
+            "i fornitori leciti stanno un gradino sopra il tier del purpose: la \
+             selezione deve scendere la catena fino a trovarli, non fermarsi sul \
+             tier dove resta il solo esecutore"
+        );
+
+        let (convocati, degraded) = seleziona_convocati(candidati, &esecutore);
+        assert_eq!(
+            convocati.len(),
+            VALIDATORI_RICHIESTI,
+            "il gate convoca i due giudici che il requisito pretende: {convocati:?}"
+        );
+        assert_eq!(degraded, None, "nessun degrado da dichiarare: i giudici c'erano");
+
+        for nome in SENZA_CREDITO {
+            crate::provider_cooldown::remove_cooldown(&forn(nome));
+        }
+    }
+
     /// GAP-4 — LA PROVA dei validatori con mandato REALE, su OGNI provider
     /// candidato del purpose, PRIMA che il gate lavori sotto carico.
     ///
@@ -738,7 +925,9 @@ mod tests {
         let setup = build_step_gate(&db, gateway)
             .await
             .expect("gate non armato: mode 'off' o prompt assenti (applicare la mig 0677)");
-        let candidati = risolvi_candidati(&db)
+        // Esecutore vuoto: la prova diagnostica interroga TUTTI i candidati del
+        // purpose, non quelli residui di un turno.
+        let candidati = risolvi_candidati(&db, "")
             .await
             .unwrap_or_else(|r| panic!("purpose {PURPOSE} non risolvibile: {:?}", r.degraded));
         assert!(

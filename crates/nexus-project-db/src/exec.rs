@@ -13,11 +13,11 @@
 //!
 //! - La connessione e' SEMPRE risolta da `project_database_config` (filtro
 //!   `is_primary = true`). Mai da input utente/modello.
-//! - Guard-rail anti-contaminazione: se la URL punta al DB infrastruttura
-//!   Nexus (db `nexus` su porta 5433, oppure hostname `postgres-nexus`/
-//!   `ideai-postgres-nexus`), l'esecuzione viene RIFIUTATA. Un tool
-//!   applicativo non deve mai toccare il DB di sistema (regola E:
-//!   isolamento progetti).
+//! - Guard-rail anti-contaminazione: se la riga risolta NON e' il DB
+//!   applicativo del progetto, l'esecuzione viene RIFIUTATA. Il criterio e'
+//!   [`classifica_connessione`], punto unico della domanda. Un tool
+//!   applicativo non deve mai toccare l'infrastruttura (regola E: isolamento
+//!   progetti).
 //! - Limiti: timeout query 30s, max 1000 righe ritornate, 20_000 caratteri
 //!   per cella stringa.
 
@@ -31,12 +31,79 @@ pub const QUERY_TIMEOUT_SECS: u64 = 30;
 pub const MAX_ROWS: usize = 1000;
 pub const MAX_CELL_CHARS: usize = 20_000;
 
+/// Valore canonico di `project_database_config.connection_role` (mig 0494) per
+/// il DB metadati Nexus per-progetto. Gemello del `DbRole::NexusMetadata` di
+/// `mcp_core::project_db_routes::provision`, che scrive la riga: i due crate non
+/// si vedono (mcp-core dipende da questo, mai il contrario).
+pub const RUOLO_METADATI_NEXUS: &str = "nexus_metadata";
+
+/// «Questa riga di `project_database_config` e' il DB APPLICATIVO del progetto,
+/// o e' infrastruttura Nexus?»
+///
+/// PUNTO UNICO (regola L) del discriminante di connessione dei tool DB. E' la
+/// domanda strutturale che rende superflua ogni ispezione del TESTO della query
+/// per stabilire "dove si sta scrivendo": chi decide e' la connessione, non cio'
+/// che la statement nomina (regola M).
+///
+/// Le due prove NON si sostituiscono, e sono entrambe necessarie:
+///   - il RUOLO dichiarato riconosce il DB metadati per-progetto `<slug>_nexus`
+///     (`agent_steps`, `nexus_agent_plans`, `jobs`, ...), che la URL non
+///     tradisce: gira sullo STESSO cluster applicativo e il nome del database
+///     e' `<slug>_nexus`, non `nexus`. Prima di questo criterio bastava
+///     `nexus_db_query(connection: "nexus_metadata")` per aprirci un pool;
+///   - la URL riconosce il DB META (`nexus` su 5433) anche quando il ruolo non
+///     e' stato scritto da chi ha registrato la riga (connessioni censite a
+///     mano, righe anteriori alla mig 0494).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnessioneRisolta {
+    /// DB applicativo del progetto: i tool possono usarlo.
+    DbApplicativo,
+    /// DB metadati Nexus per-progetto (`<slug>_nexus`): infrastruttura.
+    MetadatiDiProgetto,
+    /// DB infrastruttura Nexus (`nexus` su 5433): infrastruttura.
+    InfrastrutturaNexus,
+}
+
+impl ConnessioneRisolta {
+    /// Testo del rifiuto, composto DAL verdetto (regola Q). `None` per il DB
+    /// applicativo, che non si rifiuta.
+    pub fn motivo_del_rifiuto(&self) -> Option<String> {
+        match self {
+            ConnessioneRisolta::DbApplicativo => None,
+            ConnessioneRisolta::MetadatiDiProgetto => Some(
+                "SICUREZZA: quella connessione e' il DB metadati Nexus del \
+                 progetto (chat, run, costi), non il suo DB applicativo. \
+                 Operazione rifiutata per isolamento: usa la connessione \
+                 applicativa (omettere 'connection' seleziona la primaria)."
+                    .to_string(),
+            ),
+            ConnessioneRisolta::InfrastrutturaNexus => Some(
+                "SICUREZZA: la connessione del progetto punta al DB infrastruttura \
+                 Nexus. Operazione rifiutata per isolamento. Configura un DB \
+                 applicativo dedicato per il progetto."
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+/// Criterio puro di [`ConnessioneRisolta`]: ruolo dichiarato e URL della riga.
+pub fn classifica_connessione(conn_url: &str, connection_role: &str) -> ConnessioneRisolta {
+    if connection_role.eq_ignore_ascii_case(RUOLO_METADATI_NEXUS) {
+        return ConnessioneRisolta::MetadatiDiProgetto;
+    }
+    if points_to_nexus_infra_db(conn_url) {
+        return ConnessioneRisolta::InfrastrutturaNexus;
+    }
+    ConnessioneRisolta::DbApplicativo
+}
+
 /// Risolve la connection string del DB del progetto.
 ///
 /// Se `connection_name` e' `Some(name)` filtra per `name` (case-insensitive);
 /// altrimenti torna la connessione `is_primary=true` (comportamento storico).
 ///
-/// Applica il guard-rail anti-contaminazione verso il DB Nexus. Legge
+/// Applica il guard-rail anti-contaminazione ([`classifica_connessione`]). Legge
 /// `connection_secret` (bytea con la URL raw) dal pool Nexus passato.
 pub async fn resolve_project_conn(
     db: &PgPool,
@@ -45,15 +112,13 @@ pub async fn resolve_project_conn(
 ) -> Result<String, String> {
     let row = fetch_conn_secret_row(db, project_id, connection_name).await?;
     let conn = decode_connection_secret(&row)?;
+    let role: String = row
+        .try_get::<Option<String>, _>("connection_role")
+        .unwrap_or(None)
+        .unwrap_or_default();
 
-    // Guard-rail: blocca connessioni verso il DB infrastruttura Nexus.
-    if points_to_nexus_infra_db(&conn) {
-        return Err(
-            "SICUREZZA: la connessione del progetto punta al DB infrastruttura \
-             Nexus. Operazione rifiutata per isolamento. Configura un DB \
-             applicativo dedicato per il progetto."
-                .to_string(),
-        );
+    if let Some(motivo) = classifica_connessione(&conn, &role).motivo_del_rifiuto() {
+        return Err(motivo);
     }
     Ok(conn)
 }
@@ -68,7 +133,7 @@ async fn fetch_conn_secret_row(
 ) -> Result<sqlx::postgres::PgRow, String> {
     if let Some(name) = connection_name.map(|s| s.trim()).filter(|s| !s.is_empty()) {
         sqlx::query(
-            "SELECT connection_secret FROM project_database_config \
+            "SELECT connection_secret, connection_role FROM project_database_config \
              WHERE project_id = $1 AND LOWER(name) = LOWER($2) \
              LIMIT 1",
         )
@@ -86,7 +151,7 @@ async fn fetch_conn_secret_row(
         })
     } else {
         sqlx::query(
-            "SELECT connection_secret FROM project_database_config \
+            "SELECT connection_secret, connection_role FROM project_database_config \
              WHERE project_id = $1 AND is_primary = true \
              ORDER BY updated_at DESC LIMIT 1",
         )
@@ -1468,4 +1533,69 @@ pub fn batch_contains_ddl(sql: &str) -> bool {
     split_statements(sql)
         .iter()
         .any(|s| classify_statement(s) == "ddl")
+}
+
+#[cfg(test)]
+mod tests_connessione {
+    use super::*;
+
+    /// Il DB metadati per-progetto NON e' riconoscibile dalla URL: stesso
+    /// cluster del DB applicativo, e nome database `<slug>_nexus`. Prima del
+    /// ruolo dichiarato la sola prova disponibile era `points_to_nexus_infra_db`,
+    /// che su quella URL dice (correttamente) "non e' il DB META" — e da li'
+    /// `nexus_db_query(connection: "nexus_metadata")` apriva un pool su
+    /// `agent_steps`.
+    #[test]
+    fn il_db_metadati_di_progetto_non_si_riconosce_dalla_url() {
+        let url = "postgres://nexus_admin:pw@127.0.0.1:5434/gestione_corsi_nexus";
+        assert!(
+            !points_to_nexus_infra_db(url),
+            "la URL del DB metadati di progetto non e' quella del DB META: \
+             e' il RUOLO a doverlo dire"
+        );
+        assert_eq!(
+            classifica_connessione(url, RUOLO_METADATI_NEXUS),
+            ConnessioneRisolta::MetadatiDiProgetto
+        );
+        assert!(classifica_connessione(url, RUOLO_METADATI_NEXUS)
+            .motivo_del_rifiuto()
+            .is_some());
+    }
+
+    /// La URL resta necessaria: una riga registrata a mano puo' puntare al DB
+    /// META senza dichiarare alcun ruolo (le righe anteriori alla mig 0494
+    /// hanno il default 'app').
+    #[test]
+    fn il_db_meta_resta_rifiutato_anche_col_ruolo_applicativo() {
+        for url in [
+            "postgres://nexus:pw@postgres-nexus:5433/nexus",
+            "postgres://nexus:pw@127.0.0.1:5433/nexus",
+            "postgresql://u:p@ideai-postgres-nexus:5433/nexus?sslmode=disable",
+        ] {
+            assert_eq!(
+                classifica_connessione(url, "app"),
+                ConnessioneRisolta::InfrastrutturaNexus,
+                "url {url}"
+            );
+        }
+    }
+
+    /// Il DB applicativo passa: e' il caso ordinario, e senza di esso il guard
+    /// sarebbe verde per assenza.
+    #[test]
+    fn il_db_applicativo_del_progetto_passa() {
+        let url = "postgres://app:pw@127.0.0.1:5434/gestione_corsi_app";
+        assert_eq!(
+            classifica_connessione(url, "app"),
+            ConnessioneRisolta::DbApplicativo
+        );
+        assert!(classifica_connessione(url, "app")
+            .motivo_del_rifiuto()
+            .is_none());
+        // Ruolo assente (colonna NULL letta come stringa vuota): resta applicativo.
+        assert_eq!(
+            classifica_connessione(url, ""),
+            ConnessioneRisolta::DbApplicativo
+        );
+    }
 }

@@ -383,6 +383,30 @@ fn base_caps_from_name(provider: &str, m: &str) -> &'static [&'static str] {
                 &["code", "chat"]
             }
         }
+        // Moonshot/Kimi. Il discriminante NON e' una parola nel nome che indichi
+        // il ragionamento — come `reasoner` su deepseek o `magistral` su mistral —
+        // perche' su questo fornitore il pensiero non e' una variante del
+        // modello: sull'intera serie `kimi-k*` e' acceso sempre e non si spegne
+        // (doc: "Always reasons", e su k2.7-code "thinking is on by default").
+        // Quindi il tag `reasoning` appartiene alla serie, non a un suffisso.
+        //
+        // Serve perche' il default e' `["chat"]` e le capability si scrivono UNA
+        // VOLTA SOLA, se vuote: un modello kimi scoperto in futuro dalla
+        // `/v1/models` nascerebbe monco in modo permanente, e senza `reasoning`
+        // resterebbe fuori dai sette intent agentici che lo pretendono. E' la
+        // causa gia' misurata su groq/openrouter, corretta a posteriori dalla
+        // mig 0582.
+        "kimi" => {
+            if m.contains("moonshot-v1") {
+                // Serie legacy pre-thinking, in dismissione: chat e basta.
+                &["chat"]
+            } else if m.contains("k3") {
+                // Finestra da 1M token: e' il modello a cui dare i contesti lunghi.
+                &["reasoning", "code", "long-context", "chat"]
+            } else {
+                &["reasoning", "code", "chat"]
+            }
+        }
         _ => &["chat"],
     }
 }
@@ -2658,6 +2682,36 @@ mod tests {
         ("catalog.agentic_index_sync.max_age_hours", "168"),
     ];
 
+
+    /// I modelli Kimi nascono col tag `reasoning`, e la serie legacy no.
+    ///
+    /// Senza il ramo il default e' `["chat"]`, e sette intent agentici su
+    /// diciassette filtrano su `capabilities @> ["reasoning"]`: il modello
+    /// resterebbe invisibile a tutta la catena pesante. Non e' un'ipotesi — e'
+    /// la causa misurata il 13/07/2026 per cui groq e openrouter non venivano
+    /// MAI scelti, corretta a posteriori dalla mig 0582. Qui la si previene,
+    /// perche' `capabilities` si scrive una volta sola quando e' vuota: un
+    /// modello nato monco resta monco per sempre.
+    ///
+    /// MUTAZIONE DI CONTROLLO: togliendo il ramo `"kimi"` le prime tre
+    /// asserzioni rosseggiano (cadono sul default `["chat"]`).
+    #[test]
+    fn le_capability_kimi_nascono_col_ragionamento() {
+        for modello in ["kimi-k3", "kimi-k2.6", "kimi-k2.7-code", "kimi-k2.7-code-highspeed"] {
+            let caps = infer_capabilities_from_name("kimi", modello);
+            assert!(
+                caps.contains(&"reasoning"),
+                "{modello} senza reasoning: invisibile agli intent agentici"
+            );
+            assert!(caps.contains(&"code"), "{modello} senza code");
+        }
+        // La finestra da 1M e' del solo k3: e' il modello dei contesti lunghi.
+        assert!(infer_capabilities_from_name("kimi", "kimi-k3").contains(&"long-context"));
+        assert!(!infer_capabilities_from_name("kimi", "kimi-k2.6").contains(&"long-context"));
+        // Serie legacy pre-thinking: nessuna promessa di ragionamento.
+        let legacy = infer_capabilities_from_name("kimi", "moonshot-v1-128k");
+        assert_eq!(legacy, vec!["chat"]);
+    }
 
     #[test]
     fn test_is_chat_compatible_no_per_name_blacklist() {

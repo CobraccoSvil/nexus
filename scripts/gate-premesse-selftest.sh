@@ -70,6 +70,23 @@ unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_COMMON_DIR GIT_PREFIX \
   GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE \
   GIT_INDEX_VERSION GIT_REFLOG_ACTION
 
+# L'identita' dei commit usa-e-getta viaggia PER COMANDO (`-c`), mai scritta con
+# `git config`, ed e' difesa in profondita' rispetto all'unset qui sopra.
+#
+# MISURATO l'09/08/2026, dopo il primo incidente: `git -C "$COMUNE" config
+# user.name ...` con GIT_DIR ereditato non aveva solo committato sul repo reale
+# — aveva RISCRITTO `D:/IDEAI/.git/config`, che i worktree condividono. Da quel
+# momento ogni commit di OGNI sessione e' uscito firmato
+# `gate selftest <selftest@nexus.local>` invece di `Nexus Dev <dev@ideai.local>`:
+# 18 commit su 40, di sessioni diverse, prima che qualcuno se ne accorgesse.
+# Quelli restano come sono (riscrivere una storia gia' pubblicata costa piu' del
+# danno); il config e' stato ripristinato.
+#
+# `-c` non puo' fare questo danno per costruzione: vale per la singola
+# invocazione e non tocca nessun file di configurazione, nemmeno se un domani
+# qualcuno reintroducesse una variabile d'ambiente che scavalca `-C`.
+IDENTITA_USA_E_GETTA=(-c user.name="gate selftest" -c user.email=selftest@nexus.local)
+
 SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
 TMP="$(mktemp -d)"
 COMUNE="$TMP/comune"
@@ -96,15 +113,13 @@ esito() { # esito <descrizione> <atteso> <ottenuto>
 # verificando.
 mkdir -p "$NOHOOKS"
 git init -q -b main "$COMUNE"
-git -C "$COMUNE" config user.email selftest@nexus.local
-git -C "$COMUNE" config user.name "gate selftest"
 mkdir -p "$COMUNE/scripts"
 for s in gate-env.sh gate-premesse.sh precommit-cargo-check.sh precommit-turbo.sh; do
   cp "$SCRIPTS/$s" "$COMUNE/scripts/$s"
 done
 git -C "$COMUNE" add -A
-git -C "$COMUNE" -c core.hooksPath="$NOHOOKS" -c commit.gpgsign=false \
-  commit -q -m "selftest: script dei gate"
+git -C "$COMUNE" "${IDENTITA_USA_E_GETTA[@]}" -c core.hooksPath="$NOHOOKS" \
+  -c commit.gpgsign=false commit -q -m "selftest: script dei gate"
 git -C "$COMUNE" worktree add -q -b selftest-wt "$WT" main
 
 echo "repo comune : $COMUNE"
@@ -232,14 +247,19 @@ if [ "${NEXUS_SELFTEST_ANNIDATO:-}" != "1" ]; then
   # come, e un domani il rimedio potrebbe essere un altro (regola O).
   VITTIMA="$TMP/vittima"
   git init -q -b main "$VITTIMA"
-  git -C "$VITTIMA" config user.email selftest@nexus.local
-  git -C "$VITTIMA" config user.name "gate selftest"
   printf 'segnaposto\n' > "$VITTIMA/file.txt"
   git -C "$VITTIMA" add -A
-  git -C "$VITTIMA" -c core.hooksPath="$NOHOOKS" -c commit.gpgsign=false \
-    commit -q -m "vittima: stato iniziale"
+  git -C "$VITTIMA" "${IDENTITA_USA_E_GETTA[@]}" -c core.hooksPath="$NOHOOKS" \
+    -c commit.gpgsign=false commit -q -m "vittima: stato iniziale"
   head_prima="$(git -C "$VITTIMA" rev-parse HEAD)"
   wt_prima="$(git -C "$VITTIMA" worktree list | wc -l)"
+  # L'IDENTITA' della vittima: il danno peggiore del 09/08 non fu il commit di
+  # straforo ma il `git config user.name` finito nel config CONDIVISO dei
+  # worktree — da li' in poi ogni commit di ogni sessione usciva firmato
+  # "gate selftest". Si guarda il config, non il commit.
+  git -C "$VITTIMA" config user.name "Proprietario Vero"
+  git -C "$VITTIMA" config user.email vero@esempio.local
+  nome_prima="$(git -C "$VITTIMA" config user.name)"
 
   # Una modifica NON committata nell'indice: e' cio' che il difetto committava.
   printf 'modifica in staging\n' > "$VITTIMA/file.txt"
@@ -254,6 +274,8 @@ if [ "${NEXUS_SELFTEST_ANNIDATO:-}" != "1" ]; then
     "$head_prima" "$(git -C "$VITTIMA" rev-parse HEAD)"
   esito "nessun worktree registrato nella vittima" \
     "$wt_prima" "$(git -C "$VITTIMA" worktree list | wc -l)"
+  esito "l'identita' della vittima non viene riscritta" \
+    "$nome_prima" "$(git -C "$VITTIMA" config user.name)"
 fi
 
 echo

@@ -26,6 +26,9 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use nexus_agent_tools::input_contract::InputTool;
+use nexus_agent_tools::tool_inputs::NexusGetWorklogInput;
+use nexus_types::tool_outcome::RispostaTool;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
@@ -1143,55 +1146,162 @@ async fn fetch_worklog_page(
     .await
 }
 
+/// I filtri della pagina, gia' letti dal contratto e VALIDATI.
+///
+/// Tre dei quattro campi — `run_id`, `limit`, `offset` — venivano prima ridotti
+/// al default in SILENZIO: chi aveva chiesto una restrizione riceveva una
+/// lettura diversa da quella chiesta, senza che nulla lo dicesse. Il quarto,
+/// `kind`, e' un enum del catalogo: li' il vincolo c'era gia'.
+struct PaginaWorklog {
+    kind: Option<&'static str>,
+    run_id: Option<Uuid>,
+    limit: i64,
+    offset: i64,
+}
+
+/// Legge l'input dal contratto d'ingresso e valida cio' che lo schema non puo'
+/// vincolare da solo (un UUID, due interi non negativi).
+///
+/// `kind` non ha piu' bisogno di controlli: e' un enum del catalogo, quindi un
+/// valore fuori elenco non arriva fin qui — lo ferma la deserializzazione, col
+/// messaggio che elenca i valori ammessi.
+fn leggi_pagina(input: &Value, page_size: i64) -> Result<PaginaWorklog, RispostaTool> {
+    let letto = NexusGetWorklogInput::leggi(input)?;
+    Ok(PaginaWorklog {
+        kind: letto.kind.map(|k| k.come_stringa()),
+        run_id: leggi_run_id(letto.run_id.as_deref())?,
+        limit: leggi_limit(letto.limit, page_size)?,
+        offset: leggi_offset(letto.offset)?,
+    })
+}
+
+/// Un `run_id` malformato veniva SCARTATO in silenzio (`Uuid::parse_str(s).ok()`
+/// dentro un `and_then`): l'agente credeva di aver ristretto la lettura a un
+/// run e riceveva l'intera sessione. E' la stessa forma di difetto gia' chiusa
+/// su `filter_session_id` in `nexus_search_semantic`.
+fn leggi_run_id(grezzo: Option<&str>) -> Result<Option<Uuid>, RispostaTool> {
+    let Some(testo) = grezzo.map(str::trim) else {
+        return Ok(None);
+    };
+    Uuid::parse_str(testo).map(Some).map_err(|_| {
+        RispostaTool::fallito_rimediabile(format!(
+            "'run_id' non e' un UUID: ricevuto '{testo}'. Passa il valore del campo \
+             'run_id' di un evento gia' letto, oppure ometti il campo per leggere \
+             tutti i run della sessione."
+        ))
+    })
+}
+
+/// Il TETTO lo promette il catalogo, quindi tagliarvi non e' una sorpresa; uno
+/// zero o un negativo non e' invece la richiesta di una pagina piu' piccola, e'
+/// una chiamata sbagliata — e il vecchio `clamp(1, page_size)` la trasformava
+/// nella lettura di un evento solo.
+fn leggi_limit(grezzo: Option<i64>, page_size: i64) -> Result<i64, RispostaTool> {
+    match grezzo {
+        None => Ok(page_size),
+        Some(n) if n > 0 => Ok(n.min(page_size)),
+        Some(n) => Err(RispostaTool::fallito_rimediabile(format!(
+            "'limit' deve essere un intero positivo (ricevuto {n}). Omettilo per il \
+             default di {page_size} eventi per pagina."
+        ))),
+    }
+}
+
+/// Un `offset` negativo diventava 0 con `.max(0)`: la pagina letta non era
+/// quella chiesta, e la risposta la dichiarava come se lo fosse.
+fn leggi_offset(grezzo: Option<i64>) -> Result<i64, RispostaTool> {
+    match grezzo {
+        None => Ok(0),
+        Some(n) if n >= 0 => Ok(n),
+        Some(n) => Err(RispostaTool::fallito_rimediabile(format!(
+            "'offset' non puo' essere negativo (ricevuto {n}). Omettilo per partire \
+             dall'evento piu' recente."
+        ))),
+    }
+}
+
+/// Compone la risposta di una pagina LETTA: il payload JSON nel testo, l'esito
+/// nel campo.
+///
+/// Zero eventi e' un SUCCESSO — la sessione non ha ancora prodotto worklog, che
+/// e' cosa diversa dal non aver potuto leggere.
+fn pagina_letta(
+    session_id: Uuid,
+    pagina: &PaginaWorklog,
+    rows: &[sqlx::postgres::PgRow],
+) -> RispostaTool {
+    let total: i64 = rows
+        .first()
+        .and_then(|r| r.try_get::<i64, _>("total").ok())
+        .unwrap_or(0);
+    let events: Vec<Value> = rows.iter().map(worklog_row_to_json).collect();
+    let payload = json!({
+        "session_id": session_id.to_string(),
+        "total": total,
+        "offset": pagina.offset,
+        "limit": pagina.limit,
+        "events": events,
+    });
+    match serde_json::to_string(&payload) {
+        Ok(testo) => RispostaTool::riuscito(testo),
+        Err(e) => {
+            tracing::warn!(error = %e, %session_id, "nexus_get_worklog: serializzazione fallita");
+            RispostaTool::fallito_di_sistema(
+                "nexus_get_worklog: la pagina di eventi non e' serializzabile in JSON. \
+                 Nessun parametro della chiamata lo cambia.",
+            )
+        }
+    }
+}
+
 pub async fn tool_nexus_get_worklog(
     ctx: &crate::agent_tools::AgentToolContext,
     input: &Value,
-) -> String {
+) -> RispostaTool {
     let Some(session_id) = ctx.session_id else {
-        return "nexus_get_worklog: disponibile solo nelle sessioni chat (nessuna sessione nel contesto).".to_string();
+        // RAMO NUDO CHIUSO: usciva senza dichiarazione d'esito, cioe' come un
+        // successo il cui testo dice "non disponibile" — e chi legge l'esito
+        // proseguiva come se il worklog fosse semplicemente vuoto. Nessun
+        // parametro della chiamata lo cambia: il worklog e' per-sessione, e
+        // fuori da una chat la sessione non esiste.
+        return RispostaTool::fallito_di_sistema(
+            "nexus_get_worklog: disponibile solo nelle sessioni chat \
+             (nessuna sessione nel contesto).",
+        );
     };
     let db: &PgPool = ctx.db.as_ref();
     // settings: config GLOBALE -> meta. Le righe worklog vivono nel DB del
     // progetto: pool gia' risolto alla costruzione del contesto (ctx.run_db),
     // nessuna seconda risoluzione qui (regola L).
     let settings = current_settings(db).await;
-    let wpool: &PgPool = ctx.run_db.as_ref();
-    let kind = input.get("kind").and_then(Value::as_str);
-    let run_id = input
-        .get("run_id")
-        .and_then(Value::as_str)
-        .and_then(|s| Uuid::parse_str(s).ok());
-    let limit = input
-        .get("limit")
-        .and_then(Value::as_i64)
-        .unwrap_or(settings.tool_page_size)
-        .clamp(1, settings.tool_page_size);
-    let offset = input
-        .get("offset")
-        .and_then(Value::as_i64)
-        .unwrap_or(0)
-        .max(0);
-
-    let rows = match fetch_worklog_page(wpool, session_id, kind, run_id, limit, offset).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, %session_id, "nexus_get_worklog: query fallita");
-            return "nexus_get_worklog: errore di lettura del worklog (riprova).".to_string();
-        }
+    let pagina = match leggi_pagina(input, settings.tool_page_size) {
+        Ok(p) => p,
+        Err(risposta) => return risposta,
     };
-    let total: i64 = rows
-        .first()
-        .and_then(|r| r.try_get::<i64, _>("total").ok())
-        .unwrap_or(0);
-    let events: Vec<Value> = rows.iter().map(worklog_row_to_json).collect();
-    serde_json::to_string(&json!({
-        "session_id": session_id.to_string(),
-        "total": total,
-        "offset": offset,
-        "limit": limit,
-        "events": events,
-    }))
-    .unwrap_or_else(|_| "nexus_get_worklog: errore di serializzazione.".to_string())
+    let wpool: &PgPool = ctx.run_db.as_ref();
+    let rows = fetch_worklog_page(
+        wpool,
+        session_id,
+        pagina.kind,
+        pagina.run_id,
+        pagina.limit,
+        pagina.offset,
+    )
+    .await;
+    match rows {
+        Ok(r) => pagina_letta(session_id, &pagina, &r),
+        Err(e) => {
+            // ERRORE INGHIOTTITO: la query fallita usciva senza dichiarazione —
+            // un successo, per una lettura mai avvenuta — e il testo invitava
+            // pure a "riprovare" cio' che rifallira' identico finche' il DB del
+            // progetto non torna interrogabile.
+            tracing::warn!(error = %e, %session_id, "nexus_get_worklog: query fallita");
+            RispostaTool::fallito_di_sistema(
+                "nexus_get_worklog: lettura del worklog fallita (DB del progetto non \
+                 interrogabile). Il dettaglio dell'errore e' nei log del servizio.",
+            )
+        }
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1494,5 +1604,125 @@ mod tests {
                 out.chars().count()
             );
         }
+    }
+
+    // ── Contratto d'ingresso di nexus_get_worklog ───────────────────────────
+    //
+    // I tre filtri qui sotto venivano RIDOTTI AL DEFAULT in silenzio: chi aveva
+    // chiesto una restrizione riceveva una lettura diversa da quella chiesta, e
+    // la risposta la dichiarava come se fosse quella chiesta. Senza questi test
+    // il ripristino dei tre ripieghi (`and_then(|s| ...ok())`, `clamp(1, ..)`,
+    // `.max(0)`) lascerebbe l'intera suite verde: nessun altro test attraversa
+    // `leggi_pagina`, che e' l'unica porta d'ingresso del tool.
+
+    /// MUTAZIONE: rimettendo `Uuid::parse_str(s).ok()` dentro un `and_then`,
+    /// questo test rosseggia perche' la lettura torna a essere accettata.
+    #[test]
+    fn run_id_non_uuid_e_un_rifiuto_non_un_filtro_scartato() {
+        let Err(risposta) = leggi_pagina(&json!({"run_id": "ultimo"}), 50) else {
+            panic!("un run_id non-UUID e' stato accettato: la lettura non sarebbe ristretta");
+        };
+        assert!(risposta.esito.e_fallito(), "{}", risposta.testo);
+        assert_eq!(
+            risposta.natura,
+            Some(nexus_types::tool_outcome::NaturaFallimento::Rimediabile),
+            "l'agente puo' correggerlo da solo: {}",
+            risposta.testo
+        );
+        assert!(
+            risposta.testo.contains("run_id"),
+            "il messaggio deve nominare il campo: {}",
+            risposta.testo
+        );
+    }
+
+    /// MUTAZIONE: rimettendo `clamp(1, page_size)`, `limit: 0` torna a leggere
+    /// UN evento e questo test rosseggia.
+    #[test]
+    fn limit_non_positivo_e_rifiutato_non_ridotto_a_uno() {
+        for n in [0_i64, -5] {
+            let Err(risposta) = leggi_pagina(&json!({ "limit": n }), 50) else {
+                panic!("limit {n} accettato: la pagina letta non sarebbe quella chiesta");
+            };
+            assert!(risposta.testo.contains("limit"), "{}", risposta.testo);
+            assert_eq!(
+                risposta.natura,
+                Some(nexus_types::tool_outcome::NaturaFallimento::Rimediabile),
+                "{}",
+                risposta.testo
+            );
+        }
+    }
+
+    /// MUTAZIONE: rimettendo `.max(0)`, un offset negativo torna a leggere la
+    /// prima pagina e questo test rosseggia.
+    #[test]
+    fn offset_negativo_e_rifiutato_non_azzerato() {
+        let Err(risposta) = leggi_pagina(&json!({"offset": -10}), 50) else {
+            panic!("offset negativo accettato: la pagina letta non sarebbe quella chiesta");
+        };
+        assert!(risposta.testo.contains("offset"), "{}", risposta.testo);
+    }
+
+    /// Il TETTO resta, perche' il catalogo lo promette: tagliare a `page_size`
+    /// non e' una sorpresa, e' cio' che la descrizione del campo dichiara.
+    #[test]
+    fn limite_oltre_il_tetto_e_tagliato_non_rifiutato() {
+        let Ok(pagina) = leggi_pagina(&json!({"limit": 5000}), 50) else {
+            panic!("il tetto promesso dal catalogo e' diventato un rifiuto");
+        };
+        assert_eq!(pagina.limit, 50);
+    }
+
+    /// `kind` e' un enum del catalogo: un valore fuori vocabolario lo ferma la
+    /// deserializzazione. Prima arrivava al bind SQL e produceva zero eventi,
+    /// cioe' un successo indistinguibile da «nessun evento di quel tipo».
+    ///
+    /// MUTAZIONE: riportando il campo a `String`, il rifiuto sparisce.
+    #[test]
+    fn kind_fuori_vocabolario_lo_ferma_il_contratto() {
+        let Err(risposta) = leggi_pagina(&json!({"kind": "tool_call"}), 50) else {
+            panic!("un kind inesistente e' stato accettato: la query direbbe zero eventi");
+        };
+        assert!(risposta.esito.e_fallito(), "{}", risposta.testo);
+        assert!(
+            risposta.testo.contains("failed_attempt"),
+            "il messaggio deve elencare i valori ammessi: {}",
+            risposta.testo
+        );
+    }
+
+    /// I quattro campi sono opzionali: la chiamata nuda legge la prima pagina di
+    /// tutti gli eventi della sessione, che e' cio' che il catalogo promette.
+    #[test]
+    fn chiamata_nuda_usa_i_default_del_catalogo() {
+        let Ok(pagina) = leggi_pagina(&json!({}), 50) else {
+            panic!("la chiamata senza filtri e' stata rifiutata");
+        };
+        assert_eq!(pagina.limit, 50);
+        assert_eq!(pagina.offset, 0);
+        assert!(pagina.kind.is_none());
+        assert!(pagina.run_id.is_none());
+    }
+
+    /// Una pagina VUOTA e' un SUCCESSO: la sessione senza eventi e' una
+    /// risposta, non un guasto. La distinzione e' l'intero punto della
+    /// migrazione — «non c'era niente da leggere» contro «non ho potuto
+    /// leggere» — e senza questo test niente impedisce di far collassare il
+    /// primo caso sul secondo.
+    #[test]
+    fn pagina_senza_eventi_resta_un_successo() {
+        let pagina = PaginaWorklog {
+            kind: None,
+            run_id: None,
+            limit: 50,
+            offset: 0,
+        };
+        let risposta = pagina_letta(Uuid::nil(), &pagina, &[]);
+        assert!(!risposta.esito.e_fallito(), "{}", risposta.testo);
+        assert!(risposta.natura.is_none());
+        let payload: Value = serde_json::from_str(&risposta.testo).expect("payload JSON");
+        assert_eq!(payload["total"], json!(0));
+        assert_eq!(payload["events"], json!([]));
     }
 }

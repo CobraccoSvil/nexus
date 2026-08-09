@@ -10,10 +10,12 @@
 # ancora lockati (os error 5). Vedi lib\nexus-process.ps1 per il razionale.
 $ErrorActionPreference = 'Stop'
 $RUNTIME = 'D:\IDEAI-runtime'
+$WINSW   = Join-Path $RUNTIME 'winsw'
 $PIDFILE = Join-Path $RUNTIME 'nexus-dev.pids.json'
 
 . (Join-Path $PSScriptRoot 'lib\nexus-process.ps1')
-. (Join-Path $PSScriptRoot 'lib\nexus-liveness.ps1')
+# FORMA del pidfile + criterio di vitalita' che si porta dietro.
+. (Join-Path $PSScriptRoot 'lib\nexus-pidfile.ps1')
 
 # Processi sopravvissuti al kill: raccolti qui e riportati insieme in coda, cosi'
 # un fallimento non impedisce di tentare gli altri servizi.
@@ -41,6 +43,17 @@ function Invoke-Kill([int]$processId, [string]$label, [string]$how) {
 if (Test-Path $PIDFILE) {
   try {
     $procs = Read-NexusPidFile -Path $PIDFILE
+    # Le prove d'identita' mancanti si completano dal manifest PRIMA di giudicare,
+    # come fa la guardia di dev-start: e' lo stesso file, e due letture con due
+    # corredi di prove diversi davano due verdetti diversi sugli stessi nove pid.
+    # Senza questa riga, un pidfile scritto da un produttore che non le annota
+    # rendeva OGNI voce «non interrogabile», questo script usciva 1 e il deploy
+    # si fermava con gli eseguibili lockati (misurato tre volte il 09/08/2026).
+    $procs = Resolve-NexusPidEntries -Voci @($procs) -WinswRoot $WINSW
+    $antecedenti = @($procs | Where-Object { $_.Antecedente })
+    if ($antecedenti.Count -gt 0) {
+      Write-Host "Pidfile senza prove d'identita' per $($antecedenti.Count) voce/i (file antecedente al contratto): completate dai manifest WinSW." -ForegroundColor DarkGray
+    }
     # Il pid nel file e' un NUMERO, non un'identita': prima di `taskkill /T /F`
     # si verifica che sia ancora il nostro processo. Senza questa domanda un pid
     # riciclato dal SO fa abbattere l'albero di un estraneo — e' la stessa

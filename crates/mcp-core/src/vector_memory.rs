@@ -1196,6 +1196,28 @@ async fn ensure_conversation_context_collection(db: &PgPool) -> anyhow::Result<(
     Ok(())
 }
 
+/// Payload Qdrant di un punto della collection `conversation_context`.
+///
+/// Estratto — come [`doc_point_payload`] lo e' gia' per `project_docs` — perche'
+/// il LETTORE possa provarsi contro il produttore invece che contro un payload
+/// riscritto a mano nel test (regola O). Finche' questa scrittura viveva solo
+/// dentro il corpo dell'upsert, un lettore poteva cercare una chiave che qui non
+/// c'e' senza che nulla lo dicesse: `agent_tools::semantic_tools` chiedeva
+/// `text_preview`, che questa funzione non ha mai scritto.
+pub(crate) fn conversation_point_payload(
+    session_id: Uuid,
+    role: &str,
+    content: &str,
+    created_at: &str,
+) -> Value {
+    json!({
+        "session_id": session_id.to_string(),
+        "role": role,
+        "content": content,
+        "created_at": created_at,
+    })
+}
+
 /// Salva un turno conversazionale (user o assistant) nella collection Qdrant.
 /// `point_id` dovrebbe essere deterministico: sha256(session_id + message_id).
 pub async fn upsert_conversation_turn(
@@ -1215,12 +1237,7 @@ pub async fn upsert_conversation_turn(
         "points": [{
             "id": point_id,
             "vector": vector,
-            "payload": {
-                "session_id": session_id.to_string(),
-                "role": role,
-                "content": content,
-                "created_at": created_at,
-            }
+            "payload": conversation_point_payload(session_id, role, content, created_at),
         }]
     });
 

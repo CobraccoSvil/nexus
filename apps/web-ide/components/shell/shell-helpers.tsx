@@ -24,25 +24,31 @@ export type ProviderHealthState = {
 const PROVIDER_LABELS: Record<string, string> = {
   openai: "OpenAI", anthropic: "Anthropic", google: "Google", deepseek: "DeepSeek",
   mistral: "Mistral", groq: "Groq", openrouter: "OpenRouter", perplexity: "Perplexity",
-  vllm: "vLLM", ollama: "Ollama",
+  kimi: "Kimi", vllm: "vLLM", ollama: "Ollama",
 };
 // Ordine di visualizzazione preferito (storici prima, poi il resto in coda).
-const PROVIDER_ORDER = ["openai", "anthropic", "google", "deepseek", "mistral", "groq", "openrouter", "perplexity", "vllm", "ollama"];
-
 export function providerDisplayLabel(name: string): string {
   return PROVIDER_LABELS[name] ?? (name.charAt(0).toUpperCase() + name.slice(1));
 }
 
-/** Ordina i nomi provider: quelli noti nell'ordine preferito, gli altri in coda alfabetica. */
+/**
+ * Ordina i provider per ETICHETTA VISUALIZZATA, che e' cio' che il lettore
+ * scorre: chi cerca "Mistral" lo cerca fra la M, non nella posizione che un
+ * elenco redazionale gli ha assegnato.
+ *
+ * Prima l'ordine veniva da una lista fissa (`PROVIDER_ORDER`), con ripiego
+ * alfabetico per i nomi non elencati. Due difetti: un provider nuovo finiva in
+ * coda finche' qualcuno non lo aggiungeva a mano, e la posizione degli altri
+ * non seguiva alcuna regola che il lettore potesse indovinare.
+ *
+ * Si ordina per label e non per chiave perche' le due divergono dove conta:
+ * la chiave `openrouter` sta dopo `openai`, ma le etichette "OpenAI" e
+ * "OpenRouter" si confrontano diversamente, e il lettore vede solo le seconde.
+ */
 export function sortProviderNames(names: string[]): string[] {
-  return [...names].sort((a, b) => {
-    const ia = PROVIDER_ORDER.indexOf(a);
-    const ib = PROVIDER_ORDER.indexOf(b);
-    if (ia !== -1 && ib !== -1) return ia - ib;
-    if (ia !== -1) return -1;
-    if (ib !== -1) return 1;
-    return a.localeCompare(b);
-  });
+  return [...names].sort((a, b) =>
+    providerDisplayLabel(a).localeCompare(providerDisplayLabel(b), "it", { sensitivity: "base" }),
+  );
 }
 
 export const sidebarItems: Array<{ key: SidebarView; label: string; icon: string }> = [
@@ -287,9 +293,39 @@ export function summarizeProviderReason(reason?: string): string | undefined {
   return firstLine.length > 220 ? `${firstLine.slice(0, 217)}...` : firstLine;
 }
 
+/**
+ * Frase per un provider CONFIGURATO che non ha ancora una misura, ma che un
+ * ciclo di verifica raggiunge. Il testo si compone DAI campi che il backend
+ * dichiara (regola Q): qui non si deduce nulla, si traduce.
+ */
+export function awaitingReason(
+  cycle?: "periodic_probe" | "reprobe",
+  models?: number,
+): string {
+  const quanti = models && models > 0 ? ` (${models} modelli)` : "";
+  return cycle === "reprobe"
+    ? `In attesa della prima verifica${quanti}: i modelli sono in coda al re-probe, che gira ogni 30 minuti.`
+    : `In attesa del primo health probe${quanti}: gira ogni 5 minuti.`;
+}
+
+/**
+ * Frase per un provider CONFIGURATO che nessun ciclo di verifica raggiunge:
+ * non arrivera' nessuna misura da sola, serve un intervento.
+ */
+export function stalledReason(
+  cause?: "no_models" | "no_verification_cycle",
+  models?: number,
+): string {
+  if (cause === "no_models") {
+    return "Chiave configurata ma nessun modello a catalogo: nessun ciclo ne crea, serve la migrazione di onboarding o il discovery.";
+  }
+  const quanti = models && models > 0 ? `${models} modelli` : "I modelli";
+  return `${quanti} a catalogo, tutti disabilitati e nessuno in coda a un ciclo di verifica: il provider non tornera' su da solo.`;
+}
+
 export function providerTitle(label: string, state: ProviderHealthState): string {
   if (state.ok === null) {
-    return `${label} stato sconosciuto`;
+    return state.reason ? `${label}: ${state.reason}` : `${label} stato sconosciuto`;
   }
   if (state.ok) {
     return state.status ? `${label} disponibile (${state.status})` : `${label} disponibile`;

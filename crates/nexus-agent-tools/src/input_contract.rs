@@ -163,9 +163,33 @@ pub trait InputTool: Sized {
 /// letteralmente vero: il messaggio nomina il campo e dice cosa ci si aspettava.
 pub fn errore_di_lettura(tool: &str, e: serde_json::Error) -> RispostaTool {
     RispostaTool::fallito_rimediabile(format!(
-        "[Errore: parametri di '{tool}' non validi: {e}. \
-         Correggi la chiamata rispettando lo schema del tool.]"
+        "[Errore: parametri di '{tool}' non validi: {e}.          Correggi la chiamata rispettando lo schema del tool.]"
     ))
+}
+
+/// `null` vale come «nessun parametro», cioe' come `{}`.
+///
+/// MISURATO: senza questa equivalenza `serde` rifiuta `Value::Null` con «invalid
+/// type: null, expected struct X» per QUALUNQUE contratto, anche uno che non
+/// dichiara un solo campo — e un tool senza parametri chiamato senza parametri
+/// non ha nulla di sbagliato da segnalare. Il caso non e' teorico: la traduzione
+/// della risposta di un fornitore OpenAI-compat produce `Null` quando il modello
+/// emette `arguments: "null"`, forma che il ripiego a `{}` di quel punto non
+/// intercetta perche' `from_str("null")` RIESCE.
+///
+/// Sui contratti CON campi obbligatori non cambia l'esito — falliscono comunque
+/// — ma cambia il MESSAGGIO, e in meglio: da «invalid type: null», che parla di
+/// JSON, a «missing field `path`», che nomina il campo da aggiungere. Un
+/// messaggio dichiarato `Rimediabile` deve dire COME rimediare, e il primo non
+/// lo diceva.
+pub fn oggetto_vuoto_se_nullo(input: &Value) -> &Value {
+    static VUOTO: std::sync::LazyLock<Value> =
+        std::sync::LazyLock::new(|| Value::Object(Map::new()));
+    if input.is_null() {
+        &VUOTO
+    } else {
+        input
+    }
 }
 
 /// Compone lo schema `object` dai campi dichiarati. Usata dalla macro; esposta
@@ -294,6 +318,7 @@ macro_rules! tool_input {
                 tool: &str,
                 input: &::serde_json::Value,
             ) -> ::std::result::Result<Self, ::nexus_types::tool_outcome::RispostaTool> {
+                let input = $crate::input_contract::oggetto_vuoto_se_nullo(input);
                 ::serde_json::from_value::<Self>(input.clone())
                     .map_err(|e| $crate::input_contract::errore_di_lettura(tool, e))
             }
@@ -553,6 +578,26 @@ pub fn con_descrizione(mut schema: Value, descrizione: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    crate::tool_input! {
+        /// Contratto senza campi, come `nexus_list_ports`: e' il caso in cui
+        /// `null` deve passare.
+        SenzaCampi for "senza_campi" {
+            obbligatori {}
+            opzionali {}
+        }
+    }
+
+    crate::tool_input! {
+        /// Contratto con un obbligatorio: `null` deve fallire, ma dicendo QUALE
+        /// campo manca.
+        ConCampo for "con_campo" {
+            obbligatori {
+                path: String, "Percorso del file";
+            }
+            opzionali {}
+        }
+    }
+
     use super::*;
 
     crate::tool_input! {
@@ -935,5 +980,41 @@ mod tests {
             "l'errore nomina il campo di troppo: {}",
             errore.testo
         );
+    }
+
+    /// `null` e' «nessun parametro», non un input malformato.
+    ///
+    /// MISURATO prima del fix: `serde` rifiutava `Value::Null` con «invalid
+    /// type: null, expected struct X» per QUALUNQUE contratto, anche uno senza
+    /// un solo campo dichiarato — cioe' un tool senza parametri chiamato senza
+    /// parametri riceveva un errore. Il caso arriva dal wire: la traduzione
+    /// della risposta di un fornitore OpenAI-compat produce `Null` quando il
+    /// modello emette `arguments: "null"`, forma che il ripiego a `{}` di quel
+    /// punto non intercetta perche' `from_str("null")` RIESCE.
+    ///
+    /// MUTAZIONE che rende rosso: togliere `oggetto_vuoto_se_nullo` dalla macro.
+    /// La prima `expect` fallisce; e la seconda meta' del test rosseggia sul
+    /// messaggio, che tornerebbe a parlare di JSON invece di nominare il campo.
+    #[test]
+    fn un_input_nullo_vale_come_nessun_parametro() {
+        // Contratto SENZA campi: `null` non ha niente di sbagliato da segnalare.
+        SenzaCampi::leggi(&Value::Null).expect("null == {} per un contratto senza campi");
+        SenzaCampi::leggi(&json!({})).expect("l'oggetto vuoto passa, come prima");
+
+        // Il campo si legge davvero: un contratto che deserializza senza che
+        // nessuno guardi cosa ha prodotto proverebbe meta' di quel che dice.
+        let letto = ConCampo::leggi(&json!({"path": "src/main.rs"})).expect("input valido");
+        assert_eq!(letto.path, "src/main.rs");
+
+        // Contratto CON un campo obbligatorio: l'esito non cambia — fallisce
+        // comunque — ma il messaggio nomina il CAMPO invece del tipo JSON, ed e'
+        // la differenza fra una direttiva `Rimediabile` mantenuta e una no.
+        let e = ConCampo::leggi(&Value::Null).expect_err("il campo obbligatorio manca davvero");
+        assert!(
+            e.testo.contains("missing field"),
+            "il messaggio deve nominare il campo mancante: {}",
+            e.testo
+        );
+        assert!(!e.testo.contains("invalid type"), "{}", e.testo);
     }
 }

@@ -70,10 +70,12 @@ import { useHealthSnapshot } from "../lib/hooks/use-health-snapshot";
 import { ACTION_AGENT_HINT, promptFromProblem } from "../lib/chat-prompts";
 import {
   EMPTY_GROUPS,
+  awaitingReason,
   basename,
   hydrateGroups,
   makeTab,
   normalizeWorkbenchState,
+  stalledReason,
   type ProviderHealthState,
   type ProviderKey,
   type SecondarySidebarView,
@@ -858,6 +860,13 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
         error?: string;
         cooldown_seconds_remaining?: number;
         last_health_check_at?: string;
+        // Prontezza DICHIARATA dal backend (mcp-core provider_readiness): dice
+        // PERCHE' `healthy` e' null, che da solo confondeva "mai interrogato",
+        // "nessuno lo interroghera'" e "gateway spento" in un unico grigio.
+        readiness?: "not_configured" | "awaiting_first_probe" | "stalled" | "healthy" | "down";
+        readiness_cycle?: "periodic_probe" | "reprobe";
+        readiness_cause?: "no_models" | "no_verification_cycle";
+        readiness_models?: number;
       };
       const gwList = (data?.providers as GwEntry[]) ?? [];
       const resolve = (key: ProviderKey): ProviderHealthState => {
@@ -877,10 +886,19 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
             reason: `${gw.error ?? "In cooldown"} (${remaining} rimanenti). Nexus userà automaticamente un altro provider.`,
           };
         }
-        // healthy null = gateway offline ma il provider era in lista (stato storico
-        // dall'health probe o provider mai testato). Mostriamo grigio (ok: null)
-        // invece di rosso per non allarmare su uno stato non aggiornato.
+        // healthy null = nessuna osservazione. NON e' una sola situazione: il
+        // backend dichiara quale, e le due hanno rimedi opposti.
         if (gw.healthy === null || gw.healthy === undefined) {
+          if (gw.readiness === "stalled") {
+            // Nessun ciclo di verifica lo raggiunge: non arrivera' nessuna
+            // misura da sola. E' un difetto di configurazione, va acceso rosso.
+            return { ok: false, reason: stalledReason(gw.readiness_cause, gw.readiness_models) };
+          }
+          if (gw.readiness === "awaiting_first_probe") {
+            // Transitorio e dichiarato: grigio, ma con la causa vera invece di
+            // "Stato sconosciuto".
+            return { ok: null, reason: awaitingReason(gw.readiness_cycle, gw.readiness_models) };
+          }
           return { ok: null };
         }
         return gw.healthy

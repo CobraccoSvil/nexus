@@ -1270,11 +1270,17 @@ function GruppoSubagenteView({
             </span>
           </div>
           {espanso && (
+            // Nessuna guida verticale qui: questo gruppo vive gia' DENTRO il
+            // blocco del segmento, che la disegna (stesso `borderLeft`, 8px
+            // piu' a sinistra). Due linee parallele a nove pixel di distanza si
+            // leggono come un doppio bordo, non come due livelli -- e quella
+            // interna, essendo l'ultima disegnata, risaltava piu' della
+            // struttura che la contiene. L'appartenenza dei passi al gruppo la
+            // dicono gia' l'intestazione ("N passi") e il rientro.
             <div
               style={{
                 marginLeft: 8,
                 paddingLeft: 8,
-                borderLeft: `2px solid ${withAlpha(segColor, 0.35)}`,
                 minWidth: 0,
               }}
             >

@@ -2607,6 +2607,56 @@ else
   echo "OK vita-processo: la guardia dello stack interroga il SO"
 fi
 
+# forma-pidfile — «chi scrive il registro dei pid, e con quali campi?»
+#
+# Il criterio di vitalita' e' esatto ma vale quanto le PROVE che il registro gli
+# porta, e quelle prove le annota chi scrive. Il 09/08/2026 dev-service.ps1
+# leggeva il pidfile in una hashtable `id -> pid` e lo riscriveva da quella: una
+# sola azione su un solo servizio spogliava tutte e nove le voci, nessun pid era
+# piu' identificabile, dev-stop.ps1 usciva 1 e il deploy si fermava con gli
+# eseguibili lockati. Il criterio non poteva accorgersene: si comportava bene.
+#
+# Due regressioni possibili, entrambe silenziose. (1) Un secondo posto che
+# serializza il pidfile: divergera' dal primo come divergeva Write-PidMap.
+# (2) Un consumatore che smette di delegare — costruisce una voce a mano
+# (perdendo l'annotazione delle prove) o giudica un file senza completarne le
+# prove mancanti (bloccando ogni pidfile antecedente).
+pidfile_scrittori="$(grep -rlnE '(Set-Content[^|]*\$PIDFILE|\$PIDFILE[^|]*ConvertTo-Json)' \
+  --include='*.ps1' deploy/ 2>/dev/null | grep -v 'deploy/lib/nexus-pidfile\.ps1' || true)"
+if [[ -n "$pidfile_scrittori" ]]; then
+  echo "!! forma-pidfile: il pidfile si serializza fuori dal punto unico:" >&2
+  printf '%s\n' "$pidfile_scrittori" >&2
+  echo "   Delegare a Write-NexusPidFile (deploy/lib/nexus-pidfile.ps1): la" >&2
+  echo "   proiezione sui campi canonici e' cio' che impedisce a una vista" >&2
+  echo "   ridotta di arrivare su disco." >&2
+  fail=1
+else
+  echo "OK forma-pidfile: un solo scrittore del registro dei pid"
+fi
+pidfile_muti=""
+# chi SCRIVE deve costruire le voci dal costruttore che misura le prove;
+# chi GIUDICA deve prima completare le prove mancanti dai manifest.
+for coppia in "deploy/dev-start.ps1:New-NexusPidEntry" \
+              "deploy/dev-start.ps1:Resolve-NexusPidEntries" \
+              "deploy/dev-stop.ps1:Resolve-NexusPidEntries" \
+              "deploy/dev-service.ps1:New-NexusPidEntry" \
+              "deploy/dev-service.ps1:Resolve-NexusPidEntries"; do
+  file="${coppia%%:*}"; atteso="${coppia##*:}"
+  if [[ -f "$file" ]] && ! grep -q "$atteso" "$file"; then
+    pidfile_muti+="  $file non chiama $atteso"$'\n'
+  fi
+done
+if [[ -n "$pidfile_muti" ]]; then
+  echo "!! forma-pidfile: un consumatore non delega piu' al punto unico:" >&2
+  printf '%s' "$pidfile_muti" >&2
+  echo "   Senza New-NexusPidEntry le prove d'identita' non vengono annotate;" >&2
+  echo "   senza Resolve-NexusPidEntries un pidfile antecedente resta per sempre" >&2
+  echo "   'non interrogabile' e lo stack non si dichiara mai fermo." >&2
+  fail=1
+else
+  echo "OK forma-pidfile: scrittori e giudici del pidfile delegano al punto unico"
+fi
+
 # premesse-dei-gate — «il gate ha bocciato il codice, o non e' mai partito?»
 #
 # Due regressioni possibili, entrambe silenziose. (1) Un secondo posto in cui un
@@ -2770,6 +2820,144 @@ if [[ ! -f "apps/web-ide/lib/api/__wire__/session-usage.json" ]]; then
   fail=1
 else
   echo "OK confine-wire-session-usage: fixture condivisa e i suoi due lati"
+fi
+
+# --- governance-sql-connessione ---------------------------------------------
+# "Quale database sta toccando questa query?" ha UN punto di controllo, ed e' la
+# CONNESSIONE: `classifica_connessione` in nexus-project-db, chiamata da
+# `resolve_project_conn`. Il guard sul TESTO della statement
+# (`check_dangerous_sql`) risponde a un'altra domanda — "questa statement puo'
+# girare?" — e non deve tornare a rispondere alla prima indovinandola dai nomi
+# che la query cita.
+#
+# MISURATO il 09/08/2026 su gestione-corsi: `information_schema` era vietato per
+# SOTTOSTRINGA, quindi l'agente non poteva verificare la migrazione che aveva
+# appena applicato al DB del progetto — mentre sulla STESSA connessione i tool
+# nativi e il pannello SQL quel catalogo lo leggevano gia'.
+assert_single "classifica_connessione" 'fn classifica_connessione' \
+  'crates/nexus-project-db/src/exec.rs' crates
+assert_single "check_dangerous_sql" 'pub fn check_dangerous_sql' \
+  'crates/mcp-core/src/security/resource_governance.rs' crates
+
+gov="crates/mcp-core/src/security/resource_governance.rs"
+exec_rs="crates/nexus-project-db/src/exec.rs"
+# Il giudizio e' per STATEMENT, sulle stesse che l'esecutore eseguira' (regola O):
+# senza questa delega la regola di massa torna a guardare il primo token del
+# blocco e `SELECT 1; DELETE FROM users` non viene vista.
+if ! grep -q 'split_statements' "$gov" || ! grep -q 'is_read_only' "$gov"; then
+  echo "!! governance-sql-connessione: check_dangerous_sql non delega piu' a" >&2
+  echo "   split_statements/is_read_only (nexus_project_db::exec): il guard" >&2
+  echo "   giudicherebbe il testo come blocco unico, non le statement eseguite." >&2
+  fail=1
+# Il divieto sull'infrastruttura non si riscrive come needle incondizionato sul
+# catalogo: se `information_schema` ricompare senza il ramo di sola lettura, il
+# difetto del 09/08 e' tornato.
+elif ! grep -q 'e_sola_lettura' "$gov"; then
+  echo "!! governance-sql-connessione: sparito il ramo di sola lettura sui" >&2
+  echo "   cataloghi: leggere information_schema/pg_catalog del DB applicativo" >&2
+  echo "   e' legittimo, e' l'unico modo di verificare una migrazione." >&2
+  fail=1
+elif ! grep -q 'classifica_connessione' "$exec_rs"; then
+  echo "!! governance-sql-connessione: resolve_project_conn non passa piu' dal" >&2
+  echo "   criterio di connessione: il DB metadati per-progetto tornerebbe" >&2
+  echo "   raggiungibile via nexus_db_query(connection: 'nexus_metadata')." >&2
+  fail=1
+else
+  echo "OK governance-sql-connessione: la connessione decide il database, il testo no"
+fi
+
+# Resa di un path per un PROCESSO ESTERNO (2026-08-09). `canonicalize` su
+# Windows produce la forma verbatim `\\?\D:\...`: le API del filesystem la
+# accettano, l'argv di un processo esterno no. E il runtime MSYS di `grep.exe`
+# non la RIFIUTA — il `?` del prefisso rende l'argomento un pattern di glob, i
+# backslash diventano escape e vengono consumati, cosi' che il processo cerchi
+# un percorso DIVERSO da quello chiesto: `\?D:IDEAI-projectsgestione-corsi...`,
+# misurato in esercizio il 09/08/2026 su due `agent_steps` falliti.
+assert_single "path-processo-esterno" 'fn path_per_processo_esterno' \
+  'crates/nexus-types/src/workspace_paths.rs' crates
+
+# I DUE lati di quel confine devono usare la stessa resa: chi scrive l'argv e
+# chi rilegge l'echo che torna in testa a ogni riga di output. Se uno solo
+# smette di delegare non si rompe niente in modo visibile — le righe restano
+# assolute, e l'agente riceve percorsi che non sa piu' rendere relativi.
+# Si guardano le due CHIAMATE per il loro argomento, non il conteggio del nome:
+# il file lo nomina anche in prosa (i commenti che spiegano le mutazioni), e un
+# conteggio resterebbe verde con una delle due deleghe rimossa.
+ricerca_file="crates/nexus-agent-tools/src/files.rs"
+deleghe_ok=1
+for chiamata in "path_per_processo_esterno(search_path)" \
+                "path_per_processo_esterno(root_path)"; do
+  if ! grep -qF "$chiamata" "$ricerca_file" 2>/dev/null; then
+    echo "!! path-processo-esterno: manca la delega '$chiamata' in $ricerca_file" >&2
+    echo "   I due lati del confine sono l'argv consegnato alla ricerca e la" >&2
+    echo "   root con cui se ne rendono relative le righe di output: con rese" >&2
+    echo "   diverse il prefisso non viene riconosciuto e l'agente riceve" >&2
+    echo "   percorsi assoluti, senza che nulla fallisca." >&2
+    deleghe_ok=0
+    fail=1
+  fi
+done
+# L'OK solo se lo e' davvero: stamparlo comunque metterebbe una riga verde
+# accanto a una rossa sullo stesso check, che e' il modo piu' rapido di far
+# leggere «passato» a un gate fallito. `if` e non `[[ ... ]] &&`: sotto
+# `set -e` la forma con `&&` fa USCIRE lo script quando la condizione e' falsa,
+# saltando il riepilogo finale.
+if [[ "$deleghe_ok" -eq 1 ]]; then
+  echo "OK path-processo-esterno: argv ed echo usano la stessa resa"
+fi
+# ── veto-in-eleggibilita (2026-08-09) ───────────────────────────────────────
+# Il fornitore che il chiamante NON puo' usare va detto alla SELEZIONE, non
+# filtrato dopo. La tier-chain esce al primo anello che soddisfa la soglia di
+# fornitori distinti: se quell'anello contiene solo il fornitore vietato, la
+# catena si e' fermata su un pool che il chiamante buttera' via, e i tier
+# successivi non vengono mai interrogati. MISURATO il 09/08/2026 sul gate
+# duale: tier `medium` con capability `reasoning` popolato da tre fornitori,
+# due senza credito, l'esecutore il terzo -> `validators: []` e
+# `unavailable_declared`, con deepseek/google/openrouter sani un gradino sopra.
+if grep -nE 'exclude_providers: &\[\]' crates/mcp-core/src/internal_routing.rs \
+   | grep -vE '^[0-9]+: *(//|/\*|\*)' >/dev/null 2>&1; then
+  echo "!! veto-in-eleggibilita: la selezione dei candidati di un purpose torna" >&2
+  echo "   a ignorare il veto del chiamante (exclude_providers: &[] nella" >&2
+  echo "   ModelRequest). Il veto e' ELEGGIBILITA': senza, la condizione di" >&2
+  echo "   uscita della tier-chain conta fornitori che il chiamante scartera'." >&2
+  fail=1
+else
+  echo "OK veto-in-eleggibilita: il veto del chiamante entra nella selezione"
+fi
+
+# E il gate duale deve continuare a passarcelo, insieme alla soglia dei due
+# giudici: sono le due meta' dello stesso requisito, e una sola non basta.
+if ! grep -q 'VALIDATORI_RICHIESTI,' crates/mcp-core/src/agent_graph_adapter/step_validation.rs \
+   || ! grep -q '&veto,' crates/mcp-core/src/agent_graph_adapter/step_validation.rs; then
+  echo "!! veto-in-eleggibilita: il gate duale non chiede piu' alla selezione" >&2
+  echo "   DUE fornitori distinti dall'esecutore (soglia VALIDATORI_RICHIESTI +" >&2
+  echo "   veto). Con una sola delle due meta' il gate torna a dichiararsi" >&2
+  echo "   senza giudici mentre i giudici ci sono." >&2
+  fail=1
+else
+  echo "OK veto-in-eleggibilita: il gate duale dichiara soglia e veto"
+fi
+
+# Prontezza di un fornitore (2026-08-09). `healthy: Option<bool>` faceva di
+# «mai interrogato», «nessuno lo interroghera'», «non configurato» e «gateway
+# spento» un unico `null`, reso come un unico pallino grigio: quattro situazioni
+# con rimedi opposti. Il classificatore vive in un modulo solo e, soprattutto,
+# NON ricopia i criteri dei due cicli di verifica — li interroga.
+assert_single "prontezza-fornitore" 'pub fn classifica(' \
+  'crates/mcp-core/src/provider_readiness.rs' crates
+
+prontezza="crates/mcp-core/src/provider_readiness.rs"
+if [[ ! -f "$prontezza" ]]; then
+  echo "!! prontezza-fornitore: $prontezza non esiste piu'" >&2
+  fail=1
+elif ! grep -q 'model_health_probe::is_reprobe_candidate' "$prontezza"; then
+  echo "!! prontezza-fornitore: il classificatore non delega piu' a" >&2
+  echo "   is_reprobe_candidate. Con una copia del criterio, un fornitore che" >&2
+  echo "   il re-probe ha smesso di guardare continuerebbe a dichiararsi 'in" >&2
+  echo "   attesa' per sempre: lo stallo tornerebbe invisibile (regola L/O)." >&2
+  fail=1
+else
+  echo "OK prontezza-fornitore: l'ignoto e' una variante, e i cicli si interrogano"
 fi
 
 if [[ "$fail" -ne 0 ]]; then

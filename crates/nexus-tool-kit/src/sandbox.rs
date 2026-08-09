@@ -40,28 +40,49 @@ pub struct ProjectSandboxConfig {
 }
 
 /// Carica la configurazione sandbox per-progetto dal DB.
-/// Restituisce `Default` se il progetto non ha override.
+///
+/// `Ok(default)` significa «nessun override»: la colonna e' NULL (o, caso che
+/// qui non si distingue, la riga del progetto non c'e' — sul percorso di
+/// SCRITTURA lo intercetta [`save_project_sandbox_config`], che rifiuta un
+/// UPDATE a zero righe). `Err` significa «non ho letto», ed e' l'altra cosa.
+///
+/// Prima erano lo stesso valore: `.ok().flatten().flatten()` piu'
+/// `unwrap_or_default()` facevano di «DB irraggiungibile», «JSON in colonna
+/// illeggibile» e «progetto senza override» un unico `ProjectSandboxConfig`
+/// vuoto. I due consumatori vi costruivano sopra conseguenze opposte e
+/// entrambe sbagliate: `get_sandbox_config` dichiarava «memoria: 1024
+/// (default)» come se avesse guardato, e `set_sandbox_config` applicava la
+/// patch sopra quel vuoto e lo RISALVAVA — cioe' cancellava, annunciando un
+/// successo, proprio gli override che non era riuscito a leggere.
 pub async fn load_project_sandbox_config(
     db: &PgPool,
     project_id: uuid::Uuid,
-) -> ProjectSandboxConfig {
+) -> Result<ProjectSandboxConfig, String> {
     let row = sqlx::query_scalar::<_, Option<serde_json::Value>>(
         "SELECT sandbox_config FROM projects WHERE id = $1",
     )
     .bind(project_id)
     .fetch_optional(db)
     .await
-    .ok()
-    .flatten()
-    .flatten();
+    .map_err(|e| format!("lettura sandbox config fallita: {e}"))?;
 
-    match row {
-        Some(v) => serde_json::from_value(v).unwrap_or_default(),
-        None => ProjectSandboxConfig::default(),
+    match row.flatten() {
+        // JSON presente ma non conforme: e' un dato ROTTO, non un progetto
+        // senza override. Degradarlo a `Default` (era `unwrap_or_default`)
+        // autorizzava la scrittura successiva a sovrascriverlo col vuoto.
+        Some(v) => serde_json::from_value(v)
+            .map_err(|e| format!("sandbox config del progetto non deserializzabile: {e}")),
+        None => Ok(ProjectSandboxConfig::default()),
     }
 }
 
 /// Salva la configurazione sandbox per-progetto nel DB.
+///
+/// Zero righe toccate NON e' un successo: significa che nessun progetto ha quel
+/// `project_id`, quindi la configurazione non e' finita da nessuna parte.
+/// Senza questo controllo l'UPDATE a vuoto ritornava `Ok(())` e il tool
+/// annunciava «Configurazione sandbox aggiornata» per una scrittura mai
+/// avvenuta.
 pub async fn save_project_sandbox_config(
     db: &PgPool,
     project_id: uuid::Uuid,
@@ -69,12 +90,17 @@ pub async fn save_project_sandbox_config(
 ) -> Result<(), String> {
     let json = serde_json::to_value(config)
         .map_err(|e| format!("serializzazione sandbox config fallita: {e}"))?;
-    sqlx::query("UPDATE projects SET sandbox_config = $1 WHERE id = $2")
+    let esito = sqlx::query("UPDATE projects SET sandbox_config = $1 WHERE id = $2")
         .bind(json)
         .bind(project_id)
         .execute(db)
         .await
         .map_err(|e| format!("aggiornamento sandbox config fallito: {e}"))?;
+    if esito.rows_affected() == 0 {
+        return Err(format!(
+            "nessun progetto con id {project_id}: configurazione sandbox non scritta"
+        ));
+    }
     Ok(())
 }
 
@@ -100,10 +126,35 @@ pub fn sandbox_enabled() -> bool {
 const CONTAINER_PREFIX: &str = "nx-sb-";
 
 /// Memoria di default per ogni container sandbox (1 GB).
-const DEFAULT_MEMORY_MB: u64 = 1024;
+///
+/// Pubblica perche' `get_sandbox_config` DICHIARA questo numero al modello come
+/// il limite in vigore quando il progetto non ha override: ricopiarlo la' (era
+/// un `unwrap_or(1024)`) sono due verita' per lo stesso fatto, e il giorno in
+/// cui la costante cambia il tool annuncia un limite che la sandbox non usa.
+pub const DEFAULT_MEMORY_MB: u64 = 1024;
 
-/// CPU di default per ogni container sandbox (2 core).
-const DEFAULT_CPUS: f64 = 2.0;
+/// CPU di default per ogni container sandbox (2 core). Pubblica per la stessa
+/// ragione di [`DEFAULT_MEMORY_MB`].
+pub const DEFAULT_CPUS: f64 = 2.0;
+
+/// La rete che un container riceve quando il progetto non dichiara nulla:
+/// `Some("none")` = isolamento totale, `None` = default di Docker (bridge).
+///
+/// Estratta da [`SandboxConfig::new`] per la stessa ragione delle due costanti
+/// qui sopra: `get_sandbox_config` etichetta un valore come «(default)», e con
+/// la bandiera di rollback attiva quell'etichetta avrebbe dichiarato al modello
+/// `none` (isolamento) su container che ricevono la rete di Docker — cioe' la
+/// bugia esattamente all'opposto, e su una proprieta' di sicurezza.
+///
+/// Rollback temporaneo: `NEXUS_SANDBOX_LEGACY_NETWORK=1` ripristina il vecchio
+/// default. Rimuovere dopo 1 settimana di rollout.
+pub fn default_network_mode() -> Option<String> {
+    if std::env::var("NEXUS_SANDBOX_LEGACY_NETWORK").ok().as_deref() == Some("1") {
+        None
+    } else {
+        Some("none".to_string())
+    }
+}
 
 /// Variabili d'ambiente del processo Nexus che NON devono mai
 /// essere propagate ai container dei progetti.
@@ -187,22 +238,13 @@ impl SandboxConfig {
     /// Rollback temporaneo: bandiera ENV `NEXUS_SANDBOX_LEGACY_NETWORK=1` ripristina
     /// il vecchio default (Docker bridge). Rimuovere dopo 1 settimana di rollout.
     pub fn new(project_root: PathBuf, process_id: Uuid) -> Self {
-        let default_network = if std::env::var("NEXUS_SANDBOX_LEGACY_NETWORK")
-            .ok()
-            .as_deref()
-            == Some("1")
-        {
-            None
-        } else {
-            Some("none".to_string())
-        };
         Self {
             project_root,
             process_id,
             memory_mb: DEFAULT_MEMORY_MB,
             cpus: DEFAULT_CPUS,
             project_image: None,
-            network_mode: default_network,
+            network_mode: default_network_mode(),
             extra_env: HashMap::new(),
         }
     }

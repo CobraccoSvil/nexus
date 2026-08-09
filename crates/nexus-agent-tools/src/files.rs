@@ -1077,25 +1077,44 @@ pub async fn tool_search_in_files(
 
     let max_file_bytes = fs_read_max_bytes(&ctx.db).await;
     let stdout = match run_grep_or_fallback(pattern, &search_path, max_file_bytes).await {
-        Ok(s) => s,
+        RisultatoRicerca::Grep(s) | RisultatoRicerca::RipiegoRust(s) => s,
         // Rimediabile, e la ragione e' strutturale: questo ramo scatta solo dove
         // `grep` esiste ed E' GIRATO emettendo un errore proprio (il fallback
         // Rust non fallisce mai — se la regex non compila degrada a ricerca
         // letterale). Cio' che grep rifiuta e' quasi sempre il pattern, che e'
         // l'unica cosa che ha scritto l'agente, e il suo messaggio viaggia qui
         // dentro: e' l'informazione con cui correggere.
-        Err(msg) => return RispostaTool::fallito_rimediabile(msg),
+        RisultatoRicerca::ErroreGrep(msg) => return RispostaTool::fallito_rimediabile(msg),
     };
 
     RispostaTool::riuscito(format_search_output(ctx, pattern, &stdout))
 }
 
+/// Chi ha risposto alla ricerca, e con quale esito (regola Q: l'esito sta in un
+/// campo, non in una convenzione sulla stringa).
+///
+/// La distinzione fra `Grep` e `RipiegoRust` non e' decorativa: senza di essa
+/// un test che chiede "la ricerca ha trovato il file?" resta verde anche dove
+/// `grep` non e' installato e ha risposto lo scanner in-process — cioe' proprio
+/// dove il difetto del path consegnato a un processo esterno non esiste. Un
+/// verde per assenza (regola O) e' cio' che questo enum rende impossibile.
+#[derive(Debug)]
+pub(crate) enum RisultatoRicerca {
+    /// `grep` e' girato e ha risposto: stdout nel formato "path:lineno:riga".
+    Grep(String),
+    /// `grep` non e' invocabile: ha risposto [`search_in_files_rust`].
+    RipiegoRust(String),
+    /// `grep` e' girato e ha emesso un errore proprio, da propagare.
+    ErroreGrep(String),
+}
+
 /// Esegue `grep -rn --include=* --max-count=50 -I` su `search_path` e ne
-/// ritorna lo stdout (formato "path:lineno:contenuto"). Se lo spawn fallisce
-/// (grep assente, tipico Windows nativo) ripiega su [`search_in_files_rust`],
-/// che produce lo STESSO formato cosi' il post-processing a valle resta unico
-/// (regola L). `Err(msg)` solo quando grep gira ma emette un errore reale
-/// (stdout vuoto + stderr non vuoto), da propagare al chiamante.
+/// ritorna lo stdout (formato "path:lineno:contenuto") dentro la variante che
+/// dice CHI ha risposto. Se lo spawn fallisce (grep assente, tipico Windows
+/// nativo) ripiega su [`search_in_files_rust`], che produce lo STESSO formato
+/// cosi' il post-processing a valle resta unico (regola L).
+/// [`RisultatoRicerca::ErroreGrep`] solo quando grep gira ed emette un errore
+/// reale (stdout vuoto + stderr non vuoto), da propagare al chiamante.
 ///
 /// Il fallback e' I/O SINCRONO su tutto l'albero, quindi gira in
 /// `spawn_blocking`: su un worker tokio terrebbe fermo il thread per l'intera
@@ -1107,18 +1126,30 @@ pub async fn tool_search_in_files(
 /// ricerca esplicita dentro un albero escluso (`path='target'` -> zero righe).
 /// Nel fallback il rischio non c'e': il filtro guarda i nomi delle entry
 /// visitate, mai la root da cui si parte.
+///
+/// La resa del path per il processo esterno avviene QUI, non nel chiamante:
+/// e' questa la funzione che lo consegna, e tenerla fuori significherebbe che
+/// un test puo' attraversarla senza incontrare la resa — cioe' misurare una
+/// strada che la produzione non percorre (regola O). Vale anche per il ripiego
+/// in Rust, che non lancia processi ma produce le righe di output che
+/// [`format_search_output`] deve poi riconoscere: se i due partissero da forme
+/// diverse dello stesso path, il prefisso non verrebbe tolto e l'agente
+/// riceverebbe percorsi assoluti al posto dei relativi.
 async fn run_grep_or_fallback(
     pattern: &str,
     search_path: &Path,
     max_file_bytes: u64,
-) -> Result<String, String> {
+) -> RisultatoRicerca {
+    let search_path =
+        PathBuf::from(nexus_types::workspace_paths::path_per_processo_esterno(search_path));
+
     let output = Command::new("grep")
         .arg("-rn")
         .arg("--include=*")
         .arg("--max-count=50")
         .arg("-I") // ignora file binari
         .arg(pattern)
-        .arg(search_path)
+        .arg(&search_path)
         .output()
         .await;
 
@@ -1128,24 +1159,26 @@ async fn run_grep_or_fallback(
             let stdout = String::from_utf8_lossy(&out.stdout).to_string();
             // grep esce con 1 e stdout vuoto quando non trova nulla: non e' un errore.
             if stdout.is_empty() && !stderr.is_empty() {
-                return Err(format!("[grep error: {}]", stderr.trim()));
+                return RisultatoRicerca::ErroreGrep(format!("[grep error: {}]", stderr.trim()));
             }
-            Ok(stdout)
+            RisultatoRicerca::Grep(stdout)
         }
         // grep assente (tipico Windows nativo): ricerca in-process, best-effort,
         // su un thread di blocking (mai su un worker del runtime).
         Err(_) => {
-            let root = search_path.to_path_buf();
+            let root = search_path;
             let pat = pattern.to_string();
             match tokio::task::spawn_blocking(move || {
                 search_in_files_rust(&root, &pat, max_file_bytes)
             })
             .await
             {
-                Ok(stdout) => Ok(stdout),
+                Ok(stdout) => RisultatoRicerca::RipiegoRust(stdout),
                 // Panic nella scansione: esito STRUTTURATO al chiamante (regola
                 // M), mai un unwrap che porterebbe giu' il tool runner.
-                Err(e) => Err(format!("[search error: scansione interrotta: {e}]")),
+                Err(e) => {
+                    RisultatoRicerca::ErroreGrep(format!("[search error: scansione interrotta: {e}]"))
+                }
             }
         }
     }
@@ -1155,6 +1188,14 @@ async fn run_grep_or_fallback(
 /// path relativi alla root e applica il troncamento. Punto unico (regola L): la
 /// stessa logica serviva sia al ramo grep sia al fallback Windows.
 fn format_search_output(ctx: &ToolContextCore, pattern: &str, stdout: &str) -> String {
+    formatta_risultati(&ctx.root_path, pattern, stdout)
+}
+
+/// La parte che decide davvero, senza il `ToolContextCore` attorno: di quel
+/// contesto qui serve la sola root, e pretenderlo intero significherebbe che
+/// per misurare la resa delle righe serve un DB. Separata per questo (regola
+/// O), e `format_search_output` non fa altro che passarle la root.
+fn formatta_risultati(root_path: &Path, pattern: &str, stdout: &str) -> String {
     // Limite massimo di output: 500KB. Risultati piu' grandi causano
     // RESOURCE_EXHAUSTED gRPC (limite 16MB client Python) e consumano
     // troppi token di contesto per l'LLM. 500KB ~ 10k righe di codice.
@@ -1164,11 +1205,17 @@ fn format_search_output(ctx: &ToolContextCore, pattern: &str, stdout: &str) -> S
     if stdout.is_empty() {
         return format!("Nessun risultato per '{pattern}'.");
     }
-    // Rendi i path relativi alla root per leggibilita'
+    // Rendi i path relativi alla root per leggibilita'. La root si confronta
+    // nella STESSA resa con cui il path e' stato consegnato alla ricerca
+    // (`run_grep_or_fallback`): e' quella la forma che torna in testa a ogni
+    // riga, e due rese diverse dello stesso path non si riconoscerebbero — il
+    // prefisso resterebbe li' e l'agente leggerebbe percorsi assoluti.
+    let root_reso = nexus_types::workspace_paths::path_per_processo_esterno(root_path);
+    let root_reso = root_reso.to_string_lossy();
     let lines: Vec<String> = stdout
         .lines()
         .map(|line| {
-            line.replacen(ctx.root_path.to_string_lossy().as_ref(), "", 1)
+            line.replacen(root_reso.as_ref(), "", 1)
                 .trim_start_matches(['/', '\\'])
                 .to_string()
         })
@@ -2781,6 +2828,88 @@ gamma
     /// per l'ambiente invece che per il difetto.
     fn relativo(out: &str, dir: &tempfile::TempDir) -> String {
         out.replace(&dir.path().to_string_lossy().to_string(), "")
+    }
+
+    /// Con un `path` esplicito, cio' che `search_in_files` consegna alla ricerca
+    /// non e' una stringa dell'agente: e' il prodotto di `canonicalize` dentro
+    /// `resolve_relative_path`, e su Windows quel produttore antepone il
+    /// prefisso verbatim `\\?\`. Il test parte da LI' (regola O) — un path
+    /// scritto a mano fisserebbe proprio l'assunto da verificare — e arriva
+    /// alla CONSEGUENZA, che grep trovi il file: asserire la forma del path
+    /// proverebbe solo che una `replace` funziona, non che il processo
+    /// dall'altra parte l'ha capita.
+    ///
+    /// MISURATO in esercizio il 09/08/2026 su gestione-corsi: due `agent_steps`
+    /// con `status='failed'` e dentro
+    /// `grep: \?D:IDEAI-projectsgestione-corsiSchoolCoursesApi: No such file or
+    /// directory` — lo stesso percorso senza piu' un solo separatore.
+    ///
+    /// Mutazione che lo fa rosseggiare: in `run_grep_or_fallback` togliere la
+    /// chiamata a `path_per_processo_esterno` e consegnare a grep il path come
+    /// arriva.
+    #[tokio::test]
+    async fn la_ricerca_trova_il_file_partendo_da_un_path_canonicalizzato() {
+        let dir = albero_di_ricerca(0);
+        let canonico = dir.path().canonicalize().expect("canonicalize");
+
+        match super::run_grep_or_fallback("AGO_NEL_PAGLIAIO", &canonico, 1_000_000).await {
+            // La premessa DICHIARATA invece di un verde per assenza: dove grep
+            // non e' invocabile risponde lo scanner in-process, che non passa da
+            // nessun confine con un processo esterno — quel confine, qui, resta
+            // semplicemente non misurato.
+            super::RisultatoRicerca::RipiegoRust(_) => {
+                eprintln!(
+                    "premessa: `grep` non invocabile da questo processo - \
+                     il confine col processo esterno NON e' stato misurato"
+                );
+            }
+            super::RisultatoRicerca::ErroreGrep(msg) => panic!(
+                "grep ha rifiutato un path canonicalizzato ({}): {msg}",
+                canonico.display()
+            ),
+            super::RisultatoRicerca::Grep(stdout) => assert!(
+                stdout.contains("AGO_NEL_PAGLIAIO"),
+                "grep e' girato senza trovare nulla partendo da {}: {stdout}",
+                canonico.display()
+            ),
+        }
+    }
+
+    /// L'altra meta' dello stesso confine: chi ha scritto l'argv e chi legge
+    /// l'echo devono concordare sulla resa del path, o il prefisso della root
+    /// non viene riconosciuto e l'agente riceve percorsi ASSOLUTI al posto dei
+    /// relativi. Il test percorre la catena intera — ricerca reale, poi
+    /// formattazione reale — invece di fabbricare le righe di grep, che
+    /// fisserebbe proprio la forma da verificare (regola O).
+    ///
+    /// Mutazione che lo fa rosseggiare: in `formatta_risultati` tornare a
+    /// strippare `root_path.to_string_lossy()` invece della sua resa.
+    #[tokio::test]
+    async fn le_righe_tornano_relative_anche_con_root_canonicalizzata() {
+        let dir = albero_di_ricerca(0);
+        let canonico = dir.path().canonicalize().expect("canonicalize");
+
+        let stdout =
+            match super::run_grep_or_fallback("AGO_NEL_PAGLIAIO", &canonico, 1_000_000).await {
+                super::RisultatoRicerca::Grep(s) | super::RisultatoRicerca::RipiegoRust(s) => s,
+                super::RisultatoRicerca::ErroreGrep(msg) => panic!("ricerca fallita: {msg}"),
+            };
+        let reso = super::formatta_risultati(&canonico, "AGO_NEL_PAGLIAIO", &stdout);
+
+        assert!(
+            reso.contains("AGO_NEL_PAGLIAIO"),
+            "la ricerca non ha prodotto righe: {reso}"
+        );
+        // Le due forme assolute della stessa root. La seconda passa da
+        // `path_for_storage`, funzione INDIPENDENTE da quella sotto esame: usare
+        // qui `path_per_processo_esterno` renderebbe l'asserzione circolare.
+        let assoluto_verbatim = canonico.to_string_lossy().to_string();
+        let assoluto_pulito = nexus_types::workspace_paths::path_for_storage(&canonico);
+        assert!(
+            !reso.contains(&assoluto_verbatim) && !reso.contains(&assoluto_pulito),
+            "le righe devono essere relative alla root, nessuna forma assoluta puo' restare.\n\
+             verbatim: {assoluto_verbatim}\npulito:   {assoluto_pulito}\nreso: {reso}"
+        );
     }
 
     #[test]

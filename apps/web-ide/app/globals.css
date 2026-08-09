@@ -370,3 +370,14 @@ optgroup {
   .nx-as-thought-body { -webkit-line-clamp: none; }
   .nx-as-tool-target { max-width: none; white-space: normal; }
 }
+
+/* Riga provider nel popover di stato: il marker nativo di <details> sta a
+   SINISTRA e spingerebbe pallino e nome fuori allineamento fra i provider con
+   dettaglio e quelli senza. Lo si toglie qui perche' `::-webkit-details-marker`
+   non e' raggiungibile da uno stile inline; la freccia la disegna il componente
+   a destra, dove non compete con la colonna che si legge (nome + stato). */
+.nx-provider-row > summary { list-style: none; }
+.nx-provider-row > summary::-webkit-details-marker { display: none; }
+.nx-provider-row > summary::marker { content: ""; }
+.nx-provider-row > summary > .nx-provider-caret { transition: transform 120ms ease; }
+.nx-provider-row[open] > summary > .nx-provider-caret { transform: rotate(90deg); }

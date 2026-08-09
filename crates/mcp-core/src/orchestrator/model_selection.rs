@@ -772,6 +772,107 @@ mod tests {
         );
     }
 
+    /// Il seed della mig 0690 rende kimi VISIBILE alla catena agentica che filtra
+    /// su `reasoning` — la sola cosa che ai tre provider precedenti e' mancata.
+    ///
+    /// Groq e OpenRouter furono registrati correttamente (chiave, flag, registry,
+    /// catalog) e non venivano MAI scelti: la causa dominante, misurata il
+    /// 13/07/2026, era che i loro modelli erano seedati con `["chat","code"]`
+    /// mentre sette intent agentici pretendono `capabilities @> ["reasoning"]`.
+    /// Servi' la mig 0582 a posteriori. Nessun test copriva quel salto, e non
+    /// poteva coprirlo un test sulla stringa del seed: la domanda e' se la
+    /// SELEZIONE li trovi.
+    ///
+    /// Il test parte dalle righe che la MIGRAZIONE ha scritto (il migrator
+    /// embedded le applica davvero: non si ricostruisce il seed a mano, regola O)
+    /// e attraversa `select_models_tierchain`, cioe' il punto unico della WHERE di
+    /// eleggibilita' usato da tutta la famiglia `best_model_for_tier*` /
+    /// `select_agentic_model*`.
+    ///
+    /// L'abilitazione la fa il test, e non e' una scorciatoia: `is_enabled` e' un
+    /// fatto d'esercizio che nasce dal probe reale sul provider (gate mig 0629),
+    /// non un contenuto del seed. Cio' che qui si verifica e' che il seed porti
+    /// tutto il resto — capability, tool, thinking policy, prezzo — perche' il
+    /// modello sia eleggibile NON APPENA il probe passa.
+    ///
+    /// MUTAZIONE DI CONTROLLO: togliendo `"reasoning"` dalle capabilities nella
+    /// mig 0690, la prima asserzione trova zero candidati.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn kimi_seedato_e_visibile_alla_catena_agentica(pool: sqlx::PgPool) {
+        // Cio' che la migrazione ha scritto davvero, non un INSERT di comodo.
+        let seedati: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM ai_price_catalog WHERE provider = 'kimi'")
+                .fetch_one(&pool)
+                .await
+                .expect("conteggio seed kimi");
+        assert!(
+            seedati > 0,
+            "la mig 0690 non ha seedato alcun modello kimi: il resto del test non prova nulla"
+        );
+
+        // Il probe reale non puo' girare qui: se ne simula l'ESITO, che e' l'unico
+        // pezzo mancante fra il seed e l'eleggibilita'.
+        sqlx::query(
+            "UPDATE ai_price_catalog SET is_enabled = true, last_probe_healthy_at = now(), \
+             auto_disabled_reason = NULL WHERE provider = 'kimi'",
+        )
+        .execute(&pool)
+        .await
+        .expect("simulazione esito probe");
+
+        let filtro = |capability| EligibilityFilter {
+            require_tool_use: true,
+            require_thinking_non_exclude: true,
+            capability,
+            min_context_window: 0,
+            min_tier: None,
+            exclude_providers: &[],
+            apply_cooldown: false,
+            only_provider: Some("kimi"),
+            require_qualified: false,
+            exclude_preview: true,
+        };
+
+        // Nessun tier nella catena: si guarda l'eleggibilita', non la fascia (che
+        // al seed e' volutamente NULL, perche' la scrivono l'indice e la batteria).
+        let agentici = select_models_tierchain(
+            &pool,
+            &filtro(Some("reasoning")),
+            &[],
+            "input_cost_per_million_tokens ASC",
+            10,
+            1,
+        )
+        .await
+        .expect("query di selezione");
+        assert!(
+            !agentici.is_empty(),
+            "nessun modello kimi eleggibile per gli intent che pretendono reasoning: \
+             e' lo stesso stato in cui groq e openrouter sono rimasti per mesi"
+        );
+
+        // E per la capability con cui il fornitore si presenta.
+        let di_codice = select_models_tierchain(
+            &pool,
+            &filtro(Some("code")),
+            &[],
+            "input_cost_per_million_tokens ASC",
+            10,
+            1,
+        )
+        .await
+        .expect("query di selezione");
+        assert!(!di_codice.is_empty(), "nessun modello kimi eleggibile per code");
+
+        // Il piu' economico vince l'ordinamento per costo: e' la stessa regola con
+        // cui la selezione agentica sceglie fra pari.
+        assert_eq!(
+            agentici.first().map(|(p, m, _)| (p.as_str(), m.as_str())),
+            Some(("kimi", "kimi-k2.6")),
+            "l'ordine per costo non corrisponde ai prezzi di listino seedati"
+        );
+    }
+
     /// TEST 6 — only_provider (PIN): `Some(p)` RESTRINGE la selezione al solo
     /// provider `p` (filtro positivo bindato); `None` = query identica alla
     /// precedente (nessuna regressione per i chiamanti storici). Discriminante:
