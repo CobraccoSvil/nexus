@@ -46,6 +46,13 @@ pub struct ModelFact {
     pub is_enabled: bool,
     pub capability_source: String,
     pub auto_disabled_reason: Option<String>,
+    /// Il modello compare nella vista `v_model_capabilities`, cioe' la sua
+    /// dichiarazione esiste. NON e' un fatto sulla salute e `classifica` non lo
+    /// guarda: lo legge [`crate::provider_declaration`], che risponde a un'altra
+    /// domanda sugli STESSI fatti. Sta qui perche' la query e' una sola (regola
+    /// L): due caricamenti della stessa tabella per due domande vicine sono il
+    /// modo in cui, un giorno, i due rispondono su parchi modelli diversi.
+    pub ha_capability: bool,
 }
 
 /// Quale ciclo di verifica raggiunge un modello. Sono due e sono nominati:
@@ -218,14 +225,25 @@ pub fn classifica(
 /// handler di stato elencano tutti i fornitori, e una query per fornitore
 /// sarebbe N round-trip per la stessa tabella.
 ///
-/// Legge le TRE colonne su cui i cicli decidono, e nient'altro: un `SELECT *`
+/// Legge le colonne su cui i cicli decidono, e nient'altro: un `SELECT *`
 /// legherebbe questo modulo a colonne che non gli servono e che cambiano.
+///
+/// La copertura della dichiarazione si chiede alla VISTA `v_model_capabilities`,
+/// non alla tabella che la alimenta: la vista e' cio' che i consumatori
+/// interrogano a runtime (`capability::resolve_tool_choice_style`,
+/// `native_engine`), quindi «dichiarato» deve significare qui esattamente cio'
+/// che significa li' (regola O). Interrogare la tabella sarebbe una seconda idea
+/// dello stesso concetto, e divergerebbe il giorno in cui la vista cambia
+/// definizione.
 pub async fn carica_fatti_catalogo(db: &sqlx::PgPool) -> HashMap<String, Vec<ModelFact>> {
     let rows = sqlx::query(
-        "SELECT provider, is_enabled, \
-                COALESCE(capability_source, 'auto') AS capability_source, \
-                auto_disabled_reason \
-           FROM ai_price_catalog",
+        "SELECT c.provider, c.is_enabled, \
+                COALESCE(c.capability_source, 'auto') AS capability_source, \
+                c.auto_disabled_reason, \
+                (v.model IS NOT NULL) AS ha_capability \
+           FROM ai_price_catalog c \
+           LEFT JOIN v_model_capabilities v \
+                  ON v.provider = c.provider AND v.model = c.model",
     )
     .fetch_all(db)
     .await
@@ -242,6 +260,7 @@ pub async fn carica_fatti_catalogo(db: &sqlx::PgPool) -> HashMap<String, Vec<Mod
                 .try_get::<Option<String>, _>("auto_disabled_reason")
                 .ok()
                 .flatten(),
+            ha_capability: r.try_get("ha_capability").unwrap_or(false),
         });
     }
     out
@@ -280,6 +299,7 @@ mod tests {
             is_enabled: true,
             capability_source: "auto".to_string(),
             auto_disabled_reason: None,
+            ha_capability: true,
         }
     }
 
@@ -292,6 +312,7 @@ mod tests {
             auto_disabled_reason: Some(
                 crate::model_health_probe::REASON_UNVERIFIED_NO_PROBE.to_string(),
             ),
+            ha_capability: false,
         }
     }
 
@@ -302,6 +323,7 @@ mod tests {
             is_enabled: false,
             capability_source: "auto".to_string(),
             auto_disabled_reason: None,
+            ha_capability: false,
         }
     }
 
@@ -398,6 +420,7 @@ mod tests {
             is_enabled: false,
             capability_source: "auto".to_string(),
             auto_disabled_reason: Some("manual:disabilitato dall'admin".to_string()),
+            ha_capability: false,
         };
         assert_eq!(
             classifica(true, &[escluso], None),

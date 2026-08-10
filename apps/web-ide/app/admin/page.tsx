@@ -7,7 +7,7 @@ import { useThemeColors } from "../../lib/theme";
 import { AdminPageHeader } from "../../components/admin/AdminPageHeader";
 import { getGatewayProviders, reloadGatewayConfig } from "../../lib/api-client";
 import { useProviderBudgets } from "../../components/settings/provider-budget";
-import { renderReadiness, type GatewayProvider } from "../../lib/api/gateway-providers";
+import { renderDeclaration, renderReadiness, type GatewayProvider } from "../../lib/api/gateway-providers";
 
 const SHORTCUTS: Array<{ label: string; href: Route; desc: string }> = [
   { label: "Provider & Modelli", href: "/admin/settings/providers" as Route, desc: "API key, modelli attivi, stato, budget" },
@@ -102,23 +102,40 @@ export default function AdminDashboardPage() {
             <div style={{ fontSize: 12, color: tc.textMuted }}>Nessun dato provider dal gateway.</div>
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              {providers.map((p) => (
-                <div key={p.name} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
-                  <span style={{
-                    width: 8, height: 8, borderRadius: "50%", flexShrink: 0,
-                    background: p.healthy === true ? "#4ade80"
-                      : p.healthy === false ? "#f87171"
-                      : renderReadiness(p).requiresAction ? "#fbbf24" : "#9ca3af",
-                  }} />
-                  <span style={{ fontWeight: 600, color: tc.text }}>{p.name}</span>
-                  <span style={{
-                    marginLeft: "auto", fontSize: 11,
-                    color: renderReadiness(p).requiresAction ? "#fbbf24" : tc.textMuted,
-                  }}>
-                    {renderReadiness(p).label}
-                  </span>
-                </div>
-              ))}
+              {providers.map((p) => {
+                // Due domande, due righe: la salute e la copertura della
+                // dichiarazione non si possono fondere in un'etichetta sola —
+                // groq e openrouter sono `attivo` E senza una riga di
+                // capability, e una riga sola dovrebbe sceglierne una.
+                const dichiarazione = renderDeclaration(p);
+                return (
+                  <div key={p.name} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+                      <span style={{
+                        width: 8, height: 8, borderRadius: "50%", flexShrink: 0,
+                        background: p.healthy === true ? "#4ade80"
+                          : p.healthy === false ? "#f87171"
+                          : renderReadiness(p).requiresAction ? "#fbbf24" : "#9ca3af",
+                      }} />
+                      <span style={{ fontWeight: 600, color: tc.text }}>{p.name}</span>
+                      <span style={{
+                        marginLeft: "auto", fontSize: 11,
+                        color: renderReadiness(p).requiresAction ? "#fbbf24" : tc.textMuted,
+                      }}>
+                        {renderReadiness(p).label}
+                      </span>
+                    </div>
+                    {dichiarazione && (
+                      <div style={{
+                        fontSize: 11, paddingLeft: 16,
+                        color: dichiarazione.requiresAction ? "#fbbf24" : tc.textMuted,
+                      }}>
+                        {dichiarazione.label}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>

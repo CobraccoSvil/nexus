@@ -39,6 +39,24 @@ cambiare a meta'.
 | file | produttore | consumatore |
 |---|---|---|
 | `session-usage.json` | `crates/mcp-core/src/billing.rs` (`corpo_session_usage`) | `lib/api/billing.ts` (`getSessionUsage`) |
+| `gateway-providers.json` | `crates/mcp-core/src/environment.rs` (`entry_con_prontezza`) | `lib/api/gateway-providers.ts` (`renderReadiness`, `renderDeclaration`) |
+
+### gateway-providers.json
+
+Catturata dall'endpoint reale il 10/08/2026. A differenza di `session-usage.json`
+**non e' ancorata da un test Rust**: il produttore compone l'entry da piu' punti
+(`entry_con_prontezza` piu' i rami che aggiungono health e cooldown) e non esiste
+una funzione sola che produca l'intero corpo. Dichiararlo qui e' meglio che
+lasciarlo intuire — se un giorno quel corpo avra' un compositore unico, questa
+fixture va ancorata con `include_str!` come l'altra.
+
+I campi `declaration` / `declaration_undeclared` portano la misura del
+10/08/2026 su `ai_price_catalog` incrociato con `v_model_capabilities`: 37
+modelli abilitati su 128 non hanno una riga di capability (openrouter 17 su 17,
+openai 11 su 65, perplexity 3 su 3, groq 2 su 2, anthropic 2 su 9, google 2 su
+9). `groq` e `openrouter` sono nella fixture con `readiness: "healthy"` E
+`declaration: "absent"`: e' la coppia di valori che rende il caso non
+rappresentabile con un campo solo.
 
 ### session-usage.json
 

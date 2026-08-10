@@ -32,6 +32,20 @@ export type ProviderReadiness =
 export type ReadinessCycle = "periodic_probe" | "reprobe";
 export type ReadinessCause = "no_models" | "no_verification_cycle";
 
+/**
+ * Le varianti di copertura dichiarate da `mcp-core::provider_declaration`.
+ *
+ * ORTOGONALE alla prontezza, e i due campi non si possono fondere: un fornitore
+ * puo' essere `healthy` e non avere una sola riga di capability — e' il caso
+ * reale di groq e openrouter, misurato il 10/08/2026. Il pannello li mostra su
+ * due righe perche' rispondono a due domande con due rimedi diversi.
+ */
+export type ProviderDeclaration =
+  | "nothing_to_declare"
+  | "complete"
+  | "partial"
+  | "absent";
+
 /** Una entry di `GET /api/gateway/providers`. */
 export interface GatewayProvider {
   name: string;
@@ -49,6 +63,9 @@ export interface GatewayProvider {
   readiness_cycle?: ReadinessCycle;
   readiness_cause?: ReadinessCause;
   readiness_models?: number;
+  declaration?: ProviderDeclaration;
+  /** Quanti modelli ABILITATI sono privi di capability. Assente dove non ne manca nessuno. */
+  declaration_undeclared?: number;
 }
 
 /**
@@ -110,5 +127,48 @@ export function renderReadiness(p: GatewayProvider): RenderedReadiness {
         return { label: p.error?.split(":")[0] ?? "errore", requiresAction: false };
       }
       return { label: "prontezza non dichiarata", requiresAction: false };
+  }
+}
+
+/**
+ * L'etichetta della COPERTURA DELLA DICHIARAZIONE, o `null` quando non c'e'
+ * nulla da dire.
+ *
+ * `null` non e' un esito conflazionato (regola Q): l'esito sta nel campo
+ * `declaration`, e questo e' solo il verdetto su cosa MOSTRARE. Stampare
+ * «dichiarazione completa» accanto a ogni fornitore in ordine sarebbe rumore, e
+ * il rumore e' il modo in cui una riga che conta smette di essere letta.
+ *
+ * Le due mancanze restano DUE frasi perche' hanno due rimedi: `absent` e' il
+ * fornitore onboardato senza la sua migrazione di capability (un atto solo),
+ * `partial` e' il catalogo vivo che ha aggiunto modelli dopo quella migrazione
+ * (un rimedio per-modello, ricorrente).
+ *
+ * L'IGNOTO non diventa un allarme: una entry senza `declaration` viene da un
+ * backend che non parla questa versione del contratto, e di lui non sappiamo se
+ * manchi qualcosa.
+ */
+export function renderDeclaration(p: GatewayProvider): RenderedReadiness | null {
+  const mancanti = p.declaration_undeclared;
+  switch (p.declaration) {
+    case "absent":
+      return {
+        label:
+          mancanti === undefined
+            ? "nessuna capability dichiarata"
+            : `nessuna capability dichiarata (${mancanti} modelli)`,
+        requiresAction: true,
+      };
+    case "partial":
+      return {
+        label:
+          mancanti === undefined
+            ? "capability incomplete"
+            : `${mancanti} modelli senza capability`,
+        requiresAction: true,
+      };
+    default:
+      // `complete`, `nothing_to_declare`, o campo assente: niente da mostrare.
+      return null;
   }
 }

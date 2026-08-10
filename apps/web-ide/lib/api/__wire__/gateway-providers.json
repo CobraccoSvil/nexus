@@ -6,37 +6,46 @@
       "configured": true,
       "error": "credit_balance_too_low",
       "readiness": "down",
-      "cooldown_seconds_remaining": 21377
+      "cooldown_seconds_remaining": 21377,
+      "declaration": "partial",
+      "declaration_undeclared": 2
     },
     {
       "name": "deepseek",
       "healthy": true,
       "configured": true,
-      "readiness": "healthy"
+      "readiness": "healthy",
+      "declaration": "complete"
     },
     {
       "name": "google",
       "healthy": true,
       "configured": true,
-      "readiness": "healthy"
+      "readiness": "healthy",
+      "declaration": "partial",
+      "declaration_undeclared": 2
     },
     {
       "name": "groq",
       "healthy": true,
       "configured": true,
-      "readiness": "healthy"
+      "readiness": "healthy",
+      "declaration": "absent",
+      "declaration_undeclared": 2
     },
     {
       "name": "kimi",
       "healthy": true,
       "configured": true,
-      "readiness": "healthy"
+      "readiness": "healthy",
+      "declaration": "complete"
     },
     {
       "name": "mistral",
       "healthy": true,
       "configured": true,
-      "readiness": "healthy"
+      "readiness": "healthy",
+      "declaration": "complete"
     },
     {
       "name": "openai",
@@ -44,13 +53,17 @@
       "configured": true,
       "error": "credit_balance_too_low",
       "readiness": "down",
-      "cooldown_seconds_remaining": 21019
+      "cooldown_seconds_remaining": 21019,
+      "declaration": "partial",
+      "declaration_undeclared": 11
     },
     {
       "name": "openrouter",
       "healthy": true,
       "configured": true,
-      "readiness": "healthy"
+      "readiness": "healthy",
+      "declaration": "absent",
+      "declaration_undeclared": 17
     },
     {
       "name": "perplexity",
@@ -58,12 +71,15 @@
       "configured": true,
       "error": "credit_balance_too_low",
       "readiness": "down",
-      "cooldown_seconds_remaining": 21196
+      "cooldown_seconds_remaining": 21196,
+      "declaration": "absent",
+      "declaration_undeclared": 3
     },
     {
       "name": "vllm",
       "configured": false,
-      "readiness": "not_configured"
+      "readiness": "not_configured",
+      "declaration": "nothing_to_declare"
     }
   ]
 }

@@ -1628,6 +1628,13 @@ fn build_provider_status_entry(
 /// `healthy: null` da solo non dice PERCHE' non si sa nulla: la prontezza lo
 /// dichiara in un campo (regola Q), delegando al punto unico che interroga i
 /// due cicli di verifica reali.
+///
+/// Accanto alla prontezza viaggia la COPERTURA DELLA DICHIARAZIONE, che risponde
+/// a un'altra domanda sugli stessi fatti di catalogo: la prima dice se sappiamo
+/// che il fornitore risponde, la seconda se cio' che sappiamo basta a usarlo. Le
+/// due non si possono fondere in un campo solo — un fornitore sano e interamente
+/// privo di capability e' il caso REALE di groq e openrouter (misurato il
+/// 10/08/2026), e collassarle perderebbe l'una o l'altra meta'.
 fn entry_con_prontezza(
     name: &str,
     health_map: &std::collections::HashMap<String, ProviderHealthRow>,
@@ -1635,6 +1642,7 @@ fn entry_con_prontezza(
     catalog_facts: &std::collections::HashMap<String, Vec<crate::provider_readiness::ModelFact>>,
 ) -> Value {
     let configured = api_key_configured.get(name).copied().unwrap_or(false);
+    let modelli = catalog_facts.get(name).map(Vec::as_slice).unwrap_or(&[]);
     let mut p = json!({
         "name": name,
         "configured": configured,
@@ -1644,9 +1652,13 @@ fn entry_con_prontezza(
         &mut p,
         &crate::provider_readiness::classifica(
             configured,
-            catalog_facts.get(name).map(Vec::as_slice).unwrap_or(&[]),
+            modelli,
             health_map.get(name).map(|h| h.healthy),
         ),
+    );
+    crate::provider_declaration::scrivi_dichiarazione(
+        &mut p,
+        &crate::provider_declaration::classifica_dichiarazione(modelli),
     );
     p
 }

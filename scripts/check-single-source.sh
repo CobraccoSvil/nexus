@@ -3070,6 +3070,50 @@ else
   echo "OK prontezza-fornitore: l'ignoto e' una variante, e i cicli si interrogano"
 fi
 
+# --- dichiarazione-fornitore ------------------------------------------------
+# Copertura di `nexus_provider_capabilities` (2026-08-10). MISURATO: 37 modelli
+# ABILITATI su 128 senza una riga di capability, e nessun ciclo a runtime li
+# scopre — le scritture vengono tutte da migrazioni. La condizione e' distinta
+# dalla prontezza e NON puo' esserne una variante: `classifica` ritorna
+# `Observed` appena c'e' una misura di salute, quindi una `CausaStallo` sarebbe
+# irraggiungibile proprio per groq, openrouter e perplexity, che sono sani.
+assert_single "dichiarazione-fornitore" 'pub fn classifica_dichiarazione(' \
+  'crates/mcp-core/src/provider_declaration.rs' crates
+
+dichiarazione="crates/mcp-core/src/provider_declaration.rs"
+if [[ ! -f "$dichiarazione" ]]; then
+  echo "!! dichiarazione-fornitore: $dichiarazione non esiste piu'" >&2
+  fail=1
+elif ! grep -q 'v_model_capabilities' crates/mcp-core/src/provider_readiness.rs; then
+  echo "!! dichiarazione-fornitore: i fatti di catalogo non arrivano piu' dalla" >&2
+  echo "   vista v_model_capabilities. La copertura va misurata sulla stessa" >&2
+  echo "   fonte che i consumatori interrogano a runtime: chiedere alla tabella" >&2
+  echo "   e' una seconda idea di 'dichiarato', e divergera' (regola O)." >&2
+  fail=1
+elif grep -q 'ha_capability' crates/mcp-core/src/provider_readiness.rs \
+     && grep -n 'pub fn classifica(' -A 40 crates/mcp-core/src/provider_readiness.rs \
+        | grep -q 'ha_capability'; then
+  echo "!! dichiarazione-fornitore: la prontezza ha cominciato a guardare la" >&2
+  echo "   capability. Sono due domande con due rimedi: fonderle perde la meta'" >&2
+  echo "   che dice se il fornitore RISPONDE." >&2
+  fail=1
+else
+  echo "OK dichiarazione-fornitore: la copertura si misura sulla vista, e non e' la prontezza"
+fi
+
+# I due lati del confine devono nominare la resa: senza, il campo torna a
+# viaggiare sul wire e a non comparire da nessuna parte — che e' esattamente lo
+# stato in cui il difetto e' vissuto finora.
+if ! grep -q 'renderDeclaration' apps/web-ide/app/admin/page.tsx \
+   || ! grep -q '"declaration"' apps/web-ide/lib/api/__wire__/gateway-providers.json; then
+  echo "!! dichiarazione-fornitore: la copertura non arriva piu' alla pagina" >&2
+  echo "   (admin/page.tsx) o e' sparita dalla fixture di confine. Un campo che" >&2
+  echo "   nessuno rende e' un campo che non esiste." >&2
+  fail=1
+else
+  echo "OK dichiarazione-fornitore: il campo arriva alla pagina e sta nella fixture"
+fi
+
 # --- nascita-riga-run -------------------------------------------------------
 # La riga iniziale di `agent_runs` nasce da UN punto solo, che ne dichiara
 # l'esito. I tre percorsi (turno agentico, nessun provider capace, ripresa)

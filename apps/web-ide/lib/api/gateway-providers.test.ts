@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import {
+  renderDeclaration,
   renderReadiness,
   type GatewayProvider,
 } from "./gateway-providers.ts";
@@ -109,6 +110,76 @@ test("una entry senza prontezza dichiara l'assenza, non una misura", () => {
   const reso = renderReadiness({ name: "vecchio", healthy: null });
   assert.equal(reso.label, "prontezza non dichiarata");
   assert.equal(reso.requiresAction, false);
+});
+
+test("il difetto misurato: un fornitore sano puo' essere interamente non dichiarato", () => {
+  // IL CASO CHE GIUSTIFICA IL CAMPO. Sul wire REALE groq e openrouter arrivano
+  // `healthy` — e sono anche i due che non hanno una sola riga di capability.
+  // Finche' la pagina leggeva la sola prontezza, di loro diceva «attivo» e
+  // nient'altro: l'assenza non aveva dove comparire.
+  const perNome = new Map(wire().map((p) => [p.name, p]));
+  for (const nome of ["groq", "openrouter"]) {
+    const p = perNome.get(nome);
+    assert.ok(p, `${nome} deve essere nella fixture`);
+    assert.equal(renderReadiness(p).label, "attivo", `${nome} e' sano, e resta sano`);
+    assert.equal(renderReadiness(p).requiresAction, false);
+    const d = renderDeclaration(p);
+    assert.ok(d, `${nome} non ha capability: l'assenza deve avere una resa`);
+    assert.equal(d.requiresAction, true, "nessun ciclo la completa: serve un intervento");
+    assert.match(d.label, /capability/);
+  }
+});
+
+test("assente e parziale non si rendono con la stessa frase", () => {
+  // Due rimedi diversi: una migrazione di onboarding mancante contro un
+  // catalogo che ha aggiunto modelli dopo. Una frase sola manderebbe a cercare
+  // la cosa sbagliata.
+  const assente = renderDeclaration({
+    name: "openrouter",
+    healthy: true,
+    declaration: "absent",
+    declaration_undeclared: 17,
+  });
+  const parziale = renderDeclaration({
+    name: "openai",
+    healthy: true,
+    declaration: "partial",
+    declaration_undeclared: 11,
+  });
+  assert.notEqual(assente?.label, parziale?.label);
+  assert.match(assente?.label ?? "", /17/);
+  assert.match(parziale?.label ?? "", /11/);
+});
+
+test("cio' che e' dichiarato per intero non produce rumore", () => {
+  // `complete` e `nothing_to_declare` non hanno nulla da dire: una riga per
+  // ogni fornitore in ordine e' il modo in cui quelle che contano smettono di
+  // essere lette.
+  for (const declaration of ["complete", "nothing_to_declare"] as const) {
+    assert.equal(renderDeclaration({ name: "x", healthy: true, declaration }), null);
+  }
+});
+
+test("una entry senza dichiarazione non inventa una mancanza", () => {
+  // Backend che non parla questa versione del contratto: di lui non sappiamo se
+  // manchi qualcosa, e l'ignoto non diventa un allarme (regola Q).
+  assert.equal(renderDeclaration({ name: "vecchio", healthy: true }), null);
+});
+
+test("le due domande restano due campi", () => {
+  // MUTAZIONE dichiarata: se la copertura fosse stata infilata dentro
+  // `readiness` come variante di stallo, questa entry non sarebbe
+  // rappresentabile — `healthy` e `stalled` sono lo stesso campo. Il test la
+  // costruisce apposta, ed e' lo stato reale di groq.
+  const p: GatewayProvider = {
+    name: "groq",
+    healthy: true,
+    readiness: "healthy",
+    declaration: "absent",
+    declaration_undeclared: 2,
+  };
+  assert.equal(renderReadiness(p).requiresAction, false, "la salute e' misurata e va bene");
+  assert.equal(renderDeclaration(p)?.requiresAction, true, "la dichiarazione no");
 });
 
 test("il difetto reale: derivare l'etichetta dal solo healthy la sbaglia", () => {

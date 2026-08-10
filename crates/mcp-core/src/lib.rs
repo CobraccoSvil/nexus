@@ -115,6 +115,7 @@ mod provider_cooldown;
 mod provider_error_classifier;
 mod provider_inflight;
 mod provider_health_probe;
+mod provider_declaration;
 mod provider_readiness;
 mod rag;
 mod reconcile_default_models;
