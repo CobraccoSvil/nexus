@@ -664,10 +664,11 @@ crate::tool_input! {
     EditFileInput for "edit_file" {
         obbligatori {
             path: String, "Percorso del file relativo alla root";
-            old_string: String, "Stringa esatta da sostituire (deve esistere esattamente una volta nel file)";
+            old_string: String, "Stringa esatta da sostituire (deve esistere esattamente una volta nel file, a meno di replace_all)";
             new_string: String, "Stringa con cui sostituire old_string";
         }
         opzionali {
+            replace_all: bool, "Se true, sostituisce TUTTE le occorrenze di old_string invece di pretenderne una sola. Default: false";
         }
     }
 }
@@ -899,6 +900,7 @@ crate::tool_input! {
         }
         opzionali {
             directory: String, "Directory da listare (relativa alla root). Ometti o usa '' per la root del progetto.";
+            recursive: bool, "Se true, elenca anche il contenuto delle sottodirectory. Default: false";
         }
     }
 }

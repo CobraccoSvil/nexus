@@ -47,14 +47,28 @@ pub struct SemanticSearchReport {
 }
 
 /// I kind interrogati quando il chiamante non ne specifica: tutte le fonti
-/// per-progetto, INCLUSO il codice. Code ne era escluso quando la sua
-/// collection era un nome mai esistito ("code_embeddings"): tolta la faglia,
-/// escluderlo renderebbe la ricerca cieca proprio sui sorgenti — la domanda
-/// piu' frequente di un run di correzione.
+/// per-progetto CHE QUALCUNO POPOLA, incluso il codice. Code ne era escluso
+/// quando la sua collection era un nome mai esistito ("code_embeddings"):
+/// tolta la faglia, escluderlo renderebbe la ricerca cieca proprio sui
+/// sorgenti — la domanda piu' frequente di un run di correzione.
+///
+/// `Kb` NON e' qui, ed e' la stessa faglia di "code_embeddings" in forma
+/// estrema: la sua collection (`agent.rag.collection_kb` = `kb_chunks`) non ha
+/// alcuno SCRITTORE. MISURATO il 10/08/2026: `SourceKind::Kb` compare in tutto
+/// il workspace solo in lettura (qui, in `config::collection_for` e nel recall
+/// del mandato), Qdrant espone dieci collection e quella non c'e' — mentre le
+/// altre tre configurate esistono tutte. Una fonte che nessuno popola non e'
+/// una fonte vuota: e' una domanda a cui nessuno puo' rispondere, e chiederla
+/// a ogni ricerca produce un `collections_fallite` costante che segnala un
+/// guasto dove non ce n'e'.
+///
+/// Il kind resta nel vocabolario e resta interrogabile a richiesta esplicita:
+/// il giorno in cui un percorso di ingest lo popolera', tornera' fra i default
+/// senza che nulla vada reinventato. La KB vera di Nexus vive altrove
+/// (`wiki_content`, interrogata da `knowledge_search`).
 pub(crate) fn default_kinds() -> Vec<SourceKind> {
     vec![
         SourceKind::Attachment,
-        SourceKind::Kb,
         SourceKind::ChatHistory,
         SourceKind::ToolResult,
         SourceKind::Code,

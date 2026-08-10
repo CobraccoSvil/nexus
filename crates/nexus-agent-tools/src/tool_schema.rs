@@ -76,6 +76,10 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         "directory": {
           "type": "string",
           "description": "Directory da listare (relativa alla root). Ometti o usa '' per la root del progetto."
+        },
+        "recursive": {
+          "type": "boolean",
+          "description": "Se true, elenca anche il contenuto delle sottodirectory. Default: false"
         }
       }
     }
@@ -626,7 +630,11 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         },
         "old_string": {
           "type": "string",
-          "description": "Stringa esatta da sostituire (deve esistere esattamente una volta nel file)"
+          "description": "Stringa esatta da sostituire (deve esistere esattamente una volta nel file, a meno di replace_all)"
+        },
+        "replace_all": {
+          "type": "boolean",
+          "description": "Se true, sostituisce TUTTE le occorrenze di old_string invece di pretenderne una sola. Default: false"
         },
         "new_string": {
           "type": "string",

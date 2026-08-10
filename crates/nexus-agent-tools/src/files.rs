@@ -980,6 +980,68 @@ pub async fn upsert_project_document_if_doc(
 /// dedurre da questo testo se un file esista — deve interrogare il filesystem.
 /// Una entry illeggibile interrompe la raccolta senza far fallire il tool: cio'
 /// che si e' potuto elencare vale piu' di un errore su tutto.
+/// Variante RICORSIVA di [`raccogli_voci_visibili`], per `list_files` con
+/// `recursive: true`. Ritorna percorsi relativi a `radice`, separatore `/`.
+///
+/// Le esclusioni delegano al PUNTO UNICO `nexus_tool_kit::is_skipped_dir`
+/// (regola L), lo stesso di `classify_scan_entry`: copre i dotfile/dotdir —
+/// comportamento storico della variante piatta — e gli alberi di build
+/// (node_modules, target, dist, build). Senza, un elenco ricorsivo su una root
+/// di sviluppo percorrerebbe decine di GB per rispondere a una domanda che
+/// riguarda i sorgenti.
+///
+/// Il tetto sulle voci non e' cautela generica: il risultato finisce nel
+/// contesto di un modello, e un elenco che lo satura fa perdere il turno a
+/// prescindere da quanto sia completo. Raggiunto il tetto lo DICHIARA, invece
+/// di troncare in silenzio facendo credere che l'albero finisca li'.
+async fn raccogli_voci_ricorsive(radice: &Path) -> Vec<String> {
+    /// Oltre questo numero di voci l'elenco si ferma e lo dichiara.
+    const MAX_VOCI: usize = 2000;
+
+    let mut out: Vec<String> = Vec::new();
+    let mut da_visitare: Vec<(std::path::PathBuf, String)> =
+        vec![(radice.to_path_buf(), String::new())];
+
+    while let Some((dir, prefisso)) = da_visitare.pop() {
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            // Una directory illeggibile non fa fallire l'elenco: cio' che si e'
+            // potuto raccogliere vale piu' di un errore su tutto (stessa scelta
+            // della variante piatta).
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if out.len() >= MAX_VOCI {
+                out.push(format!(
+                    "[elenco troncato a {MAX_VOCI} voci: usa 'directory' per restringere]"
+                ));
+                return out;
+            }
+            let nome = entry.file_name().to_string_lossy().to_string();
+            if nexus_tool_kit::is_skipped_dir(&nome) {
+                continue;
+            }
+            let relativo = if prefisso.is_empty() {
+                nome.clone()
+            } else {
+                format!("{prefisso}/{nome}")
+            };
+            let is_dir = entry
+                .file_type()
+                .await
+                .map(|t| t.is_dir())
+                .unwrap_or(false);
+            if is_dir {
+                out.push(format!("{relativo}/"));
+                da_visitare.push((entry.path(), relativo));
+            } else {
+                out.push(relativo);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 async fn raccogli_voci_visibili(entries: &mut tokio::fs::ReadDir) -> Vec<String> {
     let mut lines = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
@@ -1031,7 +1093,11 @@ pub async fn tool_list_files(
         }
     };
 
-    let lines = raccogli_voci_visibili(&mut entries).await;
+    let lines = if params.recursive.unwrap_or(false) {
+        raccogli_voci_ricorsive(&target).await
+    } else {
+        raccogli_voci_visibili(&mut entries).await
+    };
     if lines.is_empty() {
         // "vuota o non trovata" era una disgiunzione che il codice sa risolvere:
         // se `read_dir` e' RIUSCITA la directory esiste, punto — l'inesistenza
@@ -2122,7 +2188,16 @@ pub async fn tool_edit_file(
         }
     };
 
-    edit_matched_content(ctx, &target, path_str, old_string, new_string, bg_warning).await
+    edit_matched_content(
+        ctx,
+        &target,
+        path_str,
+        old_string,
+        new_string,
+        bg_warning,
+        params.replace_all.unwrap_or(false),
+    )
+    .await
 }
 
 /// Legge il file, normalizza CRLF -> LF per un matching consistente e, in base al
@@ -2142,6 +2217,7 @@ async fn edit_matched_content(
     old_string: &str,
     new_string: &str,
     bg_warning: Option<String>,
+    replace_all: bool,
 ) -> nexus_types::tool_outcome::RispostaTool {
     use nexus_types::tool_outcome::RispostaTool;
     let raw_content = match tokio::fs::read_to_string(target).await {
@@ -2177,13 +2253,13 @@ async fn edit_matched_content(
                 path_str,
             )),
         },
-        n if n > 1 => RispostaTool::fallito_rimediabile(build_old_string_ambiguous_message(
-            &content,
-            &old_string_lf,
-            path_str,
-            n,
-        )),
-        _ => RispostaTool::riuscito(
+        // Con `replace_all` la molteplicita' NON e' piu' un'ambiguita': e' cio'
+        // che l'agente ha chiesto. Senza, resta il fallimento rimediabile di
+        // sempre — e il messaggio spiega come rendere univoco l'old_string.
+        n if n > 1 && !replace_all => RispostaTool::fallito_rimediabile(
+            build_old_string_ambiguous_message(&content, &old_string_lf, path_str, n),
+        ),
+        n => RispostaTool::riuscito(
             apply_edit_and_persist(
                 ctx,
                 target,
@@ -2195,6 +2271,7 @@ async fn edit_matched_content(
                     raw_content: &raw_content,
                     was_crlf,
                     bg_warning,
+                    sostituzioni: n,
                 },
             )
             .await,
@@ -2207,8 +2284,15 @@ async fn edit_matched_content(
 struct EditApply<'a> {
     /// Contenuto attuale LF-normalizzato del file.
     content_lf: &'a str,
-    /// `old_string` LF-normalizzato (gia' verificato univoco dal chiamante).
+    /// `old_string` LF-normalizzato (le occorrenze le ha gia' contate il
+    /// chiamante, che dichiara quante sostituirne in [`Self::sostituzioni`]).
     old_string_lf: &'a str,
+    /// Quante occorrenze sostituire: 1 nel caso univoco, N con `replace_all`.
+    ///
+    /// E' un NUMERO e non un booleano perche' il chiamante lo ha CONTATO: un
+    /// `bool` costringerebbe questa funzione a ricontare per sapere quante ne
+    /// ha toccate, cioe' a rifare la misura che ha gia' deciso il ramo.
+    sostituzioni: usize,
     /// `new_string` LF-normalizzato che sostituisce l'occorrenza.
     new_string_lf: &'a str,
     /// Contenuto preesistente grezzo (EOL originali), per il tracking mutazioni.
@@ -2239,9 +2323,10 @@ async fn apply_edit_and_persist(
     path_str: &str,
     apply: EditApply<'_>,
 ) -> String {
-    let new_content_lf = apply
-        .content_lf
-        .replacen(apply.old_string_lf, apply.new_string_lf, 1);
+    let new_content_lf =
+        apply
+            .content_lf
+            .replacen(apply.old_string_lf, apply.new_string_lf, apply.sostituzioni);
     // Ripristina gli EOL originali del file (CRLF se l'originale era CRLF).
     // Senza questo, ogni edit di un file Windows convertirebbe l'intero file
     // in LF generando un diff git rumoroso (bug 14).
