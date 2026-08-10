@@ -1524,6 +1524,30 @@ assert_single "risorse-di-pagina" 'fn classifica_risorse' \
 assert_single "richiesta-fallita" 'fn richiesta_fallita' \
   'crates/nexus-agent-graph/src/decisions/browser_dialogue.rs' crates
 
+# «Posso obbligare una tool call su questa coppia?» (2026-08-10, mig 0694)
+#
+# La domanda ha gia' il suo punto unico (capability::resolve_tool_choice_style +
+# provider_style_supports_forcing) e l'esecutore lo interrogava; il gate duale
+# scriveva `force_tool_choice: Some(true)` a mano, e su kimi/kimi-k2.6 —
+# dichiarato `openai_auto`, cioe' «non si puo' forzare» — ha prodotto 22
+# astensioni su 22 per HTTP 400. Nessun chiamante torni a deciderlo da se'.
+forcing_bad=0
+while IFS= read -r riga; do
+  [[ -z "$riga" ]] && continue
+  echo "   $riga" >&2
+  forcing_bad=$((forcing_bad + 1))
+done < <(grep -rn 'force_tool_choice: Some(true)' --include='*.rs' crates 2>/dev/null \
+          | grep -v '/tests/' | grep -v '_test.rs')
+if [[ "$forcing_bad" -gt 0 ]]; then
+  echo "!! forcing-dal-punto-unico: qualcuno forza la tool call con un letterale." >&2
+  echo "   Chiedere a capability::resolve_tool_choice_style +" >&2
+  echo "   provider_style_supports_forcing: il catalogo sa quali coppie lo" >&2
+  echo "   ammettono, e forzare dove non si puo' costa un HTTP 400." >&2
+  fail=1
+else
+  echo "OK forcing-dal-punto-unico: nessun letterale che obbliga la tool call"
+fi
+
 # Il SECONDO canale (2026-08-10): «la risorsa si e' VISTA?», distinta da «e'
 # arrivata?».
 #

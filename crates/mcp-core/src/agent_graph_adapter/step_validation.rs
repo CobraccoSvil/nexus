@@ -29,6 +29,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use nexus_agent_graph::decisions::helpers::provider_style_supports_forcing;
 use nexus_agent_graph::decisions::step_gate::{StepGateMode, StepVerdict};
 use nexus_agent_graph::runtime::ports::{
     LlmGateway, LlmMessage, LlmRequest, StepValidationPort, StepValidationReport,
@@ -350,7 +351,11 @@ async fn chiamata_one_shot(
         project_id,
         user_id,
     );
-    let resp = match llm.complete(richiesta_verdetto(&cand, system, blob, run_id)).await {
+    let forzatura = forzatura_ammessa(&setup.db, &cand.provider, &cand.model).await;
+    let resp = match llm
+        .complete(richiesta_verdetto(&cand, system, blob, run_id, forzatura))
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             let causa = causa_di(&e);
@@ -378,13 +383,40 @@ async fn chiamata_one_shot(
     estrai_verdetto(&resp, role, provider_eff, model_eff, cost_usd)
 }
 
+/// «Posso OBBLIGARE una tool call su questa coppia (fornitore, modello)?»
+///
+/// DELEGATA al punto unico che gia' risponde a questa domanda (regola L):
+/// [`crate::capability::resolve_tool_choice_style`] per lo stile dichiarato dal
+/// catalogo (col suo ripiego per famiglia) e
+/// [`provider_style_supports_forcing`] per il vocabolario degli stili che il
+/// forcing lo ammettono. L'esecutore la interrogava gia'; il gate scriveva
+/// `Some(true)` a mano.
+///
+/// MISURATO il 09-10/08/2026 su vetrina-statica: `kimi/kimi-k2.6` e' dichiarato
+/// `openai_auto`, cioe' il catalogo SAPEVA che non si puo' forzare, e le 22
+/// convocazioni di quel giudice sono uscite tutte `abstained/client_error` —
+/// HTTP 400 di Moonshot, "tool_choice required is incompatible with thinking
+/// enabled". Zero verdetti su 22, cioe' un giudice sprecato a ogni giro.
+///
+/// Il verso dell'ignoto e' quello prudente e non cambia: stile sconosciuto o
+/// provider non mappato -> il punto unico ritorna `None` -> forcing OFF. Non
+/// forzare costa al piu' una risposta in prosa, che `estrai_verdetto` tratta
+/// gia' come astensione dichiarata; forzare dove non si puo' costa il 400.
+async fn forzatura_ammessa(db: &PgPool, provider: &str, model: &str) -> bool {
+    let stile = crate::capability::resolve_tool_choice_style(db, provider, model).await;
+    provider_style_supports_forcing(stile.as_deref())
+}
+
 /// La richiesta one-shot: system del ruolo (prefisso STABILE riusabile in
-/// cache), batch nel messaggio utente, tool inline con `tool_choice` forzato.
+/// cache), batch nel messaggio utente, tool inline. Il `tool_choice` si forza
+/// solo dove la coppia lo ammette: la decisione arriva da
+/// [`forzatura_ammessa`], mai da un letterale.
 fn richiesta_verdetto(
     cand: &PurposeProviderCandidate,
     system: String,
     blob: String,
     run_id: String,
+    forza_tool_choice: bool,
 ) -> LlmRequest {
     LlmRequest {
         provider: cand.provider.clone(),
@@ -395,7 +427,7 @@ fn richiesta_verdetto(
             ..Default::default()
         }],
         tools: Some(vec![schema_step_verdict()]),
-        force_tool_choice: Some(true),
+        force_tool_choice: Some(forza_tool_choice),
         system_text: Some(system),
         max_tokens: Some(1024),
         run_id: Some(run_id),
