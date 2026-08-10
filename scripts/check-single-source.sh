@@ -24,11 +24,34 @@ fail=0
 assert_single() {
   local label="$1" pattern="$2" allowed="$3"; shift 3
   local dirs=("$@"); [[ ${#dirs[@]} -eq 0 ]] && dirs=(crates apps packages)
-  local hits bad=""
+  local hits bad="" errore rc=0
+  # Un pattern che grep RIFIUTA non produce "zero risultati": non produce alcuna
+  # MISURA, ed e' il caso in cui un guard e' verde per assenza (regola O).
+  # MISURATO il 10/08/2026: tre degli 80 assert_single passavano una parentesi
+  # non escapata come ERE (`pub fn classifica(`, `pub fn
+  # classifica_dichiarazione(`, `pub(crate) async fn inserisci_riga_run(`);
+  # grep usciva 2 con "Unmatched ( or \(", lo stderr finiva in /dev/null e
+  # `|| true` trasformava l'errore in un elenco vuoto. I tre stampavano OK da
+  # quando erano stati scritti, senza aver mai guardato un file. Percio' lo
+  # stderr si conserva e l'uscita >= 2 e' un FALLIMENTO, non un "non trovato":
+  # cosi' il difetto non puo' ripresentarsi silenziosamente su un pattern nuovo.
+  errore="$(grep -rEl --include='*.rs' --include='*.ts' --include='*.tsx' \
+    --exclude-dir=target --exclude-dir=node_modules --exclude-dir=.next \
+    --exclude-dir=.turbo --exclude-dir=dist \
+    -e "$pattern" "${dirs[@]}" 2>&1 >/dev/null)" || true
   hits="$(grep -rEl --include='*.rs' --include='*.ts' --include='*.tsx' \
     --exclude-dir=target --exclude-dir=node_modules --exclude-dir=.next \
     --exclude-dir=.turbo --exclude-dir=dist \
-    -e "$pattern" "${dirs[@]}" 2>/dev/null || true)"
+    -e "$pattern" "${dirs[@]}" 2>/dev/null)" || rc=$?
+  if (( rc >= 2 )) || [[ -n "$errore" ]]; then
+    echo "!! single-source [$label]: grep ha RIFIUTATO il pattern, quindi questo" >&2
+    echo "   check non ha misurato nulla (verde per assenza, regola O):" >&2
+    echo "     pattern: $pattern" >&2
+    echo "     grep:    ${errore:-uscita $rc}" >&2
+    echo "   In ERE le parentesi vanno escapate: 'fn nome\\('." >&2
+    fail=1
+    return
+  fi
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     # shellcheck disable=SC2053
@@ -3053,7 +3076,16 @@ fi
 # spento» un unico `null`, reso come un unico pallino grigio: quattro situazioni
 # con rimedi opposti. Il classificatore vive in un modulo solo e, soprattutto,
 # NON ricopia i criteri dei due cicli di verifica — li interroga.
-assert_single "prontezza-fornitore" 'pub fn classifica(' \
+#
+# Il pattern nomina il CONCERN, non il verbo. `pub fn classifica(` sembrava
+# identificarlo e non lo faceva: «classifica» e' il nome che questo repo da' a
+# ogni criterio puro, e appena il guard ha smesso di essere verde per assenza
+# (2026-08-10) ha subito accusato `nexus-migrations/src/registro.rs:194`, che
+# classifica la divergenza di un CHECKSUM e non c'entra nulla. Il tipo di
+# ritorno invece identifica la domanda: chiunque scriva una seconda funzione che
+# produce un `ProviderReadiness` sta duplicando questo criterio, comunque la
+# chiami.
+assert_single "prontezza-fornitore" '\-> ProviderReadiness \{' \
   'crates/mcp-core/src/provider_readiness.rs' crates
 
 prontezza="crates/mcp-core/src/provider_readiness.rs"
@@ -3077,14 +3109,25 @@ fi
 # dalla prontezza e NON puo' esserne una variante: `classifica` ritorna
 # `Observed` appena c'e' una misura di salute, quindi una `CausaStallo` sarebbe
 # irraggiungibile proprio per groq, openrouter e perplexity, che sono sani.
-assert_single "dichiarazione-fornitore" 'pub fn classifica_dichiarazione(' \
-  'crates/mcp-core/src/provider_declaration.rs' crates
+#
+# Il criterio si e' TRASFERITO in `nexus-capability-audit` il 2026-08-10, e la
+# decisione precedente non e' contraddetta: resta un punto unico, cambia la casa.
+# Il motivo e' la regola O — `xtask capability-census` deve porre la STESSA
+# domanda del pannello, e mcp-core e' bin-only, quindi l'alternativa non era
+# «xtask chiama mcp-core», era «xtask ricopia il criterio». Stessa forma di
+# `nexus-model-eligibility`, nato per la stessa ragione dopo che uno script
+# diagnostico aveva ricopiato la query del claim e riportato 0 candidati su 29.
+assert_single "dichiarazione-fornitore" 'pub fn classifica_dichiarazione\(' \
+  'crates/nexus-capability-audit/src/copertura.rs' crates
 
-dichiarazione="crates/mcp-core/src/provider_declaration.rs"
+dichiarazione="crates/nexus-capability-audit/src/copertura.rs"
 if [[ ! -f "$dichiarazione" ]]; then
   echo "!! dichiarazione-fornitore: $dichiarazione non esiste piu'" >&2
   fail=1
-elif ! grep -q 'v_model_capabilities' crates/mcp-core/src/provider_readiness.rs; then
+elif ! grep -A 8 'pub const SQL_FATTI_CATALOGO' "$dichiarazione" | grep -q 'v_model_capabilities'; then
+  # Si guarda la QUERY, non il file: il nome della vista compare anche nella
+  # prosa che spiega perche' si usi, e un guard soddisfatto da un commento e'
+  # verde per assenza come lo erano i tre pattern con la parentesi non escapata.
   echo "!! dichiarazione-fornitore: i fatti di catalogo non arrivano piu' dalla" >&2
   echo "   vista v_model_capabilities. La copertura va misurata sulla stessa" >&2
   echo "   fonte che i consumatori interrogano a runtime: chiedere alla tabella" >&2
@@ -3114,13 +3157,62 @@ else
   echo "OK dichiarazione-fornitore: il campo arriva alla pagina e sta nella fixture"
 fi
 
+# --- vocabolario-capability -------------------------------------------------
+# «Di questa colonna di v_model_capabilities, chi la legge, di chi e' la
+# proprieta', con quale prova si accerta?» (2026-08-10). MISURATO: la vista
+# espone 32 colonne e l'intero Rust vi esegue TRE SELECT, che ne leggono tre —
+# 20 colonne non hanno alcun lettore, e una di quelle (`supports_prompt_cache`)
+# e' dichiarata false per nove coppie che nel ledger hanno letture di cache,
+# fino a 2.461.120 token su mistral-small-latest. Una dichiarazione falsa e
+# INERTE: innocua solo finche' resta morta.
+#
+# Il vocabolario e' un elenco tipizzato, non un commento, e ha il suo guard di
+# schema nel crate (`vocabolario_copre_la_vista_reale`, sqlx su META_MIGRATOR):
+# una colonna aggiunta domani rende rosso quel test finche' non se ne dichiarano
+# le tre risposte. Qui si difende solo che resti UNA.
+assert_single "vocabolario-capability" 'pub const COLONNE: &\[ColonnaCapability\]' \
+  'crates/nexus-capability-audit/src/vocabolario.rs' crates
+
+voc="crates/nexus-capability-audit/src/vocabolario.rs"
+if [[ ! -f "$voc" ]]; then
+  echo "!! vocabolario-capability: $voc non esiste piu'" >&2
+  fail=1
+elif ! grep -q 'v_model_capabilities' crates/nexus-capability-audit/src/lib.rs; then
+  echo "!! vocabolario-capability: il guard di schema non interroga piu' la vista." >&2
+  echo "   Senza quel confronto il vocabolario e' un commento: puo' descrivere" >&2
+  echo "   uno schema che non esiste piu' e restare verde (regola O)." >&2
+  fail=1
+elif ! grep -q 'NessunLettore' "$voc"; then
+  echo "!! vocabolario-capability: sparita la variante 'nessun lettore'. E' quella" >&2
+  echo "   che distingue un dato SBAGLIATO da un dato INERTE, e i due hanno" >&2
+  echo "   rimedi opposti: correggerlo, oppure collegarlo o rimuoverlo." >&2
+  fail=1
+else
+  echo "OK vocabolario-capability: unico, e confrontato con le colonne reali della vista"
+fi
+
+# Il censimento deve DELEGARE il criterio, non averne una copia: e' l'intera
+# ragione per cui il crate esiste.
+if grep -q 'fn classifica_dichiarazione' crates/xtask/src/capability_census.rs; then
+  echo "!! vocabolario-capability: capability-census ha una copia del criterio di" >&2
+  echo "   copertura. Deve chiederlo a nexus_capability_audit, o rispondera' con" >&2
+  echo "   una regola diversa da quella del pannello (regola O)." >&2
+  fail=1
+elif ! grep -q 'nexus_capability_audit' crates/xtask/src/capability_census.rs; then
+  echo "!! vocabolario-capability: capability-census non nomina piu' il crate del" >&2
+  echo "   punto unico: sta misurando qualcos'altro." >&2
+  fail=1
+else
+  echo "OK vocabolario-capability: il censimento delega il criterio al punto unico"
+fi
+
 # --- nascita-riga-run -------------------------------------------------------
 # La riga iniziale di `agent_runs` nasce da UN punto solo, che ne dichiara
 # l'esito. I tre percorsi (turno agentico, nessun provider capace, ripresa)
 # avevano ognuno la propria INSERT e tutti e tre ne buttavano via l'errore con
 # `let _ = sqlx::query(...)`: il chiamante proseguiva con un run_id che in
 # tabella non esisteva, e il messaggio utente restava senza esito (regola M).
-assert_single "nascita-riga-run" 'pub(crate) async fn inserisci_riga_run(' \
+assert_single "nascita-riga-run" 'pub\(crate\) async fn inserisci_riga_run\(' \
   'crates/mcp-core/src/chat_messages/run_row.rs' crates
 
 # Nessun altro punto puo' far nascere il run di un TURNO UTENTE: una quarta

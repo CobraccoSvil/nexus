@@ -34,26 +34,13 @@
 //! verifichera' piu' smette di dichiararsi «in attesa» e passa a `Stalled`
 //! senza che nessuno debba ricordarsi di aggiornare questo modulo.
 
-use std::collections::HashMap;
-
-use sqlx::Row;
-
-/// Fatto di UN modello a catalogo, nella forma minima su cui i due cicli di
-/// verifica decidono. I nomi dei campi sono quelli delle colonne di
-/// `ai_price_catalog`: non c'e' traduzione, quindi non c'e' dove sbagliarla.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelFact {
-    pub is_enabled: bool,
-    pub capability_source: String,
-    pub auto_disabled_reason: Option<String>,
-    /// Il modello compare nella vista `v_model_capabilities`, cioe' la sua
-    /// dichiarazione esiste. NON e' un fatto sulla salute e `classifica` non lo
-    /// guarda: lo legge [`crate::provider_declaration`], che risponde a un'altra
-    /// domanda sugli STESSI fatti. Sta qui perche' la query e' una sola (regola
-    /// L): due caricamenti della stessa tabella per due domande vicine sono il
-    /// modo in cui, un giorno, i due rispondono su parchi modelli diversi.
-    pub ha_capability: bool,
-}
+/// Il fatto di catalogo su cui i due cicli decidono vive nel crate
+/// `nexus-capability-audit` insieme alla query che lo produce e all'altra
+/// domanda che vi si appoggia (la copertura della dichiarazione). Sta li' e non
+/// qui perche' anche uno strumento a riga di comando deve poterlo chiedere, e
+/// mcp-core e' bin-only: l'alternativa non era «xtask chiama mcp-core», era
+/// «xtask ricopia la query» (regola O).
+pub use nexus_capability_audit::{carica_fatti_catalogo, ModelFact};
 
 /// Quale ciclo di verifica raggiunge un modello. Sono due e sono nominati:
 /// «qualcuno lo guardera'» senza dire CHI non permette di stimare QUANDO, ne'
@@ -219,51 +206,6 @@ pub fn classifica(
     ProviderReadiness::Stalled(CausaStallo::NoVerificationCycle {
         models: models.len(),
     })
-}
-
-/// Fatti di catalogo per fornitore. Una sola query per l'intera risposta: gli
-/// handler di stato elencano tutti i fornitori, e una query per fornitore
-/// sarebbe N round-trip per la stessa tabella.
-///
-/// Legge le colonne su cui i cicli decidono, e nient'altro: un `SELECT *`
-/// legherebbe questo modulo a colonne che non gli servono e che cambiano.
-///
-/// La copertura della dichiarazione si chiede alla VISTA `v_model_capabilities`,
-/// non alla tabella che la alimenta: la vista e' cio' che i consumatori
-/// interrogano a runtime (`capability::resolve_tool_choice_style`,
-/// `native_engine`), quindi «dichiarato» deve significare qui esattamente cio'
-/// che significa li' (regola O). Interrogare la tabella sarebbe una seconda idea
-/// dello stesso concetto, e divergerebbe il giorno in cui la vista cambia
-/// definizione.
-pub async fn carica_fatti_catalogo(db: &sqlx::PgPool) -> HashMap<String, Vec<ModelFact>> {
-    let rows = sqlx::query(
-        "SELECT c.provider, c.is_enabled, \
-                COALESCE(c.capability_source, 'auto') AS capability_source, \
-                c.auto_disabled_reason, \
-                (v.model IS NOT NULL) AS ha_capability \
-           FROM ai_price_catalog c \
-           LEFT JOIN v_model_capabilities v \
-                  ON v.provider = c.provider AND v.model = c.model",
-    )
-    .fetch_all(db)
-    .await
-    .unwrap_or_default();
-    let mut out: HashMap<String, Vec<ModelFact>> = HashMap::new();
-    for r in rows {
-        let provider: String = r.try_get("provider").unwrap_or_default();
-        out.entry(provider).or_default().push(ModelFact {
-            is_enabled: r.try_get("is_enabled").unwrap_or(false),
-            capability_source: r
-                .try_get("capability_source")
-                .unwrap_or_else(|_| "auto".to_string()),
-            auto_disabled_reason: r
-                .try_get::<Option<String>, _>("auto_disabled_reason")
-                .ok()
-                .flatten(),
-            ha_capability: r.try_get("ha_capability").unwrap_or(false),
-        });
-    }
-    out
 }
 
 /// Scrive la prontezza sull'entry JSON di un fornitore. Unico compositore

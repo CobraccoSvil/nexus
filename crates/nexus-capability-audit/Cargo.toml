@@ -1,0 +1,22 @@
+[package]
+name = "nexus-capability-audit"
+edition.workspace = true
+version.workspace = true
+
+# Punto unico (regola L) di due domande sulle capability dichiarate, e crate a
+# se' per la stessa ragione di `nexus-model-eligibility`: i consumatori sono
+# mcp-core (che serve il wire del pannello) e xtask (che ne fa un censimento a
+# riga di comando), e mcp-core e' bin-only — uno strumento di misura non puo'
+# dipenderne, quindi senza questo crate dovrebbe RICOPIARE il criterio, che e'
+# esattamente il difetto che la regola O descrive.
+[dependencies]
+sqlx.workspace = true
+
+[dev-dependencies]
+# Lo schema su cui il vocabolario si verifica e' quello che le migrazioni vere
+# producono, non un CREATE VIEW ricopiato nel test (regola O).
+nexus-migrations-embedded = { path = "../nexus-migrations-embedded" }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

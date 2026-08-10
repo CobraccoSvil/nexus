@@ -57,6 +57,10 @@ nexus-build-graph = { path = "../nexus-build-graph" }
 nexus-tool-kit = { path = "../nexus-tool-kit" }
 nexus-agent-tools = { path = "../nexus-agent-tools" }
 nexus-prompt = { path = "../nexus-prompt" }
+# Copertura della dichiarazione di capability e vocabolario delle colonne:
+# punto unico condiviso con `xtask capability-census`, che deve porre la stessa
+# domanda del pannello invece di ricopiarne il criterio (regola L/O).
+nexus-capability-audit = { path = "../nexus-capability-audit" }
 nexus-orchestrator = { path = "../nexus-orchestrator" }
 nexus-events = { path = "../nexus-events" }
 nexus-graph = { path = "../nexus-graph" }

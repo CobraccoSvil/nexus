@@ -20,6 +20,7 @@
 
 mod audit_settings;
 mod battery_explain;
+mod capability_census;
 mod migrate;
 mod premessa;
 mod quality_scan;
@@ -56,6 +57,10 @@ fn main() -> Result<()> {
             let code = battery_explain::run(&args[2..])?;
             std::process::exit(code);
         }
+        "capability-census" => {
+            let code = capability_census::run(&args[2..])?;
+            std::process::exit(code);
+        }
         "service-manifests" => {
             let code = service_manifests::run(&args[2..])?;
             std::process::exit(code);
@@ -71,6 +76,9 @@ fn main() -> Result<()> {
             eprintln!("  quality-scan [--gate|--update] Gate ratchet qualita codice Rust");
             eprintln!(
                 "  battery-explain [modello]     Eleggibilita' batteria: chi e perche' (DB live)"
+            );
+            eprintln!(
+                "  capability-census [--gate]    Capability: copertura, lettori e prove (DB live)"
             );
             eprintln!(
                 "  service-manifests [flags]     Manifest di servizio derivati dal catalogo (DB live)"
