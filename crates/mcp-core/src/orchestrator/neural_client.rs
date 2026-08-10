@@ -179,7 +179,15 @@ impl NeuralCoreClient {
             // ritornava (content "[Error: ...]" + error/error_class). I call site
             // dipendono da questa forma per la detection "errore ingoiato"
             // (provider_health_probe) e per `completion_has_error` (core).
-            Err(e) => Ok(error_completion_value(provider, model, &e.to_string())),
+            // L'errore si passa TIPIZZATO, non appiattito: il ponte ne estrae la
+            // classe dal segnale strutturato del gateway e ricade sul testo solo
+            // quando quel segnale non c'e' (regola M).
+            Err(e) => Ok(valore_derrore_dal_gateway(
+                provider,
+                model,
+                &e,
+                FormaErrore::Completion,
+            )),
         }
     }
 
@@ -442,20 +450,117 @@ fn completion_value_from_gw(provider: &str, model: &str, resp: &GwResponse) -> V
 /// unico Rust `provider_error_classifier`. `completion_has_error` (core) e la
 /// detection "errore ingoiato" di `provider_health_probe` dipendono da questa
 /// forma (prefisso `[Error:` + `error`/`error_class` non-null).
-fn error_completion_value(provider: &str, model: &str, raw_error: &str) -> Value {
-    let class = crate::provider_error_classifier::classify_text(raw_error).stop_reason;
-    json!({
-        "provider": provider,
-        "model": model,
-        "content": format!("[Error: {raw_error}]"),
-        "metadata": {
-            "usage": json!({ "input_tokens": 0, "output_tokens": 0 }),
+/// PUNTO UNICO (regola L) del `Value` d'ERRORE per il path COMPLETION: dall'errore
+/// TIPIZZATO del gateway al `Value` che i consumatori leggono davvero — il probe di
+/// salute prende `error_class` proprio da qui (`probe_provider_once`, ramo
+/// `Ok(Ok(response))`).
+///
+/// Gemello di [`error_agent_turn_from_error`], e per lo stesso motivo (regola O): il
+/// ramo `Err` di `generate_completion` delega QUI, cosi' un test raggiunge il suo
+/// oggetto per la STESSA strada della produzione, estrazione del segnale strutturato
+/// inclusa.
+///
+/// Perche' lo strutturato deve vincere: l'`anyhow::Error` PORTA il `GatewayHttpError`
+/// (status + `details.primary_cause`, decisi alla fonte). Appiattirlo con
+/// `to_string()` e ri-dedurne la classe dal Display non e' classificare: e' un
+/// indovinello su prosa che il provider riscrive quando vuole (regola M).
+///
+/// MISURATO il 10/08/2026: un 429 di groq per tetto GIORNALIERO (TPD) — che il
+/// gateway classifica gia' `transient`, perche' il codice strutturato e'
+/// `rate_limit_exceeded` — arrivava qui come stringa. Il messaggio invita ad alzare
+/// il piano "at https://console.groq.com/settings/billing", `billing_re()` trovava la
+/// parola `billing` DENTRO L'URL DELLA DOCUMENTAZIONE -> `billing_error` ->
+/// `outcome_from_error_class` -> `ProbeOutcome::Billing` ->
+/// `put_provider_in_long_cooldown`: groq spento SEI ORE
+/// (`nexus_provider_health.billing_cooldown_until = 18:09:52`, reason "Quota AI
+/// esaurita o credito insufficiente") mentre alle 12:15 rispondeva 200 OK con quota
+/// di nuovo disponibile. Un rate-limit si aspetta, un credito finito si ricarica: la
+/// confusione fra i due toglie dal routing un fornitore sano.
+///
+/// E' la stessa regressione del 2026-07-16 gia' chiusa sul path agentico e in
+/// `agent_turn_setup::classe_dal_ripiego_lessicale`: restava aperta QUI, l'unico ramo
+/// da cui passa il probe di salute.
+/// Quale dei due canali interni sta ricevendo l'errore. I due `Value` hanno contratti
+/// diversi (la completion porta `metadata.usage`, il turno agentico porta
+/// `stop_reason` e i blocchi tool), quindi la FORMA va dichiarata; tutto il resto —
+/// come si decide la classe — e' comune, ed e' il motivo per cui esiste un solo
+/// ponte invece di due gemelli.
+#[derive(Clone, Copy)]
+pub(crate) enum FormaErrore {
+    /// `generate_completion`: la forma che legge il probe di salute.
+    Completion,
+    /// `generate_agent_turn_with_thinking`: la forma che legge il motore agentico.
+    AgentTurn,
+}
+
+impl FormaErrore {
+    fn costruttore(self) -> fn(&str, &str, &str, String) -> Value {
+        match self {
+            FormaErrore::Completion => error_completion_value_inner,
+            FormaErrore::AgentTurn => error_agent_turn_value_inner,
+        }
+    }
+}
+
+/// PUNTO UNICO (regola L) della PRECEDENZA fra i due segnali: la classe strutturata
+/// dichiarata dal gateway vince sempre; il classificatore testuale e' il ripiego, e
+/// interviene solo quando quel segnale non c'e'.
+///
+/// I due path d'errore — completion e agent-turn — differiscono unicamente per la
+/// FORMA del `Value`, che percio' passano come costruttore (`forma`). La decisione su
+/// QUALE classe usare e' invece una sola: duplicarla significa poterla cambiare in un
+/// path e non nell'altro, che e' esattamente come e' nato il difetto groq del
+/// 10/08/2026 — il ponte strutturato era collegato al turno agentico e non alla
+/// completion, cioe' proprio al ramo da cui passa il probe di salute.
+fn value_derrore(
+    provider: &str,
+    model: &str,
+    raw_error: &str,
+    structured: Option<&'static str>,
+    forma: fn(&str, &str, &str, String) -> Value,
+) -> Value {
+    let class = match structured {
+        Some(c) => c.to_string(),
+        None => crate::provider_error_classifier::classify_text(raw_error).stop_reason,
+    };
+    forma(provider, model, raw_error, class)
+}
+
+/// I campi che le DUE forme d'errore hanno in comune: identita' della chiamata, il
+/// testo per l'umano e l'esito in un campo (regola Q). Le forme si distinguono per il
+/// resto — dove mettono `usage`, e i campi del turno agentico — e quel resto lo
+/// aggiunge il chiamante.
+fn campi_comuni_derrore(
+    provider: &str,
+    model: &str,
+    raw_error: &str,
+    class: &str,
+) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    m.insert("provider".into(), json!(provider));
+    m.insert("model".into(), json!(model));
+    m.insert("content".into(), json!(format!("[Error: {raw_error}]")));
+    m.insert("error".into(), json!(raw_error));
+    m.insert("error_class".into(), json!(class));
+    m
+}
+
+fn error_completion_value_inner(
+    provider: &str,
+    model: &str,
+    raw_error: &str,
+    class: String,
+) -> Value {
+    let mut campi = campi_comuni_derrore(provider, model, raw_error, &class);
+    campi.insert(
+        "metadata".into(),
+        json!({
+            "usage": { "input_tokens": 0, "output_tokens": 0 },
             "error": raw_error,
             "error_class": class,
-        },
-        "error": raw_error,
-        "error_class": class,
-    })
+        }),
+    );
+    Value::Object(campi)
 }
 
 /// Converte i `tool_calls` (dialetto OpenAI) della `GwResponse` nei blocchi
@@ -653,23 +758,42 @@ pub(crate) fn error_agent_turn_from_error(
     model: &str,
     err: &anyhow::Error,
 ) -> Value {
-    let structured = structured_error_class(err);
-    error_agent_turn_value_with_class(provider, model, &err.to_string(), structured)
+    valore_derrore_dal_gateway(provider, model, err, FormaErrore::AgentTurn)
 }
 
-/// Come [`error_agent_turn_value`] ma con la classe gia' derivata da un segnale
-/// strutturato: se `structured` e' `Some`, vince sul classificatore testuale (che
-/// sul Display del gateway non puo' ricostruire la causa reale).
-fn error_agent_turn_value_with_class(
+/// PUNTO UNICO (regola L) del passaggio dall'errore TIPIZZATO del gateway al `Value`
+/// che i canali interni consegnano ai loro consumatori.
+///
+/// Esiste come funzione a se' per la regola O: i rami `Err` di `generate_completion` e
+/// di `generate_agent_turn_with_thinking` delegano QUI, quindi un test che parte da
+/// questa funzione raggiunge il suo oggetto per la STESSA strada della produzione —
+/// estrazione del segnale strutturato inclusa.
+///
+/// UNO e non due: il ponte strutturato era collegato al turno agentico e NON alla
+/// completion, cioe' proprio al ramo da cui passa il probe di salute, e per tre
+/// settimane nessuno ha potuto accorgersene perche' i due rami erano scritti a parte.
+/// MISURATO il 10/08/2026: un 429 di groq per tetto GIORNALIERO (TPD) — che il gateway
+/// classifica gia' `transient`, essendo `rate_limit_exceeded` il codice strutturato —
+/// arrivava alla completion appiattito a stringa; il messaggio invita ad alzare il
+/// piano "at https://console.groq.com/settings/billing", la regex billing trovava la
+/// parola DENTRO L'URL DELLA DOCUMENTAZIONE -> `billing_error` ->
+/// `ProbeOutcome::Billing` -> `put_provider_in_long_cooldown`: groq spento SEI ORE
+/// (`nexus_provider_health.billing_cooldown_until = 18:09:52`) mentre alle 12:15
+/// rispondeva 200 OK con quota di nuovo disponibile. Un rate-limit si aspetta, un
+/// credito finito si ricarica: confonderli toglie dal routing un fornitore sano.
+pub(crate) fn valore_derrore_dal_gateway(
     provider: &str,
     model: &str,
-    raw_error: &str,
-    structured: Option<&'static str>,
+    err: &anyhow::Error,
+    forma: FormaErrore,
 ) -> Value {
-    match structured {
-        Some(class) => error_agent_turn_value_inner(provider, model, raw_error, class.to_string()),
-        None => error_agent_turn_value(provider, model, raw_error),
-    }
+    value_derrore(
+        provider,
+        model,
+        &err.to_string(),
+        structured_error_class(err),
+        forma.costruttore(),
+    )
 }
 
 /// Il turno d'errore quando NON c'e' un segnale strutturato e la classe va dedotta
@@ -678,8 +802,7 @@ fn error_agent_turn_value_with_class(
 /// motivo di [`error_agent_turn_from_error`]: un ramo che nessun test puo'
 /// raggiungere se lo costruisce da se', e cosi' fissa l'assunto che dovrebbe provare.
 pub(crate) fn error_agent_turn_value(provider: &str, model: &str, raw_error: &str) -> Value {
-    let class = crate::provider_error_classifier::classify_text(raw_error).stop_reason;
-    error_agent_turn_value_inner(provider, model, raw_error, class)
+    value_derrore(provider, model, raw_error, None, error_agent_turn_value_inner)
 }
 
 fn error_agent_turn_value_inner(
@@ -688,17 +811,16 @@ fn error_agent_turn_value_inner(
     raw_error: &str,
     class: String,
 ) -> Value {
-    json!({
-        "provider": provider,
-        "model": model,
-        "content": format!("[Error: {raw_error}]"),
-        "stop_reason": "error",
-        "tool_use_blocks": [],
-        "assistant_content": [],
-        "usage": json!({ "input_tokens": 0, "output_tokens": 0 }),
-        "error": raw_error,
-        "error_class": class,
-    })
+    let mut campi = campi_comuni_derrore(provider, model, raw_error, &class);
+    for (k, v) in [
+        ("stop_reason", json!("error")),
+        ("tool_use_blocks", json!([])),
+        ("assistant_content", json!([])),
+        ("usage", json!({ "input_tokens": 0, "output_tokens": 0 })),
+    ] {
+        campi.insert(k.into(), v);
+    }
+    Value::Object(campi)
 }
 
 /// Converte un messaggio grezzo `{role, content, [tool_calls], [tool_call_id]}`
@@ -779,22 +901,104 @@ mod ponte_errore_tests {
     /// `failures[0]["status"]`), e osservata sul vivo il 2026-07-16 21:23 UTC:
     /// "gateway: modello invalido/deprecato (client_error, niente cooldown provider)
     ///  provider=google status=404 code=not_found".
-    fn errore_404_dal_gateway() -> anyhow::Error {
+    /// L'errore AGGREGATO come lo costruisce il gateway quando la chain fallisce:
+    /// `code = PROVIDER_ERROR` piu' il blocco `details` con la causa e i failure.
+    /// Passa dal produttore vero (`from_response`, regola O) ed e' il punto unico da
+    /// cui nascono gli errori di questi test: la FORMA del wire e' una sola, e due
+    /// copie divergerebbero al primo campo che il gateway aggiunge.
+    fn errore_aggregato_dal_gateway(
+        messaggio: &str,
+        primary_cause: &str,
+        failure: Value,
+    ) -> anyhow::Error {
         crate::nexus_gateway::GatewayHttpError::from_response(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             json!({
-                "error": "tutti i provider hanno fallito -> google (google HTTP 404: ...)",
+                "error": messaggio,
                 "code": "PROVIDER_ERROR",
-                "details": {
-                    "primary_cause": "client_error",
-                    "failures": [{"provider": "google", "class": "client_error",
-                                  "status": 404, "code": "not_found",
-                                  "message": "Publisher Model not found"}]
-                }
+                "details": { "primary_cause": primary_cause, "failures": [failure] }
             })
             .to_string(),
         )
         .into()
+    }
+
+    fn errore_404_dal_gateway() -> anyhow::Error {
+        errore_aggregato_dal_gateway(
+            "tutti i provider hanno fallito -> google (google HTTP 404: ...)",
+            "client_error",
+            json!({"provider": "google", "class": "client_error", "status": 404,
+                   "code": "not_found", "message": "Publisher Model not found"}),
+        )
+    }
+
+    /// La prosa VERBATIM di un 429 groq per tetto GIORNALIERO (TPD), 10/08/2026.
+    /// L'unica occorrenza della parola `billing` e' l'URL della documentazione:
+    /// e' li' che `billing_re()` abbocca.
+    const GROQ_429_TPD: &str = concat!(
+        "Rate limit reached for model `openai/gpt-oss-20b` in organization `org_01j` ",
+        "service tier `on_demand` on tokens per day (TPD): Limit 200000, Used 199373, ",
+        "Requested 654. Please try again in 4m56.448s. Need more tokens? ",
+        "Upgrade to Dev Tier today at https://console.groq.com/settings/billing"
+    );
+
+    /// L'errore come lo produce il gateway per quel 429: `primary_cause` = `transient`,
+    /// perche' il codice STRUTTURATO del provider e' `rate_limit_exceeded`.
+    /// Costruito dal produttore vero (`from_response`), non a mano (regola O).
+    fn errore_429_tpd_dal_gateway() -> anyhow::Error {
+        errore_aggregato_dal_gateway(
+            &format!("tutti i provider hanno fallito -> groq (groq HTTP 429: {GROQ_429_TPD})"),
+            "transient",
+            json!({"provider": "groq", "class": "transient", "status": 429,
+                   "code": "rate_limit_exceeded", "message": GROQ_429_TPD}),
+        )
+    }
+
+    /// LA REGRESSIONE (misurata il 10/08/2026): il path COMPLETION — l'unico da cui
+    /// passa il probe di salute — appiattiva l'errore a stringa, e la regex billing
+    /// trovava `billing` nell'URL della documentazione. Esito: `billing_error` ->
+    /// `ProbeOutcome::Billing` -> cooldown di SEI ORE su un fornitore che rispondeva
+    /// 200 OK. Con il segnale strutturato la classe e' quella dichiarata dal gateway.
+    #[test]
+    fn un_rate_limit_di_groq_non_diventa_credito_esaurito() {
+        let v = valore_derrore_dal_gateway(
+            "groq",
+            "openai/gpt-oss-20b",
+            &errore_429_tpd_dal_gateway(),
+            FormaErrore::Completion,
+        );
+
+        assert_eq!(
+            v.get("error_class").and_then(|c| c.as_str()),
+            Some("transient"),
+            "la classe deve venire dal gateway (primary_cause), non dalla prosa"
+        );
+        // Il probe legge anche la copia sotto `metadata`: le due non possono divergere.
+        assert_eq!(
+            v.pointer("/metadata/error_class").and_then(|c| c.as_str()),
+            Some("transient")
+        );
+        assert_ne!(
+            v.get("error_class").and_then(|c| c.as_str()),
+            Some("billing_error"),
+            "un rate-limit si aspetta, un credito finito si ricarica: mai confonderli"
+        );
+    }
+
+    /// La premessa del test sopra: senza il segnale strutturato il TESTO mente davvero.
+    /// Se un giorno questo smettesse di valere, il fix qui sopra non starebbe piu' in
+    /// piedi sulla ragione per cui e' stato scritto.
+    #[test]
+    fn il_solo_testo_del_429_groq_direbbe_credito_esaurito() {
+        assert_eq!(
+            crate::provider_error_classifier::classify_text(GROQ_429_TPD).stop_reason,
+            "billing_error",
+            "la regex abbocca sull'URL: e' la ragione per cui la classe deve arrivare strutturata"
+        );
+        assert!(
+            GROQ_429_TPD.contains("console.groq.com/settings/billing"),
+            "l'unica occorrenza di 'billing' e' l'URL della documentazione"
+        );
     }
 
     /// PRIMA ROTTURA: il 404 deve diventare una causa NOMINATA, non 'error'.
@@ -808,17 +1012,13 @@ mod ponte_errore_tests {
 
     /// Il turno che il ramo d'errore consegna al chiamante: la classe struttura il
     /// verdetto, il testo resta solo da leggere. Attraversa il produttore vero
-    /// (`error_agent_turn_value_with_class`), che e' cio' che i tre test rimossi
-    /// non facevano.
+    /// (`error_agent_turn_from_error`, lo stesso che chiama il ramo `Err` di
+    /// `generate_agent_turn_with_thinking`), che e' cio' che i tre test rimossi non
+    /// facevano.
     #[test]
     fn il_404_arriva_al_turno_come_classe_e_non_come_testo() {
         let e = errore_404_dal_gateway();
-        let turn = error_agent_turn_value_with_class(
-            "google",
-            "gemini-2.0-flash-lite-001",
-            &e.to_string(),
-            structured_error_class(&e),
-        );
+        let turn = error_agent_turn_from_error("google", "gemini-2.0-flash-lite-001", &e);
         assert_eq!(turn["error_class"], "not_found");
         assert_eq!(turn["stop_reason"], "error");
     }
@@ -1024,9 +1224,13 @@ mod gateway_mapping_tests {
         assert_eq!(n.total_tokens, 46);
     }
 
+    /// Il RIPIEGO: un errore LOCALE (nessun `GatewayHttpError` nella catena, es.
+    /// bridge non configurato) non ha segnale strutturato, quindi la classe la deve
+    /// dedurre il testo. Passa dal produttore reale, non da una scorciatoia.
     #[test]
     fn completion_errore_ha_prefisso_error_e_classe() {
-        let v = error_completion_value("anthropic", "claude-x", "HTTP 401 invalid api key");
+        let e = anyhow::anyhow!("HTTP 401 invalid api key");
+        let v = valore_derrore_dal_gateway("anthropic", "claude-x", &e, FormaErrore::Completion);
         let content = v["content"].as_str().unwrap();
         assert!(content.starts_with("[Error:"));
         assert!(!v["error"].is_null());

@@ -299,17 +299,7 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
             // verita': il content puo' essere un messaggio umano che NON inizia
             // con "[Error:" (il brain riformatta), quindi non basta il check sul
             // prefisso. Se error_class e' presente, deriva il kind da quello.
-            let ec_canon = response
-                .get("error_class")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    response
-                        .get("metadata")
-                        .and_then(|m| m.get("error_class"))
-                        .and_then(|v| v.as_str())
-                })
-                .unwrap_or("")
-                .to_string();
+            let ec_canon = error_class_from_completion(&response).to_string();
             let is_brain_swallowed_error =
                 trimmed.starts_with("[Error:") || trimmed.starts_with("[error:");
             if !ec_canon.is_empty() || is_brain_swallowed_error {
@@ -524,16 +514,7 @@ pub async fn probe_provider_once(
             // un messaggio umano che NON inizia con "[Error:", quindi senza
             // questo check la recovery-loop credeva il provider sano e lo
             // riabilitava (bug: openai/anthropic senza credito tornavano attivi).
-            let ec = response
-                .get("error_class")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    response
-                        .get("metadata")
-                        .and_then(|m| m.get("error_class"))
-                        .and_then(|v| v.as_str())
-                })
-                .unwrap_or("");
+            let ec = error_class_from_completion(&response);
             if !ec.is_empty() {
                 return outcome_from_error_class(ec);
             }
@@ -554,6 +535,27 @@ pub async fn probe_provider_once(
         ),
         Err(_elapsed) => ProbeOutcome::Transient("timeout".to_string()),
     }
+}
+
+/// La classe d'errore dichiarata nel `Value` di `generate_completion`, letta dai due
+/// posti in cui quel produttore la scrive (top-level e sotto `metadata`).
+///
+/// Estratta come funzione per la regola O: e' il campo su cui `probe_provider_once`
+/// decide se spegnere un fornitore, e un test che lo leggesse per conto proprio
+/// misurerebbe la propria copia invece di questa. Chi la produce e' il punto unico
+/// `neural_client::error_completion_from_error`, che dal 10/08/2026 la deriva dal
+/// segnale STRUTTURATO del gateway e non piu' dalla prosa dell'errore.
+fn error_class_from_completion(response: &serde_json::Value) -> &str {
+    response
+        .get("error_class")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            response
+                .get("metadata")
+                .and_then(|m| m.get("error_class"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("")
 }
 
 /// Mappa l'error_class CANONICO (dal brain, unico classificatore) in
@@ -625,6 +627,57 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LA CONSEGUENZA, non la stringa (regola O): un 429 di groq per tetto giornaliero
+    /// non deve produrre `ProbeOutcome::Billing`, che e' cio' che porta a
+    /// `put_provider_in_long_cooldown` (SEI ORE) e toglie il fornitore dal routing.
+    ///
+    /// La catena e' attraversata per intero e per la stessa strada della produzione:
+    /// l'errore nasce dal produttore vero (`GatewayHttpError::from_response`), il
+    /// `Value` da `error_completion_from_error`, la lettura del campo da
+    /// `error_class_from_completion` — le stesse tre funzioni che esegue
+    /// `probe_provider_once`.
+    ///
+    /// MISURATO il 10/08/2026: groq in `billing_cooldown_until = 18:09:52` con
+    /// "Quota AI esaurita o credito insufficiente" mentre alle 12:15 rispondeva 200 OK
+    /// e la quota si era gia' riaperta.
+    #[test]
+    fn un_rate_limit_giornaliero_non_spegne_il_fornitore_per_credito() {
+        let err: anyhow::Error = crate::nexus_gateway::GatewayHttpError::from_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({
+                "error": "tutti i provider hanno fallito -> groq (groq HTTP 429: Rate limit \
+                          reached for model `openai/gpt-oss-20b` service tier `on_demand` on \
+                          tokens per day (TPD): Limit 200000, Used 199373. Need more tokens? \
+                          Upgrade to Dev Tier today at https://console.groq.com/settings/billing)",
+                "code": "PROVIDER_ERROR",
+                "details": {
+                    "primary_cause": "transient",
+                    "failures": [{"provider": "groq", "class": "transient",
+                                  "status": 429, "code": "rate_limit_exceeded"}]
+                }
+            })
+            .to_string(),
+        )
+        .into();
+
+        let response = crate::orchestrator::neural_client::valore_derrore_dal_gateway(
+            "groq",
+            "openai/gpt-oss-20b",
+            &err,
+            crate::orchestrator::neural_client::FormaErrore::Completion,
+        );
+        let esito = outcome_from_error_class(error_class_from_completion(&response));
+
+        assert!(
+            !matches!(esito, ProbeOutcome::Billing(_)),
+            "un tetto di frequenza non e' credito esaurito: esito ottenuto {esito:?}"
+        );
+        assert!(
+            matches!(esito, ProbeOutcome::Transient(ref k) if k == "transient"),
+            "l'esito atteso e' transitorio (si riprova), non billing: {esito:?}"
+        );
+    }
 
     #[test]
     fn resolve_probed_providers_usa_il_catalog_quando_presente() {

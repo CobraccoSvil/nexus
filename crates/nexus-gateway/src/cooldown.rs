@@ -231,8 +231,47 @@ impl CooldownManager {
     }
 
     /// Marca un provider in cooldown transitorio. Usa l'orologio reale.
+    ///
+    /// Delega a [`Self::mark_transient_after`] senza `Retry-After`: la durata del
+    /// cooldown transitorio si decide in UN punto solo (regola L).
     pub fn mark_transient(&self, provider: &str, last_error: Option<String>) {
-        let secs = self.current_durations().transient_seconds;
+        self.mark_transient_after(provider, last_error, None);
+    }
+
+    /// Marca un provider in cooldown transitorio ONORANDO il `Retry-After` che il
+    /// provider ha dichiarato, quando c'e'.
+    ///
+    /// Regola M: `retry_after_seconds` e' un segnale STRUTTURATO e autoritativo — il
+    /// provider sta dicendo QUANDO tornera' a servire. Scartarlo per applicare il
+    /// cooldown fisso significa ripresentarsi prima, prendere lo stesso errore e
+    /// riaccodare lo stesso cooldown: un ciclo che non converge e che consuma quota
+    /// (o quantomeno richieste) a ogni giro.
+    ///
+    /// MISURATO il 10/08/2026 su groq, con il tetto GIORNALIERO (TPD) esaurito: il
+    /// provider chiedeva minuti, il cooldown ne applicava 30 secondi, e il log del
+    /// gateway mostra la sequenza "provider in cooldown 30s -> attendo -> ritento ->
+    /// 429 -> cooldown 30s" ininterrotta dalle 11:39:50 alle 12:09 — mezz'ora di
+    /// tentativi contro un muro che, trattandosi di un tetto giornaliero, poteva
+    /// durare l'intera giornata. La distinzione fra un tetto al MINUTO e uno al
+    /// GIORNO non sta negli header di rate-limit (MISURATO: groq espone solo i
+    /// contatori al minuto): sta proprio nel `Retry-After`, che percio' e' l'unico
+    /// segnale con cui i due casi si possono separare senza leggere la prosa.
+    ///
+    /// Si prende il PIU' LUNGO dei due: il provider dice quando ritentare al piu'
+    /// presto, il nostro minimo resta una protezione nostra. Il tetto superiore lo
+    /// mette gia' `parse_retry_after` (clamp difensivo a 3600s), quindi un provider
+    /// che chiedesse giorni non blocca il fornitore oltre l'ora.
+    pub fn mark_transient_after(
+        &self,
+        provider: &str,
+        last_error: Option<String>,
+        retry_after_seconds: Option<u64>,
+    ) {
+        let base = self.current_durations().transient_seconds;
+        let secs = match retry_after_seconds {
+            Some(s) => base.max(i64::try_from(s).unwrap_or(base)),
+            None => base,
+        };
         self.mark_at(
             provider,
             CooldownReason::Transient,
@@ -855,6 +894,45 @@ mod tests {
             30,
         );
         assert!(m.is_in_cooldown_at("acme", now));
+    }
+
+    /// LA REGRESSIONE (misurata il 10/08/2026 su groq, tetto GIORNALIERO esaurito):
+    /// il provider dichiara un `Retry-After` di minuti, il cooldown ne applicava 30
+    /// secondi fissi, e il log del gateway mostra "cooldown 30s -> ritento -> 429 ->
+    /// cooldown 30s" ininterrotto per mezz'ora. Ora la durata dichiarata dal provider
+    /// vince, perche' e' lui a sapere quando tornera' a servire.
+    #[test]
+    fn il_cooldown_transitorio_onora_il_retry_after_del_provider() {
+        let m = CooldownManager::new();
+        // 4m56s: il valore che groq indica quando e' il tetto giornaliero a scattare.
+        m.mark_transient_after("groq", Some("429 TPD".to_string()), Some(296));
+
+        let fra_un_minuto = Utc::now() + chrono::Duration::seconds(60);
+        assert!(
+            m.is_in_cooldown_at("groq", fra_un_minuto),
+            "a +60s deve essere ancora escluso: il provider aveva chiesto 296s, \
+             ripresentarsi prima significa riprendere lo stesso 429"
+        );
+
+        let fra_dieci_minuti = Utc::now() + chrono::Duration::seconds(600);
+        assert!(
+            !m.is_in_cooldown_at("groq", fra_dieci_minuti),
+            "scaduta l'attesa dichiarata, il provider torna disponibile"
+        );
+    }
+
+    /// Il controllo dell'altro verso: senza `Retry-After` resta il default (30s), cosi'
+    /// il test sopra non passerebbe per una durata alzata a tutti.
+    #[test]
+    fn senza_retry_after_resta_il_cooldown_transitorio_di_default() {
+        let m = CooldownManager::new();
+        m.mark_transient("acme", Some("timeout".to_string()));
+
+        let fra_un_minuto = Utc::now() + chrono::Duration::seconds(60);
+        assert!(
+            !m.is_in_cooldown_at("acme", fra_un_minuto),
+            "senza segnale del provider vale il transient di default, ben sotto i 60s"
+        );
     }
 
     #[test]
