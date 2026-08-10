@@ -223,7 +223,7 @@ const DISCOVERY_META: &[&str] = &["nexus_mcp_tool_search", "nexus_mcp_tool_call"
 /// Finestra di history su cui si guarda il PROGRESSO di una ripetizione. La
 /// stessa per le due domande gemelle — "stessa chiamata, esiti diversi?"
 /// ([`crate::routing::signals::repeated_signature_output_progress`]) e "chiamate
-/// diverse, stesso esito?" ([`crate::routing::signals::ricerca_senza_nuovi_risultati`]) —
+/// diverse, stesso esito?" ([`crate::routing::signals::stessa_risposta_ripetuta`]) —
 /// perche' guardano lo stesso fatto da due lati: due finestre diverse darebbero
 /// due idee diverse di quanto indietro conti il passato.
 const STALLO_ESITO_LOOKBACK: usize = 24;
@@ -5695,7 +5695,7 @@ Riformula la richiesta, oppure riprova con un modello piu' capace di usare i too
     /// Sono due domande, e la seconda esiste perche' la prima non poteva
     /// rispondere: [`Self::firma_in_loop`] chiede «stessa chiamata ripetuta?» e
     /// un modello che varia la query di una parola le sfugge per costruzione;
-    /// [`ricerca_senza_nuovi_risultati`] chiede «stessa RISPOSTA ottenuta?», che
+    /// [`stessa_risposta_ripetuta`] chiede «stessa RISPOSTA ottenuta?», che
     /// e' cio' che conta quando le chiamate riescono tutte.
     ///
     /// L'ordine non e' arbitrario: la firma d'input, quando c'e', dice qualcosa
@@ -5719,7 +5719,7 @@ Riformula la richiesta, oppure riprova con un modello piu' capace di usare i too
         if richiesti.is_empty() {
             return None;
         }
-        crate::routing::signals::ricerca_senza_nuovi_risultati(
+        crate::routing::signals::stessa_risposta_ripetuta(
             messages,
             &richiesti,
             STALLO_ESITO_LOOKBACK,

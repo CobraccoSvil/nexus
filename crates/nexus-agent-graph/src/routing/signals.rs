@@ -24,7 +24,9 @@
 
 use serde_json::Value;
 
-use crate::decisions::loop_signatures::{build_signature, firma_esito_ricerca, serie_in_stallo};
+use crate::decisions::loop_signatures::{
+    build_signature, firma_esito_ricerca, serie_in_stallo_con,
+};
 use crate::state::{AgentState, ContentBlock, Message, MessageContent};
 
 use super::config::RoutingConfig;
@@ -835,35 +837,90 @@ pub fn repeated_signature_output_progress(
 /// con un campo `hits` contiene per forza questa sottostringa.
 const CHIAVE_HITS: &str = "\"hits\"";
 
-/// La firma d'ESITO del tool_use a `recent[idx]`, se quel tool ha risposto con
-/// un insieme di risultati. `None` per tutto il resto.
+/// Cio' che si e' osservato dell'esito di UNA chiamata: la firma esatta se il
+/// payload porta i campi, e sempre il testo, che e' l'unica cosa che i tool
+/// senza payload strutturato consegnano.
+///
+/// Entrambi, e non l'uno o l'altro, perche' i due modi di rispondere a «e' lo
+/// stesso esito?» non sono intercambiabili e la scelta si fa al confronto, non
+/// alla raccolta.
+#[derive(Clone)]
+struct EsitoOsservato {
+    firma: Option<String>,
+    testo: String,
+}
+
+/// `true` se due esiti osservati sono lo STESSO esito.
+///
+/// Con i campi da entrambe le parti la risposta e' esatta. Senza campi da
+/// entrambe le parti si delega al confronto strutturale gia' in uso per
+/// l'output-progresso. MISTI = diversi: se un giro ha prodotto un insieme di
+/// risultati e l'altro no, sono due esiti diversi, e cadere sul testo li
+/// confronterebbe con un metro piu' debole proprio dove ne esiste uno esatto.
+fn stesso_esito(a: &EsitoOsservato, b: &EsitoOsservato) -> bool {
+    match (&a.firma, &b.firma) {
+        (Some(x), Some(y)) => x == y,
+        (None, None) => outputs_similar(&a.testo, &b.testo),
+        _ => false,
+    }
+}
+
+/// L'esito osservato del tool_use a `recent[idx]`, se se ne puo' osservare uno.
 ///
 /// Il payload viaggia come TESTO (il tool serializza il proprio JSON e il wire
 /// porta stringhe), quindi qui si DESERIALIZZA prima di guardare i campi: non e'
 /// leggere lo stato tecnico dal testo (regola M), e' rimettere in forma un
 /// oggetto che il produttore aveva composto dai propri campi.
-fn firma_esito_del_tool_use(recent: &[Message], idx: usize, name: &str) -> Option<String> {
+///
+/// Senza campi resta il solo testo, e li' il confronto e' ammesso SOLO per i
+/// tool di sola lettura: per un tool produttivo la ripetizione con lo stesso
+/// output e' gia' governata da [`detect_repeated_action`] e
+/// [`repeated_signature_output_progress`], e un comando il cui output non cambia
+/// (`git status` pulito) e' una verifica, non uno stallo.
+fn esito_osservato(recent: &[Message], idx: usize, name: &str) -> Option<EsitoOsservato> {
     let testo = tool_result_text_after(recent, idx, 3, None)?;
-    if !testo.contains(CHIAVE_HITS) {
+    let firma = if testo.contains(CHIAVE_HITS) {
+        serde_json::from_str::<Value>(&testo)
+            .ok()
+            .and_then(|payload| firma_esito_ricerca(name, &payload))
+    } else {
+        None
+    };
+    if firma.is_none() && !EXPLORATION_ONLY_TOOLS.contains(&name) {
         return None;
     }
-    let payload: Value = serde_json::from_str(&testo).ok()?;
-    firma_esito_ricerca(name, &payload)
+    Some(EsitoOsservato {
+        firma,
+        // Stesso taglio con cui `outputs_similar` viene gia' usato altrove: il
+        // confronto guarda la testa dell'output, e un blob intero non lo
+        // renderebbe piu' vero, solo piu' caro.
+        testo: testo.chars().take(OUTPUT_COMPARE_CAP).collect(),
+    })
 }
 
-/// `Some(firma_esito)` se il tool che il turno sta chiamando ORA ha gia'
-/// risposto `soglia` volte di fila con lo STESSO identico insieme di risultati.
+/// `Some(descrizione)` se il tool che il turno sta chiamando ORA ha gia'
+/// risposto `soglia` volte di fila con lo STESSO esito, comunque siano state
+/// formulate le richieste.
 ///
-/// IL DIFETTO CHE COPRE, misurato il 10/08/2026 su `prova-fix-10-08`: 17
-/// chiamate a `nexus_search_semantic` in un run, 16 riuscite, tutte con gli
-/// stessi quattro hit da `index.html`, per una domanda che si risolveva leggendo
-/// un file di 183 righe — 852K token dopo che la PRIMA chiamata aveva gia' la
-/// risposta. Nessun presidio poteva vederlo: [`repeated_signature_output_progress`]
-/// e il signature-loop firmano l'INPUT, e query variate di una parola danno 17
-/// firme diverse; `repeated_action_failed` guarda le ripetizioni che FALLISCONO;
-/// `correction_progress` misura le scritture, e qui non se ne fa nessuna. Il
-/// vocabolario del repo lo diceva gia' — «solo una ripetizione che RIESCE senza
-/// progresso e' uno stallo vero» — ma quel caso non aveva un rilevatore.
+/// IL DIFETTO CHE COPRE, misurato il 10/08/2026 su `prova-fix-10-08` in DUE
+/// forme, a poche ore l'una dall'altra e sullo stesso identico compito («quante
+/// card prodotto contiene index.html», un file di 183 righe gia' letto per
+/// intero all'inizio del run):
+/// - 17 chiamate a `nexus_search_semantic`, 16 riuscite, tutte con gli stessi
+///   quattro hit — 852K token e $0.11;
+/// - 8 iterazioni di `search_in_files` con i pattern `<div class="product-card">`,
+///   `<div class="product-card"[^>]*>` e `<div class="product-card"` — 288K
+///   token e $0.15, con in mezzo un'escalation di modello che ha solo alzato il
+///   prezzo del giro a vuoto.
+///
+/// La seconda e' la ragione per cui il criterio non si ferma ai campi: cambiare
+/// il tool bastava a renderlo cieco. Nessun altro presidio le vede —
+/// [`repeated_signature_output_progress`] e il signature-loop firmano l'INPUT, e
+/// una query variata di una parola e' un input nuovo; `repeated_action_failed`
+/// guarda le ripetizioni che FALLISCONO; `correction_progress` misura le
+/// scritture, e qui non se ne fa nessuna. Il vocabolario del repo lo diceva
+/// gia' — «solo una ripetizione che RIESCE senza progresso e' uno stallo
+/// vero» — ma quel caso non aveva un rilevatore.
 ///
 /// GEMELLA E INVERSA di [`repeated_signature_output_progress`]: quella dice
 /// «stessa domanda, risposte diverse -> sta progredendo, non chiuderlo»; questa
@@ -877,33 +934,33 @@ fn firma_esito_del_tool_use(recent: &[Message], idx: usize, name: &str) -> Optio
 ///   con cui il signature-loop pretende la firma fra le `new_signatures`;
 /// - un'AZIONE PRODUTTIVA azzera ogni serie: una ricerca ripetuta dopo una
 ///   scrittura e' una verifica legittima, e puo' dare lo stesso esito;
-/// - un turno che emette PIU' tool_use non produce firme: il risultato non e'
-///   attribuibile con certezza al singolo tool_use (la history non porta qui il
-///   `tool_use_id`), e su un'attribuzione incerta non si decide.
-pub fn ricerca_senza_nuovi_risultati(
+/// - un turno che emette PIU' tool_use non produce osservazioni: il risultato
+///   non e' attribuibile con certezza al singolo tool_use (la history non porta
+///   qui il `tool_use_id`), e su un'attribuzione incerta non si decide.
+pub fn stessa_risposta_ripetuta(
     messages: &[Message],
     tool_richiesti_ora: &[String],
     lookback: usize,
     soglia: usize,
 ) -> Option<String> {
     let recent = tail_messages(messages, lookback);
-    let mut serie: Vec<(String, Vec<String>)> = Vec::new();
+    let mut serie: Vec<(String, Vec<EsitoOsservato>)> = Vec::new();
     for (idx, m) in recent.iter().enumerate() {
         let uses = message_tool_uses(m);
         if uses.is_empty() {
             continue;
         }
         if let [(name, _)] = uses.as_slice() {
-            if let Some(firma) = firma_esito_del_tool_use(recent, idx, name) {
+            if let Some(esito) = esito_osservato(recent, idx, name) {
                 match serie.iter_mut().find(|(n, _)| n == name) {
-                    Some((_, s)) => s.push(firma),
-                    None => serie.push(((*name).to_string(), vec![firma])),
+                    Some((_, s)) => s.push(esito),
+                    None => serie.push(((*name).to_string(), vec![esito])),
                 }
                 continue;
             }
         }
-        // Nessun insieme di risultati da questo turno: se ha fatto qualcosa che
-        // non e' sola lettura, e' lavoro, e ogni serie riparte da li'.
+        // Nessun esito osservabile da questo turno: se ha fatto qualcosa che non
+        // e' sola lettura, e' lavoro, e ogni serie riparte da li'.
         if uses
             .iter()
             .any(|(n, _)| !EXPLORATION_ONLY_TOOLS.contains(n))
@@ -912,10 +969,11 @@ pub fn ricerca_senza_nuovi_risultati(
         }
     }
     tool_richiesti_ora.iter().find_map(|name| {
-        serie
-            .iter()
-            .find(|(n, _)| n == name)
-            .and_then(|(_, s)| serie_in_stallo(s, soglia))
+        let (_, s) = serie.iter().find(|(n, _)| n == name)?;
+        let fermo = serie_in_stallo_con(s, soglia, stesso_esito)?;
+        // La firma quando c'e' (identifica l'insieme di risultati); altrimenti
+        // il nome del tool, che e' quanto si puo' dire di un esito senza campi.
+        Some(fermo.firma.unwrap_or_else(|| name.clone()))
     })
 }
 
@@ -1724,7 +1782,7 @@ mod tests {
         }
         let attivi = vec![RICERCA.to_string()];
         assert!(
-            ricerca_senza_nuovi_risultati(&msgs, &attivi, 24, 3).is_some(),
+            stessa_risposta_ripetuta(&msgs, &attivi, 24, 3).is_some(),
             "tre risposte identiche a tre domande diverse sono uno stallo"
         );
         // Il presidio storico non lo vede, ed e' la ragione per cui questo esiste.
@@ -1755,8 +1813,67 @@ mod tests {
             "il payload di prova deve superare il cap, altrimenti non prova nulla"
         );
         assert!(
-            ricerca_senza_nuovi_risultati(&msgs, &[RICERCA.to_string()], 24, 3).is_some(),
+            stessa_risposta_ripetuta(&msgs, &[RICERCA.to_string()], 24, 3).is_some(),
             "il payload va letto INTERO: un JSON troncato non si deserializza"
+        );
+    }
+
+    #[test]
+    fn grep_con_pattern_variati_e_stesso_output_e_stallo() {
+        // LA SECONDA FORMA MISURATA (10/08/2026, stesso compito della prima): il
+        // modello passa a `search_in_files` e varia il PATTERN a ogni giro
+        // ricevendo sempre le stesse tre righe. `search_in_files` consegna testo
+        // (righe di grep), non un payload con campi: senza il ramo testuale il
+        // criterio sarebbe cieco proprio qui, e cambiare tool basterebbe a
+        // scavalcarlo.
+        let righe = "index.html:41:  <div class=\"product-card\">\n\
+index.html:52:  <div class=\"product-card\">\n\
+index.html:63:  <div class=\"product-card\">";
+        let mut msgs = Vec::new();
+        for p in [
+            "<div class=\"product-card\">",
+            "<div class=\"product-card\"[^>]*>",
+            "<div class=\"product-card\"",
+        ] {
+            msgs.push(ai_tool_input("search_in_files", json!({"pattern": p})));
+            msgs.push(human_tool_result(None, false, righe));
+        }
+        assert!(
+            stessa_risposta_ripetuta(&msgs, &["search_in_files".to_string()], 24, 3).is_some(),
+            "tre grep diversi che tornano le stesse righe sono uno stallo"
+        );
+    }
+
+    #[test]
+    fn output_diversi_di_un_tool_testuale_non_sono_stallo() {
+        let mut msgs = Vec::new();
+        for (p, out) in [
+            ("uno", "a.rs:1:primo"),
+            ("due", "b.rs:9:secondo\nc.rs:2:terzo"),
+            ("tre", "d.ts:44:quarto"),
+        ] {
+            msgs.push(ai_tool_input("search_in_files", json!({"pattern": p})));
+            msgs.push(human_tool_result(None, false, out));
+        }
+        assert_eq!(
+            stessa_risposta_ripetuta(&msgs, &["search_in_files".to_string()], 24, 3),
+            None,
+            "ogni grep ha trovato righe diverse"
+        );
+    }
+
+    #[test]
+    fn un_tool_produttivo_senza_campi_non_entra_nel_criterio() {
+        // `run_command` con output stabile e' una VERIFICA (`git status` pulito),
+        // e la sua ripetizione ha gia' i suoi presidi: qui non si decide.
+        let mut msgs = Vec::new();
+        for c in ["git status", "git status --short", "git status -s"] {
+            msgs.push(ai_tool_input("run_command", json!({"command": c})));
+            msgs.push(human_tool_result(Some(0), false, "nothing to commit"));
+        }
+        assert_eq!(
+            stessa_risposta_ripetuta(&msgs, &["run_command".to_string()], 24, 3),
+            None
         );
     }
 
@@ -1771,7 +1888,7 @@ mod tests {
         msgs.push(human_tool_result(None, false, "ok"));
         msgs.extend(giro_ricerca("tre", &stessi, 0));
         assert_eq!(
-            ricerca_senza_nuovi_risultati(&msgs, &[RICERCA.to_string()], 24, 3),
+            stessa_risposta_ripetuta(&msgs, &[RICERCA.to_string()], 24, 3),
             None,
             "dopo una scrittura la ri-verifica riparte da zero"
         );
@@ -1787,7 +1904,7 @@ mod tests {
         // Il turno corrente scrive: la ripetizione passata non e' un motivo per
         // fermarlo adesso.
         assert_eq!(
-            ricerca_senza_nuovi_risultati(&msgs, &["edit_file".to_string()], 24, 3),
+            stessa_risposta_ripetuta(&msgs, &["edit_file".to_string()], 24, 3),
             None
         );
     }
@@ -1798,7 +1915,7 @@ mod tests {
         msgs.extend(giro_ricerca("due", &[("b.md", 0)], 0));
         msgs.extend(giro_ricerca("tre", &[("c.md", 0)], 0));
         assert_eq!(
-            ricerca_senza_nuovi_risultati(&msgs, &[RICERCA.to_string()], 24, 3),
+            stessa_risposta_ripetuta(&msgs, &[RICERCA.to_string()], 24, 3),
             None,
             "ogni giro ha trovato qualcosa di nuovo"
         );
@@ -1808,7 +1925,7 @@ mod tests {
             vuoti.extend(giro_ricerca(q, &[], 0));
         }
         assert_eq!(
-            ricerca_senza_nuovi_risultati(&vuoti, &[RICERCA.to_string()], 24, 3),
+            stessa_risposta_ripetuta(&vuoti, &[RICERCA.to_string()], 24, 3),
             None
         );
     }
@@ -1842,7 +1959,7 @@ mod tests {
             msgs.push(human_tool_result(None, false, &testo_ricerca(q, &stessi, 0)));
         }
         assert_eq!(
-            ricerca_senza_nuovi_risultati(&msgs, &[RICERCA.to_string()], 24, 3),
+            stessa_risposta_ripetuta(&msgs, &[RICERCA.to_string()], 24, 3),
             None
         );
     }

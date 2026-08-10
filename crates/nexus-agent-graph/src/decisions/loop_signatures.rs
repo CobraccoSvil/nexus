@@ -230,12 +230,35 @@ pub fn firma_esito_ricerca(tool_name: &str, tool_result: &Value) -> Option<Strin
 /// `soglia` 0 o 1 non e' una domanda sensata — un solo esito non e' una
 /// ripetizione — e ritorna `None`.
 pub fn serie_in_stallo(serie: &[String], soglia: usize) -> Option<String> {
+    serie_in_stallo_con(serie, soglia, |a, b| a == b)
+}
+
+/// Variante di [`serie_in_stallo`] con l'uguaglianza DICHIARATA dal chiamante.
+///
+/// Esiste perche' «stesso esito» non ha una sola forma. Dove il payload porta i
+/// campi (`hits`) la risposta e' ESATTA e si confrontano le firme; dove il tool
+/// consegna testo e basta — `search_in_files` rende righe di grep, non un
+/// oggetto — la stessa domanda si risponde col confronto STRUTTURALE degli
+/// output che il repo gia' usa (`outputs_similar`: Jaccard sulle righe, mai
+/// semantica del contenuto). Un solo criterio, due modi di rispondere entrambi
+/// dichiarati: la conseguenza e' la stessa, quindi il punto di decisione resta
+/// uno (regola L).
+///
+/// L'uguaglianza NON deve essere transitiva: si confronta ogni elemento della
+/// coda con il PRIMO della coda, che e' il termine di paragone esplicito. Con un
+/// predicato fuzzy, confrontare a coppie consecutive lascerebbe passare una
+/// deriva graduale come «sempre lo stesso».
+pub fn serie_in_stallo_con<T: Clone>(
+    serie: &[T],
+    soglia: usize,
+    uguali: impl Fn(&T, &T) -> bool,
+) -> Option<T> {
     if soglia < 2 || serie.len() < soglia {
         return None;
     }
     let coda = &serie[serie.len() - soglia..];
     let prima = coda.first()?;
-    coda.iter().all(|f| f == prima).then(|| prima.clone())
+    coda.iter().all(|e| uguali(prima, e)).then(|| prima.clone())
 }
 
 /// Esito della rilevazione loop: la signature eventualmente in loop e la coda

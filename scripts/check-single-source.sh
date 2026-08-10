@@ -3303,6 +3303,24 @@ assert_single "firma-di-esito" 'pub fn firma_esito_ricerca' \
   'crates/nexus-agent-graph/src/decisions/loop_signatures.rs' crates
 assert_single "firma-di-esito" 'pub fn nome_tool_da_firma' \
   'crates/nexus-agent-graph/src/decisions/loop_signatures.rs' crates
+assert_single "firma-di-esito" 'pub fn stessa_risposta_ripetuta' \
+  'crates/nexus-agent-graph/src/routing/signals.rs' crates
+
+# «Questo esito e' lo stesso dell'altro?» ha DUE modi di rispondere — i campi
+# quando ci sono, il confronto strutturale del testo quando il tool non ne
+# consegna — ma un solo posto in cui si sceglie quale usare. Il confronto
+# testuale delega a `outputs_similar`, lo stesso che l'output-progresso usa: una
+# seconda nozione di "output uguale" divergerebbe dalla prima al primo ritocco
+# di soglia, e le due domande sono l'una l'inversa dell'altra.
+if ! grep -q 'outputs_similar(&a.testo, &b.testo)' \
+  crates/nexus-agent-graph/src/routing/signals.rs; then
+  echo "!! firma-di-esito: il confronto degli esiti senza campi non delega piu' a" >&2
+  echo "   outputs_similar. Con due nozioni di 'stesso output' il criterio che" >&2
+  echo "   ferma un run e quello che lo assolve possono contraddirsi." >&2
+  fail=1
+else
+  echo "OK firma-di-esito: l'esito senza campi si confronta col punto unico"
+fi
 
 # L'executor estraeva il nome del tool a mano (`loop_sig.split_once('|')`) e con
 # una firma d'esito quella riga non sbaglia rumorosamente: nomina il tool con
