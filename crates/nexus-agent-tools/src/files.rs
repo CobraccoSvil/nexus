@@ -1907,6 +1907,125 @@ fn build_old_string_not_found_message(
     )
 }
 
+/// «Questa modifica risulta GIA' APPLICATA?»
+///
+/// Si pone SOLO quando `old_string` non e' stato trovato, ed e' l'altra
+/// spiegazione possibile di quel fatto: o il testo da sostituire non e' mai
+/// esistito, oppure e' gia' stato sostituito — da questa stessa chiamata
+/// ripetuta, o da un'altra andata a buon fine.
+///
+/// MISURATO il 10/08/2026 sul run b8a9db1d (vetrina-statica): due `edit_file`
+/// falliti su quattro, entrambi con `old_string` assente e `new_string` GIA'
+/// presente nel file. Il messaggio diceva "correggi spazi, newline o testo che
+/// differiscono" e mandava l'agente a cercare differenze di spaziatura in un
+/// file di soli LF, dove non ce n'erano: una diagnosi che nomina una causa
+/// inesistente non fa perdere solo un turno, ne fa perdere quanti ne servono
+/// perche' il modello si arrenda.
+///
+/// `None` = non lo si puo' affermare. Il `new_string` VUOTO e' il caso da
+/// escludere per primo: una cancellazione lascia un testo vuoto che
+/// `contains` trova ovunque, e senza questa guardia OGNI old_string mancante
+/// diventerebbe una "modifica gia' applicata".
+fn modifica_gia_applicata(content: &str, new_string_lf: &str) -> Option<usize> {
+    if new_string_lf.trim().is_empty() {
+        return None;
+    }
+    match content.matches(new_string_lf).count() {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// Il testo dell'esito idempotente, composto DAI fatti (regola Q punto 3).
+///
+/// E' un SUCCESSO e non un fallimento perche' lo stato che l'agente voleva c'e'
+/// gia': chiamarlo errore terrebbe vivo un giro che non ha piu' niente da
+/// correggere. Ma dice anche, senza ambiguita', che QUESTA chiamata non ha
+/// scritto nulla — «riuscito» e «ho cambiato qualcosa» non sono la stessa cosa,
+/// e confonderli farebbe credere a un progresso che non c'e' stato.
+///
+/// Quando le occorrenze sono piu' d'una la si dichiara invece di tacerla: non
+/// si puo' sapere quale sia opera di questa modifica, e un numero che non torna
+/// e' un'informazione, non un dettaglio da nascondere.
+fn messaggio_gia_applicata(path_str: &str, occorrenze: usize) -> String {
+    let quante = if occorrenze == 1 {
+        String::new()
+    } else {
+        format!(
+            " Il testo nuovo compare {occorrenze} volte nel file: verifica che sia \
+             cio' che intendevi prima di procedere."
+        )
+    };
+    format!(
+        "Nessuna modifica applicata a '{path_str}': il file e' gia' in questo stato. \
+         L'old_string non e' presente e il new_string si', quindi la sostituzione \
+         risulta gia' avvenuta — da questa stessa chiamata ripetuta o da una \
+         precedente andata a buon fine.{quante} Non ripetere questo edit e non \
+         rileggere il file per cercarne le differenze: non ce ne sono."
+    )
+}
+
+#[cfg(test)]
+mod modifica_idempotente {
+    use super::{messaggio_gia_applicata, modifica_gia_applicata};
+
+    /// IL CASO MISURATO il 10/08/2026 (run b8a9db1d su vetrina-statica): due
+    /// `edit_file` su quattro falliti con `old_string` assente e `new_string`
+    /// gia' presente. Il file era di soli LF, quindi la diagnosi «correggi
+    /// spazi, newline o testo che differiscono» nominava una causa inesistente.
+    ///
+    /// MUTAZIONE: far ritornare `None` a `modifica_gia_applicata` quando il
+    /// new_string c'e' -> si torna al messaggio di old_string non trovato, e
+    /// questo test rosseggia.
+    #[test]
+    fn una_modifica_gia_applicata_non_e_un_old_string_sbagliato() {
+        let file = "<div class=\"filter-bar\">
+  <button>Tutti</button>
+  <button>Azzera</button>
+</div>
+";
+        let nuovo = "  <button>Azzera</button>";
+        assert_eq!(modifica_gia_applicata(file, nuovo), Some(1));
+        let msg = messaggio_gia_applicata("index.html", 1);
+        assert!(msg.contains("gia' in questo stato"), "{msg}");
+        assert!(
+            !msg.contains("spazi") && !msg.contains("newline"),
+            "non deve mandare a cercare differenze che non ci sono: {msg}"
+        );
+    }
+
+    /// Una cancellazione ha `new_string` vuoto, e `contains("")` e' vero
+    /// ovunque: senza la guardia OGNI old_string mancante diventerebbe una
+    /// «modifica gia' applicata», cioe' il tool direbbe sempre di si'.
+    ///
+    /// MUTAZIONE: togliere la guardia sul vuoto -> questo test rosseggia con
+    /// `Some(_)`.
+    #[test]
+    fn una_cancellazione_non_risulta_mai_gia_applicata() {
+        assert_eq!(modifica_gia_applicata("qualunque contenuto", ""), None);
+        assert_eq!(modifica_gia_applicata("qualunque contenuto", "   
+  "), None);
+    }
+
+    /// Il testo nuovo assente e' il caso ordinario: l'old_string era davvero
+    /// sbagliato, e il messaggio di prima resta quello giusto.
+    #[test]
+    fn se_il_testo_nuovo_non_c_e_resta_un_old_string_sbagliato() {
+        assert_eq!(modifica_gia_applicata("alfa beta", "gamma"), None);
+    }
+
+    /// Piu' occorrenze non si tacciono: non si puo' sapere quale sia opera di
+    /// questa modifica, e un numero che non torna e' un'informazione.
+    #[test]
+    fn le_occorrenze_multiple_si_dichiarano() {
+        assert_eq!(modifica_gia_applicata("x
+x
+x", "x"), Some(3));
+        let msg = messaggio_gia_applicata("f.txt", 3);
+        assert!(msg.contains("3 volte"), "{msg}");
+    }
+}
+
 /// Preambolo di `edit_file`: permesso di scrittura, path presente e non
 /// protetto, parametri `old_string`/`new_string` presenti. Ritorna la tripla
 /// `(path_str, old_string, new_string)` o il messaggio d'errore. Estratto da
@@ -2047,11 +2166,17 @@ async fn edit_matched_content(
         // Entrambi i messaggi portano l'estratto numerato del file reale: e'
         // cio' che rende la dichiarazione «rimediabile» una promessa mantenuta
         // e non un'etichetta.
-        0 => RispostaTool::fallito_rimediabile(build_old_string_not_found_message(
-            &content,
-            &old_string_lf,
-            path_str,
-        )),
+        0 => match modifica_gia_applicata(&content, &new_string_lf) {
+            Some(occorrenze) => RispostaTool::riuscito(messaggio_gia_applicata(
+                path_str,
+                occorrenze,
+            )),
+            None => RispostaTool::fallito_rimediabile(build_old_string_not_found_message(
+                &content,
+                &old_string_lf,
+                path_str,
+            )),
+        },
         n if n > 1 => RispostaTool::fallito_rimediabile(build_old_string_ambiguous_message(
             &content,
             &old_string_lf,
