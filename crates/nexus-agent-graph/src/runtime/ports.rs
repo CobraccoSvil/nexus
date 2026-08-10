@@ -708,6 +708,22 @@ pub struct ReviewPanelRequest {
     /// Ciclo di review corrente (1-based): al secondo giro il concreto sa che
     /// e' una RI-review dopo correzione.
     pub cycle: i64,
+    /// I requisiti emessi dagli apparati advisory a monte (punto unico
+    /// [`crate::decisions::advisory_requirements`]): il METRO di questa
+    /// revisione.
+    ///
+    /// Viaggiano nella richiesta e non li rilegge l'adapter dallo stato, perche'
+    /// e' il NODO a conoscere lo stato del run e la porta a non conoscerlo: un
+    /// concreto che se li andasse a cercare per conto proprio potrebbe leggerne
+    /// un insieme diverso da quello che il nodo ha visto.
+    ///
+    /// Prima di questo campo il mandato dei revisori era «rivedi le modifiche,
+    /// verifica correttezza, sicurezza, edge case e regressioni»: il ciclo di
+    /// review girava — ed e' l'unico consumatore dei pareri advisory che abbia
+    /// una CONSEGUENZA (`needs_changes` -> rimando in correzione) — senza sapere
+    /// nulla dei requisiti che il Consiglio e il panel multi-provider avevano
+    /// emesso prima del lavoro.
+    pub requirements: crate::decisions::EmittedRequirements,
 }
 
 /// Perche' il panel NON e' stato convocato (segnale strutturato, regola M:

@@ -3157,6 +3157,12 @@ struct UpstreamAdvisory {
     synthesis: Option<serde_json::Value>,
     source: Option<&'static str>,
     gate: Option<tokio::sync::watch::Receiver<nexus_agent_graph::nodes::AdvisoryGateState>>,
+    /// I requisiti di TUTTI gli apparati, per il ramo CLASSICO (senza overlap):
+    /// li' i panel hanno gia' deliberato e i requisiti entrano nello stato
+    /// all'avvio del run. Nel ramo overlap restano vuoti qui e arrivano dalla
+    /// barriera — stessa chiave, due scrittori (vedi
+    /// `decisions::ADVISORY_REQUIREMENTS_KEY`).
+    requirements: nexus_agent_graph::decisions::EmittedRequirements,
 }
 
 /// OVERLAP (mig 0606): il run parte SUBITO e i panel deliberano in parallelo,
@@ -3188,6 +3194,11 @@ async fn resolve_upstream_advisory(
             synthesis: None,
             source: None,
             gate: Some(gate_rx),
+            // In overlap i panel non hanno ancora deliberato: i requisiti non
+            // esistono ancora e arriveranno dalla barriera. Vuoto qui significa
+            // «non ancora», e chi scrive lo stato non deve confonderlo con
+            // «nessun requisito».
+            requirements: Default::default(),
         };
     }
     let panels = run_upstream_panels(&upstream_inputs).await;
@@ -3204,6 +3215,7 @@ async fn resolve_upstream_advisory(
         synthesis: panels.synthesis,
         source: panels.source,
         gate: None,
+        requirements: panels.requirements,
     }
 }
 
@@ -5149,6 +5161,7 @@ pub(crate) async fn spawn_agent_run(
     .await;
     let pre_run_advisory_synthesis = advisory.synthesis;
     let pre_run_advisory_source = advisory.source;
+    let pre_run_advisory_requirements = advisory.requirements;
     let advisory_gate = advisory.gate;
 
     // Nota operativa del last-wins (supersede): vedi `apply_supersede_note`.
@@ -5222,6 +5235,7 @@ pub(crate) async fn spawn_agent_run(
     let classifier_input_for_native: String = classifier_input.clone();
     let pre_run_advisory_synthesis_clone = pre_run_advisory_synthesis.clone();
     let pre_run_advisory_source_clone = pre_run_advisory_source;
+    let pre_run_advisory_requirements_clone = pre_run_advisory_requirements.clone();
     // Barriera advisory (overlap, mig 0606): il receiver entra nel ctx del grafo
     // e arma il gate del ToolDispatchNode. `None` nel ramo classico.
     let advisory_gate_for_run = advisory_gate;
@@ -5333,6 +5347,7 @@ pub(crate) async fn spawn_agent_run(
                     write_scope: Vec::new(),
                     pre_run_advisory_synthesis: pre_run_advisory_synthesis_clone.clone(),
                     pre_run_advisory_source: pre_run_advisory_source_clone,
+                    pre_run_advisory_requirements: pre_run_advisory_requirements_clone.clone(),
                     advisory_gate: advisory_gate_for_run.clone(),
                 };
                 execute_native_run(
@@ -5644,6 +5659,7 @@ pub(crate) async fn confirm_native_run(
         write_scope: Vec::new(),
         pre_run_advisory_synthesis: None,
         pre_run_advisory_source: None,
+        pre_run_advisory_requirements: Default::default(),
         // RESUME da checkpoint: i panel a monte hanno gia' deliberato nel primo
         // tratto del run e il loro esito e' nello stato checkpointato (chiave
         // `advisory_gate`); ri-armare la barriera farebbe attendere un verdetto
@@ -6052,6 +6068,7 @@ pub(crate) async fn resume_fanin(
         write_scope: Vec::new(),
         pre_run_advisory_synthesis: None,
         pre_run_advisory_source: None,
+        pre_run_advisory_requirements: Default::default(),
         // RESUME da checkpoint: i panel a monte hanno gia' deliberato nel primo
         // tratto del run e il loro esito e' nello stato checkpointato (chiave
         // `advisory_gate`); ri-armare la barriera farebbe attendere un verdetto
@@ -6350,6 +6367,12 @@ struct UpstreamPanels {
     /// `true` se il consiglio ha prodotto un blocco: la direttiva
     /// `<consiglio_analisi>` va tolta dal system prompt (l'ha gia' fatto).
     council_present: bool,
+    /// I requisiti di TUTTI gli apparati (punto unico
+    /// `decisions::advisory_requirements`), distinti da `synthesis`, che porta
+    /// il solo panel scelto per l'enforcement. La selezione risponde a «quale
+    /// verdetto governa l'enforcement» e portarsi via i requisiti dell'altro
+    /// apparato ne scartava 8 su 8 a rango pari (misurato il 10/08/2026).
+    requirements: nexus_agent_graph::decisions::EmittedRequirements,
 }
 
 /// Dibattito, se il consiglio ha dichiarato una decisione contesa: consuma il
@@ -6427,16 +6450,38 @@ async fn run_upstream_panels(inp: &UpstreamInputs) -> UpstreamPanels {
         .filter(|b| !b.is_empty());
     let debate_block = run_debate_if_contested(inp, council_outcome.as_ref()).await;
 
-    let (synthesis, source) = select_pre_run_advisory(
-        council_outcome
-            .as_ref()
-            .and_then(|o| o.advisory_synthesis_value()),
-        multi_provider
-            .as_ref()
-            .and_then(|o| o.advisory_synthesis_value()),
+    let council_synthesis = council_outcome
+        .as_ref()
+        .and_then(|o| o.advisory_synthesis_value());
+    let multi_provider_synthesis = multi_provider
+        .as_ref()
+        .and_then(|o| o.advisory_synthesis_value());
+
+    // I REQUISITI sono l'UNIONE dei due apparati (punto unico, regola L): un
+    // requisito emesso dal panel che perde la selezione e' stato emesso lo
+    // stesso. La selezione qui sotto risponde a un'altra domanda — quale
+    // verdetto governa l'enforcement, dove il messaggio da emettere e' uno solo
+    // — e prima si portava via anche i requisiti dell'apparato non scelto.
+    let requirements = nexus_agent_graph::decisions::EmittedRequirements::from_panels(
+        &[
+            (
+                nexus_agent_graph::decisions::AdvisorySource::Council,
+                council_synthesis.clone(),
+            ),
+            (
+                nexus_agent_graph::decisions::AdvisorySource::MultiProvider,
+                multi_provider_synthesis.clone(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(source, synthesis)| synthesis.map(|s| (source, s)))
+        .collect::<Vec<_>>(),
     );
+
+    let (synthesis, source) = select_pre_run_advisory(council_synthesis, multi_provider_synthesis);
     UpstreamPanels {
         council_present: council_block.is_some(),
+        requirements,
         blocks: [
             council_block,
             debate_block,
@@ -6506,12 +6551,18 @@ fn gate_state_from_panels(
             } else {
                 AdvisoryGateState::Released {
                     enforcement: Some(enforcement),
+                    requirements: panels.requirements.clone(),
                 }
             }
         }
         // Sintesi senza enforcement = via libera piena: niente vincoli da
-        // ricordare.
-        None => AdvisoryGateState::Released { enforcement: None },
+        // ricordare al modello ADESSO. I requisiti viaggiano comunque: «nessun
+        // vincolo da ricordare prima della scrittura» non significa «nessun
+        // requisito da riscontrare a lavoro finito».
+        None => AdvisoryGateState::Released {
+            enforcement: None,
+            requirements: panels.requirements.clone(),
+        },
     }
 }
 
@@ -9537,6 +9588,16 @@ mod tests_native_mapping {
     /// scritto a mano — se un giorno il campo `requirements` cambiasse nome, il
     /// test deve accorgersene invece di continuare a leggere il proprio mock
     /// (regola O).
+    ///
+    /// La CHIAVE e' cambiata il 10/08/2026, e il motivo e' istruttivo: questo
+    /// helper scriveva `pre_run_advisory_synthesis`, che il ramo classico
+    /// popola — ma in produzione `advisory_overlap_enabled` e' `true` e quel
+    /// ramo non gira, quindi la chiave non veniva scritta MAI e il riscontro
+    /// non e' entrato in esercizio una sola volta in 200 run. Il test era verde
+    /// perche' si costruiva da solo la premessa che la produzione non
+    /// soddisfaceva: e' la regola O nella sua forma piu' silenziosa. Ora la
+    /// chiave e' quella che ENTRAMBI i rami scrivono, e i requisiti passano dal
+    /// punto unico `EmittedRequirements`.
     fn stato_con_requisiti_del_consiglio(
         requirements: &[&str],
         recommendations: &[&str],
@@ -9564,11 +9625,17 @@ mod tests_native_mapping {
             result: Some("Task completato: porta resa dinamica.".to_string()),
             ..Default::default()
         };
-        // La stessa chiave con cui il coordinatore ha ricevuto il parere nel
-        // prompt: e' il segnale che il riscontro deve ritrovare a fine run.
-        state.extra.insert(
-            nexus_agent_graph::nodes::PRE_RUN_ADVISORY_SYNTHESIS_KEY.to_string(),
+        // La chiave che ENTRAMBI i rami scrivono (classico all'avvio, barriera
+        // alla release in overlap): e' il segnale che il riscontro ritrova a
+        // fine run, e i requisiti vi arrivano dal punto unico che ne fa l'unione
+        // fra gli apparati.
+        let emessi = nexus_agent_graph::decisions::EmittedRequirements::from_panels(&[(
+            nexus_agent_graph::decisions::AdvisorySource::Council,
             synth.to_value(),
+        )]);
+        state.extra.insert(
+            nexus_agent_graph::decisions::ADVISORY_REQUIREMENTS_KEY.to_string(),
+            emessi.to_value(),
         );
         state
     }

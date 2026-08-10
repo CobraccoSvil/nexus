@@ -235,10 +235,16 @@ impl ReviewPanelPort for ReviewPanelAdapter {
             .map(|f| format!("- {f}"))
             .collect::<Vec<_>>()
             .join("\n");
+        // Il METRO della revisione, dal punto unico che sa quali requisiti sono
+        // stati emessi e da chi (regola L): l'adapter non ricompone un elenco
+        // per conto proprio, o due convocazioni consegnerebbero due metri.
+        // `None` = nessun apparato ha posto vincoli, e una sezione vuota
+        // insegnerebbe al revisore che quella sezione si puo' ignorare.
+        let metro = req.requirements.metro().unwrap_or_default();
         let task = format!(
             "Rivedi le modifiche al codice appena applicate dal run corrente. File modificati:\n\
              {files_line}\n\nLeggi questi file, verifica correttezza, sicurezza, edge case e \
-             regressioni, e dichiara il verdetto con review_verdict."
+             regressioni, e dichiara il verdetto con review_verdict.{metro}"
         );
         let lente_ui = self.lente_ui_attiva(&modified).await;
         tracing::info!(
@@ -247,6 +253,7 @@ impl ReviewPanelPort for ReviewPanelAdapter {
             files = modified.len(),
             cycle = req.cycle,
             lente_ui,
+            requisiti = req.requirements.len(),
             "review gate: convocazione del panel (dentro il grafo)"
         );
         match crate::agent_tools::subagent_native::convene_review_panel(

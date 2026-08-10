@@ -99,6 +99,14 @@
 //!     misura: `recommendations` e' l'altra lista e non genera rilievi. L'I/O
 //!     (leggere il file dal workspace) e' il parametro `leggi` di
 //!     `compose_conformance`.
+//!   - [`advisory_requirements`]: PUNTO UNICO di "quali requisiti ha emesso
+//!     l'apparato advisory di questo run, e chi li usa come metro?". I requisiti
+//!     sono l'UNIONE dei due apparati (Consiglio + multi-provider): la selezione
+//!     del panel «vincitore» risponde a un'altra domanda — quale verdetto governa
+//!     l'enforcement — e portarsi via i requisiti dell'altro ne scartava 8 su 8
+//!     (misurato il 10/08/2026). Il consumatore che CONTA e' il mandato dei
+//!     revisori: il riscontro meccanico di [`requirement_conformance`] copre solo
+//!     i requisiti con un letterale citato, che in produzione sono 1 su 89.
 //!   - [`static_render`]: PUNTO UNICO di "l'app SENZA server mostra davvero il
 //!     suo contenuto?". Terzo di una famiglia: `endpoint_probes` chiede al
 //!     server, `browser_dialogue` chiede alla pagina se ottiene i propri dati
@@ -126,6 +134,7 @@
 
 pub mod adversarial_review;
 pub mod advisory_panel;
+pub mod advisory_requirements;
 pub mod avanzamento_figura;
 pub mod browser_dialogue;
 pub mod clarify_signature;
@@ -176,6 +185,9 @@ pub use adversarial_review::{
 pub use advisory_panel::{
     compose_advisory_synthesis, AdvisoryPanelVerdict, AdvisoryPolicy, AdvisoryRoster,
     AdvisorySynthesis, AdvisoryVerdict, Requirement,
+};
+pub use advisory_requirements::{
+    AdvisorySource, EmittedRequirements, SourcedRequirement, ADVISORY_REQUIREMENTS_KEY,
 };
 pub use clarify_signature::{clarify_signature, normalize_question};
 pub use context_reduction::{

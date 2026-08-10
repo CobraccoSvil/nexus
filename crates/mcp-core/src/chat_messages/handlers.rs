@@ -1361,6 +1361,7 @@ async fn try_resume_interrupted_run(
             // riprende il lavoro, non riapre la deliberazione.
             pre_run_advisory_synthesis: None,
             pre_run_advisory_source: None,
+            pre_run_advisory_requirements: Default::default(),
             advisory_gate: None,
         };
         let mut result = match crate::chat_messages::agent_run::run_via_native(

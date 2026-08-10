@@ -4410,6 +4410,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         write_scope,
         pre_run_advisory_synthesis: None,
         pre_run_advisory_source: None,
+        pre_run_advisory_requirements: Default::default(),
         // Un SUB-RUN non ha barriera: i panel a monte sono del coordinatore, non
         // suoi. Un figlio che attendesse il consiglio del padre sarebbe un'attesa
         // circolare (il padre sta aspettando lui).
