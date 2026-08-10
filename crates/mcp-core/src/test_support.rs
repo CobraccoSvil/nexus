@@ -123,6 +123,28 @@ pub(crate) async fn seed_chat_session(pool: &PgPool, project_id: Uuid) -> Uuid {
     id
 }
 
+/// Semina un messaggio di chat (`chat_messages`, mig project 0001) e ne ritorna
+/// l'id.
+///
+/// Serve per la stessa ragione di [`seed_chat_session`]: lo schema reale VINCOLA
+/// `agent_runs.run_message_id` con una FK verso `chat_messages(id)`, quindi un
+/// uuid inventato non e' un'ancora valida — un test che ne passasse uno
+/// misurerebbe il rifiuto della FK invece di cio' che voleva provare.
+pub(crate) async fn seed_chat_message(pool: &PgPool, session_id: Uuid, project_id: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO chat_messages (id, session_id, project_id, role, content)
+         VALUES ($1, $2, $3, 'user', 'messaggio di prova')",
+    )
+    .bind(id)
+    .bind(session_id)
+    .bind(project_id)
+    .execute(pool)
+    .await
+    .expect("seed chat_messages");
+    id
+}
+
 /// Semina una memoria di sessione in `prompt_corrections` - una voce del pannello
 /// "Memoria del progetto" - come la scrive `chat_sessions::compact_session_core`,
 /// e ne ritorna l'id di riga.

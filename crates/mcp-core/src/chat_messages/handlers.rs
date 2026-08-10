@@ -1215,7 +1215,6 @@ async fn try_resume_interrupted_run(
             provider: &prev_provider,
             model: &prev_model,
             supervisor_mode: prev_supervisor.as_str(),
-            error: None,
             parent_run_id: Some(prev_run_id),
         },
     )

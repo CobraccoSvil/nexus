@@ -2761,10 +2761,13 @@ async fn handle_no_capable_provider(
         params.session_id,
         alert_msg,
     );
-    // Nascita del run dal punto unico (regola L): qui nasce gia' `failed` e
-    // porta con se' la ragione. L'esito e' dichiarato (regola Q) perche' il
-    // valore di ritorno lo USA: `Started` prometterebbe alla UI un run che puo'
-    // interrogare, e su una riga mai nata quella promessa e' falsa.
+    // Nascita del run dal punto unico (regola L): qui nasce gia' `failed`.
+    // La RAGIONE non viaggia in tabella — `agent_runs` non ha una colonna che
+    // la ospiti e nessuno la leggerebbe — ma nell'alert SSE poche righe sotto,
+    // che e' il canale con cui l'utente la riceve davvero.
+    // L'esito e' dichiarato (regola Q) perche' il valore di ritorno lo USA:
+    // `Started` prometterebbe alla UI un run che puo' interrogare, e su una
+    // riga mai nata quella promessa e' falsa.
     let nascita = crate::chat_messages::run_row::inserisci_riga_run(
         run_pool,
         crate::chat_messages::run_row::NuovaRigaRun {
@@ -2778,7 +2781,6 @@ async fn handle_no_capable_provider(
             provider: &routing_result.provider,
             model: &routing_result.model,
             supervisor_mode: params.supervisor_mode.as_str(),
-            error: Some(&alert_msg),
             parent_run_id: None,
         },
     )
@@ -4921,7 +4923,6 @@ pub(crate) async fn spawn_agent_run(
             provider: &provider,
             model: &model_str,
             supervisor_mode: params.supervisor_mode.as_str(),
-            error: None,
             parent_run_id: None,
         },
     )
