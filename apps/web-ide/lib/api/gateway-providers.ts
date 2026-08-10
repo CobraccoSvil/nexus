@@ -79,8 +79,15 @@ export interface RenderedReadiness {
 export function renderReadiness(p: GatewayProvider): RenderedReadiness {
   const cooldown = p.cooldown_seconds_remaining;
   if (typeof cooldown === "number" && cooldown > 0) {
+    // Causa E pausa, non l'una AL POSTO dell'altra. Osservato il 10/08/2026:
+    // con la sola pausa, i tre provider fuori per credito perdevano
+    // `credit_balance_too_low`, che e' l'unica delle due informazioni su cui un
+    // amministratore puo' AGIRE — la pausa, da sola, si ripresenta uguale al
+    // termine se il credito non e' stato ricaricato.
+    const pausa = `in pausa per ${Math.ceil(cooldown / 60)} min`;
+    const causa = p.error?.split(":")[0]?.trim();
     return {
-      label: `in pausa per ${Math.ceil(cooldown / 60)} min`,
+      label: causa ? `${causa}, ${pausa}` : pausa,
       requiresAction: false,
     };
   }

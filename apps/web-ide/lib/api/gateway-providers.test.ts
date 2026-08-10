@@ -88,6 +88,19 @@ test("il cooldown ha la precedenza che aveva gia'", () => {
     cooldown_seconds_remaining: 21377,
   });
   assert.match(reso.label, /in pausa per \d+ min/);
+  // ...ma senza mangiarsi la causa: la pausa dice QUANDO torna, il credito
+  // dice COSA fare perche' torni davvero.
+  assert.match(reso.label, /credit_balance_too_low/);
+});
+
+test("una pausa senza causa nota non inventa una causa", () => {
+  const reso = renderReadiness({
+    name: "x",
+    healthy: null,
+    readiness: "down",
+    cooldown_seconds_remaining: 120,
+  });
+  assert.equal(reso.label, "in pausa per 2 min");
 });
 
 test("una entry senza prontezza dichiara l'assenza, non una misura", () => {
