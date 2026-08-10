@@ -257,17 +257,26 @@ pub fn resolve_relative_path_detailed(
         root_canonical.join(&clean)
     };
 
-    let canonical = target.canonicalize().map_err(|e| {
-        let causa = classifica_causa(e.kind());
-        ErroreRisoluzione::Filesystem(ErrorePercorso {
-            causa,
-            radice_esistente: match causa {
-                CausaPercorso::NonEsiste => radice_esistente(&root_canonical, &clean),
-                _ => None,
-            },
-            relativo_normalizzato: clean.clone(),
-        })
-    })?;
+    let canonical = match target.canonicalize() {
+        Ok(c) => c,
+        // Prima di dichiarare l'assenza si prova l'UNICA altra lettura sensata
+        // del path: il modello ha prefissato il NOME della cartella di
+        // progetto. Vedi `senza_nome_della_root`.
+        Err(e) => match senza_nome_della_root(&root_canonical, &clean) {
+            Some(c) => c,
+            None => {
+                let causa = classifica_causa(e.kind());
+                return Err(ErroreRisoluzione::Filesystem(ErrorePercorso {
+                    causa,
+                    radice_esistente: match causa {
+                        CausaPercorso::NonEsiste => radice_esistente(&root_canonical, &clean),
+                        _ => None,
+                    },
+                    relativo_normalizzato: clean.clone(),
+                }));
+            }
+        },
+    };
 
     if !path_within(&root_canonical, &canonical) {
         return Err(ErroreRisoluzione::Richiesta(api_error(
@@ -277,6 +286,44 @@ pub fn resolve_relative_path_detailed(
     }
 
     Ok(canonical)
+}
+
+/// Ripiego per il path prefissato col NOME della cartella di progetto:
+/// `vetrina-statica/index.html` quando la root E' gia' `.../vetrina-statica`.
+///
+/// MISURATO il 10/08/2026 su `vetrina-statica`: otto chiamate fallite in questa
+/// forma esatta (sei `read_file`, una `ui_styling_audit`, e la stessa firma
+/// altrove), tutte con il tool che rispondeva correttamente «non esiste sotto
+/// la root del progetto». A sbagliare era il modello, e in modo sistematico:
+/// vede il nome del progetto nel contesto e lo tratta come primo componente.
+///
+/// NON e' un secondo caso di [`nexus_types::workspace_paths::normalize_into_root`]:
+/// quel punto unico de-duplica la root COMPLETA (caso 3 dei sei che documenta),
+/// ed e' senza IO per contratto. Qui il prefisso e' il solo NOME finale, e
+/// distinguerlo da una sottocartella legittima OMONIMA — `progetto/progetto/` —
+/// richiede di guardare il filesystem. Percio' il ripiego vive nel resolver di
+/// LETTURA, che l'IO lo fa gia', e non nel normalizzatore.
+///
+/// Accetta solo su un FATTO: il path senza prefisso esiste. Uno strip
+/// incondizionato romperebbe proprio il caso omonimo, dove il path originale e'
+/// quello giusto. Per la stessa ragione si prova solo DOPO che il path chiesto
+/// ha fallito: finche' esiste cio' che e' stato chiesto, non si indovina nulla.
+fn senza_nome_della_root(root_canonical: &Path, clean: &str) -> Option<PathBuf> {
+    let nome_root = root_canonical.file_name()?.to_string_lossy().to_string();
+    let resto = clean.strip_prefix(&format!("{nome_root}/"))?;
+    if resto.is_empty() {
+        return None;
+    }
+    let candidato = root_canonical.join(resto).canonicalize().ok()?;
+    if !path_within(root_canonical, &candidato) {
+        return None;
+    }
+    tracing::debug!(
+        chiesto = %clean,
+        risolto = %resto,
+        "resolve_relative_path: nome della cartella di progetto usato come prefisso, strippato"
+    );
+    Some(candidato)
 }
 
 pub fn resolve_relative_path(root: &Path, relative: &str) -> Result<PathBuf, ApiError> {
@@ -306,6 +353,57 @@ mod tests {
                 panic!("attesa causa di filesystem, ottenuto rifiuto della richiesta {api:?}")
             }
         }
+    }
+
+    /// Il caso misurato: il modello prefissa il NOME della cartella di
+    /// progetto. La root di prova si chiama come la tempdir, quindi il nome si
+    /// legge da lei — inventarlo proverebbe solo che `format!` funziona.
+    ///
+    /// MUTAZIONE che lo fa rosseggiare: togliere il ripiego
+    /// `senza_nome_della_root` dal resolver. Torna `Percorso non trovato`,
+    /// che e' esattamente l'errore osservato otto volte in esercizio.
+    #[test]
+    fn il_nome_della_cartella_usato_come_prefisso_viene_strippato() {
+        let dir = root_di_prova();
+        let nome = dir.path().file_name().unwrap().to_string_lossy().to_string();
+
+        let risolto = resolve_relative_path_detailed(
+            dir.path(),
+            &format!("{nome}/school-courses-fe/src/app.ts"),
+        )
+        .expect("il prefisso col nome del progetto deve essere strippato");
+
+        let atteso = dir
+            .path()
+            .join("school-courses-fe/src/app.ts")
+            .canonicalize()
+            .expect("canonicalize atteso");
+        assert_eq!(risolto, atteso);
+    }
+
+    /// Una sottocartella OMONIMA al progetto e' il caso che uno strip
+    /// incondizionato romperebbe: li' il path chiesto e' quello giusto, e va
+    /// risolto senza toccarlo. E' la ragione per cui il ripiego pretende un
+    /// FATTO (il path senza prefisso esiste) e si prova solo dopo il
+    /// fallimento del path chiesto.
+    #[test]
+    fn una_sottocartella_omonima_non_viene_scavalcata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nome = dir.path().file_name().unwrap().to_string_lossy().to_string();
+        // Dentro il progetto esiste una cartella che si chiama come lui.
+        std::fs::create_dir_all(dir.path().join(&nome)).expect("omonima");
+        std::fs::write(dir.path().join(&nome).join("dati.txt"), "interno").expect("interno");
+        // E un file con lo STESSO nome relativo esiste anche in root.
+        std::fs::write(dir.path().join("dati.txt"), "esterno").expect("esterno");
+
+        let risolto = resolve_relative_path_detailed(dir.path(), &format!("{nome}/dati.txt"))
+            .expect("il path chiesto esiste e va risolto com'e'");
+
+        assert_eq!(
+            std::fs::read_to_string(&risolto).expect("lettura"),
+            "interno",
+            "risolto il file esterno: il ripiego ha scavalcato un path che esisteva"
+        );
     }
 
     #[test]
