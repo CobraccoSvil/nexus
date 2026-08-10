@@ -2761,25 +2761,34 @@ async fn handle_no_capable_provider(
         params.session_id,
         alert_msg,
     );
-    let _ = sqlx::query(
-        r#"INSERT INTO agent_runs
-           (id, session_id, project_id, user_id, run_message_id, status,
-            automation_mode, provider, model, supervisor_mode, iteration_count, error, created_at)
-           VALUES ($1,$2,$3,$4,$5,'failed',$6,$7,$8,$9,0,$10,NOW())"#,
+    // Nascita del run dal punto unico (regola L): qui nasce gia' `failed` e
+    // porta con se' la ragione. L'esito e' dichiarato (regola Q) perche' il
+    // valore di ritorno lo USA: `Started` prometterebbe alla UI un run che puo'
+    // interrogare, e su una riga mai nata quella promessa e' falsa.
+    let nascita = crate::chat_messages::run_row::inserisci_riga_run(
+        run_pool,
+        crate::chat_messages::run_row::NuovaRigaRun {
+            run_id,
+            session_id: params.session_id,
+            project_id: params.project_id,
+            user_id: params.user_id,
+            run_message_id: params.user_message_id,
+            status: "failed",
+            automation_mode: params.automation_mode.as_str(),
+            provider: &routing_result.provider,
+            model: &routing_result.model,
+            supervisor_mode: params.supervisor_mode.as_str(),
+            error: Some(&alert_msg),
+            parent_run_id: None,
+        },
     )
-    .bind(run_id)
-    .bind(params.session_id)
-    .bind(params.project_id)
-    .bind(params.user_id)
-    .bind(params.user_message_id)
-    .bind(params.automation_mode.as_str())
-    .bind(&routing_result.provider)
-    .bind(&routing_result.model)
-    .bind(params.supervisor_mode.as_str())
-    .bind(&alert_msg)
-    .execute(run_pool)
     .await;
+    // L'alert SSE parte comunque: e' il canale con cui l'utente scopre che
+    // nessun provider e' utilizzabile, e vale anche se la riga non e' nata.
     emit_provider_unavailable(tx, run_id, routing_result, &alert_msg);
+    if !nascita.run_esiste() {
+        return SpawnOutcome::NotStarted;
+    }
     SpawnOutcome::Started(SpawnAgentResult {
         run_id,
         provider: routing_result.provider.clone(),
@@ -4893,23 +4902,39 @@ pub(crate) async fn spawn_agent_run(
     // Pool del progetto (separazione DB): tabella agent_runs migrata -> riusa
     // msgs_pool (stesso DB <slug>_nexus, risolto una volta a inizio spawn).
     let run_pool = msgs_pool.clone();
-    let _ = sqlx::query(
-        r#"INSERT INTO agent_runs
-           (id, session_id, project_id, user_id, run_message_id, status,
-            automation_mode, provider, model, supervisor_mode, iteration_count, created_at)
-           VALUES ($1,$2,$3,$4,$5,'running',$6,$7,$8,$9,0,NOW())"#,
+    // Nascita del run dal punto unico, che ne DICHIARA l'esito (regola Q).
+    // Se la riga non esiste non si spawna il task: `supersede_active_runs` ha
+    // gia' cancellato i run precedenti, quindi proseguire lascerebbe la sessione
+    // senza alcun run e il messaggio utente senza esito — il messaggio orfano
+    // misurato il 09/08/2026. `NotStarted` fa cadere l'handler su `run_turn`,
+    // che una risposta all'utente la produce.
+    let nascita = crate::chat_messages::run_row::inserisci_riga_run(
+        &run_pool,
+        crate::chat_messages::run_row::NuovaRigaRun {
+            run_id,
+            session_id: params.session_id,
+            project_id: params.project_id,
+            user_id: params.user_id,
+            run_message_id: params.user_message_id,
+            status: "running",
+            automation_mode: params.automation_mode.as_str(),
+            provider: &provider,
+            model: &model_str,
+            supervisor_mode: params.supervisor_mode.as_str(),
+            error: None,
+            parent_run_id: None,
+        },
     )
-    .bind(run_id)
-    .bind(params.session_id)
-    .bind(params.project_id)
-    .bind(params.user_id)
-    .bind(params.user_message_id)
-    .bind(params.automation_mode.as_str())
-    .bind(&provider)
-    .bind(&model_str)
-    .bind(params.supervisor_mode.as_str())
-    .execute(&run_pool)
     .await;
+    if !nascita.run_esiste() {
+        tracing::error!(
+            run_id = %run_id,
+            session_id = %params.session_id,
+            "spawn_agent_run: riga di run non nata, niente task distaccato (fallback al turno singolo)"
+        );
+        state.agent_channels.remove(&run_id);
+        return SpawnOutcome::NotStarted;
+    }
 
     let tx_for_brain = tx.clone();
     drop(tx);

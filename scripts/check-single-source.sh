@@ -3070,6 +3070,43 @@ else
   echo "OK prontezza-fornitore: l'ignoto e' una variante, e i cicli si interrogano"
 fi
 
+# --- nascita-riga-run -------------------------------------------------------
+# La riga iniziale di `agent_runs` nasce da UN punto solo, che ne dichiara
+# l'esito. I tre percorsi (turno agentico, nessun provider capace, ripresa)
+# avevano ognuno la propria INSERT e tutti e tre ne buttavano via l'errore con
+# `let _ = sqlx::query(...)`: il chiamante proseguiva con un run_id che in
+# tabella non esisteva, e il messaggio utente restava senza esito (regola M).
+assert_single "nascita-riga-run" 'pub(crate) async fn inserisci_riga_run(' \
+  'crates/mcp-core/src/chat_messages/run_row.rs' crates
+
+# Nessun altro punto puo' far nascere il run di un TURNO UTENTE: una quarta
+# copia della INSERT tornerebbe a poter ignorare il proprio esito senza che
+# nulla lo veda. Restano fuori, DICHIARATI:
+#  - `subagent_native.rs` (`ensure_child_agent_run`): e' la gemella `agent_runs`
+#    di un SUB-run, non la nascita di un turno. Ha `nexus_agent_type='subagent'`,
+#    nessun `run_message_id` (l'ancora e' il padre) e `ON CONFLICT DO NOTHING`
+#    perche' li' la ri-creazione e' attesa. Il suo errore NON e' ingoiato: e'
+#    gia' controllato e loggato, con la scelta best-effort motivata sul posto.
+#  - `test_support.rs` / `tests/`: i seeder, che sono a loro volta il punto
+#    unico dello schema di test (guard `schema-di-test`).
+altri_insert_run=$(grep -rn "INSERT INTO agent_runs" --include=*.rs crates/ \
+  | grep -v 'crates/mcp-core/src/chat_messages/run_row.rs' \
+  | grep -v 'crates/mcp-core/src/agent_tools/subagent_native.rs' \
+  | grep -v 'crates/mcp-core/src/test_support.rs' \
+  | grep -vE '^[^:]*/tests/' \
+  | grep -vE '^[^:]+:[0-9]+: *///? ' || true)
+if [[ -n "$altri_insert_run" ]]; then
+  echo "!! nascita-riga-run: INSERT INTO agent_runs fuori dal punto unico:" >&2
+  echo "$altri_insert_run" >&2
+  echo "   La nascita di un run passa da run_row::inserisci_riga_run, che" >&2
+  echo "   DICHIARA se la riga esiste. Una INSERT sparsa puo' fallire in" >&2
+  echo "   silenzio e lasciare la sessione senza run dopo che" >&2
+  echo "   supersede_active_runs ha gia' cancellato i precedenti." >&2
+  fail=1
+else
+  echo "OK nascita-riga-run: un run nasce da un punto solo, e l'esito e' un campo"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

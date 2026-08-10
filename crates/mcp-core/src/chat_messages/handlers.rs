@@ -1195,24 +1195,39 @@ async fn try_resume_interrupted_run(
         crate::chat_messages::agent_run::supersede_active_runs(state, context.session_id, "resume")
             .await;
 
-    let _ = sqlx::query(
-        r#"INSERT INTO agent_runs
-           (id, session_id, project_id, user_id, run_message_id, status,
-            automation_mode, provider, model, supervisor_mode, iteration_count, parent_run_id, created_at)
-           VALUES ($1,$2,$3,$4,$5,'running',$6,$7,$8,$9,0,$10,NOW())"#,
+    // Nascita del run dal punto unico, con esito dichiarato (regola Q). Se la
+    // riga non nasce il resume NON parte: `supersede_active_runs` ha appena
+    // cancellato il run che si voleva riprendere, quindi proseguire lascerebbe
+    // la sessione senza run e il messaggio utente senza esito. `None` fa
+    // proseguire il chiamante col flusso normale — stesso degrado gia' scelto
+    // qui sotto quando il contesto progetto non si carica.
+    let nascita = crate::chat_messages::run_row::inserisci_riga_run(
+        session_pool,
+        crate::chat_messages::run_row::NuovaRigaRun {
+            run_id: new_run_id,
+            session_id: context.session_id,
+            project_id: context.project_id,
+            user_id,
+            run_message_id: user_message_id,
+            status: "running",
+            automation_mode: automation_mode.as_str(),
+            provider: &prev_provider,
+            model: &prev_model,
+            supervisor_mode: prev_supervisor.as_str(),
+            error: None,
+            parent_run_id: Some(prev_run_id),
+        },
     )
-    .bind(new_run_id)
-    .bind(context.session_id)
-    .bind(context.project_id)
-    .bind(user_id)
-    .bind(user_message_id)
-    .bind(automation_mode.as_str())
-    .bind(&prev_provider)
-    .bind(&prev_model)
-    .bind(prev_supervisor.as_str())
-    .bind(prev_run_id)
-    .execute(session_pool)
     .await;
+    if !nascita.run_esiste() {
+        tracing::error!(
+            run_id = %new_run_id,
+            session_id = %context.session_id,
+            "resume: riga di run non nata, il resume non parte"
+        );
+        state.agent_channels.remove(&new_run_id);
+        return None;
+    }
 
     // Carica contesto progetto per il nuovo run
     let Ok(proj) = load_project_context(&state.db, context.project_id, user_id).await else {

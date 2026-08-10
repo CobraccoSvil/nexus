@@ -120,6 +120,7 @@ mod handlers;
 mod intent;
 mod persistence;
 mod run;
+mod run_row;
 
 // Re-export interni: i sottomoduli usano  e accedono cosi ai
 // simboli pub(crate) condivisi (helper di contesto, persistenza, intent, ecc.).
