@@ -310,6 +310,14 @@ pub fn resolve_relative_path_detailed(
 /// ha fallito: finche' esiste cio' che e' stato chiesto, non si indovina nulla.
 fn senza_nome_della_root(root_canonical: &Path, clean: &str) -> Option<PathBuf> {
     let nome_root = root_canonical.file_name()?.to_string_lossy().to_string();
+    // Il nome DA SOLO significa «la root del progetto», ed e' la forma che
+    // `list_files` riceve: `{"directory": "prova-fix-10-08"}`. MISURATA in
+    // esercizio il 10/08/2026 nello stesso run in cui le quattro letture col
+    // sottopath passavano: cercare il solo prefisso `nome/` la lasciava fuori,
+    // perche' qui il separatore non c'e'.
+    if clean == nome_root {
+        return Some(root_canonical.to_path_buf());
+    }
     let resto = clean.strip_prefix(&format!("{nome_root}/"))?;
     if resto.is_empty() {
         return None;
@@ -379,6 +387,23 @@ mod tests {
             .canonicalize()
             .expect("canonicalize atteso");
         assert_eq!(risolto, atteso);
+    }
+
+    /// Il nome della cartella DA SOLO: e' la forma che `list_files` riceve
+    /// (`{"directory": "prova-fix-10-08"}`) e significa «la root del progetto».
+    ///
+    /// MISURATA in esercizio il 10/08/2026 nello stesso run in cui le quattro
+    /// letture col sottopath passavano gia': il primo ripiego cercava il solo
+    /// prefisso `nome/` e qui il separatore non c'e'.
+    #[test]
+    fn il_nome_da_solo_e_la_root_del_progetto() {
+        let dir = root_di_prova();
+        let nome = dir.path().file_name().unwrap().to_string_lossy().to_string();
+
+        let risolto = resolve_relative_path_detailed(dir.path(), &nome)
+            .expect("il nome da solo deve risolvere nella root");
+
+        assert_eq!(risolto, dir.path().canonicalize().expect("root canonica"));
     }
 
     /// Una sottocartella OMONIMA al progetto e' il caso che uno strip
