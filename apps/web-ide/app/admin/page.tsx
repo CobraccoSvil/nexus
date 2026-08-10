@@ -7,6 +7,7 @@ import { useThemeColors } from "../../lib/theme";
 import { AdminPageHeader } from "../../components/admin/AdminPageHeader";
 import { getGatewayProviders, reloadGatewayConfig } from "../../lib/api-client";
 import { useProviderBudgets } from "../../components/settings/provider-budget";
+import { renderSpendCap } from "../../lib/api/provider-spend-cap";
 import { renderDeclaration, renderReadiness, type GatewayProvider } from "../../lib/api/gateway-providers";
 
 const SHORTCUTS: Array<{ label: string; href: Route; desc: string }> = [
@@ -61,7 +62,11 @@ export default function AdminDashboardPage() {
   };
   const cardTitle: React.CSSProperties = { fontSize: 13, fontWeight: 700, color: tc.text, marginBottom: 12, textTransform: "uppercase", letterSpacing: "0.05em" };
 
-  const budgetedProviders = budgets.items.filter((b) => parseFloat(b.monthly_budget_usd) > 0);
+  // NIENTE filtro sul tetto: nascondere i fornitori senza tetto nascondeva
+  // esattamente quelli che nessuno ferma (openrouter e kimi, secondo e quarto
+  // per chiamate reali, misurati il 10/08/2026). Il tetto assente ora ha un
+  // nome, e lo dichiara il wire.
+  const budgetProviders = budgets.items;
 
   return (
     <div>
@@ -143,28 +148,38 @@ export default function AdminDashboardPage() {
         {/* ── Budget mensile ── */}
         <div style={cardStyle}>
           <div style={cardTitle}>Budget mensile</div>
-          {budgetedProviders.length === 0 ? (
+          {budgetProviders.length === 0 ? (
             <div style={{ fontSize: 12, color: tc.textMuted }}>
-              Nessun budget impostato.{" "}
-              <Link href={"/admin/settings/providers" as Route} style={{ color: tc.accent }}>Impostane uno</Link>.
+              Nessun provider.{" "}
+              <Link href={"/admin/settings/providers" as Route} style={{ color: tc.accent }}>Configurane uno</Link>.
             </div>
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              {budgetedProviders.map((b) => {
+              {budgetProviders.map((b) => {
                 const budget = parseFloat(b.monthly_budget_usd);
                 const spent = parseFloat(b.spent_usd);
-                const pct = Math.min(100, (spent / budget) * 100);
+                const tetto = renderSpendCap(b.spend_cap);
+                // Senza tetto non c'e' una percentuale da mostrare: si mostra
+                // cio' che si sa, cioe' quanto ha gia' speso.
+                const pct = budget > 0 ? Math.min(100, (spent / budget) * 100) : 0;
                 return (
                   <div key={b.provider}>
-                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 3 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 3, gap: 8 }}>
                       <span style={{ fontWeight: 600, color: tc.text }}>{b.provider}</span>
                       <span style={{ color: tc.textMuted, fontFamily: "var(--font-mono)" }}>
-                        ${spent.toFixed(2)} / ${budget.toFixed(2)} ({pct.toFixed(0)}%)
+                        {budget > 0
+                          ? `$${spent.toFixed(2)} / $${budget.toFixed(2)} (${pct.toFixed(0)}%)`
+                          : `$${spent.toFixed(2)} spesi`}
                       </span>
                     </div>
                     <div style={{ height: 6, borderRadius: 3, background: tc.border, overflow: "hidden" }}>
                       <div style={{ height: "100%", width: `${pct}%`, background: pct > 90 ? "#c00" : pct > 70 ? "#f80" : "#0a0" }} />
                     </div>
+                    {tetto && (
+                      <div style={{ fontSize: 11, marginTop: 3, color: tetto.requiresAction ? "#fbbf24" : tc.textMuted }}>
+                        {tetto.label}
+                      </div>
+                    )}
                   </div>
                 );
               })}

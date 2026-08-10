@@ -3157,6 +3157,54 @@ else
   echo "OK dichiarazione-fornitore: il campo arriva alla pagina e sta nella fixture"
 fi
 
+# --- tetto-di-spesa ---------------------------------------------------------
+# «Questo fornitore ha un tetto — e se lo superasse, chi lo fermerebbe?»
+# (2026-08-10). MISURATO sul META vivo: `provider_health_probe` e' l'UNICO
+# presidio di spesa (`ai_quota_policies` ha 0 righe; `nexus_resource_quotas`
+# porta porte/memoria/disco per progetto) e pretendeva `monthly_budget_usd > 0`
+# dentro la propria query. Lo stesso `> 0` viveva in altri due posti del
+# frontend, e in uno di quelli — il riquadro BUDGET MENSILE di /admin — dalla
+# risposta negativa faceva SPARIRE la riga: openrouter e kimi, secondo e quarto
+# fornitore per chiamate reali (72 e 29 in 3 giorni), erano invisibili proprio
+# perche' nessuno aveva deciso un tetto per loro.
+#
+# Il criterio NON torna a essere un predicato SQL: enforcement e pannello devono
+# rispondere con la stessa funzione, o possono divergere sullo stesso fornitore.
+assert_single "tetto-di-spesa" 'pub fn classifica\(' \
+  'crates/mcp-core/src/provider_spend_cap.rs' crates/mcp-core/src/provider_spend_cap.rs
+
+tetto="crates/mcp-core/src/provider_spend_cap.rs"
+if [[ ! -f "$tetto" ]]; then
+  echo "!! tetto-di-spesa: $tetto non esiste piu'" >&2
+  fail=1
+# Si guardano le righe di CODICE, non il file: il criterio revocato compare
+# anche nella prosa che spiega perche' sia stato revocato, e un guard che
+# rosseggia per un commento e' il gemello del guard verde per assenza.
+elif sed 's|//.*||' crates/mcp-core/src/provider_health_probe.rs \
+     | grep -q 'monthly_budget_usd > 0'; then
+  echo "!! tetto-di-spesa: l'enforcement ha ricominciato a decidere da se' se un" >&2
+  echo "   tetto esista ('monthly_budget_usd > 0' nella query). E' il criterio di" >&2
+  echo "   provider_spend_cap: due copie divergono, e la copia silenziosa e'" >&2
+  echo "   quella che lascia spendere senza che nessuno lo veda." >&2
+  fail=1
+elif ! grep -q 'ferma_adesso' crates/mcp-core/src/provider_health_probe.rs; then
+  echo "!! tetto-di-spesa: provider_health_probe non delega piu' il verdetto" >&2
+  echo "   (ferma_adesso). Senza, l'is_exhausted della vista viene preso per buono" >&2
+  echo "   anche a tetto 0, dove e' vero per costruzione: (0 - speso) < soglia." >&2
+  fail=1
+elif grep -qE 'monthly_budget_usd\) > 0|monthly_budget_usd\) *> *0' apps/web-ide/app/admin/page.tsx; then
+  echo "!! tetto-di-spesa: il pannello /admin ha ricominciato a filtrare per" >&2
+  echo "   tetto. Nascondere i fornitori senza tetto nasconde esattamente quelli" >&2
+  echo "   che nessuno ferma: era il difetto segnalato il 10/08/2026." >&2
+  fail=1
+elif ! grep -q 'renderSpendCap' apps/web-ide/app/admin/page.tsx; then
+  echo "!! tetto-di-spesa: il verdetto non arriva piu' alla pagina. Un campo che" >&2
+  echo "   nessuno rende e' un campo che non esiste." >&2
+  fail=1
+else
+  echo "OK tetto-di-spesa: un solo criterio, e il pannello non nasconde chi non ha tetto"
+fi
+
 # --- vocabolario-capability -------------------------------------------------
 # «Di questa colonna di v_model_capabilities, chi la legge, di chi e' la
 # proprieta', con quale prova si accerta?» (2026-08-10). MISURATO: la vista

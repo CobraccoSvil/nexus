@@ -935,6 +935,39 @@ mod provider_names_tests {
         assert_eq!(out[1]["configured"], true);
     }
 
+    /// Il caso misurato il 10/08/2026: un fornitore che spende e che nessuno
+    /// fermerebbe. La entry deve ESISTERE e DICHIARARLO — prima il pannello la
+    /// filtrava via con un `monthly_budget_usd > 0` scritto in casa propria.
+    ///
+    /// MUTAZIONE che lo fa rosseggiare: togliere la `scrivi_tetto` da
+    /// `entry_budget`, oppure classificare il tetto 0 come `uncapped_idle`
+    /// ignorando lo speso. Il campo sparisce o cambia valore e l'assert cade.
+    #[test]
+    fn budget_senza_tetto_ma_con_spesa_e_dichiarato_sul_wire() {
+        let names = vec!["kimi".to_string()];
+        let mut r = budget_row("kimi", "0");
+        r.spent_current_period_usd = "0.195600".to_string();
+        r.remaining_usd = "0".to_string();
+        let out = merge_budget_entries(&names, vec![r]);
+        assert_eq!(out.len(), 1, "la riga non deve sparire dal pannello");
+        assert_eq!(out[0]["spend_cap"], "uncapped_spending");
+    }
+
+    #[test]
+    fn budget_con_tetto_e_dichiarato_capped() {
+        let out = merge_budget_entries(&["mistral".to_string()], vec![budget_row("mistral", "20.0")]);
+        assert_eq!(out[0]["spend_cap"], "capped");
+    }
+
+    /// Un fornitore senza riga non ha tetto, ma nemmeno spesa registrata:
+    /// dichiararlo `uncapped_spending` accuserebbe chi non ha speso nulla.
+    #[test]
+    fn budget_provider_senza_riga_e_uncapped_idle() {
+        let out = merge_budget_entries(&["vllm".to_string()], vec![]);
+        assert_eq!(out[0]["spend_cap"], "uncapped_idle");
+        assert_eq!(out[0]["configured"], false);
+    }
+
     #[test]
     fn budget_ordinamento_deterministico_segue_names() {
         let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
@@ -1730,43 +1763,59 @@ fn merge_budget_entries(names: &[String], rows: Vec<BudgetRow>) -> Vec<Value> {
     let mut items: Vec<Value> = Vec::with_capacity(names.len());
     for name in names {
         match by_provider.remove(name) {
-            Some(r) => items.push(json!({
-                "provider": r.provider,
-                "monthly_budget_usd": r.monthly_budget_usd,
-                "spent_usd": r.spent_current_period_usd,
-                "remaining_usd": r.remaining_usd,
-                "min_threshold_usd": r.min_threshold_usd,
-                "is_exhausted": r.is_exhausted,
-                "period_start": r.period_start.to_rfc3339(),
-                "configured": true,
-            })),
-            None => items.push(json!({
-                "provider": name,
-                "monthly_budget_usd": "0",
-                "spent_usd": "0",
-                "remaining_usd": "0",
-                // Default allineato a admin_set_provider_budget (threshold 1.0).
-                "min_threshold_usd": "1.0",
-                "is_exhausted": false,
-                "period_start": now.to_rfc3339(),
-                "configured": false,
-            })),
+            Some(r) => items.push(entry_budget(&r)),
+            None => {
+                let mut p = json!({
+                    "provider": name,
+                    "monthly_budget_usd": "0",
+                    "spent_usd": "0",
+                    "remaining_usd": "0",
+                    // Default allineato a admin_set_provider_budget (threshold 1.0).
+                    "min_threshold_usd": "1.0",
+                    "is_exhausted": false,
+                    "period_start": now.to_rfc3339(),
+                    "configured": false,
+                });
+                // Nessuna riga = nessun tetto e nessuna spesa registrata.
+                crate::provider_spend_cap::scrivi_tetto(
+                    &mut p,
+                    &crate::provider_spend_cap::SpendCap::UncappedIdle,
+                );
+                items.push(p);
+            }
         }
     }
     // Righe orfane: budget impostato per un provider non piu' nelle fonti.
     for (_, r) in by_provider {
-        items.push(json!({
-            "provider": r.provider,
-            "monthly_budget_usd": r.monthly_budget_usd,
-            "spent_usd": r.spent_current_period_usd,
-            "remaining_usd": r.remaining_usd,
-            "min_threshold_usd": r.min_threshold_usd,
-            "is_exhausted": r.is_exhausted,
-            "period_start": r.period_start.to_rfc3339(),
-            "configured": true,
-        }));
+        items.push(entry_budget(&r));
     }
     items
+}
+
+/// Una entry dal suo `BudgetRow`, con il verdetto sul tetto scritto dal punto
+/// unico (regola L). Il pannello NON ricava piu' da se' se un tetto esista:
+/// il suo `monthly_budget_usd > 0` era il terzo posto in cui quel criterio
+/// viveva, e l'unico dei tre che dalla risposta negativa faceva sparire la riga.
+fn entry_budget(r: &BudgetRow) -> Value {
+    let mut p = json!({
+        "provider": r.provider,
+        "monthly_budget_usd": r.monthly_budget_usd,
+        "spent_usd": r.spent_current_period_usd,
+        "remaining_usd": r.remaining_usd,
+        "min_threshold_usd": r.min_threshold_usd,
+        "is_exhausted": r.is_exhausted,
+        "period_start": r.period_start.to_rfc3339(),
+        "configured": true,
+    });
+    crate::provider_spend_cap::scrivi_tetto(
+        &mut p,
+        &crate::provider_spend_cap::classifica(
+            r.monthly_budget_usd.parse().ok(),
+            r.spent_current_period_usd.parse().ok(),
+            r.is_exhausted,
+        ),
+    );
+    p
 }
 
 /// GET /api/admin/providers/budget

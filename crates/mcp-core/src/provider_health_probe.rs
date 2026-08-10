@@ -209,16 +209,36 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
     // internamente lo speso e dichiariamo il provider unhealthy quando
     // (monthly_budget - spent) < min_threshold. Cosi' la UI mostra LED
     // giallo/rosso e il routing dinamico evita il provider.
-    let budget_exhausted: Option<bool> = sqlx::query_scalar(
-        "SELECT is_exhausted FROM provider_budget_remaining_view
-          WHERE provider = $1 AND monthly_budget_usd > 0",
+    //
+    // Il criterio "esiste un tetto?" NON e' piu' un `AND monthly_budget_usd > 0`
+    // scritto qui dentro: lo decide `provider_spend_cap`, che e' anche cio' che
+    // il pannello admin interroga. Con due `> 0` in due posti, enforcement e
+    // pannello potevano dare risposte diverse sullo stesso fornitore — ed e'
+    // esattamente cio' che accadeva: qui il fornitore senza tetto veniva
+    // scartato in silenzio, li' spariva dalla lista.
+    let fatti: Option<(Option<String>, Option<String>, bool)> = sqlx::query_as(
+        "SELECT monthly_budget_usd::text, spent_current_period_usd::text, is_exhausted
+           FROM provider_budget_remaining_view
+          WHERE provider = $1",
     )
     .bind(provider)
     .fetch_optional(db)
     .await
     .ok()
     .flatten();
-    if budget_exhausted == Some(true) {
+    let cap = match &fatti {
+        // Nessuna riga (o query fallita: `.ok()` sopra le confonde, come faceva
+        // gia' il codice precedente). In entrambi i casi non si ferma nessuno —
+        // e' la direzione giusta in cui sbagliare: un errore del DB non deve
+        // togliere di mezzo un fornitore sano.
+        None => crate::provider_spend_cap::SpendCap::UncappedIdle,
+        Some((budget, spent, esaurito)) => crate::provider_spend_cap::classifica(
+            budget.as_deref().and_then(|v| v.parse().ok()),
+            spent.as_deref().and_then(|v| v.parse().ok()),
+            *esaurito,
+        ),
+    };
+    if cap.ferma_adesso() {
         tracing::warn!(
             "provider_health_probe: {provider} budget esaurito (tracking interno) — skip probe + cooldown lungo"
         );

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useI18n } from "../../lib/i18n";
+import { renderSpendCap, type SpendCap } from "../../lib/api/provider-spend-cap";
 
 /**
  * Budget mensile per provider.
@@ -37,6 +38,12 @@ export type BudgetEntry = {
   /** false = provider attivo (registry/catalog/key) ma senza riga budget in DB:
    *  "Imposta budget" la crea (UPSERT); "Ricarica" (UPDATE-only) resta disabilitato. */
   configured?: boolean;
+  /**
+   * Il verdetto sul TETTO, da `mcp-core::provider_spend_cap`. Distinto da
+   * `configured`: una riga puo' esistere (creata dal primo addebito) e non
+   * portare alcun tetto — e' il caso in cui nessuno fermerebbe quel fornitore.
+   */
+  spend_cap?: SpendCap;
 };
 
 type BudgetDraft = { budget: string; threshold: string };
@@ -159,6 +166,11 @@ export function ProviderBudgetRow({
   // provider_health_probe, che considera esausti solo i provider con budget>0).
   const hasBudget = budget > 0;
   const configured = it.configured !== false && hasBudget;
+  // Il tetto assente ha due significati con due rimedi (sta spendendo / non ha
+  // ancora speso): il verdetto lo porta il wire, qui se ne fa un'etichetta.
+  // Se il campo manca — backend che non parla questa versione del contratto —
+  // si ripiega sul badge storico invece di lasciare la riga muta.
+  const tetto = renderSpendCap(it.spend_cap);
   const pct = hasBudget ? Math.min(100, (spent / budget) * 100) : 0;
   const exhausted = configured && it.is_exhausted;
 
@@ -172,8 +184,12 @@ export function ProviderBudgetRow({
               {t("badge.esaurito")}
             </span>
           ) : !hasBudget ? (
-            <span style={{ marginLeft: 8, fontSize: 11, padding: "2px 8px", borderRadius: 4, background: "var(--color-border)", color: "var(--color-textMuted)" }}>
-              {t("badge.nonImpostato")}
+            <span style={{
+              marginLeft: 8, fontSize: 11, padding: "2px 8px", borderRadius: 4,
+              background: tetto?.requiresAction ? "rgba(251,191,36,0.15)" : "var(--color-border)",
+              color: tetto?.requiresAction ? "#a16207" : "var(--color-textMuted)",
+            }}>
+              {tetto ? tetto.label : t("badge.nonImpostato")}
             </span>
           ) : null}
         </div>
