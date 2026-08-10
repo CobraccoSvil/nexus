@@ -1232,7 +1232,10 @@ async fn complete_with_retry(
                             || retry_after.is_some_and(|s| s > cap_s)
                             || std::time::Duration::from_millis(delay) > residual
                         {
-                            cooldown.mark_transient(name, Some(msg));
+                            // Il cooldown onora il `Retry-After` del provider: se ha
+                            // detto quando tornera' a servire, ripresentarsi prima
+                            // significa riprendere lo stesso errore (regola M).
+                            cooldown.mark_transient_after(name, Some(msg), retry_after);
                             return Err(failure);
                         }
                         tracing::warn!(
@@ -1248,6 +1251,17 @@ async fn complete_with_retry(
             }
         }
     }
+}
+
+/// Il `Retry-After` che il provider ha dichiarato, se l'errore lo porta.
+///
+/// PUNTO UNICO (regola L) dell'estrazione: il segnale e' TIPIZZATO dentro
+/// [`ProviderHttpError`] (che lo ha gia' letto dall'header, `parse_retry_after`) e si
+/// prende per downcast — mai ri-parsato dal testo del messaggio (regola M).
+fn retry_after_of(err: &anyhow::Error) -> Option<u64> {
+    err.chain()
+        .find_map(|c| c.downcast_ref::<ProviderHttpError>())?
+        .retry_after_seconds
 }
 
 /// Seed per il jitter del backoff: nanosecondi dell'orologio di sistema. Serve
@@ -1641,9 +1655,15 @@ async fn build_sse_stream(
                     ProviderErrorKind::ClientError => {}
                     // 413 troppo grande per il provider: sano, niente cooldown.
                     ProviderErrorKind::ContextTooLong => {}
-                    ProviderErrorKind::Transient => {
-                        state.cooldown.mark_transient(name, Some(msg.clone()))
-                    }
+                    // Anche sullo streaming il cooldown onora il `Retry-After`: il
+                    // segnale e' lo stesso del path non-streaming, e una durata
+                    // diversa a seconda del canale sarebbe due risposte alla stessa
+                    // domanda (regola L).
+                    ProviderErrorKind::Transient => state.cooldown.mark_transient_after(
+                        name,
+                        Some(msg.clone()),
+                        retry_after_of(&err),
+                    ),
                 }
                 // Stesso corpo del path non-streaming: qui usciva il solo
                 // `err.to_string()`, cioe' il body grezzo del provider — la
