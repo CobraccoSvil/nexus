@@ -225,8 +225,9 @@ pub use helpers::{
 pub use loop_signatures::{
     build_signature, detect_signature_loop, detect_signature_loop_progress_aware,
     detect_signature_loop_progress_aware_with, detect_signature_loop_with,
-    exploration_counter_update, ExplorationCounterUpdate, LoopDetection, LoopThresholds,
-    LOOP_THRESHOLD, RECENT_SIGNATURES_CAP,
+    exploration_counter_update, firma_esito_ricerca, nome_tool_da_firma, serie_in_stallo,
+    ExplorationCounterUpdate, LoopDetection, LoopThresholds, NaturaStallo, LOOP_THRESHOLD,
+    RECENT_SIGNATURES_CAP,
 };
 pub use m16::{
     build_m16_allowed, is_tool_allowed, merge_discovered_run, parse_discovered_tools,

@@ -89,7 +89,153 @@ pub fn build_signature(name: &str, input: &Value) -> String {
     for byte in digest.iter().take(6) {
         hex12.push_str(&format!("{byte:02x}"));
     }
-    format!("{name}|{hex12}")
+    format!("{name}{SEP_INPUT}{hex12}")
+}
+
+/// Separatore fra nome del tool e hash nella firma dell'INPUT
+/// ([`build_signature`]).
+const SEP_INPUT: char = '|';
+
+/// Separatore fra nome del tool e hash nella firma dell'ESITO
+/// ([`firma_esito_ricerca`]). DISTINTO da [`SEP_INPUT`] perche' le due firme
+/// rispondono a domande diverse e non devono mai confondersi in un confronto.
+const SEP_ESITO: char = '@';
+
+/// Il NOME DEL TOOL letto da una firma, qualunque sia la domanda a cui quella
+/// firma risponde (input o esito).
+///
+/// Punto unico (regola L): il nome si legge in due posti — lo sconto
+/// post-progresso di [`detect_signature_loop_progress_aware_with`], che deve
+/// sapere se il tool e' read-only, e il messaggio di chiusura dell'executor, che
+/// lo dice all'utente. Finche' il separatore era uno solo, `split_once('|')` a
+/// mano bastava; con due, una firma d'esito letta da chi conosce il solo `|`
+/// ritorna la stringa intera come "nome del tool" — cioe' non e' in nessuna
+/// lista di tool e viene classificata produttiva, che e' l'esatto contrario.
+pub fn nome_tool_da_firma(firma: &str) -> &str {
+    firma
+        .split_once(SEP_INPUT)
+        .or_else(|| firma.split_once(SEP_ESITO))
+        .map(|(nome, _)| nome)
+        .unwrap_or(firma)
+}
+
+/// Natura della ripetizione rilevata: che cosa, esattamente, si sta ripetendo.
+///
+/// Sono due fatti diversi con due rimedi diversi, e il consumatore (il messaggio
+/// all'utente, il payload della fase) deve poterli distinguere senza leggere il
+/// formato della firma (regola Q: l'esito sta in un campo).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NaturaStallo {
+    /// Stessa tool call, stesso input, senza progresso in mezzo.
+    StessoInput,
+    /// Chiamate DIVERSE che hanno restituito lo stesso identico insieme di
+    /// risultati: il modello varia la domanda e riceve sempre la stessa risposta.
+    StessoEsito,
+}
+
+impl NaturaStallo {
+    /// Chiave macchina per il payload strutturato della fase emessa (regola M:
+    /// chi legge quell'evento decide sul campo, non sulla frase).
+    pub fn chiave(self) -> &'static str {
+        match self {
+            Self::StessoInput => "signature_loop",
+            Self::StessoEsito => "same_result_loop",
+        }
+    }
+}
+
+/// La firma dell'ESITO di una ricerca: l'insieme ORDINATO dei risultati che ha
+/// restituito, non il testo con cui li si e' chiesti.
+///
+/// PERCHE' ESISTE. [`build_signature`] firma `nome | hash(input)`, cioe' cio'
+/// che si CHIEDE. Un agente che varia la query di una parola produce una firma
+/// nuova a ogni giro, e per il rilevatore non sta ripetendo: sta esplorando.
+///
+/// MISURATO il 10/08/2026 su `prova-fix-10-08`, per una domanda che si risolve
+/// leggendo un file di 183 righe: 17 chiamate a `nexus_search_semantic`, 16
+/// riuscite, TUTTE con gli stessi identici quattro hit da `index.html`. Le
+/// query erano `card prodotto`, `card prodotto product card`, `product card
+/// component card container product-card`, `card prodotto classe CSS`... —
+/// diciassette firme diverse per un unico risultato. 852K token e $0.11 spesi
+/// dopo che la prima chiamata aveva gia' la risposta.
+///
+/// Nessuno degli altri presidi poteva vederlo: `repeated_action_failed` guarda
+/// le ripetizioni che FALLISCONO (qui riuscivano tutte), `correction_progress`
+/// misura le SCRITTURE (qui non se ne fa nessuna), e
+/// `avanzamento_figura` usa questa stessa `build_signature`, quindi eredita la
+/// cecita' — ogni query nuova gli conta come strada mai percorsa, cioe' come
+/// avanzamento.
+///
+/// NON e' la regola M al contrario: l'esito e' gia' strutturato (`hits` con
+/// `source_id` e `chunk_index`), quindi la firma nasce da CAMPI e non dal testo
+/// della risposta. Dove quei campi non ci sono la firma non nasce: `None` dice
+/// «di questo esito non so dire nulla», che non e' «esito diverso».
+///
+/// ORDINATA e DEDUPLICATA perche' la domanda e' «ho gia' visto questo INSIEME
+/// di risultati?»: due ricerche che tornano gli stessi chunk in ordine di score
+/// diverso hanno trovato la stessa cosa, e per chi decide se continuare sono la
+/// stessa risposta.
+pub fn firma_esito_ricerca(tool_name: &str, tool_result: &Value) -> Option<String> {
+    let hits = tool_result.get("hits")?.as_array()?;
+    // Zero risultati NON produce firma: «non ho trovato niente» ripetuto puo'
+    // essere esplorazione legittima di query diverse, ed e' gia' coperto dal
+    // rilevatore sull'input. Qui si guarda cio' che si e' TROVATO.
+    if hits.is_empty() {
+        return None;
+    }
+    let mut chiavi: Vec<String> = hits
+        .iter()
+        .filter_map(|h| {
+            let fonte = h.get("source_id").and_then(Value::as_str)?;
+            let chunk = h
+                .get("chunk_index")
+                .and_then(Value::as_i64)
+                .map(|i| i.to_string())
+                .unwrap_or_default();
+            Some(format!("{fonte}#{chunk}"))
+        })
+        .collect();
+    // Un array di hit privo dei campi attesi non e' un insieme vuoto: e' una
+    // forma che non conosciamo, e su cui non si decide.
+    if chiavi.is_empty() {
+        return None;
+    }
+    chiavi.sort();
+    chiavi.dedup();
+    let mut hasher = Sha1::new();
+    hasher.update(chiavi.join("\u{1}").as_bytes());
+    let digest = hasher.finalize();
+    let mut hex12 = String::with_capacity(12);
+    for byte in digest.iter().take(6) {
+        hex12.push_str(&format!("{byte:02x}"));
+    }
+    Some(format!("{tool_name}{SEP_ESITO}{hex12}"))
+}
+
+/// Data la SERIE cronologica delle firme d'esito osservate per un tool, dice se
+/// le ultime `soglia` sono la stessa: N risposte identiche di fila a domande
+/// diverse.
+///
+/// PERCHE' QUI E NON NEL RACCOGLITORE. La serie la costruisce chi legge la
+/// history (un attraversamento con I/O sui messaggi); il CRITERIO su cosa quella
+/// serie significhi sta accanto al vocabolario che la produce, cosi' chi cambia
+/// la forma della firma vede subito la regola che la consuma.
+///
+/// La domanda e' sulle ultime `soglia` occorrenze CONSECUTIVE, non su un
+/// conteggio nella finestra: due esiti identici separati da un terzo diverso
+/// sono un'esplorazione che ha trovato qualcosa in mezzo, non uno stallo. Chi
+/// costruisce la serie ha gia' interrotto la sequenza dove c'e' stato lavoro
+/// (una scrittura rende legittima la ri-verifica dello stesso esito).
+///
+/// `soglia` 0 o 1 non e' una domanda sensata — un solo esito non e' una
+/// ripetizione — e ritorna `None`.
+pub fn serie_in_stallo(serie: &[String], soglia: usize) -> Option<String> {
+    if soglia < 2 || serie.len() < soglia {
+        return None;
+    }
+    let coda = &serie[serie.len() - soglia..];
+    let prima = coda.first()?;
+    coda.iter().all(|f| f == prima).then(|| prima.clone())
 }
 
 /// Esito della rilevazione loop: la signature eventualmente in loop e la coda
@@ -203,12 +349,6 @@ pub fn detect_signature_loop_progress_aware_with(
     combined.extend_from_slice(recent);
     combined.extend_from_slice(new_signatures);
 
-    let sig_name = |sig: &str| -> String {
-        sig.split_once('|')
-            .map(|(n, _)| n.to_string())
-            .unwrap_or_else(|| sig.to_string())
-    };
-
     let mut loop_signature: Option<String> = None;
     if combined.len() >= thresholds.signature && !new_signatures.is_empty() {
         let window_len = thresholds.signature * 2;
@@ -216,9 +356,11 @@ pub fn detect_signature_loop_progress_aware_with(
         let window = &combined[start..];
         // Posizione dell'ULTIMA firma produttiva nella finestra: le occorrenze
         // read-only PRECEDENTI sono "scontate" dal progresso.
-        let last_productive = window.iter().rposition(|s| !is_read_only(&sig_name(s)));
+        let last_productive = window
+            .iter()
+            .rposition(|s| !is_read_only(nome_tool_da_firma(s)));
         for sig in new_signatures {
-            let read_only = is_read_only(&sig_name(sig));
+            let read_only = is_read_only(nome_tool_da_firma(sig));
             let count = if read_only {
                 let from = last_productive.map(|p| p + 1).unwrap_or(0);
                 window[from..].iter().filter(|s| *s == sig).count()
@@ -333,6 +475,104 @@ mod tests {
         let a = build_signature("t", &Value::Null);
         let b = build_signature("t", &json!({}));
         assert_eq!(a, b);
+    }
+
+    /// Esito di una ricerca nella forma che il tool produce davvero: il payload
+    /// di `mcp-core::agent_tools::rag_search::payload_ricerca` (`query`, `count`,
+    /// `hits` con `source_id`/`chunk_index`). Il ponte col produttore VERO e' un
+    /// test in mcp-core (che dipende da questo crate, non viceversa): qui la
+    /// forma e' riprodotta, li' e' quella emessa dal tool.
+    fn esito_ricerca(hits: &[(&str, i64)]) -> Value {
+        let h: Vec<Value> = hits
+            .iter()
+            .map(|(fonte, chunk)| json!({"source_id": fonte, "chunk_index": chunk, "text": "..."}))
+            .collect();
+        json!({"query": "qualunque", "count": h.len(), "hits": h})
+    }
+
+    #[test]
+    fn firma_esito_ignora_la_query_e_l_ordine_dei_hit() {
+        // IL FATTO MISURATO (run su prova-fix-10-08): query diverse, stessi hit.
+        // Le due firme d'INPUT differiscono, quella d'ESITO no.
+        let a = firma_esito_ricerca(
+            "nexus_search_semantic",
+            &esito_ricerca(&[("index.html", 0), ("index.html", 2)]),
+        );
+        // Stessi hit in ordine di score diverso: hanno trovato la stessa cosa.
+        let b = firma_esito_ricerca(
+            "nexus_search_semantic",
+            &esito_ricerca(&[("index.html", 2), ("index.html", 0)]),
+        );
+        assert_eq!(a, b);
+        assert!(a.is_some());
+        assert_ne!(
+            build_signature("nexus_search_semantic", &json!({"query": "card prodotto"})),
+            build_signature(
+                "nexus_search_semantic",
+                &json!({"query": "card prodotto product card"})
+            ),
+            "le firme d'input DEVONO restare diverse: e' il difetto che l'esito copre"
+        );
+    }
+
+    #[test]
+    fn firma_esito_distingue_insiemi_diversi_e_tool_diversi() {
+        let uno = firma_esito_ricerca("t", &esito_ricerca(&[("a.md", 0)]));
+        let due = firma_esito_ricerca("t", &esito_ricerca(&[("a.md", 1)]));
+        assert_ne!(uno, due, "chunk diverso = risultato diverso");
+        let altro_tool = firma_esito_ricerca("u", &esito_ricerca(&[("a.md", 0)]));
+        assert_ne!(uno, altro_tool, "il nome del tool entra nella firma");
+    }
+
+    #[test]
+    fn firma_esito_assente_dove_non_c_e_nulla_da_dire() {
+        // Nessun campo `hits`: non e' una ricerca -> il criterio non si applica.
+        assert_eq!(
+            firma_esito_ricerca("read_file", &json!({"content": "..."})),
+            None
+        );
+        // Zero risultati: variare la query e' esplorazione legittima, gia'
+        // coperta dal rilevatore sull'input.
+        assert_eq!(firma_esito_ricerca("t", &esito_ricerca(&[])), None);
+        // Hit in una forma che non conosciamo: l'ignoto non e' "esito diverso".
+        assert_eq!(
+            firma_esito_ricerca("t", &json!({"hits": [{"altro": 1}]})),
+            None
+        );
+    }
+
+    #[test]
+    fn nome_tool_letto_da_entrambe_le_firme() {
+        let input = build_signature("nexus_search_semantic", &json!({"query": "x"}));
+        let esito = firma_esito_ricerca("nexus_search_semantic", &esito_ricerca(&[("a", 0)]))
+            .expect("firma d'esito");
+        assert_eq!(nome_tool_da_firma(&input), "nexus_search_semantic");
+        // REGRESSIONE: con `split_once('|')` questa ritornava la stringa intera,
+        // che nessuna lista di tool contiene -> firma classificata produttiva.
+        assert_eq!(nome_tool_da_firma(&esito), "nexus_search_semantic");
+        // Stringa senza separatore: e' gia' il nome.
+        assert_eq!(nome_tool_da_firma("read_file"), "read_file");
+    }
+
+    #[test]
+    fn serie_in_stallo_solo_su_occorrenze_consecutive() {
+        let a = "t@aaa".to_string();
+        let b = "t@bbb".to_string();
+        assert_eq!(
+            serie_in_stallo(&[a.clone(), a.clone(), a.clone()], 3),
+            Some(a.clone())
+        );
+        // Due identiche e una diversa in mezzo: ha trovato altro, non e' stallo.
+        assert_eq!(serie_in_stallo(&[a.clone(), b.clone(), a.clone()], 3), None);
+        // Sotto soglia.
+        assert_eq!(serie_in_stallo(&[a.clone(), a.clone()], 3), None);
+        // Conta la CODA: le vecchie diverse non salvano dalla ripetizione in atto.
+        assert_eq!(
+            serie_in_stallo(&[b, a.clone(), a.clone(), a.clone()], 3),
+            Some(a)
+        );
+        // Un solo esito non e' una ripetizione, a nessuna soglia.
+        assert_eq!(serie_in_stallo(&["t@x".to_string()], 1), None);
     }
 
     #[test]

@@ -164,7 +164,7 @@ use crate::decisions::helpers::{
 };
 use crate::decisions::loop_signatures::{
     build_signature, detect_signature_loop_progress_aware_with, exploration_counter_update,
-    LoopThresholds,
+    nome_tool_da_firma, LoopThresholds, NaturaStallo,
 };
 use crate::decisions::meta_reason::{build_stall_context, translate};
 use crate::decisions::orchestration_reason::context_pressure_from_tokens;
@@ -219,6 +219,14 @@ const SENTINELS: &[&str] = &["__router_unavailable__", "__no_capable_provider__"
 /// Meta-tool di discovery M16 (`_DISCOVERY_META` Python): set esposto al turno
 /// di scoperta (solo `nexus_mcp_tool_search` resta forzato).
 const DISCOVERY_META: &[&str] = &["nexus_mcp_tool_search", "nexus_mcp_tool_call"];
+
+/// Finestra di history su cui si guarda il PROGRESSO di una ripetizione. La
+/// stessa per le due domande gemelle — "stessa chiamata, esiti diversi?"
+/// ([`crate::routing::signals::repeated_signature_output_progress`]) e "chiamate
+/// diverse, stesso esito?" ([`crate::routing::signals::ricerca_senza_nuovi_risultati`]) —
+/// perche' guardano lo stesso fatto da due lati: due finestre diverse darebbero
+/// due idee diverse di quanto indietro conti il passato.
+const STALLO_ESITO_LOOKBACK: usize = 24;
 
 /// Config DB-driven dell'`ExecutorNode`, PASSATA (regola G: nessuna lettura DB nel
 /// nodo, nessun fallback hardcoded nella logica decisionale).
@@ -2269,6 +2277,47 @@ pub(crate) fn tool_uses_da_risposta(resp: &crate::runtime::ports::LlmResponse) -
         .iter()
         .map(|t| json!({"type": "tool_use", "id": t.id, "name": t.name, "input": t.input}))
         .collect()
+}
+
+/// La riga di fase emessa quando il run si interrompe per ripetizione.
+fn frase_di_stallo(natura: NaturaStallo, tool_name: &str) -> String {
+    match natura {
+        NaturaStallo::StessoInput => {
+            format!("Interrompo: '{tool_name}' ripetuto identico senza progresso")
+        }
+        NaturaStallo::StessoEsito => {
+            format!("Interrompo: '{tool_name}' restituisce sempre gli stessi risultati")
+        }
+    }
+}
+
+/// Il messaggio con cui il run chiude, composto DALLA natura dello stallo
+/// (regola Q punto 3: il testo si compone dai campi, mai il contrario).
+///
+/// Le due frasi sono diverse perche' i due fatti lo sono, e la differenza non e'
+/// di stile: a un modello che variava la query a ogni giro, «hai ripetuto lo
+/// stesso input» e' una diagnosi che non riconosce, e su cui non ha modo di
+/// correggersi.
+fn messaggio_di_chiusura_stallo(
+    natura: NaturaStallo,
+    tool_name: &str,
+    provider: &str,
+    model: &str,
+) -> String {
+    match natura {
+        NaturaStallo::StessoInput => format!(
+            "[LOOP RILEVATO] Il run e' stato interrotto: il tool '{tool_name}' e' stato \
+ripetuto con lo stesso input 3+ volte senza alcun progresso in mezzo ({provider}/{model}). \
+Riformula la richiesta in modo piu' specifico oppure indica un punto di partenza diverso."
+        ),
+        NaturaStallo::StessoEsito => format!(
+            "[LOOP RILEVATO] Il run e' stato interrotto: il tool '{tool_name}' ha restituito \
+3+ volte di fila lo stesso identico insieme di risultati, con richieste diverse e senza alcun \
+lavoro in mezzo ({provider}/{model}). Riformulare la domanda non porta altro: quei risultati \
+sono gia' tutto cio' che quella fonte contiene. Usa cio' che hai gia' ottenuto, oppure cambia \
+strumento."
+        ),
+    }
 }
 
 /// Firme (name+input) dei tool_use del turno, per il detector di signature-loop.
@@ -5596,16 +5645,13 @@ Riformula la richiesta, oppure riprova con un modello piu' capace di usare i too
         recent: &[String],
         esito: &mut EsitoTurno,
     ) -> Option<OpaqueDelta> {
-        let loop_sig = self.firma_in_loop(messages, recent, &esito.new_signatures)?;
-        let tool_name = loop_sig
-            .split_once('|')
-            .map(|(t, _)| t)
-            .unwrap_or(&loop_sig)
-            .to_string();
+        let (loop_sig, natura) = self.stallo_del_turno(messages, recent, esito)?;
+        let tool_name = nome_tool_da_firma(&loop_sig).to_string();
         tracing::warn!(
             target: "nexus_agent_graph::executor",
             tool = %tool_name,
-            "LOOP detected per signature ripetuta"
+            natura = natura.chiave(),
+            "LOOP detected: ripetizione senza progresso"
         );
         if self
             .promuovi_su_signature_loop(ctx, richiesta, &tool_name, esito)
@@ -5632,19 +5678,54 @@ Riformula la richiesta, oppure riprova con un modello piu' capace di usare i too
         self.emit_phase(
             ctx,
             "loop_break",
-            format!("Interrompo: '{tool_name}' ripetuto identico senza progresso"),
-            json!({"tool": tool_name, "reason": "signature_loop"}),
+            frase_di_stallo(natura, &tool_name),
+            json!({"tool": tool_name, "reason": natura.chiave()}),
         )
         .await;
-        let provider = &esito.provider;
-        let model = &esito.model;
-        let loop_msg = format!(
-            "[LOOP RILEVATO] Il run e' stato interrotto: il tool '{tool_name}' e' stato \
-ripetuto con lo stesso input 3+ volte senza alcun progresso in mezzo ({provider}/{model}). \
-Riformula la richiesta in modo piu' specifico oppure indica un punto di partenza diverso."
-        );
+        let loop_msg =
+            messaggio_di_chiusura_stallo(natura, &tool_name, &esito.provider, &esito.model);
         esito.chiudi_per_loop(loop_msg);
         None
+    }
+
+    /// La ripetizione senza progresso di questo turno, se c'e': la firma e la sua
+    /// NATURA (regola Q — chi la riceve deve poter distinguere i due casi senza
+    /// leggere il formato della firma).
+    ///
+    /// Sono due domande, e la seconda esiste perche' la prima non poteva
+    /// rispondere: [`Self::firma_in_loop`] chiede «stessa chiamata ripetuta?» e
+    /// un modello che varia la query di una parola le sfugge per costruzione;
+    /// [`ricerca_senza_nuovi_risultati`] chiede «stessa RISPOSTA ottenuta?», che
+    /// e' cio' che conta quando le chiamate riescono tutte.
+    ///
+    /// L'ordine non e' arbitrario: la firma d'input, quando c'e', dice qualcosa
+    /// di piu' preciso (l'identico input ripetuto) ed e' il caso storico.
+    fn stallo_del_turno(
+        &self,
+        messages: &[Message],
+        recent: &[String],
+        esito: &EsitoTurno,
+    ) -> Option<(String, NaturaStallo)> {
+        if let Some(sig) = self.firma_in_loop(messages, recent, &esito.new_signatures) {
+            return Some((sig, NaturaStallo::StessoInput));
+        }
+        // I tool che il turno sta chiedendo ADESSO: senza questo vincolo si
+        // fermerebbe un run che ha smesso di cercare e si e' messo a lavorare.
+        let richiesti: Vec<String> = esito
+            .pending_tool_uses
+            .iter()
+            .filter_map(|tu| tu.get("name").and_then(Value::as_str).map(String::from))
+            .collect();
+        if richiesti.is_empty() {
+            return None;
+        }
+        crate::routing::signals::ricerca_senza_nuovi_risultati(
+            messages,
+            &richiesti,
+            STALLO_ESITO_LOOKBACK,
+            self.cfg.loop_thresholds.signature,
+        )
+        .map(|firma| (firma, NaturaStallo::StessoEsito))
     }
 
     /// Firma del turno che il detector considera in loop, `None` se non c'e'.
@@ -5672,8 +5753,11 @@ Riformula la richiesta in modo piu' specifico oppure indica un punto di partenza
             self.cfg.loop_thresholds,
         );
         let sig = det.loop_signature?;
-        let progress =
-            crate::routing::signals::repeated_signature_output_progress(messages, &sig, 24);
+        let progress = crate::routing::signals::repeated_signature_output_progress(
+            messages,
+            &sig,
+            STALLO_ESITO_LOOKBACK,
+        );
         if progress {
             tracing::info!(
                 target: "nexus_agent_graph::executor",

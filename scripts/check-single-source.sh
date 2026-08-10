@@ -3291,6 +3291,33 @@ else
   echo "OK nascita-riga-run: un run nasce da un punto solo, e l'esito e' un campo"
 fi
 
+# --- firma-di-esito ---------------------------------------------------------
+# La firma dell'ESITO di una ricerca e il NOME DEL TOOL letto da una firma sono
+# vocabolario di UN modulo. Il nome, in particolare, si legge in due posti con
+# conseguenze opposte: lo sconto post-progresso del signature-loop (che deve
+# sapere se il tool e' read-only) e il messaggio di chiusura dell'executor. Con
+# due separatori in circolazione, chi ne conosce uno solo ritorna la firma
+# INTERA come "nome del tool" — che nessuna lista di tool contiene, quindi la
+# classifica produttiva: l'esatto contrario.
+assert_single "firma-di-esito" 'pub fn firma_esito_ricerca' \
+  'crates/nexus-agent-graph/src/decisions/loop_signatures.rs' crates
+assert_single "firma-di-esito" 'pub fn nome_tool_da_firma' \
+  'crates/nexus-agent-graph/src/decisions/loop_signatures.rs' crates
+
+# L'executor estraeva il nome del tool a mano (`loop_sig.split_once('|')`) e con
+# una firma d'esito quella riga non sbaglia rumorosamente: nomina il tool con
+# l'intera firma nel messaggio che l'utente legge.
+nome_a_mano=$(grep -nE '(loop_sig|sig|firma)\.split_once\(.\|.\)' \
+  crates/nexus-agent-graph/src/nodes/executor.rs || true)
+if [[ -n "$nome_a_mano" ]]; then
+  echo "!! firma-di-esito: l'executor legge il nome del tool da una firma senza" >&2
+  echo "   passare da nome_tool_da_firma:" >&2
+  echo "$nome_a_mano" >&2
+  fail=1
+else
+  echo "OK firma-di-esito: il nome del tool viene dal punto unico"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

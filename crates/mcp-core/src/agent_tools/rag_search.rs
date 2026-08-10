@@ -344,6 +344,41 @@ mod tests {
         assert_eq!(v["hits"][0]["source_id"], "frontend/src/App.tsx");
     }
 
+    /// PONTE COL CONSUMATORE (regola O): l'anti-loop riconosce «stessa risposta
+    /// a domande diverse» costruendo una firma dai campi `source_id`/
+    /// `chunk_index` degli hit — ma quei campi li scrive QUESTO produttore, e i
+    /// suoi test vivono in un altro crate, dove il payload e' riprodotto a mano.
+    /// Qui il payload e' quello VERO: se domani un hit cambia forma, il criterio
+    /// smette di nascere e questo test lo dice, invece di lasciare l'anti-loop
+    /// silenziosamente cieco con tutte le sue prove verdi.
+    #[test]
+    fn il_payload_reale_alimenta_la_firma_d_esito_dell_anti_loop() {
+        let hit = |chunk: i64| rag::search::SearchHit {
+            source_kind: "code".into(),
+            source_id: "index.html".into(),
+            chunk_index: chunk,
+            chunk_text: "<div class=\"product-card\">".into(),
+            score: 0.9,
+            metadata: Value::Null,
+        };
+        let report = || rag::SemanticSearchReport {
+            hits: vec![hit(0), hit(2)],
+            collections_fallite: Vec::new(),
+        };
+        // Due ricerche con query DIVERSE che trovano gli stessi chunk: e' il
+        // fatto misurato il 10/08/2026 (17 giri, sempre gli stessi quattro hit).
+        let firma_di = |query: &str| {
+            let out = render_search_result(query, report());
+            nexus_agent_graph::decisions::firma_esito_ricerca(
+                "nexus_search_semantic",
+                &payload_di(&out),
+            )
+        };
+        let prima = firma_di("card prodotto").expect("il payload reale deve produrre una firma");
+        let poi = firma_di("product card component");
+        assert_eq!(Some(prima), poi, "stessi hit, stessa firma d'esito");
+    }
+
     /// Un `top_k` negativo diventava il DEFAULT: la chiamata sbagliata veniva
     /// eseguita come se fosse giusta. Ora e' un rifiuto che nomina il campo.
     #[test]

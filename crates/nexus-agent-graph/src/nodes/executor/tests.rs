@@ -1893,6 +1893,99 @@ async fn signature_loop_chiude() {
 }
 
 #[tokio::test]
+async fn stallo_di_esito_chiude_anche_se_la_query_cambia_ogni_volta() {
+    // IL FATTO MISURATO (prova-fix-10-08): il modello varia la query a ogni giro
+    // e riceve sempre gli stessi quattro hit. Nessuna firma d'INPUT si ripete —
+    // `recent_tool_signatures` e' VUOTO apposta — quindi il detector storico non
+    // ha nulla da dire, ed e' esattamente il buco per cui il criterio esiste.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let esito = |q: &str| {
+        json!({
+            "query": q,
+            "count": 2,
+            "hits": [
+                {"source_id": "index.html", "chunk_index": 0, "text": "<div class=\"product-card\">"},
+                {"source_id": "index.html", "chunk_index": 2, "text": "</div>"},
+            ],
+        })
+        .to_string()
+    };
+    let mut messages = vec![human("quante card prodotto contiene index.html")];
+    for q in ["card prodotto", "card prodotto product card", "prodotto card griglia"] {
+        messages.push(ai_tool("nexus_search_semantic", json!({"query": q})));
+        messages.push(tool_msg_err(&esito(q)));
+    }
+    // Il turno corrente ne chiede una QUARTA, con una query ancora nuova.
+    let llm = llm_tool_call(
+        "nexus_search_semantic",
+        json!({"query": "card prodotto classe CSS"}),
+    );
+    let ctx = ctx_with(llm.clone());
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages,
+        tools_json: Some(vec![json!({"name": "nexus_search_semantic"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::LoopDetected));
+    // La quarta ricerca NON viene eseguita.
+    assert!(out.pending_tool_uses.unwrap().is_empty());
+    let result = out.result.as_deref().unwrap_or_default();
+    assert!(
+        result.contains("stesso identico insieme di risultati"),
+        "la diagnosi deve dire QUALE ripetizione: {result}"
+    );
+    assert!(
+        !result.contains("con lo stesso input"),
+        "dire 'stesso input' a chi variava la query e' una diagnosi che non \
+riconosce, e su cui non puo' correggersi: {result}"
+    );
+}
+
+#[tokio::test]
+async fn ricerca_ripetuta_dopo_una_scrittura_non_e_stallo() {
+    // Stessi tre esiti identici, ma con una scrittura in mezzo: e' una verifica
+    // dopo il lavoro, e puo' legittimamente ritrovare le stesse cose. Il run
+    // prosegue e la quarta ricerca viene eseguita.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let esito = json!({
+        "query": "x",
+        "count": 1,
+        "hits": [{"source_id": "index.html", "chunk_index": 0, "text": "card"}],
+    })
+    .to_string();
+    let mut messages = vec![human("aggiungi una card")];
+    for q in ["uno", "due"] {
+        messages.push(ai_tool("nexus_search_semantic", json!({"query": q})));
+        messages.push(tool_msg_err(&esito));
+    }
+    messages.push(ai_tool("edit_file", json!({"path": "index.html"})));
+    messages.push(tool_msg_err("modificato"));
+    messages.push(ai_tool("nexus_search_semantic", json!({"query": "tre"})));
+    messages.push(tool_msg_err(&esito));
+    let llm = llm_tool_call("nexus_search_semantic", json!({"query": "quattro"}));
+    let ctx = ctx_with(llm.clone());
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages,
+        tools_json: Some(vec![json!({"name": "nexus_search_semantic"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_ne!(out.stop_reason, Some(StopReason::LoopDetected));
+    assert_eq!(
+        out.pending_tool_uses.unwrap().len(),
+        1,
+        "la ricerca di verifica deve poter partire"
+    );
+}
+
+#[tokio::test]
 async fn errore_gateway_persiste_contatori() {
     // Il gateway LLM fallisce (provider down/billing). Parita' col ramo `except`
     // Python (py:3104-3107 -> return UNIFICATO py:3457-3513): il run NON aborta

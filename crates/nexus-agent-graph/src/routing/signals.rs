@@ -24,7 +24,7 @@
 
 use serde_json::Value;
 
-use crate::decisions::loop_signatures::build_signature;
+use crate::decisions::loop_signatures::{build_signature, firma_esito_ricerca, serie_in_stallo};
 use crate::state::{AgentState, ContentBlock, Message, MessageContent};
 
 use super::config::RoutingConfig;
@@ -710,9 +710,22 @@ pub const OUTPUT_SIMILARITY_THRESHOLD: f64 = 0.75;
 /// TESTO del primo tool_result dopo `idx` (gemello di
 /// [`tool_result_outcome_after`], stessa finestra e STESSE FORME accettate:
 /// `Message::Tool` langchain E `Message::Human` con blocchi `ToolResult`):
-/// usato per il confronto output-progresso. Cap [`OUTPUT_COMPARE_CAP`].
+/// usato per il confronto output-progresso.
 /// `None` se nessun tool_result nella finestra.
-fn tool_result_text_after(recent: &[Message], idx: usize, max_ahead: usize) -> Option<String> {
+///
+/// Il TAGLIO lo dichiara il chiamante, perche' le due domande che passano di qui
+/// lo vogliono opposto: il confronto output-progresso guarda la TESTA del testo
+/// e [`OUTPUT_COMPARE_CAP`] gli basta (evita di confrontare blob enormi), mentre
+/// chi deve DESERIALIZZARE il payload non puo' accettare alcun taglio — un JSON
+/// troncato non si parsa, e il criterio tacerebbe proprio sui risultati piu'
+/// ricchi. Un cap fisso qui dentro rendeva il secondo uso impossibile senza che
+/// nulla lo dichiarasse.
+fn tool_result_text_after(
+    recent: &[Message],
+    idx: usize,
+    max_ahead: usize,
+    cap: Option<usize>,
+) -> Option<String> {
     let end = (idx + 1 + max_ahead).min(recent.len());
     for nm in recent.iter().take(end).skip(idx + 1) {
         let content = match nm {
@@ -740,7 +753,10 @@ fn tool_result_text_after(recent: &[Message], idx: usize, max_ahead: usize) -> O
                 parts.join("\n")
             }
         };
-        return Some(text.chars().take(OUTPUT_COMPARE_CAP).collect());
+        return Some(match cap {
+            Some(n) => text.chars().take(n).collect(),
+            None => text,
+        });
     }
     None
 }
@@ -797,7 +813,8 @@ pub fn repeated_signature_output_progress(
     for (idx, m) in recent.iter().enumerate() {
         for (name, input) in message_tool_uses(m) {
             if build_signature(name, input) == target_sig {
-                if let Some(text) = tool_result_text_after(recent, idx, 3) {
+                if let Some(text) = tool_result_text_after(recent, idx, 3, Some(OUTPUT_COMPARE_CAP))
+                {
                     outputs.push(text);
                 }
             }
@@ -809,6 +826,97 @@ pub fn repeated_signature_output_progress(
     let last = &outputs[outputs.len() - 1];
     let prev = &outputs[outputs.len() - 2];
     !outputs_similar(prev, last)
+}
+
+/// La chiave che un payload di ricerca porta letteralmente quando ha risultati.
+/// Serve SOLO a evitare di deserializzare ogni tool_result della history (log,
+/// file letti, output di comandi): non e' un criterio — la decisione resta sui
+/// CAMPI dopo il parse (regola M) — ed e' esatta, non euristica, perche' un JSON
+/// con un campo `hits` contiene per forza questa sottostringa.
+const CHIAVE_HITS: &str = "\"hits\"";
+
+/// La firma d'ESITO del tool_use a `recent[idx]`, se quel tool ha risposto con
+/// un insieme di risultati. `None` per tutto il resto.
+///
+/// Il payload viaggia come TESTO (il tool serializza il proprio JSON e il wire
+/// porta stringhe), quindi qui si DESERIALIZZA prima di guardare i campi: non e'
+/// leggere lo stato tecnico dal testo (regola M), e' rimettere in forma un
+/// oggetto che il produttore aveva composto dai propri campi.
+fn firma_esito_del_tool_use(recent: &[Message], idx: usize, name: &str) -> Option<String> {
+    let testo = tool_result_text_after(recent, idx, 3, None)?;
+    if !testo.contains(CHIAVE_HITS) {
+        return None;
+    }
+    let payload: Value = serde_json::from_str(&testo).ok()?;
+    firma_esito_ricerca(name, &payload)
+}
+
+/// `Some(firma_esito)` se il tool che il turno sta chiamando ORA ha gia'
+/// risposto `soglia` volte di fila con lo STESSO identico insieme di risultati.
+///
+/// IL DIFETTO CHE COPRE, misurato il 10/08/2026 su `prova-fix-10-08`: 17
+/// chiamate a `nexus_search_semantic` in un run, 16 riuscite, tutte con gli
+/// stessi quattro hit da `index.html`, per una domanda che si risolveva leggendo
+/// un file di 183 righe — 852K token dopo che la PRIMA chiamata aveva gia' la
+/// risposta. Nessun presidio poteva vederlo: [`repeated_signature_output_progress`]
+/// e il signature-loop firmano l'INPUT, e query variate di una parola danno 17
+/// firme diverse; `repeated_action_failed` guarda le ripetizioni che FALLISCONO;
+/// `correction_progress` misura le scritture, e qui non se ne fa nessuna. Il
+/// vocabolario del repo lo diceva gia' — «solo una ripetizione che RIESCE senza
+/// progresso e' uno stallo vero» — ma quel caso non aveva un rilevatore.
+///
+/// GEMELLA E INVERSA di [`repeated_signature_output_progress`]: quella dice
+/// «stessa domanda, risposte diverse -> sta progredendo, non chiuderlo»; questa
+/// dice «domande diverse, stessa risposta -> sta girando a vuoto». Stesso
+/// attraversamento, stesso principio: il progresso si misura sull'ESITO.
+///
+/// TRE CAUTELE, tutte verso il NON rilevare:
+/// - il tool dev'essere fra quelli che il turno chiede ADESSO
+///   (`tool_richiesti_ora`): se il modello ha smesso di cercare e sta scrivendo,
+///   la ripetizione passata non e' un motivo per fermarlo — stessa condizione
+///   con cui il signature-loop pretende la firma fra le `new_signatures`;
+/// - un'AZIONE PRODUTTIVA azzera ogni serie: una ricerca ripetuta dopo una
+///   scrittura e' una verifica legittima, e puo' dare lo stesso esito;
+/// - un turno che emette PIU' tool_use non produce firme: il risultato non e'
+///   attribuibile con certezza al singolo tool_use (la history non porta qui il
+///   `tool_use_id`), e su un'attribuzione incerta non si decide.
+pub fn ricerca_senza_nuovi_risultati(
+    messages: &[Message],
+    tool_richiesti_ora: &[String],
+    lookback: usize,
+    soglia: usize,
+) -> Option<String> {
+    let recent = tail_messages(messages, lookback);
+    let mut serie: Vec<(String, Vec<String>)> = Vec::new();
+    for (idx, m) in recent.iter().enumerate() {
+        let uses = message_tool_uses(m);
+        if uses.is_empty() {
+            continue;
+        }
+        if let [(name, _)] = uses.as_slice() {
+            if let Some(firma) = firma_esito_del_tool_use(recent, idx, name) {
+                match serie.iter_mut().find(|(n, _)| n == name) {
+                    Some((_, s)) => s.push(firma),
+                    None => serie.push(((*name).to_string(), vec![firma])),
+                }
+                continue;
+            }
+        }
+        // Nessun insieme di risultati da questo turno: se ha fatto qualcosa che
+        // non e' sola lettura, e' lavoro, e ogni serie riparte da li'.
+        if uses
+            .iter()
+            .any(|(n, _)| !EXPLORATION_ONLY_TOOLS.contains(n))
+        {
+            serie.clear();
+        }
+    }
+    tool_richiesti_ora.iter().find_map(|name| {
+        serie
+            .iter()
+            .find(|(n, _)| n == name)
+            .and_then(|(_, s)| serie_in_stallo(s, soglia))
+    })
 }
 
 /// Conta le chiamate `request_port` negli ultimi `lookback` messaggi (default 16).
@@ -1181,7 +1289,8 @@ pub fn detect_repeated_action_detailed(
             // STESSO esito e' uno stallo (incidente "run_command: npm run build
             // si ripeteva senza ulteriore progresso" su un run che convergeva).
             if !is_read_only_repeatable_tool(name) && outcome == Some(true) {
-                let cur_out = tool_result_text_after(recent, idx, 3).unwrap_or_default();
+                let cur_out = tool_result_text_after(recent, idx, 3, Some(OUTPUT_COMPARE_CAP))
+                    .unwrap_or_default();
                 if let Some((_, prev_out)) = last_outputs.iter_mut().find(|(s, _)| *s == sig) {
                     if !outputs_similar(prev_out, &cur_out) {
                         if let Some((_, c)) = counts.iter_mut().find(|(s, _)| *s == sig) {
@@ -1574,6 +1683,168 @@ mod tests {
             tool_call_id: "c1".into(),
             content: MessageContent::text(text),
         }
+    }
+
+    /// Il testo di un tool_result di ricerca nella forma che il tool emette:
+    /// `payload_ricerca(...).to_string()`. `zavorra` allunga il testo dei chunk,
+    /// per riprodurre un payload REALE (con 4 chunk sta ben oltre i 4000
+    /// caratteri di [`OUTPUT_COMPARE_CAP`]).
+    fn testo_ricerca(query: &str, hits: &[(&str, i64)], zavorra: usize) -> String {
+        let h: Vec<Value> = hits
+            .iter()
+            .map(|(fonte, chunk)| {
+                json!({
+                    "source_id": fonte,
+                    "chunk_index": chunk,
+                    "score": 0.9,
+                    "text": "x".repeat(zavorra),
+                })
+            })
+            .collect();
+        json!({"query": query, "count": h.len(), "hits": h}).to_string()
+    }
+
+    /// Un giro di ricerca: la tool call e il suo risultato.
+    fn giro_ricerca(query: &str, hits: &[(&str, i64)], zavorra: usize) -> Vec<Message> {
+        vec![
+            ai_tool_input("nexus_search_semantic", json!({"query": query})),
+            human_tool_result(None, false, &testo_ricerca(query, hits, zavorra)),
+        ]
+    }
+
+    const RICERCA: &str = "nexus_search_semantic";
+
+    #[test]
+    fn stesso_esito_con_query_diverse_e_stallo() {
+        // IL FATTO MISURATO (prova-fix-10-08): query sempre diverse, stessi hit.
+        let stessi = [("index.html", 0), ("index.html", 2)];
+        let mut msgs = Vec::new();
+        for q in ["card prodotto", "card prodotto product card", "card prodotto HTML"] {
+            msgs.extend(giro_ricerca(q, &stessi, 0));
+        }
+        let attivi = vec![RICERCA.to_string()];
+        assert!(
+            ricerca_senza_nuovi_risultati(&msgs, &attivi, 24, 3).is_some(),
+            "tre risposte identiche a tre domande diverse sono uno stallo"
+        );
+        // Il presidio storico non lo vede, ed e' la ragione per cui questo esiste.
+        let firme: Vec<String> = ["card prodotto", "card prodotto product card", "card prodotto HTML"]
+            .iter()
+            .map(|q| build_signature(RICERCA, &json!({"query": q})))
+            .collect();
+        assert_eq!(
+            firme.iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "le firme d'INPUT restano tutte diverse"
+        );
+    }
+
+    #[test]
+    fn payload_oltre_il_cap_del_confronto_testuale_resta_leggibile() {
+        // REGRESSIONE DI PROGETTO: con il taglio a OUTPUT_COMPARE_CAP il JSON
+        // arriva troncato e non si parsa -> il criterio tacerebbe proprio sulle
+        // ricerche piu' ricche, che sono quelle che costano. Quattro chunk da
+        // 2000 caratteri: ~8000, il doppio del cap.
+        let stessi = [("a.md", 0), ("a.md", 1), ("b.md", 0), ("b.md", 1)];
+        let mut msgs = Vec::new();
+        for q in ["uno", "due", "tre"] {
+            msgs.extend(giro_ricerca(q, &stessi, 2000));
+        }
+        assert!(
+            testo_ricerca("uno", &stessi, 2000).len() > OUTPUT_COMPARE_CAP * 2,
+            "il payload di prova deve superare il cap, altrimenti non prova nulla"
+        );
+        assert!(
+            ricerca_senza_nuovi_risultati(&msgs, &[RICERCA.to_string()], 24, 3).is_some(),
+            "il payload va letto INTERO: un JSON troncato non si deserializza"
+        );
+    }
+
+    #[test]
+    fn una_scrittura_in_mezzo_azzera_la_serie() {
+        // Ricerca ripetuta DOPO lavoro: e' una verifica, e puo' legittimamente
+        // dare lo stesso esito.
+        let stessi = [("index.html", 0)];
+        let mut msgs = giro_ricerca("uno", &stessi, 0);
+        msgs.extend(giro_ricerca("due", &stessi, 0));
+        msgs.push(ai_tool_input("edit_file", json!({"path": "index.html"})));
+        msgs.push(human_tool_result(None, false, "ok"));
+        msgs.extend(giro_ricerca("tre", &stessi, 0));
+        assert_eq!(
+            ricerca_senza_nuovi_risultati(&msgs, &[RICERCA.to_string()], 24, 3),
+            None,
+            "dopo una scrittura la ri-verifica riparte da zero"
+        );
+    }
+
+    #[test]
+    fn niente_stallo_se_il_turno_non_cerca_piu() {
+        let stessi = [("index.html", 0)];
+        let mut msgs = Vec::new();
+        for q in ["uno", "due", "tre"] {
+            msgs.extend(giro_ricerca(q, &stessi, 0));
+        }
+        // Il turno corrente scrive: la ripetizione passata non e' un motivo per
+        // fermarlo adesso.
+        assert_eq!(
+            ricerca_senza_nuovi_risultati(&msgs, &["edit_file".to_string()], 24, 3),
+            None
+        );
+    }
+
+    #[test]
+    fn esiti_diversi_non_sono_stallo() {
+        let mut msgs = giro_ricerca("uno", &[("a.md", 0)], 0);
+        msgs.extend(giro_ricerca("due", &[("b.md", 0)], 0));
+        msgs.extend(giro_ricerca("tre", &[("c.md", 0)], 0));
+        assert_eq!(
+            ricerca_senza_nuovi_risultati(&msgs, &[RICERCA.to_string()], 24, 3),
+            None,
+            "ogni giro ha trovato qualcosa di nuovo"
+        );
+        // Zero risultati: variare la query e' esplorazione legittima.
+        let mut vuoti = Vec::new();
+        for q in ["uno", "due", "tre"] {
+            vuoti.extend(giro_ricerca(q, &[], 0));
+        }
+        assert_eq!(
+            ricerca_senza_nuovi_risultati(&vuoti, &[RICERCA.to_string()], 24, 3),
+            None
+        );
+    }
+
+    #[test]
+    fn turno_con_piu_tool_non_produce_firma_d_esito() {
+        // Il risultato non e' attribuibile al singolo tool_use (la history non
+        // porta qui il tool_use_id): su un'attribuzione incerta non si decide.
+        let stessi = [("index.html", 0)];
+        let mut msgs = Vec::new();
+        for q in ["uno", "due", "tre"] {
+            msgs.push(Message::Ai {
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::ToolUse {
+                        id: "c1".into(),
+                        name: RICERCA.into(),
+                        input: json!({"query": q}),
+                        thought_signature: None,
+                    },
+                    ContentBlock::ToolUse {
+                        id: "c2".into(),
+                        name: "read_file".into(),
+                        input: json!({"path": "index.html"}),
+                        thought_signature: None,
+                    },
+                ]),
+                tool_calls: vec![],
+                reasoning: None,
+                thinking_signature: None,
+            });
+            msgs.push(human_tool_result(None, false, &testo_ricerca(q, &stessi, 0)));
+        }
+        assert_eq!(
+            ricerca_senza_nuovi_risultati(&msgs, &[RICERCA.to_string()], 24, 3),
+            None
+        );
     }
 
     #[test]
