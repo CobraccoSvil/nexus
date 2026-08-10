@@ -10,6 +10,9 @@
     "run_id": "50187da9-a188-4861-a89a-67af5c1587b1",
     "total_tokens": 720874,
     "total_cost_usd": 0.1272,
-    "run_count": 1
+    "run_count": 1,
+    "breakdown": [
+      { "model": "mistral/mistral-small-latest", "tokens": 720874, "cost_usd": 0.1272 }
+    ]
   }
 }

@@ -29,6 +29,9 @@ export interface SessionUsageWire {
     total_tokens: number;
     total_cost_usd: number;
     run_count: number;
+    /** Ripartizione del RUN, dalla stessa fonte e dallo stesso elenco del suo
+     *  totale. Assente sui backend anteriori a questo campo. */
+    breakdown?: Array<{ model: string; tokens: number; cost_usd: number }>;
   } | null;
 }
 
@@ -44,6 +47,11 @@ export interface SessionUsage {
     totalTokens: number;
     totalCostUsd: number;
     runCount: number;
+    /** Ripartizione per modello del run. Lista VUOTA quando il backend non
+     *  manda il campo: «non me l'ha detto» e «non ha speso nulla» portano
+     *  entrambi a non mostrare voci, ma nessuna delle due e' uno zero
+     *  inventato — il totale accanto resta quello del ledger. */
+    breakdown: Array<{ model: string; tokens: number; costUsd: number }>;
   } | null;
 }
 
@@ -61,20 +69,26 @@ export function sessionUsageDalWire(res: SessionUsageWire): SessionUsage {
   return {
     totalTokens: res.total_tokens,
     totalCostUsd: res.total_cost_usd,
-    breakdown: (res.breakdown ?? []).map((b) => ({
-      model: b.model,
-      tokens: b.tokens,
-      costUsd: b.cost_usd,
-    })),
+    breakdown: ripartizioneDalWire(res.breakdown),
     currentRun: run
       ? {
           runId: run.run_id,
           totalTokens: run.total_tokens,
           totalCostUsd: run.total_cost_usd,
           runCount: run.run_count,
+          breakdown: ripartizioneDalWire(run.breakdown),
         }
       : null,
   };
+}
+
+/** La traduzione di UNA ripartizione, usata dai due perimetri. Il produttore
+ *  Rust ne compone una sola (`ripartizione_wire`): due letture divergerebbero
+ *  al primo campo rinominato, e lo farebbero su un solo perimetro. */
+function ripartizioneDalWire(
+  righe: Array<{ model: string; tokens: number; cost_usd: number }> | undefined,
+): Array<{ model: string; tokens: number; costUsd: number }> {
+  return (righe ?? []).map((b) => ({ model: b.model, tokens: b.tokens, costUsd: b.cost_usd }));
 }
 
 /**

@@ -76,6 +76,44 @@ test("il perimetro del run e' un insieme DIVERSO da quello della sessione", () =
   assert.ok(usage.currentRun!.totalTokens < usage.totalTokens);
 });
 
+test("la ripartizione del RUN somma al suo totale, e non e' quella della sessione", () => {
+  const usage = sessionUsageDalWire(corpoDalWire());
+  const run = usage.currentRun!;
+
+  // IL DIFETTO CHE CHIUDE (misurato il 10/08/2026): il footer del messaggio
+  // componeva questa lista dalle TRACCE e la riprezzava col catalogo, mentre il
+  // totale accanto veniva dal ledger. Risultato: mancavano kimi (15 chiamate
+  // nel ledger) e groq (10), e compariva openai a $0.0000 — che nelle stesse 12
+  // ore nel ledger non aveva una sola riga.
+  assert.ok(run.breakdown.length > 0, "la ripartizione del run deve essere letta dal wire");
+  const sommaToken = run.breakdown.reduce((acc, b) => acc + b.tokens, 0);
+  const sommaCosto = run.breakdown.reduce((acc, b) => acc + b.costUsd, 0);
+  assert.equal(sommaToken, run.totalTokens, "la ripartizione del run non somma ai suoi token");
+  assert.ok(
+    Math.abs(sommaCosto - run.totalCostUsd) < 1e-9,
+    `la ripartizione del run non somma al suo costo: ${sommaCosto} contro ${run.totalCostUsd}`,
+  );
+
+  // E' un insieme PROPRIO: il run ha usato un modello dei due che la
+  // conversazione ha visto. Se le due liste coincidessero, il footer starebbe
+  // mostrando il perimetro sbagliato — il difetto dell'08/08 in un altro posto.
+  assert.ok(
+    run.breakdown.length < usage.breakdown.length,
+    "la ripartizione del run non puo' essere quella dell'intera sessione",
+  );
+});
+
+test("un backend senza la ripartizione del run non inventa voci", () => {
+  const corpo = corpoDalWire();
+  delete corpo.current_run!.breakdown;
+
+  const usage = sessionUsageDalWire(corpo);
+  // Lista vuota, non voci a zero: il totale del run resta quello del ledger e
+  // il footer non mostra una ripartizione che nessuno gli ha mandato.
+  assert.deepEqual(usage.currentRun!.breakdown, []);
+  assert.equal(usage.currentRun!.totalCostUsd, 0.1272);
+});
+
 test("il run viaggia come parametro, o il backend non puo' calcolarne il perimetro", () => {
   const conRun = urlSessionUsage(
     "",

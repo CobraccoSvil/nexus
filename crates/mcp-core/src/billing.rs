@@ -691,18 +691,11 @@ pub async fn get_session_usage(
     // controllo usa l'elenco gia' letto, cosi' la verifica di appartenenza e la
     // definizione del perimetro non possono divergere.
     let run_corrente = match params.get("run_id").and_then(|s| Uuid::parse_str(s).ok()) {
-        Some(run_id) if run_ids.contains(&run_id) => {
-            let ids_run = crate::session_usage::run_ids_del_perimetro(
-                &session_pool,
-                crate::session_usage::Perimetro::RunConDiscendenza(run_id),
-            )
-            .await
-            .map_err(errore_perimetro)?;
-            let consumo = nexus_ledger::usage_for_runs(&state.db, &ids_run)
+        Some(run_id) if run_ids.contains(&run_id) => Some(
+            perimetro_del_run(&session_pool, &state.db, run_id)
                 .await
-                .map_err(errore_lettura)?;
-            Some((run_id, ids_run.len(), consumo))
-        }
+                .map_err(errore_lettura)?,
+        ),
         // Un `run_id` che non appartiene alla sessione non e' un errore da 4xx
         // (la chat lo passa a ogni refresh, e un run puo' essere appena nato o
         // di un'altra sessione): il perimetro semplicemente non c'e', e il wire
@@ -735,35 +728,89 @@ fn corpo_session_usage(
     session_id: Uuid,
     totale: &nexus_ledger::Consumption,
     per_modello: &[(String, nexus_ledger::Consumption)],
-    run_corrente: Option<(Uuid, usize, nexus_ledger::Consumption)>,
+    run_corrente: Option<PerimetroRun>,
 ) -> Value {
-    let breakdown: Vec<Value> = per_modello
-        .iter()
-        .map(|(modello, c)| {
-            json!({ "model": modello, "tokens": c.tokens, "cost_usd": c.cost })
-        })
-        .collect();
-
-    let current_run = match run_corrente {
-        Some((run_id, run_count, consumo)) => json!({
-            "run_id": run_id,
-            "total_tokens": consumo.tokens,
-            "total_cost_usd": consumo.cost,
-            // Quanti run compongono il perimetro: 1 = nessuna delega. Il
-            // consumatore lo mostra perche' «$0,13 su 4 run» e «$0,13 su 1 run»
-            // dicono cose diverse a chi valuta se un run e' costato troppo.
-            "run_count": run_count,
-        }),
-        None => Value::Null,
-    };
-
     json!({
         "session_id": session_id,
         "total_tokens": totale.tokens,
         "total_cost_usd": totale.cost,
-        "breakdown": breakdown,
-        "current_run": current_run,
+        "breakdown": ripartizione_wire(per_modello),
+        "current_run": run_corrente_wire(run_corrente),
     })
+}
+
+/// Il blocco `current_run` sul wire, o `null`.
+///
+/// `run_count` viaggia perche' «$0,13 su 4 run» e «$0,13 su 1 run» dicono cose
+/// diverse a chi valuta se un run e' costato troppo: senza, il numero non si
+/// puo' interpretare.
+fn run_corrente_wire(run_corrente: Option<PerimetroRun>) -> Value {
+    let Some(r) = run_corrente else {
+        return Value::Null;
+    };
+    json!({
+        "run_id": r.run_id,
+        "total_tokens": r.consumo.tokens,
+        "total_cost_usd": r.consumo.cost,
+        "run_count": r.run_count,
+        "breakdown": ripartizione_wire(&r.per_modello),
+    })
+}
+
+/// Il consumo di UN run e del lavoro che ha delegato: quali run compongono il
+/// perimetro, quanto hanno speso in tutto, e come si ripartisce.
+///
+/// Le tre letture stanno insieme perche' devono vedere lo STESSO elenco: totale
+/// e ripartizione presi con due elenchi diversi darebbero voci che non sommano
+/// al numero che le sta sopra, che e' il difetto gia' chiuso per la sessione.
+///
+/// La ripartizione e' la meta' che mancava. Finche' non c'era, il footer del
+/// messaggio se la componeva dalle TRACCE e la riprezzava col catalogo — due
+/// fonti per due numeri letti insieme, e infatti non tornavano: MISURATO il
+/// 10/08/2026, l'elenco diceva `mistral | openrouter x2 | openai $0.0000`
+/// mentre il ledger nelle stesse 12 ore aveva kimi (15 chiamate) e groq (10), e
+/// per openai non aveva una sola riga.
+async fn perimetro_del_run(
+    session_pool: &PgPool,
+    ledger_pool: &PgPool,
+    run_id: Uuid,
+) -> anyhow::Result<PerimetroRun> {
+    let ids_run = crate::session_usage::run_ids_del_perimetro(
+        session_pool,
+        crate::session_usage::Perimetro::RunConDiscendenza(run_id),
+    )
+    .await?;
+    let consumo = nexus_ledger::usage_for_runs(ledger_pool, &ids_run).await?;
+    let per_modello = nexus_ledger::usage_by_model_for_runs(ledger_pool, &ids_run).await?;
+    Ok(PerimetroRun {
+        run_id,
+        run_count: ids_run.len(),
+        consumo,
+        per_modello,
+    })
+}
+
+/// Il perimetro contabile di UN run: il totale e la sua ripartizione, dallo
+/// stesso elenco di run e dalla stessa fonte.
+///
+/// Una struct e non una tupla perche' i campi che porta sono due numeri e un
+/// conteggio: come posizionali sarebbero tre occasioni di scambiarne due senza
+/// che il compilatore se ne accorga.
+struct PerimetroRun {
+    run_id: Uuid,
+    run_count: usize,
+    consumo: nexus_ledger::Consumption,
+    per_modello: Vec<(String, nexus_ledger::Consumption)>,
+}
+
+/// La forma sul wire di una ripartizione per modello: una sola, usata dai DUE
+/// perimetri (sessione e run). Con due composizioni, il giorno in cui una
+/// cambiasse nome a un campo il consumatore ne leggerebbe una sola.
+fn ripartizione_wire(per_modello: &[(String, nexus_ledger::Consumption)]) -> Vec<Value> {
+    per_modello
+        .iter()
+        .map(|(modello, c)| json!({ "model": modello, "tokens": c.tokens, "cost_usd": c.cost }))
+        .collect()
 }
 
 async fn usage_report(db: &PgPool, query: UsageQuery) -> ApiResult {
@@ -1079,11 +1126,21 @@ mod tests {
                     consumo(6_413_580, 0.6712),
                 ),
             ],
-            Some((
-                Uuid::parse_str("50187da9-a188-4861-a89a-67af5c1587b1").expect("uuid run"),
-                1,
-                consumo(720_874, 0.1272),
-            )),
+            Some(PerimetroRun {
+                run_id: Uuid::parse_str("50187da9-a188-4861-a89a-67af5c1587b1")
+                    .expect("uuid run"),
+                run_count: 1,
+                consumo: consumo(720_874, 0.1272),
+                // La ripartizione del RUN e' un SOTTOINSIEME di quella di
+                // sessione, non una sua copia: qui il run ha usato un solo
+                // modello dei due che la conversazione ha visto. E' la
+                // proprieta' che il footer deve mostrare, e che prima non
+                // poteva perche' la componeva dalle tracce.
+                per_modello: vec![(
+                    "mistral/mistral-small-latest".to_string(),
+                    consumo(720_874, 0.1272),
+                )],
+            }),
         );
         let atteso: Value = serde_json::from_str(WIRE_SESSION_USAGE).expect("fixture leggibile");
         assert_eq!(
