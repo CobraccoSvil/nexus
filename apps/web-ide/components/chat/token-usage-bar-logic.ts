@@ -26,6 +26,8 @@
 // (`refreshSessionUsage`), e gli eventi sono segnali di avanzamento che ne
 // innescano la rilettura. Questo modulo rende quel contratto un tipo.
 
+import type { RigaRipartizione } from "../../lib/api/session-usage-wire";
+
 /** Token e costo di un perimetro, come li riporta il ledger. */
 export interface UsageTotals {
   totalTokens: number;
@@ -37,6 +39,13 @@ export interface CurrentRunUsage extends UsageTotals {
   runId: string;
   /** Quanti run compongono il perimetro: 1 = nessuna delega. */
   runCount: number;
+  /** La ripartizione per modello dello STESSO perimetro, dallo stesso elenco di
+   *  run e dalla stessa fonte del totale qui sopra. Viaggia col totale e non a
+   *  parte perche' il footer del nastro attivita' la mostra ACCANTO a quel
+   *  numero: prenderla da un'altra fonte e' il difetto misurato il 10/08/2026
+   *  (voci dalle tracce, totale dal ledger, e un provider che non aveva mai
+   *  chiamato). Lista vuota = il backend non l'ha dichiarata, mai voci a zero. */
+  breakdown: RigaRipartizione[];
 }
 
 /**

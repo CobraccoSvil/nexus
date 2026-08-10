@@ -15,9 +15,6 @@ import {
   composeActivityStream,
   figureVerdictDisplay,
   foldConsecutiveOkTools,
-  aggregateTokensByProvider,
-  etichetteVociCosto,
-  providerCostBreakdown,
   tracesForRun,
   capStreamToRecent,
   raggruppaBlocchiNastro,
@@ -26,12 +23,9 @@ import {
   type ActivityEvent,
   type ToolEvent,
   type ReviewGateEvent,
-  type ProviderTokenBucket,
 } from "./activity-stream.ts";
-import { bucketCost } from "../model-catalog.ts";
 import type { MetaStepEntry } from "./types.ts";
 import type { AgentStep, AITraceEvent } from "../api/agent.ts";
-import type { ModelCatalogEntry } from "../api/models.ts";
 
 // ── Costruttori di fixture ──────────────────────────────────────────────────
 
@@ -59,38 +53,6 @@ function step(
     toolResult: extra.toolResult,
     status,
     createdAt: ts(),
-  };
-}
-
-/** Riga di listino: le sole tariffe variano, il resto e' il contratto reale di
- *  `ModelCatalogEntry` (niente cast: un fixture che aggira il tipo smette di
- *  misurare il codice vero appena il contratto cambia). */
-function listino(
-  provider: string,
-  model: string,
-  inputPerMln: number,
-  outputPerMln: number,
-): ModelCatalogEntry {
-  return {
-    provider,
-    model,
-    displayName: model,
-    inputCostPerMillionTokens: inputPerMln,
-    outputCostPerMillionTokens: outputPerMln,
-    cacheReadCostPerMillionTokens: null,
-    cacheCreationCostPerMillionTokens: null,
-    currency: "USD",
-    performanceTier: null,
-    tierSource: null,
-    agenticIndex: null,
-    qualificationState: null,
-    speedTier: "medium",
-    capabilities: [],
-    contextWindow: 128_000,
-    supportsToolUse: true,
-    batchDiscountPct: 0,
-    isFeatured: false,
-    isEnabled: true,
   };
 }
 
@@ -759,108 +721,13 @@ test("provider di segmento preso dalla trace effettiva quando differisce dal pay
   assert.ok(providers.includes("anthropic"), "il provider effettivo dalla trace prevale");
 });
 
-test("aggregateTokensByProvider somma i token per coppia provider/model", () => {
-  beforeEach();
-  const runId = "run-1";
-  const traces = [
-    trace(runId, 1, "google", "gemini", { inputTokens: 100, outputTokens: 40 }),
-    trace(runId, 2, "google", "gemini", { inputTokens: 50, outputTokens: 10 }),
-    trace(runId, 3, "anthropic", "claude", { inputTokens: 200, outputTokens: 80 }),
-  ];
-  const buckets = aggregateTokensByProvider(traces);
-  assert.equal(buckets.length, 2);
-  const google = buckets.find((b) => b.provider === "google");
-  assert.equal(google?.inputTokens, 150);
-  assert.equal(google?.outputTokens, 50);
-  const anthropic = buckets.find((b) => b.provider === "anthropic");
-  assert.equal(anthropic?.inputTokens, 200);
-});
-
-test("due modelli dello stesso provider non danno due etichette identiche", () => {
-  beforeEach();
-  // Il difetto, osservato il 29/07/2026: la barra costi mostrava "openrouter"
-  // due volte con importi diversi ($2,9436 e $0,0011) e si leggeva come un
-  // doppio conteggio. Il conto era giusto -- erano `x-ai/grok-4.5` e
-  // `z-ai/glm-4.7-flash` -- ma l'etichetta mostrava meta' della chiave con cui
-  // le voci sono aggregate, quindi cio' che le distingue restava invisibile.
-  //
-  // Le voci arrivano dal produttore vero (`aggregateTokensByProvider`, la stessa
-  // funzione da cui passa `providerCostBreakdown`): costruire i bucket a mano
-  // fisserebbe qui l'assunto che il test deve verificare.
-  const runId = "run-1";
-  const voci = aggregateTokensByProvider([
-    trace(runId, 1, "openrouter", "x-ai/grok-4.5", { inputTokens: 900, outputTokens: 300 }),
-    trace(runId, 2, "openrouter", "z-ai/glm-4.7-flash", { inputTokens: 40, outputTokens: 10 }),
-    trace(runId, 3, "google", "gemini-3.1-flash-lite", { inputTokens: 60, outputTokens: 20 }),
-  ]);
-  const etichette = etichetteVociCosto(voci);
-  assert.equal(new Set(etichette).size, etichette.length, "due voci non possono avere la stessa etichetta");
-  // Il modello compare col solo nome: il prefisso dice chi lo ha fatto, che nel
-  // provider e' gia' implicito.
-  assert.ok(etichette.includes("openrouter grok-4.5"));
-  assert.ok(etichette.includes("openrouter glm-4.7-flash"));
-  // Il provider che compare una volta sola resta corto: la barra ha poco spazio
-  // e li' il modello non distingue nulla.
-  assert.ok(etichette.includes("google"));
-});
-
-test("senza modello l'etichetta non si allunga", () => {
-  beforeEach();
-  // Un modello assente non ha nulla da distinguere: allungare l'etichetta con
-  // un vuoto darebbe due righe ancora identiche, piu' una spaziatura sospetta.
-  const runId = "run-1";
-  const voci = aggregateTokensByProvider([
-    trace(runId, 1, "openrouter", undefined, { inputTokens: 10, outputTokens: 5 }),
-    trace(runId, 2, "openrouter", "x-ai/grok-4.5", { inputTokens: 20, outputTokens: 5 }),
-  ]);
-  const etichette = etichetteVociCosto(voci);
-  assert.ok(etichette.includes("openrouter"));
-  assert.ok(etichette.includes("openrouter grok-4.5"));
-});
-
-test("i token di cache entrano nel bucket e nel costo della ripartizione", () => {
-  beforeEach();
-  // Il difetto: la traccia porta il DETTAGLIO di cache accanto al prompt lordo,
-  // ma il bucket aggregava solo prompt e output e il footer prezzava solo
-  // quelli. Senza i due conteggi, i token serviti da cache restavano nel monte
-  // a tariffa piena di input: il footer dichiarava PIU' del ledger, e il divario
-  // era massimo proprio sui run che la cache serve meglio.
-  //
-  // Il prezzatore e' quello DI PRODUZIONE (`bucketCost`, la funzione che
-  // `ActivityCostFooter` passa a `providerCostBreakdown`), non una sua copia:
-  // finche' il test ne iniettava una propria, togliere le quantita' di cache
-  // dalla chiamata reale lasciava verde l'intera suite.
-  //
-  // MUTAZIONE che rende rosso: smettere di passare le quantita' di cache a
-  // `costFromCatalog` dentro `bucketCost` -> 500k token tornano a tariffa piena,
-  // il costo sale da 1.995 a 3.0.
-  const catalogo: ModelCatalogEntry[] = [listino("anthropic", "claude-x", 3.0, 15.0)];
-  catalogo[0].cacheReadCostPerMillionTokens = 0.3;
-  catalogo[0].cacheCreationCostPerMillionTokens = 3.75;
-  const prezzo = (b: ProviderTokenBucket) => bucketCost(b, catalogo);
-
-  const traces = [
-    // `inputTokens` e' il prompt LORDO: i 400k letti da cache e i 100k scritti
-    // ne fanno parte, quindi 500k restano a tariffa piena.
-    trace("padre", 1, "anthropic", "claude-x", {
-      inputTokens: 1_000_000,
-      outputTokens: 0,
-      cacheReadTokens: 400_000,
-      cacheCreationTokens: 100_000,
-    }),
-  ];
-  const r = providerCostBreakdown(traces, prezzo);
-  const voce = r.voci[0];
-  assert.equal(voce.cacheReadTokens, 400_000);
-  assert.equal(voce.cacheCreationTokens, 100_000);
-  // I token totali sono prompt lordo + output: 1M, non 1.5M (i token di cache
-  // sono gia' dentro il prompt e non si contano due volte).
-  assert.equal(r.totalTokens, 1_000_000);
-  assert.ok(
-    Math.abs(r.totalCostUsd - (1.5 + 0.12 + 0.375)) < 1e-9,
-    `atteso 1.995, ottenuto ${r.totalCostUsd}`,
-  );
-});
+// L'aggregazione dei token dalle TRACCE, il suo prezzatore col catalogo e i
+// test che li coprivano sono usciti di qui il 10/08/2026 insieme alla
+// ripartizione che alimentavano: le voci del footer vengono dal ledger, e con
+// esse il costo gia' calcolato. Le etichette — l'unica parte rimasta — si
+// provano dove ora nascono le voci (`use-run-cost-logic.test.ts`), cosi' il test
+// attraversa il produttore vero invece di un aggregatore che nessuno chiama piu'
+// (regola O).
 
 test("tracesForRun filtra per runId", () => {
   beforeEach();
@@ -893,71 +760,27 @@ test("tracesForRun include le trace dei sub-run, dichiarate dal parentRunId del 
   // Il figlio, guardato come run a se', porta solo le proprie trace.
   assert.equal(tracesForRun(traces, "sub-1").length, 1);
 
-  const buckets = aggregateTokensByProvider(conFigli);
-  const groq = buckets.find((b) => b.provider === "groq");
-  assert.equal(groq?.inputTokens, 300, "i token del subagente sono contabilizzati");
-  assert.equal(groq?.outputTokens, 50);
+  // La trace del subagente arriva col suo provider e i suoi token: e' cio' su
+  // cui il nastro costruisce i segmenti del lavoro delegato.
+  const delFiglio = conFigli.find((t) => t.runId === "sub-1");
+  assert.equal(delFiglio?.provider, "groq");
+  assert.equal(delFiglio?.inputTokens, 300);
+  assert.equal(delFiglio?.outputTokens, 50);
 });
 
 // ── Il difetto misurato il 26/07/2026 sul progetto e2e-todo ────────────────
 // La barra dichiarava la ripartizione per provider di un run e mostrava una sola
 // voce, "deepseek": i 4 cicli di review su openrouter/z-ai/glm-4.7-flash (21
-// iterazioni complessive, costo registrato in nexus_subagent_runs) non c'erano.
-// Non un'approssimazione: un provider intero omesso.
+// iterazioni complessive) non c'erano. Non un'approssimazione: un provider
+// intero omesso.
 //
-// Il test attraversa la stessa composizione che usa il footer
-// (`providerCostBreakdown`) e lo stesso prezzatore (`bucketCost`), e parte dalle
-// trace nella forma in cui arrivano dal wire.
-// MUTAZIONE: se `tracesForRun` torna a ignorare `parentRunId`, la voce openrouter
-// sparisce e il totale cala esattamente del costo del revisore.
-test("la ripartizione elenca il provider del revisore e il totale ne contiene il costo", () => {
-  beforeEach();
-  const catalogo: ModelCatalogEntry[] = [
-    listino("deepseek", "deepseek-v4-flash", 0.28, 0.42),
-    listino("openrouter", "z-ai/glm-4.7-flash", 0.1, 0.3),
-  ];
-  const prezzo = (b: ProviderTokenBucket) => bucketCost(b, catalogo);
-
-  // Token del ciclo di review piu' lungo misurato (12 iterazioni).
-  const REV_IN = 30_991;
-  const REV_OUT = 3_544;
-  const traces = [
-    trace("padre", 1, "deepseek", "deepseek-v4-flash", { inputTokens: 200_000, outputTokens: 9_000 }),
-    trace("review-1", 1, "openrouter", "z-ai/glm-4.7-flash", {
-      inputTokens: REV_IN,
-      outputTokens: REV_OUT,
-      parentRunId: "padre",
-    }),
-  ];
-
-  const ripartizione = providerCostBreakdown(tracesForRun(traces, "padre"), prezzo);
-  const providers = ripartizione.voci.map((v) => v.provider).sort();
-  assert.deepEqual(providers, ["deepseek", "openrouter"], "il revisore ha una sua voce");
-
-  // I dollari si confrontano a meno dell'ultimo bit di virgola mobile: sommare
-  // in ordine diverso cambia il risultato oltre la 15a cifra, e un'uguaglianza
-  // esatta renderebbe il test fragile su una differenza che non esiste.
-  const quasiUguale = (a: number, b: number, msg: string) =>
-    assert.ok(Math.abs(a - b) < 1e-12, `${msg}: ${a} != ${b}`);
-
-  const costoRevisore = (REV_IN * 0.1 + REV_OUT * 0.3) / 1_000_000;
-  const voceRevisore = ripartizione.voci.find((v) => v.provider === "openrouter");
-  quasiUguale(voceRevisore?.costUsd ?? 0, costoRevisore, "costo della voce revisore");
-  assert.equal(voceRevisore?.inputTokens, REV_IN);
-
-  // Il totale CONTIENE il contributo del revisore: la differenza con la
-  // ripartizione del solo run padre e' esattamente il suo costo (e i suoi token).
-  const soloPadre = providerCostBreakdown(
-    traces.filter((t) => t.runId === "padre"),
-    prezzo,
-  );
-  quasiUguale(
-    ripartizione.totalCostUsd - soloPadre.totalCostUsd,
-    costoRevisore,
-    "quota del revisore nel totale",
-  );
-  assert.equal(ripartizione.totalTokens - soloPadre.totalTokens, REV_IN + REV_OUT);
-});
+// Quella garanzia non si prova piu' qui, e non perche' sia decaduta: e' cambiato
+// il posto in cui vive. Il footer non compone piu' la ripartizione dalle trace,
+// quindi «il lavoro delegato entra nel costo del turno» e' ora una proprieta' del
+// PERIMETRO che il ledger interroga, provata su DB vero da
+// `session_usage::il_run_comprende_la_sua_discendenza_e_non_quella_altrui`
+// (crates/mcp-core). Qui resta il test sotto, che copre la stessa parentela per
+// il NASTRO — dove le trace dei sub-run continuano a produrre i loro segmenti.
 
 test("tracesForRun risale la catena: anche i nipoti appartengono al run", () => {
   beforeEach();

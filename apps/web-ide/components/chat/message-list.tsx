@@ -19,6 +19,7 @@ import { ActivityCostFooter } from "./activity-cost-footer";
 import { ActivityHistoryRow } from "./activity-history-row";
 import { InlineTruncated, formatStepInput } from "./step-detail";
 import { usageBadgeView } from "./usage-badge-logic";
+import type { CurrentRunUsage } from "./token-usage-bar-logic";
 import { runStatusBadgeSource } from "./run-status-display-logic";
 import { useResolvedRunSteps } from "../../lib/use-chat/use-run-steps";
 
@@ -661,6 +662,8 @@ function MessageActivityStream({
   metaSteps,
   steps,
   traces,
+  sessionId,
+  runCostNoto,
   foldThreshold,
   tc,
 }: {
@@ -668,6 +671,8 @@ function MessageActivityStream({
   metaSteps: MetaStepEntry[];
   steps: AgentStep[];
   traces: AITraceEvent[];
+  sessionId?: string;
+  runCostNoto?: CurrentRunUsage | null;
   foldThreshold: FoldThreshold;
   tc: ThemeColors;
 }) {
@@ -680,7 +685,16 @@ function MessageActivityStream({
   return (
     <div style={{ minWidth: 0 }}>
       <ActivityStreamView stream={stream} tc={tc} />
-      {traces.length > 0 && <ActivityCostFooter traces={traces} tc={tc} />}
+      {/* Il footer non e' piu' gatato dalle TRACCE: la ripartizione viene dal
+          ledger, e le tracce sono un altro insieme — un turno con righe di
+          ledger e senza trace in memoria (cap di sessione, reload) mostrava un
+          costo che il ledger conosceva benissimo. */}
+      <ActivityCostFooter
+        runId={runId}
+        sessionId={sessionId}
+        ripartizioneNota={runCostNoto}
+        tc={tc}
+      />
     </div>
   );
 }
@@ -1130,6 +1144,14 @@ export interface MessageListProps {
   agentStepsMap?: Map<string, AgentStep[]>;
   /** Trace gateway della SESSIONE (filtrate per runId dentro il nastro). */
   traces?: AITraceEvent[];
+  /** Sessione corrente: il footer costo del nastro la usa per chiedere al
+   *  ledger il perimetro contabile di un turno STORICO (il backend la vuole per
+   *  autorizzare e per risolvere il pool del progetto). */
+  sessionId?: string;
+  /** Il perimetro contabile gia' letto dal contatore sotto la chat. Il footer lo
+   *  riusa per il turno a cui appartiene invece di richiederlo: stessa fonte, e
+   *  quello e' riletto al ritmo del run. */
+  runCostNoto?: CurrentRunUsage | null;
   /** Flag chat.activity_stream_enabled (ADR 0037). OFF (default) = rendering
    *  odierno bit-identico; ON = nastro attivita'. */
   activityStreamEnabled?: boolean;
@@ -1194,6 +1216,8 @@ export function MessageList({
   metaStepsMap,
   agentStepsMap,
   traces,
+  sessionId,
+  runCostNoto,
   activityStreamEnabled = false,
   foldThreshold = 3,
 }: MessageListProps) {
@@ -1589,6 +1613,8 @@ export function MessageList({
                     metaSteps={runMeta}
                     steps={runSteps}
                     traces={runTraces}
+                    sessionId={sessionId}
+                    runCostNoto={runCostNoto}
                     foldThreshold={foldThreshold}
                     tc={tc}
                   />
@@ -1620,6 +1646,8 @@ export function MessageList({
                     metaSteps={runMeta}
                     steps={runSteps}
                     traces={runTraces}
+                    sessionId={sessionId}
+                    runCostNoto={runCostNoto}
                     foldThreshold={foldThreshold}
                     runStatus={message.runStatus}
                     totalTokens={message.totalTokens}

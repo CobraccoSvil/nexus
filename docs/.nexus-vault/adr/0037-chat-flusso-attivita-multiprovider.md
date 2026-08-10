@@ -61,6 +61,19 @@ aggiunge in quel solo punto.
   calcolo con prezzi hardcoded (regola G). Questo sostituisce l'uso di
   `model-catalog.ts` come fonte prezzi.
 
+  **SUPERATO il 10/08/2026.** Il footer non aggrega piu' le trace e non prezza
+  piu' nulla: voci, token e costo vengono dal LEDGER, dal perimetro del run e
+  dalla stessa lettura che porta il totale mostrato accanto
+  (`GET /api/billing/session-usage?run_id=...`, campo `current_run.breakdown`).
+  La decisione di allora non era sbagliata sui prezzi — il listino resta fuori
+  dal codice — ma sulla FONTE: il totale veniva gia' dal ledger e l'elenco no,
+  e i due non tornavano. MISURATO su un footer reale: `openai $0.0000` in
+  elenco, e nel ledger delle stesse 12 ore per openai nessuna riga, mentre kimi
+  (15 chiamate) e groq (10) non comparivano. Le trace sono un'ottima fonte per
+  il NASTRO (chi ha eseguito cosa, e quando) e una fonte sbagliata per la
+  contabilita', che ha gia' la sua. Vedi CLAUDE.md, riga «PERIMETRO contabile
+  del contatore di chat».
+
 ### 3. Densita' adattiva
 
 Guidata da `@container` query sul CONTENITORE della lista messaggi (il pannello

@@ -19,7 +19,6 @@
 
 import type { ModelCatalogEntry } from "./api/models";
 import type { AITraceEvent } from "./api/agent";
-import type { ProviderTokenBucket } from "./use-chat/activity-stream";
 
 /** Entry del catalogo per un (provider, model), o `null` se non coperto.
  *
@@ -82,47 +81,21 @@ export function costFromCatalog(
 }
 
 /**
- * Costo USD di un bucket di token (una coppia provider/model gia' aggregata):
- * il PREZZATORE che il footer costo-per-provider passa a `providerCostBreakdown`.
- *
- * Vive qui, e non dentro il componente, per una ragione di misura (regola O):
- * finche' stava nel `.tsx` nessun test poteva chiamarlo — il modulo tira dentro
- * React — e il test della ripartizione si iniettava un prezzatore PROPRIO che
- * ricopiava a mano questo stesso adattamento. Le due copie potevano divergere in
- * silenzio: togliendo di qui le quantita' di cache, tutti i test restavano verdi.
- * Ora il test chiama questa funzione, cioe' quella che gira nel footer.
- *
- * L'unica scelta locale al footer che resta incapsulata qui e' il modello non a
- * catalogo: contributo ZERO invece che voce nascosta. In una ripartizione per
- * provider omettere una voce falserebbe le proporzioni delle altre; il `null` di
- * `costFromCatalog` resta invece la risposta onesta per la cella singola.
- */
-export function bucketCost(
-  bucket: ProviderTokenBucket,
-  catalog: ModelCatalogEntry[],
-): number {
-  const entry = findCatalogEntry(catalog, bucket.provider, bucket.model);
-  return (
-    costFromCatalog(
-      entry,
-      bucket.inputTokens,
-      bucket.outputTokens,
-      // Le quantita' di cache vanno passate: omettendole, il loro sconto non lo
-      // applica nessuno e il footer dichiara PIU' del ledger, tanto piu' quanto
-      // meglio la cache ha servito.
-      bucket.cacheReadTokens,
-      bucket.cacheCreationTokens,
-    ) ?? 0
-  );
-}
-
-/**
  * Costo USD di una singola trace, `null` se il modello non e' a catalogo (la
  * cella si nasconde: un trattino e' onesto, uno zero e' una bugia).
  *
- * Sta qui per la stessa ragione di `bucketCost`: dentro `inline-trace-panel.tsx`
- * nessun test poteva chiamarla, e togliere le due quantita' di cache dalla
- * chiamata lasciava verde tutta la suite (regola O).
+ * Sta qui e non dentro `inline-trace-panel.tsx` per una ragione di misura
+ * (regola O): nel `.tsx` nessun test potrebbe chiamarla — il modulo tira dentro
+ * React — e togliere le due quantita' di cache dalla chiamata lascerebbe verde
+ * tutta la suite.
+ *
+ * NON e' piu' il prezzatore del footer costo-per-provider. Il gemello che lo
+ * era (`bucketCost`, che prezzava col catalogo i token aggregati dalle TRACCE)
+ * e' stato rimosso il 10/08/2026 insieme alla ripartizione che alimentava: quel
+ * costo ora arriva gia' calcolato dal ledger, cioe' dalla stessa fonte del
+ * totale che gli sta accanto. Qui resta la cella SINGOLA della trace, che e' una
+ * domanda diversa — quanto e' costata QUESTA chiamata secondo il listino — e ha
+ * un solo consumatore.
  *
  * I campi di cache sono opzionali sul wire — le trace persistite prima che il
  * campo esistesse non li portano — e in quel caso non c'e' nulla da scorporare.

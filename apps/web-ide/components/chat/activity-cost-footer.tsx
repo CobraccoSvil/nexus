@@ -2,57 +2,125 @@
 
 // Footer costo-per-provider del nastro attivita' (ADR 0037 sez. 2).
 //
-// Compone le voci per (provider, model) dal punto unico providerCostBreakdown e
-// le PREZZA col catalogo /api/models (usePricingCatalog di provider-badge.tsx).
-// NIENTE prezzi hardcoded (regola G): se il catalogo non ha la entry, il costo di
-// quella voce e' 0 e restano solo i token.
+// Le voci vengono dal LEDGER, dal perimetro del RUN (se stesso + i sub-run che
+// ha dispatchato) e dalla stessa lettura che porta il totale mostrato accanto.
+// Prima si componevano dalle TRACCE e si riprezzavano col catalogo /api/models,
+// mentre il totale veniva gia' dal ledger: due fonti per due numeri che l'utente
+// legge insieme, e infatti non tornavano — MISURATO il 10/08/2026, l'elenco
+// dichiarava `openai $0.0000` (zero righe nel ledger nelle stesse 12 ore) e
+// ometteva kimi e groq, che ne avevano 25.
 //
-// Le trace da passare sono quelle di `tracesForRun`, che include i sub-run: una
-// barra composta sulle sole trace del run padre dichiara una ripartizione e ne
-// omette i provider usati solo dai figli (difetto misurato il 26/07/2026 —
-// vedi `crates/mcp-core/src/run_lineage.rs`).
-//
-// La formula del costo vive in lib/model-catalog.ts (costFromCatalog) e con essa
-// il prezzatore del bucket (bucketCost): quel file non contiene piu' il listino
-// scritto a mano da cui l'ADR prendeva le distanze — ora e' solo il calcolo,
-// alimentato dal catalogo del DB. Qui NON si ricalcola nulla: un prezzatore
-// scritto in questo file non sarebbe raggiungibile da alcun test (il modulo tira
-// dentro React) e potrebbe divergere in silenzio da quello misurato.
+// Il quando si legge sta nell'hook (`useRipartizioneRun`), il che si puo'
+// dichiarare nel modulo puro (`use-run-cost-logic.ts`): qui resta solo la resa.
+// NIENTE prezzi qui e niente ripiego sulle tracce: se il ledger non ha dato la
+// ripartizione, il footer lo dice (regola Q) invece di ricomporne una da
+// un'altra fonte, che e' esattamente il difetto appena chiuso.
 //
 // Densita': a larghezze strette il NOME provider nei costi cede (classe
 // nx-as-cost-provider-name); restano barra + numeri.
 
 import { useThemeColors } from "../../lib/theme";
-import { providerBaseColor, usePricingCatalog } from "./provider-badge";
-import { etichetteVociCosto, providerCostBreakdown } from "../../lib/use-chat/activity-stream";
-import type { AITraceEvent } from "../../lib/api/agent";
-import { bucketCost } from "../../lib/model-catalog";
+import { providerBaseColor } from "./provider-badge";
+import { etichetteVociCosto } from "../../lib/use-chat/activity-stream";
+import { useRipartizioneRun } from "../../lib/use-chat/use-run-cost";
+import { vistaCostoRun, type VoceCostoLedger } from "../../lib/use-chat/use-run-cost-logic";
+import type { CurrentRunUsage } from "./token-usage-bar-logic";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
+/** Il perimetro contabile del turno, dichiarato nel tooltip: senza, i numeri
+ *  del footer e quelli del contatore sotto la chat si leggono come due misure
+ *  della stessa cosa che non tornano (sullo stesso istante misurato l'08/08:
+ *  $0,1272 il run, $2,6024 la conversazione). */
+function perimetroLeggibile(runCount: number): string {
+  const delegati = runCount - 1;
+  if (delegati <= 0) return "questo turno, dal ledger";
+  return delegati === 1
+    ? "questo turno e il lavoro che ha delegato (1 sub-run), dal ledger"
+    : `questo turno e il lavoro che ha delegato (${delegati} sub-run), dal ledger`;
+}
+
 export function ActivityCostFooter({
-  traces,
+  runId,
+  sessionId,
+  ripartizioneNota,
   tc,
 }: {
-  traces: AITraceEvent[];
+  runId: string;
+  /** Serve al backend per autorizzare e per risolvere il pool del progetto:
+   *  senza, il perimetro del run non e' chiedibile. */
+  sessionId?: string;
+  /** Il perimetro gia' letto dal contatore sotto la chat. Se e' di QUESTO run
+   *  si usa quello — stessa fonte, e riletto al ritmo del run invece che fermo
+   *  all'istante in cui il footer e' comparso. */
+  ripartizioneNota?: CurrentRunUsage | null;
   tc: ThemeColors;
 }) {
-  const catalog = usePricingCatalog();
-  // Composizione dal punto unico (regola L): quali voci esistono e come si
-  // sommano vive in `providerCostBreakdown`, testato senza React; qui resta il
-  // solo rendering e il listino, che il punto unico non conosce (regola G).
-  const { voci, totalTokens, totalCostUsd } = providerCostBreakdown(traces, (b) =>
-    bucketCost(b, catalog),
+  const vista = vistaCostoRun(useRipartizioneRun(sessionId, runId, ripartizioneNota));
+
+  if (vista.modo === "in_lettura") return null;
+  if (vista.modo === "nessun_consumo") {
+    // Non e' un footer vuoto: e' il ledger che per questo perimetro non ha
+    // ancora righe finalizzate (il caso normale di un turno appena partito).
+    return (
+      <GuscioFooter tc={tc} titolo="Nessuna riga di ledger finalizzata per questo turno.">
+        <span>nessun consumo registrato</span>
+      </GuscioFooter>
+    );
+  }
+  if (vista.modo === "non_disponibile") {
+    return (
+      <GuscioFooter tc={tc} titolo={`Contabilita' del turno non leggibile: ${vista.motivo}.`}>
+        <span>costo del turno non leggibile</span>
+      </GuscioFooter>
+    );
+  }
+
+  const totale = (
+    <span style={{ marginLeft: "auto" }}>
+      tot. <b style={{ color: tc.text }}>${vista.totalCostUsd.toFixed(4)}</b>
+    </span>
   );
-  if (voci.length === 0) return null;
 
-  // Il provider da solo non distingue due voci dello stesso provider su modelli
-  // diversi: il criterio sta col punto unico, qui resta la resa.
-  const etichette = etichetteVociCosto(voci);
-  const totalForBar = Math.max(totalTokens, 1);
+  if (vista.modo === "solo_totale") {
+    // Il backend ha dato il totale e non la sua ripartizione: si mostra quel che
+    // c'e' e si dichiara quel che manca, senza ricomporlo da un'altra fonte.
+    return (
+      <GuscioFooter tc={tc} titolo={`Token e costo di ${perimetroLeggibile(vista.runCount)}.`}>
+        <TokenTotali n={vista.totalTokens} tc={tc} />
+        <span>ripartizione per provider non dichiarata</span>
+        {totale}
+      </GuscioFooter>
+    );
+  }
 
+  const etichette = etichetteVociCosto(vista.voci);
+  return (
+    <GuscioFooter tc={tc} titolo={`Token e costo di ${perimetroLeggibile(vista.runCount)}.`}>
+      <TokenTotali n={vista.totalTokens} tc={tc} />
+      <BarraToken voci={vista.voci} totale={vista.totalTokens} tc={tc} />
+      {vista.voci.map((v, i) => (
+        <VoceCosto key={`cost-${i}`} voce={v} etichetta={etichette[i] ?? v.provider} />
+      ))}
+      {totale}
+    </GuscioFooter>
+  );
+}
+
+/** La riga del footer: stessa cornice per tutti i modi, cosi' un turno senza
+ *  ripartizione non si legge come un turno senza footer. */
+function GuscioFooter({
+  tc,
+  titolo,
+  children,
+}: {
+  tc: ThemeColors;
+  titolo: string;
+  children: React.ReactNode;
+}) {
   return (
     <div
+      title={titolo}
       style={{
         display: "flex",
         alignItems: "center",
@@ -67,64 +135,68 @@ export function ActivityCostFooter({
         minWidth: 0,
       }}
     >
-      <span>
-        <b style={{ color: tc.text }}>{totalTokens.toLocaleString("it-IT")}</b> tok
-      </span>
-      {/* Barra token per provider (colore brand, proporzionale) */}
-      <span
-        style={{
-          display: "flex",
-          height: 8,
-          width: 120,
-          borderRadius: 5,
-          overflow: "hidden",
-          border: `1px solid ${tc.border}`,
-          flexShrink: 0,
-        }}
-      >
-        {voci.map((b, i) => {
-          // Stessa misura del totale (`providerCostBreakdown.totalTokens`):
-          // prompt LORDO + output, coi token di cache gia' dentro il primo.
-          const frac = (b.inputTokens + b.outputTokens) / totalForBar;
-          return (
-            <span
-              key={`bar-${i}`}
-              style={{ width: `${(frac * 100).toFixed(1)}%`, background: providerBaseColor(b.provider) }}
-            />
-          );
-        })}
-      </span>
-      {voci.map((b, i) => {
-        const color = providerBaseColor(b.provider);
-        const etichetta = etichette[i] ?? b.provider;
-        return (
-          <span
-            key={`cost-${i}`}
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 5,
-              color,
-              minWidth: 0,
-            }}
-          >
-            <span
-              className="nx-as-cost-provider-name"
-              style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-            >
-              {etichetta}
-            </span>
-            <b style={{ color }}>${b.costUsd.toFixed(4)}</b>
-          </span>
-        );
-      })}
-      {/* Il totale portava il solo importo: accanto a tre cifre per fornitore
-          nella stessa riga, l'ultima si leggeva come un quarto fornitore senza
-          nome invece che come la loro somma. L'etichetta e' letterale come il
-          "tok" qui sopra -- questo footer non passa da i18n. */}
-      <span style={{ marginLeft: "auto" }}>
-        tot. <b style={{ color: tc.text }}>${totalCostUsd.toFixed(4)}</b>
-      </span>
+      {children}
     </div>
+  );
+}
+
+function TokenTotali({ n, tc }: { n: number; tc: ThemeColors }) {
+  return (
+    <span>
+      <b style={{ color: tc.text }}>{n.toLocaleString("it-IT")}</b> tok
+    </span>
+  );
+}
+
+/** Barra token per voce (colore brand del provider, proporzionale). La misura e'
+ *  la stessa del totale accanto: i token che il ledger ha contato per quella
+ *  coppia provider/modello. */
+function BarraToken({
+  voci,
+  totale,
+  tc,
+}: {
+  voci: VoceCostoLedger[];
+  totale: number;
+  tc: ThemeColors;
+}) {
+  const base = Math.max(totale, 1);
+  return (
+    <span
+      style={{
+        display: "flex",
+        height: 8,
+        width: 120,
+        borderRadius: 5,
+        overflow: "hidden",
+        border: `1px solid ${tc.border}`,
+        flexShrink: 0,
+      }}
+    >
+      {voci.map((v, i) => (
+        <span
+          key={`bar-${i}`}
+          style={{
+            width: `${((v.tokens / base) * 100).toFixed(1)}%`,
+            background: providerBaseColor(v.provider),
+          }}
+        />
+      ))}
+    </span>
+  );
+}
+
+function VoceCosto({ voce, etichetta }: { voce: VoceCostoLedger; etichetta: string }) {
+  const color = providerBaseColor(voce.provider);
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 5, color, minWidth: 0 }}>
+      <span
+        className="nx-as-cost-provider-name"
+        style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+      >
+        {etichetta}
+      </span>
+      <b style={{ color }}>${voce.costUsd.toFixed(4)}</b>
+    </span>
   );
 }
