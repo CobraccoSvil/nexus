@@ -102,6 +102,123 @@ struct SubagentSettings {
     tetto_moltiplicatore: i64,
 }
 
+/// Perche' la rete di sicurezza ha smesso di attendere: il run e' finito, oppure
+/// TACE da troppo tempo per essere ancora al lavoro.
+///
+/// Due cause distinte nel TIPO e non in un booleano (regola Q): chi tace e'
+/// bloccato dove nessun gate arriva, chi sfora il tetto stava lavorando — e i
+/// due referti non devono confondersi.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FineVeglia {
+    /// Nessun fatto registrato per piu' della soglia derivata dal budget.
+    Silenzio,
+    /// Il tetto assoluto e' scaduto mentre il run produceva fatti.
+    TettoAssoluto,
+}
+
+/// Che cosa dice UNA attesa sul canale del sub-run.
+///
+/// Separata dall'attendere perche' e' il CRITERIO, e un criterio si prova senza
+/// far passare il tempo: qui non c'e' `await`, quindi la tabella dei casi si
+/// legge tutta insieme invece che dentro tre livelli di `select!`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attesa {
+    /// Un fatto e' arrivato (o ne sono arrivati troppi): il run lavora.
+    RunVivo,
+    /// Nessun fatto entro la soglia.
+    Silenzio,
+    /// Il run ha chiuso il canale: non c'e' piu' nulla da osservare.
+    CanaleChiuso,
+}
+
+/// `Lagged` e' `RunVivo`, non silenzio: dice che gli eventi sono arrivati piu'
+/// in fretta di quanto la veglia li consumasse. Trattarlo come una scadenza
+/// ucciderebbe i run piu' operosi — quelli che riempiono il buffer.
+fn legge_attesa(
+    esito: Result<
+        Result<crate::agent_types::AgentStepEvent, tokio::sync::broadcast::error::RecvError>,
+        tokio::time::error::Elapsed,
+    >,
+) -> Attesa {
+    use tokio::sync::broadcast::error::RecvError;
+    match esito {
+        Ok(Ok(_)) | Ok(Err(RecvError::Lagged(_))) => Attesa::RunVivo,
+        Ok(Err(RecvError::Closed)) => Attesa::CanaleChiuso,
+        Err(_) => Attesa::Silenzio,
+    }
+}
+
+/// Veglia sul SILENZIO di un sub-run: ritorna quando il run smette di produrre
+/// fatti per piu' di `soglia`, oppure quando scade `tetto`.
+///
+/// PERCHE' NON E' UN `tokio::time::timeout` SULLA DURATA. Un timeout sulla
+/// durata totale non distingue un run che lavora da uno bloccato: li uccide
+/// entrambi alla stessa ora. Questa veglia guarda l'unica cosa che li distingue
+/// — se arrivano fatti — e per farlo NON serve un canale nuovo: il sub-run
+/// pubblica gia' i propri passi su un `broadcast`, e un secondo `subscribe()`
+/// osserva senza togliere nulla al ponte di narrazione.
+async fn veglia_sul_silenzio(
+    mut rx: tokio::sync::broadcast::Receiver<crate::agent_types::AgentStepEvent>,
+    soglia: std::time::Duration,
+    tetto: std::time::Duration,
+) -> FineVeglia {
+    let scadenza_tetto = tokio::time::sleep(tetto);
+    tokio::pin!(scadenza_tetto);
+    loop {
+        // La select ATTENDE e basta; che cosa significhi l'attesa lo dice
+        // `legge_attesa`, e la conseguenza si legge qui sotto tutta insieme.
+        let attesa = tokio::select! {
+            _ = &mut scadenza_tetto => return FineVeglia::TettoAssoluto,
+            esito = tokio::time::timeout(soglia, rx.recv()) => legge_attesa(esito),
+        };
+        match attesa {
+            Attesa::RunVivo => continue,
+            Attesa::Silenzio => return FineVeglia::Silenzio,
+            Attesa::CanaleChiuso => break,
+        }
+    }
+    // Canale chiuso: il run e' finito e non c'e' piu' nulla da osservare. Resta
+    // il solo tetto, che il ramo vincente della select chiamante battera'.
+    scadenza_tetto.await;
+    FineVeglia::TettoAssoluto
+}
+
+/// I tempi dello scatto, per il referto. Raggruppati perche' viaggiano insieme e
+/// da soli sarebbero cinque parametri posizionali dello stesso tipo — cioe'
+/// cinque occasioni di scambiarne due senza che il compilatore se ne accorga.
+struct ScattoVeglia {
+    soglia_silenzio_s: u64,
+    timeout_s: i64,
+    tetto_s: i64,
+    scatto_ms: u64,
+    ritardo_ms: u64,
+}
+
+/// Il referto di una veglia che ha chiuso: due frasi diverse perche' i due fatti
+/// lo sono, e chi legge il log deve distinguerli senza dedurlo dai numeri.
+fn logga_fine_veglia(fine: FineVeglia, sub_run_id: Uuid, kind: &str, t: ScattoVeglia) {
+    match fine {
+        FineVeglia::Silenzio => tracing::warn!(
+            sub_run_id = %sub_run_id,
+            kind = %kind,
+            soglia_silenzio_s = t.soglia_silenzio_s,
+            scatto_ms = t.scatto_ms,
+            "sub-run fermato per SILENZIO: nessun fatto registrato oltre la soglia \
+             derivata dal budget di una chiamata"
+        ),
+        FineVeglia::TettoAssoluto => tracing::warn!(
+            sub_run_id = %sub_run_id,
+            kind = %kind,
+            timeout_s = t.timeout_s,
+            tetto_s = t.tetto_s,
+            scatto_ms = t.scatto_ms,
+            ritardo_ms = t.ritardo_ms,
+            "sub-run scaduto al TETTO ASSOLUTO mentre produceva fatti: il tetto in \
+             tempo ha fermato una figura che stava lavorando"
+        ),
+    }
+}
+
 /// Il TETTO ASSOLUTO di una figura, dal suo timeout e dal moltiplicatore.
 ///
 /// PUNTO UNICO del calcolo (regola L): lo usano i DUE lati che devono
@@ -4183,6 +4300,11 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
     // il PONTE narrazione verso il padre (prima era scartato: feature muta);
     // senza narratore il receiver e' droppato e il comportamento e' lo storico.
     let (sub_tx, sub_rx) = tokio::sync::broadcast::channel(256);
+    // Secondo receiver per la VEGLIA sul silenzio, preso QUI perche' `sub_tx`
+    // entra in `native_input` poco sotto e da li' non e' piu' nostro. Un
+    // `subscribe()` non consuma eventi al ponte — il broadcast li consegna a
+    // entrambi — quindi osservare non toglie nulla alla narrazione.
+    let sub_tx_veglia = sub_tx.subscribe();
     let bridge = narrator.as_ref().map(|n| {
         spawn_narration_bridge(
             n.clone(),
@@ -4321,59 +4443,79 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
     // nella scrittura (pool esaurito) somigliava a un timer che scatta tardi:
     // due cause opposte con la stessa faccia.
     let t_budget_start = std::time::Instant::now();
-    let outcome: anyhow::Result<NativeRunOutcome> =
-        match tokio::time::timeout(std::time::Duration::from_secs(tetto_s.max(0) as u64), run_fut)
-            .await
-        {
-            Ok(res) => res,
-            Err(_) => {
-                // Misurato PRIMA di ogni await successivo: da qui in poi qualunque
-                // attesa (il ponte, il ledger, una connessione dal pool) sposta
-                // solo la scrittura, non lo scatto.
-                let scatto_ms = t_budget_start.elapsed().as_millis() as u64;
-                let ritardo_ms = ritardo_scatto_ms(scatto_ms, tetto_s);
-                tracing::warn!(
-                    sub_run_id = %subagent_run_id,
-                    kind = %kind,
+    // La soglia viene dal punto unico che conosce il budget di UNA chiamata
+    // (regole G/L): qui non si sceglie un numero, si legge quello che rende vera
+    // la domanda «da quanto tace?». `for_run` la riallinea al timeout REALE di
+    // questa figura, che per un `implement` non e' quello di un `review`.
+    let soglia_silenzio = nexus_auth::llm_timeouts::LlmTimeouts::resolve(&ctx.core.db)
+        .await
+        .for_run(Some(timeout_s.max(0) as u64))
+        .soglia_silenzio();
+    let veglia = veglia_sul_silenzio(
+        sub_tx_veglia,
+        soglia_silenzio,
+        std::time::Duration::from_secs(tetto_s.max(0) as u64),
+    );
+    tokio::pin!(run_fut);
+    // La select ATTENDE e basta: chi ha vinto lo dice il valore, e la
+    // conseguenza si legge sotto, al primo livello. Il run vince sempre quando
+    // conclude — la veglia e' una rete, non un concorrente — e `biased` toglie
+    // la casualita' proprio dove un run appena concluso e una scadenza
+    // simultanea darebbero due referti diversi per lo stesso fatto.
+    let esito_attesa = tokio::select! {
+        biased;
+        res = &mut run_fut => Err(res),
+        fine = veglia => Ok(fine),
+    };
+    let outcome: anyhow::Result<NativeRunOutcome> = match esito_attesa {
+        Err(res) => res,
+        Ok(fine) => {
+            // Misurato PRIMA di ogni await successivo: da qui in poi qualunque
+            // attesa (il ponte, il ledger, una connessione dal pool) sposta
+            // solo la scrittura, non lo scatto.
+            let scatto_ms = t_budget_start.elapsed().as_millis() as u64;
+            logga_fine_veglia(
+                fine,
+                subagent_run_id,
+                &kind,
+                ScattoVeglia {
+                    soglia_silenzio_s: soglia_silenzio.as_secs(),
                     timeout_s,
                     tetto_s,
                     scatto_ms,
-                    ritardo_ms,
-                    "sub-run scaduto al TETTO ASSOLUTO: il gate di progresso non lo ha \
-                     mai interrogato (nessun confine di iterazione raggiunto)"
-                );
-                stop_bridge(bridge).await;
-                // Il timeout marca comunque la riga TERMINALE (status='timeout'):
-                // deve passare per l'enqueue fan-in come gli altri rami (senza,
-                // un parent con l'ultimo figlio andato in timeout resterebbe
-                // sospeso per sempre). Non esce con return diretto.
-                // Il budget REALMENTE scaduto e' il tetto, non l'intervallo di
-                // lavoro: il referto deve nominare il tempo che la figura ha
-                // davvero avuto, o la diagnosi manderebbe a cercare un tetto
-                // stretto che non e' quello che ha scattato.
-                let out = finalize_timeout(
-                    &proj_pool,
-                    &ctx.core.db,
-                    narrator.as_deref(),
-                    subagent_run_id,
-                    &kind,
-                    tetto_s,
-                    &provider_resolved,
-                    &model_resolved,
-                )
-                .await;
-                maybe_enqueue_fanin_resume(
-                    &ctx,
-                    &proj_pool,
-                    anchor,
-                    fanin_parent_run_id,
-                    session_id,
-                    is_background,
-                )
-                .await;
-                return out;
-            }
-        };
+                    ritardo_ms: ritardo_scatto_ms(scatto_ms, tetto_s),
+                },
+            );
+            stop_bridge(bridge).await;
+            // Marca comunque la riga TERMINALE (status='timeout'): deve passare
+            // per l'enqueue fan-in come gli altri rami (senza, un parent con
+            // l'ultimo figlio scaduto resterebbe sospeso per sempre). Non esce
+            // con return diretto. Il referto nomina il TETTO e non l'intervallo
+            // di lavoro, o la diagnosi manderebbe a cercare un tetto stretto che
+            // non e' quello che ha scattato.
+            let out = finalize_timeout(
+                &proj_pool,
+                &ctx.core.db,
+                narrator.as_deref(),
+                subagent_run_id,
+                &kind,
+                tetto_s,
+                &provider_resolved,
+                &model_resolved,
+            )
+            .await;
+            maybe_enqueue_fanin_resume(
+                &ctx,
+                &proj_pool,
+                anchor,
+                fanin_parent_run_id,
+                session_id,
+                is_background,
+            )
+            .await;
+            return out;
+        }
+    };
     stop_bridge(bridge).await;
 
     let out = match outcome {
@@ -5784,6 +5926,82 @@ mod tests {
     /// gate chiuderebbe all'ora esatta di prima e il criterio di progresso non
     /// avrebbe mai occasione di parlare.
     ///
+    /// Un evento del sub-run, ridotto ai campi che la veglia guarda: lei non
+    /// legge il contenuto, guarda che ARRIVI.
+    fn evento_qualunque() -> crate::agent_types::AgentStepEvent {
+        crate::agent_types::AgentStepEvent {
+            run_id: "r".into(),
+            step: None,
+            trace: None,
+            is_final: false,
+            token_delta: None,
+            thinking_delta: None,
+            meta_step: None,
+        }
+    }
+
+    /// IL DIFETTO CHE LA VEGLIA CHIUDE: un run che PRODUCE non deve morire per
+    /// via dell'orologio. Qui i fatti arrivano a cadenza inferiore alla soglia
+    /// per un tempo che la supera di cinque volte — col vecchio
+    /// `tokio::time::timeout` sulla DURATA questo run sarebbe stato ucciso.
+    ///
+    /// MUTAZIONE: far chiudere la veglia sul primo fatto ricevuto (invece di far
+    /// ripartire la finestra) rende questo test rosso.
+    #[tokio::test(start_paused = true)]
+    async fn chi_produce_fatti_non_viene_fermato_dal_silenzio() {
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        let veglia = tokio::spawn(super::veglia_sul_silenzio(
+            rx,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(3600),
+        ));
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = tx.send(evento_qualunque());
+        }
+        assert!(
+            !veglia.is_finished(),
+            "un run che produce fatti non e' in silenzio, per quanto a lungo lavori"
+        );
+        veglia.abort();
+    }
+
+    /// L'altra meta': chi TACE oltre la soglia viene fermato, e la causa e'
+    /// dichiarata nel tipo — non e' il tetto, e i referti non si confondono.
+    #[tokio::test(start_paused = true)]
+    async fn chi_tace_oltre_la_soglia_viene_fermato_per_silenzio() {
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        // Il sender resta vivo: senza, il canale si chiuderebbe e la veglia
+        // finirebbe per un'altra ragione (canale chiuso), non per silenzio.
+        let _tx = tx;
+        let fine = super::veglia_sul_silenzio(
+            rx,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(3600),
+        )
+        .await;
+        assert_eq!(fine, super::FineVeglia::Silenzio);
+    }
+
+    /// Il buffer saturo NON e' silenzio: e' il segno che il run produce piu' in
+    /// fretta di quanto la veglia consumi. Trattare `Lagged` come una scadenza
+    /// ucciderebbe proprio i run piu' operosi.
+    ///
+    /// MUTAZIONE: classificare `Lagged` come `Silenzio` rende questo rosso.
+    #[test]
+    fn il_buffer_saturo_non_e_silenzio() {
+        use tokio::sync::broadcast::error::RecvError;
+        assert_eq!(
+            super::legge_attesa(Ok(Err(RecvError::Lagged(7)))),
+            super::Attesa::RunVivo,
+            "eventi troppo veloci non sono assenza di eventi"
+        );
+        assert_eq!(
+            super::legge_attesa(Ok(Err(RecvError::Closed))),
+            super::Attesa::CanaleChiuso
+        );
+    }
+
     /// MUTAZIONE: `timeout_s.max(0)` senza il moltiplicatore rende questo test
     /// rosso con 240 al posto di 960, cioe' col valore del difetto reale.
     #[test]

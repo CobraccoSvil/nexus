@@ -163,6 +163,35 @@ impl LlmTimeouts {
         self.per_attempt.max(self.stream_timeout)
     }
 
+    /// Oltre quanto SILENZIO un run non sta piu' lavorando, ma e' bloccato.
+    ///
+    /// PERCHE' ESISTE. La rete di sicurezza che avvolge un sub-run era armata
+    /// sulla DURATA TOTALE (`tetto_assoluto_s` = timeout x 4 = 1200s), e la
+    /// ragione dichiarata era coprire «un run wedged dentro una singola chiamata
+    /// al modello, che non raggiunge mai un confine di iterazione». Ma quel caso
+    /// non puo' durare 1200s: [`Self::client_budget`] e' il timeout del client
+    /// reqwest verso il gateway, quindi una chiamata si interrompe entro quel
+    /// tempo e il run TORNA al confine di iterazione, dove il criterio di
+    /// progresso decide. La durata totale non proteggeva da cio' per cui era
+    /// stata messa — e nel frattempo era LEI a decidere: il 09/08/2026 ha
+    /// fermato quattro figure su nove con 4, 5, 17 e 22 passi in corso, cioe'
+    /// mentre lavoravano.
+    ///
+    /// La domanda giusta non e' «da quanto va avanti» ma «da quanto TACE», e la
+    /// soglia non si sceglie a mano: la fissa il tempo massimo in cui una
+    /// chiamata puo' legittimamente non produrre nulla. Il fattore DUE copre il
+    /// turno che spende un budget pieno e ne ricomincia un altro senza aver
+    /// ancora registrato un passo: oltre due budget interi senza un solo fatto,
+    /// non c'e' lavoro in corso.
+    ///
+    /// Derivata e non configurabile: un setting a parte sarebbe una seconda
+    /// verita' da tenere allineata a `client_budget`, e il giorno in cui
+    /// divergessero la soglia mentirebbe con l'aria di una configurazione
+    /// (regola G).
+    pub fn soglia_silenzio(&self) -> Duration {
+        self.client_budget.saturating_mul(2)
+    }
+
     /// Valori di default (nessun DB disponibile): stessa derivazione, stessi
     /// invarianti. Niente numeri magici sparsi nei costruttori.
     pub fn defaults() -> Self {
@@ -274,6 +303,41 @@ mod tests {
             largo.per_attempt,
             largo.request_budget,
             "non puo' sforare il budget"
+        );
+    }
+
+    /// La soglia di silenzio sta SOPRA il tempo in cui una chiamata puo'
+    /// legittimamente tacere e SOTTO il tetto storico che sostituisce: sotto il
+    /// primo ucciderebbe chi aspetta una risposta legittima, sopra il secondo
+    /// non sarebbe un miglioramento ma un tetto piu' largo con un altro nome.
+    #[test]
+    fn la_soglia_di_silenzio_sta_fra_una_chiamata_e_il_tetto_storico() {
+        let t = LlmTimeouts::derive(300, 120, 300, DEFAULT_MIN_GUARANTEED_TURNS);
+        let silenzio = t.soglia_silenzio();
+        assert!(
+            silenzio > t.client_budget,
+            "una chiamata in volo non e' silenzio: {silenzio:?} deve superare {:?}",
+            t.client_budget
+        );
+        // Il tetto storico era timeout x 4 = 1200s con questi valori.
+        assert!(
+            silenzio < Duration::from_secs(1200),
+            "una soglia >= al tetto storico non cambierebbe nulla: {silenzio:?}"
+        );
+        assert_eq!(silenzio, Duration::from_secs(180));
+    }
+
+    /// La soglia SEGUE `client_budget` invece di essere un numero proprio: con
+    /// una figura piu' lunga il budget cresce e la soglia con lui. E' cio' che
+    /// le impedisce di diventare una seconda verita' da riallineare a mano.
+    #[test]
+    fn la_soglia_di_silenzio_segue_il_budget_e_non_e_un_numero_proprio() {
+        let corta = LlmTimeouts::derive(300, 120, 300, 4);
+        let lunga = LlmTimeouts::derive(1200, 120, 300, 4);
+        assert!(lunga.client_budget > corta.client_budget, "premessa del test");
+        assert!(
+            lunga.soglia_silenzio() > corta.soglia_silenzio(),
+            "la soglia deve muoversi col budget, non restare ferma"
         );
     }
 
