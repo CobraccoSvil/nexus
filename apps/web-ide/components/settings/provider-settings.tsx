@@ -10,15 +10,12 @@ import { getProviderRegistry, type ProviderRegistryEntry } from "../../lib/api/m
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
-export interface GatewayProvider {
-  name: string;
-  // null = gateway offline, stato dall'ultimo health probe o mai misurato
-  healthy: boolean | null;
-  configured?: boolean;
-  last_check?: string;
-  last_health_check_at?: string;
-  error?: string;
-}
+// Il tipo del wire vive in UN posto solo: `lib/api/gateway-providers`. Qui
+// restava una seconda dichiarazione senza i campi di prontezza, e i suoi
+// consumatori erano ciechi a quei campi per costruzione del tipo. Il re-export
+// tiene in piedi gli import esistenti senza duplicare la definizione.
+import type { GatewayProvider } from "../../lib/api/gateway-providers";
+export type { GatewayProvider };
 
 export interface SettingEntry {
   key: string;

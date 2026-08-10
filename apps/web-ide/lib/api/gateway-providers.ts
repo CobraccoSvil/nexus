@@ -1,0 +1,107 @@
+/**
+ * IL TIPO DEL WIRE dei provider del gateway, dichiarato UNA VOLTA SOLA.
+ *
+ * Prima viveva in due posti indipendenti e senza alcun legame: `GwEntry` in
+ * `components/ide-shell.tsx` (CON i campi di prontezza) e `GatewayProvider` in
+ * `components/settings/provider-settings.tsx` (SENZA). Il secondo rendeva i
+ * suoi consumatori ciechi ai campi nuovi per COSTRUZIONE DEL TIPO: non c'era
+ * niente da dimenticare di leggere, il campo semplicemente non esisteva.
+ *
+ * MISURATO a schermo il 10/08/2026 su /admin: `vllm` arriva dal wire con
+ * `readiness: "not_configured"` — «nessuno ha chiesto che funzionasse» — e la
+ * pagina scriveva «mai misurato», che e' il significato di un'ALTRA variante.
+ * Il ramo `healthy === null` collassava tre casi con rimedi opposti:
+ * non configurato (niente da fare), in attesa della prima misura (aspettare),
+ * stallo (serve un intervento). E' la regola Q vista dal lato del consumatore:
+ * il produttore aveva smesso di usare un booleano a tre stati, il consumatore
+ * no.
+ *
+ * E' la stessa forma del difetto «costi a $0.00 per camelCase», chiuso con la
+ * fixture di confine condivisa `__wire__/session-usage.json`: un solo tipo, e
+ * una fixture che i due lati leggono.
+ */
+
+/** Le varianti di prontezza dichiarate da `mcp-core::provider_readiness`. */
+export type ProviderReadiness =
+  | "not_configured"
+  | "awaiting_first_probe"
+  | "stalled"
+  | "healthy"
+  | "down";
+
+export type ReadinessCycle = "periodic_probe" | "reprobe";
+export type ReadinessCause = "no_models" | "no_verification_cycle";
+
+/** Una entry di `GET /api/gateway/providers`. */
+export interface GatewayProvider {
+  name: string;
+  /**
+   * `null` NON significa «mai misurato»: significa che non c'e' una misura, e
+   * il PERCHE' lo dice `readiness`. Leggere questo campo da solo e' il difetto.
+   */
+  healthy: boolean | null;
+  configured?: boolean;
+  last_check?: string;
+  last_health_check_at?: string;
+  error?: string;
+  cooldown_seconds_remaining?: number;
+  readiness?: ProviderReadiness;
+  readiness_cycle?: ReadinessCycle;
+  readiness_cause?: ReadinessCause;
+  readiness_models?: number;
+}
+
+/**
+ * Cio' che un pannello mostra per una entry: l'ETICHETTA breve e se il caso
+ * RICHIEDE UN INTERVENTO.
+ *
+ * Il secondo campo non e' un dettaglio di stile: e' il solo modo perche' uno
+ * stallo — l'unica variante che nessun ciclo risolvera' da solo — si distingua
+ * da un'attesa, che invece si risolve aspettando.
+ */
+export interface RenderedReadiness {
+  label: string;
+  requiresAction: boolean;
+}
+
+/**
+ * L'etichetta breve per una entry, DERIVATA dai campi (regola Q punto 3).
+ *
+ * Il cooldown ha la precedenza che aveva gia' in `ide-shell`: e' scritto da
+ * mcp-core indipendentemente da `readiness`, e dice una cosa che l'utente deve
+ * sapere prima di tutto il resto — quel provider e' escluso adesso, e per
+ * quanto.
+ *
+ * L'IGNOTO non degrada: una entry senza `readiness` viene da un backend che non
+ * parla questa versione del contratto, e lo dichiara invece di fingere una
+ * misura mai fatta.
+ */
+export function renderReadiness(p: GatewayProvider): RenderedReadiness {
+  const cooldown = p.cooldown_seconds_remaining;
+  if (typeof cooldown === "number" && cooldown > 0) {
+    return {
+      label: `in pausa per ${Math.ceil(cooldown / 60)} min`,
+      requiresAction: false,
+    };
+  }
+  switch (p.readiness) {
+    case "healthy":
+      return { label: "attivo", requiresAction: false };
+    case "down":
+      return { label: p.error?.split(":")[0] ?? "errore", requiresAction: false };
+    case "not_configured":
+      return { label: "non configurato", requiresAction: false };
+    case "awaiting_first_probe":
+      return { label: "in attesa della prima verifica", requiresAction: false };
+    case "stalled":
+      return { label: "fermo: serve un intervento", requiresAction: true };
+    default:
+      // Campo assente: il backend non dichiara la prontezza. Si ripiega sul
+      // solo fatto disponibile, e non si inventa una causa.
+      if (p.healthy === true) return { label: "attivo", requiresAction: false };
+      if (p.healthy === false) {
+        return { label: p.error?.split(":")[0] ?? "errore", requiresAction: false };
+      }
+      return { label: "prontezza non dichiarata", requiresAction: false };
+  }
+}

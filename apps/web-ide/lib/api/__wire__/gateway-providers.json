@@ -1,0 +1,69 @@
+{
+  "providers": [
+    {
+      "name": "anthropic",
+      "healthy": false,
+      "configured": true,
+      "error": "credit_balance_too_low",
+      "readiness": "down",
+      "cooldown_seconds_remaining": 21377
+    },
+    {
+      "name": "deepseek",
+      "healthy": true,
+      "configured": true,
+      "readiness": "healthy"
+    },
+    {
+      "name": "google",
+      "healthy": true,
+      "configured": true,
+      "readiness": "healthy"
+    },
+    {
+      "name": "groq",
+      "healthy": true,
+      "configured": true,
+      "readiness": "healthy"
+    },
+    {
+      "name": "kimi",
+      "healthy": true,
+      "configured": true,
+      "readiness": "healthy"
+    },
+    {
+      "name": "mistral",
+      "healthy": true,
+      "configured": true,
+      "readiness": "healthy"
+    },
+    {
+      "name": "openai",
+      "healthy": false,
+      "configured": true,
+      "error": "credit_balance_too_low",
+      "readiness": "down",
+      "cooldown_seconds_remaining": 21019
+    },
+    {
+      "name": "openrouter",
+      "healthy": true,
+      "configured": true,
+      "readiness": "healthy"
+    },
+    {
+      "name": "perplexity",
+      "healthy": false,
+      "configured": true,
+      "error": "credit_balance_too_low",
+      "readiness": "down",
+      "cooldown_seconds_remaining": 21196
+    },
+    {
+      "name": "vllm",
+      "configured": false,
+      "readiness": "not_configured"
+    }
+  ]
+}
