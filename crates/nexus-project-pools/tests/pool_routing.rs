@@ -10,6 +10,7 @@
 //! contratto verificato, e non distinguevano "variabile assente" da "DB che non
 //! risponde".
 
+use nexus_project_pools::EntityKind;
 use nexus_test_preconditions::db_o_salta;
 use uuid::Uuid;
 
@@ -62,7 +63,8 @@ async fn progetto_sconosciuto_fallisce_tipizzato() {
 async fn entita_non_mappata_ritorna_none() {
     let Some(pool) = db_o_salta().await else { return };
     let ghost = Uuid::new_v4();
-    let got = nexus_project_pools::project_id_for_entity(&pool, "session", ghost).await;
+    let got =
+        nexus_project_pools::project_id_for_entity(&pool, EntityKind::Session, ghost).await;
     assert!(got.is_none(), "entita' fantasma non deve risultare mappata");
 }
 
@@ -83,4 +85,49 @@ async fn sessione_sconosciuta_not_found() {
         }
         Err(e) => panic!("errore inatteso per sessione sconosciuta: {e}"),
     }
+}
+
+/// Ogni kind del vocabolario `EntityKind` deve essere ACCETTATO dalla CHECK di
+/// `nexus_data_routing`.
+///
+/// Il test attraversa il vincolo REALE (regola O): apre una transazione, prova
+/// l'INSERT esattamente come la fa `register_entity_routing` in produzione, e
+/// fa rollback. Confrontare l'enum col testo della migrazione sarebbe
+/// ricopiare la lista che si vuole verificare, e resterebbe verde proprio nel
+/// caso che conta — la migrazione non applicata al DB su cui il codice gira.
+///
+/// Perche' esiste: la CHECK della mig 0496 (30/06/2026) ammetteva i soli
+/// 'session' e 'run', mentre il codice ha aggiunto 'message', 'correction' e
+/// 'feedback'. MISURATO il 10/08/2026 sul meta-DB: 706 righe 'run', 187
+/// 'session', ZERO degli altri tre in 41 giorni — ogni scrittura respinta con
+/// SQLSTATE 23514 e l'errore ingoiato in un WARN. Allineamento: mig 0695.
+///
+/// MUTAZIONE che lo fa rosseggiare: togliere un kind dalla CHECK (o aggiungere
+/// una variante a `EntityKind::TUTTI` senza la migrazione che la ammette).
+/// Il messaggio nomina il kind rifiutato e il codice SQLSTATE.
+#[tokio::test]
+async fn la_check_ammette_ogni_kind_del_vocabolario() {
+    let Some(pool) = db_o_salta().await else { return };
+    let mut tx = pool.begin().await.expect("apertura transazione");
+    for kind in EntityKind::TUTTI {
+        let esito = sqlx::query(
+            "INSERT INTO nexus_data_routing (entity_kind, entity_id, project_id)              VALUES ($1, $2, $3)",
+        )
+        .bind(kind.as_str())
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .execute(&mut *tx)
+        .await;
+        if let Err(e) = esito {
+            let codice = match &e {
+                sqlx::Error::Database(db) => db.code().map(|c| c.to_string()),
+                _ => None,
+            };
+            panic!(
+                "la CHECK di nexus_data_routing rifiuta il kind '{kind}'                  (SQLSTATE {codice:?}): lo schema e' indietro rispetto a                  EntityKind::TUTTI. Ogni scrittura di questo kind sara' respinta                  in silenzio e la directory non potra' mai instradarlo.                  Errore: {e}"
+            );
+        }
+    }
+    // Rollback: il test resta idempotente (regola F) e non lascia righe.
+    tx.rollback().await.expect("rollback");
 }

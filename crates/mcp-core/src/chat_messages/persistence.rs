@@ -1,4 +1,5 @@
 use super::*;
+use crate::project_db_routes::EntityKind;
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -407,7 +408,7 @@ pub(crate) async fn insert_message_with_client_id(
 
     // Directory di routing (meta): registra message_id -> project_id cosi' gli
     // endpoint keyed solo dal messaggio (feedback, delete) risolvono il pool.
-    crate::project_db_routes::register_entity_routing(db, "message", message_id, project_id).await;
+    crate::project_db_routes::register_entity_routing(db, EntityKind::Message, message_id, project_id).await;
 
     Ok(ClientIdInsert::Inserted(message_id))
 }

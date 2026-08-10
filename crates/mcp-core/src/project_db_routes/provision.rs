@@ -11,6 +11,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use nexus_project_pools::EntityKind;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -724,7 +725,7 @@ pub async fn project_data_pool(
 /// `nexus_project_pools::project_id_for_entity` (regola L). `None` se non mappata.
 async fn resolve_project_for_entity(
     meta_db: &sqlx::PgPool,
-    entity_kind: &str,
+    entity_kind: EntityKind,
     entity_id: Uuid,
 ) -> Option<Uuid> {
     nexus_project_pools::project_id_for_entity(meta_db, entity_kind, entity_id).await
@@ -737,11 +738,15 @@ async fn resolve_project_for_entity(
 /// Best-effort. Delega al punto unico omonimo di nexus-project-pools (regola L).
 pub async fn register_entity_routing(
     meta: &sqlx::PgPool,
-    entity_kind: &str,
+    entity_kind: EntityKind,
     entity_id: Uuid,
     project_id: Uuid,
 ) {
-    nexus_project_pools::register_entity_routing(meta, entity_kind, entity_id, project_id).await
+    // L'esito e' un valore (regola Q) e il punto unico lo LOGGA distinguendo
+    // "schema indietro" da "guasto contingente". Qui resta best-effort per il
+    // chiamante: la creazione dell'entita' non fallisce per la directory.
+    let _ = nexus_project_pools::register_entity_routing(meta, entity_kind, entity_id, project_id)
+        .await;
 }
 
 pub async fn project_data_pool_by_session(
@@ -755,7 +760,7 @@ pub async fn project_data_pool_by_session(
     // dalla UI (fetch 404/lista vuota -> il client svuota la chat, incidente
     // 2026-07-02). Si CERCA la sessione nei DB-progetto e si auto-registra la
     // mappa per le chiamate successive.
-    project_data_pool_by_search_from(&state.db, "session", "chat_sessions", session_id).await
+    project_data_pool_by_search_from(&state.db, EntityKind::Session, "chat_sessions", session_id).await
 }
 
 // ── Pool per-progetto per gli helper senza &AppState (route-at-helper) ────────
@@ -812,7 +817,7 @@ pub async fn project_data_pool_by_session_from(
     meta: &sqlx::PgPool,
     session_id: Uuid,
 ) -> Result<sqlx::PgPool, ProjectDbError> {
-    project_data_pool_by_search_from(meta, "session", "chat_sessions", session_id).await
+    project_data_pool_by_search_from(meta, EntityKind::Session, "chat_sessions", session_id).await
 }
 
 /// Elenco dei `project_id` (tabella globale `projects`, meta-DB). Serve al
@@ -834,7 +839,7 @@ pub async fn list_all_project_ids(meta: &sqlx::PgPool) -> Vec<Uuid> {
 /// produceva a valle un errore SQL non strutturato o una lettura vuota.
 async fn project_data_pool_by_search_from(
     meta: &sqlx::PgPool,
-    entity_kind: &'static str,
+    entity_kind: EntityKind,
     table: &str,
     entity_id: Uuid,
 ) -> Result<sqlx::PgPool, ProjectDbError> {
@@ -852,7 +857,7 @@ async fn project_data_pool_by_search_from(
             Err(e) => {
                 tracing::warn!(
                     project_id = %pid,
-                    entity_kind,
+                    entity_kind = entity_kind.as_str(),
                     entity_id = %entity_id,
                     error = %e,
                     "routing by-id: DB-progetto irraggiungibile durante la ricerca, progetto saltato"
@@ -873,7 +878,7 @@ async fn project_data_pool_by_search_from(
             return Ok(pool);
         }
     }
-    Err(search_exhausted_outcome(entity_kind, entity_id, unreachable))
+    Err(search_exhausted_outcome(entity_kind.as_str(), entity_id, unreachable))
 }
 
 /// Verdetto (e logging) della ricerca by-id esaurita: "non trovata" e'
@@ -911,7 +916,7 @@ pub async fn project_data_pool_by_message_from(
     meta: &sqlx::PgPool,
     message_id: Uuid,
 ) -> Result<sqlx::PgPool, ProjectDbError> {
-    project_data_pool_by_search_from(meta, "message", "chat_messages", message_id).await
+    project_data_pool_by_search_from(meta, EntityKind::Message, "chat_messages", message_id).await
 }
 
 /// Pool del progetto risolto dal `run_id` (directory + fallback ricerca). Per gli
@@ -920,7 +925,7 @@ pub async fn project_data_pool_by_run_from(
     meta: &sqlx::PgPool,
     run_id: Uuid,
 ) -> Result<sqlx::PgPool, ProjectDbError> {
-    project_data_pool_by_search_from(meta, "run", "agent_runs", run_id).await
+    project_data_pool_by_search_from(meta, EntityKind::Run, "agent_runs", run_id).await
 }
 
 /// Pool del progetto risolto dall'id di una `prompt_corrections` (directory +
@@ -930,7 +935,7 @@ pub async fn project_data_pool_by_correction_from(
     meta: &sqlx::PgPool,
     correction_id: Uuid,
 ) -> Result<sqlx::PgPool, ProjectDbError> {
-    project_data_pool_by_search_from(meta, "correction", "prompt_corrections", correction_id).await
+    project_data_pool_by_search_from(meta, EntityKind::Correction, "prompt_corrections", correction_id).await
 }
 
 /// Pool del progetto risolto dall'id di un `ai_response_feedback` (directory +
@@ -940,7 +945,7 @@ pub async fn project_data_pool_by_feedback_from(
     meta: &sqlx::PgPool,
     feedback_id: Uuid,
 ) -> Result<sqlx::PgPool, ProjectDbError> {
-    project_data_pool_by_search_from(meta, "feedback", "ai_response_feedback", feedback_id).await
+    project_data_pool_by_search_from(meta, EntityKind::Feedback, "ai_response_feedback", feedback_id).await
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
+use crate::project_db_routes::EntityKind;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::Row;
@@ -286,7 +287,7 @@ pub async fn create_chat_session(
     // Directory di routing (sempre sul meta-DB, mig 0496): session -> project,
     // cosi' gli handler con solo session_id risolvono il pool del progetto anche
     // a flag on. Best-effort: il punto unico logga WARN, mai errore propagato.
-    crate::project_db_routes::register_entity_routing(&state.db, "session", session_id, project_id)
+    crate::project_db_routes::register_entity_routing(&state.db, EntityKind::Session, session_id, project_id)
         .await;
 
     update_user_active_project(&state, user_id, project_id).await;

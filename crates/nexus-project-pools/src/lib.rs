@@ -39,6 +39,66 @@ use std::sync::{Arc, OnceLock};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Le entita' che la directory di routing (`nexus_data_routing`) sa mappare a
+/// un progetto.
+///
+/// Punto unico del vocabolario (regole L + N): la CHECK della tabella DISCENDE
+/// da questo enum, non gli corre accanto. Finche' il kind era una `&str` scritta
+/// a mano nei call site, le due liste potevano divergere — e sono divergute.
+///
+/// MISURATO il 10/08/2026 sul meta-DB vivo: `nexus_data_routing` conteneva 706
+/// righe `run` e 187 `session`, e ZERO `message`, `correction`, `feedback` —
+/// perche' la CHECK della mig 0496 (30/06/2026) ammetteva i soli due kind
+/// esistenti allora, mentre il codice ne ha aggiunti tre. Ogni scrittura di
+/// quei tre era respinta dal DB (SQLSTATE 23514) e l'errore finiva in un WARN
+/// indistinguibile da un guasto di rete.
+///
+/// La conseguenza non era cosmetica: `project_data_pool_by_message_from`,
+/// `_by_correction_from` e `_by_feedback_from` non trovavano MAI la riga in
+/// directory, quindi cadevano sempre sul fallback che itera TUTTI i DB-progetto
+/// con una SELECT ciascuno; e il self-healing che avrebbe dovuto rendere O(1)
+/// la chiamata successiva riscriveva ogni volta la stessa riga rifiutata. Il
+/// fast-path era inerte per costruzione, per 41 giorni.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityKind {
+    Session,
+    Run,
+    Message,
+    Correction,
+    Feedback,
+}
+
+impl EntityKind {
+    /// Tutti i kind ammessi. La migrazione che scrive la CHECK e il test che la
+    /// verifica leggono DA QUI: aggiungere una variante senza allineare lo
+    /// schema fa fallire il test, invece di produrre scritture respinte in
+    /// silenzio.
+    pub const TUTTI: [EntityKind; 5] = [
+        EntityKind::Session,
+        EntityKind::Run,
+        EntityKind::Message,
+        EntityKind::Correction,
+        EntityKind::Feedback,
+    ];
+
+    /// Identificatore canonico (regola N), quello che finisce in colonna.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EntityKind::Session => "session",
+            EntityKind::Run => "run",
+            EntityKind::Message => "message",
+            EntityKind::Correction => "correction",
+            EntityKind::Feedback => "feedback",
+        }
+    }
+}
+
+impl std::fmt::Display for EntityKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Errore di risoluzione del pool per-progetto. Tipizzato (regola M): i call
 /// site decidono la degradazione sul variante, mai sul testo.
 #[derive(Debug, thiserror::Error)]
@@ -224,19 +284,19 @@ pub async fn project_data_pool(
 /// nel meta, mig 0496). `None` se non mappata o su errore di lettura (loggato).
 pub async fn project_id_for_entity(
     meta: &PgPool,
-    entity_kind: &str,
+    entity_kind: EntityKind,
     entity_id: Uuid,
 ) -> Option<Uuid> {
     sqlx::query_scalar::<_, Uuid>(
         "SELECT project_id FROM nexus_data_routing WHERE entity_kind = $1 AND entity_id = $2",
     )
-    .bind(entity_kind)
+    .bind(entity_kind.as_str())
     .bind(entity_id)
     .fetch_optional(meta)
     .await
     .unwrap_or_else(|e| {
         tracing::warn!(
-            entity_kind,
+            entity_kind = entity_kind.as_str(),
             entity_id = %entity_id,
             error = %e,
             "nexus-project-pools: lettura nexus_data_routing fallita"
@@ -245,28 +305,85 @@ pub async fn project_id_for_entity(
     })
 }
 
-/// Registra la mappa entita' -> progetto nella directory (idempotente,
-/// best-effort: un fallimento e' loggato WARN, mai propagato — la creazione
-/// dell'entita' non deve fallire per la directory). Fonte unica (regola L): il
-/// wrapper omonimo di `mcp-core::project_db_routes` vi delega.
-pub async fn register_entity_routing(meta: &PgPool, entity_kind: &str, entity_id: Uuid, pid: Uuid) {
-    if let Err(e) = sqlx::query(
+/// SQLSTATE `check_violation`: lo schema rifiuta il valore, non il DB a rifiutare
+/// la connessione. Nessun retry lo sana.
+const SQLSTATE_CHECK_VIOLATION: &str = "23514";
+
+/// Esito della registrazione in directory (regola Q: l'esito e' un campo).
+///
+/// Le due varianti di fallimento NON sono la stessa cosa e hanno rimedi
+/// opposti: `SchemaNonAllineato` e' un difetto PERMANENTE — la migrazione che
+/// allinea la CHECK non e' stata applicata, e nessun tentativo successivo
+/// riuscira' mai — mentre `ScritturaFallita` e' un guasto contingente, che al
+/// prossimo giro puo' andare bene. Collassarle in un `()` con lo stesso WARN e'
+/// cio' che ha reso invisibile per 41 giorni il rifiuto di tre kind su cinque.
+#[derive(Debug)]
+pub enum EsitoRegistrazione {
+    /// La mappa e' in directory (inserita ora o gia' presente).
+    Registrata,
+    /// Il DB rifiuta il kind: la CHECK di `nexus_data_routing` non conosce
+    /// ancora questo valore. Difetto di schema, non di rete.
+    SchemaNonAllineato { kind: EntityKind },
+    /// Guasto contingente (connessione, permessi, timeout).
+    ScritturaFallita { causa: String },
+}
+
+/// Registra la mappa entita' -> progetto nella directory (idempotente).
+///
+/// Resta BEST-EFFORT per il chiamante — la creazione dell'entita' non deve
+/// fallire perche' la directory non ha accettato la riga, ed e' una scelta
+/// motivata che qui si conserva. Cio' che cambia e' che l'esito ora e' un
+/// VALORE: un `()` non permetteva a nessuno di distinguere "il DB era giu' un
+/// istante" da "questo kind non entrera' mai", e le due cose finivano nello
+/// stesso WARN. Fonte unica (regola L): il wrapper omonimo di
+/// `mcp-core::project_db_routes` vi delega.
+pub async fn register_entity_routing(
+    meta: &PgPool,
+    entity_kind: EntityKind,
+    entity_id: Uuid,
+    pid: Uuid,
+) -> EsitoRegistrazione {
+    let esito = sqlx::query(
         "INSERT INTO nexus_data_routing (entity_kind, entity_id, project_id) \
          VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
     )
-    .bind(entity_kind)
+    .bind(entity_kind.as_str())
     .bind(entity_id)
     .bind(pid)
     .execute(meta)
-    .await
-    {
-        tracing::warn!(
-            entity_kind,
+    .await;
+
+    let Err(e) = esito else {
+        return EsitoRegistrazione::Registrata;
+    };
+    // Segnale strutturato, mai il testo (regola M): il messaggio del vincolo
+    // arriva tradotto nella lingua del server.
+    let schema_indietro = matches!(
+        &e,
+        sqlx::Error::Database(db) if db.code().as_deref() == Some(SQLSTATE_CHECK_VIOLATION)
+    );
+    if schema_indietro {
+        tracing::error!(
+            entity_kind = entity_kind.as_str(),
             entity_id = %entity_id,
             project_id = %pid,
             error = %e,
-            "nexus-project-pools: insert in nexus_data_routing fallito"
+            "nexus-project-pools: la CHECK di nexus_data_routing non ammette questo kind. \
+             Nessun retry lo sanera': manca la migrazione che allinea lo schema al vocabolario \
+             EntityKind. Finche' dura, ogni risoluzione del pool per questo kind paga la \
+             scansione di TUTTI i DB-progetto."
         );
+        return EsitoRegistrazione::SchemaNonAllineato { kind: entity_kind };
+    }
+    tracing::warn!(
+        entity_kind = entity_kind.as_str(),
+        entity_id = %entity_id,
+        project_id = %pid,
+        error = %e,
+        "nexus-project-pools: insert in nexus_data_routing fallito"
+    );
+    EsitoRegistrazione::ScritturaFallita {
+        causa: e.to_string(),
     }
 }
 
@@ -280,7 +397,7 @@ pub async fn project_data_pool_by_session(
     meta: &PgPool,
     session_id: Uuid,
 ) -> Result<PgPool, ProjectPoolError> {
-    if let Some(pid) = project_id_for_entity(meta, "session", session_id).await {
+    if let Some(pid) = project_id_for_entity(meta, EntityKind::Session, session_id).await {
         return project_data_pool(meta, pid).await;
     }
     for pid in list_project_ids(meta).await {
@@ -304,7 +421,7 @@ pub async fn project_data_pool_by_session(
             .flatten()
             .is_some();
         if found {
-            register_entity_routing(meta, "session", session_id, pid).await;
+            register_entity_routing(meta, EntityKind::Session, session_id, pid).await;
             return Ok(pool);
         }
     }

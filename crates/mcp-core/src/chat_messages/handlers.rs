@@ -1,4 +1,5 @@
 use super::*;
+use crate::project_db_routes::EntityKind;
 
 /// Messaggi della sessione gia' in forma view JSON, in ordine cronologico.
 /// Il LEFT JOIN su `agent_runs` porta lo `run_status` del run eventualmente
@@ -2285,7 +2286,7 @@ async fn insert_error_feedback(
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     crate::project_db_routes::register_entity_routing(
         &state.db,
-        "feedback",
+        EntityKind::Feedback,
         feedback_id,
         target.project_id,
     )
@@ -2333,7 +2334,7 @@ async fn insert_prompt_correction(
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     crate::project_db_routes::register_entity_routing(
         &state.db,
-        "correction",
+        EntityKind::Correction,
         rec.correction_id,
         target.project_id,
     )
@@ -2612,7 +2613,7 @@ async fn insert_positive_feedback(
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     crate::project_db_routes::register_entity_routing(
         &state.db,
-        "feedback",
+        EntityKind::Feedback,
         feedback_id,
         target.project_id,
     )

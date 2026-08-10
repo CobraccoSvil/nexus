@@ -60,6 +60,10 @@ pub use provision::{
     provision_internal_core, provision_project_db, register_entity_routing, DbRole,
     ProjectDbError,
 };
+// Vocabolario dei kind della directory di routing: il punto unico e'
+// `nexus_project_pools::EntityKind`, qui solo ri-esportato perche' i call site
+// di mcp-core passano gia' da `project_db_routes`.
+pub use nexus_project_pools::EntityKind;
 pub(crate) use shared::pg_physical_target;
 pub use query::{
     discover_schema_candidates, execute_project_db_query, import_project_db_schema,
