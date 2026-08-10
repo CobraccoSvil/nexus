@@ -1524,6 +1524,46 @@ assert_single "risorse-di-pagina" 'fn classifica_risorse' \
 assert_single "richiesta-fallita" 'fn richiesta_fallita' \
   'crates/nexus-agent-graph/src/decisions/browser_dialogue.rs' crates
 
+# Il SECONDO canale (2026-08-10): «la risorsa si e' VISTA?», distinta da «e'
+# arrivata?».
+#
+# Il verdetto sull'elemento lo deriva il criterio puro dai tre fatti grezzi che
+# lo script raccoglie, MAI il JavaScript: se lo classificasse la pagina, la
+# regola vivrebbe in due posti e uno dei due non sarebbe testabile. Lo stesso
+# vale per il riconoscimento dello schema incorporato: un secondo test su
+# `data:`/`blob:` darebbe due idee diverse di «incorporata», e la provenienza
+# e' cio' che decide il RILIEVO che l'agente legge.
+assert_single "resa-dell-elemento" 'fn classifica_elemento' \
+  'crates/nexus-agent-graph/src/decisions/risorse_pagina.rs' crates
+assert_single "forma-dell-url" 'fn forma_url' \
+  'crates/nexus-agent-graph/src/decisions/risorse_pagina.rs' crates
+
+# Nessun secondo riconoscitore di schema incorporato fuori dal punto unico.
+# Si esaminano le sole righe di CODICE dei file che toccano le risorse: nei
+# test i data URI sono la fixture.
+incorporati_bad=0
+for f in crates/mcp-core/src/agent_tools/browser_probe.rs \
+         crates/nexus-agent-graph/src/decisions/static_render.rs; do
+  [[ -f "$f" ]] || continue
+  if awk '
+    /^#\[cfg\(test\)\]/ { exit }
+    /^[[:space:]]*\/\// { next }
+    /starts_with\("data:|starts_with\("blob:|== "data:|contains\("data:/ {
+      trovato = 1; print "   " FILENAME " riga " NR ": " $0 > "/dev/stderr"
+    }
+    END { exit !trovato }
+  ' "$f" 2>&1; then
+    echo "!! forma-dell-url: riconoscimento di uno schema incorporato fuori dal punto unico." >&2
+    echo "   Delegare a risorse_pagina::forma_url: due riconoscitori danno due" >&2
+    echo "   idee diverse di 'incorporata', e da li' dipende il rilievo." >&2
+    incorporati_bad=$((incorporati_bad + 1))
+    fail=1
+  fi
+done
+if [[ "$incorporati_bad" -eq 0 ]]; then
+  echo "OK forma-dell-url: nessun secondo riconoscitore di schema incorporato"
+fi
+
 # Il guard che conta davvero: il TIPO di una risorsa lo dichiara il browser.
 #
 # `resourceType()` e' un segnale strutturato (regola M). Dedurlo dall'estensione

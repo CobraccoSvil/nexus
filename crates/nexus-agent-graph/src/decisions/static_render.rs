@@ -78,7 +78,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use super::risorse_pagina::{
-    self, PoliticaRisorse, RisorsaMancante, RisorsaOsservata, TipoCompromesso, VerdettoRisorse,
+    self, ElementoPortante, PoliticaRisorse, RisorsaMancante, RisorsaOsservata, TipoCompromesso,
+    VerdettoRisorse,
 };
 
 /// Cosa e' successo al contenitore dichiarato. Tre stati e non un `usize`:
@@ -122,6 +123,17 @@ pub struct ProveResa {
     /// NON e' una lista vuota: quella direbbe «la pagina non ha chiesto nulla».
     #[serde(default)]
     pub risorse: Option<Vec<RisorsaOsservata>>,
+    /// Gli ELEMENTI della pagina che portano una risorsa, con l'esito della
+    /// loro resa. Canale distinto da [`ProveResa::risorse`], non un suo
+    /// doppione: quello dice se la risorsa e' ARRIVATA, questo se si e' VISTA.
+    ///
+    /// `None` = l'osservazione non li ha riportati. Serve perche' per gli URL
+    /// incorporati (`data:`) il browser non emette alcun evento di rete —
+    /// MISURATO il 10/08/2026: `requests: []` su una pagina con sei immagini
+    /// rotte — e senza questo canale l'unica risposta possibile sarebbe «la
+    /// pagina non referenzia nulla».
+    #[serde(default)]
+    pub elementi: Option<Vec<ElementoPortante>>,
     /// L'URL su cui la pagina si e' fermata, come lo dichiara il browser (dopo
     /// eventuali redirezioni). Serve SOLO ad attribuire la provenienza di una
     /// risorsa mancante: senza, il verdetto e' lo stesso e i rilievi dicono
@@ -298,6 +310,7 @@ pub fn classifica_resa(
 pub fn risorse_della_pagina(prove: &ProveResa, politica: &PoliticaRisorse) -> VerdettoRisorse {
     risorse_pagina::classifica_risorse(
         prove.risorse.as_deref(),
+        prove.elementi.as_deref(),
         prove.origine.as_deref(),
         politica,
     )

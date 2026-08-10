@@ -248,7 +248,8 @@ pub use reward::{
     MAX_AGENT_ITERATIONS,
 };
 pub use risorse_pagina::{
-    classifica_risorse, origine_di, provenienza, PoliticaRisorse, Provenienza, RisorsaMancante,
+    classifica_elemento, classifica_risorse, forma_url, origine_di, provenienza, CanaleFallito,
+    ElementoPortante, EsitoResa, FormaUrl, PoliticaRisorse, Provenienza, RisorsaMancante,
     RisorsaOsservata, TipoCompromesso, VerdettoRisorse,
 };
 pub use run_summary::{riassunto_del_run, Finalizzatore, FontiRiassunto, RiassuntoRun};

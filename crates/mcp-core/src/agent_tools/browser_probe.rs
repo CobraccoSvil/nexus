@@ -35,7 +35,9 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use nexus_agent_graph::decisions::browser_dialogue::{ProveBrowser, RichiestaOsservata};
-use nexus_agent_graph::decisions::risorse_pagina::RisorsaOsservata;
+use nexus_agent_graph::decisions::risorse_pagina::{
+    classifica_elemento, ElementoPortante, RisorsaOsservata,
+};
 use nexus_agent_graph::decisions::static_render::{EsitoContenitore, ProveResa};
 
 /// Marcatore del payload JSON sullo stdout dello script Node.
@@ -69,9 +71,26 @@ mod campo {
     pub const TIPO_RISORSA: &str = "resourceKind";
     /// L'URL su cui la pagina si e' fermata, per attribuire la provenienza.
     pub const URL_PAGINA: &str = "pageUrl";
+    /// Gli ELEMENTI che portano una risorsa, con l'esito della loro RESA.
+    ///
+    /// Canale distinto da [`RICHIESTE`] e non un suo doppione: la rete risponde
+    /// «e' arrivato?», l'elemento «si e' visto?». Per gli URL `data:` Chromium
+    /// non emette alcun evento di rete — MISURATO il 10/08/2026 eseguendo
+    /// questo stesso script sulla pagina di vetrina-statica: `requests: []` su
+    /// sei immagini rotte — quindi senza questo canale la sola risposta
+    /// possibile e' «la pagina non referenzia nulla».
+    pub const ELEMENTI_RISORSA: &str = "resourceElements";
+    /// I tipi per cui il canale degli elementi ha effettivamente guardato.
+    ///
+    /// Serve a distinguere «zero elementi di questo tipo nella pagina» da «non
+    /// ho guardato questo tipo»: il primo giustifica un verdetto, il secondo
+    /// no (regola Q). Nome scelto perche' non sia sottostringa di
+    /// [`TIPO_RISORSA`] ne' di [`ELEMENTI`], o il guard resterebbe verde su un
+    /// contratto rotto.
+    pub const TIPI_CON_ELEMENTO: &str = "elementKinds";
 
     /// Tutti, per il test che li confronta con lo script.
-    pub const TUTTI: [&str; 8] = [
+    pub const TUTTI: [&str; 10] = [
         RICHIESTE,
         ERRORI_CONSOLE,
         ERRORI_PAGINA,
@@ -80,6 +99,8 @@ mod campo {
         CONTENITORE,
         TIPO_RISORSA,
         URL_PAGINA,
+        ELEMENTI_RISORSA,
+        TIPI_CON_ELEMENTO,
     ];
 }
 
@@ -280,6 +301,17 @@ pub fn interpreta_resa(payload: &str) -> Result<ProveResa, String> {
         .get(campo::RICHIESTE)
         .and_then(|r| r.as_array())
         .map(|a| a.iter().filter_map(risorsa_da).collect());
+    // Stessa disciplina: assente = il canale degli elementi non ha guardato.
+    // Il campo si legge SOLO se lo script ha dichiarato per quali tipi ha
+    // guardato: una lista di elementi senza la dichiarazione di copertura
+    // direbbe «questi sono tutti», che e' un'affermazione che quello script
+    // non e' in grado di fare.
+    let elementi = v
+        .get(campo::TIPI_CON_ELEMENTO)
+        .and_then(|t| t.as_array())
+        .and(v.get(campo::ELEMENTI_RISORSA))
+        .and_then(|e| e.as_array())
+        .map(|a| a.iter().filter_map(elemento_da).collect());
     Ok(ProveResa {
         pagina_caricata: caricata(&v),
         elementi_resi,
@@ -287,6 +319,7 @@ pub fn interpreta_resa(payload: &str) -> Result<ProveResa, String> {
         errori_esecuzione: lista(&v, campo::ERRORI_PAGINA),
         errori_console: lista(&v, campo::ERRORI_CONSOLE),
         risorse,
+        elementi,
         origine: v
             .get(campo::URL_PAGINA)
             .and_then(serde_json::Value::as_str)
@@ -324,6 +357,51 @@ fn risorsa_da(r: &serde_json::Value) -> Option<RisorsaOsservata> {
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(str::to_string),
+    })
+}
+
+/// I nomi dei campi INTERNI di un elemento portante: stesso contratto fra due
+/// linguaggi dei campi esterni, e nessun compilatore lo controlla.
+mod campo_elemento {
+    pub const TIPO: &str = "kind";
+    pub const URL: &str = "url";
+    pub const DICHIARA: &str = "declared";
+    pub const CONCLUSO: &str = "settled";
+    pub const UTILIZZABILE: &str = "usable";
+
+    /// Tutti, per il test che li confronta con lo script.
+    pub const TUTTI: [&str; 5] = [TIPO, URL, DICHIARA, CONCLUSO, UTILIZZABILE];
+}
+
+/// Un elemento portante dal payload.
+///
+/// Il verdetto NON arriva dallo script: arriva dal punto unico
+/// [`nexus_agent_graph::decisions::classifica_elemento`], che lo deriva dai tre
+/// fatti grezzi. Se lo classificasse il JavaScript, il criterio vivrebbe in due
+/// posti e uno dei due non sarebbe testabile.
+fn elemento_da(e: &serde_json::Value) -> Option<ElementoPortante> {
+    let tipo = e
+        .get(campo_elemento::TIPO)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())?;
+    let flag = |k: &str| {
+        e.get(k)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    Some(ElementoPortante {
+        tipo: tipo.to_string(),
+        url: e
+            .get(campo_elemento::URL)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        resa: classifica_elemento(
+            flag(campo_elemento::DICHIARA),
+            flag(campo_elemento::CONCLUSO),
+            flag(campo_elemento::UTILIZZABILE),
+        ),
     })
 }
 
@@ -453,6 +531,26 @@ const MISURA_DOM: &str = r#"
           ? document.body.querySelectorAll('*:not(script):not(style):not(link):not(meta):not(template):not(noscript)').length
           : 0);
       } catch (_) {}
+      try {
+        fatti.elementKinds = ['image', 'media'];
+        fatti.resourceElements = await page.evaluate(() => {
+          const diRete = (u) => /^https?:/i.test(u);
+          const resa = (u) => (diRete(u) ? u : String(u || '').slice(0, 120));
+          const img = Array.from(document.images).map((i) => {
+            const dichiara = !!(i.getAttribute('src') || i.getAttribute('srcset')
+              || (i.parentElement && i.parentElement.tagName === 'PICTURE'));
+            return { kind: 'image', url: resa(i.currentSrc), declared: dichiara,
+                     settled: !!i.complete, usable: i.naturalWidth > 0 };
+          });
+          const media = Array.from(document.querySelectorAll('video,audio')).map((m) => {
+            const dichiara = !!(m.getAttribute('src') || m.querySelector('source'));
+            return { kind: 'media', url: resa(m.currentSrc), declared: dichiara,
+                     settled: !!(m.error || m.readyState >= 1),
+                     usable: !m.error && m.readyState >= 1 };
+          });
+          return img.concat(media);
+        });
+      } catch (_) {}
       if (SEL) {
         try {
           fatti.container = await page.evaluate((s) => {
@@ -562,6 +660,16 @@ mod tests {
             assert!(
                 s.contains(nome),
                 "il campo `{nome}` e' letto dagli interpreti ma lo script non lo scrive"
+            );
+        }
+        // Anche i campi INTERNI di un elemento portante: verificare i soli nomi
+        // esterni lascerebbe verde un rinominamento di `usable`, cioe' proprio
+        // il campo da cui dipende se un'immagine risulta resa o rotta.
+        for nome in campo_elemento::TUTTI {
+            assert!(
+                s.contains(nome),
+                "il campo `{nome}` di un elemento portante e' letto da \
+                 `elemento_da` ma lo script non lo scrive"
             );
         }
     }
@@ -700,6 +808,82 @@ mod tests {
           "consoleErrors":["avviso"],"pageErrors":["eccezione"]}"#;
         let d = interpreta(payload).expect("leggibile");
         assert_eq!(d.errori_console.len(), 2);
+    }
+
+    /// IL CASO MISURATO il 10/08/2026, e il payload ha la forma che lo script
+    /// EMETTE DAVVERO su quella pagina: `requests` VUOTO — Chromium non emette
+    /// eventi di rete per gli URL incorporati — e sei elementi con la sorgente
+    /// dichiarata, il caricamento concluso e il contenuto inutilizzabile.
+    ///
+    /// Il test attraversa il produttore (`interpreta_resa`) e arriva al
+    /// VERDETTO, non a una stringa: prima del canale degli elementi la stessa
+    /// pagina usciva `NessunaDichiarata`, cioe' «non referenzia risorse di
+    /// alcun tipo governato», e il gate la dichiarava resa.
+    ///
+    /// MUTAZIONE: togliere `resourceElements` dal payload (o `elementKinds`,
+    /// che ne autorizza la lettura) -> `prove.elementi` torna `None`, il
+    /// verdetto torna `NessunaDichiarata` e la pagina torna `Resa`. E' lo
+    /// stesso rosso che si ottiene togliendo il ramo degli elementi dal
+    /// criterio: il difetto reale ricompare in entrambi i casi.
+    #[test]
+    fn le_immagini_incorporate_rotte_arrivano_al_criterio_dal_produttore() {
+        use nexus_agent_graph::decisions::risorse_pagina::{PoliticaRisorse, VerdettoRisorse};
+        use nexus_agent_graph::decisions::static_render::{
+            classifica_resa, risorse_della_pagina, CausaNonResa, VerdettoResa,
+        };
+        let elementi: Vec<String> = (0..6)
+            .map(|_| {
+                r#"{"kind":"image","url":"data:image/svg+xml;utf8,<svg xmlns=",
+                    "declared":true,"settled":true,"usable":false}"#
+                    .to_string()
+            })
+            .collect();
+        let payload = format!(
+            r#"{{"loaded":true,"elementCount":38,
+              "pageUrl":"http://127.0.0.1:4000/preview/76d9b79e/index.html",
+              "container":{{"found":true,"children":6}},
+              "consoleErrors":[],"pageErrors":[],
+              "requests":[],
+              "elementKinds":["image","media"],
+              "resourceElements":[{}]}}"#,
+            elementi.join(",")
+        );
+
+        let prove = interpreta_resa(&payload).expect("fatti leggibili");
+        assert_eq!(
+            prove.risorse.as_ref().map(Vec::len),
+            Some(0),
+            "il canale di rete ha guardato e non ha visto nulla: e' un fatto, non un'assenza"
+        );
+        assert_eq!(prove.elementi.as_ref().map(Vec::len), Some(6));
+
+        let politica = PoliticaRisorse::nuova(
+            vec![
+                "image".into(),
+                "stylesheet".into(),
+                "script".into(),
+                "media".into(),
+            ],
+            Some(1.0),
+        );
+        let VerdettoRisorse::TipiCompromessi { tipi, .. } =
+            risorse_della_pagina(&prove, &politica)
+        else {
+            panic!("sei immagini su sei che non rendono compromettono il tipo");
+        };
+        assert_eq!((tipi[0].falliti, tipi[0].osservati), (6, 6));
+        assert_eq!(tipi[0].incorporate, 6);
+
+        let VerdettoResa::NonResa { cause } = classifica_resa(&prove, 5, &politica) else {
+            panic!("una pagina le cui immagini non si vedono non mostra il proprio contenuto");
+        };
+        assert!(
+            cause
+                .iter()
+                .any(|c| matches!(c, CausaNonResa::RisorseNonCaricate { .. })),
+            "il DOM ha 38 elementi e il contenitore ha sei figli: senza il canale \
+             degli elementi nessuna causa nascerebbe"
+        );
     }
 }
 
