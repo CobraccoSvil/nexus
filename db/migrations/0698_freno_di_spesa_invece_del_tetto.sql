@@ -1,0 +1,63 @@
+-- 0698 — Il tetto in tempo di una figura non esiste piu': il freno e' la SPESA.
+--
+-- CONTINUA LA 0687, che aveva sostituito il criterio (dal tempo al progresso) e
+-- lasciato il tempo come backstop: `tetto_assoluto = timeout_kind x
+-- progresso_tetto_moltiplicatore` = 1200s per una figura da 300s. Quel backstop
+-- era l'ultimo pezzo di orologio rimasto, e restava armato per DUE ragioni
+-- dichiarate nel codice. Verificate una per una, ne regge mezza.
+--
+-- 1) «UN RUN WEDGED DENTRO UNA SINGOLA CHIAMATA AL MODELLO, che non raggiunge
+--    mai un confine di iterazione e quindi nessun gate lo interroga».
+--    SMONTATA. Il client reqwest di `NexusGatewayClient` e' costruito con
+--    `.timeout(client_budget)`: una chiamata non puo' restare appesa oltre quel
+--    tempo, quindi il run TORNA al confine di iterazione e li' il criterio
+--    decide. Il tetto era venti volte piu' largo del presidio che copriva gia'
+--    quel caso — e nel frattempo era LUI a decidere. Da qui la veglia sul
+--    SILENZIO (commit b07c176b): la sola domanda che una rete ESTERNA puo'
+--    porre e' «da quanto non arriva un fatto?», e la soglia si deriva dal budget
+--    di una chiamata invece di essere scelta a mano.
+--
+-- 2) «UNA FIGURA CHE AVANZA PER SEMPRE». REALE: chi produce fatti nuovi non e'
+--    in silenzio e non e' fermo, quindi ne' la veglia ne' il criterio di
+--    progresso lo fermano. Finora lo fermava l'orologio.
+--
+-- IL FRENO GIUSTO PER (2) E' LA SPESA, E ESISTEVA GIA' A META'. Il cap
+-- `orchestrator.subagent_cost_cap_per_run_usd` (5.00) era un guard di
+-- AMMISSIONE: `prepare_reject` decide se un sub-run PUO' PARTIRE confrontando il
+-- gia' speso della famiglia col cap, e non ha piu' voce su un run in corso. Un
+-- figlio ammesso con 4.99 gia' spesi poteva bruciare quanto voleva.
+--
+-- Ora la stessa capienza risponde a DUE domande dallo STESSO punto unico
+-- (`subagent_native::capienza_spesa`, regola L): se il figlio parte, e quanto
+-- puo' spendere una volta partito. La capienza residua (cap meno lo speso)
+-- scende nel motore come `run_cost_budget_usd` e li' la fa valere
+-- `gate_budget_spesa`, che chiude PULITO — sollecito al canale di ruolo, esito
+-- dichiarato, parere raccolto — invece di cancellare un future da fuori.
+--
+-- PERCHE' LA SPESA E NON UN TETTO PIU' LARGO. Alzare un timeout e' la prima
+-- toppa che la regola H vieta per nome, e qui sarebbe anche la domanda
+-- sbagliata: il tempo di parete di una figura non dice nulla su quanto lavoro
+-- stia facendo (una chiamata lenta e una catena di venti chiamate rapide durano
+-- uguale) mentre i dollari misurano esattamente le risorse consumate. E il tetto
+-- di spesa non ha bisogno di essere indovinato per kind: e' gia' deciso, e' il
+-- cap della famiglia.
+--
+-- COSA VIENE RIMOSSO. `orchestrator.progresso_tetto_moltiplicatore` non ha piu'
+-- lettori: nessun sub-run deriva un tetto dal proprio timeout, e
+-- `NativeRunInput.run_time_budget_s` per una figura vale `None`. Il tetto in
+-- tempo resta ESISTENTE come configurazione esplicita (`agent.run_time_budget_s`,
+-- `0` per policy dalla mig 0604/0607) — chi lo alza sa cosa sta facendo, e il
+-- criterio continuera' a usarlo come ultima difesa. Cio' che sparisce e' che
+-- ogni figura ne ricevesse uno armato senza che nessuno lo avesse deciso.
+--
+-- UNA CHIAVE LASCIATA IN TABELLA SENZA LETTORI E' PEGGIO DI UNA RIMOSSA: chi la
+-- trova crede di poter governare qualcosa, e la modifica non ha effetto. Per lo
+-- stesso motivo il DELETE e' incondizionato e non un "commenta e lascia".
+--
+-- COSA NON CAMBIA: il timeout per kind (`nexus_subagent_definitions.timeout_s`)
+-- resta e continua a dire l'INTERVALLO DI LAVORO ATTESO — da lui si deriva la
+-- soglia di silenzio della veglia (`LlmTimeouts::for_run(...).soglia_silenzio()`)
+-- e con lui `decisions::timeout_cause` giudica se l'attesa in coda sia stata la
+-- maggior parte della vita di un run. Non e' piu' una condanna a morte.
+
+DELETE FROM settings WHERE key = 'orchestrator.progresso_tetto_moltiplicatore';

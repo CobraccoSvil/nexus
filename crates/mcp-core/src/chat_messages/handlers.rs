@@ -1353,7 +1353,7 @@ async fn try_resume_interrupted_run(
             sizing_complexity: None,
             sizing_scope_system_wide: false,
             classifier_intent: None,
-            run_time_budget_s: None,
+            budget: crate::native_engine::BudgetDelRun::dai_setting_globali(),
             working_root: None,
             // Nessun passo di piano a monte: nessuno scope dichiarato da misurare.
             write_scope: Vec::new(),

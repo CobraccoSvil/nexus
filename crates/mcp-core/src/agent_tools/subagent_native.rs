@@ -90,30 +90,59 @@ struct SubagentSettings {
     /// Heartbeat "al lavoro" nei silenzi del sub-run (secondi, mig 0535).
     /// 0 -> heartbeat disabilitato (restano avvio/progressi/chiusura).
     narration_heartbeat_s: i64,
-    /// Per quanto il TETTO ASSOLUTO di una figura eccede il suo timeout
-    /// (`orchestrator.progresso_tetto_moltiplicatore`, mig 0687).
-    ///
-    /// Dal 09/08/2026 il timeout della figura non e' piu' il criterio di morte ma
-    /// l'intervallo di lavoro che ci si aspetta: chi AVANZA puo' eccederlo fino a
-    /// questo multiplo, chi non avanza muore molto prima (vedi
-    /// `nexus_agent_graph::decisions::avanzamento_figura`). Il moltiplicatore e'
-    /// clampato a >= 1 dal punto unico [`tetto_assoluto_s`]: un tetto piu'
-    /// stretto del timeout riporterebbe il difetto misurato da un'altra porta.
-    tetto_moltiplicatore: i64,
 }
 
-/// Perche' la rete di sicurezza ha smesso di attendere: il run e' finito, oppure
-/// TACE da troppo tempo per essere ancora al lavoro.
+/// Quanta SPESA resta alla famiglia di sub-run ancorata a un parent.
 ///
-/// Due cause distinte nel TIPO e non in un booleano (regola Q): chi tace e'
-/// bloccato dove nessun gate arriva, chi sfora il tetto stava lavorando — e i
-/// due referti non devono confondersi.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FineVeglia {
-    /// Nessun fatto registrato per piu' della soglia derivata dal budget.
-    Silenzio,
-    /// Il tetto assoluto e' scaduto mentre il run produceva fatti.
-    TettoAssoluto,
+/// PUNTO UNICO (regola L) di una domanda che ha DUE consumatori, e che finora
+/// aveva una risposta sola perche' il secondo non esisteva:
+///
+/// * l'AMMISSIONE — capienza esaurita, il figlio non parte (`prepare_reject`);
+/// * il FRENO del figlio che parte — quanto puo' spendere prima di chiudere
+///   d'autorita' (`ExecutorConfig::run_cost_budget_usd` -> `gate_budget_spesa`).
+///
+/// Fino al 10/08/2026 il cap era il solo guard di ammissione: decideva se un
+/// sub-run POTEVA partire e non aveva piu' voce su uno in corso. Percio' l'unica
+/// difesa contro la figura che «avanza per sempre» restava l'orologio — cioe'
+/// la cosa che il 09/08 ha ucciso quattro figure su nove mentre lavoravano.
+/// Stesso numero, stessa fonte, un secondo consumatore.
+///
+/// L'esito sta nel TIPO e non in un `f64` (regola Q): un residuo `0.0` passato
+/// al motore SPEGNEREBBE il freno (li' `0` significa disabilitato), cioe' la
+/// capienza esaurita si tradurrebbe in «nessun limite» — l'errore piu' pericoloso
+/// possibile, e silenzioso. [`CapienzaSpesa::Residua`] e' positiva per
+/// costruzione.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CapienzaSpesa {
+    /// Il cap e' gia' raggiunto: nessun figlio nuovo.
+    Esaurita { speso_usd: f64, cap_usd: f64 },
+    /// Quanto il figlio puo' ancora spendere. Sempre `> 0`.
+    Residua { usd: f64 },
+}
+
+/// La capienza, dal cap di famiglia e da quanto la famiglia ha gia' speso.
+///
+/// Un cap `<= 0` NON e' «nessun limite»: e' capienza zero, e resta un rifiuto —
+/// lo stesso comportamento di prima, quando il confronto era `speso >= cap`. Un
+/// tetto disabilitandosi da solo sarebbe un magic fallback (regola G).
+///
+/// LIMITE DICHIARATO: la capienza e' fotografata al VIA del figlio. Sei figure
+/// convocate in parallelo, nessuna delle quali ha ancora speso, ricevono tutte
+/// la stessa capienza e insieme possono eccedere il cap di famiglia. E' lo
+/// stesso limite che il guard di ammissione ha sempre avuto (nessuna delle sei
+/// viene rifiutata, per la stessa ragione), e nessuna delle due meta' lo
+/// peggiora: prima del 10/08/2026 una figura in corso non aveva ALCUN freno di
+/// spesa. Chiuderlo vuol dire prenotare la capienza al dispatch, come il
+/// registro del carico fa con le chiamate in volo — lavoro suo, non di qui.
+fn capienza_spesa(cap_usd: f64, speso_usd: f64) -> CapienzaSpesa {
+    let residuo = cap_usd - speso_usd;
+    if residuo <= 0.0 {
+        return CapienzaSpesa::Esaurita {
+            speso_usd,
+            cap_usd,
+        };
+    }
+    CapienzaSpesa::Residua { usd: residuo }
 }
 
 /// Che cosa dice UNA attesa sul canale del sub-run.
@@ -149,7 +178,7 @@ fn legge_attesa(
 }
 
 /// Veglia sul SILENZIO di un sub-run: ritorna quando il run smette di produrre
-/// fatti per piu' di `soglia`, oppure quando scade `tetto`.
+/// fatti per piu' di `soglia`. Non ritorna per nessun'altra ragione.
 ///
 /// PERCHE' NON E' UN `tokio::time::timeout` SULLA DURATA. Un timeout sulla
 /// durata totale non distingue un run che lavora da uno bloccato: li uccide
@@ -157,82 +186,54 @@ fn legge_attesa(
 /// — se arrivano fatti — e per farlo NON serve un canale nuovo: il sub-run
 /// pubblica gia' i propri passi su un `broadcast`, e un secondo `subscribe()`
 /// osserva senza togliere nulla al ponte di narrazione.
+///
+/// PERCHE' NON C'E' PIU' UN TETTO. Fino al 10/08/2026 la veglia aveva un
+/// secondo braccio, il tetto assoluto derivato dal timeout della figura, e chi
+/// produceva fatti moriva comunque alla sua ora. Un run che PRODUCE non e'
+/// bloccato: se produce troppo a lungo lo ferma la SPESA, dentro il motore e
+/// con un esito dichiarato, non un future cancellato da fuori. Qui resta la
+/// sola domanda che da fuori si puo' porre — «da quanto tace?».
 async fn veglia_sul_silenzio(
     mut rx: tokio::sync::broadcast::Receiver<crate::agent_types::AgentStepEvent>,
     soglia: std::time::Duration,
-    tetto: std::time::Duration,
-) -> FineVeglia {
-    let scadenza_tetto = tokio::time::sleep(tetto);
-    tokio::pin!(scadenza_tetto);
+) {
     loop {
-        // La select ATTENDE e basta; che cosa significhi l'attesa lo dice
-        // `legge_attesa`, e la conseguenza si legge qui sotto tutta insieme.
-        let attesa = tokio::select! {
-            _ = &mut scadenza_tetto => return FineVeglia::TettoAssoluto,
-            esito = tokio::time::timeout(soglia, rx.recv()) => legge_attesa(esito),
-        };
-        match attesa {
+        // L'attesa e' una sola; che cosa significhi lo dice `legge_attesa`, e la
+        // conseguenza si legge qui sotto tutta insieme.
+        match legge_attesa(tokio::time::timeout(soglia, rx.recv()).await) {
             Attesa::RunVivo => continue,
-            Attesa::Silenzio => return FineVeglia::Silenzio,
+            Attesa::Silenzio => return,
             Attesa::CanaleChiuso => break,
         }
     }
-    // Canale chiuso: il run e' finito e non c'e' piu' nulla da osservare. Resta
-    // il solo tetto, che il ramo vincente della select chiamante battera'.
-    scadenza_tetto.await;
-    FineVeglia::TettoAssoluto
+    // Canale chiuso: non c'e' piu' nulla da osservare, e su nulla non si decide
+    // (regola Q: l'ignoto non degrada a scadenza). La veglia tace per sempre e
+    // lascia vincere il run, che e' l'altro ramo della select chiamante.
+    std::future::pending::<()>().await
 }
 
 /// I tempi dello scatto, per il referto. Raggruppati perche' viaggiano insieme e
-/// da soli sarebbero cinque parametri posizionali dello stesso tipo — cioe'
-/// cinque occasioni di scambiarne due senza che il compilatore se ne accorga.
+/// da soli sarebbero tre parametri posizionali dello stesso tipo — cioe' tre
+/// occasioni di scambiarne due senza che il compilatore se ne accorga.
 struct ScattoVeglia {
     soglia_silenzio_s: u64,
     timeout_s: i64,
-    tetto_s: i64,
     scatto_ms: u64,
-    ritardo_ms: u64,
 }
 
-/// Il referto di una veglia che ha chiuso: due frasi diverse perche' i due fatti
-/// lo sono, e chi legge il log deve distinguerli senza dedurlo dai numeri.
-fn logga_fine_veglia(fine: FineVeglia, sub_run_id: Uuid, kind: &str, t: ScattoVeglia) {
-    match fine {
-        FineVeglia::Silenzio => tracing::warn!(
-            sub_run_id = %sub_run_id,
-            kind = %kind,
-            soglia_silenzio_s = t.soglia_silenzio_s,
-            scatto_ms = t.scatto_ms,
-            "sub-run fermato per SILENZIO: nessun fatto registrato oltre la soglia \
-             derivata dal budget di una chiamata"
-        ),
-        FineVeglia::TettoAssoluto => tracing::warn!(
-            sub_run_id = %sub_run_id,
-            kind = %kind,
-            timeout_s = t.timeout_s,
-            tetto_s = t.tetto_s,
-            scatto_ms = t.scatto_ms,
-            ritardo_ms = t.ritardo_ms,
-            "sub-run scaduto al TETTO ASSOLUTO mentre produceva fatti: il tetto in \
-             tempo ha fermato una figura che stava lavorando"
-        ),
-    }
-}
-
-/// Il TETTO ASSOLUTO di una figura, dal suo timeout e dal moltiplicatore.
-///
-/// PUNTO UNICO del calcolo (regola L): lo usano i DUE lati che devono
-/// concordare — la rete di sicurezza `tokio::time::timeout` FUORI dal run e il
-/// gate di deadline DENTRO l'executor. Se divergessero, il piu' stretto dei due
-/// vincerebbe in silenzio e il criterio di progresso sarebbe inerte proprio nel
-/// caso per cui esiste.
-///
-/// Il clamp a `>= 1` non e' difensivo per abitudine: un moltiplicatore sotto 1
-/// renderebbe il tetto nuovo piu' stretto di quello di oggi, cioe' farebbe
-/// tornare — peggiorato — il difetto che il criterio chiude. La configurazione
-/// puo' allargare, mai stringere sotto il timeout della figura.
-fn tetto_assoluto_s(timeout_s: i64, moltiplicatore: i64) -> i64 {
-    timeout_s.max(0).saturating_mul(moltiplicatore.max(1))
+/// Il referto della veglia che ha chiuso. Un fatto solo, perche' uno solo la fa
+/// tornare: il run TACE. Il tempo trascorso e' una misura di contorno, non la
+/// causa — nominarlo come causa rimanderebbe a cercare un tetto stretto.
+fn logga_silenzio(sub_run_id: Uuid, kind: &str, t: ScattoVeglia) {
+    tracing::warn!(
+        sub_run_id = %sub_run_id,
+        kind = %kind,
+        soglia_silenzio_s = t.soglia_silenzio_s,
+        timeout_s = t.timeout_s,
+        scatto_ms = t.scatto_ms,
+        "sub-run fermato per SILENZIO: nessun fatto registrato oltre la soglia \
+         derivata dal budget di una chiamata"
+    );
 }
 
 async fn read_subagent_settings(ctx: &AgentToolContext) -> Result<SubagentSettings, String> {
@@ -244,8 +245,7 @@ async fn read_subagent_settings(ctx: &AgentToolContext) -> Result<SubagentSettin
             'orchestrator.subagent_cost_cap_per_run_usd',
             'orchestrator.subagent_default_timeout_s',
             'orchestrator.subagent_narration_enabled',
-            'orchestrator.subagent_narration_heartbeat_s',
-            'orchestrator.progresso_tetto_moltiplicatore'
+            'orchestrator.subagent_narration_heartbeat_s'
         )",
     )
     .fetch_all(&*ctx.core.db)
@@ -260,11 +260,6 @@ async fn read_subagent_settings(ctx: &AgentToolContext) -> Result<SubagentSettin
         default_timeout_s: 300,
         narration_enabled: true,
         narration_heartbeat_s: 20,
-        // 1 = tetto assoluto COINCIDENTE col timeout della figura, cioe' il
-        // comportamento a tempo storico. Il valore di esercizio vive nel DB
-        // (mig 0687): qui il safe-default non deve MAI concedere piu' tempo di
-        // quanto la configurazione dica (regola G).
-        tetto_moltiplicatore: 1,
     };
     for row in rows {
         let k: String = row.get("key");
@@ -298,9 +293,6 @@ fn apply_subagent_setting(s: &mut SubagentSettings, key: &str, value: &str) {
         "orchestrator.subagent_narration_enabled" => s.narration_enabled = settings_flag(v),
         "orchestrator.subagent_narration_heartbeat_s" => {
             s.narration_heartbeat_s = v.parse().unwrap_or(20)
-        }
-        "orchestrator.progresso_tetto_moltiplicatore" => {
-            s.tetto_moltiplicatore = v.parse().unwrap_or(1)
         }
         _ => {}
     }
@@ -3987,16 +3979,19 @@ async fn prepare_subagent_run(
     }
 
     // ── Guard 4: cost cap cumulativo per parent ───────────────────────────────
+    // La stessa capienza risponde a DUE domande (vedi [`capienza_spesa`]): qui
+    // se il figlio parte, piu' avanti quanto puo' spendere una volta partito.
     let spent = cumulative_cost(&proj_pool, anchor).await;
-    if spent >= settings.cost_cap_usd {
-        return Err(prepare_reject(
-            "cost_cap_reached",
-            format!(
-                "cost cap raggiunto per parent={anchor} ({spent:.4} >= {:.4})",
-                settings.cost_cap_usd
-            ),
-        ));
-    }
+    let capienza = capienza_spesa(settings.cost_cap_usd, spent);
+    let budget_spesa_usd = match capienza {
+        CapienzaSpesa::Esaurita { speso_usd, cap_usd } => {
+            return Err(prepare_reject(
+                "cost_cap_reached",
+                format!("cost cap raggiunto per parent={anchor} ({speso_usd:.4} >= {cap_usd:.4})"),
+            ))
+        }
+        CapienzaSpesa::Residua { usd } => usd,
+    };
 
     // ── Risoluzione system_text + tools + modello worker (DB-driven) ──────────
     let system_text =
@@ -4129,7 +4124,7 @@ async fn prepare_subagent_run(
         tools_json,
         current_depth,
         timeout_s,
-        tetto_s: tetto_assoluto_s(timeout_s, settings.tetto_moltiplicatore),
+        budget_spesa_usd,
         narration_enabled: settings.narration_enabled,
         narration_heartbeat_s: settings.narration_heartbeat_s,
         // Il ramo background NON supporta isolamento (vedi doc su tool_dispatch_*):
@@ -4201,13 +4196,17 @@ struct SubagentExecInputs {
     current_depth: i64,
     /// Intervallo di lavoro atteso per questa figura (il vecchio tetto fisso).
     /// Dal 09/08/2026 NON e' piu' il criterio di morte: resta la misura che
-    /// narrazione, ledger e referto di scadenza dichiarano.
+    /// narrazione, ledger e referto di scadenza dichiarano, e da cui si deriva
+    /// la soglia di silenzio della veglia.
     timeout_s: i64,
-    /// Tetto ASSOLUTO oltre cui la figura si ferma comunque, dal punto unico
-    /// [`tetto_assoluto_s`]. E' il backstop del criterio di progresso, e lo
-    /// leggono i due lati che devono concordare: il `tokio::time::timeout`
-    /// esterno e il `run_time_budget_s` del motore.
-    tetto_s: i64,
+    /// Quanto questa figura puo' SPENDERE prima di chiudere d'autorita': la
+    /// capienza residua del cap di famiglia, dal punto unico [`capienza_spesa`].
+    ///
+    /// E' il freno che ha sostituito il tetto in tempo (10/08/2026). Scende nel
+    /// motore come `run_cost_budget_usd` e li' lo fa valere `gate_budget_spesa`,
+    /// che chiude PULITO — esito dichiarato, parere del ruolo raccolto — invece
+    /// di cancellare un future da fuori.
+    budget_spesa_usd: f64,
     narration_enabled: bool,
     narration_heartbeat_s: i64,
     /// Root del sub-run (worktree isolato) o `None` (root condivisa / background).
@@ -4255,7 +4254,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         tools_json,
         current_depth,
         timeout_s,
-        tetto_s,
+        budget_spesa_usd,
         narration_enabled,
         narration_heartbeat_s,
         working_root,
@@ -4380,23 +4379,21 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         sizing_complexity: None,
         sizing_scope_system_wide: false,
         classifier_intent: None,
-        // Il tetto REALE di questa figura (lo stesso del `tokio::time::timeout`
-        // esterno qui sotto) entra nel motore: senza, il gate a tempo dell'executor
-        // userebbe il setting globale `agent.run_time_budget_s` (0 per policy) e
-        // resterebbe inerte, lasciando la figura morire muta allo scadere.
-        // Il TETTO ASSOLUTO della figura (lo stesso del `tokio::time::timeout`
-        // esterno qui sotto) entra nel motore: senza, il gate di deadline
-        // dell'executor userebbe il setting globale `agent.run_time_budget_s`
-        // (0 per policy) e resterebbe inerte, lasciando la figura morire muta
-        // allo scadere della rete di sicurezza.
+        // NESSUN tetto in tempo, e come freno la capienza residua della
+        // famiglia (10/08/2026). Fino a ieri qui scendeva il tetto assoluto —
+        // `timeout_s x 4` — e teneva in piedi da solo tutto il criterio di
+        // progresso; il 09/08 ha comunque ucciso quattro figure su nove mentre
+        // lavoravano, e alzarlo ancora e' la toppa che la regola H vieta per
+        // nome. Delle due ragioni che lo giustificavano, la prima («run wedged
+        // dentro una singola chiamata») non regge — il client reqwest del
+        // gateway ha il proprio timeout, quindi la chiamata rientra e il
+        // criterio decide al confine di iterazione — e la seconda («figura che
+        // avanza per sempre») ha ora la difesa giusta, che e' la spesa.
         //
-        // Dal 09/08/2026 e' il TETTO e non piu' il `timeout_s`: dentro il gate
-        // il criterio non e' piu' il tempo ma il PROGRESSO (punto unico
-        // `nexus_agent_graph::decisions::avanzamento_figura`), e questo valore
-        // fa da ultima difesa. Passare qui il `timeout_s` renderebbe il criterio
-        // inerte — il gate chiuderebbe all'ora esatta di prima, e la figura che
-        // avanza morirebbe come prima.
-        run_time_budget_s: Some(tetto_s.max(0) as u64),
+        // La capienza e' anche cio' che tiene ACCESO il criterio di progresso:
+        // la sua condizione d'ingresso e' «questo run ha un budget proprio»
+        // (`ExecutorConfig::governa_prosecuzione`), non piu' «c'e' un tetto».
+        budget: crate::native_engine::BudgetDelRun::di_figura(budget_spesa_usd),
         // FASE 2: override root del sub-run. `None` (ramo sequenziale/condiviso o
         // background) -> scrive sulla root del progetto, comportamento invariato.
         // `Some(worktree)` (ramo ISOLATO, valorizzato dal batch parallelo di
@@ -4420,14 +4417,15 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
     //
     // Fino al 09/08/2026 questo `timeout` scattava al `timeout_s` della figura ed
     // ERA il modo in cui una figura moriva: e' cio' che ha ucciso quattro figure
-    // su nove mentre lavoravano (vedi `decisions::avanzamento_figura`). Ora
-    // scatta al TETTO ASSOLUTO, e nel mezzo decide il criterio di progresso
-    // dentro il gate di deadline dell'executor — che chiude PULITO (sollecito al
-    // canale di ruolo + esito dichiarato) invece di cancellare un future.
+    // su nove mentre lavoravano (vedi `decisions::avanzamento_figura`). Poi e'
+    // diventato il tetto assoluto — piu' largo, stessa natura — e dal
+    // 10/08/2026 non e' piu' un orologio affatto: guarda il SILENZIO.
     //
-    // Questo resta armato perche' copre l'unico caso che il gate non puo'
-    // vedere: un run wedged DENTRO una singola chiamata al modello, che non
-    // raggiunge mai un confine di iterazione e quindi non viene mai interrogato.
+    // Cosa ferma cosa, adesso: chi TACE lo ferma questa veglia, da fuori, perche'
+    // un run che non produce fatti non raggiunge nessun gate; chi PRODUCE senza
+    // concludere lo fermano, dentro il motore e con un esito dichiarato, il
+    // criterio di progresso (ripete le stesse strade) e il freno di spesa
+    // (avanza davvero, ma oltre la capienza della famiglia).
     //
     // In OGNI ramo il ponte e' fermato e ATTESO (`stop_bridge`) prima del meta-step
     // di chiusura: senza l'await, abort() e' cooperativo (cancella al prossimo poll)
@@ -4436,12 +4434,13 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
     // per created_at). L'await del handle garantisce che nessuna INSERT del ponte
     // segua quella di chiusura (race chiusa alla radice, regola H).
     let run_fut = crate::native_engine::run_native(&deps, &native_input);
-    // L'istante da cui il budget decorre, in Rust. Serve al ramo di scadenza:
-    // `completed_at` sulla riga del sub-run e' il NOW() del server Postgres,
-    // scritto DOPO stop_bridge + fetch_ledger_totals + mark_run, cioe' misura la
-    // CHIUSURA e non lo scatto. Finche' i due erano indistinguibili, un ritardo
-    // nella scrittura (pool esaurito) somigliava a un timer che scatta tardi:
-    // due cause opposte con la stessa faccia.
+    // L'istante del via, in Rust. Serve al ramo di scadenza per dire da quanto
+    // il sub-run fosse in piedi quando la veglia ha scattato: `completed_at`
+    // sulla sua riga e' il NOW() del server Postgres, scritto DOPO stop_bridge +
+    // fetch_ledger_totals + mark_run, cioe' misura la CHIUSURA e non lo scatto.
+    // Finche' i due erano indistinguibili, un ritardo nella scrittura (pool
+    // esaurito) somigliava a una rete che scatta tardi: due cause opposte con la
+    // stessa faccia.
     let t_budget_start = std::time::Instant::now();
     // La soglia viene dal punto unico che conosce il budget di UNA chiamata
     // (regole G/L): qui non si sceglie un numero, si legge quello che rende vera
@@ -4451,11 +4450,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         .await
         .for_run(Some(timeout_s.max(0) as u64))
         .soglia_silenzio();
-    let veglia = veglia_sul_silenzio(
-        sub_tx_veglia,
-        soglia_silenzio,
-        std::time::Duration::from_secs(tetto_s.max(0) as u64),
-    );
+    let veglia = veglia_sul_silenzio(sub_tx_veglia, soglia_silenzio);
     tokio::pin!(run_fut);
     // La select ATTENDE e basta: chi ha vinto lo dice il valore, e la
     // conseguenza si legge sotto, al primo livello. Il run vince sempre quando
@@ -4464,42 +4459,40 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
     // simultanea darebbero due referti diversi per lo stesso fatto.
     let esito_attesa = tokio::select! {
         biased;
-        res = &mut run_fut => Err(res),
-        fine = veglia => Ok(fine),
+        res = &mut run_fut => Some(res),
+        _ = veglia => None,
     };
     let outcome: anyhow::Result<NativeRunOutcome> = match esito_attesa {
-        Err(res) => res,
-        Ok(fine) => {
+        Some(res) => res,
+        None => {
             // Misurato PRIMA di ogni await successivo: da qui in poi qualunque
             // attesa (il ponte, il ledger, una connessione dal pool) sposta
             // solo la scrittura, non lo scatto.
             let scatto_ms = t_budget_start.elapsed().as_millis() as u64;
-            logga_fine_veglia(
-                fine,
+            logga_silenzio(
                 subagent_run_id,
                 &kind,
                 ScattoVeglia {
                     soglia_silenzio_s: soglia_silenzio.as_secs(),
                     timeout_s,
-                    tetto_s,
                     scatto_ms,
-                    ritardo_ms: ritardo_scatto_ms(scatto_ms, tetto_s),
                 },
             );
             stop_bridge(bridge).await;
             // Marca comunque la riga TERMINALE (status='timeout'): deve passare
             // per l'enqueue fan-in come gli altri rami (senza, un parent con
             // l'ultimo figlio scaduto resterebbe sospeso per sempre). Non esce
-            // con return diretto. Il referto nomina il TETTO e non l'intervallo
-            // di lavoro, o la diagnosi manderebbe a cercare un tetto stretto che
-            // non e' quello che ha scattato.
+            // con return diretto.
             let out = finalize_timeout(
                 &proj_pool,
                 &ctx.core.db,
                 narrator.as_deref(),
                 subagent_run_id,
                 &kind,
-                tetto_s,
+                ScadenzaPerSilenzio {
+                    timeout_s,
+                    silenzio_s: soglia_silenzio.as_secs(),
+                },
                 &provider_resolved,
                 &model_resolved,
             )
@@ -5205,17 +5198,6 @@ async fn insert_subagent_run(
 
 /// Ferma il ponte narrazione e ATTENDE che sia davvero finito (vedi commento
 /// sul timeout in `run_single_subagent`: chiude la race abort/INSERT-in-volo).
-/// Quanto lo scatto del timeout ha ecceduto il budget, in millisecondi.
-///
-/// Un valore vicino a zero dice che il timer e' stato puntuale e che un eventuale
-/// ritardo osservato a valle (su `completed_at`) sta nella scrittura, non nello
-/// scatto. Un valore grande dice il contrario: sono due diagnosi opposte, e senza
-/// questa misura si distinguono solo per congettura.
-fn ritardo_scatto_ms(scatto_ms: u64, timeout_s: i64) -> u64 {
-    let budget_ms = (timeout_s.max(0) as u64).saturating_mul(1_000);
-    scatto_ms.saturating_sub(budget_ms)
-}
-
 async fn stop_bridge(bridge: Option<tokio::task::JoinHandle<()>>) {
     if let Some(b) = bridge {
         b.abort();
@@ -5223,12 +5205,23 @@ async fn stop_bridge(bridge: Option<tokio::task::JoinHandle<()>>) {
     }
 }
 
-/// Chiusura del sub-run in TIMEOUT: mark_run + narrazione + tool_result.
+/// I DUE tempi della chiusura per silenzio. Insieme perche' la confusione fra
+/// loro e' precisamente il difetto: `silenzio_s` e' cio' che ha fatto scattare
+/// la rete, `timeout_s` l'intervallo di lavoro atteso dalla figura — quello con
+/// cui `causa_del_timeout` giudica se l'attesa in coda sia stata la maggior
+/// parte della sua vita. Passarne uno al posto dell'altro non rompe niente e
+/// falsa entrambi i referti.
+struct ScadenzaPerSilenzio {
+    timeout_s: i64,
+    silenzio_s: u64,
+}
+
+/// Chiusura del sub-run fermato dalla veglia: mark_run + narrazione + tool_result.
 ///
 /// La scadenza DICHIARA su cosa il budget e' finito. Prima diceva soltanto
 /// "[Sub-agent timeout]": vero e inutile, perche' non distingue un run fermo su
 /// una strada chiusa da uno che stava lavorando — due diagnosi opposte, e solo
-/// per la seconda ha senso chiedersi se il tetto del kind sia dimensionato bene.
+/// per la seconda ha senso chiedersi se il timeout del kind sia dimensionato bene.
 /// La causa viene dai passi che il run ha lasciato (`agent_steps`), classificati
 /// dal punto unico `decisions::timeout_cause`; il testo si compone DA quella
 /// (regola Q), che e' anche il campo che il coordinatore e il pannello leggono.
@@ -5238,16 +5231,20 @@ async fn finalize_timeout(
     narrator: Option<&ParentNarrator>,
     sub_run_id: Uuid,
     kind: &str,
-    timeout_s: i64,
+    scadenza: ScadenzaPerSilenzio,
     provider: &str,
     model: &str,
 ) -> Value {
+    let ScadenzaPerSilenzio {
+        timeout_s,
+        silenzio_s,
+    } = scadenza;
     // Gli step del sub-run vivono nel DB del PROGETTO, con `run_id` = id del
     // sub-run (la riga `agent_runs` creata da `ensure_child_agent_run`).
     let causa =
         crate::agent_tools::subagent_timeout::causa_del_timeout(pool, sub_run_id, timeout_s).await;
     let nota = causa.nota();
-    let errore = format!("[Sub-agent timeout dopo {timeout_s}s] {nota}");
+    let errore = format!("[Sub-agent fermo da {silenzio_s}s] {nota}");
     let verdict = terminal_verdict("timed_out", "timeout", Some(&causa));
     // Un timeout non azzera la spesa gia' fatturata: la prendo dal ledger (META).
     let ledger = crate::chat_messages::fetch_ledger_totals(meta_db, sub_run_id).await;
@@ -5257,24 +5254,16 @@ async fn finalize_timeout(
         SubRunClosure::from_ledger("timeout", &errore, verdict.clone(), &ledger),
     )
     .await;
-    if let Some(n) = narrator {
-        n.say(
-            "subagent_failed",
-            format!("Subagente {kind} in timeout dopo {timeout_s}s: {nota}"),
-            n.with_pin(json!({
-                K_SUB_RUN_ID: sub_run_id.to_string(),
-                K_SUB_KIND: kind,
-                "status": "timeout",
-                K_TIMEOUT_S: timeout_s,
-                "error": errore,
-                // La causa STRUTTURATA viaggia accanto al testo: il pannello la
-                // legge dal campo, non dalla frase (regola Q).
-                "timeout_cause": serde_json::to_value(&causa).unwrap_or(Value::Null),
-            })),
-            sub_run_id,
-        )
-        .await;
-    }
+    narrate_silenzio(
+        narrator,
+        sub_run_id,
+        kind,
+        scadenza,
+        &errore,
+        &causa,
+        &nota,
+    )
+    .await;
     let mut out = json!({
         K_SUB_RUN_ID: sub_run_id.to_string(),
         "kind": kind,
@@ -5286,6 +5275,45 @@ async fn finalize_timeout(
     });
     put_model_fields(&mut out, provider, model);
     out
+}
+
+/// Narrazione (meta-step live sul run PADRE) del sub-run fermato dalla veglia.
+/// Estratta da `finalize_timeout` come `narrate_completed` lo e' da
+/// `finalize_success` (regola L / lunghezza): no-op se `narrator` e' `None`.
+async fn narrate_silenzio(
+    narrator: Option<&ParentNarrator>,
+    sub_run_id: Uuid,
+    kind: &str,
+    scadenza: ScadenzaPerSilenzio,
+    errore: &str,
+    causa: &CausaTimeout,
+    nota: &str,
+) {
+    let Some(n) = narrator else { return };
+    let ScadenzaPerSilenzio {
+        timeout_s,
+        silenzio_s,
+    } = scadenza;
+    n.say(
+        "subagent_failed",
+        format!("Subagente {kind} fermo da {silenzio_s}s senza produrre fatti: {nota}"),
+        n.with_pin(json!({
+            K_SUB_RUN_ID: sub_run_id.to_string(),
+            K_SUB_KIND: kind,
+            "status": "timeout",
+            K_TIMEOUT_S: timeout_s,
+            // Cio' che ha DAVVERO fatto scattare la rete, accanto all'intervallo
+            // di lavoro atteso: sono due numeri diversi, e confonderli manda a
+            // cercare un tetto stretto (regola Q).
+            "silenzio_s": silenzio_s,
+            "error": errore,
+            // La causa STRUTTURATA viaggia accanto al testo: il pannello la
+            // legge dal campo, non dalla frase (regola Q).
+            "timeout_cause": serde_json::to_value(causa).unwrap_or(Value::Null),
+        })),
+        sub_run_id,
+    )
+    .await;
 }
 
 /// Narrazione (meta-step live sul run PADRE) della chiusura OK del sub-run.
@@ -5915,17 +5943,6 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
 mod tests {
     use super::*;
 
-    /// IL CASO MISURATO (09/08/2026), sul numero che lo produceva: una figura del
-    /// Consiglio con timeout 240s riceve un tetto di 960s, quindi le quattro
-    /// fermate a 240s con 4, 5, 17 e 22 passi in corso avrebbero avuto il tempo
-    /// che stavano usando.
-    ///
-    /// E' QUI che vive la meta' permissiva del criterio, non nell'executor: il
-    /// gate di deadline non puo' sapere che il budget che riceve era il timeout
-    /// della figura. Se questa funzione tornasse a consegnare `timeout_s`, il
-    /// gate chiuderebbe all'ora esatta di prima e il criterio di progresso non
-    /// avrebbe mai occasione di parlare.
-    ///
     /// Un evento del sub-run, ridotto ai campi che la veglia guarda: lei non
     /// legge il contenuto, guarda che ARRIVI.
     fn evento_qualunque() -> crate::agent_types::AgentStepEvent {
@@ -5953,7 +5970,6 @@ mod tests {
         let veglia = tokio::spawn(super::veglia_sul_silenzio(
             rx,
             std::time::Duration::from_millis(100),
-            std::time::Duration::from_secs(3600),
         ));
         for _ in 0..10 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -5966,21 +5982,67 @@ mod tests {
         veglia.abort();
     }
 
-    /// L'altra meta': chi TACE oltre la soglia viene fermato, e la causa e'
-    /// dichiarata nel tipo — non e' il tetto, e i referti non si confondono.
+    /// LA MUTAZIONE DEL TETTO, ora che il tetto non c'e' piu': un run che
+    /// produce fatti oltre QUALUNQUE durata non viene fermato da questa rete.
+    /// Rimettere un secondo braccio a tempo nella `select!` della veglia rende
+    /// rosso questo test — che e' l'unico modo di accorgersene, perche' un tetto
+    /// reintrodotto non rompe niente: uccide, e i test che uccidono passano.
+    #[tokio::test(start_paused = true)]
+    async fn nessuna_durata_ferma_chi_produce() {
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        let veglia = tokio::spawn(super::veglia_sul_silenzio(
+            rx,
+            std::time::Duration::from_secs(90),
+        ));
+        // Un'ora di lavoro: il TRIPLO del tetto assoluto che governava le figure
+        // fino al 10/08/2026 (300s x 4 = 1200s), e la finestra riparte a ogni
+        // fatto perche' i 60s stanno sotto la soglia di 90s.
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let _ = tx.send(evento_qualunque());
+        }
+        // Lascia girare la veglia dopo l'ultimo avanzamento del tempo: senza,
+        // `is_finished` guarderebbe un task che non e' ancora stato ripollato e
+        // il test direbbe di si' anche a un tetto appena scattato.
+        tokio::task::yield_now().await;
+        assert!(
+            !veglia.is_finished(),
+            "chi produce non lo ferma l'orologio: lo fermano il criterio di \
+             progresso e il freno di spesa, dentro il motore"
+        );
+        veglia.abort();
+    }
+
+    /// L'altra meta': chi TACE oltre la soglia viene fermato.
     #[tokio::test(start_paused = true)]
     async fn chi_tace_oltre_la_soglia_viene_fermato_per_silenzio() {
         let (tx, rx) = tokio::sync::broadcast::channel(8);
-        // Il sender resta vivo: senza, il canale si chiuderebbe e la veglia
-        // finirebbe per un'altra ragione (canale chiuso), non per silenzio.
+        // Il sender resta vivo: senza, il canale si chiuderebbe e la veglia non
+        // tornerebbe piu' (su nulla da osservare non si decide).
         let _tx = tx;
-        let fine = super::veglia_sul_silenzio(
+        super::veglia_sul_silenzio(rx, std::time::Duration::from_millis(100)).await;
+    }
+
+    /// Canale chiuso = non c'e' piu' nulla da osservare, e su nulla non si
+    /// decide: la veglia tace per sempre e lascia vincere il run.
+    ///
+    /// MUTAZIONE: far tornare la veglia alla chiusura del canale la
+    /// trasformerebbe in una scadenza — e il ramo `None` della `select!`
+    /// chiamante scriverebbe `status='timeout'` su un run che sta concludendo.
+    #[tokio::test(start_paused = true)]
+    async fn il_canale_chiuso_non_e_una_scadenza() {
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        drop(tx);
+        let veglia = tokio::spawn(super::veglia_sul_silenzio(
             rx,
             std::time::Duration::from_millis(100),
-            std::time::Duration::from_secs(3600),
-        )
-        .await;
-        assert_eq!(fine, super::FineVeglia::Silenzio);
+        ));
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        assert!(
+            !veglia.is_finished(),
+            "il canale chiuso non e' silenzio: e' assenza di osservazione"
+        );
+        veglia.abort();
     }
 
     /// Il buffer saturo NON e' silenzio: e' il segno che il run produce piu' in
@@ -6002,37 +6064,54 @@ mod tests {
         );
     }
 
-    /// MUTAZIONE: `timeout_s.max(0)` senza il moltiplicatore rende questo test
-    /// rosso con 240 al posto di 960, cioe' col valore del difetto reale.
+    /// IL FRENO CHE HA SOSTITUITO IL TETTO: quello che il figlio riceve e' la
+    /// capienza RESIDUA della famiglia, non il cap intero. Col cap intero, sei
+    /// figure convocate in sequenza potrebbero spendere sei volte il tetto —
+    /// cioe' il cap non sarebbe piu' un cap.
+    ///
+    /// MUTAZIONE: consegnare `cap_usd` invece di `cap_usd - speso` fa uscire
+    /// 5.00 al posto di 0.75, col valore del difetto reale.
     #[test]
-    fn il_tetto_di_una_figura_eccede_il_suo_timeout() {
+    fn il_figlio_riceve_la_capienza_residua_non_il_cap_intero() {
         assert_eq!(
-            tetto_assoluto_s(240, 4),
-            960,
-            "il tetto e' un MULTIPLO del timeout: chi avanza eccede l'intervallo atteso"
+            capienza_spesa(5.00, 4.25),
+            CapienzaSpesa::Residua { usd: 0.75 },
+            "il freno del figlio e' cio' che resta alla famiglia"
         );
-        assert_eq!(tetto_assoluto_s(300, 4), 1200, "vale per ogni kind, non solo per 240s");
     }
 
-    /// Il clamp non e' difensivo per abitudine: un moltiplicatore sotto 1
-    /// renderebbe il tetto nuovo piu' STRETTO di quello di oggi, cioe' farebbe
-    /// rientrare da un'altra porta il difetto che il criterio chiude. La
-    /// configurazione puo' allargare, mai stringere.
-    ///
-    /// MUTAZIONE: togliere `.max(1)` fa uscire 0 da entrambe le righe — e 0, sul
-    /// `tokio::time::timeout` esterno, e' una figura uccisa all'istante.
+    /// L'altra faccia della stessa capienza: esaurita, il figlio non parte. E'
+    /// il guard di ammissione storico, che ora legge dallo stesso punto — con
+    /// due criteri distinti un figlio poteva essere ammesso e ricevere un
+    /// residuo negativo, o essere rifiutato con capienza ancora disponibile.
     #[test]
-    fn la_configurazione_non_puo_stringere_il_tetto_sotto_il_timeout() {
-        assert_eq!(
-            tetto_assoluto_s(240, 0),
-            240,
-            "moltiplicatore 0 (o assente): il tetto resta il timeout, mai meno"
-        );
-        assert_eq!(
-            tetto_assoluto_s(240, -3),
-            240,
-            "un valore negativo in DB non puo' produrre un tetto piu' stretto"
-        );
+    fn capienza_esaurita_non_ammette_il_figlio() {
+        assert!(matches!(
+            capienza_spesa(5.00, 5.00),
+            CapienzaSpesa::Esaurita { .. }
+        ));
+        assert!(matches!(
+            capienza_spesa(5.00, 7.10),
+            CapienzaSpesa::Esaurita { .. }
+        ));
+    }
+
+    /// UN RESIDUO ZERO NON PUO' NASCERE. Nel motore `run_cost_budget_usd = 0`
+    /// significa «freno disabilitato»: se la capienza esaurita si traducesse in
+    /// uno zero, la figura senza piu' credito partirebbe SENZA ALCUN LIMITE —
+    /// l'errore piu' pericoloso possibile, e silenzioso. Il tipo lo rende
+    /// irrappresentabile (regola Q); questo test lo prova sul confine.
+    ///
+    /// MUTAZIONE: cambiare `residuo <= 0.0` in `residuo < 0.0` rende rosso il
+    /// primo caso, che e' esattamente il confine.
+    #[test]
+    fn un_cap_disabilitato_non_diventa_via_libera() {
+        for (cap, speso) in [(0.0, 0.0), (0.0, 1.0), (-1.0, 0.0)] {
+            assert!(
+                matches!(capienza_spesa(cap, speso), CapienzaSpesa::Esaurita { .. }),
+                "cap {cap} con speso {speso}: capienza zero e' un rifiuto, mai un freno spento"
+            );
+        }
     }
 
     /// REGRESSIONE (2026-07-26, osservata sul progetto e2e-todo): con openai e
@@ -6229,24 +6308,12 @@ mod tests {
     const T_RUN: &str = "run_command";
     const FIX_PATH: &str = "src/a.rs";
 
-    /// La misura che distingue "il timer e' scattato tardi" da "la scrittura di
-    /// chiusura e' arrivata tardi": nell'incidente del 19/07 le due cause erano
-    /// indistinguibili perche' l'unico timestamp disponibile era quello della
-    /// scrittura, e il ritardo era in realta' l'attesa di una connessione.
-    #[test]
-    fn il_ritardo_dello_scatto_e_l_eccesso_sul_budget() {
-        // Timer puntuale: nessun ritardo da segnalare.
-        assert_eq!(ritardo_scatto_ms(300_000, 300), 0);
-        assert_eq!(ritardo_scatto_ms(300_120, 300), 120);
-        // Il caso dell'incidente, se lo scatto fosse davvero tardato.
-        assert_eq!(ritardo_scatto_ms(427_000, 300), 127_000);
-        // Scatto anticipato (clock non monotono altrove): mai negativo.
-        assert_eq!(ritardo_scatto_ms(299_000, 300), 0);
-        // Budget non valorizzato: l'intero tempo trascorso e' l'eccesso, e non
-        // si moltiplica un negativo.
-        assert_eq!(ritardo_scatto_ms(5_000, 0), 5_000);
-        assert_eq!(ritardo_scatto_ms(5_000, -7), 5_000);
-    }
+    // Qui viveva `il_ritardo_dello_scatto_e_l_eccesso_sul_budget`, che misurava
+    // di quanto lo scatto avesse ecceduto il budget. Con la veglia sul silenzio
+    // non esiste piu' un istante ATTESO da cui misurare uno scarto: la rete
+    // scatta `soglia` dopo l'ultimo fatto, e quando quello sia arrivato lo sa
+    // solo il run. Il tempo totale resta nel referto (`scatto_ms`) come misura
+    // di contorno, non come scostamento da una previsione.
 
     /// I quattro tool sub-agent portano l'esito in un CAMPO (regola Q), e il
     /// caso che il marker in testa al testo non poteva coprire e' il rifiuto in

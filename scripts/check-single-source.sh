@@ -2222,22 +2222,37 @@ assert_single "avanzamento-figura" 'fn decidi_prosecuzione|fn classifica_avanzam
 #    `elapsed >= budget` — con tutti i test verdi, perche' un run chiuso a tempo
 #    resta un run chiuso. E' il difetto misurato, e rientrerebbe in silenzio.
 if [[ -z "$(awk '
-  /async fn gate_deadline_run/ { dentro = 1 }
+  /async fn gate_prosecuzione_run/ { dentro = 1 }
   dentro && /prosecuzione_del_run/ { print "trovato"; exit }
   dentro && /^    }/ { exit }
 ' crates/nexus-agent-graph/src/nodes/executor.rs 2>/dev/null)" ]]; then
-  echo "!! avanzamento-figura: il gate di deadline non chiede piu' se la figura avanza." >&2
-  echo "   gate_deadline_run deve interrogare prosecuzione_del_run: senza, il" >&2
+  echo "!! avanzamento-figura: il gate di prosecuzione non chiede piu' se la figura avanza." >&2
+  echo "   gate_prosecuzione_run deve interrogare prosecuzione_del_run: senza, il" >&2
   echo "   criterio torna a essere l'orologio e una figura che lavora muore al tetto." >&2
   fail=1
 else
-  echo "OK avanzamento-figura: il gate di deadline chiede se la figura sta avanzando"
+  echo "OK avanzamento-figura: il gate di prosecuzione chiede se la figura sta avanzando"
 fi
-# 3. Il tetto assoluto si calcola in UN posto: e' il numero su cui il timeout
-#    esterno e il budget del motore devono concordare. Se divergessero, il piu'
-#    stretto vincerebbe in silenzio e il criterio sarebbe inerte proprio nel caso
-#    per cui esiste.
-assert_single "tetto-assoluto-figura" 'fn tetto_assoluto_s' \
+# 3. Il gate deve essere RAGGIUNGIBILE da una figura (2026-08-10). Tolto il tetto
+#    in tempo derivato dal timeout, la vecchia condizione d'ingresso
+#    (`run_time_budget_s == 0 -> return`) rendeva il gate irraggiungibile per
+#    ogni sub-run: il criterio di progresso sarebbe rimasto perfetto e mai
+#    interrogato, senza che un solo test lo notasse (tutti passano un tetto).
+if grep -q 'if self.cfg.run_time_budget_s == 0 {' \
+    crates/nexus-agent-graph/src/nodes/executor.rs; then
+  echo "!! avanzamento-figura: la condizione d'ingresso del gate torna a essere il tetto." >&2
+  echo "   Un sub-run non passa piu' un tetto in tempo (il suo freno e' la spesa):" >&2
+  echo "   con quella guardia il gate non viene raggiunto e nessuno ferma piu' chi" >&2
+  echo "   ripete. Usare ExecutorConfig::governa_prosecuzione." >&2
+  fail=1
+else
+  echo "OK avanzamento-figura: il gate governa i run con un budget proprio, non i soli tetti"
+fi
+# 4. La capienza di spesa della famiglia si calcola in UN posto: risponde a DUE
+#    domande (il figlio parte? quanto puo' spendere?) e due criteri distinti
+#    ammetterebbero un figlio con residuo negativo, o ne rifiuterebbero uno con
+#    capienza ancora disponibile.
+assert_single "capienza-spesa-famiglia" 'fn capienza_spesa' \
   'crates/mcp-core/src/agent_tools/subagent_native.rs' crates
 
 # La RESA dell'elenco servizi si compone in un punto solo (2026-08-02, regole L+Q)

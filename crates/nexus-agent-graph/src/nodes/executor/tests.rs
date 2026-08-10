@@ -7200,6 +7200,182 @@ async fn la_figura_fermata_dal_criterio_riceve_comunque_il_sollecito() {
     );
 }
 
+/// IL FIX DEL 10/08/2026, alla giunzione. Tolto il tetto in tempo alle figure
+/// (`run_time_budget_s: 0`, come sara' d'ora in poi ogni sub-run), il criterio
+/// di progresso deve continuare a governarle: chi RIPETE si ferma, e il freno
+/// che tiene acceso il gate e' il budget di SPESA.
+///
+/// MUTAZIONE: rimettere la vecchia condizione d'ingresso
+/// (`if self.cfg.run_time_budget_s == 0 { return None }`) rende questo test
+/// rosso — il gate non viene raggiunto, la porta non viene interrogata e una
+/// figura che ripete la stessa chiamata all'infinito non ha piu' chi la fermi.
+/// E' la trappola di questo cambiamento: senza tetto il gate diventava
+/// irraggiungibile, e nessun test esistente se ne sarebbe accorto (tutti
+/// passano un tetto).
+#[tokio::test]
+async fn senza_tetto_il_criterio_governa_lo_stesso_chi_ripete() {
+    let adesso = started_epoch_fa(0);
+    let porta = Arc::new(StubAvanzamento {
+        fatti: crate::decisions::FattiAvanzamento {
+            passi: (0..6)
+                .map(|i| {
+                    passo_avanzamento(
+                        "run_command",
+                        json!({"command": "npm test"}),
+                        adesso - 150 + i * 20,
+                    )
+                })
+                .collect(),
+            scritture: Vec::new(),
+        },
+        ..Default::default()
+    });
+    let cfg = ExecutorConfig {
+        run_token_budget: 0,
+        run_token_hard_cap: 0,
+        // NESSUN tetto in tempo: il sub-run non ne passa piu' uno.
+        run_time_budget_s: 0,
+        // La capienza residua del cap di famiglia: e' questo a dire «il run ha
+        // un budget proprio», e quindi ad ammetterlo al gate.
+        run_cost_budget_usd: 4.25,
+        progresso_inattivita_max_s: 90,
+        time_grace_pct: 0,
+        ..cfg_resolved()
+    };
+    let (n, _m) = nodo_con_avanzamento(cfg, porta.clone());
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone());
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("analizza l'auth")],
+        run_started_at_epoch_s: Some(started_epoch_fa(160)),
+        iterations: Some(15),
+        tools_json: Some(vec![json!({"name": "run_command"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+
+    assert!(
+        porta.interrogata.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "senza tetto il gate deve comunque interrogare la porta"
+    );
+    let ms = out
+        .meta_steps
+        .iter()
+        .find(|m| m.kind == "anti_runaway")
+        .expect("chi ripete si ferma anche senza tetto");
+    assert_eq!(
+        ms.payload.get("reason").and_then(Value::as_str),
+        Some("no_progress"),
+        "la causa e' l'assenza di progresso: di tetti non ce ne sono piu'"
+    );
+}
+
+/// Il run PRIMARIO non e' toccato: nessun budget proprio (entrambe le chiavi a
+/// `0` per policy) -> il gate non lo governa e il turno prosegue, come prima del
+/// 10/08/2026. Senza questo test, allargare la condizione d'ingresso avrebbe
+/// potuto estendere in silenzio il criterio di progresso a un run che nessuno ha
+/// misurato con quelle soglie.
+#[tokio::test]
+async fn senza_alcun_budget_il_gate_non_governa_il_run() {
+    let porta = Arc::new(StubAvanzamento {
+        fatti: crate::decisions::FattiAvanzamento {
+            // Fatti che, se il gate fosse raggiunto, produrrebbero un arresto.
+            passi: (0..6)
+                .map(|i| {
+                    passo_avanzamento(
+                        "run_command",
+                        json!({"command": "npm test"}),
+                        started_epoch_fa(0) - 150 + i * 20,
+                    )
+                })
+                .collect(),
+            scritture: Vec::new(),
+        },
+        ..Default::default()
+    });
+    let cfg = ExecutorConfig {
+        run_token_budget: 0,
+        run_token_hard_cap: 0,
+        run_time_budget_s: 0,
+        run_cost_budget_usd: 0.0,
+        progresso_inattivita_max_s: 90,
+        time_grace_pct: 70,
+        ..cfg_resolved()
+    };
+    let (n, _m) = nodo_con_avanzamento(cfg, porta.clone());
+    let llm = Arc::new(StubLlmGateway::with_text("prosegue"));
+    let ctx = ctx_with(llm.clone());
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("analizza l'auth")],
+        run_started_at_epoch_s: Some(started_epoch_fa(4000)),
+        iterations: Some(15),
+        tools_json: Some(vec![json!({"name": "run_command"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+
+    assert_eq!(
+        porta.interrogata.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "un run senza budget proprio non passa dal gate: la porta non va nemmeno letta"
+    );
+    assert!(
+        !out.meta_steps.iter().any(|m| m.kind == "anti_runaway"),
+        "il run primario prosegue come prima: {:?}",
+        out.meta_steps
+    );
+    assert!(!llm.seen.lock().unwrap().is_empty());
+}
+
+/// SENZA TETTO NON C'E' SOGLIA per il sollecito a tempo. `time_grace_pct` e' una
+/// PERCENTUALE di `run_time_budget_s`: con il tetto a 0 la soglia vale 0, e
+/// `elapsed >= 0` e' vero al primo giro — il sollecito di FINE CORSA
+/// diventerebbe un ordine di chiudere subito, dato a una figura che ha appena
+/// cominciato. Finche' ogni figura nasceva con un tetto derivato il caso non si
+/// dava; da quando il tetto e' `0` si darebbe SEMPRE.
+///
+/// MUTAZIONE: togliere `|| self.cfg.run_time_budget_s == 0` da
+/// `maybe_time_grace_delta` rende questo test rosso su `advisory_grace_used`.
+#[tokio::test]
+async fn senza_tetto_il_sollecito_a_tempo_non_scatta_subito() {
+    let porta = Arc::new(StubAvanzamento::default());
+    let cfg = ExecutorConfig {
+        run_token_budget: 0,
+        run_token_hard_cap: 0,
+        run_time_budget_s: 0,
+        run_cost_budget_usd: 4.25,
+        // Criterio di progresso spento: qui si misura il SOLO sollecito.
+        progresso_inattivita_max_s: 0,
+        time_grace_pct: 70,
+        ..cfg_resolved()
+    };
+    let (n, _m) = nodo_con_avanzamento(cfg, porta);
+    // Il modello CHIEDE UN TOOL: cosi' il turno non e' una chiusura muta, e
+    // l'unico sollecito possibile resta quello a tempo — che e' cio' che qui si
+    // misura. Con uno stub di sola prosa scatterebbe il terzo call site della
+    // grazia (post-LLM), e il test sarebbe rosso per un'altra ragione.
+    let llm = llm_tool_call("read_file", json!({"path": "a.rs"}));
+    let ctx = ctx_with(llm.clone());
+    // Figura MUTA (canale di ruolo pendente) appena partita: 3 secondi di vita.
+    let state = figura_muta_da(3);
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+
+    assert!(
+        !llm.seen.lock().unwrap().is_empty(),
+        "il modello va interrogato: la figura ha appena cominciato"
+    );
+    assert_ne!(
+        out.extra.get("advisory_grace_used").and_then(Value::as_bool),
+        Some(true),
+        "nessun sollecito di fine corsa a una figura di 3 secondi"
+    );
+}
+
 // ── Tetto sui fallimenti gateway deterministici (mig 0619) ────────────────────
 
 #[test]
