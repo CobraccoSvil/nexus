@@ -805,6 +805,14 @@ pub struct StateDelta {
         skip_serializing_if = "Option::is_none"
     )]
     pub subagent_depth: Option<Option<i64>>,
+    /// Vedi `AgentState::prodotto_del_run`.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub prodotto_del_run:
+        Option<Option<crate::decisions::prodotto_del_run::ProdottoDelRun>>,
     /// Vedi `AgentState::subagent_results`.
     #[serde(
         default,

@@ -161,6 +161,7 @@ pub mod panel_quorum;
 pub mod severity;
 pub mod shell_command;
 pub mod predictive_cap;
+pub mod prodotto_del_run;
 pub mod progress_controller;
 pub mod requirement_conformance;
 pub mod reward;

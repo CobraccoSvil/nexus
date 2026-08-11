@@ -296,8 +296,12 @@ pub(crate) fn build_edges(
     );
 
     // ── understanding -> planner | executor (graph.py:182-186, route_after_router) ─
-    // Delega al punto unico PlannerConfig::is_eligible (regola L). I tre segnali
-    // (behavior_mode, intent, token_budget) sono letti dallo stato post-router.
+    // Delega al punto unico PlannerConfig::is_eligible (regola L). I QUATTRO segnali
+    // (behavior_mode, intent, token_budget, prodotto_del_run) sono letti dallo stato
+    // post-router. Il quarto non parla del compito ma del run: una figura convocata
+    // per dare un parere non entra nella plan-phase, perche' delegare i passi a
+    // sub-run che scrivono e' produrre il lavoro per interposta figura (vedi
+    // `decisions::prodotto_del_run`, misura del 10/08/2026).
     edges.insert(
         NodeId::Understanding,
         Edge::conditional(move |state: &AgentState| {
@@ -305,6 +309,7 @@ pub(crate) fn build_edges(
                 state.behavior_mode.as_deref(),
                 state.user_intent.as_deref(),
                 state.token_budget.unwrap_or(0),
+                state.prodotto_del_run.unwrap_or_default(),
             );
             if eligible {
                 NodeId::Planner

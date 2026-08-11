@@ -55,8 +55,26 @@ static RE_RS_FN_UPPERCASE: LazyLock<Regex> =
 static RE_JS_CLASS_LOWERCASE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"class\s+([a-z]\w*)").unwrap());
 // Marker TODO/FIXME/HACK/XXX/WORKAROUND con messaggio.
+//
+// MAIUSCOLO obbligatorio, e non e' un dettaglio di stile: un marker di debito e'
+// per convenzione universale in maiuscolo, mentre le stesse lettere in minuscolo
+// sono PAROLE. Con `(?i)` questa regex contava come debito ogni prosa che
+// nominasse una lista di attivita' — e in questo repo `todo` e' vocabolario di
+// dominio (`nexus_todo_write`, `todo_runner`, `TodoRunnerNode`, i `todos` del
+// piano), quindi la documentazione tecnica alimentava la metrica del debito.
+//
+// MISURATO il 10/08/2026 su `crates/`: 652 righe corrispondevano
+// case-insensitive, di cui **136 in maiuscolo** — i marker veri — e 516 in
+// minuscolo, cioe' il 79% di questa classe di finding era prosa. Un solo file,
+// `nodes/planner.rs`, ne portava 57, e parla di liste di attivita' per mestiere.
+//
+// La domanda «questa riga e' un marker di debito?» aveva percio' DUE risposte in
+// disaccordo (regola L): `scripts/markers-ratchet.sh` la pone case-SENSITIVE
+// (`DEBT_RE`, nessun `-i`) e conta i marker veri; questa la poneva
+// case-insensitive. Allineare qui non indebolisce il gate: gli restituisce
+// l'oggetto che il suo gemello misura gia'.
 static RE_TODO_MARKER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b(TODO|FIXME|HACK|XXX|WORKAROUND)\b:?\s*(.*)").unwrap());
+    LazyLock::new(|| Regex::new(r"\b(TODO|FIXME|HACK|XXX|WORKAROUND)\b:?\s*(.*)").unwrap());
 // Soppressioni di warning che possono indicare dead code.
 static RE_SUPPRESSED_WARNING: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"#\[allow\(dead_code\)\]|// @ts-ignore|# type: ignore|#\[cfg\(dead_code\)\]")
@@ -656,6 +674,10 @@ fn check_todos_fixmes(lines: &[&str]) -> Vec<QualityFinding> {
 
     for (i, line) in lines.iter().enumerate() {
         if let Some(cap) = RE_TODO_MARKER.captures(line) {
+            // La regex e' case-sensitive e ammette solo il MAIUSCOLO, quindi qui
+            // `cap[1]` lo e' gia': la normalizzazione resta perche' e' il tipo di
+            // riga che il titolo del finding non deve poter contraddire, non
+            // perche' serva a convertire qualcosa.
             let kind = cap[1].to_uppercase();
             let msg = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
             findings.push(QualityFinding {
@@ -1371,6 +1393,49 @@ mod tests {
         assert_eq!(RE_BRANCH_RUST_PY.find_iter("let ok = a&&b;").count(), 1);
         // `??` (variante FULL) ha lo stesso problema dei booleani
         assert_eq!(RE_BRANCH_FULL.find_iter("const x = a ?? b;").count(), 1);
+    }
+
+    /// Un marker di debito e' MAIUSCOLO; le stesse lettere in minuscolo sono una
+    /// parola, e in questo repo `todo` e' vocabolario di dominio.
+    ///
+    /// Con `(?i)` la documentazione tecnica alimentava la metrica del debito:
+    /// MISURATO il 10/08/2026 su `crates/`, 652 righe corrispondevano
+    /// case-insensitive e solo 136 erano in maiuscolo — il 79% di questa classe di
+    /// finding era prosa, con 57 occorrenze nel solo `nodes/planner.rs`, che parla
+    /// di liste di attivita' per mestiere.
+    ///
+    /// MUTAZIONE: rimettere `(?i)` nella regex fa rosseggiare le tre asserzioni
+    /// negative, cioe' proprio le forme che il difetto contava come debito.
+    #[test]
+    fn il_marker_di_debito_e_maiuscolo_non_una_parola_di_prosa() {
+        // I marker veri, nelle forme in cui si scrivono.
+        assert!(RE_TODO_MARKER.is_match("// TODO: estrarre il criterio"));
+        assert!(RE_TODO_MARKER.is_match("    // FIXME gestire il None"));
+        assert!(RE_TODO_MARKER.is_match("/* HACK temporaneo */"));
+        assert!(RE_TODO_MARKER.is_match("// XXX"));
+        assert!(RE_TODO_MARKER.is_match("// WORKAROUND: vedi issue"));
+
+        // Prosa di dominio: NON e' debito. Sono le tre forme reali che il difetto
+        // contava, prese dalla documentazione di `decisions::prodotto_del_run`.
+        assert!(
+            !RE_TODO_MARKER.is_match("//! una todo app come pagina HTML statica"),
+            "una app di liste di attivita' nominata in prosa non e' un marker"
+        );
+        assert!(
+            !RE_TODO_MARKER.is_match("//! `TodoRunnerNode` esegue ogni todo chiamando"),
+            "il nome di un tipo del dominio non e' un marker"
+        );
+        assert!(
+            !RE_TODO_MARKER.is_match("//! MISURATO sul progetto `batteria-todo-app`"),
+            "il nome del progetto misurato non e' un marker: senza poterlo \
+             nominare la documentazione perde la propria prova"
+        );
+
+        // Il titolo del finding resta in maiuscolo per costruzione.
+        let f = check_todos_fixmes(&["// FIXME: qui"]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].title, "FIXME marker");
+        assert_eq!(f[0].severity, "high");
     }
 
     /// L'ordine delle alternative e' load-bearing: `else if` sta dopo `if`, cosi' un

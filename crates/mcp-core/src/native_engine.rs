@@ -357,6 +357,22 @@ pub struct NativeRunInput {
     /// grafo nativo lo usa per il guard anti-esplosione del fan-out explore
     /// (`UnderstandingNode`, `subagent_depth >= 1 -> skip`) e per l'anti-ricorsione.
     pub subagent_depth: Option<i64>,
+    /// Che cosa questo run deve CONSEGNARE: il lavoro, o un parere su di esso.
+    ///
+    /// Valorizza `AgentState::prodotto_del_run`, che il gate d'ingresso alla
+    /// plan-phase legge: una figura convocata per dare un parere non decompone il
+    /// compito e non lo delega, perche' delegarlo a sub-run che scrivono e'
+    /// produrre il lavoro per interposta figura. Lo decide
+    /// `subagent_native::prepare_subagent_run` dal contratto della figura
+    /// (`nexus_types::figure_advisory::is_advisory_kind`), MAI da kind o
+    /// profondita'.
+    ///
+    /// `Lavoro` per il run principale e per ogni figura che lavora: il default e'
+    /// anche il comportamento storico, quindi nessun call site cambia esito senza
+    /// averlo dichiarato. Vedi
+    /// [`nexus_agent_graph::decisions::prodotto_del_run`] per la misura del
+    /// 10/08/2026 (18 dispatcher, 99 sub-run, tre alberi paralleli).
+    pub prodotto_del_run: nexus_agent_graph::decisions::prodotto_del_run::ProdottoDelRun,
     /// Le RISORSE che questo run puo' consumare, quando il chiamante le conosce
     /// meglio dei setting globali. Vedi [`BudgetDelRun`].
     pub budget: BudgetDelRun,
@@ -3849,6 +3865,11 @@ fn build_initial_state(input: &NativeRunInput) -> AgentState {
         // INVARIATO (default None). Solo `dispatch_subagent` popola questi campi.
         parent_run_id: input.parent_run_id.map(|u| u.to_string()),
         subagent_depth: input.subagent_depth,
+        // Il prodotto del run entra nello stato SEMPRE (anche `Lavoro`): un campo
+        // popolato solo nel caso restrittivo renderebbe `None` ambiguo fra «run
+        // che lavora» e «nessuno l'ha dichiarato», e sono la stessa conseguenza
+        // solo finche' il default non cambia mai (regola Q).
+        prodotto_del_run: Some(input.prodotto_del_run),
         // Epoch di avvio per la deadline di run (fase 3): scritto UNA volta qui
         // e checkpointato — un resume riparte dal checkpoint, quindi la deadline
         // misura il run INTERO. I sub-run hanno il proprio epoch ma il loro
@@ -4595,6 +4616,10 @@ mod tests {
             session_id: Uuid::new_v4(),
             provider: "anthropic".to_string(),
             model: "claude-x".to_string(),
+            // Run principale di test: produce il lavoro. I test del vincolo
+            // advisory lo sovrascrivono esplicitamente.
+            prodotto_del_run:
+                nexus_agent_graph::decisions::prodotto_del_run::ProdottoDelRun::Lavoro,
             provider_pin: crate::orchestrator::ProviderPin::none(),
             provider_veto: crate::orchestrator::ProviderVeto::none(),
             system_text: "sei un assistente".to_string(),
@@ -4970,6 +4995,53 @@ mod tests {
             state.subagent_depth,
             Some(2),
             "sub-run: subagent_depth propagato (anti-ricorsione/guard fan-out)"
+        );
+    }
+
+    /// Il PRODOTTO del run attraversa `build_initial_state` e arriva nello stato:
+    /// e' il solo campo da cui il gate d'ingresso alla plan-phase puo' sapere che
+    /// questa figura da' un parere e non delega.
+    ///
+    /// Passa dal produttore reale e non da un `AgentState` costruito a mano
+    /// (regola O): il difetto del 10/08/2026 non era nel criterio — che non
+    /// esisteva — ma nel fatto che nulla portava questa informazione fin dentro il
+    /// grafo, e un test che assegnasse il campo allo stato direttamente resterebbe
+    /// verde anche con la propagazione staccata.
+    ///
+    /// MUTAZIONE: rimuovere `prodotto_del_run: Some(input.prodotto_del_run)` da
+    /// `build_initial_state` fa rosseggiare la seconda asserzione con `None`, che
+    /// il planner legge come `Lavoro` — cioe' esattamente la figura advisory che
+    /// torna a pianificare.
+    #[test]
+    fn initial_state_porta_il_prodotto_del_run() {
+        use nexus_agent_graph::decisions::prodotto_del_run::ProdottoDelRun;
+
+        let input = sample_input();
+        assert_eq!(
+            build_initial_state(&input).prodotto_del_run,
+            Some(ProdottoDelRun::Lavoro),
+            "run principale: produce il lavoro, pianifica come prima"
+        );
+
+        let mut figura = sample_input();
+        figura.parent_run_id = Some(Uuid::new_v4());
+        figura.subagent_depth = Some(1);
+        figura.prodotto_del_run = ProdottoDelRun::Parere;
+        let state = build_initial_state(&figura);
+        assert_eq!(
+            state.prodotto_del_run,
+            Some(ProdottoDelRun::Parere),
+            "figura advisory: il prodotto arriva nello stato, non si deduce dal depth"
+        );
+        // Il grafo legge QUESTO campo attraverso il criterio, non il depth: una
+        // figura advisory e una figura che lavora possono stare alla stessa
+        // profondita', e la profondita' non dice nulla sul prodotto.
+        assert!(
+            !state
+                .prodotto_del_run
+                .unwrap_or_default()
+                .decompone_e_delega(),
+            "il criterio applicato al campo propagato nega la delega"
         );
     }
 
@@ -5663,7 +5735,11 @@ mod tests {
             cfg.is_eligible(
                 Some(crate::agent_turn_setup::PRIMARY_BEHAVIOR_MODE),
                 Some("code"),
-                1000
+                1000,
+                // Il run PRIMARIO produce il lavoro: e' il caso che questo test
+                // misura (le config lette dal DB), e il quinto cancello riguarda
+                // le figure convocate per dare un parere.
+                nexus_agent_graph::decisions::prodotto_del_run::ProdottoDelRun::Lavoro,
             ),
             "planner eleggibile col behavior_mode del primario + intent + budget"
         );

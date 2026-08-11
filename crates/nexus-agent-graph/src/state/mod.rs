@@ -694,6 +694,19 @@ pub struct AgentState {
     pub parent_run_id: Option<String>,
     /// Profondita' del sub-agente.
     pub subagent_depth: Option<i64>,
+    /// Che cosa questo run deve CONSEGNARE: il lavoro, o un parere su di esso.
+    ///
+    /// Lo dichiara chi prepara il run, dove il contratto della figura si conosce
+    /// (`subagent_native::prepare_subagent_run` lo deriva da
+    /// `nexus_types::figure_advisory::is_advisory_kind`); qui e' un DATO, mai
+    /// dedotto dal kind o dalla profondita'. `None` = non dichiarato, che vale
+    /// [`crate::decisions::prodotto_del_run::ProdottoDelRun::Lavoro`]: il
+    /// comportamento di chi non popola il campo non cambia.
+    ///
+    /// Lo legge il gate d'ingresso alla plan-phase, perche' una figura convocata
+    /// per dare un parere non decompone il compito e non lo delega — vedi
+    /// [`crate::decisions::prodotto_del_run`] per la misura del 10/08/2026.
+    pub prodotto_del_run: Option<crate::decisions::prodotto_del_run::ProdottoDelRun>,
     /// Risultati dei sub-agenti.
     pub subagent_results: Option<Vec<Value>>,
     /// Sub-run attivi.

@@ -374,14 +374,25 @@ pub async fn convocable_kinds(db: &sqlx::PgPool) -> Vec<String> {
 ///
 /// Il criterio e' il punto unico (regola L); il vocabolario dei mutatori e' la
 /// stessa riga di settings che governa il gate HITL.
+/// Chiave del vocabolario dei tool che MUTANO lo stato.
+///
+/// Nominata una volta perche' i due lettori qui sotto rispondono a domande
+/// diverse sullo STESSO vocabolario — chi puo' essere convocato per un parere
+/// ([`advisory_kinds`]) e che cosa deve produrre una figura
+/// ([`prodotto_del_run`]) — e con la chiave scritta due volte un rinominamento
+/// ne aggiornerebbe una sola, lasciando un lettore muto senza che nulla fallisca:
+/// il vocabolario assente non e' un errore, e' il ramo che NON restringe.
+/// E' la stessa riga di settings che governa il gate HITL.
+const VOCABOLARIO_MUTATORI: &str = "agent.tools.result_cache_mutators";
+
 async fn advisory_kinds(db: &sqlx::PgPool) -> Vec<String> {
-    let mutatori = nexus_auth::get_csv_setting(db, "agent.tools.result_cache_mutators").await;
+    let mutatori = nexus_auth::get_csv_setting(db, VOCABOLARIO_MUTATORI).await;
     // Vocabolario assente: non si puo' dire chi muta, quindi non si puo' dire
     // chi e' advisory. Meglio nessun filtro che un filtro cieco che escluda
     // tutti (regola Q: l'ignoto non degrada a "nessuno").
     if mutatori.is_empty() {
         tracing::warn!(
-            "advisory_kinds: 'agent.tools.result_cache_mutators' vuoto, filtro advisory non applicato"
+            "advisory_kinds: '{VOCABOLARIO_MUTATORI}' vuoto, filtro advisory non applicato"
         );
         return Vec::new();
     }
@@ -395,6 +406,48 @@ async fn advisory_kinds(db: &sqlx::PgPool) -> Vec<String> {
     .filter(|(_, tools)| nexus_types::figure_advisory::is_advisory_kind(tools, &mutatori))
     .map(|(kind, _)| kind)
     .collect()
+}
+
+/// Che cosa questo sub-run deve CONSEGNARE, dal contratto della figura.
+///
+/// Gemella di [`advisory_kinds`] e stesso criterio ([`is_advisory_kind`], regola
+/// L): quella risponde «CHI puo' essere convocato per un parere?» sull'intero
+/// roster, questa «che cosa deve produrre QUESTA figura?» sulla whitelist che il
+/// chiamante ha gia' in mano. Non e' una seconda risposta alla stessa domanda: la
+/// prima governa la SELEZIONE, e la sua risposta non dice nulla su cio' che il run
+/// selezionato potra' fare.
+///
+/// Serve perche' il contratto advisory era enforced solo contro le MANI della
+/// figura — nessun tool mutatore in whitelist — e non contro la DELEGA, che non
+/// passa da un tool: `TodoRunnerNode` chiama `dispatch_subagents` come nodo del
+/// grafo. Undici figure advisory sono cosi' diventate dispatcher di 99 sub-run
+/// `implement` su `batteria-todo-app` il 10/08/2026; vedi
+/// [`nexus_agent_graph::decisions::prodotto_del_run`].
+///
+/// Vocabolario dei mutatori assente -> `Lavoro`, cioe' nessuna restrizione: senza
+/// sapere chi muta non si puo' dire chi e' advisory, e un DB muto non e' la
+/// dichiarazione che ogni figura dia pareri. E' la STESSA scelta gia' fatta da
+/// [`advisory_kinds`] (li' nessun filtro invece di nessuna figura), col suo WARN:
+/// due direzioni opposte davanti allo stesso silenzio renderebbero il Consiglio
+/// capace di convocare una figura che poi non puo' fare nulla.
+async fn prodotto_del_run(
+    db: &sqlx::PgPool,
+    tool_whitelist: &[String],
+) -> nexus_agent_graph::decisions::prodotto_del_run::ProdottoDelRun {
+    use nexus_agent_graph::decisions::prodotto_del_run::ProdottoDelRun;
+    let mutatori = nexus_auth::get_csv_setting(db, VOCABOLARIO_MUTATORI).await;
+    if mutatori.is_empty() {
+        tracing::warn!(
+            "prodotto_del_run: '{VOCABOLARIO_MUTATORI}' vuoto, \
+             prodotto non determinabile -> Lavoro (nessuna restrizione)"
+        );
+        return ProdottoDelRun::Lavoro;
+    }
+    if nexus_types::figure_advisory::is_advisory_kind(tool_whitelist, &mutatori) {
+        ProdottoDelRun::Parere
+    } else {
+        ProdottoDelRun::Lavoro
+    }
 }
 
 /// Risolve il system_text del sub-agente dal registry prompt (`nexus_prompt_templates`,
@@ -4122,6 +4175,12 @@ async fn prepare_subagent_run(
         prompt_key: definition.prompt_key.clone(),
         mandate,
         tools_json,
+        // Deciso QUI, dove il contratto della figura e' in mano (la whitelist), e
+        // non dove il run parte: l'esecuzione riceve un FATTO gia' stabilito, come
+        // per `tools_json` e `prompt_key`. Deciderlo a valle vorrebbe dire
+        // ri-interrogare il DB per una domanda a cui la definizione appena letta
+        // risponde da sola.
+        prodotto_del_run: prodotto_del_run(db, &definition.tool_whitelist).await,
         current_depth,
         timeout_s,
         budget_spesa_usd,
@@ -4193,6 +4252,11 @@ struct SubagentExecInputs {
     /// seconda il task che il run dichiara come proprio.
     mandate: SubagentMandate,
     tools_json: Value,
+    /// Che cosa questa figura deve CONSEGNARE, dal suo contratto
+    /// ([`prodotto_del_run`]). Viaggia fino allo stato del grafo, dove il gate
+    /// d'ingresso alla plan-phase lo legge: una figura convocata per dare un
+    /// parere non decompone il compito e non lo delega a sub-run che scrivono.
+    prodotto_del_run: nexus_agent_graph::decisions::prodotto_del_run::ProdottoDelRun,
     current_depth: i64,
     /// Intervallo di lavoro atteso per questa figura (il vecchio tetto fisso).
     /// Dal 09/08/2026 NON e' piu' il criterio di morte: resta la misura che
@@ -4252,6 +4316,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         prompt_key,
         mandate,
         tools_json,
+        prodotto_del_run,
         current_depth,
         timeout_s,
         budget_spesa_usd,
@@ -4376,6 +4441,11 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         step_tx: sub_tx,
         parent_run_id: Some(anchor),
         subagent_depth: Some(current_depth),
+        // Dal CONTRATTO della figura, deciso in `prepare_subagent_run` dove la
+        // whitelist e' in mano: mai dal kind (un kind nuovo domani non sarebbe in
+        // nessun elenco) e mai dalla profondita' (una figura advisory e una che
+        // lavora possono stare allo stesso livello).
+        prodotto_del_run,
         sizing_complexity: None,
         sizing_scope_system_wide: false,
         classifier_intent: None,
@@ -8813,6 +8883,73 @@ mod tests {
         assert!(
             got.iter().any(|f| f == "software_architect"),
             "le figure advisory dichiarate restano: {got:?}"
+        );
+    }
+
+    /// Il PRODOTTO di una figura si legge dal suo contratto, sulle whitelist REALI
+    /// misurate il 10/08/2026 su `nexus_subagent_definitions`.
+    ///
+    /// `ui_ux_designer` e' il caso concreto: undici tool, nemmeno uno che scrive —
+    /// quindi il contratto advisory era rispettato alla lettera — e nel run di
+    /// `batteria-todo-app` ha comunque prodotto un piano da otto passi dell'app
+    /// intera, fatto scrivere da otto figli. `implement` e' il controllo nell'altra
+    /// direzione: deve restare `Lavoro`, o il fix spegnerebbe la delega legittima.
+    ///
+    /// MUTAZIONE: far ritornare a `prodotto_del_run` sempre `Lavoro` — il difetto
+    /// reale, cioe' il criterio assente — fa rosseggiare la prima asserzione;
+    /// invertire i due rami fa rosseggiare la seconda.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn il_prodotto_della_figura_viene_dal_suo_contratto(pool: sqlx::PgPool) {
+        use nexus_agent_graph::decisions::prodotto_del_run::ProdottoDelRun;
+
+        crate::test_support::create_settings_table(&pool).await;
+
+        // Le whitelist REALI, verbatim dal DB vivo.
+        let ui_ux_designer: Vec<String> = [
+            "read_file",
+            "search_in_files",
+            "list_files",
+            "search_codebase_semantic",
+            "recall_context",
+            "nexus_search_semantic",
+            "knowledge_search",
+            "ui_layout_patterns",
+            "ui_reference_search",
+            "advisory_verdict",
+            "ui_styling_audit",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let implement: Vec<String> = ["read_file", "write_file", "edit_file", "run_command"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // Vocabolario ASSENTE: non si puo' dire chi muta, quindi non si puo' dire
+        // chi da' pareri -> nessuna restrizione, come fa già `advisory_kinds`.
+        assert_eq!(
+            prodotto_del_run(&pool, &ui_ux_designer).await,
+            ProdottoDelRun::Lavoro,
+            "vocabolario muto: non si restringe nessuno (un DB muto non e' una dichiarazione)"
+        );
+
+        crate::test_support::seed_setting(
+            &pool,
+            "agent.tools.result_cache_mutators",
+            "write_file,edit_file,delete_file,run_command,run_service",
+        )
+        .await;
+
+        assert_eq!(
+            prodotto_del_run(&pool, &ui_ux_designer).await,
+            ProdottoDelRun::Parere,
+            "ui_ux_designer non muta nulla: il suo prodotto e' un parere, e non delega"
+        );
+        assert_eq!(
+            prodotto_del_run(&pool, &implement).await,
+            ProdottoDelRun::Lavoro,
+            "implement scrive: il suo prodotto e' il lavoro, e la delega gli resta"
         );
     }
 
