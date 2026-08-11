@@ -463,6 +463,15 @@ impl ReviewGateNode {
                 run_id: state.thread_id.clone().unwrap_or_default(),
                 cost_spent_usd: state.total_cost_usd.unwrap_or(0.0),
                 cycle,
+                // Il metro della revisione: i requisiti che gli apparati
+                // advisory hanno emesso PRIMA del lavoro. Chiave scritta da
+                // entrambi i rami (classico e barriera in overlap), letta qui —
+                // il nodo e' l'unico che vede lo stato del run.
+                requirements: state
+                    .extra
+                    .get(crate::decisions::ADVISORY_REQUIREMENTS_KEY)
+                    .map(crate::decisions::EmittedRequirements::from_value)
+                    .unwrap_or_default(),
             })
             .await
         {
@@ -1068,6 +1077,125 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self.report.clone())
         }
+    }
+
+    /// Porta stub che CATTURA la richiesta: il metro consegnato ai revisori e'
+    /// l'oggetto della misura, quindi va guardato dov'e' — nella richiesta che
+    /// il nodo compone — e non dedotto da un effetto collaterale.
+    struct CapturingPanel {
+        report: ReviewPanelReport,
+        vista: Arc<std::sync::Mutex<Option<ReviewPanelRequest>>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::runtime::ports::ReviewPanelPort for CapturingPanel {
+        async fn review(
+            &self,
+            req: ReviewPanelRequest,
+        ) -> Result<ReviewPanelReport, crate::runtime::ports::PortError> {
+            *self.vista.lock().unwrap() = Some(req);
+            Ok(self.report.clone())
+        }
+    }
+
+    /// IL DIFETTO (10/08/2026): i revisori giravano — e sono l'unico consumatore
+    /// dei pareri advisory che abbia una CONSEGUENZA (`needs_changes` -> rimando
+    /// in correzione) — con un mandato che non nominava un solo requisito.
+    ///
+    /// La catena e' quella di produzione (regola O): pareri delle figure ->
+    /// `compose_advisory_synthesis` -> punto unico `EmittedRequirements` ->
+    /// `extra` dello stato (dove li scrive la barriera in overlap) -> nodo ->
+    /// `ReviewPanelRequest`. Costruire la richiesta a mano proverebbe solo che
+    /// il campo esiste, non che qualcuno ce lo mette.
+    ///
+    /// MUTAZIONE: togliere la lettura di `ADVISORY_REQUIREMENTS_KEY` in
+    /// `convoca` (tornare a `Default::default()`) rende rosso questo test con
+    /// zero requisiti — cioe' col mandato muto che girava in produzione.
+    #[tokio::test]
+    async fn i_requisiti_advisory_raggiungono_il_mandato_dei_revisori() {
+        use crate::decisions::{
+            compose_advisory_synthesis, AdvisoryPolicy, AdvisoryRoster, AdvisorySource,
+            EmittedRequirements, ADVISORY_REQUIREMENTS_KEY,
+        };
+
+        // I due requisiti REALI del run misurato: quello della figura UI (che
+        // era corretto, ed e' rimasto inapplicato) e quello del provider
+        // `mistral`, che a rango pari veniva scartato dalla selezione.
+        let req_ui = "La pagina deve avere una scala tipografica di al massimo 5 livelli";
+        let req_multi = "Sostituire l'uso di innerHTML con metodi DOM sicuri";
+        let sintesi = |testo: &str| {
+            compose_advisory_synthesis(
+                &[json!({
+                    "success": true,
+                    "advisory": {
+                        "verdict": "proceed_with_changes",
+                        "risks": [],
+                        "requirements": [testo],
+                        "recommendations": ["Testare su tre browser"],
+                    }
+                })],
+                &AdvisoryPolicy::default(),
+                AdvisoryRoster::Convened(1),
+            )
+            .expect("sintesi composta")
+            .to_value()
+        };
+        let emessi = EmittedRequirements::from_panels(&[
+            (AdvisorySource::Council, sintesi(req_ui)),
+            (AdvisorySource::MultiProvider, sintesi(req_multi)),
+        ]);
+
+        let vista = Arc::new(std::sync::Mutex::new(None));
+        let node = ReviewGateNode::new(
+            ReviewGateConfig {
+                enabled: true,
+                max_cycles: 3,
+            },
+            Arc::new(CapturingPanel {
+                report: ReviewPanelReport::Convened(panel_approvato()),
+                vista: Arc::clone(&vista),
+            }),
+            Arc::new(StubMetaStepStore::default()),
+        );
+
+        let mut s = stato_done();
+        s.extra
+            .insert(ADVISORY_REQUIREMENTS_KEY.to_string(), emessi.to_value());
+        let _ = node.run(&s, &ctx_with()).await.expect("nodo ok");
+
+        let req = vista.lock().unwrap().clone().expect("panel convocato");
+        assert_eq!(req.requirements.len(), 2, "nessun apparato viene scartato");
+        let metro = req.requirements.metro().expect("un metro c'e'");
+        assert!(metro.contains(req_ui), "{metro}");
+        assert!(
+            metro.contains(req_multi),
+            "anche il requisito del panel che perde la selezione: {metro}"
+        );
+        assert!(
+            !metro.contains("Testare su tre browser"),
+            "le raccomandazioni non sono requisiti: {metro}"
+        );
+    }
+
+    /// Un run senza panel a monte non porta metro, e il mandato resta quello di
+    /// sempre: la consegna e' additiva, non cambia il contratto della review.
+    #[tokio::test]
+    async fn senza_apparati_advisory_il_mandato_resta_invariato() {
+        let vista = Arc::new(std::sync::Mutex::new(None));
+        let node = ReviewGateNode::new(
+            ReviewGateConfig {
+                enabled: true,
+                max_cycles: 3,
+            },
+            Arc::new(CapturingPanel {
+                report: ReviewPanelReport::Convened(panel_approvato()),
+                vista: Arc::clone(&vista),
+            }),
+            Arc::new(StubMetaStepStore::default()),
+        );
+        let _ = node.run(&stato_done(), &ctx_with()).await.expect("nodo ok");
+        let req = vista.lock().unwrap().clone().expect("panel convocato");
+        assert!(req.requirements.is_empty());
+        assert!(req.requirements.metro().is_none());
     }
 
     /// REGRESSIONE del run 609000c1 (26/07/2026): il ping-pong

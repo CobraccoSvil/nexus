@@ -385,6 +385,12 @@ pub struct NativeRunInput {
     pub pre_run_advisory_synthesis: Option<serde_json::Value>,
     /// Fonte del segnale pre-run (`multi_provider_synthesis` | `advisory_synthesis`).
     pub pre_run_advisory_source: Option<&'static str>,
+    /// Requisiti emessi da TUTTI gli apparati advisory (punto unico
+    /// `decisions::advisory_requirements`), valorizzati nel ramo CLASSICO. In
+    /// overlap restano vuoti e arrivano dalla barriera: unica chiave nello
+    /// stato, due scrittori. Distinti da `pre_run_advisory_synthesis`, che porta
+    /// il solo panel scelto per l'enforcement.
+    pub pre_run_advisory_requirements: nexus_agent_graph::decisions::EmittedRequirements,
     /// Barriera di scrittura advisory (overlap consiglio ∥ run, mig 0606).
     /// `Some(rx)` = il run parte SUBITO mentre i panel deliberano: la prima
     /// modifica attendera' il loro verdetto (gate nel ToolDispatchNode). `None`
@@ -3754,6 +3760,18 @@ fn build_initial_state(input: &NativeRunInput) -> AgentState {
                 .to_string(),
         ),
     );
+    // Requisiti degli apparati advisory: entrano nello stato QUI nel ramo
+    // classico, e dalla release della barriera in overlap (unica chiave, due
+    // scrittori — vedi `decisions::advisory_requirements`). Non si scrive la
+    // chiave se non c'e' nulla: in overlap il vuoto significa «non ancora», e
+    // scriverlo qui la renderebbe indistinguibile da «i panel non hanno posto
+    // vincoli», che e' l'informazione opposta.
+    if !input.pre_run_advisory_requirements.is_empty() {
+        extra.insert(
+            nexus_agent_graph::decisions::ADVISORY_REQUIREMENTS_KEY.to_string(),
+            input.pre_run_advisory_requirements.to_value(),
+        );
+    }
     let mut declared_outcome = None;
     let mut stop_reason = None;
     let mut result = None;
@@ -4381,10 +4399,16 @@ pub(crate) fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome 
         // RISCONTRATO a run concluso. Il riscontro (I/O sui file) e' in
         // `verifica_conformita_requisiti`, che questa funzione pura non puo'
         // fare.
+        // I requisiti di TUTTI gli apparati, dalla chiave che ENTRAMBI i rami
+        // scrivono (punto unico `decisions::advisory_requirements`). Prima si
+        // leggeva la sintesi del solo panel scelto per l'enforcement, e quella
+        // chiave la scriveva il solo ramo classico: con `advisory_overlap_enabled`
+        // a `true` — la configurazione di produzione — non veniva scritta mai, e
+        // il riscontro non ha girato una sola volta in 200 run.
         council_requirements: state
             .extra
-            .get(nexus_agent_graph::nodes::PRE_RUN_ADVISORY_SYNTHESIS_KEY)
-            .map(nexus_agent_graph::decisions::requirements_from_synthesis)
+            .get(nexus_agent_graph::decisions::ADVISORY_REQUIREMENTS_KEY)
+            .map(|v| nexus_agent_graph::decisions::EmittedRequirements::from_value(v).requirements())
             .unwrap_or_default(),
         // Lo riempie il chiamante async: qui non si legge nessun file.
         council_conformance: None,
@@ -4610,6 +4634,7 @@ mod tests {
             write_scope: Vec::new(),
             pre_run_advisory_synthesis: None,
             pre_run_advisory_source: None,
+            pre_run_advisory_requirements: Default::default(),
             // Nessun overlap nei test di costruzione dello stato: la barriera e'
             // esercitata dai test del ToolDispatchNode.
             advisory_gate: None,
@@ -4791,38 +4816,48 @@ mod tests {
     #[test]
     fn i_requisiti_del_consiglio_arrivano_dallo_stato_iniziale_all_outcome() {
         use nexus_agent_graph::decisions::{
-            compose_advisory_synthesis, AdvisoryPolicy, AdvisoryRoster,
+            compose_advisory_synthesis, AdvisoryPolicy, AdvisoryRoster, AdvisorySource,
+            EmittedRequirements,
         };
-        // Il valore della porta in UNA sede: il requisito emesso e quello atteso
-        // nell'outcome sono la stessa stringa per costruzione, non due copie che
-        // potrebbero divergere.
-        const REQ: &str = "Rimuovere `port: 33649` da `vite.config.js`";
-        let parere = serde_json::json!({
-            "success": true,
-            "advisory": {
-                "verdict": "block",
-                "risks": [],
-                "requirements": [REQ],
-                "recommendations": ["Aggiungere un health probe"],
-            }
-        });
-        let synth = compose_advisory_synthesis(
-            &[parere],
-            &AdvisoryPolicy::default(),
-            AdvisoryRoster::Convened(1),
-        )
-        .expect("il consiglio ha deliberato");
+        // I valori in UNA sede: il requisito emesso e quello atteso nell'outcome
+        // sono la stessa stringa per costruzione, non due copie che potrebbero
+        // divergere.
+        const REQ_CONSIGLIO: &str = "Rimuovere `port: 33649` da `vite.config.js`";
+        const REQ_MULTI: &str = "Sanitizzare i task utente prima di inserirli nel DOM";
+        let sintesi = |req: &str| {
+            compose_advisory_synthesis(
+                &[serde_json::json!({
+                    "success": true,
+                    "advisory": {
+                        "verdict": "block",
+                        "risks": [],
+                        "requirements": [req],
+                        "recommendations": ["Aggiungere un health probe"],
+                    }
+                })],
+                &AdvisoryPolicy::default(),
+                AdvisoryRoster::Convened(1),
+            )
+            .expect("il panel ha deliberato")
+            .to_value()
+        };
 
         let mut input = sample_input();
-        input.pre_run_advisory_synthesis = Some(synth.to_value());
+        // I requisiti nascono dal punto unico che ne fa l'UNIONE (regola O: la
+        // strada della produzione), non da una sintesi sola.
+        input.pre_run_advisory_requirements = EmittedRequirements::from_panels(&[
+            (AdvisorySource::Council, sintesi(REQ_CONSIGLIO)),
+            (AdvisorySource::MultiProvider, sintesi(REQ_MULTI)),
+        ]);
+        input.pre_run_advisory_synthesis = Some(sintesi(REQ_CONSIGLIO));
         input.pre_run_advisory_source = Some("council_synthesis");
 
         let state = build_initial_state(&input);
         let out = map_outcome(StepOutcome::Completed(state));
         assert_eq!(
             out.council_requirements,
-            vec![REQ.into()],
-            "il requisito attraversa lo stato dal prompt del coordinatore al riscontro"
+            vec![REQ_CONSIGLIO.into(), REQ_MULTI.into()],
+            "i requisiti di ENTRAMBI gli apparati attraversano lo stato fino al riscontro"
         );
         assert!(
             !out.council_requirements
@@ -4830,6 +4865,33 @@ mod tests {
                 .any(|r| r.text.contains("health probe")),
             "la raccomandazione non e' un requisito e non entra nella misura"
         );
+    }
+
+    /// Il ramo OVERLAP e' quello di PRODUZIONE (`advisory_overlap_enabled` =
+    /// `true`), e li' i panel non hanno ancora deliberato quando il run parte:
+    /// i requisiti arrivano dopo, dalla release della barriera.
+    ///
+    /// Lo stato iniziale non deve quindi scrivere la chiave — se la scrivesse
+    /// VUOTA, «i panel non hanno ancora parlato» diventerebbe indistinguibile da
+    /// «i panel non hanno posto vincoli», che e' l'informazione opposta e la sola
+    /// che il riscontro puo' dichiarare a fine run (regola Q).
+    ///
+    /// MUTAZIONE: togliere la guardia `is_empty()` in `build_initial_state`
+    /// rende rosso questo test.
+    #[test]
+    fn in_overlap_lo_stato_iniziale_non_dichiara_requisiti_che_non_esistono_ancora() {
+        let input = sample_input();
+        assert!(input.pre_run_advisory_requirements.is_empty());
+        let state = build_initial_state(&input);
+        assert!(
+            !state
+                .extra
+                .contains_key(nexus_agent_graph::decisions::ADVISORY_REQUIREMENTS_KEY),
+            "in overlap la chiave la scrive la barriera, non l'avvio del run"
+        );
+        // E il riscontro non inventa requisiti da un'assenza.
+        let out = map_outcome(StepOutcome::Completed(state));
+        assert!(out.council_requirements.is_empty());
     }
 
     /// ADVISORY NON BLOCCANTE (decisione prodotto 2026-07-13): un verdetto "block" del

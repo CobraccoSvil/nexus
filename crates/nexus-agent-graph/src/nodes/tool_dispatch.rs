@@ -243,7 +243,20 @@ pub enum AdvisoryGateState {
     /// Il consiglio ha deliberato e non veta: si puo' scrivere. `enforcement`
     /// porta i requisiti da iniettare come promemoria prima della modifica
     /// (`None` = via libera piena, nessun vincolo da ricordare).
-    Released { enforcement: Option<Value> },
+    ///
+    /// `requirements` porta gli stessi requisiti in forma STRUTTURATA e per
+    /// TUTTI gli apparati (punto unico [`crate::decisions::advisory_requirements`]),
+    /// mentre `enforcement` ne porta la resa per il solo panel scelto per
+    /// l'enforcement. I due non sono ridondanti e rispondono a due domande:
+    /// «cosa ricordo al modello adesso, prima che scriva» e «quali vincoli
+    /// dovranno essere riscontrati a lavoro finito». Senza il secondo, in
+    /// overlap — cioe' in produzione — i requisiti non raggiungevano mai lo
+    /// stato del run e nessuno li riscontrava (misurato: 200 run, zero note di
+    /// riscontro).
+    Released {
+        enforcement: Option<Value>,
+        requirements: crate::decisions::EmittedRequirements,
+    },
     /// Veto del consiglio: il run va fermato PRIMA della prima modifica.
     /// `enforcement` e' gia' nella forma di `PANEL_ENFORCEMENT_KEY` (terminal),
     /// cosi' l'edge esistente `terminal_panel_veto` lo instrada al Learner senza
@@ -667,18 +680,10 @@ impl ToolDispatchNode {
                     .into_opaque(),
                 )
             }
-            AdvisoryGateState::Released { enforcement } => {
-                let reminder = enforcement.as_ref().map(render_gate_requirements);
-                if let Some(e) = enforcement {
-                    extra.insert(PANEL_ENFORCEMENT_KEY.to_string(), e);
-                }
-                extra.insert(ADVISORY_GATE_KEY.to_string(), json!({ "status": "released" }));
-                tracing::info!(
-                    target: "nexus_agent_graph::tool_dispatch",
-                    "barriera advisory: verdetto arrivato, la scrittura procede"
-                );
-                AdvisoryBarrier::Proceed { extra, reminder }
-            }
+            AdvisoryGateState::Released {
+                enforcement,
+                requirements,
+            } => Self::rilascio(extra, enforcement, requirements),
             AdvisoryGateState::Unavailable { reason_code } => {
                 tracing::warn!(
                     target: "nexus_agent_graph::tool_dispatch",
@@ -695,6 +700,41 @@ impl ToolDispatchNode {
                 }
             }
         }
+    }
+
+    /// Il ramo di RILASCIO della barriera: cosa resta nello stato quando il
+    /// consiglio ha deliberato e non veta.
+    ///
+    /// Due scritture con due destinatari diversi, ed e' la ragione per cui il
+    /// ramo sta in una funzione sua: l'`enforcement` e' cio' che si ricorda al
+    /// MODELLO adesso, prima che scriva; i requisiti sono cio' che dovra' essere
+    /// RISCONTRATO a lavoro finito — dal riscontro deterministico e dal mandato
+    /// dei revisori — e in overlap questo e' l'unico punto in cui il run li
+    /// incontra.
+    ///
+    /// L'insieme VUOTO si scrive lo stesso: «i panel hanno deliberato senza
+    /// porre vincoli» e «i panel non hanno parlato» sono due cose diverse, e
+    /// distinguerle e' tutto il punto (regola Q).
+    fn rilascio(
+        mut extra: serde_json::Map<String, Value>,
+        enforcement: Option<Value>,
+        requirements: crate::decisions::EmittedRequirements,
+    ) -> AdvisoryBarrier {
+        let reminder = enforcement.as_ref().map(render_gate_requirements);
+        if let Some(e) = enforcement {
+            extra.insert(PANEL_ENFORCEMENT_KEY.to_string(), e);
+        }
+        extra.insert(
+            crate::decisions::ADVISORY_REQUIREMENTS_KEY.to_string(),
+            requirements.to_value(),
+        );
+        extra.insert(ADVISORY_GATE_KEY.to_string(), json!({ "status": "released" }));
+        tracing::info!(
+            target: "nexus_agent_graph::tool_dispatch",
+            requisiti = requirements.len(),
+            "barriera advisory: verdetto arrivato, la scrittura procede"
+        );
+        AdvisoryBarrier::Proceed { extra, reminder }
     }
 
     /// Insieme dei nomi dei tool scoperti nel turno precedente
@@ -3544,6 +3584,7 @@ mod tests {
                     "summary": "Usa il punto unico esistente.",
                     "terminal": false,
                 })),
+                requirements: requisiti_dei_due_apparati(),
             });
         });
         let st = state_with_pending(vec![pending_tool(
@@ -3567,6 +3608,64 @@ mod tests {
             testo.contains("punto unico esistente"),
             "il promemoria dei vincoli deve raggiungere il modello: {testo}"
         );
+
+        // E RESTANO nello stato, in forma strutturata e per TUTTI gli apparati:
+        // e' l'unico punto in cui il ramo overlap — la configurazione di
+        // produzione — li incontra, e da qui li leggono il riscontro a fine run
+        // e il mandato dei revisori. Senza questa scrittura la chiave non
+        // esisteva mai e il riscontro non ha girato in 200 run.
+        //
+        // MUTAZIONE: togliere l'insert di ADVISORY_REQUIREMENTS_KEY in
+        // `apply_gate_outcome` rende rosso qui, che e' dove il difetto viveva.
+        let riletti = crate::decisions::EmittedRequirements::from_value(
+            out.extra
+                .get(crate::decisions::ADVISORY_REQUIREMENTS_KEY)
+                .expect("i requisiti restano nello stato dopo la release"),
+        );
+        assert_eq!(riletti, requisiti_dei_due_apparati());
+        assert_eq!(
+            riletti.items[1].source,
+            crate::decisions::AdvisorySource::MultiProvider,
+            "anche l'apparato che perde la selezione per l'enforcement resta"
+        );
+    }
+
+    /// I requisiti come li produce il punto unico dai pareri dei DUE apparati
+    /// (regola O: costruirli a mano proverebbe solo che il test sa scrivere il
+    /// JSON che il test sa leggere).
+    fn requisiti_dei_due_apparati() -> crate::decisions::EmittedRequirements {
+        use crate::decisions::{
+            compose_advisory_synthesis, AdvisoryPolicy, AdvisoryRoster, AdvisorySource,
+            EmittedRequirements,
+        };
+        let sintesi = |testo: &str| {
+            let parere = json!({
+                "success": true,
+                "advisory": {
+                    "verdict": "proceed_with_changes",
+                    "risks": [],
+                    "requirements": [testo],
+                    "recommendations": [],
+                }
+            });
+            compose_advisory_synthesis(
+                &[parere],
+                &AdvisoryPolicy::default(),
+                AdvisoryRoster::Convened(1),
+            )
+            .expect("sintesi composta")
+            .to_value()
+        };
+        EmittedRequirements::from_panels(&[
+            (
+                AdvisorySource::Council,
+                sintesi("Il contrasto tra testo e sfondo deve essere >= 4.5:1"),
+            ),
+            (
+                AdvisorySource::MultiProvider,
+                sintesi("Sanitizzare i task utente prima di inserirli nel DOM"),
+            ),
+        ])
     }
 
     #[tokio::test]

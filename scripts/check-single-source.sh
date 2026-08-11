@@ -3351,6 +3351,44 @@ else
   echo "OK firma-di-esito: il nome del tool viene dal punto unico"
 fi
 
+# --- metro-della-revisione --------------------------------------------------
+# «Quali requisiti ha emesso l'apparato advisory di questo run» ha UNA risposta,
+# ed e' l'UNIONE dei due apparati. La selezione `select_pre_run_advisory` ne
+# sceglie uno, ma risponde a un'altra domanda — quale verdetto governa
+# l'enforcement — e portarsi via i requisiti dell'apparato non scelto ne
+# scartava 8 su 8 a rango pari (misurato il 10/08/2026).
+assert_single "metro-della-revisione" 'pub fn from_panels' \
+  'crates/nexus-agent-graph/src/decisions/advisory_requirements.rs' crates
+assert_single "metro-della-revisione" 'ADVISORY_REQUIREMENTS_KEY: &str' \
+  'crates/nexus-agent-graph/src/decisions/advisory_requirements.rs' crates
+
+# Il mandato dei revisori e' l'unico consumatore dei pareri advisory che abbia
+# una CONSEGUENZA (needs_changes -> rimando in correzione), e il confine e' un
+# adapter che nessun test in-process attraversa (vuole DB e sub-run veri).
+# Il guard sta qui perche' senza questa riga il panel torna a girare col mandato
+# muto che girava in produzione — e tutti i test resterebbero verdi.
+if ! grep -q 'req\.requirements\.metro()' \
+  crates/mcp-core/src/agent_graph_adapter/review_panel.rs; then
+  echo "!! metro-della-revisione: il mandato dei revisori non porta piu' i requisiti" >&2
+  echo "   emessi dagli apparati advisory. Senza metro il panel giudica" >&2
+  echo "   correttezza e regressioni, e nessuno riscontra i pareri del Consiglio." >&2
+  fail=1
+else
+  echo "OK metro-della-revisione: il mandato dei revisori porta il metro"
+fi
+
+# Il riscontro deterministico legge la chiave che ENTRAMBI i rami scrivono. Con
+# la sola sintesi del panel scelto — che il ramo overlap non scrive mai — non ha
+# girato una sola volta in 200 run.
+if ! grep -q 'decisions::ADVISORY_REQUIREMENTS_KEY' \
+  crates/mcp-core/src/native_engine.rs; then
+  echo "!! metro-della-revisione: il riscontro dei requisiti non legge piu' la chiave" >&2
+  echo "   scritta da entrambi i rami: in overlap (produzione) tornerebbe inerte." >&2
+  fail=1
+else
+  echo "OK metro-della-revisione: il riscontro legge la chiave dei due rami"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1
