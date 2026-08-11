@@ -1449,6 +1449,42 @@ mod tests {
         assert_eq!(RE_BRANCH_RUST_PY.find_iter("let matcher = 1;").count(), 0);
     }
 
+    /// Il marker di debito e' MAIUSCOLO: "todo" minuscolo e' il sostantivo del
+    /// dominio (tabella `nexus_agent_todos`, tipo `Todo`), non un debito.
+    ///
+    /// Test di conseguenza (regola O): non interroga `RE_TODO_MARKER`, attraversa
+    /// `analyze_source` — la strada che il gate percorre — e le righe di input sono
+    /// COPIATE dal repo, non inventate. Rimettendo `(?i)` sulla regex questo test
+    /// rosseggia con il valore del difetto reale: 5 marker fantasma invece di 0.
+    ///
+    /// La direzione opposta — il marker MAIUSCOLO resta riconosciuto, cioe' il fix
+    /// non ha spento il rilevatore — la presidia gia' `test_basic_analysis`, che
+    /// passa dalla stessa `analyze_source`: duplicarla qui aggiungerebbe soltanto
+    /// righe che il ratchet di `scripts/markers-ratchet.sh` conta come debito vero,
+    /// perche' un grep non distingue l'USO di un marker dalla sua MENZIONE in una
+    /// fixture — lo stesso difetto, di segno opposto, che questo test presidia.
+    #[test]
+    fn il_sostantivo_todo_non_e_un_marker_di_debito() {
+        let dominio = r#"
+use nexus_agent_graph::decisions::dag_scheduler::{Todo, TodoStatus};
+    // Testo/priorita' del todo: trasportati per il meta-step "plan"
+/// E' il prerequisito dei todo: lo schema reale vincola
+    pub fn build_context_blob(state: &AgentState, todo: &Value) -> String {
+        // Todo con scope dichiarato.
+"#;
+        let marker: Vec<_> = analyze_source("src/dominio_todo.rs", dominio)
+            .findings
+            .into_iter()
+            .filter(|f| f.title.ends_with(" marker"))
+            .collect();
+        assert!(
+            marker.is_empty(),
+            "il dominio dei todo non e' debito, ma sono stati contati {} marker: {:?}",
+            marker.len(),
+            marker.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
+    }
+
     /// La soglia delle funzioni lunghe misura il CODICE: una funzione con 40
     /// righe di codice e 30 di commenti/righe vuote (70 totali) NON e' lunga.
     /// Era il difetto: il conteggio `j - start + 1` includeva i commenti, e una
