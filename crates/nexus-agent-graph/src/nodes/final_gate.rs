@@ -237,16 +237,23 @@ pub struct FinalGateConfig {
     /// definizione dello stesso criterio (regola L).
     pub ui_styling_criterion: Option<crate::runtime::ports::CriterionSpec>,
     /// Criterio «l'app SENZA server mostra davvero il suo contenuto?», gia'
-    /// costruito dal motore. `None` = criterio spento, oppure il progetto non e'
-    /// un'app statica (ha un servizio, o non ha una pagina): in quei casi non
-    /// nasce affatto, invece di nascere e dichiararsi inconcludente — un
-    /// inconcludente chiude il run `completed_unverified`, e un criterio
-    /// inapplicabile non deve declassare i run a cui non si applica.
+    /// costruito dal motore. `None` = criterio spento (modalita' `off`) oppure
+    /// nessuna radice di anteprima configurata.
     ///
-    /// Arriva PRONTO per la stessa ragione di `ui_styling_criterion`: il suo URL
-    /// dipende dalla RADICE del progetto e dall'entry rilevata sul filesystem,
-    /// che questo crate non vede. Il nodo vi aggiunge la sola parte che conosce
-    /// lui — il contenitore DICHIARATO dall'agente.
+    /// NON dipende piu' dal fatto che il progetto SIA un'app statica, e non e'
+    /// un dettaglio: quella natura veniva decisa a t=0, prima che il run
+    /// scrivesse alcunche', quindi su un progetto nuovo il criterio non nasceva
+    /// mai (misurato l'11/08/2026: pagina rotta, run chiuso «task complete»).
+    /// La pagina — e con lei la precedenza del servizio — si risolve al momento
+    /// della VERIFICA, col punto unico `decisions::pagina_del_run`; dove non si
+    /// applica, il criterio lo DICHIARA nell'evidenza invece di sparire, e non
+    /// declassa nessuno (un progetto senza interfaccia resta una risposta, non
+    /// un inconcludente).
+    ///
+    /// Arriva PRONTO per la stessa ragione di `ui_styling_criterion`: la radice
+    /// degli indirizzi di anteprima e la configurazione della misura stanno nel
+    /// DB, che questo crate non legge. Il nodo vi aggiunge la sola parte che
+    /// conosce lui — il contenitore DICHIARATO dall'agente.
     pub static_render_criterion: Option<crate::runtime::ports::CriterionSpec>,
     /// ADR 0036: catena di verifica PER-AMBIENTE risolta a monte (profilo
     /// inferito da LLM in `project_verify_profiles`, step marcati gate=true).
@@ -2525,11 +2532,11 @@ mod tests {
     /// L'ANELLO CHE CONTA per il criterio della resa: deve arrivare fino ai
     /// criteri del gate, e portarsi dietro la DICHIARAZIONE dell'agente.
     ///
-    /// Le due parti nascono in posti diversi — l'URL lo risolve il motore, che
-    /// conosce la radice; il contenitore lo sa solo qui, dove si vede lo stato
-    /// del run — ed e' proprio la giunzione in cui una delle due puo' perdersi
-    /// senza che nulla fallisca: il criterio resterebbe valido, con un segnale
-    /// in meno e nessuno ad accorgersene.
+    /// Le due parti nascono in posti diversi — la configurazione della misura la
+    /// risolve il motore, che legge il DB; il contenitore lo sa solo qui, dove
+    /// si vede lo stato del run — ed e' proprio la giunzione in cui una delle
+    /// due puo' perdersi senza che nulla fallisca: il criterio resterebbe
+    /// valido, con un segnale in meno e nessuno ad accorgersene.
     ///
     /// MUTAZIONE: togliere `con_contenitore` dall'`extend` -> il selettore
     /// sparisce dalla spec e il browser non cerca piu' nulla, cioe' il caso
@@ -2537,14 +2544,17 @@ mod tests {
     #[test]
     fn il_criterio_della_resa_arriva_al_gate_con_la_dichiarazione() {
         use crate::decisions::risorse_pagina::PoliticaRisorse;
-        use crate::decisions::static_render::{self, CRITERION_TYPE};
+        use crate::decisions::static_render::{self, ModalitaResa, ParametriMisura, CRITERION_TYPE};
         let criterio = static_render::criterio_resa(
-            Some("http://127.0.0.1:4000/preview/abc/landing/index.html"),
+            Some("http://127.0.0.1:4000"),
             None,
-            5,
-            15.0,
-            2500,
-            &PoliticaRisorse::nuova(vec!["image".into()], Some(1.0)),
+            &ParametriMisura {
+                minimo_elementi: 5,
+                timeout_s: 15.0,
+                attesa_ms: 2500,
+                politica: PoliticaRisorse::nuova(vec!["image".into()], Some(1.0)),
+                modalita: ModalitaResa::Applica,
+            },
         );
         let cerca = |dichiarato: Option<Value>| {
             let node = node_with(
@@ -2567,15 +2577,44 @@ mod tests {
         .expect("il criterio risolto dal motore deve arrivare ai criteri del gate");
         assert_eq!(c.spec[static_render::CHIAVE_CONTENITORE], "#courses-grid");
         assert_eq!(c.spec[static_render::CHIAVE_MIN_ELEMENTI], 5);
+        // La PAGINA non e' nella spec: la risolve chi verifica. Se tornasse qui
+        // tornerebbe anche il difetto — un indirizzo composto a t=0 e'
+        // l'indirizzo della pagina di ieri.
+        assert!(
+            c.spec.get("url").is_none(),
+            "l'indirizzo si compone alla verifica, non a t=0"
+        );
+        assert_eq!(c.spec[static_render::CHIAVE_MODALITA], "enforce");
 
         // Senza dichiarazione il criterio nasce lo stesso, coi due segnali che
         // non richiedono di dichiarare nulla.
         let senza = cerca(None).expect("il criterio non dipende dalla dichiarazione");
         assert!(senza.spec.get(static_render::CHIAVE_CONTENITORE).is_none());
 
-        // Progetto non statico (o criterio spento): il motore non lo costruisce
-        // e il gate non lo inventa. Un inconcludente qui declasserebbe a
-        // `completed_unverified` ogni run a cui il criterio non si applica.
+        // UNA SOLA pagina misurata, quindi UN SOLO criterio di questo tipo. I
+        // consumatori lo cercano con `.find(...)`: con due criteri il secondo
+        // sarebbe invisibile a loro e a questo test, che resterebbe verde
+        // misurando solo il primo.
+        let node = node_with(
+            FinalGateConfig {
+                static_render_criterion: criterio.clone(),
+                ..FinalGateConfig::default()
+            },
+            Arc::new(StubCriteriaRunner::with_results(vec![])),
+        );
+        assert_eq!(
+            node.build_criteria(&software_state())
+                .iter()
+                .filter(|c| c.criterion_type == CRITERION_TYPE)
+                .count(),
+            1,
+            "il gate misura una pagina sola"
+        );
+
+        // Criterio spento (modalita' `off`) o nessuna radice di anteprima: il
+        // motore non lo costruisce e il gate non lo inventa. Un inconcludente
+        // qui declasserebbe a `completed_unverified` ogni run a cui il criterio
+        // non si applica.
         let node = node_with(
             FinalGateConfig::default(),
             Arc::new(StubCriteriaRunner::with_results(vec![])),

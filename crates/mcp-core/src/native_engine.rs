@@ -1293,9 +1293,8 @@ async fn load_final_gate_config(db: &PgPool, project_id: Option<Uuid>) -> FinalG
     // progetto CON servizio sarebbe stato classificato «app statica» e aperto su
     // `/preview`, cioe' misurato male e non semplicemente non misurato.
     // (Regola G: il nodo non legge il DB, la risoluzione sta qui.)
-    let static_render_enabled =
-        setting_bool(db, "agent.final_gate.static_render_enabled", false).await;
-    let serve_origine = endpoint_check_enabled || browser_dialogue_enabled || static_render_enabled;
+    let static_render_acceso = modalita_resa_statica(db).await.nasce();
+    let serve_origine = endpoint_check_enabled || browser_dialogue_enabled || static_render_acceso;
     let origine_frontend = match (serve_origine, project_id) {
         (true, Some(pid)) => load_origine_frontend(db, pid, endpoint_timeout_s).await,
         _ => None,
@@ -1482,17 +1481,22 @@ fn criterio_stile(
     })
 }
 
-/// Il criterio della resa di un'app SENZA server, quando il progetto E' una di
-/// quelle app.
+/// Il criterio della resa di un'app SENZA server.
 ///
-/// Il DISCRIMINANTE non e' indovinato dal testo del task ne' dal nome dei file:
-/// sono due fatti osservabili, e li mette insieme il punto unico puro
-/// [`static_render::classifica_natura`] (regola L). Dove c'e' un servizio la
-/// domanda completa la pone gia' il dialogo (criterio 5c), che vede anche le
-/// chiamate dati; dove non c'e' pagina non c'e' niente da guardare. In
-/// entrambi i casi il criterio NON nasce — non nasce e si dichiara
-/// inconcludente, che declasserebbe a `completed_unverified` ogni run a cui
-/// questo criterio non si applica.
+/// QUI NON SI RISOLVE LA PAGINA, ed e' il cambiamento dell'11/08/2026. Questa
+/// funzione gira a t=0, prima che il run abbia scritto una riga: un'entry
+/// rilevata adesso e' la pagina di IERI, o non esiste affatto. Entrambe le
+/// forme sono state misurate — un progetto nuovo il cui criterio non nasceva
+/// mai (pagina rotta, run chiuso «task complete») e un progetto vivo in cui il
+/// gate misurava `index.html` del giorno prima mentre il run aveva prodotto
+/// `galleria.html`, con un ciclo di correzione che non poteva convergere. La
+/// pagina — e con lei la precedenza del servizio, delegata a
+/// `static_render::classifica_natura` — si risolve al momento della verifica
+/// col punto unico [`nexus_agent_graph::decisions::pagina_del_run`].
+///
+/// Qui resta cio' che a t=0 si sa davvero: la CONFIGURAZIONE della misura (dal
+/// DB, regola G), la radice degli indirizzi di anteprima, e l'origine del
+/// frontend gia' risolta per gli altri criteri.
 ///
 /// L'INDIRIZZO e' la route `/preview` di mcp-core, non un `file:///`, e per due
 /// ragioni. E' la strada che l'utente percorre davvero quando apre la pagina dal
@@ -1502,27 +1506,24 @@ fn criterio_stile(
 /// che sotto HTTP non esiste. L'URL base viene dal DB (`settings.mcp_core_url`,
 /// mig 0190) come per ogni altro servizio: senza, il criterio non nasce, perche'
 /// una pagina che non si sa dove aprire non e' misurabile.
-async fn criterio_resa_statica(
+/// `pub(crate)` per una ragione di MISURA, non di riuso: la modalita' con cui
+/// il criterio gira la scrive il DB, e un test che la fabbricasse a mano
+/// fisserebbe proprio l'assunto da verificare (regola O). Il test di mutazione
+/// in `agent_graph_adapter::criteria_runner` parte da qui, cioe' dal produttore
+/// vero, e attraversa la stessa strada della produzione: migrazione -> spec ->
+/// rilettura della spec -> conseguenza.
+pub(crate) async fn criterio_resa_statica(
     db: &PgPool,
-    root: &str,
     project_id: Uuid,
     origine_frontend: Option<&str>,
     timeout_s: f64,
     attesa_ms: u64,
 ) -> Option<nexus_agent_graph::runtime::ports::CriterionSpec> {
-    use nexus_agent_graph::decisions::static_render::{
-        classifica_natura, criterio_resa, NaturaApp,
-    };
-    if !setting_bool(db, "agent.final_gate.static_render_enabled", false).await {
+    use nexus_agent_graph::decisions::static_render::{criterio_resa, ParametriMisura};
+    let modalita = modalita_resa_statica(db).await;
+    if !modalita.nasce() {
         return None;
     }
-    // Il rilevamento e' il punto unico gia' in esercizio nel pannello Servizi
-    // (`detect_static_entry`): il gate deve guardare LA STESSA pagina che il
-    // pulsante "Apri nel browser" apre, o misurerebbe un altro file.
-    let entry = crate::static_preview::detect_static_entry(root).await;
-    let NaturaApp::Statica { entry } = classifica_natura(origine_frontend, entry.as_deref()) else {
-        return None;
-    };
     let base = nexus_auth::get_setting(db, "mcp_core_url").await;
     let Some(base) = base.map(|b| b.trim().trim_end_matches('/').to_string()).filter(|b| !b.is_empty()) else {
         tracing::warn!(
@@ -1535,15 +1536,49 @@ async fn criterio_resa_statica(
     };
     let minimo = setting_i64(db, "agent.final_gate.static_render_min_elements", 5).await;
     criterio_resa(
-        Some(&format!("{base}/preview/{project_id}/{entry}")),
-        // Il contenitore lo dichiara l'agente, e lo innesta il nodo: qui non si
-        // conosce lo stato del run.
-        None,
-        minimo.max(0) as usize,
-        timeout_s,
-        attesa_ms,
-        &politica_risorse(db).await,
+        Some(&base),
+        origine_frontend,
+        &ParametriMisura {
+            minimo_elementi: minimo.max(0) as usize,
+            timeout_s,
+            attesa_ms,
+            politica: politica_risorse(db).await,
+            modalita,
+        },
     )
+}
+
+/// Quanto pesa il verdetto della resa (mig 0699). Chiave ASSENTE o valore
+/// IGNOTO -> criterio spento, DICHIARANDOLO: nessun ripiego silenzioso (regola
+/// G), e un criterio che si accende per un typo e' peggio di uno spento
+/// visibilmente.
+async fn modalita_resa_statica(db: &PgPool) -> nexus_agent_graph::decisions::static_render::ModalitaResa {
+    use nexus_agent_graph::decisions::static_render::ModalitaResa;
+    const CHIAVE: &str = "agent.final_gate.static_render_mode";
+    match nexus_auth::get_setting(db, CHIAVE).await {
+        Some(raw) => match ModalitaResa::try_parse(&raw) {
+            Some(m) => m,
+            None => {
+                tracing::warn!(
+                    target: "mcp_core::native_engine",
+                    chiave = CHIAVE,
+                    valore = %raw,
+                    "modalita' della resa statica non riconosciuta: criterio spento \
+                     (valori canonici: off|observe|enforce)"
+                );
+                ModalitaResa::Off
+            }
+        },
+        None => {
+            tracing::warn!(
+                target: "mcp_core::native_engine",
+                chiave = CHIAVE,
+                "modalita' della resa statica assente dal DB: criterio spento \
+                 (applicare la migrazione 0699)"
+            );
+            ModalitaResa::Off
+        }
+    }
 }
 
 /// La politica delle risorse della pagina, TUTTA dal DB (mig 0692).
@@ -2998,6 +3033,51 @@ async fn measure_gate_steps(
     }
 }
 
+/// Il runner dei criteri del final_gate, con addosso TUTTO cio' che lo lega a
+/// QUESTO run: la radice su cui il run lavora, il progetto della sessione e —
+/// dall'11/08/2026 — l'IDENTITA' del run, che e' cio' che permette al criterio
+/// della resa di chiedere al registro delle scritture quale pagina misurare
+/// invece di indovinarla dall'albero.
+///
+/// ESISTE COME FUNZIONE PER UNA RAGIONE DI MISURA (regola O), non di riuso: ha
+/// un solo chiamante di produzione, ed e' [`build_native_engine`], che un test
+/// non puo' attraversare (pretende deps gateway/tool-runner e la directory di
+/// routing dei DB di progetto). Finche' l'aggancio viveva in mezzo a quella
+/// funzione, l'unico punto che collega il gate ai fatti del run era
+/// irraggiungibile da qualunque prova: rimuovendo `.con_run(...)` l'intera
+/// suite restava VERDE (2057 passati, misurato l'11/08/2026), cioe' il gate
+/// sarebbe tornato a misurare la prima pagina che trova sull'albero senza che
+/// nulla protestasse. I test dei criteri l'adapter se lo costruiscono a mano
+/// chiamando `con_run` loro stessi: fissano l'assunto che dovrebbero
+/// verificare. Il guard che chiude quel buco e'
+/// `il_runner_del_gate_nasce_legato_ai_fatti_del_run`, qui sotto, e passa DA
+/// QUI.
+///
+/// `project_id` a `None` = sessione senza progetto: il criterio della resa lo
+/// DICHIARA inconcludente (non ha ne' registro ne' indirizzo di anteprima),
+/// come gia' faceva.
+pub(crate) fn criteria_runner_del_gate(
+    tools: Arc<dyn ToolExecutor>,
+    run_db: PgPool,
+    criteria_root: Option<std::path::PathBuf>,
+    meta_db: &PgPool,
+    project_id: Option<Uuid>,
+    input: &NativeRunInput,
+) -> Arc<FinalGateCriteriaRunnerAdapter> {
+    let adapter = FinalGateCriteriaRunnerAdapter::new(tools, run_db, criteria_root)
+        // L'identita' del run serve al criterio della resa per chiedere al
+        // registro QUALE pagina questo lavoro ha prodotto: senza, resterebbe a
+        // misurare la prima pagina che trova sull'albero, che e' il difetto
+        // misurato l'11/08/2026 nelle sue due forme (progetto nuovo -> nessuna
+        // pagina, criterio mai nato; progetto vivo -> la pagina di ieri, ciclo
+        // di correzione che non puo' convergere).
+        .con_run(input.session_id, input.run_id);
+    Arc::new(match project_id {
+        Some(pid) => adapter.con_progetto(meta_db.clone(), pid),
+        None => adapter,
+    })
+}
+
 /// Ritorna la `RoutingConfig` risolta (serve a popolare il ctx, il cui
 /// `recursion_limit` viene letto dal motore) + le porte gateway/tools per il ctx.
 async fn build_native_engine(
@@ -3233,14 +3313,14 @@ async fn build_native_engine(
     // `run_command` possa DELEGARE una suite di test al punto unico della
     // verifica (memoria per stato del codice + classificazione del rosso non
     // riprodotto). Senza, il gate resterebbe il terzo esecutore cieco.
-    let criteria_adapter = {
-        let adapter =
-            FinalGateCriteriaRunnerAdapter::new(tools.clone(), run_db.clone(), criteria_root);
-        Arc::new(match session_project.as_ref() {
-            Some((pid, _)) => adapter.con_progetto(db.clone(), *pid),
-            None => adapter,
-        })
-    };
+    let criteria_adapter = criteria_runner_del_gate(
+        tools.clone(),
+        run_db.clone(),
+        criteria_root,
+        &db,
+        session_project.as_ref().map(|(pid, _)| *pid),
+        input,
+    );
     let criteria: Arc<dyn CriteriaRunner> = criteria_adapter.clone();
 
     // Misura del progresso fra un rimando in correzione e il successivo. Senza,
@@ -3321,12 +3401,12 @@ async fn build_native_engine(
             final_gate_cfg.verify_profile_missing = final_gate_cfg.verify_steps.is_empty();
 
             // La resa di un'app SENZA server si risolve QUI e non nel loader:
-            // il rilevamento dell'entry vuole la radice, che li' non c'e'. Il
-            // discriminante lo decide il punto unico, coi due fatti gia'
-            // raccolti (origine del servizio e pagina rilevata).
+            // serve il progetto della sessione, che li' non c'e'. QUALE pagina
+            // misurare NON si decide qui — a t=0 l'albero e' quello di prima
+            // del lavoro — ma al momento della verifica, col punto unico
+            // `decisions::pagina_del_run`.
             final_gate_cfg.static_render_criterion = criterio_resa_statica(
                 &db,
-                &root,
                 pid,
                 final_gate_cfg.origine_frontend.as_deref(),
                 final_gate_cfg.endpoint_timeout_s,
@@ -6760,6 +6840,114 @@ mod tests {
             eseguiti.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "kill-switch OFF: nessun comando eseguito"
+        );
+    }
+
+    /// Esecutore muto per i criteri che non eseguono comandi: la resa non ne
+    /// chiama nessuno, ma il costruttore lo pretende (e fa bene: un runner
+    /// senza esecutore non e' un runner).
+    fn esecutore_muto() -> Arc<ContaComandi> {
+        Arc::new(ContaComandi {
+            eseguiti: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    }
+
+    /// IL COLLEGAMENTO FRA IL GATE E I FATTI DEL RUN, provato dove nasce.
+    ///
+    /// [`criteria_runner_del_gate`] e' l'UNICO punto di produzione in cui il
+    /// runner dei criteri riceve l'identita' del run, ed e' cio' che permette al
+    /// criterio della resa di chiedere al registro delle scritture quale pagina
+    /// misurare invece di indovinarla dall'albero. Finche' quell'aggancio viveva
+    /// in mezzo a `build_native_engine` — che un test non puo' attraversare —
+    /// non era coperto da niente: rimuovendo `.con_run(...)` l'intera suite
+    /// restava VERDE (2057 passati, misurato l'11/08/2026). I test dei criteri
+    /// l'adapter se lo costruiscono a mano chiamando `con_run` loro stessi,
+    /// quindi fissano proprio l'assunto che dovrebbero verificare (regola O).
+    ///
+    /// La catena e' quella della produzione, dall'inizio alla fine: costruzione
+    /// dal punto di produzione -> criterio dalla CONFIGURAZIONE reale (le
+    /// migrazioni applicate a questo DB, mig 0699/0700) -> `CriteriaRunner::run`,
+    /// la stessa porta che il `FinalGateNode` chiama.
+    ///
+    /// L'albero e' VUOTO di proposito: li' la risoluzione risponde «nessuna
+    /// pagina» e si ferma, senza aprire un browser — cosi' il test misura il
+    /// COLLEGAMENTO e non la macchina che guarda le pagine, che ha gia' i suoi
+    /// test e che qui renderebbe l'esito dipendente da Chromium. Le due risposte
+    /// sono distinte e dicono cose diverse:
+    ///   - collegato  -> `Passed` + «nessuna pagina in questo progetto»: la
+    ///     domanda e' stata POSTA, e ha una risposta;
+    ///   - scollegato -> `Inconclusive` + «manca il progetto, il run o la radice
+    ///     del lavoro»: la domanda non e' stata posta affatto.
+    ///
+    /// MUTAZIONE: togliere `.con_run(...)` da [`criteria_runner_del_gate`] e la
+    /// prima meta' rosseggia con l'esito e il motivo della seconda.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_runner_del_gate_nasce_legato_ai_fatti_del_run(pool: PgPool) {
+        let (_user, project_id) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let albero = tempfile::tempdir().expect("tempdir");
+        // L'input REALE di un run, dalla fixture del modulo: session_id e run_id
+        // escono da li', non da due `Uuid::new_v4()` scritti nel test accanto
+        // alla chiamata che dovrebbero raggiungere.
+        let input = sample_input();
+
+        // La CONFIGURAZIONE della misura dal produttore vero: un criterio
+        // fabbricato qui fisserebbe l'assunto da verificare.
+        let criterio = criterio_resa_statica(&pool, project_id, None, 15.0, 2000)
+            .await
+            .expect("la configurazione reale accende il criterio della resa");
+
+        // 1. Il runner come nasce in PRODUZIONE.
+        let runner = criteria_runner_del_gate(
+            esecutore_muto(),
+            pool.clone(),
+            Some(albero.path().to_path_buf()),
+            &pool,
+            Some(project_id),
+            &input,
+        );
+        let collegato = runner
+            .run(vec![criterio.clone()])
+            .await
+            .expect("i criteri girano");
+        let motivo = |r: &nexus_agent_graph::runtime::ports::CriterionResult| {
+            r.evidence["skipped_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(
+            collegato[0].passed(),
+            "col run agganciato la pagina si RISOLVE e la risposta e' «non c'e' \
+             pagina», che passa: {:?}",
+            collegato[0].evidence
+        );
+        assert!(
+            motivo(&collegato[0]).contains("nessuna pagina in questo progetto"),
+            "la domanda e' stata posta al registro delle scritture: {:?}",
+            collegato[0].evidence
+        );
+
+        // 2. Il VALORE del difetto, esplicito: lo stesso runner senza l'identita'
+        //    del run, cioe' esattamente cio' che resta togliendo `.con_run(...)`.
+        //    Qui l'adapter si costruisce a mano APPOSTA — e' il controllo, non la
+        //    misura.
+        let scollegato = FinalGateCriteriaRunnerAdapter::new(
+            esecutore_muto(),
+            pool.clone(),
+            Some(albero.path().to_path_buf()),
+        )
+        .con_progetto(pool.clone(), project_id);
+        let cieco = scollegato.run(vec![criterio]).await.expect("i criteri girano");
+        assert!(
+            cieco[0].inconclusive(),
+            "senza l'identita' del run non c'e' registro da interrogare: {:?}",
+            cieco[0].evidence
+        );
+        assert!(
+            motivo(&cieco[0]).contains("manca il progetto, il run o la radice del lavoro"),
+            "e' il difetto: il gate non sa di quale run stia chiudendo il lavoro, \
+             quindi non sa quale pagina misurare: {:?}",
+            cieco[0].evidence
         );
     }
 

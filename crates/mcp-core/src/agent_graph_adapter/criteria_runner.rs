@@ -49,6 +49,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use nexus_agent_graph::decisions::browser_dialogue;
+use nexus_agent_graph::decisions::pagina_del_run;
 use nexus_agent_graph::decisions::risorse_pagina::{PoliticaRisorse, VerdettoRisorse};
 use nexus_agent_graph::decisions::static_render;
 use nexus_agent_graph::runtime::ports::{
@@ -118,6 +119,16 @@ pub struct FinalGateCriteriaRunnerAdapter {
     /// comando qualunque (nessuna memoria, nessuna classificazione), che e' il
     /// comportamento storico.
     progetto: Option<(PgPool, Uuid)>,
+    /// Identita' del run che si sta chiudendo: `(session_id, run_id)`. Serve al
+    /// criterio della resa per chiedere al registro delle scritture QUALE
+    /// pagina misurare — la sessione e' il perimetro (contiene il lavoro
+    /// delegato ai sub-run), il run distingue chi ha scritto.
+    ///
+    /// `None` = chiamante che non partecipa a quella domanda (baseline
+    /// pre-lavoro, test dei criteri comando): il criterio della resa lo
+    /// DICHIARA inconcludente invece di guardare l'albero e basta, che sarebbe
+    /// il ripiego silenzioso da cui il difetto nasceva.
+    run: Option<(Uuid, Uuid)>,
     /// Porte gia' attese in QUESTA invocazione del gate (azzerata a ogni
     /// `run`): la readiness si paga una volta per porta per ciclo, mai per
     /// criterio — e resta per-ciclo (non per-adapter) perche' fra un ciclo e
@@ -141,6 +152,7 @@ impl FinalGateCriteriaRunnerAdapter {
             http_client: reqwest::Client::new(),
             run_root,
             progetto: None,
+            run: None,
             porte_attese: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
@@ -151,6 +163,15 @@ impl FinalGateCriteriaRunnerAdapter {
     /// terzo esecutore cieco agli altri due.
     pub fn con_progetto(mut self, meta_db: PgPool, project_id: Uuid) -> Self {
         self.progetto = Some((meta_db, project_id));
+        self
+    }
+
+    /// Aggancia l'identita' del run che si sta chiudendo (vedi il campo `run`):
+    /// e' cio' che permette al criterio della resa di chiedere al registro
+    /// QUALE pagina questo lavoro ha prodotto, invece di misurare la prima che
+    /// trova sull'albero.
+    pub fn con_run(mut self, session_id: Uuid, run_id: Uuid) -> Self {
+        self.run = Some((session_id, run_id));
         self
     }
 
@@ -1158,37 +1179,118 @@ task_complete (outcome + summary)"
     /// unico puro [`static_render::classifica_resa`]: qui SOLO l'I/O (aprire la
     /// pagina, contare il DOM) e la traduzione dell'esito.
     ///
+    /// QUALE pagina si apra si decide QUI, cioe' al momento della verifica, col
+    /// punto unico [`pagina_del_run::risolvi_pagina`] sui fatti che raccoglie
+    /// [`crate::agent_graph_adapter::pagina_del_run::fatti_pagina`]. Prima la
+    /// spec portava gia' l'URL, composto a t=0 in `build_native_engine`: su un
+    /// progetto nuovo non c'era pagina da rilevare (criterio mai nato, misurato
+    /// l'11/08/2026 su una pagina rotta chiusa «task complete») e su un progetto
+    /// vivo c'era la pagina di IERI (misurata al posto di quella prodotta,
+    /// 254.938 token su un ciclo di correzione che non poteva convergere).
+    ///
     /// Un guasto dello STRUMENTO e' `Inconclusive`, mai `Failed`, per la stessa
     /// ragione del criterio gemello: bocciare un progetto perche' la macchina
     /// non sa guardarlo sarebbe il falso positivo peggiore, e il gate ha gia' il
     /// canale giusto per dirlo (un run con inconcludenti chiude
-    /// `completed_unverified`, non `passed`).
+    /// `completed_unverified`, non `passed`). «Non ho potuto guardare» e «non
+    /// c'e' pagina» restano DUE cose: la seconda e' una risposta, e passa.
     async fn check_static_render(&self, spec: &Value, timeout_s: f64) -> (CriterionOutcome, Value) {
         let Some(p) = ParametriResa::da_spec(spec) else {
+            // Spec senza la radice degli indirizzi: qui la modalita' non si e'
+            // potuta leggere, quindi la conseguenza resta quella storica.
             return (
                 CriterionOutcome::Inconclusive,
-                json!({ "skipped_reason": "nessuna pagina da aprire" }),
+                json!({ "skipped_reason": "criterio senza radice di anteprima: pagina non apribile" }),
             );
         };
-        let (url, selettore) = (p.url.as_str(), p.selettore.as_deref());
-        // La radice serve solo come working dir del processo node: la
-        // node_modules di Nexus vive nella CWD del servizio, e il progetto
-        // osservato non deve avere nulla installato.
-        let radice = self
-            .run_root
-            .clone()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        // La radice serve a due cose: cercarvi la pagina di ripiego, e fare da
+        // working dir del processo node (la node_modules di Nexus vive nella CWD
+        // del servizio, e il progetto osservato non deve avere nulla installato).
+        let (Some((meta_db, project_id)), Some((session_id, run_id)), Some(radice)) =
+            (self.progetto.clone(), self.run, self.run_root.clone())
+        else {
+            return in_osservazione(
+                p.modalita,
+                (
+                    CriterionOutcome::Inconclusive,
+                    json!({
+                        "skipped_reason":
+                            "pagina non risolvibile: manca il progetto, il run o la radice del lavoro",
+                    }),
+                ),
+            );
+        };
+        let fatti = match crate::agent_graph_adapter::pagina_del_run::fatti_pagina(
+            &meta_db, project_id, session_id, run_id, &radice,
+        )
+        .await
+        {
+            Ok(f) => f,
+            // NIENTE ripiego sul solo rilevatore: sarebbe la pagina di ieri
+            // misurata in silenzio, cioe' il difetto reso di nuovo
+            // indistinguibile dal caso buono.
+            Err(e) => {
+                return in_osservazione(
+                    p.modalita,
+                    (
+                        CriterionOutcome::Inconclusive,
+                        json!({ "skipped_reason": e }),
+                    ),
+                )
+            }
+        };
+        let (entry, provenienza) =
+            match pagina_del_run::risolvi_pagina(p.origine_servizio.as_deref(), &fatti) {
+                // Non e' un'astensione: la domanda completa la pone il dialogo
+                // browser, che vede anche le chiamate dati.
+                pagina_del_run::PaginaDaMisurare::ConServizio => {
+                    return in_osservazione(
+                        p.modalita,
+                        (
+                            CriterionOutcome::Passed,
+                            json!({
+                                "skipped_reason":
+                                    "il progetto serve il proprio frontend: la resa la misura il dialogo browser",
+                            }),
+                        ),
+                    )
+                }
+                // «Non c'e' interfaccia» e' una RISPOSTA, e passa: un backend o
+                // una CLI non devono chiudere `completed_unverified` per un
+                // criterio che non li riguarda.
+                pagina_del_run::PaginaDaMisurare::NessunaPagina => {
+                    return in_osservazione(
+                        p.modalita,
+                        (
+                            CriterionOutcome::Passed,
+                            json!({
+                                "skipped_reason":
+                                    "nessuna pagina in questo progetto: niente da guardare",
+                            }),
+                        ),
+                    )
+                }
+                pagina_del_run::PaginaDaMisurare::Una { entry, provenienza } => {
+                    (entry, provenienza)
+                }
+            };
+        let url = format!(
+            "{}{}",
+            p.base_anteprima,
+            crate::static_preview::percorso_preview(project_id, &entry)
+        );
+        let selettore = p.selettore.as_deref();
         let prove = match crate::agent_tools::browser_probe::osserva_resa(
             &radice,
-            url,
+            &url,
             selettore,
             p.attesa_ms,
             timeout_s.max(1.0) as u64,
         )
         .await
         {
-            Ok(p) => p,
-            Err(e) => return strumento_muto(url, &e),
+            Ok(prove) => prove,
+            Err(e) => return in_osservazione(p.modalita, strumento_muto(&url, &e)),
         };
         let verdetto = static_render::classifica_resa(&prove, p.minimo, &p.politica);
         // Il selettore lo porta la spec, non i fatti: e' qui che le cause che lo
@@ -1202,7 +1304,10 @@ task_complete (outcome + summary)"
         // sotto soglia non bocciano nessuno e sono il solo dato con cui si
         // potra' decidere, misurando, se quella soglia va abbassata.
         let risorse = static_render::risorse_della_pagina(&prove, &p.politica);
-        esito_resa(url, &prove, verdetto, &risorse)
+        in_osservazione(
+            p.modalita,
+            esito_resa(&url, &prove, verdetto, &risorse, provenienza),
+        )
     }
 
     /// Lo stile dichiarato dal codice e' applicato? Il criterio e' il punto
@@ -1519,10 +1624,16 @@ fn strumento_muto(url: &str, errore: &str) -> (CriterionOutcome, Value) {
 /// Le chiavi sono quelle del punto unico (`static_render::CHIAVE_*`) e si
 /// leggono qui, non sparse nel corpo del check: e' l'unico posto in cui la spec
 /// costruita dal produttore torna a essere dati, e tenerlo insieme rende
-/// evidente quando un campo manca. Senza URL non c'e' nulla da aprire e la
-/// struttura non nasce: la misura non e' possibile, e lo dice il tipo.
+/// evidente quando un campo manca. Senza la RADICE degli indirizzi non c'e'
+/// nulla da aprire e la struttura non nasce: la misura non e' possibile, e lo
+/// dice il tipo.
+///
+/// La PAGINA non e' fra questi parametri, e non e' una dimenticanza: la
+/// risolve il check al momento della verifica (vedi `check_static_render`).
 struct ParametriResa {
-    url: String,
+    base_anteprima: String,
+    origine_servizio: Option<String>,
+    modalita: static_render::ModalitaResa,
     selettore: Option<String>,
     minimo: usize,
     attesa_ms: u64,
@@ -1531,13 +1642,36 @@ struct ParametriResa {
 
 impl ParametriResa {
     fn da_spec(spec: &Value) -> Option<Self> {
-        let url = spec
-            .get("url")
+        let base = spec
+            .get(static_render::CHIAVE_BASE_ANTEPRIMA)
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|u| !u.is_empty())?;
+            .map(|b| b.trim_end_matches('/'))
+            .filter(|b| !b.is_empty())?;
         Some(Self {
-            url: url.to_string(),
+            base_anteprima: base.to_string(),
+            origine_servizio: spec
+                .get(static_render::CHIAVE_ORIGINE_SERVIZIO)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|o| !o.is_empty())
+                .map(str::to_string),
+            // Modalita' assente o ignota: si OSSERVA, mai si boccia. NON e' il
+            // regime del sistema (quello e' `enforce`, mig 0700, e il produttore
+            // scrive SEMPRE questo campo): e' cio' che resta quando la spec non
+            // dichiara la modalita', cioe' quando arriva da un motore che non
+            // parla questa versione del contratto — un run costruito prima di un
+            // deploy e ripreso dopo. Applicare una conseguenza a una spec nata
+            // sotto altre regole sarebbe deciderlo al posto di chi l'ha
+            // costruita; il verso prudente e' lo stesso del produttore, che
+            // davanti a un valore che non riconosce spegne il criterio
+            // dichiarandolo.
+            modalita: spec
+                .get(static_render::CHIAVE_MODALITA)
+                .and_then(Value::as_str)
+                .and_then(static_render::ModalitaResa::try_parse)
+                .filter(|m| m.nasce())
+                .unwrap_or(static_render::ModalitaResa::Osserva),
             selettore: spec
                 .get(static_render::CHIAVE_CONTENITORE)
                 .and_then(Value::as_str)
@@ -1580,11 +1714,23 @@ impl ParametriResa {
 /// Gli errori di CONSOLE entrano nell'evidenza anche quando il verdetto e'
 /// negativo per altro: non bocciano (lo dichiara il punto unico), ma sono la
 /// prima cosa utile a chi deve capire perche' la pagina e' vuota.
+///
+/// La PROVENIENZA viaggia nell'evidenza accanto all'URL: «ho misurato il lavoro
+/// di questo run» e «ho misurato cio' che ho trovato sull'albero» sono due cose
+/// diverse, e chi legge un rosso deve poterle distinguere.
+///
+/// Qui il verdetto e' quello VERO, sempre: la modalita' non entra in questa
+/// funzione, e la conseguenza la applica [`in_osservazione`] dopo. Tenerle
+/// separate e' cio' che rende la misura la stessa nei due regimi — se la
+/// modalita' entrasse nel merito, l'evidenza raccolta in osservazione non
+/// direbbe piu' che cosa sarebbe successo in applicazione, cioe' non
+/// servirebbe a decidere se accendere.
 fn esito_resa(
     url: &str,
     prove: &static_render::ProveResa,
     verdetto: static_render::VerdettoResa,
     risorse: &VerdettoRisorse,
+    provenienza: pagina_del_run::ProvenienzaPagina,
 ) -> (CriterionOutcome, Value) {
     use static_render::VerdettoResa;
     let (esito, mut evidenza) = match verdetto {
@@ -1613,14 +1759,65 @@ fn esito_resa(
             )
         }
     };
-    // Le risorse si allegano QUI, fuori dal match, ed e' la forma che rende
-    // vera la promessa scritta nel chiamante: si riportano SEMPRE, anche a
-    // verdetto positivo. Ripetere la chiave in ogni ramo la renderebbe
-    // omissibile per distrazione proprio nel ramo che passa.
+    // Risorse e provenienza si allegano QUI, fuori dal match, ed e' la forma
+    // che rende vera la promessa scritta nel chiamante: si riportano SEMPRE,
+    // anche a verdetto positivo. Ripetere le chiavi in ogni ramo le renderebbe
+    // omissibili per distrazione proprio nel ramo che passa.
     if let Value::Object(m) = &mut evidenza {
         m.insert("resources".to_string(), risorse.evidenza());
+        m.insert("page_source".to_string(), json!(provenienza.as_str()));
+        m.insert(
+            "page_source_note".to_string(),
+            json!(provenienza.descrizione()),
+        );
     }
     (esito, evidenza)
+}
+
+/// La CONSEGUENZA, in un punto solo: in osservazione il criterio non ne ha.
+///
+/// Il regime con cui il sistema gira e' `enforce` (mig 0700) e questa funzione
+/// li' non fa nulla: e' la strada del RIPIEGO, quella che si percorre se i primi
+/// run mostrassero falsi rossi sulla popolazione che prima non veniva mai
+/// misurata (una SPA scaffoldata durante il run, il cui bundle la route di
+/// anteprima serve con un content-type generico).
+///
+/// Non riguarda il solo `Failed`, ed e' la ragione per cui esiste come funzione
+/// invece di essere un `if` sul verdetto: anche un `Inconclusive` e' una
+/// conseguenza, perche' chiude il run `completed_unverified`. Se il browser non
+/// fosse installato sulla macchina, un `observe` che lasciasse passare gli
+/// inconcludenti declasserebbe TUTTI i run — cioe' il contrario di cio' per cui
+/// il ripiego esiste. Percio' in `observe` l'esito e' `Passed` qualunque cosa si
+/// sia vista, e cio' che si e' visto resta scritto per intero.
+///
+/// L'evidenza dichiara il verdetto VERO in un campo (`observed_outcome`,
+/// `observed_only`), mai nella prosa: e' il dato con cui si decidera', sui run
+/// reali, se passare ad `enforce` — e va interrogato, non letto (regola Q).
+/// L'`error` diventa `observed_error` perche' un criterio che PASSA non porti
+/// un campo che il resto del gate legge come rilievo.
+fn in_osservazione(
+    modalita: static_render::ModalitaResa,
+    (esito, mut evidenza): (CriterionOutcome, Value),
+) -> (CriterionOutcome, Value) {
+    if let Value::Object(m) = &mut evidenza {
+        m.insert("mode".to_string(), json!(modalita.as_str()));
+    }
+    if modalita.boccia() || esito == CriterionOutcome::Passed {
+        return (esito, evidenza);
+    }
+    let osservato = match esito {
+        CriterionOutcome::Failed => "failed",
+        CriterionOutcome::Inconclusive => "inconclusive",
+        CriterionOutcome::Passed => "passed",
+    };
+    if let Value::Object(m) = &mut evidenza {
+        m.insert("observed_only".to_string(), json!(true));
+        m.insert("observed_outcome".to_string(), json!(osservato));
+        if let Some(err) = m.remove("error") {
+            m.insert("observed_error".to_string(), err);
+        }
+    }
+    (CriterionOutcome::Passed, evidenza)
 }
 
 /// Promuove l'esito di un criterio che ha DAVVERO misurato (`bool`) alla forma
@@ -2001,6 +2198,247 @@ fn verdetto_del_comando(f: FattiDelComando) -> CriterionOutcome {
     }
     // Fail-closed: criterio assoluto.
     CriterionOutcome::measured(f.exit_ok)
+}
+
+#[cfg(test)]
+mod conseguenza_resa_tests {
+    use super::*;
+    use nexus_agent_graph::decisions::pagina_del_run::ProvenienzaPagina;
+    use nexus_agent_graph::decisions::risorse_pagina::PoliticaRisorse;
+    use static_render::{
+        classifica_resa, EsitoContenitore, ModalitaResa, ProveResa, VerdettoResa,
+    };
+
+    /// La pagina dell'incidente: contenitore dichiarato e rimasto vuoto.
+    fn verdetto_negativo() -> (ProveResa, VerdettoResa) {
+        let prove = ProveResa {
+            pagina_caricata: true,
+            elementi_resi: Some(3),
+            contenitore: Some(EsitoContenitore::Trovato { figli: 0 }),
+            ..Default::default()
+        };
+        let v = classifica_resa(&prove, 5, &PoliticaRisorse::default());
+        assert!(matches!(v, VerdettoResa::NonResa { .. }));
+        (prove, v)
+    }
+
+    fn esito(modalita: ModalitaResa) -> (CriterionOutcome, Value) {
+        let (prove, verdetto) = verdetto_negativo();
+        in_osservazione(
+            modalita,
+            esito_resa(
+                "http://x/preview/p/galleria.html",
+                &prove,
+                verdetto,
+                &VerdettoRisorse::NonOsservabile {
+                    motivo: "nessun canale".into(),
+                },
+                ProvenienzaPagina::ScrittaDalRun,
+            ),
+        )
+    }
+
+    /// In APPLICAZIONE il verdetto negativo boccia, e il rilievo nomina la
+    /// pagina e la sua provenienza.
+    #[test]
+    fn in_applicazione_una_pagina_non_resa_boccia() {
+        let (out, ev) = esito(ModalitaResa::Applica);
+        assert_eq!(out, CriterionOutcome::Failed);
+        assert_eq!(ev["mode"], "enforce");
+        assert_eq!(ev["page_source"], "written_by_run");
+        assert!(ev["error"].as_str().unwrap_or_default().contains("contenitore"));
+        assert!(ev.get("observed_only").is_none());
+    }
+
+    /// In OSSERVAZIONE la stessa misura non ha conseguenza, e cio' che si e'
+    /// visto resta scritto per intero in CAMPI interrogabili (regola Q): e' il
+    /// dato con cui si decidera' se accendere.
+    ///
+    /// MUTAZIONE: far ritornare `Failed` anche in osservazione -> una
+    /// popolazione di run che nessuno ha mai misurato comincia a essere
+    /// bocciata prima che qualcuno ne abbia visto l'evidenza.
+    #[test]
+    fn in_osservazione_la_stessa_misura_non_ha_conseguenza() {
+        let (out, ev) = esito(ModalitaResa::Osserva);
+        assert_eq!(out, CriterionOutcome::Passed);
+        assert_eq!(ev["mode"], "observe");
+        assert_eq!(ev["observed_only"], true);
+        assert_eq!(ev["observed_outcome"], "failed");
+        assert!(
+            ev.get("error").is_none() && ev["observed_error"].is_string(),
+            "un criterio che PASSA non porta un campo che il gate legge come rilievo"
+        );
+        // La misura e' la stessa: le cause restano, o l'evidenza non direbbe
+        // che cosa sarebbe successo in applicazione.
+        assert!(ev["causes"].as_array().is_some_and(|c| !c.is_empty()));
+    }
+
+    /// «Non ho potuto guardare» in osservazione non declassa il run. Senza
+    /// questo, accendere l'osservazione su una macchina senza browser
+    /// chiuderebbe `completed_unverified` OGNI run con un progetto — il
+    /// contrario di cio' per cui l'osservazione esiste.
+    #[test]
+    fn in_osservazione_nemmeno_l_ignoto_declassa() {
+        let muto = strumento_muto("http://x/preview/p/galleria.html", "chromium assente");
+        assert_eq!(muto.0, CriterionOutcome::Inconclusive);
+
+        let (out, ev) = in_osservazione(ModalitaResa::Osserva, muto.clone());
+        assert_eq!(out, CriterionOutcome::Passed);
+        assert_eq!(ev["observed_outcome"], "inconclusive");
+        assert!(ev["skipped_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("chromium assente"));
+
+        // In applicazione resta inconcludente: bocciare un progetto perche' la
+        // macchina non sa guardarlo sarebbe il falso positivo peggiore, e
+        // `completed_unverified` e' il canale giusto per dirlo.
+        assert_eq!(
+            in_osservazione(ModalitaResa::Applica, muto).0,
+            CriterionOutcome::Inconclusive
+        );
+    }
+}
+
+#[cfg(test)]
+mod caso_reale_resa_tests {
+    use super::*;
+
+    use nexus_agent_graph::decisions::pagina_del_run::{
+        risolvi_pagina, PaginaDaMisurare, ProvenienzaPagina,
+    };
+    use static_render::ModalitaResa;
+
+    use crate::file_mutations::{record_mutation, ScopeAudit};
+
+    /// I fatti del browser sulla pagina di `test-11-08-listino`, nella forma in
+    /// cui lo script li emette.
+    ///
+    /// Non e' un `ProveResa` costruito a mano: lo produce `interpreta_resa`, che
+    /// e' il produttore vero (regola O). Costruirlo per campi fisserebbe qui la
+    /// forma del payload, cioe' l'assunto da verificare, e un campo rinominato
+    /// nello script lascerebbe questo test verde.
+    const PAGINA_ROTTA: &str = r#"{
+        "loaded": true,
+        "elementCount": 0,
+        "container": { "found": true, "children": 0 },
+        "pageErrors": ["SyntaxError: Unexpected token '}'"],
+        "consoleErrors": [],
+        "pageUrl": "http://127.0.0.1:4000/preview/p/listino.html"
+    }"#;
+
+    /// IL CASO MISURATO L'11/08/2026, dall'inizio alla fine e con la
+    /// configurazione REALE.
+    ///
+    /// `test-11-08-listino`: progetto nuovo, l'agente scrive `listino.html`, la
+    /// pagina non funziona (eccezione non gestita, contenitore `productsGrid` a
+    /// zero figli, body di 90 caratteri) e il run chiude «task complete».
+    ///
+    /// La catena e' quella della produzione, senza scorciatoie:
+    ///   migrazioni (la modalita' la scrive il DB, non il test)
+    ///     -> `native_engine::criterio_resa_statica` costruisce la spec
+    ///     -> `record_mutation` registra la scrittura del run
+    ///     -> `fatti_pagina` + `risolvi_pagina` scelgono la pagina alla verifica
+    ///     -> `ParametriResa::da_spec` rilegge la spec come fa il runner
+    ///     -> `interpreta_resa` traduce i fatti del browser
+    ///     -> `classifica_resa` giudica
+    ///     -> `in_osservazione` applica la conseguenza.
+    ///
+    /// MUTAZIONE (il valore reale del difetto): riportare la migrazione a
+    /// `observe` — cioe' la decisione della 0699 che la 0700 corregge — e
+    /// l'ultima asserzione cade con `Passed`. E' esattamente il run chiuso
+    /// «task complete» su una pagina rotta: tutto il resto della catena
+    /// funzionerebbe, la misura sarebbe negativa, e nessuno fermerebbe il run.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn una_pagina_rotta_scritta_dal_run_boccia_con_la_configurazione_reale(pool: PgPool) {
+        let (user_id, project_id) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let session_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let albero = tempfile::tempdir().expect("tempdir");
+        let root = albero.path();
+
+        // 1. La CONFIGURAZIONE: la modalita' arriva dalle migrazioni applicate a
+        //    questo DB, non da un letterale di questo test.
+        let criterio = crate::native_engine::criterio_resa_statica(&pool, project_id, None, 15.0, 2000)
+            .await
+            .expect("il criterio nasce: la configurazione lo accende");
+        let p = ParametriResa::da_spec(&criterio.spec).expect("la spec si rilegge");
+        assert_eq!(
+            p.modalita,
+            ModalitaResa::Applica,
+            "la configurazione reale APPLICA (mig 0700): in osservazione questo \
+             run si chiuderebbe di nuovo «task complete» su una pagina rotta"
+        );
+
+        // 2. Il LAVORO del run, col produttore reale del registro.
+        let pagina = root.join("listino.html");
+        std::fs::write(&pagina, "<html><body><div id=\"productsGrid\"></div></body></html>")
+            .expect("write");
+        record_mutation(
+            &pool,
+            project_id,
+            Some(session_id),
+            Some(run_id),
+            Some(user_id),
+            "listino.html",
+            "write_file",
+            None,
+            Some("<html><body><div id=\"productsGrid\"></div></body></html>"),
+            ScopeAudit::none(),
+        )
+        .await
+        .expect("mutazione registrata");
+
+        // 3. QUALE pagina, risolta alla verifica.
+        let fatti = crate::agent_graph_adapter::pagina_del_run::fatti_pagina(
+            &pool, project_id, session_id, run_id, root,
+        )
+        .await
+        .expect("fatti");
+        let PaginaDaMisurare::Una { entry, provenienza } =
+            risolvi_pagina(p.origine_servizio.as_deref(), &fatti)
+        else {
+            panic!("la pagina che il run ha scritto e' la pagina da misurare");
+        };
+        assert_eq!(entry, "listino.html");
+        assert_eq!(provenienza, ProvenienzaPagina::ScrittaDalRun);
+        let url = format!(
+            "{}{}",
+            p.base_anteprima,
+            crate::static_preview::percorso_preview(project_id, &entry)
+        );
+
+        // 4. I FATTI del browser e il GIUDIZIO, coi produttori veri.
+        let prove = crate::agent_tools::browser_probe::interpreta_resa(PAGINA_ROTTA)
+            .expect("fatti del browser");
+        let verdetto = static_render::cause_con_selettore(
+            static_render::classifica_resa(&prove, p.minimo, &p.politica),
+            "#productsGrid",
+        );
+        let risorse = static_render::risorse_della_pagina(&prove, &p.politica);
+
+        // 5. La CONSEGUENZA.
+        let (esito, evidenza) = in_osservazione(
+            p.modalita,
+            esito_resa(&url, &prove, verdetto, &risorse, provenienza),
+        );
+        assert_eq!(
+            esito,
+            CriterionOutcome::Failed,
+            "una pagina rotta scritta dal run deve fermare il run: evidenza {evidenza}"
+        );
+        assert_eq!(evidenza["mode"], "enforce");
+        assert_eq!(evidenza["page_source"], "written_by_run");
+        assert!(
+            evidenza.get("observed_only").is_none(),
+            "in applicazione il rilievo non e' una semplice osservazione"
+        );
+        let cause = evidenza["causes"].as_array().expect("cause");
+        assert!(
+            cause.len() >= 2,
+            "eccezione non gestita + contenitore vuoto: {cause:?}"
+        );
+    }
 }
 
 #[cfg(test)]

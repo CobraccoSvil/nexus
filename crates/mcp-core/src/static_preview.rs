@@ -196,7 +196,16 @@ const ENTRY_CANONICHE: [&str; 4] = ["index.html", "index.htm", "home.html", "mai
 /// Cartelle che non contengono mai il sito da mostrare: dipendenze, cache di
 /// build, metadati di VCS. `dist` e `build` NON sono qui — sono proprio i posti
 /// in cui un sito costruito finisce.
-const CARTELLE_ESCLUSE: [&str; 6] = [
+///
+/// PUBBLICO perche' e' l'unico proprietario di questo vocabolario (regola L), e
+/// ha un secondo lettore: il criterio che sceglie QUALE pagina il gate misura
+/// (`decisions::pagina_del_run`) deve scartare le stesse cartelle di qui, o le
+/// due strade che portano una pagina al gate — il rilevamento e la scrittura —
+/// avrebbero due idee diverse di «cartella che non e' il sito». Quel criterio
+/// vive in un crate che non vede questo, quindi l'elenco gli arriva coi fatti;
+/// che vi arrivi DAVVERO lo verifica il ponte in
+/// `agent_graph_adapter::pagina_del_run`.
+pub const CARTELLE_ESCLUSE: [&str; 6] = [
     "node_modules",
     ".git",
     ".next",
@@ -278,6 +287,19 @@ pub async fn detect_static_entry(root: &str) -> Option<String> {
     html_files.into_iter().next()
 }
 
+/// Il PERCORSO con cui si apre una pagina del progetto attraverso il proxy di
+/// anteprima. Same-origin e relativo: il frontend lo apre cosi', e chi ha una
+/// base assoluta (il gate) vi antepone la propria.
+///
+/// Un posto solo perche' la forma della route non e' un dettaglio di stampa: se
+/// due chiamanti la componessero a modo loro, il giorno che la route cambia uno
+/// dei due aprirebbe un indirizzo che risponde 404 — e per il gate un 404 non e'
+/// un errore di configurazione, e' «la pagina non si e' caricata», cioe' un
+/// difetto della misura travestito da difetto del codice.
+pub fn percorso_preview(project_id: uuid::Uuid, entry: &str) -> String {
+    format!("/preview/{}/{}", project_id, entry.trim_start_matches('/'))
+}
+
 async fn e_un_file(percorso: &str) -> bool {
     tokio::fs::metadata(percorso)
         .await
@@ -305,10 +327,10 @@ pub async fn static_site_info(
     match detect_static_entry(context.root_path.to_string_lossy().as_ref()).await {
         Some(entry) => Ok(Json(json!({
             "detected": true,
-            "entry": entry,
             // URL relativo same-origin: il proxy web-ide inoltra /preview/* a
             // mcp-core. Apribile direttamente in una nuova scheda.
-            "url": format!("/preview/{}/{}", project_id, entry),
+            "url": percorso_preview(project_id, &entry),
+            "entry": entry,
         }))),
         None => Ok(Json(json!({ "detected": false }))),
     }

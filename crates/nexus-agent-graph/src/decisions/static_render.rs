@@ -69,6 +69,15 @@
 //! di console presente su ENTRAMBE non ha spostato nulla, che e' esattamente
 //! cio' che deve fare.
 //!
+//! QUALE PAGINA si misura NON e' una domanda di questo modulo, e dall'11/08/2026
+//! ha il suo punto unico: [`super::pagina_del_run`]. Qui resta il DISCRIMINANTE
+//! ([`classifica_natura`]), a cui quel modulo delega per la precedenza del
+//! servizio. La ragione della separazione e' un difetto misurato: la pagina era
+//! risolta a t=0, prima che il run scrivesse alcunche', quindi su un progetto
+//! nuovo il criterio non nasceva (nessuna pagina da rilevare) e su un progetto
+//! con una pagina preesistente misurava QUELLA invece di cio' che il run aveva
+//! prodotto — un ciclo di correzione che non poteva convergere.
+//!
 //! CONFINE (regola L): qui SOLO il criterio puro sui fatti gia' raccolti.
 //! L'I/O — avviare Chromium, caricare la pagina, contare gli elementi — sta in
 //! `mcp-core` (`agent_tools::browser_probe`), che porta i fatti e non li
@@ -411,6 +420,84 @@ pub fn classifica_natura(origine_servizio: Option<&str>, entry: Option<&str>) ->
 /// Il tipo di criterio nel vocabolario del runner (regola N).
 pub const CRITERION_TYPE: &str = "static_render";
 
+/// Quanto pesa il verdetto di questo criterio sul run. Vocabolario CHIUSO
+/// (regola N), modellato su [`super::step_gate::StepGateMode`], che risponde
+/// alla stessa domanda per un altro presidio.
+///
+/// PERCHE' SI PARTE APPLICANDO (`enforce`, mig 0700), per ogni pagina e senza
+/// distinzione fra quelle che il run ha scritto e quelle rilevate sull'albero.
+///
+///   1. Osservare e basta NON CHIUDE il caso che motiva la risoluzione tardiva.
+///      `test-11-08-listino`: pagina rotta (eccezione non gestita, contenitore a
+///      zero figli, body di 90 caratteri) e run chiuso «task complete». Ora il
+///      criterio nasce e la misura e' negativa — ma in osservazione l'esito
+///      resta `Passed`, quindi quel run si chiuderebbe di nuovo «completato».
+///   2. Il criterio NON e' nuovo: e' in esercizio dalla mig 0685 e la sua chiave
+///      booleana valeva `true` in produzione, con la conseguenza piena. Nascere
+///      in osservazione non sarebbe stata prudenza verso una copertura nuova,
+///      sarebbe stato un depotenziamento di una difesa gia' attiva.
+///   3. La MISURA e' la stessa nei due regimi: la modalita' non entra nel merito
+///      del verdetto, e non c'e' niente da guadagnare aspettando (vedi
+///      `in_osservazione` nel runner del gate).
+///
+/// [`ModalitaResa::Osserva`] resta, e non e' decorativa: e' il ripiego per il
+/// rischio dichiarato — la popolazione di run che prima non veniva mai misurata,
+/// dove una SPA scaffoldata DURANTE il run puo' referenziare un modulo che la
+/// route di anteprima serve con un content-type generico, cioe' restare vuota
+/// per costruzione e non per colpa dell'agente. Se quella forma si presentasse,
+/// il ripiego e' una riga di UPDATE e la correzione vera sta nel content-type
+/// della route, non nella soglia del criterio.
+///
+/// Il [`Default`] resta [`ModalitaResa::Off`], e non contraddice quanto sopra:
+/// e' cio' che vale quando la configurazione NON si e' potuta leggere, e li' un
+/// criterio che si accende da se' sarebbe il magic fallback che la regola G
+/// vieta. Il valore con cui il sistema gira lo scrive il DB.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModalitaResa {
+    /// Il criterio non nasce: nessuna misura, nessun costo.
+    #[default]
+    Off,
+    /// Misura e SCRIVE l'evidenza, senza mai produrre un `Failed`: e' la
+    /// telemetria con cui si decidera', sui dati, se accendere `Applica`.
+    Osserva,
+    /// Il verdetto negativo boccia il run.
+    Applica,
+}
+
+impl ModalitaResa {
+    /// Parse dell'identificatore canonico. `None` su valore ignoto: il
+    /// chiamante degrada a [`ModalitaResa::Off`] DICHIARANDOLO, perche' un
+    /// criterio che si accende per un typo e' peggio di uno spento visibilmente.
+    pub fn try_parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "observe" => Some(Self::Osserva),
+            "enforce" => Some(Self::Applica),
+            _ => None,
+        }
+    }
+
+    /// Identificatore canonico, per la spec e per l'evidenza.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Osserva => "observe",
+            Self::Applica => "enforce",
+        }
+    }
+
+    /// Il criterio NASCE?
+    pub fn nasce(self) -> bool {
+        self != Self::Off
+    }
+
+    /// Un verdetto NEGATIVO boccia il run, o resta osservazione dichiarata?
+    pub fn boccia(self) -> bool {
+        self == Self::Applica
+    }
+}
+
 /// Chiavi della spec, con un solo punto di scrittura (i test le referenziano da
 /// qui, mai come letterali sparsi).
 pub const CHIAVE_CONTENITORE: &str = "container_selector";
@@ -418,52 +505,99 @@ pub const CHIAVE_MIN_ELEMENTI: &str = "min_elements";
 pub const CHIAVE_ATTESA_MS: &str = "settle_ms";
 pub const CHIAVE_TIPI_RISORSA: &str = "resource_types";
 pub const CHIAVE_SOGLIA_RISORSE: &str = "broken_resource_ratio";
+/// Radice degli indirizzi di anteprima. La PAGINA non e' nella spec: la
+/// risolve chi verifica, non chi costruisce il criterio (vedi
+/// [`super::pagina_del_run`]).
+pub const CHIAVE_BASE_ANTEPRIMA: &str = "preview_base";
+/// L'origine del servizio frontend, quando il progetto ne ha uno. Viaggia nella
+/// spec perche' la precedenza del servizio si decide insieme alla pagina, in un
+/// punto solo e al momento della verifica.
+pub const CHIAVE_ORIGINE_SERVIZIO: &str = "frontend_origin";
+/// Quanto pesa il verdetto ([`ModalitaResa`]).
+pub const CHIAVE_MODALITA: &str = "mode";
+
+/// I parametri della misura che NON dipendono dalla pagina: li risolve dal DB
+/// chi costruisce il criterio (regola G) e viaggiano insieme perche' sono la
+/// stessa configurazione. Struct e non argomenti sciolti: sei numeri in fila
+/// nella firma sono sei occasioni di scambiarne due senza che nulla se ne
+/// accorga.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParametriMisura {
+    /// Soglia sul body reso (`agent.final_gate.static_render_min_elements`).
+    pub minimo_elementi: usize,
+    /// Pazienza concessa all'osservazione.
+    pub timeout_s: f64,
+    /// Attesa che la pagina si calmi (`agent.final_gate.browser_settle_ms`).
+    pub attesa_ms: u64,
+    /// Politica delle risorse (mig 0692).
+    pub politica: PoliticaRisorse,
+    /// Quanto pesa il verdetto.
+    pub modalita: ModalitaResa,
+}
 
 /// La spec del criterio, costruita QUI e non dai chiamanti: il produttore del
 /// criterio e' uno solo, cosi' i test possono attraversarlo invece di
 /// fabbricare la spec a mano (regola O).
 ///
-/// `url` e' l'indirizzo su cui la pagina va aperta. Non nasce senza: una
-/// pagina che non si sa dove aprire non e' misurabile, e un criterio che
-/// fallisse per questo boccerebbe il progetto per un difetto della misura.
+/// LA PAGINA NON E' QUI, ed e' il punto del cambiamento dell'11/08/2026: il
+/// criterio si costruisce a t=0, cioe' prima che il run scriva alcunche', e una
+/// pagina risolta li' e' la pagina di IERI (o nessuna, su un progetto nuovo).
+/// La spec porta la RADICE degli indirizzi di anteprima; quale pagina comporre
+/// lo decide chi verifica, col punto unico [`super::pagina_del_run`].
+///
+/// `base_anteprima` e' quella radice. Il criterio non nasce senza: una pagina
+/// che non si sa dove aprire non e' misurabile, e un criterio che fallisse per
+/// questo boccerebbe il progetto per un difetto della misura.
+///
+/// `origine_servizio` e' l'indirizzo del frontend quando il progetto ne ha uno.
+/// Non impedisce al criterio di nascere: la precedenza del servizio la applica
+/// [`super::pagina_del_run::risolvi_pagina`] insieme alla scelta della pagina,
+/// in un punto solo — e cosi' il criterio DICHIARA di non essersi applicato
+/// invece di sparire senza dire niente.
 ///
 /// La `politica` delle risorse viaggia nella SPEC e non come stato del runner,
 /// per la stessa ragione del vocabolario delle terze parti in
 /// [`super::browser_dialogue`]: e' configurazione (regola G), la risolve a
 /// monte chi legge il DB, e cosi' il runner non lo legge.
 pub fn criterio_resa(
-    url: Option<&str>,
-    contenitore: Option<&str>,
-    minimo_elementi: usize,
-    timeout_s: f64,
-    attesa_ms: u64,
-    politica: &PoliticaRisorse,
+    base_anteprima: Option<&str>,
+    origine_servizio: Option<&str>,
+    p: &ParametriMisura,
 ) -> Option<crate::runtime::ports::CriterionSpec> {
     use crate::runtime::ports::{CriterionProvenance, CriterionSpec};
-    let url = url.map(str::trim).filter(|u| !u.is_empty())?;
+    if !p.modalita.nasce() {
+        return None;
+    }
+    let base = base_anteprima
+        .map(str::trim)
+        .map(|b| b.trim_end_matches('/'))
+        .filter(|b| !b.is_empty())?;
     let mut spec = Map::new();
-    spec.insert("url".to_string(), json!(url));
-    spec.insert(CHIAVE_MIN_ELEMENTI.to_string(), json!(minimo_elementi));
-    spec.insert(CHIAVE_ATTESA_MS.to_string(), json!(attesa_ms));
+    spec.insert(CHIAVE_BASE_ANTEPRIMA.to_string(), json!(base));
+    spec.insert(CHIAVE_MODALITA.to_string(), json!(p.modalita.as_str()));
+    spec.insert(CHIAVE_MIN_ELEMENTI.to_string(), json!(p.minimo_elementi));
+    spec.insert(CHIAVE_ATTESA_MS.to_string(), json!(p.attesa_ms));
     spec.insert(
         CHIAVE_TIPI_RISORSA.to_string(),
-        json!(politica.tipi_governati),
+        json!(p.politica.tipi_governati),
     );
     // La soglia entra solo se configurata: una chiave assente nella spec dice
     // al criterio «non risponderai sulle risorse», e un numero di ripiego
     // scritto qui sarebbe il magic fallback che la regola G vieta.
-    if let Some(s) = politica.soglia {
+    if let Some(s) = p.politica.soglia {
         spec.insert(CHIAVE_SOGLIA_RISORSE.to_string(), json!(s));
     }
-    if let Some(c) = contenitore.map(str::trim).filter(|c| !c.is_empty()) {
-        spec.insert(CHIAVE_CONTENITORE.to_string(), json!(c));
+    // Stessa disciplina per l'origine: assente significa «nessun servizio
+    // dichiarato», non «stringa vuota».
+    if let Some(o) = origine_servizio.map(str::trim).filter(|o| !o.is_empty()) {
+        spec.insert(CHIAVE_ORIGINE_SERVIZIO.to_string(), json!(o));
     }
     Some(CriterionSpec {
         criterion_type: CRITERION_TYPE.to_string(),
         provenance: CriterionProvenance::Gate,
         spec: Value::Object(spec),
         expected: json!({}),
-        timeout_s: Some(timeout_s),
+        timeout_s: Some(p.timeout_s),
     })
 }
 
@@ -724,49 +858,105 @@ mod tests {
         assert_eq!(classifica_natura(None, Some("   ")), NaturaApp::SenzaPagina);
     }
 
-    /// Il criterio si costruisce dal produttore unico, e senza URL non nasce.
-    #[test]
-    fn il_criterio_nasce_solo_con_un_url() {
-        let p = politica();
-        assert!(criterio_resa(None, None, 5, 30.0, 2000, &p).is_none());
-        assert!(criterio_resa(Some("  "), None, 5, 30.0, 2000, &p).is_none());
+    /// I parametri della misura come li risolve il motore dal DB.
+    fn parametri(modalita: ModalitaResa) -> ParametriMisura {
+        ParametriMisura {
+            minimo_elementi: 5,
+            timeout_s: 30.0,
+            attesa_ms: 2000,
+            politica: politica(),
+            modalita,
+        }
+    }
 
-        let c = criterio_resa(
-            Some("http://127.0.0.1:4000/preview/e4d446ce/landing/index.html"),
-            Some("#courses-grid"),
-            5,
-            30.0,
-            2000,
-            &p,
-        )
-        .expect("criterio");
+    /// Il criterio si costruisce dal produttore unico, e senza la radice degli
+    /// indirizzi di anteprima non nasce.
+    ///
+    /// LA PAGINA NON E' NELLA SPEC, e il test lo afferma: era li' che il
+    /// difetto dell'11/08 viveva — un indirizzo composto a t=0 e' l'indirizzo
+    /// della pagina di ieri.
+    #[test]
+    fn il_criterio_nasce_solo_con_la_base_di_anteprima() {
+        let p = parametri(ModalitaResa::Applica);
+        assert!(criterio_resa(None, None, &p).is_none());
+        assert!(criterio_resa(Some("  "), None, &p).is_none());
+
+        let c = criterio_resa(Some("http://127.0.0.1:4000/"), None, &p).expect("criterio");
         assert_eq!(c.criterion_type, CRITERION_TYPE);
+        // La barra finale non entra: l'indirizzo si compone al momento della
+        // verifica, e due barre di fila non sono lo stesso percorso.
+        assert_eq!(c.spec[CHIAVE_BASE_ANTEPRIMA], "http://127.0.0.1:4000");
+        assert_eq!(c.spec[CHIAVE_MODALITA], "enforce");
         assert_eq!(c.spec[CHIAVE_MIN_ELEMENTI], 5);
         assert_eq!(c.spec[CHIAVE_ATTESA_MS], 2000);
-        assert_eq!(c.spec[CHIAVE_CONTENITORE], "#courses-grid");
         // La politica delle risorse viaggia nella spec: il runner non legge il DB.
         assert_eq!(c.spec[CHIAVE_TIPI_RISORSA][0], "image");
         assert_eq!(c.spec[CHIAVE_SOGLIA_RISORSE], 1.0);
+        assert!(
+            c.spec.get("url").is_none(),
+            "la pagina si risolve alla verifica, non qui: una spec con l'URL \
+             riporterebbe la risoluzione a t=0"
+        );
 
         // Senza contenitore dichiarato la chiave non c'e' affatto: un
         // selettore vuoto nella spec farebbe cercare al browser un elemento
         // che nessuno ha chiesto.
-        let senza = criterio_resa(Some("http://x/index.html"), Some(" "), 5, 30.0, 2000, &p)
-            .expect("criterio");
-        assert!(senza.spec.get(CHIAVE_CONTENITORE).is_none());
+        assert!(c.spec.get(CHIAVE_CONTENITORE).is_none());
 
         // Soglia non configurata: la chiave NON entra nella spec. Un numero di
         // ripiego scritto qui deciderebbe al posto dell'amministratore.
         let muta = criterio_resa(
-            Some("http://x/index.html"),
+            Some("http://x"),
             None,
-            5,
-            30.0,
-            2000,
-            &PoliticaRisorse::nuova(vec!["image".into()], None),
+            &ParametriMisura {
+                politica: PoliticaRisorse::nuova(vec!["image".into()], None),
+                ..parametri(ModalitaResa::Applica)
+            },
         )
         .expect("criterio");
         assert!(muta.spec.get(CHIAVE_SOGLIA_RISORSE).is_none());
+    }
+
+    /// L'origine del servizio viaggia nella spec e NON impedisce al criterio di
+    /// nascere: la precedenza la applica `pagina_del_run` insieme alla scelta
+    /// della pagina, in un punto solo, e il criterio dichiara di non essersi
+    /// applicato invece di sparire in silenzio.
+    #[test]
+    fn l_origine_del_servizio_viaggia_nella_spec() {
+        let p = parametri(ModalitaResa::Osserva);
+        let c = criterio_resa(Some("http://x"), Some("http://127.0.0.1:35954"), &p)
+            .expect("con un servizio il criterio nasce lo stesso");
+        assert_eq!(c.spec[CHIAVE_ORIGINE_SERVIZIO], "http://127.0.0.1:35954");
+
+        // Origine degenere: la chiave non entra. «Assente» significa nessun
+        // servizio dichiarato, non stringa vuota.
+        let senza = criterio_resa(Some("http://x"), Some("  "), &p).expect("criterio");
+        assert!(senza.spec.get(CHIAVE_ORIGINE_SERVIZIO).is_none());
+    }
+
+    /// La modalita' governa DUE cose distinte: se il criterio nasce, e se il
+    /// suo verdetto negativo ha conseguenza. A `Off` non nasce affatto; a
+    /// `Osserva` nasce e misura senza bocciare; ad `Applica` boccia.
+    ///
+    /// MUTAZIONE: far nascere il criterio anche a `Off` -> il kill-switch non
+    /// spegnerebbe piu' nulla, e un progetto lo pagherebbe in tempo di browser
+    /// a ogni chiusura di run.
+    #[test]
+    fn la_modalita_governa_nascita_e_conseguenza() {
+        assert!(criterio_resa(Some("http://x"), None, &parametri(ModalitaResa::Off)).is_none());
+        assert!(criterio_resa(Some("http://x"), None, &parametri(ModalitaResa::Osserva)).is_some());
+
+        assert_eq!(ModalitaResa::try_parse("observe"), Some(ModalitaResa::Osserva));
+        assert_eq!(ModalitaResa::try_parse(" ENFORCE "), Some(ModalitaResa::Applica));
+        assert_eq!(ModalitaResa::try_parse("off"), Some(ModalitaResa::Off));
+        // Valore ignoto: nessun ramo inventato, il chiamante degrada
+        // dichiarandolo.
+        assert_eq!(ModalitaResa::try_parse("osserva"), None);
+        assert_eq!(ModalitaResa::default(), ModalitaResa::Off);
+
+        assert!(!ModalitaResa::Off.nasce());
+        assert!(ModalitaResa::Osserva.nasce() && !ModalitaResa::Osserva.boccia());
+        assert!(ModalitaResa::Applica.boccia());
     }
 
     /// IL CASO MISURATO IL 09/08/2026: la pagina si genera, ha i suoi nodi, il
@@ -903,7 +1093,7 @@ mod tests {
     /// elemento che nessuno ha dichiarato.
     #[test]
     fn il_contenitore_dichiarato_entra_nel_criterio() {
-        let base = criterio_resa(Some("http://x/index.html"), None, 5, 30.0, 2000, &politica())
+        let base = criterio_resa(Some("http://x"), None, &parametri(ModalitaResa::Applica))
             .expect("criterio");
         let dichiarato = json!({ "outcome": "done", "rendered_container": "#courses-grid" });
         let c = con_contenitore(base.clone(), Some(&dichiarato));

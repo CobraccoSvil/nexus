@@ -83,6 +83,13 @@ struct MutationBody<'a> {
     solo_fine_riga: Option<bool>,
 }
 
+/// Il valore che la colonna `op` prende quando la scrittura ha RIMOSSO il file.
+/// Ha un nome perche' non e' solo il campo di una riga: chi legge il registro
+/// deve poter distinguere un file ancora li' da uno che non c'e' piu' — e
+/// riconoscerlo con un letterale ricopiato altrove sarebbe la stessa domanda
+/// con due risposte (regola L, e regola M sul riconoscimento a mano).
+pub const OP_CANCELLATO: &str = "deleted";
+
 impl<'a> MutationBody<'a> {
     /// Deriva op/hash/size e applica il cap di tracking.
     ///
@@ -93,7 +100,7 @@ impl<'a> MutationBody<'a> {
         let op = match (before.is_some(), after.is_some()) {
             (false, true) => "created",
             (true, true) => "modified",
-            (true, false) => "deleted",
+            (true, false) => OP_CANCELLATO,
             // Non dovrebbe mai accadere (chiamata vuota). Trattato come modified
             // per non perdere il record; before e after sono entrambi NULL.
             (false, false) => "modified",
@@ -449,7 +456,7 @@ pub async fn revert_mutation(
                     }
                 }
                 new_after_content = None;
-                new_op = "deleted";
+                new_op = OP_CANCELLATO;
             }
         }
         _ => {

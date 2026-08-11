@@ -129,6 +129,15 @@
 //!     (`resourceType()`), mai l'estensione dell'URL; il verdetto distingue le
 //!     assenze sparse dal TIPO compromesso e separa la causa locale da quella
 //!     esterna. Lo consuma `static_render` sulla stessa singola osservazione.
+//!   - [`pagina_del_run`]: PUNTO UNICO di "QUALE pagina va misurata alla
+//!     chiusura di questo run?". Domanda diversa da "qual e' l'entry di questo
+//!     sito?" (`static_preview::detect_static_entry`, che resta il suo punto
+//!     unico e qui e' il RIPIEGO): la pagina era risolta a t=0 e le due forme
+//!     del difetto, misurate l'11/08/2026, sono il criterio che non nasce su un
+//!     progetto nuovo e il criterio che misura la pagina di IERI invece di
+//!     quella che il run ha appena scritto. La precedenza e' un fatto gia'
+//!     persistito — chi ha SCRITTO la pagina — e la precedenza del servizio si
+//!     delega a `static_render::classifica_natura`.
 //!
 //! Le `route_after_*` NON sono qui: stanno nel PR 2b.
 
@@ -157,6 +166,7 @@ pub mod meta_reason;
 pub mod orchestration_reason;
 pub mod orchestration_sizing;
 pub mod origine_frontend;
+pub mod pagina_del_run;
 pub mod panel_quorum;
 pub mod severity;
 pub mod shell_command;

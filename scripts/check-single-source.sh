@@ -1500,17 +1500,80 @@ assert_single "resa-statica" 'fn classifica_resa' \
 assert_single "natura-app-dai-fatti" 'fn classifica_natura' \
   'crates/nexus-agent-graph/src/decisions/static_render.rs' crates
 
+# «Quale pagina di QUESTO run va misurata?» (2026-08-11, mig 0699)
+#
+# Domanda NUOVA e distinta da quella del rilevatore qui sotto. Nasce da due
+# forme dello stesso difetto: la pagina era risolta a t=0, quindi su un progetto
+# nuovo il criterio non nasceva (pagina rotta, run chiuso «task complete») e su
+# un progetto vivo misurava la pagina di IERI invece di quella prodotta (254.938
+# token su un ciclo che non poteva convergere). La precedenza e' un fatto gia'
+# persistito — chi ha SCRITTO la pagina — e la precedenza del servizio si delega
+# a `classifica_natura`, che la incarna gia'.
+assert_single "pagina-da-misurare" 'fn risolvi_pagina' \
+  'crates/nexus-agent-graph/src/decisions/pagina_del_run.rs' crates
+
+# ...e non torna a risolversi a t=0. `build_native_engine` gira PRIMA dei nodi e
+# dello stato iniziale: qualunque rilevamento dell'entry fatto li' guarda
+# l'albero com'era prima del lavoro. Il motore costruisce la CONFIGURAZIONE
+# della misura; la pagina la risolve chi verifica.
+if awk '
+  /^#\[cfg\(test\)\]/ { exit }
+  /^[[:space:]]*\/\// { next }
+  /detect_static_entry/ { trovato = 1; print "   riga " NR ": " $0 > "/dev/stderr" }
+  END { exit !trovato }
+' crates/mcp-core/src/native_engine.rs 2>&1; then
+  echo "!! pagina-da-misurare: il motore risolve di nuovo la pagina a t=0." >&2
+  echo "   A t=0 l'albero e' quello di PRIMA del lavoro: su un progetto nuovo" >&2
+  echo "   non c'e' pagina (criterio mai nato) e su uno vivo c'e' quella di" >&2
+  echo "   ieri (misurata al posto di quella prodotta). La risoluzione sta in" >&2
+  echo "   agent_graph_adapter::pagina_del_run, chiamata dal runner dei criteri." >&2
+  fail=1
+else
+  echo "OK pagina-da-misurare: il motore non risolve la pagina a t=0"
+fi
+
+# ...e il runner dei criteri del gate NASCE IN UN PUNTO SOLO.
+#
+# Il guard che copre il COMPORTAMENTO e' un test —
+# `il_runner_del_gate_nasce_legato_ai_fatti_del_run`, in mcp-core/src/native_engine.rs —
+# e attraversa il punto di produzione `criteria_runner_del_gate`, cioe' l'unico
+# posto in cui il gate riceve l'identita' del run (senza, il criterio della resa
+# torna a misurare la prima pagina che trova sull'albero). Resta un modo per
+# rendere quel test decorativo senza toccarlo: ricostruire l'adapter IN LINEA
+# dentro `build_native_engine`, dove nessun test arriva — ed e' esattamente lo
+# stato da cui questo lavoro e' partito. Percio' fuori dai test il costruttore si
+# nomina UNA volta sola: una seconda nascita e' un secondo runner che nessuno
+# prova. Cancellare del tutto la funzione non e' una scappatoia: il test la
+# chiama, e senza di lei non compila.
+nascite_runner=$(awk '
+  /^#\[cfg\(test\)\]/ { exit }
+  /^[[:space:]]*\/\// { next }
+  /FinalGateCriteriaRunnerAdapter::new/ { n++ }
+  END { print n + 0 }
+' crates/mcp-core/src/native_engine.rs)
+if [[ "$nascite_runner" -ne 1 ]]; then
+  echo "!! runner-del-gate-unico: il runner dei criteri nasce $nascite_runner volte" >&2
+  echo "   fuori dai test in crates/mcp-core/src/native_engine.rs (atteso: 1)." >&2
+  echo "   Delegare a criteria_runner_del_gate: e' il solo punto che lega il" >&2
+  echo "   gate ai fatti del run, ed e' il solo che un test possa attraversare." >&2
+  fail=1
+else
+  echo "OK runner-del-gate-unico: il runner dei criteri nasce in un punto solo"
+fi
+
 # Il guard che conta davvero: la pagina da guardare non si cerca due volte.
 #
 # `detect_static_entry` (mcp-core/src/static_preview.rs) e' gia' il punto unico
 # di «qual e' la pagina di questo progetto», e la usa il pannello Servizi per il
-# pulsante "Apri nel browser". Il gate DEVE guardare quella stessa pagina: una
-# seconda ricerca — foss'anche un solo `index.html` scritto a mano nel motore —
-# darebbe al criterio un bersaglio diverso da quello che l'utente apre, e il
-# verde varrebbe per un file che nessuno guarda. Si esaminano le sole righe di
-# CODICE (nei test il nome e' la fixture, e li' e' legittimo).
+# pulsante "Apri nel browser". Il gate DEVE delegare a quella stessa ricerca
+# (oggi come RIPIEGO, quando il run non ha scritto pagine): una seconda ricerca
+# — foss'anche un solo `index.html` scritto a mano — darebbe al criterio un
+# bersaglio diverso da quello che l'utente apre, e il verde varrebbe per un file
+# che nessuno guarda. Si esaminano le sole righe di CODICE (nei test il nome e'
+# la fixture, e li' e' legittimo).
 per_file_entry=0
 for f in crates/mcp-core/src/native_engine.rs \
+         crates/mcp-core/src/agent_graph_adapter/pagina_del_run.rs \
          crates/mcp-core/src/agent_graph_adapter/criteria_runner.rs; do
   [[ -f "$f" ]] || continue
   per_file_entry=$((per_file_entry + 1))

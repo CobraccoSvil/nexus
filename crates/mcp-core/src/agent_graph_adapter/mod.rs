@@ -69,6 +69,11 @@ pub mod review_panel;
 // --- misura del progresso fra un rimando in correzione e il successivo:
 //     MutationProgressPort (sopra `file_mutations`, hash del contenuto) ---
 pub mod mutation_progress;
+
+// --- «quale pagina va misurata alla chiusura di questo run?»: i FATTI del
+//     punto unico `decisions::pagina_del_run` (registro delle scritture +
+//     rilevatore dell'albero), raccolti quando il gate MISURA e non a t=0 ---
+pub mod pagina_del_run;
 pub mod llm_gateway;
 pub mod step_validation;
 pub mod tool_executor;
