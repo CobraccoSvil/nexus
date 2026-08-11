@@ -35,10 +35,18 @@ export interface SessionUsageWire {
   } | null;
 }
 
+/** Una riga di ripartizione come la manda il ledger: `model` e' l'ETICHETTA
+ *  intera che `usage_by_model_for_runs` compone, cioe' `provider/model`. */
+export interface RigaRipartizione {
+  model: string;
+  tokens: number;
+  costUsd: number;
+}
+
 export interface SessionUsage {
   totalTokens: number;
   totalCostUsd: number;
-  breakdown: Array<{ model: string; tokens: number; costUsd: number }>;
+  breakdown: RigaRipartizione[];
   /** Consumo del run richiesto e del lavoro che ha delegato. `null` se non
    *  richiesto o non pertinente — mai un oggetto a zeri: «non ho un perimetro»
    *  e «non e' costato nulla» sono due cose diverse (regola Q). */
@@ -51,9 +59,10 @@ export interface SessionUsage {
      *  manda il campo: «non me l'ha detto» e «non ha speso nulla» portano
      *  entrambi a non mostrare voci, ma nessuna delle due e' uno zero
      *  inventato — il totale accanto resta quello del ledger. */
-    breakdown: Array<{ model: string; tokens: number; costUsd: number }>;
+    breakdown: RigaRipartizione[];
   } | null;
 }
+
 
 /**
  * Traduzione del wire nei tipi del frontend.
@@ -87,7 +96,7 @@ export function sessionUsageDalWire(res: SessionUsageWire): SessionUsage {
  *  al primo campo rinominato, e lo farebbero su un solo perimetro. */
 function ripartizioneDalWire(
   righe: Array<{ model: string; tokens: number; cost_usd: number }> | undefined,
-): Array<{ model: string; tokens: number; costUsd: number }> {
+): RigaRipartizione[] {
   return (righe ?? []).map((b) => ({ model: b.model, tokens: b.tokens, costUsd: b.cost_usd }));
 }
 

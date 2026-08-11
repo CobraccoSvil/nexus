@@ -7,7 +7,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  bucketCost,
   costFromCatalog,
   findCatalogEntry,
   formatCostUsd,
@@ -97,49 +96,13 @@ test("cache maggiore del prompt: l'input residuo clampa a zero, mai un credito",
   assert.ok(Math.abs((c ?? 0) - 0.3) < 1e-9, `atteso 0.3 (1M a 0.3/M), ottenuto ${c}`);
 });
 
-test("bucketCost: modello non a catalogo vale zero, non fa sparire la voce", () => {
-  // Scelta locale al footer costo-per-provider, che qui e' incapsulata: in una
-  // RIPARTIZIONE una voce nascosta falserebbe le proporzioni delle altre, quindi
-  // il modello sconosciuto contribuisce zero e resta elencato. Diverso dal `null`
-  // di `costFromCatalog`, che per la cella singola e' la risposta onesta.
-  //
-  // MUTAZIONE che lo rende rosso: propagare il `null` invece dello zero.
-  const bucket = {
-    provider: "provider-mai-visto",
-    model: "modello-mai-visto",
-    inputTokens: 1_000_000,
-    outputTokens: 1_000_000,
-    cacheReadTokens: 0,
-    cacheCreationTokens: 0,
-  };
-  assert.equal(bucketCost(bucket, [entry()]), 0);
-  // Contro-prova sullo stesso bucket, col modello a catalogo: non e' lo zero di
-  // un calcolo che non gira, e' quello di un modello che non conosciamo.
-  const noto = { ...bucket, provider: "anthropic", model: "claude-sonnet-4-6" };
-  assert.equal(bucketCost(noto, [entry()]), 18.0);
-});
-
-test("bucketCost passa al calcolo le quantita' di cache del bucket", () => {
-  // E' il prezzatore che gira nel footer (`ActivityCostFooter` gli passa solo il
-  // catalogo di `/api/models`): se smette di inoltrare i due conteggi di cache, i
-  // token serviti dalla cache tornano a tariffa piena di input e il pannello
-  // dichiara piu' del ledger.
-  //
-  // MUTAZIONE che lo rende rosso: togliere `bucket.cacheReadTokens` e
-  // `bucket.cacheCreationTokens` dalla chiamata a `costFromCatalog` -> 3.0.
-  const c = bucketCost(
-    {
-      provider: "anthropic",
-      model: "claude-sonnet-4-6",
-      inputTokens: 1_000_000,
-      outputTokens: 0,
-      cacheReadTokens: 400_000,
-      cacheCreationTokens: 100_000,
-    },
-    [entry()],
-  );
-  assert.ok(Math.abs(c - (1.5 + 0.12 + 0.375)) < 1e-9, `atteso 1.995, ottenuto ${c}`);
-});
+// I due test di `bucketCost` sono usciti col prezzatore che coprivano
+// (10/08/2026): il footer costo-per-provider non prezza piu' i token aggregati
+// dalle trace, riceve il costo gia' calcolato dal ledger. Cio' che presidiavano
+// resta presidiato altrove — lo scorporo della cache dai test di
+// `costFromCatalog` qui sopra, e la scelta «una voce sconosciuta non sparisce»
+// non ha piu' oggetto, perche' le voci le elenca il ledger e non un catalogo che
+// puo' non conoscerle.
 
 test("traceCost scorpora la cache della trace e resta null fuori catalogo", () => {
   // Prezzatore del pannello trace inline. Stessa specie del bucket: se smette di

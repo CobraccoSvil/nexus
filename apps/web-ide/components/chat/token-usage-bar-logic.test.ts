@@ -24,6 +24,9 @@ const MISURATO: SessionUsageState = {
     totalTokens: 720_874,
     totalCostUsd: 0.1272,
     runCount: 1,
+    // La ripartizione viaggia col totale (stessa lettura, stesso elenco di run):
+    // e' quella che il footer del nastro mostra accanto a questi numeri.
+    breakdown: [{ model: "mistral/mistral-small-latest", tokens: 720_874, costUsd: 0.1272 }],
   },
 };
 

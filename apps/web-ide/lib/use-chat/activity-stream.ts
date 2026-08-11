@@ -1435,90 +1435,33 @@ export function capStreamToRecent(stream: ActivityStream, cap: number): CappedSt
   };
 }
 
-// ── Aggregazione costo-per-provider (regola G: prezzi dal catalogo) ──────────
-// Aggrega SOLO i token per provider/model dalle trace del run. Il PREZZO viene
-// applicato dal renderer col catalogo /api/models (useModelPricing di
-// provider-badge.tsx): qui NON esiste alcun prezzo hardcoded.
-
-export interface ProviderTokenBucket {
-  provider: string;
-  model: string;
-  /** Token di prompt LORDI: comprendono i due conteggi di cache qui sotto. */
-  inputTokens: number;
-  outputTokens: number;
-  /** Token serviti da cache: SOTTOINSIEME di `inputTokens`, con la sua tariffa.
-   *  Senza questo campo il bucket non lo portava affatto e chi prezzava pagava
-   *  tutto il prompt a tariffa piena di input. */
-  cacheReadTokens: number;
-  /** Token scritti in cache: stessa storia, tariffa ancora diversa. */
-  cacheCreationTokens: number;
-}
-
-/** Una voce della ripartizione: il bucket con il suo costo in USD. */
-export interface ProviderCostRow extends ProviderTokenBucket {
-  costUsd: number;
-}
-
-/** Ripartizione per provider di un run: le voci, i token e il costo totali. */
-export interface ProviderCostBreakdown {
-  voci: ProviderCostRow[];
-  totalTokens: number;
-  totalCostUsd: number;
-}
-
-/**
- * Ripartizione costo-per-provider di un insieme di trace: PUNTO UNICO (regola L)
- * di cio' che la barra dei costi dichiara.
- *
- * Il prezzo arriva come funzione perche' il listino non e' qui (regola G: viene
- * dal catalogo `/api/models`); quello che vive qui e' la COMPOSIZIONE — quali
- * voci esistono e come si sommano — cioe' esattamente cio' che il difetto del
- * 26/07/2026 sbagliava. Le trace da passare sono quelle di `tracesForRun`, che
- * include i sub-run: una barra composta sulle sole trace del run padre dichiara
- * una ripartizione e ne omette i provider usati solo dai figli.
- */
-export function providerCostBreakdown(
-  traces: AITraceEvent[],
-  prezzo: (bucket: ProviderTokenBucket) => number,
-): ProviderCostBreakdown {
-  const voci = aggregateTokensByProvider(traces).map((b) => ({ ...b, costUsd: prezzo(b) }));
-  return {
-    voci,
-    // `inputTokens` e' il prompt LORDO: i token di cache sono gia' dentro, e
-    // sommarli qui li conterebbe due volte.
-    totalTokens: voci.reduce((s, v) => s + v.inputTokens + v.outputTokens, 0),
-    totalCostUsd: voci.reduce((s, v) => s + v.costUsd, 0),
-  };
-}
-
-/** Somma i token per coppia provider/model dalle trace del run, tenendo il
- *  DETTAGLIO di cache separato dal prompt lordo (ha tariffe diverse). */
-export function aggregateTokensByProvider(traces: AITraceEvent[]): ProviderTokenBucket[] {
-  const map = new Map<string, ProviderTokenBucket>();
-  for (const t of traces) {
-    const key = `${t.provider}|${t.model}`;
-    const bucket = map.get(key) ?? {
-      provider: t.provider,
-      model: t.model,
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheReadTokens: 0,
-      cacheCreationTokens: 0,
-    };
-    bucket.inputTokens += t.inputTokens ?? 0;
-    bucket.outputTokens += t.outputTokens ?? 0;
-    bucket.cacheReadTokens += t.cacheReadTokens ?? 0;
-    bucket.cacheCreationTokens += t.cacheCreationTokens ?? 0;
-    map.set(key, bucket);
-  }
-  return Array.from(map.values());
-}
+// ── Come si NOMINA una voce della ripartizione costo-per-provider ───────────
+//
+// La ripartizione non si compone piu' qui. Le voci del footer vengono dal
+// LEDGER, dallo stesso perimetro e dalla stessa lettura del totale che le sta
+// sopra (`lib/use-chat/use-run-cost-logic.ts`): comporle dalle trace e
+// riprezzarle col catalogo faceva due fonti per due numeri letti insieme, e i
+// due non tornavano — MISURATO il 10/08/2026, l'elenco mostrava un provider che
+// nel ledger non aveva una sola riga e ne ometteva due che ne avevano 25.
+//
+// Di quella famiglia resta qui la sola parte che riguarda il NASTRO: l'etichetta
+// di una voce, che il footer usa e che un giorno potrebbe servire anche altrove
+// nel nastro. Il costo e la sua somma non sono piu' affare di questo modulo.
 
 /** Ultimo segmento di un id modello (`x-ai/grok-4.5` -> `grok-4.5`): il prefisso
  *  nomina l'autore del modello, che nella voce e' gia' implicito nel provider. */
 function nomeBreveModello(model: string): string {
   const i = model.lastIndexOf("/");
   return i >= 0 ? model.slice(i + 1) : model;
+}
+
+/** Il minimo che serve a nominare una voce di costo: chi l'ha servita e con
+ *  quale modello. Le voci arrivano dal ledger gia' sommate, e per l'etichetta
+ *  token e costo non contano — chiedere un bucket intero costringerebbe il
+ *  chiamante a inventare campi che qui nessuno legge. */
+export interface VoceNominabile {
+  provider: string;
+  model?: string;
 }
 
 /** Etichette delle voci di costo, una per voce e nello stesso ordine.
@@ -1534,7 +1477,7 @@ function nomeBreveModello(model: string): string {
  *  dove il provider da solo non basta, cosi' il caso comune resta corto in una
  *  barra che ha poco spazio. Un modello assente non produce etichetta piu'
  *  lunga di quella del provider: non avrebbe nulla da distinguere. */
-export function etichetteVociCosto(voci: readonly ProviderTokenBucket[]): string[] {
+export function etichetteVociCosto(voci: readonly VoceNominabile[]): string[] {
   const vociPerProvider = new Map<string, number>();
   for (const v of voci) vociPerProvider.set(v.provider, (vociPerProvider.get(v.provider) ?? 0) + 1);
   return voci.map((v) => {

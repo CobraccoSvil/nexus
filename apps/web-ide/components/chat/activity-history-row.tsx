@@ -28,6 +28,7 @@ import {
   type FoldThreshold,
 } from "../../lib/use-chat/activity-stream";
 import { useResolvedRunSteps } from "../../lib/use-chat/use-run-steps";
+import type { CurrentRunUsage } from "./token-usage-bar-logic";
 import type { MetaStepEntry } from "../../lib/use-chat/types";
 import type { AgentStep, AITraceEvent } from "../../lib/api/agent";
 
@@ -133,6 +134,8 @@ export function ActivityHistoryRow({
   metaSteps,
   steps,
   traces,
+  sessionId,
+  runCostNoto,
   foldThreshold,
   runStatus,
   query,
@@ -147,6 +150,11 @@ export function ActivityHistoryRow({
   steps: AgentStep[];
   /** Trace del SOLO run del turno (gia' filtrate dal parent). */
   traces: AITraceEvent[];
+  /** Sessione corrente: serve al footer costo per chiedere al ledger il
+   *  perimetro contabile di QUESTO turno (vedi ActivityCostFooter). */
+  sessionId?: string;
+  /** Il perimetro gia' letto dal contatore, se e' di questo turno. */
+  runCostNoto?: CurrentRunUsage | null;
   foldThreshold: FoldThreshold;
   runStatus?: string;
   /** Testo utente del turno (per il riepilogo compatto). */
@@ -315,7 +323,16 @@ export function ActivityHistoryRow({
       {expanded && !stream.empty && (
         <div style={{ borderTop: `1px solid ${tc.border}`, padding: "0 2px 4px", minWidth: 0 }}>
           <ActivityStreamView stream={stream} tc={tc} />
-          {traces.length > 0 && <ActivityCostFooter traces={traces} tc={tc} />}
+          {/* Il footer chiede il perimetro del turno al ledger, e lo fa solo
+              QUI: la riga e' collassata finche' nessuno la apre, quindi la
+              lettura la governa il click e non la lunghezza della cronologia
+              (stesso patto del lazy-fetch degli step, qui sopra). */}
+          <ActivityCostFooter
+            runId={runId}
+            sessionId={sessionId}
+            ripartizioneNota={runCostNoto}
+            tc={tc}
+          />
         </div>
       )}
     </div>

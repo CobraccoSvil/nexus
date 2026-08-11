@@ -1262,6 +1262,11 @@ export function ChatPanel({
             metaStepsMap={metaStepsMap}
             agentStepsMap={agentStepsMap}
             traces={traces}
+            sessionId={sessionId}
+            // Il perimetro del run che il contatore sta gia' rileggendo: il
+            // footer del nastro lo riusa per il turno a cui appartiene, invece
+            // di richiedere al ledger un numero che e' gia' qui e piu' fresco.
+            runCostNoto={tokenUsage.stato === "noto" ? tokenUsage.run : null}
             activityStreamEnabled={activityStreamEnabled}
             foldThreshold={foldThreshold}
             nextActions={(!agentRun && metaStepsMap.size > 0) ? (() => {
