@@ -5287,6 +5287,11 @@ pub(crate) async fn spawn_agent_run(
                 let native_input = crate::native_engine::NativeRunInput {
                     run_id,
                     session_id: session_id_cp,
+                    // Il run principale deve produrre il LAVORO: e' suo il compito
+                    // dell'utente, e decomporlo e delegarlo e' il suo mestiere.
+                    // Il vincolo riguarda le figure convocate per dare un parere.
+                    prodotto_del_run:
+                        nexus_agent_graph::decisions::prodotto_del_run::ProdottoDelRun::Lavoro,
                     provider: provider_clone.clone(),
                     model: model_clone.clone(),
                     provider_pin: provider_pin_clone.clone(),
@@ -5607,6 +5612,12 @@ pub(crate) async fn confirm_native_run(
     let input = crate::native_engine::NativeRunInput {
         run_id,
         session_id,
+        // RESUME: qui il campo non e' l'autorita'. `RunMode::Resume` non chiama
+        // `build_initial_state` — carica il checkpoint — quindi il prodotto del run
+        // e' quello che il run aveva dichiarato quando e' partito, e riprenderlo
+        // non lo cambia. `Lavoro` e' la dichiarazione onesta per questo percorso,
+        // che riprende un run PRINCIPALE.
+        prodotto_del_run: nexus_agent_graph::decisions::prodotto_del_run::ProdottoDelRun::Lavoro,
         provider: provider.clone(),
         model: model.clone(),
         // Nessun vincolo: qui non c'e' una richiesta utente in corso da cui un
@@ -6014,6 +6025,8 @@ pub(crate) async fn resume_fanin(
     let input = crate::native_engine::NativeRunInput {
         run_id: parent_run_id,
         session_id,
+        // Come sopra: resume di un run principale, il checkpoint e' l'autorita'.
+        prodotto_del_run: nexus_agent_graph::decisions::prodotto_del_run::ProdottoDelRun::Lavoro,
         provider,
         model,
         // Come sopra: nessuna richiesta in corso, nessun vincolo.

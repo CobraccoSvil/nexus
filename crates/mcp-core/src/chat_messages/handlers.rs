@@ -1318,6 +1318,11 @@ async fn try_resume_interrupted_run(
         let native_input = crate::native_engine::NativeRunInput {
             run_id: new_run_id,
             session_id: session_id_r,
+            // Resume di un run principale: il prodotto e' il lavoro, e per il ramo
+            // `RunMode::Resume` l'autorita' resta comunque il checkpoint (nessun
+            // `build_initial_state`).
+            prodotto_del_run:
+                nexus_agent_graph::decisions::prodotto_del_run::ProdottoDelRun::Lavoro,
             provider: provider_r.clone(),
             model: model_r.clone(),
             // Resume: il pin vale per la richiesta in cui l'utente lo da', e

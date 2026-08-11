@@ -3336,6 +3336,90 @@ else
   echo "OK firma-di-esito: il nome del tool viene dal punto unico"
 fi
 
+# ── prodotto-del-run (2026-08-10) ───────────────────────────────────────────
+# «Che cosa deve produrre questo run — il lavoro, o un parere?» ha UN punto
+# unico, e da esso discende se il run possa decomporre il compito e delegarlo.
+# Il difetto che ha chiuso: su `batteria-todo-app` il compito e' stato
+# pianificato DICIOTTO volte da diciotto dispatcher, undici dei quali figure
+# advisory, per 99 sub-run `implement` e tre alberi paralleli. Il contratto
+# advisory era enforced sulle sole MANI della figura (nessun tool mutatore in
+# whitelist) e non sulla DELEGA, che non passa da un tool: TodoRunnerNode chiama
+# `dispatch_subagents` come nodo del grafo.
+assert_single "prodotto-del-run" 'pub fn decompone_e_delega' \
+  'crates/nexus-agent-graph/src/decisions/prodotto_del_run.rs' crates
+
+# Il criterio non torna a nascere dal KIND o dalla PROFONDITA': un kind nuovo
+# domani non sarebbe in nessun elenco, e una figura advisory e una che lavora
+# possono stare allo stesso livello di annidamento. La derivazione autorizzata
+# e' UNA, dal contratto della figura (`is_advisory_kind` sulla whitelist), e vive
+# in `subagent_native::prodotto_del_run`.
+# Il taglio ai soli file di PRODUZIONE non basta: le occorrenze legittime stanno
+# dentro i `mod tests` degli stessi file, e una riga non dichiara da sola di
+# essere in un blocco di test. Si guarda percio' solo cio' che PRECEDE il primo
+# `#[cfg(test)]` di ciascun file, com'e' gia' fatto per il vocabolario di
+# step_reach: un test che costruisce il caso `Parere` e' proprio la prova che il
+# criterio funziona, e un guard che lo vietasse impedirebbe di scriverla.
+derivazione=""
+for f in $(grep -rlE 'ProdottoDelRun::Parere' crates --include=*.rs \
+             | grep -vE 'decisions/prodotto_del_run\.rs' \
+             | grep -vE 'crates/mcp-core/src/agent_tools/subagent_native\.rs'); do
+  inizio=$(grep -n '#\[cfg(test)\]' "$f" | head -1 | cut -d: -f1)
+  [[ -z "$inizio" ]] && inizio=999999999
+  trovate=$(grep -nE 'ProdottoDelRun::Parere' "$f" \
+    | grep -vE '^[0-9]+: *(//|/\*|\*|///)' \
+    | awk -v inizio="$inizio" -F: '$1 < inizio' \
+    | sed "s|^|$f:|" || true)
+  [[ -n "$trovate" ]] && derivazione="$derivazione$trovate"$'\n'
+done
+derivazione=$(printf '%s' "$derivazione" | grep . || true)
+if [[ -n "$derivazione" ]]; then
+  echo "!! prodotto-del-run: un secondo punto decide che un run da' pareri." >&2
+  echo "   La derivazione autorizzata e' subagent_native::prodotto_del_run, dal" >&2
+  echo "   CONTRATTO della figura (is_advisory_kind). Dedurlo dal kind o dalla" >&2
+  echo "   profondita' e' l'elenco di nomi che la regola L rifiuta:" >&2
+  echo "$derivazione" >&2
+  fail=1
+else
+  echo "OK prodotto-del-run: il prodotto nasce dal contratto della figura"
+fi
+
+# La precondizione nel PlannerNode non si rimuove lasciando il solo controllo
+# dentro `is_eligible`: il gate orchestrazione, quando `orchestration_enabled` e'
+# acceso, SCAVALCA l'euristica con una decisione LLM esplicita
+# (`orchestration_on_planphase_scavalca_is_eligible_false`). Oggi quel flag e'
+# spento, quindi un criterio che vivesse solo in `is_eligible` non sarebbe un
+# difetto attivo: sarebbe ARMATO, e scatterebbe all'accensione del flag.
+if ! grep -qE 'decompone_e_delega' crates/nexus-agent-graph/src/nodes/planner.rs; then
+  echo "!! prodotto-del-run: il PlannerNode non interroga piu' il criterio." >&2
+  echo "   Serve in DUE punti dello stesso file e non e' una ridondanza:" >&2
+  echo "   il cancello di is_eligible (edge understanding->planner) e la" >&2
+  echo "   precondizione di run(), che il gate LLM non puo' scavalcare." >&2
+  fail=1
+else
+  echo "OK prodotto-del-run: il planner interroga il criterio (edge + nodo)"
+fi
+
+# ── marker-di-debito-maiuscolo (2026-08-10) ─────────────────────────────────
+# «Questa riga e' un marker di debito?» aveva DUE risposte in disaccordo:
+# `markers-ratchet.sh` la pone case-SENSITIVE (`DEBT_RE`, nessun `-i`) e conta i
+# marker veri; `mcp-quality::RE_TODO_MARKER` la poneva con `(?i)` e contava anche
+# la prosa. MISURATO il 10/08/2026 su `crates/`: 652 corrispondenze
+# case-insensitive, di cui solo 136 in maiuscolo — il 79% era prosa, e in questo
+# repo `todo` e' vocabolario di dominio (`nexus_todo_write`, `todo_runner`,
+# `TodoRunnerNode`). Riallineare ha portato la baseline da 7683 a 7359.
+if grep -nE 'RE_TODO_MARKER' -A 2 crates/mcp-quality/src/lib.rs \
+   | grep -qE 'Regex::new\(r"\(\?i\)'; then
+  echo "!! marker-di-debito-maiuscolo: RE_TODO_MARKER e' tornato case-insensitive." >&2
+  echo "   Con (?i) ogni prosa che nomina una lista di attivita' viene contata" >&2
+  echo "   come debito: 516 falsi positivi su 652 in crates/, e la" >&2
+  echo "   documentazione tecnica alimenta la metrica che dovrebbe misurarla." >&2
+  echo "   Il gemello markers-ratchet.sh (DEBT_RE) e' case-sensitive: qui" >&2
+  echo "   la stessa domanda deve avere la stessa risposta (regola L)." >&2
+  fail=1
+else
+  echo "OK marker-di-debito-maiuscolo: il marker e' maiuscolo, la prosa non e' debito"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

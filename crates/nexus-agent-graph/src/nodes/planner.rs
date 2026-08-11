@@ -15,10 +15,14 @@
 //! ## Cosa porta QUESTO PR (deterministico + rami ON di default, golden 1:1)
 //!
 //! - **`is_eligible`** (`orchestrator_config.py:410-428`,
-//!   [`PlannerConfig::is_eligible`]): i 4 gate (plan_phase_enabled AND
-//!   behavior_mode in plan_behavior_modes AND intent in plan_intents AND
-//!   token_budget >= plan_min_token_budget), confronto case-insensitive. false ->
-//!   pass-through (`{plan_phase_active:false}`).
+//!   [`PlannerConfig::is_eligible`]): i 4 gate di parita' col Python
+//!   (plan_phase_enabled AND behavior_mode in plan_behavior_modes AND intent in
+//!   plan_intents AND token_budget >= plan_min_token_budget), confronto
+//!   case-insensitive, PIU' un quinto che il brain non ha: il PRODOTTO del run
+//!   ([`crate::decisions::prodotto_del_run`]). I primi quattro chiedono «questo
+//!   compito merita un piano?», il quinto «pianificare e delegare e' il mestiere
+//!   di questo run?» — una figura convocata per dare un parere non decompone e
+//!   non delega. false -> pass-through (`{plan_phase_active:false}`).
 //! - **Riuso piano intent/mode-aware** (`:84-113`, [`PlannerNode::plan_reuse`]):
 //!   se `fetch_plan(run_id)` esiste, INVALIDA solo se `plan_intent != intent`
 //!   (non-None) o `plan_mode != behavior_mode` (non-None) -> rigenera; altrimenti
@@ -100,6 +104,7 @@ use nexus_graph::StateDelta as OpaqueDelta;
 
 use crate::decisions::context_reduction as ctxr;
 use crate::decisions::orchestration_reason::build_orchestration_context;
+use crate::decisions::prodotto_del_run::ProdottoDelRun;
 use crate::decisions::turn_focus::build_turn_focus_directive;
 use crate::runtime::ports::{
     Coordination, LlmMessage, LlmRequest, OrchPhase, OrchestrationMove, PlanRow, SubTask,
@@ -228,49 +233,71 @@ impl Default for PlannerConfig {
     }
 }
 
+/// «Questo valore supera il gate della sua lista di ammessi?»
+///
+/// Parita' falsy col Python (`if x and x.lower() not in [...]`): `None` e stringa
+/// VUOTA passano — non applicano il gate — e il confronto e' case-insensitive.
+///
+/// Estratta perche' `behavior_mode` e `intent` pongono la STESSA domanda su liste
+/// diverse (regola L): due copie divergerebbero al primo ritocco della semantica
+/// falsy, ed e' esattamente il punto in cui la parita' col brain si romperebbe in
+/// silenzio, perche' un gate che smette di applicarsi non fallisce — passa.
+fn valore_nella_lista(valore: Option<&str>, ammessi: &[String]) -> bool {
+    match valore {
+        // Assente o VUOTO sono lo stesso caso — entrambi falsy in Python — e
+        // stanno in un braccio solo perche' e' cosi' che si leggono: non «manca»
+        // piu' «e' vuoto», ma «non c'e' un valore su cui applicare il gate».
+        None | Some("") => true,
+        Some(v) => {
+            let v = v.to_lowercase();
+            ammessi.iter().any(|a| a.to_lowercase() == v)
+        }
+    }
+}
+
 impl PlannerConfig {
-    /// `is_eligible` (`orchestrator_config.py:410-428`): il run corrente puo'
-    /// attivare il planner? I 4 gate (in AND), confronto CASE-INSENSITIVE su
-    /// behavior_mode e intent. PURA: nessuna lettura DB (la config e' gia' qui).
+    /// I QUATTRO cancelli di parita' col brain (`orchestrator_config.py:410-428`):
+    /// «questo COMPITO merita un piano?». In AND, PURA (nessuna lettura DB).
     ///
-    /// Parita' falsy col Python: `if behavior_mode and ...` -> un behavior_mode
-    /// `None`/vuoto NON applica il gate del mode (passa); idem per `intent`. Il
-    /// gate budget usa `int(token_budget or 0)` (gia' i64 qui).
-    pub fn is_eligible(
+    /// Separata da [`Self::is_eligible`] perche' risponde a una domanda diversa da
+    /// quella del quinto cancello: qui si guarda il compito (modo, intento,
+    /// budget), li' CHI lo esegue. Tenerle in un corpo solo le faceva sembrare
+    /// cinque condizioni omogenee, e alla prossima aggiunta non si sarebbe piu'
+    /// visto quali appartengono alla parita' col Python e quali no.
+    fn compito_merita_un_piano(
         &self,
         behavior_mode: Option<&str>,
         intent: Option<&str>,
         token_budget: i64,
     ) -> bool {
-        if !self.plan_phase_enabled {
-            return false;
-        }
-        // `if behavior_mode and behavior_mode.lower() not in [...]`: stringa vuota
-        // = falsy (salta il gate), come `None`.
-        if let Some(bm) = behavior_mode {
-            if !bm.is_empty() {
-                let bm_l = bm.to_lowercase();
-                if !self
-                    .plan_behavior_modes
-                    .iter()
-                    .any(|m| m.to_lowercase() == bm_l)
-                {
-                    return false;
-                }
-            }
-        }
-        if let Some(it) = intent {
-            if !it.is_empty() {
-                let it_l = it.to_lowercase();
-                if !self.plan_intents.iter().any(|i| i.to_lowercase() == it_l) {
-                    return false;
-                }
-            }
-        }
-        if token_budget < self.plan_min_token_budget {
-            return false;
-        }
-        true
+        self.plan_phase_enabled
+            && valore_nella_lista(behavior_mode, &self.plan_behavior_modes)
+            && valore_nella_lista(intent, &self.plan_intents)
+            && token_budget >= self.plan_min_token_budget
+    }
+
+    /// Il run corrente puo' attivare il planner, cioe' decomporre il compito e
+    /// delegarne i passi?
+    ///
+    /// Due domande in AND, e l'ordine dichiara quale viene prima: il PRODOTTO del
+    /// run (`decompone_e_delega`: «pianificare e delegare e' il mio mestiere?») e
+    /// poi il compito ([`Self::compito_merita_un_piano`]: i quattro cancelli di
+    /// parita' col brain).
+    ///
+    /// `prodotto` e' un PARAMETRO e non un campo della config perche' la config e'
+    /// letta una volta dal DB e condivisa da tutti i run, mentre il prodotto e' un
+    /// fatto del singolo run: chiederlo nella firma rende impossibile a un call
+    /// site futuro dimenticarsene. Il criterio lo dichiara
+    /// [`ProdottoDelRun::decompone_e_delega`] e qui non si riscrive (regola L).
+    pub fn is_eligible(
+        &self,
+        behavior_mode: Option<&str>,
+        intent: Option<&str>,
+        token_budget: i64,
+        prodotto: ProdottoDelRun,
+    ) -> bool {
+        prodotto.decompone_e_delega()
+            && self.compito_merita_un_piano(behavior_mode, intent, token_budget)
     }
 }
 
@@ -1330,6 +1357,27 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
         let behavior_mode = state.behavior_mode.as_deref();
         let intent = state.user_intent.as_deref();
         let token_budget = state.token_budget.unwrap_or(0);
+        let prodotto = state.prodotto_del_run.unwrap_or_default();
+
+        // ── PRECONDIZIONE: il prodotto di questo run ammette la delega? ────────
+        // Precede il gate orchestrazione, e non e' una ridondanza di `is_eligible`:
+        // quel gate, quando `orchestration_enabled` e' acceso, SCAVALCA
+        // l'euristica con una decisione LLM esplicita
+        // (`orchestration_on_planphase_scavalca_is_eligible_false`), quindi un
+        // criterio che vivesse solo dentro `is_eligible` sarebbe scavalcabile
+        // proprio dal ramo che oggi e' spento — un difetto armato che scatta il
+        // giorno in cui si accende quel flag, non un difetto attivo. Il criterio e'
+        // lo stesso punto unico che `is_eligible` interroga: qui si applica prima,
+        // cosi' al reasoner non si chiede nemmeno di decidere su una figura che
+        // non puo' delegare (e non se ne paga la chiamata).
+        if !prodotto.decompone_e_delega() {
+            tracing::debug!(
+                target: "nexus_agent_graph::planner",
+                prodotto = ?prodotto,
+                "planner: skip (il prodotto di questo run e' un parere, non delega)"
+            );
+            return Ok(Self::skip(prodotto.motivo_dello_skip()));
+        }
 
         // ── GATE ORCHESTRAZIONE LLM-driven (Fase 1) prima di is_eligible ───────
         // Regola L: l'euristica `is_eligible` resta il PUNTO UNICO dell'ingresso
@@ -1358,7 +1406,10 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
                 true
             }
             // Il gate non decide: euristica esistente (planner_node.py:64-74).
-            PlanGateOutcome::Heuristic => self.cfg.is_eligible(behavior_mode, intent, token_budget),
+            PlanGateOutcome::Heuristic => {
+                self.cfg
+                    .is_eligible(behavior_mode, intent, token_budget, prodotto)
+            }
         };
         if !enter_plan_phase {
             tracing::debug!(
@@ -2131,25 +2182,48 @@ mod tests {
     #[test]
     fn is_eligible_gates() {
         let cfg = cfg_active();
+        let lavoro = ProdottoDelRun::Lavoro;
         // Eleggibile: tutto a posto. `Bilanciata`/`CODE` in mixed-case verificano
         // il match case-insensitive contro il default plan_behavior_modes
         // (`bilanciata`/`approfondita`) e plan_intents (`code`/...).
         assert!(
-            cfg.is_eligible(Some("Bilanciata"), Some("CODE"), 8000),
+            cfg.is_eligible(Some("Bilanciata"), Some("CODE"), 8000, lavoro),
             "case-insensitive"
         );
         // plan_phase OFF -> mai eleggibile.
         let off = PlannerConfig::default();
-        assert!(!off.is_eligible(Some("bilanciata"), Some("code"), 8000));
+        assert!(!off.is_eligible(Some("bilanciata"), Some("code"), 8000, lavoro));
         // behavior_mode fuori lista.
-        assert!(!cfg.is_eligible(Some("confirm"), Some("code"), 8000));
+        assert!(!cfg.is_eligible(Some("confirm"), Some("code"), 8000, lavoro));
         // intent fuori lista.
-        assert!(!cfg.is_eligible(Some("bilanciata"), Some("chat"), 8000));
+        assert!(!cfg.is_eligible(Some("bilanciata"), Some("chat"), 8000, lavoro));
         // budget sotto soglia.
-        assert!(!cfg.is_eligible(Some("bilanciata"), Some("code"), 100));
+        assert!(!cfg.is_eligible(Some("bilanciata"), Some("code"), 100, lavoro));
         // behavior_mode None/"" salta il gate del mode (parita' falsy Python).
-        assert!(cfg.is_eligible(None, Some("code"), 8000));
-        assert!(cfg.is_eligible(Some(""), Some("code"), 8000));
+        assert!(cfg.is_eligible(None, Some("code"), 8000, lavoro));
+        assert!(cfg.is_eligible(Some(""), Some("code"), 8000, lavoro));
+    }
+
+    /// Il quinto cancello: con TUTTI gli altri quattro soddisfatti — cioe' nella
+    /// configurazione reale di produzione del 10/08/2026, dove
+    /// `plan_phase_enabled=true` e `plan_intents` comprende perfino
+    /// `agentic_default` — una figura il cui prodotto e' un PARERE non entra
+    /// nella plan-phase.
+    ///
+    /// MUTAZIONE: togliere il controllo su `prodotto` da `is_eligible` fa
+    /// rosseggiare la seconda asserzione col valore del difetto reale (true:
+    /// eleggibile), che e' come undici figure advisory sono diventate dispatcher.
+    #[test]
+    fn una_figura_che_da_pareri_non_entra_nella_plan_phase() {
+        let cfg = cfg_active();
+        assert!(
+            cfg.is_eligible(Some("bilanciata"), Some("code"), 8000, ProdottoDelRun::Lavoro),
+            "chi produce il lavoro pianifica come prima: il gate non cambia per lui"
+        );
+        assert!(
+            !cfg.is_eligible(Some("bilanciata"), Some("code"), 8000, ProdottoDelRun::Parere),
+            "il parere non decompone: gli altri quattro cancelli erano tutti aperti"
+        );
     }
 
     /// La COLLA della sospensione per approvazione del piano: col gate acceso,
@@ -2345,6 +2419,66 @@ mod tests {
         assert_eq!(*spy.orchestrate_calls.lock().unwrap(), 1);
         // Il gate ha scavalcato is_eligible=false -> plan-phase attiva.
         assert_eq!(out.plan_phase_active, Some(true));
+    }
+
+    /// Lo stesso scenario del test qui sopra — flag ON, reasoner che decide
+    /// esplicitamente `PlanPhase`, cioe' l'unico ramo capace di scavalcare
+    /// `is_eligible` — ma su un run il cui prodotto e' un PARERE: la plan-phase
+    /// NON si apre, e al reasoner non si chiede nemmeno di decidere.
+    ///
+    /// E' la ragione per cui il criterio non vive solo dentro `is_eligible`:
+    /// li' sarebbe scavalcabile da questo ramo. Oggi `orchestration_enabled` e'
+    /// spento in produzione, quindi senza questa precondizione il difetto non
+    /// sarebbe attivo — sarebbe ARMATO, e scatterebbe il giorno in cui si accende
+    /// quel flag, che e' la forma di difetto piu' costosa da diagnosticare.
+    ///
+    /// MUTAZIONE: rimuovere il `return` sulla precondizione in `PlannerNode::run`
+    /// fa rosseggiare `plan_phase_active` con `Some(true)` E il conteggio delle
+    /// chiamate al reasoner con 1 — le due meta' del difetto, la delega riaperta e
+    /// la chiamata LLM pagata per una figura che non puo' delegare.
+    #[tokio::test]
+    async fn il_parere_non_e_scavalcabile_dal_gate_orchestrazione() {
+        let spy = Arc::new(SpyReasoner::new(Some(OrchestrationMove::PlanPhase {
+            decompose: false,
+        })));
+        let store = Arc::new(StubTodoStore::with_todos(vec![]));
+        // Config al MASSIMO del permissivo: plan-phase accesa E gate LLM acceso.
+        let mut cfg = cfg_active();
+        cfg.orchestration_enabled = true;
+        let node = node_with_reasoner(cfg, store, spy.clone());
+        // LO STESSO ctx del test qui sopra, non `gate_ctx()`: serve un LLM che
+        // emetta davvero `nexus_todo_write`, altrimenti togliendo la precondizione
+        // la plan-phase si chiuderebbe da se' con `no_tool_use_emitted` e il test
+        // resterebbe verde per il motivo sbagliato (regola O: la mutazione deve
+        // produrre il valore del difetto REALE, cioe' la plan-phase APERTA).
+        let ctx = ctx_with(
+            Arc::new(ScriptedLlm::always_tool(
+                "nexus_todo_write",
+                json!({"action": "create", "todos": [{"content": "step 1"}]}),
+            )),
+            Arc::new(ScriptedTools::ok(r#"{"ok":true}"#)),
+        );
+        // Stato per il resto ELEGGIBILE: cambia solo il prodotto del run.
+        let mut st = eligible_state();
+        st.prodotto_del_run = Some(ProdottoDelRun::Parere);
+
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+
+        assert_eq!(
+            out.plan_phase_active,
+            Some(false),
+            "una figura advisory non entra nella plan-phase nemmeno col gate LLM che la vuole"
+        );
+        assert_eq!(
+            *spy.orchestrate_calls.lock().unwrap(),
+            0,
+            "al reasoner non si chiede di decidere su chi non puo' delegare (ne' si paga)"
+        );
+        assert_eq!(
+            out.plan_phase_skip_reason.as_deref(),
+            Some("skip_advisory_product"),
+            "lo skip dichiara il proprio motivo: senza, non si distingue da un passaggio non avvenuto"
+        );
     }
 
     #[tokio::test]
@@ -3211,6 +3345,7 @@ mod golden {
     use serde::Deserialize;
     use serde_json::{json, Value};
 
+    use super::ProdottoDelRun;
     use super::{
         build_tool_input, clarifying_branch, parse_tool_result, plan_reuse_decision, tool_catalog,
         ClarifyingBranch, PlanReuse, PlannerConfig, PlannerNode, ToolResultOutcome,
@@ -3337,7 +3472,18 @@ mod golden {
                         .get("token_budget")
                         .and_then(Value::as_i64)
                         .unwrap_or(0);
-                    json!(cfg.is_eligible(bm.as_deref(), it.as_deref(), tb))
+                    // `Lavoro` e' l'unico valore che conserva la PARITA' col brain
+                    // Python, che ha i soli quattro cancelli storici: il quinto
+                    // nasce qui e i casi golden non lo conoscono. Passare il
+                    // default significa chiedere al golden esattamente cio' che
+                    // sa rispondere; il quinto cancello ha la sua prova sopra
+                    // (`una_figura_che_da_pareri_non_entra_nella_plan_phase`).
+                    json!(cfg.is_eligible(
+                        bm.as_deref(),
+                        it.as_deref(),
+                        tb,
+                        ProdottoDelRun::Lavoro
+                    ))
                 }
                 "plan_reuse" => {
                     // existing: null | {user_intent?, behavior_mode?}
