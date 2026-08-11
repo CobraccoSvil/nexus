@@ -516,6 +516,92 @@ pub fn derive_criterion(
     text: &str,
     declared_direction: Option<Direction>,
 ) -> Result<RequirementCriterion, Unverifiable> {
+    derive_criterion_da(text, declared_direction, None, None)
+}
+
+/// Come [`derive_criterion`], ma con FILE e LETTERALE eventualmente DICHIARATI
+/// alla fonte (campi strutturati di `advisory_verdict.requirements[]`).
+///
+/// PERCHE' ESISTE. Il criterio spremeva entrambi dalla PROSA — un path fra
+/// backtick o riconoscibile a occhio, un letterale fra backtick — e la prosa
+/// quei due elementi non li contiene quasi mai. MISURATO l'11/08/2026 sul primo
+/// run in cui il riscontro ha davvero girato: **13 requisiti emessi dal
+/// Consiglio, ZERO verificabili**, con motivi che sono la fotografia del
+/// difetto — «non nomina un file su cui controllare», «non porta un testo
+/// preciso da cercare nel file». Il verificatore funzionava: era il requisito a
+/// nascere non verificabile.
+///
+/// Chiedere alla figura di scrivere meglio la frase e' una speranza; chiedere
+/// DUE CAMPI e' un contratto. E' la stessa correzione gia' fatta per
+/// `direction` (il campo strutturato vince sull'euristica sui verbi), estesa
+/// agli altri due elementi della domanda.
+///
+/// L'estrazione dal testo RESTA come ripiego: i requisiti storici e i produttori
+/// che non valorizzano i campi continuano a essere trattati come prima, quindi
+/// nessun requisito che oggi si verifica smette di verificarsi.
+/// Il criterio dai soli CAMPI dichiarati: `None` se non ci sono (e allora
+/// decide la prosa), `Some(esito)` se ci sono — anche quando l'esito e' un
+/// rifiuto, perche' un path dichiarato fuori dal progetto non deve poi essere
+/// ripescato dal testo.
+///
+/// Un campo dichiarato ma VUOTO non e' una dichiarazione: cade sul ripiego
+/// invece di produrre un criterio che cerca la stringa vuota — che qualunque
+/// file soddisfa, cioe' un requisito sempre verde. E' il modo in cui questo fix
+/// si trasformerebbe nel suo contrario.
+fn criterio_dai_campi(
+    text: &str,
+    declared_direction: Option<Direction>,
+    declared_path: Option<&str>,
+    declared_literal: Option<&str>,
+) -> Option<Result<RequirementCriterion, Unverifiable>> {
+    fn dichiarato(v: Option<&str>) -> Option<&str> {
+        v.map(str::trim).filter(|s| !s.is_empty())
+    }
+    let path = dichiarato(declared_path)?;
+    let literal = dichiarato(declared_literal)?;
+    if !path_dentro_progetto(path) {
+        return Some(Err(Unverifiable::PathFuoriProgetto));
+    }
+    let Some(direction) = declared_direction.or_else(|| direzione(text)) else {
+        return Some(Err(Unverifiable::DirezioneAssente));
+    };
+    Some(Ok(RequirementCriterion {
+        path: path.to_string(),
+        literal: literal.to_string(),
+        direction,
+    }))
+}
+
+/// Come [`derive_criterion`], ma con FILE e LETTERALE eventualmente DICHIARATI
+/// alla fonte (campi strutturati di `advisory_verdict.requirements[]`).
+///
+/// PERCHE' ESISTE. Il criterio spremeva entrambi dalla PROSA, e la prosa quei
+/// due elementi non li contiene quasi mai. MISURATO l'11/08/2026 sul primo run
+/// in cui il riscontro ha davvero girato: 13 requisiti emessi dal Consiglio,
+/// ZERO verificabili, coi motivi che sono la fotografia del difetto — «non
+/// nomina un file su cui controllare», «non porta un testo preciso da cercare
+/// nel file». Il verificatore funzionava: era il requisito a nascere non
+/// verificabile.
+///
+/// Chiedere alla figura di scrivere meglio la frase e' una speranza; chiedere
+/// due CAMPI e' un contratto. E' la stessa correzione gia' adottata per
+/// `direction` (il campo strutturato vince sull'euristica sui verbi), estesa
+/// agli altri due elementi della domanda. L'estrazione dal testo RESTA come
+/// ripiego, quindi nessun requisito che oggi si verifica smette di verificarsi.
+pub fn derive_criterion_da(
+    text: &str,
+    declared_direction: Option<Direction>,
+    declared_path: Option<&str>,
+    declared_literal: Option<&str>,
+) -> Result<RequirementCriterion, Unverifiable> {
+    // Un campo dichiarato ma VUOTO non e' una dichiarazione: cade sul ripiego,
+    // invece di produrre un criterio che cerca la stringa vuota (che qualunque
+    // file soddisfa, cioe' un requisito sempre verde).
+    if let Some(esito) =
+        criterio_dai_campi(text, declared_direction, declared_path, declared_literal)
+    {
+        return esito;
+    }
     let backticked = estrai_backtick(text);
     // I path si cercano PRIMA fra i letterali in backtick (e' li' che una figura
     // scrive un percorso), poi nel testo nudo: "Modificare vite.config.js per
@@ -1266,6 +1352,68 @@ mod tests {
         let report = compose_conformance(&[], |_| panic!("niente da leggere"));
         assert!(report.nota().is_none());
         assert_eq!(report.to_value()["total"], 0);
+    }
+
+    /// IL DIFETTO MISURATO l'11/08/2026: 13 requisiti emessi dal Consiglio, ZERO
+    /// verificabili. Questo e' uno di quelli veri, parola per parola — prosa
+    /// impeccabile che non nomina un file ne' un testo da cercare.
+    ///
+    /// Coi campi DICHIARATI lo stesso requisito diventa una domanda meccanica.
+    /// MUTAZIONE: ignorare `declared_path`/`declared_literal` (cioe' tornare a
+    /// spremere la prosa) rende rossa la seconda meta' e riporta il caso a
+    /// `NessunFile`, che e' il valore del difetto reale.
+    #[test]
+    fn i_campi_dichiarati_rendono_verificabile_cio_che_la_prosa_non_dice() {
+        let requisito = "La griglia deve essere responsive e ogni scheda prodotto \
+                         deve mostrare nome, prezzo e descrizione.";
+
+        // Come nasce oggi dal Consiglio: non verificabile, e il motivo lo dice.
+        assert_eq!(
+            derive_criterion(requisito, None),
+            Err(Unverifiable::NessunFile),
+            "e' il caso reale: prosa senza file ne' letterale"
+        );
+
+        // Con i due campi dichiarati alla fonte diventa una domanda al file.
+        let c = derive_criterion_da(
+            requisito,
+            Some(Direction::DevePresenziare),
+            Some("galleria.html"),
+            Some("class=\"product-card\""),
+        )
+        .expect("coi campi dichiarati il criterio nasce");
+        assert_eq!(c.path, "galleria.html");
+        assert_eq!(c.literal, "class=\"product-card\"");
+        assert_eq!(c.direction, Direction::DevePresenziare);
+    }
+
+    /// Un campo dichiarato ma VUOTO non e' una dichiarazione: cade sul ripiego
+    /// invece di produrre un criterio che cerca la stringa vuota — che qualunque
+    /// file soddisfa, cioe' un requisito sempre verde. E' il modo in cui questo
+    /// fix potrebbe trasformarsi nel suo contrario.
+    #[test]
+    fn un_campo_vuoto_non_e_una_dichiarazione() {
+        let r = "In `vite.config.js` deve comparire `strictPort: true`";
+        // Vuoti -> si torna a spremere la prosa, che qui basta.
+        let c = derive_criterion_da(r, Some(Direction::DevePresenziare), Some("  "), Some(""))
+            .expect("ripiego sulla prosa");
+        assert_eq!(c.path, "vite.config.js");
+        assert_eq!(c.literal, "strictPort: true");
+    }
+
+    /// Il path dichiarato resta soggetto al confine del progetto: dichiararlo
+    /// non e' un lasciapassare per leggere fuori dalla radice.
+    #[test]
+    fn il_path_dichiarato_non_scavalca_il_confine_del_progetto() {
+        assert_eq!(
+            derive_criterion_da(
+                "qualunque cosa",
+                Some(Direction::DevePresenziare),
+                Some("../../etc/passwd"),
+                Some("root"),
+            ),
+            Err(Unverifiable::PathFuoriProgetto)
+        );
     }
 
     /// La riga riportata e' quella giusta anche con accenti prima del match: la
