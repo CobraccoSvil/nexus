@@ -55,8 +55,28 @@ static RE_RS_FN_UPPERCASE: LazyLock<Regex> =
 static RE_JS_CLASS_LOWERCASE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"class\s+([a-z]\w*)").unwrap());
 // Marker TODO/FIXME/HACK/XXX/WORKAROUND con messaggio.
+//
+// CASE-SENSITIVE, ed e' load-bearing: il maiuscolo E' la convenzione che distingue
+// il marker dalla parola. Con `(?i)` la regex matcheva il sostantivo italiano
+// "todo", che in questo dominio e' un'entita' di prima classe (tabella
+// `nexus_agent_todos`, tipo `Todo`, "i todo del piano"): ogni riga di codice o di
+// prosa che li nomina produceva un finding di categoria `maintainability`, dentro
+// la metrica sotto gate ratchet di `xtask quality-scan`. MISURATO l'11/08/2026 sul
+// repo: 468 occorrenze non-maiuscole contro 190 marker veri — il rumore era piu'
+// del doppio del segnale, e chi tocca il dominio dei todo pagava il pedaggio
+// alzando la baseline (7683 -> 7687 per un modulo solo).
+// Il criterio alternativo "parola seguita da `:`" e' stato MISURATO e scartato: in
+// Rust `nome: Tipo` e' la sintassi dei parametri, quindi `todo: &Value` sarebbe un
+// marker, e in italiano "il prerequisito dei todo:" introduce una spiegazione — dei
+// 9 candidati col due punti, zero erano marker.
+// Perdita accertata del passaggio a case-sensitive: NESSUNA. I soli minuscoli
+// plausibili erano 2 `todo!()` dentro una fixture di test di `mcp-ast` (corpo
+// segnaposto in un sorgente finto, non debito) e un elenco di pattern in
+// `sec_panic_count.rs`, che quella macro la presidia gia' per conto suo.
+// Allinea il vocabolario a `scripts/markers-ratchet.sh` (`DEBT_RE`), che era
+// case-sensitive da sempre: erano due misure divergenti dello stesso concetto.
 static RE_TODO_MARKER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b(TODO|FIXME|HACK|XXX|WORKAROUND)\b:?\s*(.*)").unwrap());
+    LazyLock::new(|| Regex::new(r"\b(TODO|FIXME|HACK|XXX|WORKAROUND)\b:?\s*(.*)").unwrap());
 // Soppressioni di warning che possono indicare dead code.
 static RE_SUPPRESSED_WARNING: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"#\[allow\(dead_code\)\]|// @ts-ignore|# type: ignore|#\[cfg\(dead_code\)\]")
@@ -1382,6 +1402,42 @@ mod tests {
         // le keyword restano ancorate: nessun match dentro un identificatore
         assert_eq!(RE_BRANCH_RUST_PY.find_iter("let verify = format(x);").count(), 0);
         assert_eq!(RE_BRANCH_RUST_PY.find_iter("let matcher = 1;").count(), 0);
+    }
+
+    /// Il marker di debito e' MAIUSCOLO: "todo" minuscolo e' il sostantivo del
+    /// dominio (tabella `nexus_agent_todos`, tipo `Todo`), non un debito.
+    ///
+    /// Test di conseguenza (regola O): non interroga `RE_TODO_MARKER`, attraversa
+    /// `analyze_source` — la strada che il gate percorre — e le righe di input sono
+    /// COPIATE dal repo, non inventate. Rimettendo `(?i)` sulla regex questo test
+    /// rosseggia con il valore del difetto reale: 5 marker fantasma invece di 0.
+    ///
+    /// La direzione opposta — il marker MAIUSCOLO resta riconosciuto, cioe' il fix
+    /// non ha spento il rilevatore — la presidia gia' `test_basic_analysis`, che
+    /// passa dalla stessa `analyze_source`: duplicarla qui aggiungerebbe soltanto
+    /// righe che il ratchet di `scripts/markers-ratchet.sh` conta come debito vero,
+    /// perche' un grep non distingue l'USO di un marker dalla sua MENZIONE in una
+    /// fixture — lo stesso difetto, di segno opposto, che questo test presidia.
+    #[test]
+    fn il_sostantivo_todo_non_e_un_marker_di_debito() {
+        let dominio = r#"
+use nexus_agent_graph::decisions::dag_scheduler::{Todo, TodoStatus};
+    // Testo/priorita' del todo: trasportati per il meta-step "plan"
+/// E' il prerequisito dei todo: lo schema reale vincola
+    pub fn build_context_blob(state: &AgentState, todo: &Value) -> String {
+        // Todo con scope dichiarato.
+"#;
+        let marker: Vec<_> = analyze_source("src/dominio_todo.rs", dominio)
+            .findings
+            .into_iter()
+            .filter(|f| f.title.ends_with(" marker"))
+            .collect();
+        assert!(
+            marker.is_empty(),
+            "il dominio dei todo non e' debito, ma sono stati contati {} marker: {:?}",
+            marker.len(),
+            marker.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
     }
 
     /// La soglia delle funzioni lunghe misura il CODICE: una funzione con 40
