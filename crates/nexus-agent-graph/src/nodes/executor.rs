@@ -366,8 +366,20 @@ pub struct ExecutorConfig {
     /// run primario (`AgentState::run_started_at_epoch_s`, checkpointato ->
     /// sopravvive ai resume, misura il run INTERO e non l'ultimo spezzone). Al
     /// raggiungimento (`>=`) l'executor chiude d'autorita' (`close_runaway`) con
-    /// reason canonico `time_budget` (regola M/N), come il cap di spesa. NON si
-    /// resetta all'escalation. Regola G: DB-driven, mai hardcoded.
+    /// la causa canonica `absolute_ceiling` (regola M/N). NON si resetta
+    /// all'escalation. Regola G: DB-driven, mai hardcoded.
+    ///
+    /// ## Dal 10/08/2026 nessuno lo DERIVA piu' (regola H)
+    ///
+    /// Fino a quella data un sub-run se lo costruiva dal proprio timeout per un
+    /// moltiplicatore (`timeout_s x 4`): ogni figura nasceva con un tetto in
+    /// tempo armato, e il tetto era l'unica difesa contro la figura che «avanza
+    /// per sempre». Quella difesa ora e' la SPESA
+    /// ([`Self::run_cost_budget_usd`], che per una figura vale la capienza
+    /// residua del cap di famiglia), e un tetto ricavato dall'orologio sarebbe
+    /// di nuovo la toppa che la regola H vieta per nome. Resta una
+    /// CONFIGURAZIONE esplicita: `0` per policy, e chi lo alza sa cosa sta
+    /// facendo.
     pub run_time_budget_s: u64,
     /// Percentuale di [`Self::run_time_budget_s`] oltre cui (`>=`) un run con un
     /// CANALE DI RUOLO ancora muto (figura del consiglio senza `advisory_verdict`,
@@ -596,6 +608,28 @@ impl Default for ScaleConfig {
             sizing_cooldown_turns: 3,
             sizing_aggressiveness: 0.5,
         }
+    }
+}
+
+impl ExecutorConfig {
+    /// Questo run ha un BUDGET PROPRIO da difendere?
+    ///
+    /// E' la condizione d'ingresso di [`ExecutorNode::gate_prosecuzione_run`], e
+    /// non e' un dettaglio di implementazione: decide QUALI run il criterio di
+    /// progresso governa. Un run senza budget non ha nulla da difendere — e'
+    /// il caso del run primario, dove entrambe le chiavi valgono `0` per policy
+    /// (mig 0604/0607 per il tempo, 0533 per la spesa).
+    ///
+    /// PERCHE' NON BASTA PIU' IL TEMPO. Fino al 10/08/2026 la condizione era il
+    /// solo `run_time_budget_s > 0`, e reggeva per un motivo accidentale: ogni
+    /// figura riceveva un tetto in tempo DERIVATO dal proprio timeout, quindi
+    /// «ha un tetto» ed «e' una figura» coincidevano. Tolto quel tetto (la
+    /// difesa contro chi avanza per sempre e' la spesa, non l'orologio), la
+    /// stessa condizione avrebbe spento il criterio di progresso proprio per i
+    /// run per cui e' nato: il gate non sarebbe piu' stato raggiunto, e una
+    /// figura che ripete la stessa chiamata non avrebbe piu' avuto chi la ferma.
+    pub fn governa_prosecuzione(&self) -> bool {
+        self.run_time_budget_s > 0 || self.run_cost_budget_usd > 0.0
     }
 }
 
@@ -4954,7 +4988,7 @@ la richiesta in modo piu' specifico.",
         if let Some(delta) = self.gate_budget_spesa(state, iters_in) {
             return Some(delta);
         }
-        if let Some(delta) = self.gate_deadline_run(state, ctx, iters_in).await {
+        if let Some(delta) = self.gate_prosecuzione_run(state, ctx, iters_in).await {
             return Some(delta);
         }
         if let Some(delta) = self
@@ -5125,8 +5159,17 @@ modo piu' specifico, oppure riprova con un modello piu' economico.",
     /// [`crate::decisions::avanzamento_figura`] sui FATTI PERSISTITI portati da
     /// [`AvanzamentoPort`], e [`ExecutorConfig::run_time_budget_s`] cambia ruolo:
     /// non e' piu' il criterio, e' il TETTO ASSOLUTO che il criterio usa come
-    /// ultima difesa (chi lo calcola lo deriva dal timeout della figura per un
-    /// moltiplicatore, vedi `subagent_native`).
+    /// ultima difesa — e dal 10/08/2026 nessuno lo deriva piu' dal timeout della
+    /// figura: vale `0` se non lo configura un admin, quindi il criterio decide
+    /// sui soli fatti e la figura che avanza per sempre la ferma la SPESA
+    /// ([`Self::gate_budget_spesa`], valutato subito prima di questo).
+    ///
+    /// ## Chi entra qui
+    ///
+    /// [`ExecutorConfig::governa_prosecuzione`] — un run con un budget proprio.
+    /// La condizione NON e' piu' «c'e' un tetto in tempo»: quella coincideva con
+    /// «e' una figura» solo finche' ogni figura nasceva con un tetto derivato, e
+    /// tolto il tetto avrebbe spento il criterio esattamente dove serve.
     ///
     /// ## Perche' la grazia precede la chiusura in ENTRAMBI i rami
     ///
@@ -5136,13 +5179,13 @@ modo piu' specifico, oppure riprova con un modello piu' economico.",
     /// criterio esiste per cogliere. Percio' un arresto passa comunque per
     /// [`Self::maybe_advisory_grace_delta`] — one-shot, quindi al giro successivo
     /// il gate chiude davvero e non si cicla.
-    async fn gate_deadline_run(
+    async fn gate_prosecuzione_run(
         &self,
         state: &AgentState,
         ctx: &AgentNodeCtx,
         iters_in: i64,
     ) -> Option<OpaqueDelta> {
-        if self.cfg.run_time_budget_s == 0 {
+        if !self.cfg.governa_prosecuzione() {
             return None;
         }
         let started = state.run_started_at_epoch_s?;
@@ -9126,10 +9169,20 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
     /// di ruolo ancora aperto gli concede il turno di grazia per dichiarare.
     ///
     /// `None` (il chiamante prosegue, comportamento invariato) se: il sollecito e'
-    /// disabilitato (`time_grace_pct == 0`), la soglia non e' raggiunta, oppure non
+    /// disabilitato (`time_grace_pct == 0`), non c'e' un tetto di cui calcolare la
+    /// percentuale, la soglia non e' raggiunta, oppure non
     /// c'e' un canale di ruolo da sollecitare / la grazia e' gia' stata concessa
     /// (decide il punto unico [`Self::maybe_advisory_grace_delta`], che qui viene
     /// solo INNESCATO su un secondo criterio — il tempo invece dei turni a vuoto).
+    ///
+    /// SENZA TETTO NON C'E' SOGLIA. Una percentuale di un budget che non esiste
+    /// vale `0`, e `elapsed >= 0` e' vero al primo giro: il sollecito di FINE
+    /// CORSA diventerebbe un sollecito immediato, e la figura riceverebbe
+    /// l'ordine di chiudere subito col poco che ha. Finche' ogni figura nasceva
+    /// con un tetto derivato il caso non si dava; da quando il tetto e' una
+    /// configurazione (`0` per policy) si da' sempre, e il sollecito arriva
+    /// dall'altro innesco — l'arresto del criterio di progresso, che passa
+    /// comunque per [`Self::maybe_advisory_grace_delta`].
     async fn maybe_time_grace_delta(
         &self,
         state: &AgentState,
@@ -9137,7 +9190,7 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
         ctx: &AgentNodeCtx,
         elapsed_s: u64,
     ) -> Option<OpaqueDelta> {
-        if self.cfg.time_grace_pct == 0 {
+        if self.cfg.time_grace_pct == 0 || self.cfg.run_time_budget_s == 0 {
             return None;
         }
         let soglia_s = self.cfg.run_time_budget_s * self.cfg.time_grace_pct / 100;

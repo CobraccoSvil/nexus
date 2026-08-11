@@ -180,6 +180,56 @@ pub struct NativeDeps {
     pub step_gate: Option<std::sync::Arc<crate::agent_graph_adapter::step_validation::StepGateSetup>>,
 }
 
+/// Le RISORSE che un run puo' consumare, dichiarate da chi lo avvia.
+///
+/// Insieme e non due campi sparsi, perche' rispondono alla STESSA domanda —
+/// «quanto puo' consumare questo run prima che qualcuno lo fermi?» — e chi ne
+/// dichiara uno ha gia' in mano l'altro. Separati, un chiamante nuovo puo'
+/// valorizzarne uno e dimenticare l'altro senza che nulla lo fermi: e' il modo
+/// in cui una figura finirebbe SENZA ALCUN freno, che e' il difetto che il
+/// 10/08/2026 ha chiuso.
+///
+/// `None` su un campo = comanda il setting globale letto da
+/// `load_executor_config` (regola G: la precedenza sta nel punto unico
+/// [`effective_run_time_budget_s`] / [`effective_run_cost_budget_usd`], mai
+/// inline nei chiamanti).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BudgetDelRun {
+    /// Tetto in SECONDI. `Some(s)` solo se un admin ha deciso un tetto per
+    /// questo run: dal 10/08/2026 nessuno lo DERIVA piu' (un sub-run passa
+    /// `None`), perche' un tetto ricavato dal timeout della figura uccideva chi
+    /// stava lavorando — vedi `ExecutorConfig::run_time_budget_s`.
+    pub tempo_s: Option<u64>,
+    /// Tetto in DOLLARI. `Some(usd)` per una FIGURA: e' la CAPIENZA RESIDUA del
+    /// cap di famiglia (`orchestrator.subagent_cost_cap_per_run_usd` meno quanto
+    /// la famiglia ha gia' speso), dal punto unico
+    /// `subagent_native::capienza_spesa`.
+    ///
+    /// E' il freno che ha SOSTITUITO quello di tempo. Il cap di famiglia
+    /// esisteva gia' ma era un guard di AMMISSIONE — `prepare_reject` decide se
+    /// un sub-run PARTE e poi non ha piu' voce: la figura che «avanza per
+    /// sempre» non veniva fermata da lui, la fermava l'orologio. Portando qui la
+    /// capienza residua, quel cap diventa anche il freno del run in corso
+    /// (`ExecutorConfig::run_cost_budget_usd` -> `gate_budget_spesa` ->
+    /// `close_runaway`: chiusura PULITA con esito dichiarato).
+    pub spesa_usd: Option<f64>,
+}
+
+impl BudgetDelRun {
+    /// Il run principale: comandano i setting globali, entrambi `0` per policy.
+    pub fn dai_setting_globali() -> Self {
+        Self::default()
+    }
+
+    /// Una FIGURA: nessun tetto in tempo, e come freno la capienza che le resta.
+    pub fn di_figura(spesa_usd: f64) -> Self {
+        Self {
+            tempo_s: None,
+            spesa_usd: Some(spesa_usd),
+        }
+    }
+}
+
 /// Parametri di un run nativo, gia' RISOLTI a monte dal call site (lo stesso
 /// punto che alimenta `run_via_brain`, regola L: non si ricostruisce qui
 /// prompt/tools/history — si riusano i valori gia' calcolati).
@@ -307,17 +357,9 @@ pub struct NativeRunInput {
     /// grafo nativo lo usa per il guard anti-esplosione del fan-out explore
     /// (`UnderstandingNode`, `subagent_depth >= 1 -> skip`) e per l'anti-ricorsione.
     pub subagent_depth: Option<i64>,
-    /// Budget in secondi del run CORRENTE, quando il chiamante lo conosce meglio
-    /// del setting globale. `None` (run principale) -> vale `agent.run_time_budget_s`
-    /// letto da `load_executor_config` (regola G). `Some(s)` (SUB-RUN/figura) -> e'
-    /// il `timeout_s` gia' risolto in `prepare_subagent_run`, cioe' il tetto REALE
-    /// applicato dal `tokio::time::timeout` esterno.
-    ///
-    /// Perche' serve: senza questo canale il motore della figura non conosce il
-    /// proprio tetto (il setting globale e' `0` per policy, mig 0604/0607), quindi
-    /// ogni gate a tempo dell'executor e' codice morto e la figura scade MUTA —
-    /// uccisa dall'esterno senza mai poter dichiarare il proprio parere.
-    pub run_time_budget_s: Option<u64>,
+    /// Le RISORSE che questo run puo' consumare, quando il chiamante le conosce
+    /// meglio dei setting globali. Vedi [`BudgetDelRun`].
+    pub budget: BudgetDelRun,
     /// Override della root di lavoro per un SUB-RUN ISOLATO (FASE 2 orchestrazione:
     /// git worktree effimero). Threadato fino al `ToolRunnerExecutorAdapter` ->
     /// `build_ctx_with_root`, che quando presente sovrascrive `root_path` e imposta
@@ -1807,6 +1849,20 @@ fn effective_run_time_budget_s(from_db: u64, from_caller: Option<u64>) -> u64 {
     from_caller.unwrap_or(from_db)
 }
 
+/// Tetto di SPESA effettivo del run: gemello di [`effective_run_time_budget_s`],
+/// stessa precedenza e per la stessa ragione.
+///
+/// Perche' esiste: `agent.run_cost_budget_usd` e' `0` per policy (mig 0533),
+/// quindi per un SUB-RUN il valore dal DB e' inservibile — il freno reale della
+/// figura e' la capienza residua del cap di famiglia
+/// (`orchestrator.subagent_cost_cap_per_run_usd`), che solo il chiamante
+/// conosce. Senza questa precedenza `gate_budget_spesa` resta codice morto per
+/// le figure, e l'unica difesa contro chi avanza per sempre torna a essere
+/// l'orologio.
+fn effective_run_cost_budget_usd(from_db: f64, from_caller: Option<f64>) -> f64 {
+    from_caller.unwrap_or(from_db)
+}
+
 async fn load_executor_config(
     db: &PgPool,
     provider: &str,
@@ -3271,7 +3327,14 @@ async fn build_native_engine(
     // esterno). Senza questo override il gate a tempo dell'executor resta codice
     // morto per le figure e il sollecito di chiusura non scatterebbe mai.
     exec_cfg.run_time_budget_s =
-        effective_run_time_budget_s(exec_cfg.run_time_budget_s, input.run_time_budget_s);
+        effective_run_time_budget_s(exec_cfg.run_time_budget_s, input.budget.tempo_s);
+    // ...e il freno di SPESA, per la stessa ragione e con la stessa precedenza:
+    // per un SUB-RUN e' la capienza residua del cap di famiglia, l'unico numero
+    // che puo' fermare una figura che avanza senza mai concludere. Dal
+    // 10/08/2026 e' LUI il freno delle figure: il tetto in tempo sopra non viene
+    // piu' derivato da nessuno (vedi `ExecutorConfig::run_time_budget_s`).
+    exec_cfg.run_cost_budget_usd =
+        effective_run_cost_budget_usd(exec_cfg.run_cost_budget_usd, input.budget.spesa_usd);
 
     let tool_dispatch_cfg = load_tool_dispatch_config(
         &db,
@@ -4541,7 +4604,7 @@ mod tests {
             sizing_complexity: None,
             sizing_scope_system_wide: false,
             classifier_intent: None,
-            run_time_budget_s: None,
+            budget: BudgetDelRun::dai_setting_globali(),
             // Test del run principale: nessun isolamento (root del progetto).
             working_root: None,
             write_scope: Vec::new(),
@@ -6579,5 +6642,25 @@ mod tests {
     fn senza_override_vale_il_setting_globale() {
         assert_eq!(effective_run_time_budget_s(900, None), 900);
         assert_eq!(effective_run_time_budget_s(0, None), 0);
+    }
+
+    /// Lo stesso, per il FRENO DI SPESA — e dal 10/08/2026 e' quello che conta
+    /// davvero: una figura non passa piu' un tetto in tempo, quindi se qui
+    /// vincesse il DB (`agent.run_cost_budget_usd` = `0` per policy, mig 0533)
+    /// il sub-run girerebbe senza NESSUN freno, ne' di tempo ne' di spesa —
+    /// esattamente la figura che «avanza per sempre».
+    ///
+    /// MUTAZIONE: far vincere `from_db` fa uscire `0.0` al posto di `4.25`, e
+    /// `0` nel motore significa freno DISABILITATO.
+    #[test]
+    fn capienza_della_figura_vince_sul_setting_globale_a_zero() {
+        assert_eq!(effective_run_cost_budget_usd(0.0, Some(4.25)), 4.25);
+    }
+
+    /// Run principale: nessun override, comanda il setting globale.
+    #[test]
+    fn senza_override_vale_il_cap_globale_di_spesa() {
+        assert_eq!(effective_run_cost_budget_usd(10.0, None), 10.0);
+        assert_eq!(effective_run_cost_budget_usd(0.0, None), 0.0);
     }
 }

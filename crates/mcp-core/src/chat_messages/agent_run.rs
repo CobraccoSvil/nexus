@@ -5324,7 +5324,7 @@ pub(crate) async fn spawn_agent_run(
                     sizing_complexity,
                     sizing_scope_system_wide,
                     classifier_intent: Some(classified_intent_for_loop.to_string()),
-                    run_time_budget_s: None,
+                    budget: crate::native_engine::BudgetDelRun::dai_setting_globali(),
                     // Run principale sulla root del progetto: nessun isolamento
                     // (l'override worktree e' riservato ai sub-run isolati, PR4).
                     working_root: None,
@@ -5637,7 +5637,7 @@ pub(crate) async fn confirm_native_run(
         sizing_complexity: None,
         sizing_scope_system_wide: false,
         classifier_intent: None,
-        run_time_budget_s: None,
+        budget: crate::native_engine::BudgetDelRun::dai_setting_globali(),
         // Resume del run principale sulla root del progetto: nessun isolamento.
         working_root: None,
         // Resume del run principale: nessuno scope di piano da misurare.
@@ -6045,7 +6045,7 @@ pub(crate) async fn resume_fanin(
         sizing_complexity: None,
         sizing_scope_system_wide: false,
         classifier_intent: None,
-        run_time_budget_s: None,
+        budget: crate::native_engine::BudgetDelRun::dai_setting_globali(),
         // Resume del run principale sulla root del progetto: nessun isolamento.
         working_root: None,
         // Resume del run principale: nessuno scope di piano da misurare.

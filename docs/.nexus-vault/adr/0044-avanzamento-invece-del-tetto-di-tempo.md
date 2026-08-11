@@ -16,7 +16,7 @@ tags:
   - regola-Q
 auto_generated: false
 created_at: 2026-08-09T00:00:00Z
-updated_at: 2026-08-09T00:00:00Z
+updated_at: 2026-08-10T00:00:00Z
 nexus_meta_version: 1
 ---
 
@@ -26,6 +26,10 @@ nexus_meta_version: 1
 
 Accepted - 2026-08-09. Migrazione META `0687`. Punto unico
 `crates/nexus-agent-graph/src/decisions/avanzamento_figura.rs`.
+
+Aggiornato - 2026-08-10, migrazione META `0698`: cade anche il BACKSTOP in tempo
+(vedi in fondo, *Aggiornamento 2026-08-10*). Il freno per la figura che avanza
+senza concludere e' la SPESA, non l'orologio.
 
 ## Contesto
 
@@ -172,7 +176,7 @@ file_mutations (DB META)   ─┘   (mcp-core, solo I/O)                   │
                                                     (puro, nessun DB)
                                                                        │
                                                                        v
-                                       ExecutorNode::gate_deadline_run
+                                       ExecutorNode::gate_prosecuzione_run
                                         - Prosegue -> sollecito a tempo invariato
                                         - Ferma    -> sollecito one-shot, poi close_runaway
 ```
@@ -185,10 +189,10 @@ CANCELLARE un future: chiuderebbe la figura senza che nessuno le abbia mai
 chiesto di dichiarare quello che ha trovato. Il gate interno chiude PULITO, e
 soprattutto passa dal turno di grazia.
 
-Il `tokio::time::timeout` esterno resta armato e sale al tetto assoluto: copre
-l'unico caso che il gate non puo' vedere — un run wedged DENTRO una singola
-chiamata al modello, che non raggiunge mai un confine di iterazione e quindi non
-viene mai interrogato.
+La rete ESTERNA resta, ma dal 10/08/2026 non e' piu' un orologio: guarda il
+SILENZIO (`veglia_sul_silenzio`). Copre l'unico caso che il gate non puo' vedere
+— un run che non raggiunge mai un confine di iterazione, e che percio' nessun
+gate interrogherebbe — senza toccare chi lavora.
 
 ### Il sollecito precede la chiusura in ENTRAMBI i rami
 
@@ -214,8 +218,8 @@ nessuna delle quattro figure misurate.
 
 | chiave | default | significato |
 |---|---|---|
-| `orchestrator.progresso_inattivita_max_s` | `90` | secondi senza avanzamento oltre cui si ferma. `0` = criterio spento, governa il solo tetto (via di ritorno senza redeploy) |
-| `orchestrator.progresso_tetto_moltiplicatore` | `4` | per quanto il tetto assoluto eccede il timeout della figura. Clampato a `>= 1` |
+| `orchestrator.progresso_inattivita_max_s` | `90` | secondi senza avanzamento oltre cui si ferma. `0` = criterio spento (via di ritorno senza redeploy) |
+| `orchestrator.progresso_tetto_moltiplicatore` | `4` | RIMOSSA dalla mig 0698: nessun sub-run deriva piu' un tetto dal proprio timeout |
 
 ## Conseguenze
 
@@ -260,12 +264,103 @@ Una divergenza e' stata trovata dal test durante la scrittura, non dopo:
 cosa (regola N), su un campo che e' anche il `reason` di chiusura. I `rename` sono
 ora espliciti.
 
+## Aggiornamento 2026-08-10 - anche il backstop smette di essere il tempo
+
+La decisione di sopra lasciava il tempo come BACKSTOP: `tetto_assoluto =
+timeout_kind x 4`. Quel residuo aveva due giustificazioni scritte nel codice, e a
+verificarle ne regge mezza.
+
+**(1) «un run wedged dentro una singola chiamata al modello».** Non regge: il
+client reqwest di `NexusGatewayClient` e' costruito con `.timeout(client_budget)`,
+quindi una chiamata non puo' restare appesa oltre quel tempo e il run torna al
+confine di iterazione, dove il criterio decide. Il tetto era venti volte piu'
+largo del presidio che copriva gia' quel caso — e nel frattempo era LUI a
+decidere. Il rimedio (commit `b07c176b`) e' la **veglia sul silenzio**: la sola
+domanda che una rete esterna puo' porre e' *da quanto non arriva un fatto?*, e la
+soglia si deriva da `LlmTimeouts::client_budget` invece di essere scelta a mano.
+
+**(2) «una figura che avanza per sempre».** Regge: chi produce fatti nuovi non e'
+in silenzio (la veglia non lo vede) e non e' fermo (il criterio di progresso lo
+assolve). Finora lo fermava l'orologio.
+
+### Il freno giusto per (2) e' la spesa, ed esisteva a meta'
+
+`orchestrator.subagent_cost_cap_per_run_usd` (5.00) era un guard di
+**ammissione**: `prepare_reject` confronta il gia' speso della famiglia col cap e
+decide se un sub-run PUO' PARTIRE. Su un run in corso non aveva piu' voce — un
+figlio ammesso con 4.99 gia' spesi poteva bruciare quanto voleva.
+
+Ora la stessa capienza risponde a due domande dallo stesso punto unico
+(`subagent_native::capienza_spesa`, regola L): *il figlio parte?* e *quanto puo'
+spendere una volta partito?*. La capienza residua scende nel motore come
+`run_cost_budget_usd` e la fa valere `gate_budget_spesa`, che chiude PULITO —
+sollecito al canale di ruolo, esito dichiarato — invece di cancellare un future.
+
+L'esito e' un tipo e non un `f64` (regola Q): nel motore `0` significa *freno
+disabilitato*, quindi una capienza esaurita tradotta in `0.0` avrebbe dato via
+libera proprio alla figura senza piu' credito. `CapienzaSpesa::Residua` e'
+positiva per costruzione.
+
+I due budget viaggiano poi insieme in un tipo solo (`BudgetDelRun{tempo_s,
+spesa_usd}` in `NativeRunInput`): rispondono alla stessa domanda — *quanto puo'
+consumare questo run prima che qualcuno lo fermi?* — e chi ne dichiara uno ha
+gia' in mano l'altro. Separati, un chiamante nuovo puo' valorizzarne uno e
+dimenticare l'altro senza che nulla lo fermi, cioe' produrre di nuovo una figura
+senza alcun freno.
+
+### La trappola: senza tetto il gate diventava irraggiungibile
+
+La condizione d'ingresso del gate era `run_time_budget_s > 0`, e reggeva per un
+motivo accidentale: ogni figura riceveva un tetto derivato, quindi *ha un tetto*
+ed *e' una figura* coincidevano. Tolto il tetto, la stessa condizione avrebbe
+spento il criterio di progresso proprio per i run per cui e' nato — con tutti i
+test verdi, perche' ognuno passa un tetto. La condizione e' ora
+`ExecutorConfig::governa_prosecuzione` (*questo run ha un budget proprio, in
+tempo o in denaro*), e un guard testuale in `check-single-source.sh` rifiuta il
+ritorno alla vecchia forma.
+
+Stessa classe, secondo caso: `time_grace_pct` e' una PERCENTUALE del tetto, e con
+il tetto a `0` la soglia vale `0` — `elapsed >= 0` e' vero al primo giro, quindi
+il sollecito di *fine corsa* sarebbe diventato un ordine di chiudere subito dato
+a una figura appena partita.
+
+### Conseguenze
+
+- Una figura che avanza non ha piu' un limite in tempo: ha un limite in DOLLARI,
+  che e' cio' che il tetto stava approssimando male.
+- Il referto della rete esterna cambia oggetto: non piu' «timeout dopo Ns» ma
+  «fermo da Ns senza produrre fatti», col `timeout_s` del kind accanto come
+  intervallo di lavoro atteso — due numeri distinti, perche' confonderli manda a
+  cercare un tetto stretto che non esiste piu'.
+- Il tetto in tempo resta ESISTENTE come configurazione esplicita
+  (`agent.run_time_budget_s`, `0` per policy): cio' che sparisce e' che ogni
+  figura ne ricevesse uno armato senza che nessuno lo avesse deciso.
+
+### Verifica (regola O)
+
+Quattro mutazioni, tutte rosse col valore del difetto:
+
+1. **vecchia condizione d'ingresso** (`run_time_budget_s == 0 -> return`) ->
+   `senza_tetto_il_criterio_governa_lo_stesso_chi_ripete` rossa sulla porta mai
+   interrogata.
+2. **grazia senza la guardia sul tetto** ->
+   `senza_tetto_il_sollecito_a_tempo_non_scatta_subito` rossa: sollecito di fine
+   corsa a una figura di 3 secondi.
+3. **capienza = cap intero** invece del residuo ->
+   `il_figlio_riceve_la_capienza_residua_non_il_cap_intero` rossa con `5.00` al
+   posto di `0.75`.
+4. **tetto rimesso nella veglia** -> `nessuna_durata_ferma_chi_produce` rossa a
+   un'ora di lavoro continuo.
+
 ## Riferimenti
 
 - `crates/nexus-agent-graph/src/decisions/avanzamento_figura.rs` - il criterio
 - `crates/nexus-agent-graph/src/runtime/ports.rs` - `AvanzamentoPort`
 - `crates/mcp-core/src/agent_graph_adapter/avanzamento.rs` - l'I/O
-- `crates/nexus-agent-graph/src/nodes/executor.rs` - `gate_deadline_run`
-- `crates/mcp-core/src/agent_tools/subagent_native.rs` - `tetto_assoluto_s`
-- `db/migrations/0687_avanzamento_invece_del_tetto.sql`
+- `crates/nexus-agent-graph/src/nodes/executor.rs` - `gate_prosecuzione_run`,
+  `ExecutorConfig::governa_prosecuzione`
+- `crates/mcp-core/src/agent_tools/subagent_native.rs` - `capienza_spesa`,
+  `veglia_sul_silenzio`
+- `db/migrations/0687_avanzamento_invece_del_tetto.sql`,
+  `db/migrations/0698_freno_di_spesa_invece_del_tetto.sql`
 - ADR 0026 (catalogo punti unici), mig 0686 (`timeout_cause`, il referto)
