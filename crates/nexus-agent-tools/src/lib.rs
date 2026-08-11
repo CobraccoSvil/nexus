@@ -33,6 +33,9 @@ pub mod gateway_client;
 pub mod git;
 pub mod image_tools;
 pub mod knowledge;
+/// Punto unico della riga `nexus_agent_meta_steps` che porta il piano di un run
+/// (una sola per run, payload fuso fra i produttori).
+pub mod meta_piano;
 pub mod monitor;
 pub mod paths;
 pub mod profile_tools;

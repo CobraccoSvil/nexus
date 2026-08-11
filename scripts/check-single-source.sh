@@ -3389,6 +3389,44 @@ else
   echo "OK metro-della-revisione: il riscontro legge la chiave dei due rami"
 fi
 
+# --- un-piano-per-run -------------------------------------------------------
+# Il PIANO di un run e' uno STATO, non una cronologia: una sola riga
+# `nexus_agent_meta_steps` kind='plan'. A rispondere erano DUE produttori con
+# discipline diverse — il tool `nexus_todo_write` (UPDATE, INSERT se manca) e la
+# porta generica `MetaStepStore` (INSERT cieca, corretta per ogni altro kind).
+# MISURATO il 10/08/2026 su batteria-todo-deepseek: due righe `plan` a 2,3 ms
+# l'una dall'altra con lo STESSO array di todo, e il piano reso due volte in chat.
+assert_single "un-piano-per-run" 'pub async fn scrivi_dai_todo' \
+  'crates/nexus-agent-tools/src/meta_piano.rs' crates
+assert_single "un-piano-per-run" 'pub fn componi_riga' \
+  'crates/nexus-agent-tools/src/meta_piano.rs' crates
+
+# L'adapter della porta generica deve DELEGARE il solo kind 'plan': se torna a
+# inserire, il difetto rientra dalla stessa porta da cui e' uscito (li' l'INSERT
+# fallirebbe contro l'indice unico, e il piano del planner sparirebbe in un warn).
+if ! grep -q 'meta_piano::scrivi' \
+  crates/mcp-core/src/agent_graph_adapter/meta_step_store.rs; then
+  echo "!! un-piano-per-run: meta_step_store non delega piu' il kind 'plan' al" >&2
+  echo "   punto unico: la riga del planner tornerebbe a essere una INSERT" >&2
+  echo "   cieca accanto a quella del tool." >&2
+  fail=1
+else
+  echo "OK un-piano-per-run: la porta generica delega il piano al punto unico"
+fi
+
+# Il tool dei todo scriveva la propria riga con SQL in casa: la disciplina "una
+# riga per run" viveva li' e l'altro produttore non poteva conoscerla.
+piano_a_mano=$(grep -n 'nexus_agent_meta_steps' \
+  crates/nexus-agent-tools/src/todos.rs || true)
+if [[ -n "$piano_a_mano" ]]; then
+  echo "!! un-piano-per-run: il tool dei todo scrive di nuovo la riga del piano" >&2
+  echo "   con SQL proprio, invece di delegare a meta_piano:" >&2
+  echo "$piano_a_mano" >&2
+  fail=1
+else
+  echo "OK un-piano-per-run: il tool dei todo delega la scrittura del piano"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1
