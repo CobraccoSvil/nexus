@@ -116,6 +116,20 @@ impl CooldownReason {
     }
 }
 
+/// CHI ha stabilito quando il cooldown finisce.
+///
+/// Non e' un dettaglio di provenienza: decide se un probe abbia titolo per
+/// abbreviarlo. Una scadenza che il FORNITORE ha dichiarato e' un fatto sul suo
+/// servizio; una che abbiamo stimato noi e' una precauzione, e una precauzione
+/// puo' essere revocata da una misura.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrigineScadenza {
+    /// Il fornitore ha detto QUANDO ritentare (`Retry-After`).
+    Dichiarata,
+    /// L'abbiamo stimata noi dalle durate di configurazione.
+    Stimata,
+}
+
 /// Stato di cooldown di un singolo provider.
 #[derive(Debug, Clone)]
 pub struct CooldownState {
@@ -125,6 +139,35 @@ pub struct CooldownState {
     pub reason: CooldownReason,
     /// Ultimo messaggio d'errore osservato (gia' privo di prompt/response).
     pub last_error: Option<String>,
+    /// Chi ha stabilito `until`. Vedi [`OrigineScadenza`] e
+    /// [`il_probe_puo_liberare`].
+    pub origine: OrigineScadenza,
+}
+
+/// Il probe di ripristino ha titolo per liberare questo cooldown?
+///
+/// MISURATO il 12/08/2026, ed e' il difetto che questa funzione chiude. Il
+/// gateway faceva la cosa giusta due volte e la disfaceva alla terza: leggeva il
+/// `Retry-After` del 429, lo onorava in [`CooldownManager::mark_transient_after`]
+/// (fix del 10/08), e poi `run_recovery_pass` cancellava tutto appena
+/// `healthcheck()` rispondeva — dove `healthcheck()` e' un `GET /models`, che NON
+/// e' soggetto al tetto sui token ne' al credito esaurito.
+///
+/// Le due misure: groq con cooldown 565s liberato dopo 170s (395 PRIMA della
+/// scadenza) e un nuovo 429 QUATTRO SECONDI dopo, col medesimo Retry-After di
+/// 395s; e lo stesso su 1790s, liberato 1304s prima. Non e' specifico di groq —
+/// anthropic in cooldown billing 3600s risultava «ripristinato» una quarantina di
+/// volte con anticipo di 3000-3500s, riprendendo il billing error pochi minuti
+/// dopo, in ciclo. Il codice lo dichiarava gia' senza trarne la conseguenza
+/// (`anthropic.rs:345-348`: su billing error le `complete` restano 4xx «ma il
+/// probe modelli resta valido per il re-probe reattivo» — non e' valido: risponde
+/// a un'altra domanda).
+///
+/// Il criterio non e' «quale fornitore» ne' «quale causa»: e' se la scadenza sia
+/// un FATTO dichiarato da chi serve o una nostra stima. Contro un fatto, una
+/// misura che riguarda un'altra operazione non ha titolo; contro una stima, si'.
+pub fn il_probe_puo_liberare(state: &CooldownState) -> bool {
+    matches!(state.origine, OrigineScadenza::Stimata)
 }
 
 /// Durate di cooldown + politica di retry effettive (gia' risolte da DB o
@@ -272,12 +315,20 @@ impl CooldownManager {
             Some(s) => base.max(i64::try_from(s).unwrap_or(base)),
             None => base,
         };
-        self.mark_at(
+        // Dove il fornitore ha DETTO quando tornera', la scadenza e' un fatto suo
+        // e non una nostra stima: il probe di ripristino non ha titolo per
+        // abbreviarla (vedi `il_probe_puo_liberare`).
+        let origine = match retry_after_seconds {
+            Some(_) => OrigineScadenza::Dichiarata,
+            None => OrigineScadenza::Stimata,
+        };
+        self.mark_at_con_origine(
             provider,
             CooldownReason::Transient,
             last_error,
             Utc::now(),
             secs,
+            origine,
         );
     }
 
@@ -292,6 +343,28 @@ impl CooldownManager {
         last_error: Option<String>,
         now: DateTime<Utc>,
         duration_seconds: i64,
+    ) {
+        self.mark_at_con_origine(
+            provider,
+            reason,
+            last_error,
+            now,
+            duration_seconds,
+            OrigineScadenza::Stimata,
+        );
+    }
+
+    /// Come [`Self::mark_at`], dichiarando CHI ha stabilito la scadenza. Il
+    /// solo chiamante che passa `Dichiarata` e' quello che ha letto un
+    /// `Retry-After` dal fornitore.
+    pub fn mark_at_con_origine(
+        &self,
+        provider: &str,
+        reason: CooldownReason,
+        last_error: Option<String>,
+        now: DateTime<Utc>,
+        duration_seconds: i64,
+        origine: OrigineScadenza,
     ) {
         let until = now + chrono::Duration::seconds(duration_seconds);
         // Regola F: logghiamo nome provider e durata, MAI il payload. last_error
@@ -309,6 +382,7 @@ impl CooldownManager {
                 until,
                 reason,
                 last_error,
+                origine,
             },
         );
     }
@@ -350,6 +424,15 @@ impl CooldownManager {
             return;
         };
         handle.spawn(make_future(pool));
+    }
+
+    /// Lo stato di cooldown del provider, se ne ha uno registrato.
+    ///
+    /// Serve a chi deve decidere COME trattarlo e non solo se esiste: il probe
+    /// di ripristino ha bisogno dell'origine della scadenza (vedi
+    /// [`il_probe_puo_liberare`]).
+    pub fn state(&self, provider: &str) -> Option<CooldownState> {
+        self.states.get(provider).map(|s| s.clone())
     }
 
     /// `true` se il provider e' in cooldown rispetto all'istante corrente.
@@ -669,6 +752,20 @@ pub async fn run_recovery_pass(manager: &CooldownManager, providers: &[Arc<dyn L
         if !in_cooldown.contains(&name) {
             continue;
         }
+        // Una scadenza DICHIARATA dal fornitore non si abbrevia con un probe che
+        // misura un'altra operazione: `healthcheck()` e' un `GET /models`, che
+        // risponde anche mentre le completion sono rifiutate per quota o credito.
+        // E' il difetto misurato il 12/08/2026 (vedi `il_probe_puo_liberare`).
+        if let Some(stato) = manager.state(&name) {
+            if !il_probe_puo_liberare(&stato) {
+                tracing::debug!(
+                    provider = %name,
+                    scade_fra_s = (stato.until - Utc::now()).num_seconds().max(0),
+                    "gateway-reprobe: scadenza dichiarata dal fornitore, il probe non la abbrevia"
+                );
+                continue;
+            }
+        }
         // Probe: NON consuma crediti di generazione (e' un /models). Se torna
         // sano, il provider rientra subito.
         if provider.healthcheck().await {
@@ -980,6 +1077,54 @@ mod tests {
         // Probe eseguito una volta e provider liberato (il fix: rientro reattivo).
         assert_eq!(openai.probe_calls.load(Ordering::SeqCst), 1);
         assert!(!m.is_in_cooldown("openai"));
+    }
+
+    /// IL CASO MISURATO il 12/08/2026 su groq. Il fornitore risponde 429 con
+    /// `Retry-After`, il gateway lo legge e lo onora (fix del 10/08), e il probe
+    /// di ripristino lo cancellava perche' `GET /models` risponde: 565 secondi
+    /// di cooldown liberati dopo 170, e un nuovo 429 col medesimo Retry-After
+    /// QUATTRO SECONDI dopo. Su anthropic la stessa dinamica produceva una
+    /// quarantina di ripristini anticipati di 3000-3500s, in ciclo.
+    ///
+    /// MUTAZIONE: togliere il `continue` da `run_recovery_pass` (o far ritornare
+    /// `true` a `il_probe_puo_liberare` per `Dichiarata`) -> questo test cade
+    /// esattamente sul difetto reale: probe eseguito e cooldown sparito.
+    #[tokio::test]
+    async fn il_probe_non_abbrevia_una_scadenza_dichiarata_dal_fornitore() {
+        let m = CooldownManager::new();
+        // 429 con Retry-After: la scadenza la dichiara il fornitore.
+        m.mark_transient_after("groq", Some("429 rate_limit".into()), Some(565));
+        let groq = FakeProvider::new("groq", true); // /models risponde: e' il punto
+        let providers: Vec<Arc<dyn LlmProvider>> = vec![groq.clone()];
+
+        run_recovery_pass(&m, &providers).await;
+
+        assert_eq!(
+            groq.probe_calls.load(Ordering::SeqCst),
+            0,
+            "contro una scadenza dichiarata il probe non va nemmeno eseguito"
+        );
+        assert!(
+            m.is_in_cooldown("groq"),
+            "il Retry-After del fornitore non si abbrevia con una misura che riguarda un'altra operazione"
+        );
+    }
+
+    /// La contropartita: dove la scadenza e' una NOSTRA stima, una misura la
+    /// puo' revocare. Senza questo, il fix diventerebbe un blocco che non si
+    /// scioglie mai e il rientro reattivo sparirebbe.
+    #[tokio::test]
+    async fn una_scadenza_stimata_resta_revocabile_dal_probe() {
+        let m = CooldownManager::new();
+        // Nessun Retry-After: la durata e' la nostra.
+        m.mark_transient_after("mistral", Some("timeout".into()), None);
+        let mistral = FakeProvider::new("mistral", true);
+        let providers: Vec<Arc<dyn LlmProvider>> = vec![mistral.clone()];
+
+        run_recovery_pass(&m, &providers).await;
+
+        assert_eq!(mistral.probe_calls.load(Ordering::SeqCst), 1);
+        assert!(!m.is_in_cooldown("mistral"));
     }
 
     #[tokio::test]
