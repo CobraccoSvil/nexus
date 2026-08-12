@@ -109,7 +109,7 @@ use crate::decisions::tool_dispatch::{
     append_reminder_block, apply_run_notes, current_context_token_estimate, estimate_context_chars,
     estimate_tool_result_size_bytes, extract_returned_bytes, normalize_advisory_verdict,
     normalize_debate_position, normalize_declared_outcome, normalize_review_verdict,
-    ContextMessage, DeclarationRejected,
+    tools_schema_token_estimate, ContextMessage, DeclarationRejected,
 };
 use crate::decisions::{
     build_m16_allowed, is_tool_allowed, merge_discovered_run, Finalizzatore, M16_META_TOOLS,
@@ -750,13 +750,17 @@ impl ToolDispatchNode {
     }
 
     /// Stima del contesto corrente (token) per il predictive cap. PURO: delega a
-    /// [`current_context_token_estimate`] sui messaggi dello stato + il system.
+    /// [`current_context_token_estimate`] sui messaggi dello stato + il system,
+    /// PIU' gli schemi dei tool ([`tools_schema_token_estimate`], punto unico):
+    /// viaggiano in ogni richiesta e il cap che li ignora ammette letture che
+    /// sforano la finestra di ~24K token.
     /// I messaggi sono mappati nella forma [`ContextMessage`] (content +
     /// anthropic_content) leggendo i `Message` dello stato.
     fn predictive_tokens(&self, state: &AgentState) -> i64 {
         let msgs: Vec<ContextMessage> = state.messages.iter().map(message_to_ctx).collect();
         let system = state.system_text.as_deref().unwrap_or("");
         current_context_token_estimate(&msgs, system)
+            + tools_schema_token_estimate(state.tools_json.as_deref().unwrap_or_default())
     }
 
     /// Costruisce un tool_result SYNTHETIC d'errore (non eseguito): il `content`

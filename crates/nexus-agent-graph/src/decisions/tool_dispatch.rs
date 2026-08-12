@@ -926,6 +926,22 @@ pub fn current_context_token_estimate(messages: &[ContextMessage], system_text: 
     (total_chars as f64 / TOKEN_CHARS_DIVISOR) as i64
 }
 
+/// Token stimati degli SCHEMI dei tool: serializzazione compatta / 3.5.
+///
+/// PUNTO UNICO (regola L) del contributo degli schemi alla stima del prompt:
+/// gli schemi viaggiano in OGNI richiesta e non si comprimono, e ogni
+/// stimatore che si confronta con una soglia di finestra li somma — l'executor
+/// (`stima_overhead_turno`) e il predictive cap (`predictive_tokens`). Prima
+/// nessuno dei due li contava: ~24K token sistematicamente invisibili ai freni
+/// (95 tool, 84.445 char misurati il 12/08/2026).
+pub fn tools_schema_token_estimate(tools_json: &[Value]) -> i64 {
+    let chars: i64 = tools_json
+        .iter()
+        .map(|t| t.to_string().chars().count() as i64)
+        .sum();
+    (chars as f64 / TOKEN_CHARS_DIVISOR) as i64
+}
+
 /// Somma i char di tutti i VALUE di tipo stringa di un blocco dict (`for v in
 /// b.values(): if isinstance(v, str): total += len(v)`). 0 se il blocco non e' dict.
 fn block_string_values_chars(block: &Value) -> i64 {

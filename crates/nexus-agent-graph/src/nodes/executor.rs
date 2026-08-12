@@ -177,7 +177,8 @@ use crate::decisions::scale_reason::{
 use crate::decisions::switch_reason::SwitchReason;
 use crate::decisions::text_repetition::{detect_repetition_collapse, RepetitionThresholds};
 use crate::decisions::tool_dispatch::{
-    current_context_token_estimate, estimate_context_chars, flatten_context_text, ContextMessage,
+    current_context_token_estimate, estimate_context_chars, flatten_context_text,
+    tools_schema_token_estimate, ContextMessage, TOKEN_CHARS_DIVISOR,
 };
 use crate::decisions::turn_focus::build_turn_focus_directive;
 use crate::nodes::final_gate::FINAL_GATE_ESCALATION_KEY;
@@ -536,6 +537,17 @@ pub struct ExecutorConfig {
     /// -> comportamento BIT-IDENTICO a oggi (vincolo primario PR-B3). Tutte le
     /// soglie/flag arrivano dai settings `agent.scale.*` (mai hardcoded).
     pub scale: ScaleConfig,
+    /// `true` se al cambio-fase il dedup dei tool_result per firma e' attivo
+    /// (`agent.context.dedup_tool_results_enabled`, mig 0199). Il setting
+    /// esisteva dal primo giorno e nessun lettore lo interrogava: il dedup
+    /// girava SEMPRE e il flag DB era config morta (censimento 12/08/2026).
+    pub dedup_tool_results_enabled: bool,
+    /// Eta' massima (in messaggi) oltre cui un payload base64 NON citato viene
+    /// degradato a placeholder al cambio-fase
+    /// (`agent.context.drop_unused_base64_age`, mig 0199, valore DB 3). Era
+    /// cablato a 8 in `ctxr_drop_age()` mentre il DB dichiarava 3: due verita'
+    /// divergenti, e vinceva quella che nessun admin poteva cambiare.
+    pub drop_unused_base64_age: i64,
 }
 
 /// Config dello SCALE-CONTROLLER letta dai settings `agent.scale.*` (mig 0516).
@@ -751,6 +763,12 @@ impl Default for ExecutorConfig {
             // Default safe-DB-down = seed mig 0516 (scale OFF). Con enabled=false il
             // detector-emissione salta PRIMA di ogni lavoro -> bit-identico.
             scale: ScaleConfig::default(),
+            // Default = comportamento storico (dedup sempre attivo); il wiring
+            // mcp-core passa `agent.context.dedup_tool_results_enabled`.
+            dedup_tool_results_enabled: true,
+            // Default DB-down = il valore che il binario cablava (8), il piu'
+            // conservativo (droppa piu' tardi). In esercizio vince il DB (3).
+            drop_unused_base64_age: 8,
         }
     }
 }
@@ -1096,6 +1114,10 @@ impl ExecutorNode {
     /// iniettata conta i token REALI sul testo appiattito (stesso perimetro del
     /// char-based: `flatten_context_text`); senza, delega alla stima char/3.5
     /// storica (`current_context_token_estimate`).
+    ///
+    /// Stima la SOLA history: i consumatori sommano l'overhead fisso del turno
+    /// ([`Self::stima_overhead_turno`]) — il prompt reale e' history + system +
+    /// schemi, e le soglie che frenano si confrontano col prompt reale.
     fn estimate_history_tokens(&self, hist: &[HistoryMessage]) -> i64 {
         match &self.token_counter {
             Some(counter) => {
@@ -1104,6 +1126,33 @@ impl ExecutorNode {
             }
             None => history_token_estimator(hist),
         }
+    }
+
+    /// L'overhead FISSO del turno: system prompt + schemi dei tool, in token.
+    ///
+    /// Prima non esisteva e la stima passava system vuoto: i quattro freni
+    /// (brake, hard cap, forced-RAG, smart-upscale) giravano su un numero che
+    /// mancava sistematicamente di 7-24K token — i ~24K dei soli schemi (95
+    /// tool, 84.445 char misurati il 12/08/2026) piu' il system — quindi
+    /// frenavano tardi, e su finestre piccole (32K) erano ciechi proprio dove
+    /// gli schemi da soli sono il 75% della finestra.
+    ///
+    /// Si calcola UNA volta a inizio turno (la serializzazione degli schemi non
+    /// va ripetuta a ogni passata del brake) sul system PRE-iniezioni: le
+    /// direttive iniettate a valle valgono poche centinaia di char e non
+    /// spostano le soglie; l'errore residuo e' due ordini di grandezza sotto
+    /// quello corretto qui. Stesso divisore char/3.5 del punto unico
+    /// (`current_context_token_estimate`); con la porta TokenCounter il system
+    /// e' contato per davvero e gli schemi restano char-based (il loro testo
+    /// wire e' la serializzazione compatta, che e' esattamente cio' che si
+    /// misura qui).
+    fn stima_overhead_turno(&self, system_text: &str, tools_json: &[Value]) -> i64 {
+        let schema_tokens = tools_schema_token_estimate(tools_json);
+        let system_tokens = match &self.token_counter {
+            Some(counter) => counter.count(system_text),
+            None => (system_text.chars().count() as f64 / TOKEN_CHARS_DIVISOR) as i64,
+        };
+        system_tokens + schema_tokens
     }
 }
 
@@ -3047,8 +3096,12 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
         // [`ModelUpscalePort`] (best-effort, fail-open). Riassegna provider/model
         // del turno (la risoluzione provider e' gia' avvenuta sopra). Niente switch
         // se la porta non promuove (parita' col Python: `_upscale_result is None`).
+        //
+        // L'overhead FISSO del turno (system + schemi) entra in TUTTE le stime a
+        // valle: i freni si confrontano col prompt REALE, non con la sola history.
+        let overhead_turno = self.stima_overhead_turno(&system_text, &tools_json);
         let effective_window = self
-            .smart_upscale_modello(&hist, &mut provider, &mut model)
+            .smart_upscale_modello(&hist, &mut provider, &mut model, overhead_turno)
             .await;
 
         // Token brake (py:2836) + hard cap post-brake (ADR 0016 fase D2): corpi
@@ -3066,6 +3119,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
                     iters_in,
                     effective_window,
                 },
+                overhead_turno,
             )
             .await
         {
@@ -3075,7 +3129,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
         // Iniezioni system_text (P3, idempotenti) nell'ordine del Python +
         // forced_rag_reminder sulla history (py:2907-2911).
         self.inietta_direttive_system(&mut system_text, state);
-        let rag_est = self.estimate_history_tokens(&hist);
+        let rag_est = self.estimate_history_tokens(&hist) + overhead_turno;
         let (hist_rag, _) = ctxr::inject_forced_rag_reminder(
             &hist,
             &system_text,
@@ -3113,9 +3167,14 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
         // resta true nel contesto). La precedenza stallo (FIX-E) usa il solo
         // segnale disponibile pre-LLM: `detect_recent_tool_error` (l'ultimo
         // tool_result e' errore -> asse stallo attivo, niente scale questo turno).
-        if let Some(delta) =
-            self.emetti_scale_reason(state, iters_in, &messages, &hist, effective_window)
-        {
+        if let Some(delta) = self.emetti_scale_reason(
+            state,
+            iters_in,
+            &messages,
+            &hist,
+            effective_window,
+            overhead_turno,
+        ) {
             return Ok(delta);
         }
 
@@ -6342,8 +6401,9 @@ modello piu' capace.",
         hist: &[HistoryMessage],
         provider: &mut String,
         model: &mut String,
+        overhead_turno: i64,
     ) -> i64 {
-        let upscale_est_tokens = self.estimate_history_tokens(hist);
+        let upscale_est_tokens = self.estimate_history_tokens(hist) + overhead_turno;
         let upscale_window = self.upscale.context_window(model).await.unwrap_or(0);
         let mut effective_window = self.cfg.context_window;
         if !should_upscale(self.cfg.upscale_enabled, upscale_est_tokens, upscale_window) {
@@ -6381,16 +6441,20 @@ modello piu' capace.",
         messages: &[Message],
         eff_token_brake: &TokenBrakeConfig,
         turno: CoppiaTurno<'_>,
+        overhead_turno: i64,
     ) -> Option<OpaqueDelta> {
         if turno.effective_window > 0 {
+            // La stima passata al brake comprende l'overhead fisso: il brake
+            // comprime la history, ma la soglia si confronta col prompt intero
+            // (system + schemi viaggiano in OGNI richiesta e non si comprimono).
             *hist = ctxr::apply_token_brake(
                 hist,
                 turno.effective_window,
                 eff_token_brake,
-                &|h: &[HistoryMessage]| self.estimate_history_tokens(h),
+                &|h: &[HistoryMessage]| self.estimate_history_tokens(h) + overhead_turno,
             );
         }
-        self.gate_hard_cap_contesto(state, ctx, hist, messages, turno)
+        self.gate_hard_cap_contesto(state, ctx, hist, messages, turno, overhead_turno)
             .await
     }
 
@@ -6458,11 +6522,12 @@ modello piu' capace.",
         hist: &[HistoryMessage],
         messages: &[Message],
         turno: CoppiaTurno<'_>,
+        overhead_turno: i64,
     ) -> Option<OpaqueDelta> {
         if self.cfg.hard_cap_ratio <= 0.0 {
             return None;
         }
-        let post_brake_est = self.estimate_history_tokens(hist);
+        let post_brake_est = self.estimate_history_tokens(hist) + overhead_turno;
         if !ctxr::check_hard_cap(
             post_brake_est,
             turno.effective_window,
@@ -6647,12 +6712,13 @@ della finestra {effective_window} del modello {provider}/{model}"
         messages: &[Message],
         hist: &[HistoryMessage],
         effective_window: i64,
+        overhead_turno: i64,
     ) -> Option<OpaqueDelta> {
         if !self.cfg.scale.enabled {
             return None;
         }
         let scale_stall_active = detect_recent_tool_error(messages, 4);
-        let scale_est_tokens = self.estimate_history_tokens(hist);
+        let scale_est_tokens = self.estimate_history_tokens(hist) + overhead_turno;
         self.maybe_scale_reason_delta(
             state,
             iters_in,
@@ -6680,8 +6746,10 @@ della finestra {effective_window} del modello {provider}/{model}"
         let mut cutoff_gen = CutoffGenerazione::default();
         let mut hist = hist;
         if fase.phase_now > prev_phase {
-            hist = ctxr::dedup_tool_results_history(&hist);
-            hist = ctxr::drop_unused_base64_payloads(&hist, ctxr_drop_age(), 2);
+            if self.cfg.dedup_tool_results_enabled {
+                hist = ctxr::dedup_tool_results_history(&hist);
+            }
+            hist = ctxr::drop_unused_base64_payloads(&hist, self.cfg.drop_unused_base64_age, 2);
             if fase.eff_rolling_enabled {
                 hist = self
                     .applica_rolling_summary(hist, fase.eff_rolling_keep, run_id, fase.phase_now)
@@ -10135,12 +10203,6 @@ fn history_to_context(m: &HistoryMessage) -> ContextMessage {
     }
 }
 
-/// Età massima per il drop dei base64 (`drop_unused_base64_age`). DB-driven nel
-/// Python (`_load_ctx_mgmt_config`); qui il safe-default documentato (mig 0199).
-/// TODO: portarlo nella `ExecutorConfig` quando il wiring mcp-core lo richiedera'.
-fn ctxr_drop_age() -> i64 {
-    8
-}
 
 #[cfg(test)]
 mod tests;

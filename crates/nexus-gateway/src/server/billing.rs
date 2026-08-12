@@ -30,7 +30,10 @@ use crate::types::{LedgerOutcome, LlmRequest, LlmResponse, MessageContent};
 // e costruisce `MediaUsage`, e deve vedere gli STESSI tipi che il ledger scrive.
 pub use nexus_ledger::{MediaKind, MediaUsage, QuantitySource, QuotaExceeded};
 
-/// Stima i token di input dai messaggi (char/4, parita' col server.ts).
+/// Stima i token di input dai messaggi (char/4, parita' col server.ts) PIU'
+/// gli schemi dei tool: viaggiano nel prompt di ogni chiamata agentica (~24K
+/// token misurati il 12/08/2026 sul catalogo pieno) e ignorarli faceva
+/// sottostimare la quota preventiva proprio della voce piu' grossa.
 pub fn estimate_prompt_tokens(req: &LlmRequest) -> i64 {
     let chars: usize = req
         .messages
@@ -41,8 +44,20 @@ pub fn estimate_prompt_tokens(req: &LlmRequest) -> i64 {
             MessageContent::Blocks(_) => 0,
         })
         .sum();
+    // Gli schemi contano per la loro serializzazione compatta: e' il testo che
+    // il wire trasporta davvero.
+    let schema_chars: usize = req
+        .tools
+        .as_ref()
+        .map(|tools| {
+            tools
+                .iter()
+                .map(|t| serde_json::to_string(t).map(|s| s.len()).unwrap_or(0))
+                .sum()
+        })
+        .unwrap_or(0);
     // Ceil division per 4 (parita' con Math.ceil(chars/4) del server.ts).
-    ((chars as i64) + 3) / 4
+    ((chars as i64) + (schema_chars as i64) + 3) / 4
 }
 
 /// Come si stima il consumo ai fini della quota.
@@ -360,6 +375,37 @@ mod tests {
         assert_eq!(estimate_prompt_tokens(&req(vec!["1234", "5678"], None)), 2);
         // vuoto -> 0.
         assert_eq!(estimate_prompt_tokens(&req(vec![""], None)), 0);
+    }
+
+    /// Gli schemi dei tool sono parte del prompt che il wire trasporta: la
+    /// stima li conta per la loro serializzazione. Prima venivano ignorati e
+    /// la quota preventiva sottostimava proprio la voce piu' grossa del prompt
+    /// agentico (~24K token di catalogo pieno).
+    #[test]
+    fn la_stima_conta_anche_gli_schemi_dei_tool() {
+        let mut r = req(vec!["12345678"], None); // 8 char -> 2 token da soli
+        let base = estimate_prompt_tokens(&r);
+        assert_eq!(base, 2);
+
+        let tool = crate::types::LlmToolDefinition {
+            kind: "function".into(),
+            function: crate::types::ToolFunctionDef {
+                name: "tool_verboso".into(),
+                description: Some("d".repeat(400)),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: None,
+            },
+        };
+        // Il contributo atteso viene dalla STESSA serializzazione usata dalla
+        // stima (serde_json), non da un conteggio ricopiato a mano.
+        let schema_chars = serde_json::to_string(&tool).expect("serializzabile").len();
+        r.tools = Some(vec![tool]);
+        let con_schemi = estimate_prompt_tokens(&r);
+        assert_eq!(con_schemi, ((8 + schema_chars as i64) + 3) / 4);
+        assert!(
+            con_schemi > base + 100,
+            "uno schema da ~400 char di descrizione deve pesare (letto {con_schemi})"
+        );
     }
 
     #[test]

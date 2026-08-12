@@ -3804,6 +3804,69 @@ async fn hard_cap_termina_il_run_senza_chiamare_llm() {
 }
 
 #[tokio::test]
+async fn la_stima_dei_freni_conta_system_e_schemi() {
+    // Il prompt reale e' history + system + schemi: system e schemi viaggiano
+    // in OGNI richiesta e non si comprimono. Qui la HISTORY e' minuscola
+    // (~1 token) e il contesto oltre soglia sta TUTTO nel system (2000 char
+    // ~571 token) e negli schemi (2000+ char di JSON): con la stima vecchia
+    // (system vuoto, schemi ignorati) il gate non vedeva niente e la chiamata
+    // partiva cieca verso il 400 del provider.
+    //
+    // MUTAZIONE: togliendo `overhead_turno` dalla stima di
+    // `gate_hard_cap_contesto` (o azzerando `stima_overhead_turno`), la stima
+    // torna ~1 token e questo test fallisce con l'LLM chiamato.
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::default());
+    let billing = Arc::new(StubBillingCooldownPort::default());
+    let upscale = Arc::new(StubModelUpscalePort::default());
+    let cfg = ExecutorConfig {
+        routing_provider: "anthropic".to_string(),
+        routing_model: "claude-x".to_string(),
+        context_window: 100,
+        hard_cap_ratio: 0.95,
+        overflow_message_template:
+            "Contesto stimato %ESTIMATED_TOKENS% token oltre la finestra %MAX_WINDOW%.".to_string(),
+        ..ExecutorConfig::default()
+    };
+    let (n, meta) = node_ports(cfg, rc, next_actions, billing, upscale);
+    let llm = Arc::new(StubLlmGateway::with_text("MAI CHIAMATO"));
+    let ctx = ctx_with(llm.clone());
+    // History minuscola; il peso sta nel SYSTEM e negli SCHEMI.
+    let system_grande = "s".repeat(2000); // ~571 token a char/3.5
+    let schema_grande = json!({
+        "name": "tool_verboso",
+        "description": "d".repeat(1500),
+        "input_schema": {"type": "object", "properties": {"campo": {"type": "string"}}}
+    });
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("ciao")],
+        action_oriented: Some(false),
+        system_text: Some(system_grande),
+        tools_json: Some(vec![schema_grande]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::Error));
+    assert_eq!(
+        out.extra.get("error_class").and_then(|v| v.as_str()),
+        Some("context_overflow")
+    );
+    assert!(
+        llm.seen.lock().unwrap().is_empty(),
+        "con system+schemi oltre soglia la chiamata NON deve partire"
+    );
+    let metas = meta.meta_steps.lock().unwrap();
+    assert!(
+        metas
+            .iter()
+            .any(|m| m.get("kind").and_then(|k| k.as_str()) == Some("context_overflow")),
+        "meta_step context_overflow atteso"
+    );
+}
+
+#[tokio::test]
 async fn hard_cap_inerte_con_ratio_default() {
     // Default safe-DB-down (`hard_cap_ratio=0.0`): gate spento, il run procede
     // e l'LLM viene chiamato anche con contesto oltre la window.

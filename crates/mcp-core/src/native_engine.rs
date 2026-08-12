@@ -2397,6 +2397,22 @@ async fn load_executor_config(
             .await;
             resolve_prompt_template(db, &key).await.unwrap_or_default()
         },
+        // Wiring delle due chiavi della mig 0199 rimaste senza lettore per tutta
+        // la loro vita (censimento 12/08/2026): il dedup diventa governabile e
+        // l'eta' del drop base64 torna a UNA verita' — quella del DB (3), non
+        // quella cablata nel binario (8).
+        dedup_tool_results_enabled: setting_bool(
+            db,
+            "agent.context.dedup_tool_results_enabled",
+            d.dedup_tool_results_enabled,
+        )
+        .await,
+        drop_unused_base64_age: setting_i64(
+            db,
+            "agent.context.drop_unused_base64_age",
+            d.drop_unused_base64_age,
+        )
+        .await,
         ..ExecutorConfig::default()
     }
 }
