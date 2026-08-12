@@ -561,6 +561,14 @@ const {{ chromium }} = require('playwright');
 /// avviso di libreria no.
 const ASCOLTATORI: &str = r#"
     await page.addInitScript(() => {
+      // Questa funzione viene serializzata ed eseguita DENTRO LA PAGINA: le
+      // costanti del processo Node qui non esistono, e usarle produce un
+      // `ReferenceError` che il criterio riporterebbe come difetto della pagina
+      // osservata — cioe' la misura inventerebbe un guasto suo. Misurato in
+      // esercizio il 12/08/2026, subito dopo averle estratte.
+      const CAP_TESTO = 500;
+      const CAP_PERCORSO = 300;
+      const CAP_CLASSE = 60;
       window.__nexusEcc = [];
       window.addEventListener('error', (ev) => {
         // Le RISORSE fallite (una <img> 404) usano lo STESSO evento, e senza
@@ -806,6 +814,25 @@ mod tests {
             "addInitScript dopo il goto non verrebbe eseguito"
         );
         assert!(s.contains("if (!ev || !ev.message) return;"), "filtro sulle risorse fallite");
+        // Cio' che gira DENTRO la pagina non vede le costanti del processo Node.
+        // MISURATO in esercizio il 12/08/2026: `ReferenceError: CAP_TESTO is not
+        // defined` riportato dal criterio come difetto della pagina osservata —
+        // la misura si era inventata un guasto suo. Il test guarda la porzione
+        // di script che il browser riceve, non l'intero file.
+        let init = s
+            .split("addInitScript")
+            .nth(1)
+            .and_then(|d| d.split("page.on('console'").next())
+            .expect("corpo dell'init script");
+        for c in ["CAP_TESTO", "CAP_PERCORSO", "CAP_CLASSE"] {
+            if init.contains(c) {
+                assert!(
+                    init.contains(&format!("const {c} =")),
+                    "{c} e' usata nella pagina ma dichiarata solo in Node: \
+                     produrrebbe un ReferenceError attribuito al progetto osservato"
+                );
+            }
+        }
         assert!(s.contains("ev.lineno"), "la riga entra nel payload");
         assert!(s.contains("ev.colno"), "la colonna entra nel payload");
         // La fusione dei due canali viene DOPO l'attesa: un'eccezione lanciata a
