@@ -85,6 +85,40 @@ macro_rules! sql_quote_attive {
 const SQL_QUOTE_ATTIVE: &str = sql_quote_attive!("");
 const SQL_QUOTE_ATTIVE_LOCK: &str = sql_quote_attive!(" FOR UPDATE");
 
+/// Il consumo che le quote leggono. Costante (non testo inline) perche' il
+/// filtro sulle righe `discarded` deve restare allineato al criterio
+/// [`crate::DiscardReason::consuma_quota`]: il test
+/// `il_filtro_quota_nomina_le_stesse_cause_del_criterio` confronta questo testo
+/// con l'enum, variante per variante.
+const SQL_USAGE_FOR_QUOTAS: &str = r#"
+        WITH q AS (
+            SELECT * FROM UNNEST(
+                $1::int[], $2::text[], $3::uuid[], $4::uuid[],
+                $5::timestamptz[], $6::timestamptz[]
+            ) AS t(idx, scope_type, user_id, project_id, valid_from, valid_to)
+        )
+        SELECT
+            q.idx AS idx,
+            COALESCE(SUM(l.total_tokens), 0)::bigint AS tokens,
+            COALESCE(SUM(l.total_cost), 0)::float8 AS cost
+        FROM q
+        LEFT JOIN ai_usage_ledger l
+            ON (
+                l.status IN ('reserved', 'finalized')
+                OR (l.status = 'discarded' AND l.discard_reason = 'degenerate_hollow')
+              )
+           AND l.created_at >= q.valid_from
+           AND l.created_at < q.valid_to
+           AND (
+                (q.scope_type = 'user' AND l.user_id = q.user_id)
+             OR (q.scope_type = 'project' AND l.project_id = q.project_id)
+             OR (q.scope_type = 'user_project'
+                 AND l.user_id = q.user_id AND l.project_id = q.project_id)
+           )
+        GROUP BY q.idx
+        ORDER BY q.idx
+        "#;
+
 /// I vincoli attivi adesso per questa identita'.
 ///
 /// L'ordine e' deterministico (`scope_type`) perche' e' quello che decide QUALE
@@ -163,6 +197,13 @@ impl ScopeArrays {
 /// DOPO che e' avvenuta. Cio' che NON deve contare e' una prenotazione
 /// RILASCIATA: e' denaro che nessuno ha speso, ed e' per questo che
 /// [`crate::release`] azzera gli importi invece di limitarsi a cambiare stato.
+///
+/// Delle righe `discarded` (mig 0701) contano SOLO quelle la cui causa ha un
+/// usage osservato: il criterio e' [`crate::DiscardReason::consuma_quota`]
+/// (punto unico, regola L) e il filtro qui sotto ne nomina le cause una a una —
+/// il test `il_filtro_quota_nomina_le_stesse_cause_del_criterio` tiene insieme
+/// le due meta'. Una risposta degenere e' spesa reale fatturata dal provider;
+/// un timeout non ha token misurati e non sposta nulla.
 pub async fn usage_for_quotas<'e, E>(exec: E, quotas: &[QuotaPolicy]) -> Result<Vec<Consumption>>
 where
     E: PgExecutor<'e>,
@@ -172,33 +213,7 @@ where
     }
     let a = ScopeArrays::from_quotas(quotas);
 
-    let rows = sqlx::query(
-        r#"
-        WITH q AS (
-            SELECT * FROM UNNEST(
-                $1::int[], $2::text[], $3::uuid[], $4::uuid[],
-                $5::timestamptz[], $6::timestamptz[]
-            ) AS t(idx, scope_type, user_id, project_id, valid_from, valid_to)
-        )
-        SELECT
-            q.idx AS idx,
-            COALESCE(SUM(l.total_tokens), 0)::bigint AS tokens,
-            COALESCE(SUM(l.total_cost), 0)::float8 AS cost
-        FROM q
-        LEFT JOIN ai_usage_ledger l
-            ON l.status IN ('reserved', 'finalized')
-           AND l.created_at >= q.valid_from
-           AND l.created_at < q.valid_to
-           AND (
-                (q.scope_type = 'user' AND l.user_id = q.user_id)
-             OR (q.scope_type = 'project' AND l.project_id = q.project_id)
-             OR (q.scope_type = 'user_project'
-                 AND l.user_id = q.user_id AND l.project_id = q.project_id)
-           )
-        GROUP BY q.idx
-        ORDER BY q.idx
-        "#,
-    )
+    let rows = sqlx::query(SQL_USAGE_FOR_QUOTAS)
     .bind(&a.idxs)
     .bind(&a.scope_types)
     .bind(&a.user_ids)
@@ -418,6 +433,25 @@ mod tests {
             cost_limit,
             valid_from: Utc::now() - Duration::hours(1),
             valid_to: Utc::now() + Duration::hours(1),
+        }
+    }
+
+    /// Il filtro SQL della quota e il criterio `consuma_quota` sono due meta'
+    /// della stessa decisione (regola L): questo test le tiene insieme,
+    /// variante per variante. Aggiungere una causa che consuma senza nominarla
+    /// nella SQL (o viceversa) rosseggia qui, non in produzione.
+    #[test]
+    fn il_filtro_quota_nomina_le_stesse_cause_del_criterio() {
+        for reason in crate::scrittura::DISCARD_REASONS {
+            let nominata = SQL_USAGE_FOR_QUOTAS.contains(reason.as_str());
+            assert_eq!(
+                nominata,
+                reason.consuma_quota(),
+                "discard_reason '{}': consuma_quota()={} ma il filtro SQL {} la nomina",
+                reason.as_str(),
+                reason.consuma_quota(),
+                if nominata { "" } else { "NON" },
+            );
         }
     }
 

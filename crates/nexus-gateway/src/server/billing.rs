@@ -168,6 +168,84 @@ pub async fn record_and_declare(db: &PgPool, req: &LlmRequest, resp: &mut LlmRes
     resp.ledger = Some(outcome);
 }
 
+/// Un tentativo verso un provider CONSUMATO ma la cui risposta non e' diventata
+/// la risposta della richiesta (mig 0701): inference avvenuta — o probabilmente
+/// avvenuta — e output buttato mentre la chain passava oltre.
+///
+/// `run_fallback`/`complete_with_retry` li ACCUMULANO (loro sanno cosa e' stato
+/// scartato ma non hanno il database) e il chiamante della pipeline li scrive
+/// con [`record_discarded_attempts`] — sia sul percorso di successo sia quando
+/// l'intera chain fallisce, perche' gli scarti sono spesa a prescindere
+/// dall'esito finale.
+#[derive(Debug, Clone)]
+pub struct TentativoScartato {
+    pub provider: String,
+    pub model: String,
+    pub reason: nexus_ledger::DiscardReason,
+    /// `Some` = usage osservato dal wire (risposta degenere: il provider ha
+    /// fatturato davvero); `None` = nessuna risposta osservata (cap
+    /// per-tentativo scaduto), e la riga resta a zero per dichiarazione.
+    pub usage: Option<crate::types::LlmUsage>,
+}
+
+impl TentativoScartato {
+    /// Risposta degenere: la causa e l'usage nascono INSIEME, cosi' una
+    /// degenere senza usage non e' rappresentabile dal costruttore.
+    pub fn degenere(provider: &str, model: &str, usage: crate::types::LlmUsage) -> Self {
+        Self {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            reason: nexus_ledger::DiscardReason::DegenerateHollow,
+            usage: Some(usage),
+        }
+    }
+
+    /// Cap per-tentativo scaduto dopo l'avvio: nessun usage osservato.
+    pub fn timeout(provider: &str, model: &str) -> Self {
+        Self {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            reason: nexus_ledger::DiscardReason::AttemptTimeout,
+            usage: None,
+        }
+    }
+}
+
+/// Scrive nel ledger i tentativi scartati della richiesta (best-effort).
+///
+/// Stesso contratto d'identita' di [`record_usage_to_ledger`]: senza
+/// `tenant_id`/`user_id` utilizzabili il ledger non scrive MAI — ma qui il
+/// silenzio si DICE, perche' e' spesa reale che nessun report vedra'.
+pub async fn record_discarded_attempts(
+    db: &PgPool,
+    req: &LlmRequest,
+    scarti: &[TentativoScartato],
+) {
+    if scarti.is_empty() {
+        return;
+    }
+    let Some(identity) = identita(req) else {
+        tracing::warn!(
+            scarti = scarti.len(),
+            "gateway-ledger: tentativi scartati NON registrati, identita' assente o non-UUID"
+        );
+        return;
+    };
+    for s in scarti {
+        nexus_ledger::record_discarded(
+            db,
+            identity,
+            &s.provider,
+            &s.model,
+            s.reason,
+            s.usage.map(|u| token_usage_from(&u)).as_ref(),
+            &req.metadata.request_id,
+            &req.metadata.feature,
+        )
+        .await;
+    }
+}
+
 /// Registra il consumo di una chiamata non-testuale.
 ///
 /// Il fallimento dell'identita' si DICE: quando scatta, un consumo reale resta
@@ -609,6 +687,86 @@ mod tests {
             entry.total_cost,
             riga.get::<f64, _>("total_cost")
         );
+    }
+
+    /// La giuntura degli SCARTI (mig 0701): dai tentativi accumulati dalla
+    /// chain alle righe `discarded`, per la strada della produzione
+    /// (`record_discarded_attempts` -> `nexus_ledger::record_discarded`) e
+    /// rilette dallo schema vero.
+    ///
+    /// La degenere porta l'usage del wire (convertito dallo STESSO
+    /// `token_usage_from` delle righe finalized: prompt LORDO, cache come
+    /// dettaglio) e un costo scorporato; il timeout resta a zero con la causa.
+    /// Nessuna delle due righe viene DICHIARATA sulla risposta: il contratto
+    /// anti-doppio-addebito non cambia.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn gli_scarti_diventano_righe_discarded(pool: PgPool) {
+        let (user, project, run) = seed_identita(&pool).await;
+        seed_listino(&pool).await;
+
+        let scarti = vec![
+            TentativoScartato {
+                provider: "anthropic".into(),
+                model: "claude-x".into(),
+                reason: nexus_ledger::DiscardReason::DegenerateHollow,
+                usage: Some(crate::types::LlmUsage::normalized(
+                    crate::types::PromptCacheReporting::CachedReportedSeparately,
+                    100_000,
+                    0,
+                    Some(900_000),
+                    None,
+                    crate::types::ReasoningTokens::IncludedInOutput,
+                )),
+            },
+            TentativoScartato {
+                provider: "anthropic".into(),
+                model: "claude-x".into(),
+                reason: nexus_ledger::DiscardReason::AttemptTimeout,
+                usage: None,
+            },
+        ];
+        record_discarded_attempts(&pool, &req_con_identita(project, user, run), &scarti).await;
+
+        let righe = sqlx::query(
+            "SELECT discard_reason, status, prompt_tokens, cache_read_tokens, \
+                    total_cost::float8 AS total_cost, user_id, run_id \
+               FROM ai_usage_ledger ORDER BY discard_reason",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("lettura righe");
+        assert_eq!(righe.len(), 2, "una riga per scarto, nessuna finalized");
+
+        let timeout = &righe[0]; // attempt_timeout < degenerate_hollow
+        assert_eq!(timeout.get::<String, _>("status"), "discarded");
+        assert_eq!(
+            timeout.get::<String, _>("discard_reason"),
+            "attempt_timeout"
+        );
+        assert_eq!(timeout.get::<i32, _>("prompt_tokens"), 0);
+
+        let degenere = &righe[1];
+        assert_eq!(
+            degenere.get::<String, _>("discard_reason"),
+            "degenerate_hollow"
+        );
+        // Wire Anthropic al netto (100k + 900k cache): la riga porta il LORDO,
+        // come ogni riga vera — e' lo stesso `token_usage_from`.
+        assert_eq!(degenere.get::<i32, _>("prompt_tokens"), 1_000_000);
+        assert_eq!(degenere.get::<i64, _>("cache_read_tokens"), 900_000);
+        // 100k a 3.0 + 900k a 0.3 = 0.57: costo scorporato, non zero.
+        assert!((degenere.get::<f64, _>("total_cost") - 0.57).abs() < 1e-9);
+        // Identita' e correlazione al run, come le righe vere.
+        assert_eq!(degenere.get::<Uuid, _>("user_id"), user);
+        assert_eq!(degenere.get::<Option<Uuid>, _>("run_id"), Some(run));
+
+        // Senza identita' non si scrive nulla (stesso contratto del resto).
+        record_discarded_attempts(&pool, &req(vec!["ciao"], None), &scarti).await;
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ai_usage_ledger")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 2, "identita' assente: nessuna riga nuova");
     }
 
     /// La domanda che decide se rilasciare una prenotazione e' "il gateway ha

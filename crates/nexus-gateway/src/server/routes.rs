@@ -49,8 +49,8 @@ use crate::types::{
 };
 
 use super::billing::{
-    enforce_quota, record_and_declare, record_media_usage_to_ledger, record_usage_to_ledger,
-    MediaKind, MediaUsage, QuotaEstimate, QuotaExceeded,
+    enforce_quota, record_and_declare, record_discarded_attempts, record_media_usage_to_ledger,
+    record_usage_to_ledger, MediaKind, MediaUsage, QuotaEstimate, QuotaExceeded, TentativoScartato,
 };
 use nexus_pricing::UsageUnit;
 use nexus_types::error_presentation::{render_user_error, ErrorDomain, ErrorFacts};
@@ -560,15 +560,23 @@ async fn run_complete(
     // risolto, nessuno swap possibile) si RITENTA lo stesso modello sui
     // transitori e si attende un cooldown breve invece di fallire subito.
     let strict = req.pin_provider.is_some();
-    let mut response = run_fallback(
+    // Tentativi CONSUMATI e scartati lungo la chain (degeneri, cap scaduti):
+    // si registrano nel ledger QUALUNQUE sia l'esito finale, perche' sono
+    // spesa a prescindere — per questo l'errore si propaga solo DOPO la
+    // scrittura (mig 0701).
+    let mut scarti: Vec<TentativoScartato> = Vec::new();
+    let esito_chain = run_fallback(
         &resolved,
         &state.cooldown,
         &redacted_req,
         strict,
         timeouts.per_attempt,
         deadline,
+        &mut scarti,
     )
-    .await?;
+    .await;
+    record_discarded_attempts(&state.db, req, &scarti).await;
+    let mut response = esito_chain?;
 
     // Reidratazione post-flight: ripristina gli originali nei placeholder.
     response = pipeline.rehydrate(&response, &mut map);
@@ -731,6 +739,7 @@ async fn run_fallback(
     strict: bool,
     per_attempt: std::time::Duration,
     deadline: tokio::time::Instant,
+    scarti: &mut Vec<TentativoScartato>,
 ) -> Result<LlmResponse, PipelineError> {
     let mut failures: Vec<ProviderFailure> = Vec::new();
     let policy = cooldown.retry_policy();
@@ -803,6 +812,7 @@ async fn run_fallback(
             strict,
             per_attempt,
             deadline,
+            scarti,
         )
         .await
         {
@@ -1031,6 +1041,7 @@ async fn complete_with_retry(
     strict: bool,
     per_attempt: std::time::Duration,
     deadline: tokio::time::Instant,
+    scarti: &mut Vec<TentativoScartato>,
 ) -> Result<LlmResponse, CallFailure> {
     let max_attempts = if strict { policy.max_attempts.max(1) } else { 1 };
     let mut attempt = 0u32;
@@ -1093,6 +1104,12 @@ async fn complete_with_retry(
                     attempt,
                     "gateway: cap per-tentativo scaduto -> transient, passo oltre"
                 );
+                // Tentativo AVVIATO e mai risposto: il provider puo' aver
+                // generato (e fatturato) comunque. Nessun usage osservato ->
+                // riga a zero con la causa dichiarata (mig 0701). Il budget
+                // esaurito PRIMA di tentare (sopra) invece non scarta nulla:
+                // nessuna chiamata e' partita.
+                scarti.push(TentativoScartato::timeout(name, &req.model));
                 let failure = CallFailure::attempt_timeout(attempt_cap);
                 cooldown.mark_transient(name, Some(failure.message.clone()));
                 return Err(failure);
@@ -1120,6 +1137,10 @@ async fn complete_with_retry(
                         "gateway: risposta degenere (content vuoto, zero tool-call, \
                          finish non terminale) -> failure empty_completion, passo oltre"
                     );
+                    // L'inference e' avvenuta e il provider l'ha fatturata:
+                    // l'usage REALE dal wire va nel ledger come 'discarded'
+                    // (mig 0701), o questa spesa non la vede nessuna query.
+                    scarti.push(TentativoScartato::degenere(name, &resp.model_used, resp.usage));
                     return Err(CallFailure::empty_completion(&resp.finish_reason));
                 }
                 return Ok(resp);
@@ -2695,6 +2716,11 @@ mod tests {
         /// Non risponde mai: simula la chiamata APPESA che ha originato il fix
         /// (misurata sul campo: 197s senza alcun log, con le figure ferme).
         Hang,
+        /// Risposta 200 DEGENERE: content vuoto, zero tool-call, finish
+        /// "length", ma con un usage REALE — la forma della degenerazione da
+        /// budget (Gemini col tetto consumato dal thinking). Il provider l'ha
+        /// fatturata: e' il caso che la mig 0701 mette a ledger.
+        Degenerate,
     }
 
     struct FakeProvider {
@@ -2941,6 +2967,26 @@ mod tests {
                 }
                 .into()),
                 Behaviour::Hang => unreachable!("Behaviour::Hang: il sleep precede il match"),
+                Behaviour::Degenerate => Ok(LlmResponse {
+                    content: String::new(),
+                    tool_calls: None,
+                    usage: LlmUsage {
+                        input_tokens: 1_000,
+                        output_tokens: 5,
+                        cache_read_tokens: Some(600),
+                        cache_creation_tokens: None,
+                        reasoning_tokens: None,
+                    },
+                    model_used: req.model.clone(),
+                    provider_used: self.name.clone(),
+                    latency_ms: 0,
+                    finish_reason: "length".into(),
+                    privacy_rerouted: None,
+                    reasoning: None,
+                    thinking_signature: None,
+                    citations: None,
+                    ledger: None,
+                }),
                 Behaviour::ErrHistoryUntilSanitized => {
                     // Corpo VERBATIM di Anthropic quando la history porta una
                     // firma di thinking che il turno non ammette: il codice
@@ -3011,7 +3057,9 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
-                Behaviour::Hang => unreachable!("Behaviour::Hang: usato solo da complete"),
+                Behaviour::Hang | Behaviour::Degenerate => {
+                    unreachable!("Behaviour usato solo da complete")
+                }
                 Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
                     anyhow::bail!("HTTP 400 invalid_request: bad field")
                 }
@@ -3033,7 +3081,9 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
-                Behaviour::Hang => unreachable!("Behaviour::Hang: usato solo da complete"),
+                Behaviour::Hang | Behaviour::Degenerate => {
+                    unreachable!("Behaviour usato solo da complete")
+                }
                 Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
                     anyhow::bail!("HTTP 400 invalid_request: bad field")
                 }
@@ -3053,7 +3103,9 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
-                Behaviour::Hang => unreachable!("Behaviour::Hang: usato solo da complete"),
+                Behaviour::Hang | Behaviour::Degenerate => {
+                    unreachable!("Behaviour usato solo da complete")
+                }
                 Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
                     anyhow::bail!("HTTP 400 invalid_request: bad field")
                 }
@@ -3077,7 +3129,9 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
-                Behaviour::Hang => unreachable!("Behaviour::Hang: usato solo da complete"),
+                Behaviour::Hang | Behaviour::Degenerate => {
+                    unreachable!("Behaviour usato solo da complete")
+                }
                 Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
                     anyhow::bail!("HTTP 400 invalid_request: bad field")
                 }
@@ -3201,7 +3255,7 @@ mod tests {
             model: "gpt-x".into(),
         }];
         let cooldown = CooldownManager::new();
-        let resp = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline()).await.unwrap();
+        let resp = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new()).await.unwrap();
         assert_eq!(resp.provider_used, "openai");
         assert_eq!(resp.model_used, "gpt-x");
     }
@@ -3250,7 +3304,7 @@ mod tests {
             },
         ];
         let cooldown = CooldownManager::new();
-        let resp = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline()).await.unwrap();
+        let resp = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new()).await.unwrap();
         assert_eq!(resp.provider_used, "mistral");
         assert!(cooldown.is_in_cooldown("openai"));
     }
@@ -3266,7 +3320,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
+        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .unwrap();
         assert_eq!(resp.provider_used, "google");
@@ -3285,7 +3339,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
+        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .err()
             .unwrap();
@@ -3305,7 +3359,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
+        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .err()
             .unwrap();
@@ -3325,7 +3379,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
+        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .err()
             .unwrap();
@@ -3372,6 +3426,7 @@ mod tests {
             true,
             TEST_PER_ATTEMPT,
             far_deadline(),
+            &mut Vec::new(),
         )
         .await
         .unwrap();
@@ -3448,6 +3503,7 @@ mod tests {
             true,
             TEST_PER_ATTEMPT,
             far_deadline(),
+            &mut Vec::new(),
         )
         .await
         .err()
@@ -3482,7 +3538,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
+        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .err()
             .unwrap();
@@ -3588,6 +3644,7 @@ mod tests {
             false,
             TEST_PER_ATTEMPT,
             far_deadline(),
+            &mut Vec::new(),
         )
         .await
         .err()
@@ -3654,6 +3711,7 @@ mod tests {
             false,
             TEST_PER_ATTEMPT,
             far_deadline(),
+            &mut Vec::new(),
         )
         .await
         .err()
@@ -3732,7 +3790,7 @@ mod tests {
         ];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline())
+        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .err()
             .unwrap();
@@ -3756,7 +3814,7 @@ mod tests {
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
         cooldown.mark_billing("openai", Some("insufficient_quota".into()));
-        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline())
+        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .err()
             .unwrap();
@@ -3844,7 +3902,7 @@ aliases:
             chrono::Utc::now(),
             2,
         );
-        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
+        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .unwrap();
         assert_eq!(resp.provider_used, "google");
@@ -3887,7 +3945,7 @@ aliases:
             model: "gpt-x".into(),
         }];
         let cooldown = CooldownManager::new();
-        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline()).await.err().unwrap();
+        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new()).await.err().unwrap();
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(err.message.contains("openai"));
     }
@@ -3949,7 +4007,7 @@ aliases:
         let cooldown = CooldownManager::new();
         cooldown.mark_billing("anthropic", Some("credit balance too low".into()));
 
-        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline())
+        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .expect_err("provider pinnato in cooldown deve fallire");
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -3970,7 +4028,7 @@ aliases:
         let resolved = vec![rp];
 
         let cooldown = CooldownManager::new();
-        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline())
+        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .expect_err("provider pinnato fallito deve dare errore, non fallback");
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -4356,6 +4414,7 @@ aliases:
                 true,
                 cap,
                 far_deadline(),
+                &mut Vec::new(),
             ),
         )
         .await
@@ -4366,6 +4425,120 @@ aliases:
         };
         assert_eq!(err.class, "transient", "lento ORA, non rotto");
         assert_eq!(err.code.as_deref(), Some("attempt_timeout"));
+    }
+
+    // ── Tentativi consumati e scartati (mig 0701) ───────────────────────────
+
+    /// La risposta DEGENERE e' spesa fatturata: PRIMA della failure il
+    /// tentativo entra negli scarti con l'usage REALE del wire e il modello
+    /// RISOLTO per quel provider, mentre la chain prosegue e vince il sano.
+    ///
+    /// MUTAZIONE: togliendo il `scarti.push` dal ramo degenere, `scarti` resta
+    /// vuoto e il test dice quale spesa e' tornata invisibile.
+    #[tokio::test]
+    async fn la_degenere_entra_negli_scarti_con_lusage_reale() {
+        let hollow: Arc<dyn LlmProvider> = FakeProvider::new("hollow", Behaviour::Degenerate);
+        let sano: Arc<dyn LlmProvider> = FakeProvider::new("sano", Behaviour::Ok);
+        let resolved = vec![
+            ResolvedProvider {
+                provider: hollow,
+                model: "m-hollow".into(),
+            },
+            ResolvedProvider {
+                provider: sano,
+                model: "m-sano".into(),
+            },
+        ];
+        let cooldown = CooldownManager::new();
+        let mut scarti = Vec::new();
+        let resp = run_fallback(
+            &resolved,
+            &cooldown,
+            &req(),
+            false,
+            TEST_PER_ATTEMPT,
+            far_deadline(),
+            &mut scarti,
+        )
+        .await
+        .expect("la chain deve superare la degenere e chiudere col provider sano");
+        assert_eq!(resp.provider_used, "sano");
+
+        assert_eq!(scarti.len(), 1, "un solo tentativo consumato e scartato");
+        let s = &scarti[0];
+        assert_eq!(s.provider, "hollow");
+        assert_eq!(s.model, "m-hollow", "il modello RISOLTO, non quello logico");
+        assert!(matches!(
+            s.reason,
+            nexus_ledger::DiscardReason::DegenerateHollow
+        ));
+        let usage = s.usage.expect("la degenere ha un usage osservato dal wire");
+        assert_eq!(usage.input_tokens, 1_000);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.cache_read_tokens, Some(600));
+    }
+
+    /// Il cap per-tentativo scaduto DOPO l'avvio e' un tentativo consumato:
+    /// entra negli scarti SENZA usage (nessuna risposta osservata). Il budget
+    /// esaurito PRIMA di tentare invece non scarta nulla: nessuna chiamata e'
+    /// partita.
+    #[tokio::test]
+    async fn il_cap_scaduto_entra_negli_scarti_senza_usage() {
+        let p = FakeProvider::new("slow", Behaviour::Hang);
+        let cooldown = CooldownManager::new();
+        let policy = cooldown.retry_policy();
+        let mut scarti = Vec::new();
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            complete_with_retry(
+                p.as_ref(),
+                &req(),
+                "slow",
+                &cooldown,
+                &policy,
+                true,
+                std::time::Duration::from_millis(50),
+                far_deadline(),
+                &mut scarti,
+            ),
+        )
+        .await
+        .expect("cap per-tentativo NON applicato");
+        assert!(res.is_err());
+
+        assert_eq!(scarti.len(), 1);
+        let s = &scarti[0];
+        assert_eq!(s.provider, "slow");
+        assert!(matches!(
+            s.reason,
+            nexus_ledger::DiscardReason::AttemptTimeout
+        ));
+        assert!(
+            s.usage.is_none(),
+            "nessuna risposta osservata: la riga resta a zero per dichiarazione"
+        );
+
+        // Budget esaurito PRIMA di tentare: deadline gia' passata -> nessuno
+        // scarto nuovo (nessuna chiamata avviata).
+        let mut scarti2 = Vec::new();
+        let res2 = complete_with_retry(
+            p.as_ref(),
+            &req(),
+            "slow",
+            &cooldown,
+            &policy,
+            true,
+            std::time::Duration::from_millis(50),
+            tokio::time::Instant::now(),
+            &mut scarti2,
+        )
+        .await;
+        assert!(res2.is_err());
+        assert!(
+            scarti2.is_empty(),
+            "un tentativo mai avviato non e' spesa: non si registra"
+        );
     }
 
     /// Il provider appeso non deve bloccare la chain: il successivo, sano,
@@ -4396,6 +4569,7 @@ aliases:
                 false,
                 std::time::Duration::from_millis(50),
                 far_deadline(),
+                &mut Vec::new(),
             ),
         )
         .await
@@ -4426,7 +4600,7 @@ aliases:
         // neutralizzato il test fallisce NETTO qui (niente sleep di 40s).
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, deadline),
+            run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, deadline, &mut Vec::new()),
         )
         .await
         .expect("il gateway ha dormito oltre il budget della richiesta")
@@ -4455,7 +4629,7 @@ aliases:
         let deadline = tokio::time::Instant::now();
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, deadline),
+            run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, deadline, &mut Vec::new()),
         )
         .await
         .expect("budget esaurito: la chain deve rispondere subito")
@@ -4485,7 +4659,7 @@ aliases:
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, deadline),
+            run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, deadline, &mut Vec::new()),
         )
         .await
         .expect("il gateway ha atteso un cooldown oltre il budget della richiesta")

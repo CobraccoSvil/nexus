@@ -415,6 +415,65 @@ pub async fn get_active_run_for_session(
     })))
 }
 
+/// Breakdown per (provider, model) del run e dei suoi sub-run, dal ledger.
+/// Il flag `fin` distingue le righe finalized dalle scartate (mig 0701): il
+/// WHERE ammette solo quei due status, quindi `NOT fin` = scartata.
+const SQL_USAGE_BREAKDOWN: &str = "\
+    SELECT provider, model,
+            SUM(prompt_tokens) FILTER (WHERE fin)::bigint         AS prompt_tokens,
+            SUM(completion_tokens) FILTER (WHERE fin)::bigint     AS completion_tokens,
+            SUM(total_tokens) FILTER (WHERE fin)::bigint          AS total_tokens,
+            SUM(cache_read_tokens) FILTER (WHERE fin)::bigint     AS cache_read_tokens,
+            SUM(cache_creation_tokens) FILTER (WHERE fin)::bigint AS cache_creation_tokens,
+            SUM(total_cost) FILTER (WHERE fin)::float8            AS total_cost,
+            COUNT(*) FILTER (WHERE fin)::int                      AS calls,
+            COUNT(*) FILTER (WHERE NOT fin)::int                  AS discarded_calls,
+            COALESCE(SUM(total_tokens) FILTER (WHERE NOT fin), 0)::bigint AS discarded_tokens,
+            COALESCE(SUM(total_cost) FILTER (WHERE NOT fin), 0)::float8   AS discarded_cost,
+            MIN(created_at)                                       AS first_call_at,
+            MAX(created_at)                                       AS last_call_at
+        FROM (
+            SELECT l.*, l.status = 'finalized' AS fin
+                FROM ai_usage_ledger l
+            WHERE l.run_id = ANY($1) AND l.status IN ('finalized', 'discarded')
+        ) l
+        GROUP BY provider, model
+        ORDER BY MIN(created_at) ASC";
+
+/// Una voce di `usageBreakdown` dai campi della riga aggregata. Le SUM con
+/// FILTER sono NULL dove il gruppo non ha righe di quel tipo: qui degradano a
+/// zero, tranne `cacheHitRate` che resta null senza prompt (uno 0 direbbe
+/// "misurato, nessun riuso").
+fn riga_breakdown(r: &sqlx::postgres::PgRow) -> Value {
+    let opt_i64 = |col: &str| r.try_get::<Option<i64>, _>(col).ok().flatten().unwrap_or(0);
+    let prompt = opt_i64("prompt_tokens");
+    let cache_read = opt_i64("cache_read_tokens");
+    // Frazione del contesto servita da cache: prompt LORDO a denominatore,
+    // stessa formula della vista analitica (mig 0702).
+    let cache_hit_rate = if prompt > 0 {
+        Value::from((cache_read as f64 / prompt as f64 * 10_000.0).round() / 10_000.0)
+    } else {
+        Value::Null
+    };
+    json!({
+        "provider": r.try_get::<String, _>("provider").unwrap_or_default(),
+        "model": r.try_get::<String, _>("model").unwrap_or_default(),
+        "promptTokens": prompt,
+        "completionTokens": opt_i64("completion_tokens"),
+        "totalTokens": opt_i64("total_tokens"),
+        "cacheReadTokens": cache_read,
+        "cacheCreationTokens": opt_i64("cache_creation_tokens"),
+        "cacheHitRate": cache_hit_rate,
+        "totalCost": r.try_get::<Option<f64>, _>("total_cost").ok().flatten().unwrap_or(0.0),
+        "calls": r.try_get::<i32, _>("calls").unwrap_or(0),
+        "discardedCalls": r.try_get::<i32, _>("discarded_calls").unwrap_or(0),
+        "discardedTokens": opt_i64("discarded_tokens"),
+        "discardedCost": r.try_get::<f64, _>("discarded_cost").unwrap_or(0.0),
+        "firstCallAt": r.try_get::<DateTime<Utc>, _>("first_call_at").ok().map(|v| v.to_rfc3339()),
+        "lastCallAt": r.try_get::<DateTime<Utc>, _>("last_call_at").ok().map(|v| v.to_rfc3339()),
+    })
+}
+
 /// GET /api/chat/agent-runs/:run_id -- legge stato run + steps.
 pub async fn get_agent_run(
     State(state): State<AppState>,
@@ -485,40 +544,17 @@ pub async fn get_agent_run(
     // (cascade fallback puo' aver coinvolto piu' provider).
     // ai_usage_ledger e' contabilita' di PIATTAFORMA (scritta dal gateway sul
     // meta-DB): qui `state.db` e' corretto, NON va instradata sul pool progetto.
-    let breakdown_rows = sqlx::query(
-        "SELECT provider, model,
-                SUM(prompt_tokens)::bigint     AS prompt_tokens,
-                SUM(completion_tokens)::bigint AS completion_tokens,
-                SUM(total_tokens)::bigint      AS total_tokens,
-                SUM(total_cost)::float8        AS total_cost,
-                COUNT(*)::int                  AS calls,
-                MIN(created_at)                AS first_call_at,
-                MAX(created_at)                AS last_call_at
-         FROM ai_usage_ledger
-         WHERE run_id = ANY($1) AND status = 'finalized'
-         GROUP BY provider, model
-         ORDER BY MIN(created_at) ASC",
-    )
-    .bind(&run_ids_con_figli)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-    let usage_breakdown: Vec<Value> = breakdown_rows
-        .iter()
-        .map(|r| {
-            json!({
-                "provider": r.try_get::<String, _>("provider").unwrap_or_default(),
-                "model": r.try_get::<String, _>("model").unwrap_or_default(),
-                "promptTokens": r.try_get::<i64, _>("prompt_tokens").unwrap_or(0),
-                "completionTokens": r.try_get::<i64, _>("completion_tokens").unwrap_or(0),
-                "totalTokens": r.try_get::<i64, _>("total_tokens").unwrap_or(0),
-                "totalCost": r.try_get::<f64, _>("total_cost").unwrap_or(0.0),
-                "calls": r.try_get::<i32, _>("calls").unwrap_or(0),
-                "firstCallAt": r.try_get::<DateTime<Utc>, _>("first_call_at").ok().map(|v| v.to_rfc3339()),
-                "lastCallAt": r.try_get::<DateTime<Utc>, _>("last_call_at").ok().map(|v| v.to_rfc3339()),
-            })
-        })
-        .collect();
+    // Le colonne storiche restano aggregati delle sole righe finalized (flag
+    // `fin` nel sub-select); le righe scartate (mig 0701) entrano come voci
+    // separate: cache e scarti erano gia' nel ledger e non arrivavano mai
+    // all'utente, che vedeva token e costo senza sapere quanta parte era
+    // servita da cache ne' quanta spesa la chain aveva buttato.
+    let breakdown_rows = sqlx::query(SQL_USAGE_BREAKDOWN)
+        .bind(&run_ids_con_figli)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+    let usage_breakdown: Vec<Value> = breakdown_rows.iter().map(riga_breakdown).collect();
 
     Ok(Json(json!({
         "runId": run.try_get::<Uuid, _>("id").ok().map(|v| v.to_string()),

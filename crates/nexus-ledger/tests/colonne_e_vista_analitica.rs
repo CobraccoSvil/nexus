@@ -30,7 +30,7 @@
 //! in `mcp-core::billing` (dal JSON del wire) e `i_token_di_cache_arrivano_alla_riga_di_ledger`
 //! in `nexus-gateway::server::billing` (da `LlmUsage::normalized`).
 
-use nexus_ledger::{ChargedBy, Identity, LedgerUsage};
+use nexus_ledger::{ChargedBy, DiscardReason, Identity, LedgerUsage, QuotaPolicy};
 use nexus_pricing::TokenUsage;
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
@@ -281,6 +281,137 @@ async fn la_vista_analitica_non_doppia_i_token_di_cache(pool: PgPool) {
     assert!(
         (hit - 0.5714).abs() < 1e-4,
         "hit-rate letto {hit}, atteso ~0.5714 (2M / 3.5M)"
+    );
+}
+
+/// La spesa SCARTATA (mig 0701/0702): scritta dal produttore reale
+/// (`record_discarded`), visibile nella vista, e con la quota che conta SOLO
+/// le cause con usage osservato.
+///
+/// Tre affermazioni in un solo scenario, tutte per la strada della produzione:
+///   1. la degenere porta token e costo REALI e nasce chiusa (`finalized_at`);
+///   2. il timeout resta a zero con la causa dichiarata, non col silenzio;
+///   3. la vista separa la spesa scartata dagli aggregati `finalized`
+///      (una riga finalizzata accanto fa da controprova), e la quota vede la
+///      degenere ma non il timeout.
+///
+/// MUTAZIONE: togliendo il ramo `discarded/degenerate_hollow` dal filtro di
+/// `usage_for_quotas`, l'asserzione sulla quota scende a 3.9M; facendo nascere
+/// la riga aperta (senza `finalized_at`), rosseggia l'asserzione dedicata.
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+async fn la_spesa_scartata_e_visibile_e_conta_in_quota_solo_se_osservata(pool: PgPool) {
+    let (identity, run) = seed_identita(&pool).await;
+    seed_listino_completo(&pool).await;
+
+    // Una chiamata riuscita, per la controprova che gli aggregati finalized
+    // non si mescolano con gli scarti.
+    prenota_e_finalizza(&pool, identity, run).await;
+
+    // La risposta DEGENERE: usage reale dal wire (1M prompt di cui 0.9M da
+    // cache, 0 completion — la forma tipica del caso misurato).
+    let usage_degenere = TokenUsage {
+        prompt_tokens: 1_000_000,
+        completion_tokens: 0,
+        cache_read_tokens: 900_000,
+        cache_creation_tokens: 0,
+    };
+    nexus_ledger::record_discarded(
+        &pool,
+        identity,
+        "anthropic",
+        "claude-x",
+        DiscardReason::DegenerateHollow,
+        Some(&usage_degenere),
+        &run.to_string(),
+        "chat",
+    )
+    .await;
+
+    // Il cap per-tentativo scaduto: nessun usage osservato.
+    nexus_ledger::record_discarded(
+        &pool,
+        identity,
+        "anthropic",
+        "claude-x",
+        DiscardReason::AttemptTimeout,
+        None,
+        &run.to_string(),
+        "chat",
+    )
+    .await;
+
+    // 1+2: le due righe, ognuna con la sua causa e i suoi numeri.
+    let righe = sqlx::query(
+        "SELECT discard_reason, total_tokens, total_cost::float8 AS total_cost, \
+                finalized_at IS NOT NULL AS chiusa \
+           FROM ai_usage_ledger WHERE status = 'discarded' ORDER BY discard_reason",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("le righe discarded devono esistere: la INSERT e' best-effort e un \
+             errore sarebbe solo loggato");
+    assert_eq!(righe.len(), 2);
+    let timeout = &righe[0]; // attempt_timeout < degenerate_hollow
+    assert_eq!(timeout.get::<String, _>("discard_reason"), "attempt_timeout");
+    assert_eq!(timeout.get::<i32, _>("total_tokens"), 0);
+    assert!(timeout.get::<f64, _>("total_cost").abs() < 1e-12);
+    let degenere = &righe[1];
+    assert_eq!(
+        degenere.get::<String, _>("discard_reason"),
+        "degenerate_hollow"
+    );
+    assert_eq!(degenere.get::<i32, _>("total_tokens"), 1_000_000);
+    // 100k a 3.0 + 900k a 0.3 = 0.57: il costo della degenere e' scorporato
+    // dalla cache come ogni riga vera.
+    assert!((degenere.get::<f64, _>("total_cost") - 0.57).abs() < 1e-9);
+    for r in &righe {
+        assert!(
+            r.get::<bool, _>("chiusa"),
+            "una riga discarded nasce CHIUSA: aperta sarebbe prenotabile"
+        );
+    }
+
+    // 3a: la vista separa scarti e finalized.
+    let vista = sqlx::query(
+        "SELECT calls, total_tokens, discarded_calls, discarded_tokens, \
+                discarded_cost::float8 AS discarded_cost \
+           FROM ai_usage_analytics_view \
+          WHERE provider = 'anthropic' AND model = 'claude-x'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("la vista deve vedere il bucket");
+    assert_eq!(vista.get::<i64, _>("calls"), 1, "solo la finalizzata");
+    assert_eq!(
+        vista.get::<i64, _>("total_tokens"),
+        3_900_000,
+        "gli aggregati finalized non assorbono gli scarti"
+    );
+    assert_eq!(vista.get::<i64, _>("discarded_calls"), 2);
+    assert_eq!(
+        vista.get::<i64, _>("discarded_tokens"),
+        1_000_000,
+        "la degenere porta i suoi token, il timeout zero"
+    );
+    assert!((vista.get::<f64, _>("discarded_cost") - 0.57).abs() < 1e-9);
+
+    // 3b: la quota conta la degenere (spesa reale) e NON il timeout.
+    let quota = QuotaPolicy {
+        scope_type: "project".into(),
+        user_id: None,
+        project_id: Some(identity.project_id),
+        token_limit: Some(i64::MAX),
+        cost_limit: None,
+        valid_from: chrono::Utc::now() - chrono::Duration::hours(1),
+        valid_to: chrono::Utc::now() + chrono::Duration::hours(1),
+    };
+    let consumi = nexus_ledger::usage_for_quotas(&pool, &[quota])
+        .await
+        .expect("lettura consumo");
+    assert_eq!(
+        consumi[0].tokens,
+        3_900_000 + 1_000_000,
+        "finalizzata + degenere; il timeout (zero osservato) non entra"
     );
 }
 

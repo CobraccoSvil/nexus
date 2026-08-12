@@ -307,6 +307,104 @@ async fn prezza_chiamata(
     }
 }
 
+/// I `details` standard di una riga che CHIUDE una chiamata (finalized e
+/// discarded): stessi campi da un punto solo — chi ne aggiunge uno lo aggiunge
+/// per entrambe le INSERT.
+///
+/// `cache_price_state` e' separato dallo stato del listino base: un
+/// `cache_read_cost` a zero puo' voler dire "nessun token da cache" o "tariffa
+/// non a listino, token fatturati a prezzo pieno di input", e i due casi non
+/// si distinguono dall'importo (regola M).
+fn details_di_chiamata(
+    request_id: &str,
+    feature: &str,
+    price_state: &str,
+    price_missing: bool,
+    cache_price_state: &str,
+) -> Value {
+    json!({
+        "request_id": request_id,
+        "feature": feature,
+        "price_missing": price_missing,
+        "price_state": price_state,
+        "cache_price_state": cache_price_state,
+    })
+}
+
+/// La query di una INSERT che chiude una chiamata, coi valori gia' legati.
+type InsertChiusura<'q> =
+    sqlx::query::QueryScalar<'q, sqlx::Postgres, Uuid, sqlx::postgres::PgArguments>;
+
+/// I sedici bind comuni alle due INSERT che chiudono una chiamata (finalized e
+/// discarded): identita', run, coppia provider/modello, i cinque conteggi, i
+/// cinque importi, la currency. L'ORDINE e' il contratto con le SQL gemelle,
+/// che condividono lo stesso prefisso di colonne fino a `currency` ($16);
+/// cio' che segue ($17+) lo lega il chiamante.
+fn bind_chiusura<'q>(
+    q: InsertChiusura<'q>,
+    identity: Identity,
+    run_uuid: Option<Uuid>,
+    provider: &str,
+    model: &str,
+    tokens: &TokenUsage,
+    costo: &CostBreakdown,
+    currency: &str,
+) -> InsertChiusura<'q> {
+    q.bind(identity.user_id)
+        .bind(identity.project_id)
+        .bind(run_uuid)
+        .bind(provider.to_string())
+        .bind(model.to_string())
+        .bind(tokens.prompt_tokens)
+        .bind(tokens.completion_tokens)
+        .bind(tokens.total_tokens())
+        .bind(tokens.cache_read_tokens)
+        .bind(tokens.cache_creation_tokens)
+        .bind(costo.input_cost)
+        .bind(costo.output_cost)
+        .bind(costo.cache_read_cost)
+        .bind(costo.cache_creation_cost)
+        .bind(costo.total_cost)
+        .bind(currency.to_string())
+}
+
+/// Esegue una delle due INSERT di chiusura, dai campi ai bind, in un punto
+/// solo: la SQL la sceglie il chiamante, `discard_reason` presente = $17 della
+/// discarded, assente = la finalized chiude con i soli details ($17).
+///
+/// `run_uuid` si deriva qui dal `request_id` (= run_id nei metadata, M71):
+/// NULL se il chiamante non lo passa o non e' un UUID valido.
+#[allow(clippy::too_many_arguments)]
+async fn esegui_chiusura(
+    db: &PgPool,
+    sql: &'static str,
+    identity: Identity,
+    provider: &str,
+    model: &str,
+    tokens: &TokenUsage,
+    costo: &CostBreakdown,
+    currency: &str,
+    discard_reason: Option<&str>,
+    request_id: &str,
+    details: Value,
+) -> Result<Uuid, sqlx::Error> {
+    let run_uuid = Uuid::parse_str(request_id.trim()).ok();
+    let mut q = bind_chiusura(
+        sqlx::query_scalar::<_, Uuid>(sql),
+        identity,
+        run_uuid,
+        provider,
+        model,
+        tokens,
+        costo,
+        currency,
+    );
+    if let Some(reason) = discard_reason {
+        q = q.bind(reason.to_string());
+    }
+    q.bind(details).fetch_one(db).await
+}
+
 /// Registra una chiamata testuale GIA' avvenuta, come riga `finalized`.
 ///
 /// RITORNA la riga scritta, oppure `None` se la INSERT e' fallita. Il valore di
@@ -330,43 +428,19 @@ pub async fn record_tokens(
 ) -> Option<LedgerEntry> {
     let (currency, costo, price_state, price_missing) =
         prezza_chiamata(db, provider, model, tokens).await;
+    let details = details_di_chiamata(
+        request_id,
+        feature,
+        price_state,
+        price_missing,
+        costo.cache_price_state(),
+    );
 
-    let details = json!({
-        "request_id": request_id,
-        "feature": feature,
-        "price_missing": price_missing,
-        "price_state": price_state,
-        // Stato del listino di CACHE, separato da quello del listino base: un
-        // `cache_read_cost` a zero puo' voler dire "nessun token da cache" o
-        // "tariffa non a listino, token fatturati a prezzo pieno di input", e i
-        // due casi non si distinguono dall'importo (regola M).
-        "cache_price_state": costo.cache_price_state(),
-    });
-
-    // run_id (= request_id nei metadata): abilita il breakdown costo per run /
-    // sessione (M71). NULL se il chiamante non lo passa o non e' un UUID valido.
-    let run_uuid = Uuid::parse_str(request_id.trim()).ok();
-
-    let res = sqlx::query_scalar::<_, Uuid>(SQL_INSERT_FINALIZED)
-        .bind(identity.user_id)
-        .bind(identity.project_id)
-        .bind(run_uuid)
-        .bind(provider)
-        .bind(model)
-        .bind(tokens.prompt_tokens)
-        .bind(tokens.completion_tokens)
-        .bind(tokens.total_tokens())
-        .bind(tokens.cache_read_tokens)
-        .bind(tokens.cache_creation_tokens)
-        .bind(costo.input_cost)
-        .bind(costo.output_cost)
-        .bind(costo.cache_read_cost)
-        .bind(costo.cache_creation_cost)
-        .bind(costo.total_cost)
-        .bind(&currency)
-        .bind(details)
-        .fetch_one(db)
-        .await;
+    let res = esegui_chiusura(
+        db, SQL_INSERT_FINALIZED, identity, provider, model, tokens,
+        &costo, &currency, None, request_id, details,
+    )
+    .await;
 
     match res {
         Ok(id) => Some(LedgerEntry {
@@ -379,6 +453,128 @@ pub async fn record_tokens(
             tracing::warn!(error = %e, "ledger: insert finalized fallita (best-effort)");
             None
         }
+    }
+}
+
+// ── La riga di un tentativo CONSUMATO e scartato ───────────────
+
+/// Perche' una riga e' `discarded`. Vocabolario canonico chiuso (regola N):
+/// solo cio' che il gateway PRODUCE oggi, niente varianti "per il futuro".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscardReason {
+    /// Risposta 200 senza output utile (content vuoto, zero tool-call, finish
+    /// non terminale): l'inference e' avvenuta e il provider l'ha fatturata
+    /// con un usage reale sul wire; la risposta e' stata buttata e la chain
+    /// e' passata al provider successivo.
+    DegenerateHollow,
+    /// Cap per-tentativo scaduto DOPO l'avvio della chiamata: la connessione
+    /// e' stata chiusa, nessun usage osservato. La spesa e' possibile ma
+    /// ignota, e lo zero della riga e' dichiarato dalla causa stessa.
+    AttemptTimeout,
+}
+
+impl DiscardReason {
+    /// L'identificatore canonico (regola N) scritto in `discard_reason` e
+    /// ammesso dal CHECK della mig 0701.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::DegenerateHollow => "degenerate_hollow",
+            Self::AttemptTimeout => "attempt_timeout",
+        }
+    }
+
+    /// Il criterio UNICO (regola L) di "questo scarto consuma quota":
+    /// solo gli scarti con usage OSSERVATO (decisione 12/08/2026). Un timeout
+    /// non ha token misurati, e contarne zero non sposta nulla; inventarli
+    /// eroderebbe la quota con un numero arbitrario.
+    ///
+    /// Il gemello SQL vive in `quote.rs` (`usage_for_quotas`), dove il filtro
+    /// nomina le sole cause per cui questo metodo risponde `true`: il test
+    /// `il_filtro_quota_nomina_le_stesse_cause_del_criterio` li tiene insieme.
+    pub fn consuma_quota(&self) -> bool {
+        matches!(self, Self::DegenerateHollow)
+    }
+}
+
+/// Tutte le varianti, per i test di coerenza col filtro SQL della quota.
+#[cfg(test)]
+pub(crate) const DISCARD_REASONS: [DiscardReason; 2] =
+    [DiscardReason::DegenerateHollow, DiscardReason::AttemptTimeout];
+
+/// La INSERT di un tentativo scartato. La riga nasce CHIUSA (`finalized_at`
+/// valorizzato): e' terminale, mai prenotabile ne' finalizzabile, e non viene
+/// mai dichiarata sul wire — il contratto anti-doppio-addebito (LedgerOutcome
+/// sulla sola risposta di successo) non cambia.
+const SQL_INSERT_DISCARDED: &str = r#"
+        INSERT INTO ai_usage_ledger (
+            user_id, project_id, run_id, provider, model,
+            prompt_tokens, completion_tokens, total_tokens,
+            cache_read_tokens, cache_creation_tokens,
+            input_cost, output_cost, cache_read_cost, cache_creation_cost, total_cost,
+            currency, status, discard_reason, details, finalized_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+            'discarded', $17, $18, NOW()
+        )
+        RETURNING id
+        "#;
+
+/// Registra un tentativo CONSUMATO ma scartato (mig 0701).
+///
+/// `tokens = Some` e' l'usage osservato dal wire (risposta degenere: il
+/// provider ha fatturato davvero, e la riga porta token e costo reali);
+/// `None` e' l'assenza di osservazione (cap per-tentativo scaduto: la riga
+/// resta a zero, e lo dice la causa, non il silenzio — regola M). Il costo si
+/// calcola SOLO dove c'e' un usage: su un timeout qualunque importo sarebbe
+/// inventato.
+///
+/// Best-effort come [`record_tokens`]: un errore di scrittura e' loggato e la
+/// risposta al chiamante non si interrompe. A differenza di `record_tokens`
+/// non ritorna una [`LedgerEntry`]: nessun chiamante deve decidere un
+/// "non addebitare due volte" su una riga che non e' mai finalizzabile.
+pub async fn record_discarded(
+    db: &PgPool,
+    identity: Identity,
+    provider: &str,
+    model: &str,
+    reason: DiscardReason,
+    tokens: Option<&TokenUsage>,
+    request_id: &str,
+    feature: &str,
+) {
+    let (currency, costo, price_state, price_missing, riga_tokens) = match tokens {
+        Some(t) => {
+            let (cur, c, state, missing) = prezza_chiamata(db, provider, model, t).await;
+            (cur, c, state, missing, *t)
+        }
+        // "Nessun usage osservato" non e' uno stato del LISTINO: lo stato
+        // dichiarato distingue questo zero da uno zero di prezzo mancante.
+        None => {
+            let cur = nexus_pricing::platform_currency(db).await.unwrap_or_default();
+            (cur, costo_nullo(), "no_usage_observed", false, TokenUsage::default())
+        }
+    };
+    let details = details_di_chiamata(
+        request_id,
+        feature,
+        price_state,
+        price_missing,
+        costo.cache_price_state(),
+    );
+
+    let res = esegui_chiusura(
+        db, SQL_INSERT_DISCARDED, identity, provider, model, &riga_tokens,
+        &costo, &currency, Some(reason.as_str()), request_id, details,
+    )
+    .await;
+
+    if let Err(e) = res {
+        // Regola F: solo l'errore SQL, nessun payload.
+        tracing::warn!(
+            error = %e,
+            reason = reason.as_str(),
+            "ledger: insert discarded fallita (best-effort)"
+        );
     }
 }
 
@@ -704,6 +900,36 @@ mod tests {
         }
     }
 
+    // Il testo VERO della migrazione che crea status 'discarded' e la colonna
+    // discard_reason (regola O): il vocabolario dell'enum si confronta con lei,
+    // non con una lista ricopiata.
+    const MIGRAZIONE_0701: &str = include_str!("../../../db/migrations/0701_ledger_discarded.sql");
+
+    /// Ogni variante di `DiscardReason` deve essere ammessa dal CHECK della
+    /// migrazione, e la INSERT deve nominare la colonna e nascere chiusa
+    /// (`finalized_at`): una riga scartata aperta sarebbe prenotabile.
+    #[test]
+    fn il_vocabolario_discarded_corrisponde_alla_migrazione() {
+        for reason in DISCARD_REASONS {
+            assert!(
+                MIGRAZIONE_0701.contains(reason.as_str()),
+                "il CHECK della 0701 non ammette '{}': la INSERT verrebbe rifiutata a runtime",
+                reason.as_str()
+            );
+        }
+        for frammento in ["discard_reason", "'discarded'", "finalized_at", "NOW()"] {
+            assert!(
+                SQL_INSERT_DISCARDED.contains(frammento),
+                "la INSERT discarded non contiene {frammento}"
+            );
+        }
+        // Le colonne di cache anche qui: una degenere con cache letta deve
+        // registrarla, o il costo scritto accanto non tornerebbe.
+        for colonna in ["cache_read_tokens", "cache_creation_tokens"] {
+            assert!(SQL_INSERT_DISCARDED.contains(colonna));
+        }
+    }
+
     /// Un segnaposto per ogni valore bindato. Uno scarto qui e' un errore SQL a
     /// runtime: sulla INSERT e' best-effort e quindi solo loggato, cioe'
     /// invisibile; sulla UPDATE propaga con `?`, cioe' una finalizzazione che
@@ -713,6 +939,7 @@ mod tests {
         for (sql, n, nome) in [
             (SQL_INSERT_STIMA, 15, "INSERT stima"),
             (SQL_INSERT_FINALIZED, 17, "INSERT finalized"),
+            (SQL_INSERT_DISCARDED, 18, "INSERT discarded"),
             (SQL_UPDATE_FINALIZE, 13, "UPDATE finalize"),
             (SQL_INSERT_MEDIA, 12, "INSERT media"),
         ] {

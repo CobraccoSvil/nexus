@@ -71,7 +71,8 @@ pub use quote::{
     usage_for_scope, Consumption, QuotaLock, QuotaPolicy,
 };
 pub use scrittura::{
-    finalize, insert_marker, record_media, record_tokens, release, reserve, settle,
+    finalize, insert_marker, record_discarded, record_media, record_tokens, release, reserve,
+    settle, DiscardReason,
 };
 
 /// Chi ha fatto la chiamata. Le due colonne sono NOT NULL e portano una FK:
