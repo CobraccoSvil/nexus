@@ -1626,6 +1626,7 @@ impl ToolDispatchNode {
             level,
             plan_excerpt: crate::decisions::turn_task::current_turn_task(state)
                 .map(str::to_string),
+            criteri_in_correzione: state.criteri_in_correzione.clone(),
             prior_rejections,
         };
         match gate.validate(req).await {

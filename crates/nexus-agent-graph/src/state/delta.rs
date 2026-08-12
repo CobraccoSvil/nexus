@@ -705,6 +705,11 @@ pub struct StateDelta {
         skip_serializing_if = "Option::is_none"
     )]
     pub final_gate_cycle: Option<Option<i64>>,
+    /// Vedi `AgentState::criteri_in_correzione`. SOSTITUISCE (non appende): il
+    /// rimando in corso e' quello dell'ultimo giro del gate, non la somma dei
+    /// giri precedenti — che direbbe «sto correggendo» a un run gia' passato.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub criteri_in_correzione: Option<Vec<String>>,
     /// Vedi `AgentState::final_gate_verdict`.
     #[serde(
         default,

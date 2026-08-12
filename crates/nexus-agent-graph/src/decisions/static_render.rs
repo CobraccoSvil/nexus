@@ -122,7 +122,7 @@ pub struct ProveResa {
     pub contenitore: Option<EsitoContenitore>,
     /// Eccezioni non gestite lanciate dalla pagina, nell'ordine osservato.
     #[serde(default)]
-    pub errori_esecuzione: Vec<String>,
+    pub errori_esecuzione: Vec<EccezionePagina>,
     /// Messaggi di console di livello errore. INFORMATIVI: entrano
     /// nell'evidenza, mai nel verdetto (vedi doc del modulo).
     #[serde(default)]
@@ -151,6 +151,96 @@ pub struct ProveResa {
     pub origine: Option<String>,
 }
 
+/// Un'eccezione non gestita, coi campi che il browser ha dichiarato.
+///
+/// E' un TIPO e non una stringa per la ragione misurata il 12/08/2026: con
+/// `Vec<String>` l'unica cosa che raggiungeva l'agente era «il JavaScript della
+/// pagina ha lanciato: Invalid or unexpected token», e su un file di 244 righe
+/// quella frase non dice dove guardare. Nella traccia del run: cinque letture
+/// consecutive senza una scrittura (`list_files`, `read_file`,
+/// `read_file_lines` x2, `list_files`), poi una promozione di modello innescata
+/// da un segnale che quelle letture le legge come «descrive senza agire» — cioe'
+/// il sistema ha scambiato per inerzia una RICERCA che aveva reso necessaria lui.
+///
+/// La posizione e' `Option` perche' esiste una classe di eccezioni per cui
+/// nessun canale la porta; l'assenza si DICHIARA e non degrada a uno zero
+/// (regola Q). `classe` e' separata dal messaggio perche' e' l'informazione che
+/// dice se cercare un errore di sintassi o di logica, ed era l'unica che il
+/// produttore reale gia' aveva e buttava via (`e.name`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct EccezionePagina {
+    /// Il messaggio, come il browser lo consegna.
+    pub messaggio: String,
+    /// `SyntaxError`, `ReferenceError`, ... `None` = non dichiarata.
+    #[serde(default)]
+    pub classe: Option<String>,
+    /// Il file che ha lanciato. `None` = non attribuito: una pagina puo' avere
+    /// piu' script, e indovinare quale manderebbe a correggere il file sbagliato.
+    #[serde(default)]
+    pub file: Option<String>,
+    #[serde(default)]
+    pub riga: Option<u32>,
+    #[serde(default)]
+    pub colonna: Option<u32>,
+}
+
+/// Un'eccezione di cui si conosce il SOLO messaggio. E' un caso reale, non una
+/// comodita' per i test: esiste una classe di eccezioni per cui nessun canale
+/// porta la posizione, e per quelle questa e' la forma completa.
+impl<S: Into<String>> From<S> for EccezionePagina {
+    fn from(messaggio: S) -> Self {
+        Self {
+            messaggio: messaggio.into(),
+            ..Default::default()
+        }
+    }
+}
+
+impl EccezionePagina {
+    /// Solo il messaggio, per i consumatori che non hanno un posto dove mettere
+    /// il resto (il dialogo browser, che di un'eccezione non fa un verdetto).
+    pub fn testo(&self) -> String {
+        match self.classe.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            Some(c) if !self.messaggio.starts_with(c) => format!("{c}: {}", self.messaggio),
+            _ => self.messaggio.clone(),
+        }
+    }
+
+    /// `file:riga:colonna`, con quello che c'e'. `None` = nessun canale l'ha
+    /// portata: si tace invece di scrivere una posizione inventata.
+    pub fn posizione(&self) -> Option<String> {
+        let riga = self.riga?;
+        let file = self
+            .file
+            .as_deref()
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            // Il percorso completo di una URL non aiuta chi deve aprire il file:
+            // il nome basta a scegliere fra gli script di una pagina.
+            .map(|f| f.rsplit(['/', '\\']).next().unwrap_or(f).to_string())
+            .unwrap_or_else(|| "la pagina".to_string());
+        Some(match self.colonna {
+            Some(col) => format!("{file}:{riga}:{col}"),
+            None => format!("{file}:{riga}"),
+        })
+    }
+
+    /// La riga che l'agente legge: cosa e' successo E dove. Composta DAI campi
+    /// (regola Q punto 3).
+    pub fn descrizione(&self) -> String {
+        let t = self.testo();
+        let t = if t.trim().is_empty() {
+            "eccezione non gestita".to_string()
+        } else {
+            t
+        };
+        match self.posizione() {
+            Some(p) => format!("{t} (in {p})"),
+            None => t,
+        }
+    }
+}
+
 /// Cosa impedisce alla pagina di mostrare il proprio contenuto. Vocabolario
 /// CHIUSO (regola N) e CAUSA insieme al verdetto: un rilievo che non dice cosa
 /// e' rimasto vuoto manda l'agente a cercare alla cieca.
@@ -158,7 +248,7 @@ pub struct ProveResa {
 #[serde(rename_all = "snake_case")]
 pub enum CausaNonResa {
     /// Il codice della pagina ha lanciato: tutto cio' che seguiva non e' girato.
-    EsecuzioneInterrotta { messaggio: String },
+    EsecuzioneInterrotta { eccezione: EccezionePagina },
     /// Il selettore dichiarato non esiste nella pagina.
     ContenitoreAssente { selettore: String },
     /// Il contenitore c'e' ed e' rimasto sotto il minimo dichiarato.
@@ -182,14 +272,11 @@ impl CausaNonResa {
     /// La riga che l'agente legge. Composta DAI campi (regola Q punto 3).
     pub fn descrizione(&self) -> String {
         match self {
-            Self::EsecuzioneInterrotta { messaggio } => {
-                let m = messaggio.trim();
-                let m = if m.is_empty() {
-                    "eccezione non gestita"
-                } else {
-                    m
-                };
-                format!("il JavaScript della pagina ha lanciato: {m}")
+            Self::EsecuzioneInterrotta { eccezione } => {
+                format!(
+                    "il JavaScript della pagina ha lanciato: {}",
+                    eccezione.descrizione()
+                )
             }
             Self::ContenitoreAssente { selettore } => {
                 format!("il contenitore '{selettore}' non esiste nella pagina resa")
@@ -276,8 +363,8 @@ pub fn classifica_resa(
     let mut cause: Vec<CausaNonResa> = prove
         .errori_esecuzione
         .iter()
-        .map(|m| CausaNonResa::EsecuzioneInterrotta {
-            messaggio: m.clone(),
+        .map(|e| CausaNonResa::EsecuzioneInterrotta {
+            eccezione: e.clone(),
         })
         .collect();
 

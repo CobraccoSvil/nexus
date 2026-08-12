@@ -1090,9 +1090,25 @@ impl FinalGateNode {
             body_parts.join("\n\n")
         };
 
-        // Direttive fail-closed (`final_gate.py:454-470`). Se ci sono errori
-        // build, la riga col conteggio si inserisce in posizione 1 (subito sotto
-        // l'intestazione "DIRETTIVE").
+        // Direttive fail-closed. Composte DAI criteri falliti (regola Q punto 3),
+        // non da un letterale fisso.
+        //
+        // MISURATO il 12/08/2026 su `test-11-08-listino`: erano SEMPRE di forma
+        // BUILD — «rilancia il comando di build con run_command», «finche' il
+        // build non passa al 100% (exit 0, zero errori)» — e venivano consegnate
+        // tali e quali a un fallimento di `static_render`, dove nessun build
+        // esiste e nessun exit code puo' andare a zero. L'agente riceveva
+        // istruzioni su un'attivita' che non era la sua, e la traccia lo mostra:
+        // dopo il rimando, cinque letture consecutive senza una scrittura.
+        //
+        // Le righe comuni restano comuni: quelle di build tornano SOLO se un
+        // criterio di build e' davvero fra i falliti. Il ramo build e' identico a
+        // prima, incluso il conteggio in posizione 1.
+        let tipi_falliti: std::collections::BTreeSet<&str> =
+            failed.iter().map(|r| r.criterion_type.as_str()).collect();
+        let c_e_build = build_errors_count > 0
+            || tipi_falliti.contains("run_command")
+            || tipi_falliti.contains("suite");
         let mut directives_lines: Vec<String> = vec![
             "DIRETTIVE (fail-closed):".to_string(),
             "- Leggi TUTTO l'output qui sopra: ogni errore va corretto, non solo il primo."
@@ -1100,13 +1116,49 @@ impl FinalGateNode {
             "- Correggi TUTTI gli errori in un solo giro quando possibile: edita ogni file"
                 .to_string(),
             "  impattato (anche errori 'banali' tipo unused/type mismatch contano).".to_string(),
-            "- Se l'output e' troncato (vedi nota 'output troncato'), rilancia il comando di"
-                .to_string(),
-            "  build con run_command (o rileggi i file impattati) per vedere il resto.".to_string(),
-            "- Lavora per CONVERGENZA: niente 'task completato' finche' il build non passa"
-                .to_string(),
-            "  al 100% (exit 0, zero errori). Riverifica sempre dopo le correzioni.".to_string(),
         ];
+        if c_e_build {
+            directives_lines.push(
+                "- Se l'output e' troncato (vedi nota 'output troncato'), rilancia il comando di"
+                    .to_string(),
+            );
+            directives_lines
+                .push("  build con run_command (o rileggi i file impattati) per vedere il resto.".to_string());
+            directives_lines.push(
+                "- Lavora per CONVERGENZA: niente 'task completato' finche' il build non passa"
+                    .to_string(),
+            );
+            directives_lines
+                .push("  al 100% (exit 0, zero errori). Riverifica sempre dopo le correzioni.".to_string());
+        } else {
+            directives_lines.push(
+                "- Lavora per CONVERGENZA: niente 'task completato' finche' la verifica non passa."
+                    .to_string(),
+            );
+            directives_lines
+                .push("  Riverifica sempre dopo le correzioni, esercitando il flusso reale.".to_string());
+        }
+        if tipi_falliti.contains(crate::decisions::static_render::CRITERION_TYPE) {
+            // La posizione la porta il rilievo quando il browser l'ha
+            // dichiarata (`EccezionePagina::posizione`): dirgli di andarci e'
+            // l'unica direttiva che gli risparmia la ricerca a tentoni.
+            directives_lines.push(
+                "- La pagina NON mostra il proprio contenuto. Se il rilievo indica una posizione"
+                    .to_string(),
+            );
+            directives_lines.push(
+                "  (file:riga:colonna), correggi LI': e' il punto esatto in cui l'esecuzione si e'"
+                    .to_string(),
+            );
+            directives_lines
+                .push("  interrotta, e tutto cio' che seguiva non e' mai girato.".to_string());
+            directives_lines.push(
+                "- Il criterio guarda il DOM DOPO l'esecuzione del JavaScript, non il sorgente:"
+                    .to_string(),
+            );
+            directives_lines
+                .push("  un file sintatticamente plausibile ma che lancia resta bocciato.".to_string());
+        }
         if build_errors_count > 0 {
             directives_lines.insert(
                 1,
@@ -1471,6 +1523,16 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
         Ok(StateDelta {
             messages: Some(vec![hm]),
             final_gate_cycle: Some(Some(cycle)),
+            // Da qui in poi il run lavora SOTTO un rimando, e chi giudica i suoi
+            // passi deve saperlo: senza, un comando che ripara cio' che il gate
+            // ha contestato risulta «non coerente» con la richiesta dell'utente.
+            criteri_in_correzione: Some(
+                results
+                    .iter()
+                    .filter(|r| r.failed())
+                    .map(|r| r.criterion_type.clone())
+                    .collect(),
+            ),
             stop_reason: Some(Some(StopReason::ToolUse)),
             // pending_tool_uses azzerato a lista vuota (durata 1 turno):
             // Some(Some(vec![])) e' AZZERA, distinto da None (no-op).
@@ -2026,6 +2088,17 @@ mod tests {
         assert_eq!(out.final_gate_passed, None);
         // pending_tool_uses azzerato a lista vuota.
         assert_eq!(out.pending_tool_uses, Some(vec![]));
+        // Da qui il run lavora SOTTO un rimando, e chi giudica i suoi passi
+        // deve poterlo sapere: senza questo campo, un comando che ripara cio'
+        // che il gate ha appena contestato risulta estraneo alla richiesta
+        // dell'utente e viene rifiutato (misurato il 12/08/2026).
+        //
+        // MUTAZIONE: togliere `criteri_in_correzione` dal delta del ramo FAIL ->
+        // questo test cade, e col difetto reale (il giudice torna cieco).
+        assert!(
+            !out.criteri_in_correzione.is_empty(),
+            "il rimando deve dichiarare PER COSA il run sta correggendo"
+        );
         // HumanMessage del gate accodato (AI preesistente + il nuovo Human).
         assert_eq!(out.messages.len(), 2);
         let last = out.messages.last().expect("ultimo messaggio");
@@ -2725,6 +2798,63 @@ mod tests {
     }
 
     // ── render_failed_block ────────────────────────────────────────────────────────
+
+    /// Le direttive parlano di cio' che e' fallito DAVVERO.
+    ///
+    /// MISURATO il 12/08/2026: a un fallimento della RESA venivano consegnate
+    /// direttive di forma build — «rilancia il comando di build con
+    /// run_command», «finche' il build non passa al 100% (exit 0, zero errori)»
+    /// — su un progetto statico dove nessun build esiste e nessun exit code puo'
+    /// andare a zero. Il modello riceveva istruzioni su un'attivita' che non era
+    /// la sua, e nella traccia del run seguono cinque letture consecutive senza
+    /// una scrittura.
+    ///
+    /// MUTAZIONE: rimettere le righe di build fuori dal ramo `c_e_build` ->
+    /// questo test cade sulla riga «exit 0», col difetto reale.
+    #[test]
+    fn le_direttive_non_parlano_di_build_a_un_fallimento_della_resa() {
+        let st = software_state();
+        let results = vec![fail_result(
+            crate::decisions::static_render::CRITERION_TYPE,
+            json!({
+                "error": "la pagina non mostra il proprio contenuto: il JavaScript della \
+                          pagina ha lanciato: Invalid or unexpected token (in listino.html:75:20)"
+            }),
+        )];
+        let block = FinalGateNode::render_failed_block(&st, 1, 2, &results);
+        assert!(block.contains("DIRETTIVE (fail-closed):"));
+        assert!(
+            !block.contains("exit 0"),
+            "un criterio senza build non deve ricevere il contratto del build:\n{block}"
+        );
+        assert!(
+            !block.contains("rilancia il comando di"),
+            "niente istruzioni di build dove non c'e' un build:\n{block}"
+        );
+        // E porta la direttiva che serve: andare dove il rilievo indica.
+        assert!(block.contains("file:riga:colonna"));
+        assert!(block.contains("DOM DOPO l'esecuzione del JavaScript"));
+        // La posizione del rilievo resta leggibile nel corpo.
+        assert!(block.contains("listino.html:75:20"));
+    }
+
+    /// Il ramo build NON cambia: quando il criterio fallito e' un comando, le
+    /// direttive di build tornano tali e quali.
+    #[test]
+    fn le_direttive_di_build_restano_dove_un_build_c_e() {
+        let st = software_state();
+        let results = vec![fail_result(
+            "run_command",
+            json!({"output_excerpt": "error: boom", "exit_code": 1, "output_total_chars": 11}),
+        )];
+        let block = FinalGateNode::render_failed_block(&st, 1, 2, &results);
+        assert!(block.contains("al 100% (exit 0, zero errori)"));
+        assert!(block.contains("rilancia il comando di"));
+        assert!(
+            !block.contains("file:riga:colonna"),
+            "le direttive della resa non entrano dove la resa non e' in causa"
+        );
+    }
 
     #[test]
     fn render_failed_block_build_con_troncamento() {

@@ -38,7 +38,7 @@ use nexus_agent_graph::decisions::browser_dialogue::{ProveBrowser, RichiestaOsse
 use nexus_agent_graph::decisions::risorse_pagina::{
     classifica_elemento, ElementoPortante, RisorsaOsservata,
 };
-use nexus_agent_graph::decisions::static_render::{EsitoContenitore, ProveResa};
+use nexus_agent_graph::decisions::static_render::{EccezionePagina, EsitoContenitore, ProveResa};
 
 /// Marcatore del payload JSON sullo stdout dello script Node.
 const MARCATORE: &str = "NEXUS_BROWSER_JSON:";
@@ -258,7 +258,12 @@ pub fn interpreta(payload: &str) -> Result<ProveBrowser, String> {
     // sono entrambi contorno dell'evidenza, e li teneva gia' in un'unica lista.
     // La distinzione la fa `interpreta_resa`, dove FA la differenza.
     let mut errori_console = lista(&v, campo::ERRORI_CONSOLE);
-    errori_console.extend(lista(&v, campo::ERRORI_PAGINA));
+    // Le eccezioni viaggiano come OGGETTI (vedi `eccezioni`): qui si appiattiscono
+    // al testo perche' il dialogo non ha dove metterne la posizione e non ne fa
+    // un verdetto. Leggerle con `lista` — che tiene solo `as_str()` — le farebbe
+    // sparire IN SILENZIO da questa evidenza, ed e' il difetto che il tipo nuovo
+    // rischiava di introdurre proprio nel lettore che non lo chiedeva.
+    errori_console.extend(eccezioni(&v, campo::ERRORI_PAGINA).iter().map(EccezionePagina::testo));
     Ok(ProveBrowser {
         richieste,
         errori_console,
@@ -316,7 +321,7 @@ pub fn interpreta_resa(payload: &str) -> Result<ProveResa, String> {
         pagina_caricata: caricata(&v),
         elementi_resi,
         contenitore,
-        errori_esecuzione: lista(&v, campo::ERRORI_PAGINA),
+        errori_esecuzione: eccezioni(&v, campo::ERRORI_PAGINA),
         errori_console: lista(&v, campo::ERRORI_CONSOLE),
         risorse,
         elementi,
@@ -405,6 +410,57 @@ fn elemento_da(e: &serde_json::Value) -> Option<ElementoPortante> {
     })
 }
 
+/// Le eccezioni del payload, coi campi che lo script ha dichiarato.
+///
+/// Tollera la forma STRINGA per una ragione che non e' retrocompatibilita' (lo
+/// script e l'interprete viaggiano nello stesso binario): un payload prodotto a
+/// mano da una fixture, o da una versione futura dello script che tornasse a
+/// mandare testo, non deve far sparire l'eccezione dall'evidenza — sparirebbe
+/// il VERDETTO, non un dettaglio. Cio' che manca resta `None` e lo dichiara.
+fn eccezioni(v: &serde_json::Value, campo: &str) -> Vec<EccezionePagina> {
+    let numero = |o: &serde_json::Value, k: &str| -> Option<u32> {
+        o.get(k)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0)
+    };
+    let testo = |o: &serde_json::Value, k: &str| -> Option<String> {
+        o.get(k)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    v.get(campo)
+        .and_then(|c| c.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| {
+                    // Forma stringa: il messaggio e nient'altro.
+                    if let Some(s) = e.as_str() {
+                        return Some(EccezionePagina {
+                            messaggio: s.to_string(),
+                            ..Default::default()
+                        });
+                    }
+                    // Forma oggetto: il messaggio e' l'unico campo obbligatorio.
+                    // Senza, la voce non e' un'eccezione e si scarta — e' il caso
+                    // delle risorse fallite, che il canale in-page filtra gia'
+                    // alla fonte ma che nessuno garantisce a questo lato.
+                    let messaggio = testo(e, "message")?;
+                    Some(EccezionePagina {
+                        messaggio,
+                        classe: testo(e, "name"),
+                        file: testo(e, "file"),
+                        riga: numero(e, "line"),
+                        colonna: numero(e, "column"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Una lista di stringhe del payload, vuota se assente.
 fn lista(v: &serde_json::Value, campo: &str) -> Vec<String> {
     v.get(campo)
@@ -449,6 +505,11 @@ const {{ chromium }} = require('playwright');
 (async () => {{
   const fatti = {{ requests: [], consoleErrors: [], pageErrors: [], loaded: false }};
   const SEL = {sel};
+  // I tagli hanno un nome: entrano in campi che viaggiano fino all'evidenza del
+  // gate, e un numero ripetuto in cinque punti diverge al primo che lo ritocca.
+  const CAP_TESTO = 500;
+  const CAP_PERCORSO = 300;
+  const CAP_CLASSE = 60;
   let browser;
   try {{
     browser = await chromium.launch({{ headless: true, executablePath: {exe}, args: ['--no-sandbox'] }});
@@ -463,6 +524,7 @@ const {{ chromium }} = require('playwright');
     // di terzi, e prenderla dall'URL richiesto direbbe la cosa sbagliata su una
     // pagina che e' stata rediretta altrove.
     try {{ fatti.pageUrl = page.url(); }} catch (_) {{}}
+{posizioni}
 {misura}
     await browser.close();
   }} catch (e) {{
@@ -480,6 +542,7 @@ const {{ chromium }} = require('playwright');
         nav = nav_timeout_ms,
         attesa = attesa_ms.max(1000),
         ascoltatori = ASCOLTATORI,
+        posizioni = POSIZIONI_ECCEZIONI,
         misura = MISURA_DOM,
         marcatore = MARCATORE,
     )
@@ -497,11 +560,33 @@ const {{ chromium }} = require('playwright');
 /// per la resa E' il verdetto — un'eccezione ha interrotto l'esecuzione, un
 /// avviso di libreria no.
 const ASCOLTATORI: &str = r#"
+    await page.addInitScript(() => {
+      window.__nexusEcc = [];
+      window.addEventListener('error', (ev) => {
+        // Le RISORSE fallite (una <img> 404) usano lo STESSO evento, e senza
+        // `message`: MISURATO il 12/08/2026, due voci vuote per due immagini
+        // rotte. Senza questo filtro un'immagine mancante diventerebbe
+        // «esecuzione interrotta», cioe' il criterio della resa invaderebbe
+        // quello delle risorse e boccerebbe per la causa sbagliata.
+        if (!ev || !ev.message) return;
+        window.__nexusEcc.push({
+          message: String(ev.message).slice(0, CAP_TESTO),
+          name: (ev.error && ev.error.name) ? String(ev.error.name).slice(0, CAP_CLASSE) : null,
+          file: ev.filename ? String(ev.filename).slice(0, CAP_PERCORSO) : null,
+          line: Number.isFinite(ev.lineno) ? ev.lineno : null,
+          column: Number.isFinite(ev.colno) ? ev.colno : null,
+        });
+      }, true);
+    });
     page.on('console', (m) => {
-      if (m.type() === 'error') fatti.consoleErrors.push(String(m.text()).slice(0, 500));
+      if (m.type() === 'error') fatti.consoleErrors.push(String(m.text()).slice(0, CAP_TESTO));
     });
     page.on('pageerror', (e) => {
-      fatti.pageErrors.push(String(e && e.message ? e.message : e).slice(0, 500));
+      fatti.pageErrors.push({
+        message: String(e && e.message ? e.message : e).slice(0, CAP_TESTO),
+        name: (e && e.name) ? String(e.name).slice(0, CAP_CLASSE) : null,
+        file: null, line: null, column: null,
+      });
     });
     page.on('requestfailed', (r) => {
       if (r.resourceType() === 'document') return;
@@ -512,6 +597,41 @@ const ASCOLTATORI: &str = r#"
       if (r.request().resourceType() === 'document') return;
       fatti.requests.push({ url: r.url(), resourceKind: r.request().resourceType(), status: r.status() });
     });"#;
+
+/// Attribuisce a ogni eccezione la sua POSIZIONE, letta dal canale in-page.
+///
+/// Non e' un secondo canale sullo stesso fatto: e' l'unico che quel fatto lo
+/// porta. MISURATO il 12/08/2026 riproducendo il difetto reale (`const products
+/// = [ @@ROTTO@@` a riga 75): `pageerror` consegna `message` «Invalid or
+/// unexpected token» e `stack` VUOTO, perche' per un errore di PARSING V8 non
+/// emette call frame e `exceptionToError` di Playwright compone lo stack dai
+/// soli call frame, scartando `exceptionDetails.lineNumber/columnNumber/url`
+/// che il CDP pure porta. Il listener `error` in fase di cattura, sulla stessa
+/// pagina, dava `listino.html:75:20`.
+///
+/// La correlazione e' per MESSAGGIO e consuma la voce usata: due eccezioni con
+/// lo stesso testo restano due, e la seconda non eredita la posizione della
+/// prima. Un'eccezione vista dal solo canale in-page non si perde — viene
+/// aggiunta — perche' il verdetto della resa non deve dipendere da quale dei
+/// due canali l'ha vista.
+///
+/// Gira DOPO l'attesa: uno script che lancia a fine caricamento non sarebbe
+/// ancora nell'array al momento del `goto`.
+const POSIZIONI_ECCEZIONI: &str = r#"
+    try {
+      const ecc = await page.evaluate(() => window.__nexusEcc || []);
+      for (const e of fatti.pageErrors) {
+        const i = ecc.findIndex((x) => x && !x.__usata && x.message === e.message);
+        if (i >= 0) {
+          ecc[i].__usata = true;
+          e.file = ecc[i].file; e.line = ecc[i].line; e.column = ecc[i].column;
+          if (!e.name) e.name = ecc[i].name;
+        }
+      }
+      for (const x of ecc) {
+        if (x && !x.__usata) fatti.pageErrors.push({ message: x.message, name: x.name, file: x.file, line: x.line, column: x.column });
+      }
+    } catch (_) {}"#;
 
 /// Il frammento che misura il DOM RESO, dopo che il JS ha girato.
 ///
@@ -591,6 +711,108 @@ mod tests {
             classifica_dialogo(&p, &[]),
             VerdettoDialogo::Rotto { .. }
         ));
+    }
+
+    /// La POSIZIONE dell'eccezione attraversa il wire e arriva ai fatti della
+    /// resa. E' il ponte fra i due lati del confine: il payload qui e' nella
+    /// forma che lo script produce dopo la fusione dei due canali.
+    ///
+    /// MUTAZIONE: far leggere `errori_esecuzione` con `lista` (la forma
+    /// precedente) -> gli oggetti non sono stringhe, la lista esce VUOTA e il
+    /// criterio perde il proprio verdetto, non solo la posizione.
+    #[test]
+    fn la_posizione_dell_eccezione_arriva_ai_fatti_della_resa() {
+        let payload = r#"{"loaded":true,"elementCount":3,
+            "pageErrors":[{"message":"Invalid or unexpected token","name":"SyntaxError",
+                           "file":"http://127.0.0.1:4000/preview/p/listino.html","line":75,"column":20}]}"#;
+        let prove = interpreta_resa(payload).expect("leggibile");
+        let ecc = prove
+            .errori_esecuzione
+            .first()
+            .expect("l'eccezione non deve sparire");
+        assert_eq!(ecc.riga, Some(75));
+        assert_eq!(ecc.colonna, Some(20));
+        assert_eq!(ecc.classe.as_deref(), Some("SyntaxError"));
+        // Il percorso completo non aiuta chi deve aprire il file.
+        assert_eq!(ecc.posizione().as_deref(), Some("listino.html:75:20"));
+        assert!(
+            ecc.descrizione().contains("listino.html:75:20"),
+            "la riga che l'agente legge deve portare la posizione: {}",
+            ecc.descrizione()
+        );
+    }
+
+    /// L'ALTRO lettore dello stesso campo. Il dialogo browser non ha dove
+    /// mettere una posizione e non fa dell'eccezione un verdetto, ma l'eccezione
+    /// deve restare nella sua evidenza.
+    ///
+    /// E' la trappola del cambiamento: `pageErrors` ha DUE consumatori, e
+    /// tipizzare il campo pensando al solo criterio della resa avrebbe fatto
+    /// sparire le eccezioni di qui IN SILENZIO — nessun tipo se ne sarebbe
+    /// accorto, perche' `lista` su oggetti ritorna semplicemente vuoto.
+    ///
+    /// MUTAZIONE: riportare la riga 261 a `lista(&v, campo::ERRORI_PAGINA)` ->
+    /// questo test cade con l'evidenza del dialogo priva dell'eccezione.
+    #[test]
+    fn il_dialogo_non_perde_l_eccezione_quando_diventa_un_oggetto() {
+        let payload = r#"{"loaded":true,"requests":[],"consoleErrors":["avviso di libreria"],
+            "pageErrors":[{"message":"courses is not defined","name":"ReferenceError","line":12}]}"#;
+        let prove = interpreta(payload).expect("leggibile");
+        assert!(
+            prove
+                .errori_console
+                .iter()
+                .any(|e| e.contains("courses is not defined")),
+            "l'eccezione deve restare nell'evidenza del dialogo: {:?}",
+            prove.errori_console
+        );
+        assert!(
+            prove
+                .errori_console
+                .iter()
+                .any(|e| e.contains("ReferenceError")),
+            "la classe entra nel testo quando il messaggio non la porta gia'"
+        );
+        assert!(prove.errori_console.iter().any(|e| e == "avviso di libreria"));
+    }
+
+    /// La forma STRINGA resta leggibile. Non e' retrocompatibilita' di wire (lo
+    /// script e l'interprete stanno nello stesso binario): e' che una fixture o
+    /// una versione futura che mandasse testo non deve far sparire il VERDETTO.
+    #[test]
+    fn un_eccezione_come_stringa_resta_un_eccezione() {
+        let prove = interpreta_resa(r#"{"loaded":true,"elementCount":1,"pageErrors":["boom"]}"#)
+            .expect("leggibile");
+        let ecc = prove.errori_esecuzione.first().expect("presente");
+        assert_eq!(ecc.messaggio, "boom");
+        assert_eq!(ecc.posizione(), None, "senza posizione non si inventa nulla");
+    }
+
+    /// Lo script apre il canale che porta la posizione, PRIMA della navigazione
+    /// (un `addInitScript` dopo il `goto` non verrebbe mai eseguito), e filtra
+    /// le voci senza `message`.
+    ///
+    /// Il filtro non e' prudenza teorica: MISURATO il 12/08/2026, una `<img>`
+    /// 404 emette sullo stesso canale una voce priva di messaggio, e senza il
+    /// filtro un'immagine rotta diventerebbe «esecuzione interrotta» — il
+    /// criterio della resa boccerebbe per la causa di un altro criterio.
+    #[test]
+    fn lo_script_apre_il_canale_della_posizione_e_scarta_le_risorse() {
+        let s = script_osservazione("/opt/chrome", "http://x", 2000, 30000, None);
+        let pos_init = s.find("addInitScript").expect("canale della posizione");
+        let pos_goto = s.find("page.goto").expect("navigazione");
+        assert!(
+            pos_init < pos_goto,
+            "addInitScript dopo il goto non verrebbe eseguito"
+        );
+        assert!(s.contains("if (!ev || !ev.message) return;"), "filtro sulle risorse fallite");
+        assert!(s.contains("ev.lineno"), "la riga entra nel payload");
+        assert!(s.contains("ev.colno"), "la colonna entra nel payload");
+        // La fusione dei due canali viene DOPO l'attesa: un'eccezione lanciata a
+        // fine caricamento non sarebbe ancora nell'array.
+        let pos_attesa = s.find("waitForLoadState").expect("attesa");
+        let pos_fusione = s.find("__nexusEcc || []").expect("fusione");
+        assert!(pos_attesa < pos_fusione, "la fusione segue l'attesa");
     }
 
     /// Un payload senza `loaded` NON diventa una pagina caricata: il default
@@ -945,7 +1167,7 @@ mod prova_dal_vivo {
             prove.pagina_caricata, prove.elementi_resi, prove.contenitore
         );
         for e in &prove.errori_esecuzione {
-            println!("  eccezione: {e}");
+            println!("  eccezione: {}", e.descrizione());
         }
         for c in prove.errori_console.iter().take(5) {
             println!("  console: {c}");

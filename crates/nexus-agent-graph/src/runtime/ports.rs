@@ -774,8 +774,26 @@ pub struct StepValidationRequest {
     pub steps: Vec<PendingStepInfo>,
     /// Livello massimo del batch (decide il fail-mode della doppia astensione).
     pub level: crate::decisions::step_gate::StepCriticality,
-    /// Estratto del piano attivo (rationale + vincoli), se esiste.
+    /// Cio' che l'utente ha chiesto in QUESTO turno.
+    ///
+    /// Il nome dice «piano» per ragioni storiche e il campo e' sempre stato
+    /// popolato con la richiesta del turno (`turn_task::current_turn_task`): la
+    /// doc diceva «rationale + vincoli del piano», che in produzione non arriva
+    /// qui e non ci e' mai arrivato.
     pub plan_excerpt: Option<String>,
+    /// I criteri per cui il gate ha rimandato il run in correzione, se il run
+    /// sta lavorando sotto un rimando.
+    ///
+    /// Viaggia SEPARATO da `plan_excerpt` perche' risponde a un'altra domanda:
+    /// quello dice cosa ha chiesto l'utente, questo cosa il sistema ha appena
+    /// contestato. Un passo puo' essere estraneo al primo e necessario al
+    /// secondo — ed e' il caso misurato il 12/08/2026, in cui due comandi che
+    /// riparavano cio' che il gate aveva bocciato sono stati rifiutati come
+    /// «non coerenti con l'estratto del piano».
+    ///
+    /// NON e' un lasciapassare: allarga cio' che e' PERTINENTE, non cio' che e'
+    /// reversibile. La soglia sull'irreversibilita' resta quella di prima.
+    pub criteri_in_correzione: Vec<String>,
     /// Rimandi gia' consumati in questo run (per il cap anti ping-pong).
     pub prior_rejections: u32,
 }

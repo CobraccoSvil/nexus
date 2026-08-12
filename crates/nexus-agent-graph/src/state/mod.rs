@@ -603,6 +603,25 @@ pub struct AgentState {
     /// gate"): non risponde e non deve rispondere a "com'e' andata la verifica"
     /// — per quello c'e' [`AgentState::final_gate_verdict`] (regola M).
     pub final_gate_cycle: Option<i64>,
+    /// I criteri per cui il gate ha rimandato il run in correzione ADESSO.
+    /// Vuoto = il run non sta lavorando sotto un rimando.
+    ///
+    /// Esiste per una domanda che il sistema non sapeva porre: «questo passo
+    /// serve a rimediare a cio' che il gate ha appena contestato?». Il gate
+    /// duale la poneva col solo `plan_excerpt`, che porta la RICHIESTA
+    /// dell'utente — e MISURATO il 12/08/2026 quella e' la risposta sbagliata:
+    /// richiesta «aggiungi un footer», il gate boccia la pagina per un
+    /// SyntaxError, l'agente prova a eseguire uno script che lo ripara e il
+    /// validatore risponde «non e' coerente con l'estratto del piano». Aveva
+    /// ragione sul dato che gli era stato dato. Due comandi rifiutati cosi'
+    /// (`npx html-validate`, `python fix_script.py`), di cui uno di sola
+    /// verifica, e il ciclo di correzione fermo.
+    ///
+    /// Porta i TIPI di criterio (vocabolario canonico), non la prosa del
+    /// rimando: al validatore serve sapere DI COSA si sta occupando l'agente,
+    /// e il testo del rimando e' gia' nella history di chi lavora.
+    #[serde(default)]
+    pub criteri_in_correzione: Vec<String>,
     /// ESITO dell'ultimo verdetto del final gate: il segnale STRUTTURATO che
     /// dice "com'e' andata" (regola M). Lo scrive OGNI ramo del gate, e i
     /// consumatori lo leggono con un `match` esaustivo invece di dedurre

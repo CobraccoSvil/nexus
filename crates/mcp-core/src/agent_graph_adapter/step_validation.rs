@@ -558,7 +558,23 @@ fn blob_del_batch(req: &StepValidationRequest) -> String {
     }
     b.push_str("</batch_da_validare>\n");
     if let Some(piano) = req.plan_excerpt.as_deref().filter(|p| !p.trim().is_empty()) {
-        b.push_str(&format!("<estratto_piano>\n{piano}\n</estratto_piano>\n"));
+        b.push_str(&format!(
+            "<richiesta_utente>\n{piano}\n</richiesta_utente>\n"
+        ));
+    }
+    // Il secondo contesto, e senza di esso il primo mente per omissione: sotto
+    // un rimando del gate l'agente lavora su qualcosa che l'utente NON ha
+    // chiesto, e giudicarne la pertinenza sulla sola richiesta boccia proprio i
+    // passi che il sistema gli ha imposto di fare.
+    if !req.criteri_in_correzione.is_empty() {
+        b.push_str(&format!(
+            "<rimando_del_gate>\nLa verifica finale ha bocciato questi criteri e il run e' in \
+             CORREZIONE: {}.\nUn passo che serve a rimediare a questi criteri e' PERTINENTE al \
+             lavoro in corso, anche se la richiesta dell'utente non lo nomina.\nQuesto non \
+             abbassa la soglia sull'irreversibilita': un passo distruttivo resta tale.\n\
+             </rimando_del_gate>\n",
+            req.criteri_in_correzione.join(", ")
+        ));
     }
     b.push_str(&format!(
         "Livello classificato del batch: {}. Rimandi gia' consumati in questo run: {}.\n\
@@ -693,6 +709,50 @@ mod tests {
     use nexus_agent_graph::decisions::step_gate::StepCriticality;
     use nexus_agent_graph::runtime::ports::PendingStepInfo;
 
+    /// Sotto un rimando del gate, i validatori ricevono ANCHE il motivo per cui
+    /// il run sta correggendo — separato dalla richiesta dell'utente.
+    ///
+    /// MISURATO il 12/08/2026 su `test-11-08-listino`: richiesta «aggiungi un
+    /// footer», il gate boccia la pagina per un `SyntaxError`, l'agente prova
+    /// `python fix_script.py` per ripararla e il validatore risponde «non e'
+    /// coerente con l'estratto del piano». Aveva ragione sul dato che gli era
+    /// stato dato: l'unico contesto era la richiesta, dove un fix non compare.
+    /// Stesso esito per `npx html-validate listino.html`, che e' di sola lettura.
+    ///
+    /// MUTAZIONE: togliere il blocco `<rimando_del_gate>` da `blob_del_batch` ->
+    /// questo test cade, e col difetto reale (il giudice torna a valutare la
+    /// pertinenza sulla sola richiesta).
+    #[test]
+    fn sotto_rimando_il_giudice_sa_di_cosa_si_sta_occupando_l_agente() {
+        let mut r = richiesta();
+        r.plan_excerpt = Some("aggiungi un footer alla pagina".into());
+        r.criteri_in_correzione = vec!["static_render".into()];
+        let b = blob_del_batch(&r);
+        assert!(b.contains("<richiesta_utente>"), "la richiesta resta dichiarata");
+        assert!(b.contains("<rimando_del_gate>"), "manca il contesto del rimando:\n{b}");
+        assert!(b.contains("static_render"), "il criterio contestato va nominato");
+        assert!(
+            b.contains("PERTINENTE"),
+            "al giudice va detto che un passo che rimedia e' pertinente"
+        );
+        // E non deve diventare un lasciapassare.
+        assert!(
+            b.contains("non abbassa la soglia sull'irreversibilita'")
+                || b.contains("irreversibilita'"),
+            "il rimando allarga la pertinenza, non la tolleranza al rischio"
+        );
+    }
+
+    /// Fuori da un rimando il blocco NON compare: un contesto che c'e' sempre
+    /// non direbbe piu' nulla, e trasformerebbe «sto correggendo» nello stato
+    /// normale del run.
+    #[test]
+    fn senza_rimando_il_blocco_non_compare() {
+        let r = richiesta();
+        assert!(r.criteri_in_correzione.is_empty());
+        assert!(!blob_del_batch(&r).contains("<rimando_del_gate>"));
+    }
+
     fn richiesta() -> StepValidationRequest {
         StepValidationRequest {
             run_id: "r1".into(),
@@ -706,6 +766,7 @@ mod tests {
             }],
             level: StepCriticality::Irreversible,
             plan_excerpt: Some("pulizia della cartella build".into()),
+            criteri_in_correzione: Vec::new(),
             prior_rejections: 1,
         }
     }
@@ -721,7 +782,10 @@ mod tests {
         assert!(b.contains("rm -rf build"));
         assert!(b.contains("irreversible"));
         assert!(b.contains("Rimandi gia' consumati in questo run: 1"));
-        assert!(b.contains("<estratto_piano>"));
+        // Il tag dice cio' che il campo CONTIENE: la richiesta del turno. Si
+        // chiamava `<estratto_piano>` e prometteva rationale e vincoli di un
+        // piano che qui non e' mai arrivato.
+        assert!(b.contains("<richiesta_utente>"));
         assert!(b.contains(TOOL_VERDETTO));
     }
 
