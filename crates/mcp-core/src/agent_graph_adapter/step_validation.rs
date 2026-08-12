@@ -26,6 +26,7 @@
 //! decisione (`Approved`/`Rejected`/`NeedsHuman`/`UnavailableDeclared`) e'
 //! SOLO di `decisions::step_gate::decide_step_gate` (regola L).
 
+use nexus_agent_graph::decisions::tetto_output::TettoOutput;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -352,8 +353,19 @@ async fn chiamata_one_shot(
         user_id,
     );
     let forzatura = forzatura_ammessa(&setup.db, &cand.provider, &cand.model).await;
+    // Il tetto lo decide il catalogo, non questo modulo: qui si dichiara solo
+    // quanto deve essere lunga la risposta VISIBILE.
+    let tetto = crate::capability::resolve_tetto_output(
+        &setup.db,
+        &cand.provider,
+        &cand.model,
+        VERDETTO_VISIBILE_TOKENS,
+    )
+    .await;
     let resp = match llm
-        .complete(richiesta_verdetto(&cand, system, blob, run_id, forzatura))
+        .complete(richiesta_verdetto(
+            &cand, system, blob, run_id, forzatura, tetto,
+        ))
         .await
     {
         Ok(r) => r,
@@ -407,16 +419,36 @@ async fn forzatura_ammessa(db: &PgPool, provider: &str, model: &str) -> bool {
     provider_style_supports_forcing(stile.as_deref())
 }
 
+/// Quanto deve essere lunga la RISPOSTA VISIBILE di un verdetto: una tool-call
+/// con enum, motivi e severita' sta ampiamente in questo spazio.
+///
+/// E' il solo numero che questo modulo puo' dichiarare, perche' riguarda cio'
+/// che LUI deve leggere. Quanto serva al modello per arrivarci — il
+/// ragionamento, che su alcuni fornitori non si spegne — non e' cosa sua: lo
+/// calcola `capability::resolve_tetto_output` dai fatti del catalogo.
+const VERDETTO_VISIBILE_TOKENS: u32 = 256;
+
 /// La richiesta one-shot: system del ruolo (prefisso STABILE riusabile in
 /// cache), batch nel messaggio utente, tool inline. Il `tool_choice` si forza
 /// solo dove la coppia lo ammette: la decisione arriva da
 /// [`forzatura_ammessa`], mai da un letterale.
+///
+/// Il TETTO di output non e' piu' un letterale, ed e' il fix di un difetto
+/// misurato il 12/08/2026: qui stava `max_tokens: Some(1024)`, uguale per
+/// qualunque modello, mentre il purpose `step_validator` seleziona apposta
+/// modelli con `required_capability = 'reasoning'`. Su un fornitore il cui
+/// pensiero non si spegne quel numero limita ragionamento E risposta insieme:
+/// il modello lo consumava pensando e rispondeva vuoto, con `finish_reason =
+/// length`. Le 15 righe `degenerate_hollow` del ledger avevano tutte
+/// `completion_tokens` ESATTAMENTE 1024, su tre fornitori diversi — e al terzo
+/// vuoto scattava l'auto-disable del MODELLO, per colpa di questo parametro.
 fn richiesta_verdetto(
     cand: &PurposeProviderCandidate,
     system: String,
     blob: String,
     run_id: String,
     forza_tool_choice: bool,
+    tetto: TettoOutput,
 ) -> LlmRequest {
     LlmRequest {
         provider: cand.provider.clone(),
@@ -429,7 +461,7 @@ fn richiesta_verdetto(
         tools: Some(vec![schema_step_verdict()]),
         force_tool_choice: Some(forza_tool_choice),
         system_text: Some(system),
-        max_tokens: Some(1024),
+        max_tokens: tetto.max_tokens().map(i64::from),
         run_id: Some(run_id),
         purpose: Some(PURPOSE.to_string()),
         ..Default::default()
@@ -741,6 +773,42 @@ mod tests {
                 || b.contains("irreversibilita'"),
             "il rimando allarga la pertinenza, non la tolleranza al rischio"
         );
+    }
+
+    /// Il tetto di output NON e' piu' deciso qui, e il verdetto di un modello
+    /// che ragiona non ci sta in 1024 token.
+    ///
+    /// MISURATO il 12/08/2026: con `max_tokens: Some(1024)` letterale, TUTTE le
+    /// 15 righe `degenerate_hollow` del ledger avevano `completion_tokens`
+    /// esattamente 1024 — kimi, openrouter e groq — perche' su quei dialetti il
+    /// tetto limita ragionamento e risposta INSIEME. Al terzo vuoto scattava
+    /// l'auto-disable del modello, per colpa di questo parametro.
+    ///
+    /// MUTAZIONE: rimettere `max_tokens: Some(1024)` in `richiesta_verdetto` ->
+    /// questo test cade sul valore del difetto reale.
+    #[test]
+    fn il_tetto_del_verdetto_lascia_spazio_al_ragionamento() {
+        use nexus_agent_graph::decisions::tetto_output::{tetto_per, FattiTetto};
+        // I fatti di kimi come sono a catalogo (default_max_output_tokens 8192).
+        let kimi = FattiTetto {
+            ragiona: Some(true),
+            default_output: Some(8192),
+            massimo_fornitore: None,
+        };
+        let tetto = tetto_per(VERDETTO_VISIBILE_TOKENS, &kimi);
+        assert_eq!(
+            tetto.max_tokens(),
+            Some(8192),
+            "il tetto deve venire dal catalogo, non da un letterale"
+        );
+        assert!(
+            tetto.max_tokens().unwrap() > 1024,
+            "1024 e' il soffitto che produceva le 15 righe degeneri"
+        );
+        // E il numero che questo modulo dichiara e' solo la parte VISIBILE:
+        // verificato a COMPILE-TIME, cosi' non c'e' un istante in cui il
+        // letterale possa tornare a essere il totale.
+        const { assert!(VERDETTO_VISIBILE_TOKENS < 1024) };
     }
 
     /// Fuori da un rimando il blocco NON compare: un contesto che c'e' sempre

@@ -20,6 +20,7 @@
 //! col TTL della routing matrix e degli altri letti-da-DB. Allineamento al DB
 //! entro 60s, niente redeploy.
 
+use nexus_agent_graph::decisions::tetto_output::{tetto_per, FattiTetto, TettoOutput};
 use nexus_cache::TtlCache;
 use sqlx::PgPool;
 use std::sync::OnceLock;
@@ -236,6 +237,69 @@ pub async fn resolve_mandatory_thinking_budget(
     };
     thinking_directive_cache().insert(key, resolved);
     resolved
+}
+
+static TETTO_CACHE: OnceLock<TtlCache<String, FattiTetto>> = OnceLock::new();
+
+fn tetto_cache() -> &'static TtlCache<String, FattiTetto> {
+    TETTO_CACHE.get_or_init(|| TtlCache::new(Duration::from_secs(TOOL_CHOICE_STYLE_TTL_SECS)))
+}
+
+/// I fatti del catalogo per la domanda del tetto di output. Nessun giudizio: il
+/// criterio e' [`nexus_agent_graph::decisions::tetto_output::tetto_per`].
+async fn fetch_fatti_tetto(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+) -> Result<Option<(Option<bool>, Option<i32>, Option<i32>)>, sqlx::Error> {
+    let sql = format!(
+        "SELECT thinking, default_max_output_tokens, max_output_tokens_hard \
+           FROM {V_MODEL_CAPABILITIES} WHERE provider = $1 AND model = $2"
+    );
+    sqlx::query_as::<_, (Option<bool>, Option<i32>, Option<i32>)>(&sql)
+        .bind(provider)
+        .bind(model)
+        .fetch_optional(db)
+        .await
+}
+
+/// Il tetto di output da imporre a `(provider, model)` per ottenere `visibile`
+/// token di risposta LEGGIBILE. Cache 60s.
+///
+/// Il chiamante dichiara solo cio' che deve vedere: il margine per il
+/// ragionamento lo calcola il criterio, dai fatti del catalogo. Vedi la doc di
+/// `tetto_output` per il difetto misurato che questa funzione chiude.
+///
+/// Su DB irraggiungibile o modello non a catalogo NON si inventa un numero: i
+/// fatti restano vuoti e il criterio decide (per un modello ignoto: nessun
+/// tetto, che e' il caso che non produce un vuoto fatturato).
+pub async fn resolve_tetto_output(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    visibile: u32,
+) -> TettoOutput {
+    let key = cache_key(provider, model);
+    if let Some(f) = tetto_cache().get(&key) {
+        return tetto_per(visibile, &f);
+    }
+    let fatti = match fetch_fatti_tetto(db, provider, model).await {
+        Ok(Some((thinking, default_out, hard))) => FattiTetto {
+            ragiona: thinking,
+            default_output: default_out.and_then(|v| u32::try_from(v).ok()),
+            massimo_fornitore: hard.and_then(|v| u32::try_from(v).ok()),
+        },
+        Ok(None) => {
+            tracing::debug!("tetto output: {provider}/{model} non a catalogo: nessun vincolo");
+            FattiTetto::default()
+        }
+        Err(e) => {
+            tracing::warn!("tetto output: catalogo non leggibile per {provider}/{model}: {e}");
+            FattiTetto::default()
+        }
+    };
+    tetto_cache().insert(key, fatti.clone());
+    tetto_per(visibile, &fatti)
 }
 
 #[cfg(test)]

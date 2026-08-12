@@ -182,6 +182,7 @@ pub mod static_render;
 pub mod supervisor;
 pub mod suspension_watch;
 pub mod switch_reason;
+pub mod tetto_output;
 pub mod text_repetition;
 pub mod tiers;
 pub mod timeout_cause;
