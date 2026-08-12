@@ -199,9 +199,15 @@ impl<S: Into<String>> From<S> for EccezionePagina {
 impl EccezionePagina {
     /// Solo il messaggio, per i consumatori che non hanno un posto dove mettere
     /// il resto (il dialogo browser, che di un'eccezione non fa un verdetto).
+    /// La classe si antepone solo se il messaggio non la porta GIA'.
+    ///
+    /// `contains` e non `starts_with`: MISURATO il 12/08/2026, il canale in-page
+    /// consegna «Uncaught SyntaxError: Unexpected token ':'» — la classe c'e' ma
+    /// non in testa, e un confronto sul prefisso produceva «SyntaxError: Uncaught
+    /// SyntaxError: ...».
     pub fn testo(&self) -> String {
         match self.classe.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
-            Some(c) if !self.messaggio.starts_with(c) => format!("{c}: {}", self.messaggio),
+            Some(c) if !self.messaggio.contains(c) => format!("{c}: {}", self.messaggio),
             _ => self.messaggio.clone(),
         }
     }
@@ -731,6 +737,43 @@ mod tests {
 
     use super::super::browser_dialogue::RichiestaOsservata;
     use super::super::risorse_pagina::Provenienza;
+
+    /// La riga che l'agente legge porta la posizione, e non ripete la classe.
+    ///
+    /// I due valori sono quelli MISURATI il 12/08/2026 col probe reale sulla
+    /// pagina di prova: il canale in-page consegna il messaggio col prefisso
+    /// «Uncaught SyntaxError: », e anteporre la classe con un confronto sul
+    /// prefisso produceva «SyntaxError: Uncaught SyntaxError: ...».
+    ///
+    /// MUTAZIONE: riportare `contains` a `starts_with` in `testo()` -> cade con
+    /// la classe ripetuta.
+    #[test]
+    fn la_riga_letta_dall_agente_dice_dove_e_non_ripete_la_classe() {
+        let e = EccezionePagina {
+            messaggio: "Uncaught SyntaxError: Unexpected token ':'".into(),
+            classe: Some("SyntaxError".into()),
+            file: Some("http://localhost:3000/preview/p/listino.html".into()),
+            riga: Some(169),
+            colonna: Some(21),
+        };
+        let d = e.descrizione();
+        assert!(d.contains("listino.html:169:21"), "manca la posizione: {d}");
+        assert_eq!(
+            d.matches("SyntaxError").count(),
+            1,
+            "la classe non va ripetuta: {d}"
+        );
+        // Il percorso completo non entra: chi apre il file vuole il nome.
+        assert!(!d.contains("http://"), "l'URL intero non aiuta: {d}");
+    }
+
+    /// Senza posizione la riga resta quella di prima: non si inventa nulla.
+    #[test]
+    fn senza_posizione_la_riga_non_inventa() {
+        let e = EccezionePagina::from("Invalid or unexpected token");
+        assert_eq!(e.descrizione(), "Invalid or unexpected token");
+        assert_eq!(e.posizione(), None);
+    }
 
     fn resa(elementi: usize) -> ProveResa {
         ProveResa {

@@ -628,8 +628,16 @@ const ASCOLTATORI: &str = r#"
 const POSIZIONI_ECCEZIONI: &str = r#"
     try {
       const ecc = await page.evaluate(() => window.__nexusEcc || []);
+      // I due canali NON danno la stessa stringa per la stessa eccezione:
+      // MISURATO il 12/08/2026, `pageerror` consegna «Unexpected token ':'» e il
+      // canale in-page «Uncaught SyntaxError: Unexpected token ':'». Un confronto
+      // per uguaglianza non aggancia mai, e il risultato non e' la perdita della
+      // posizione: e' la stessa eccezione riportata DUE volte, una con posizione
+      // e una senza. Si confronta sulla coda, che e' la parte che i due canali
+      // condividono.
+      const stessa = (a, b) => a === b || a.endsWith(b) || b.endsWith(a);
       for (const e of fatti.pageErrors) {
-        const i = ecc.findIndex((x) => x && !x.__usata && x.message === e.message);
+        const i = ecc.findIndex((x) => x && !x.__usata && stessa(x.message, e.message));
         if (i >= 0) {
           ecc[i].__usata = true;
           e.file = ecc[i].file; e.line = ecc[i].line; e.column = ecc[i].column;
@@ -834,6 +842,14 @@ mod tests {
             }
         }
         assert!(s.contains("ev.lineno"), "la riga entra nel payload");
+        // I due canali non danno la stessa stringa per la stessa eccezione
+        // (misurato: «Unexpected token ':'» contro «Uncaught SyntaxError:
+        // Unexpected token ':'»). Con l'uguaglianza secca la fusione non aggancia
+        // e la stessa eccezione viene riportata due volte, una senza posizione.
+        assert!(
+            s.contains("a.endsWith(b) || b.endsWith(a)"),
+            "la correlazione fra i due canali deve tollerare il prefisso"
+        );
         assert!(s.contains("ev.colno"), "la colonna entra nel payload");
         // La fusione dei due canali viene DOPO l'attesa: un'eccezione lanciata a
         // fine caricamento non sarebbe ancora nell'array.
