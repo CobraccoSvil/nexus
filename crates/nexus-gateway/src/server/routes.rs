@@ -54,6 +54,11 @@ use super::billing::{
 };
 use nexus_pricing::UsageUnit;
 use nexus_types::error_presentation::{render_user_error, ErrorDomain, ErrorFacts};
+// Vocabolario del blocco `details` (regola L): le classi e i nomi dei campi
+// vivono nel crate da cui dipendono ENTRAMBI i lati del confine, cosi' un
+// rename rompe la compilazione di chi legge invece di lasciare il trasporto
+// muto con tutti i test verdi (regola O).
+use nexus_types::provider_failure::{chiave, classe};
 use super::bootstrap::{build_http_client, build_runtime, GatewayConfig};
 use nexus_auth::llm_timeouts::LlmTimeouts;
 use super::AppState;
@@ -756,11 +761,12 @@ async fn run_fallback(
                 failures.push(ProviderFailure {
                     provider: name.to_string(),
                     model: Some(rp.model.clone()),
-                    class: "cooldown_billing",
+                    class: classe::COOLDOWN_BILLING,
                     status: None,
                     code: None,
                     message: format!("cooldown billing, {secs}s rimanenti"),
                     upstream: None,
+                    retry_after_seconds: attesa_dichiarabile(secs),
                 });
                 continue;
             }
@@ -789,11 +795,12 @@ async fn run_fallback(
                 failures.push(ProviderFailure {
                     provider: name.to_string(),
                     model: Some(rp.model.clone()),
-                    class: "cooldown",
+                    class: classe::COOLDOWN,
                     status: None,
                     code: None,
                     message: format!("in cooldown, {secs}s rimanenti"),
                     upstream: None,
+                    retry_after_seconds: attesa_dichiarabile(secs),
                 });
                 continue;
             }
@@ -822,7 +829,18 @@ async fn run_fallback(
                 cooldown.clear(name);
                 return Ok(resp);
             }
-            Err(f) => failures.push(f.into_provider_failure(name, &rp.model)),
+            // Il RESIDUO si legge dal registro che lo ha appena scritto, non si
+            // ricalcola dal ramo che ha fallito: qualunque strada abbia marcato
+            // il cooldown (billing, transient dopo l'ultimo retry, Retry-After
+            // onorato), il numero descrive lo stato vero adesso. Un ramo che
+            // domani marcasse in un modo nuovo lo dichiarerebbe da se'.
+            Err(f) => {
+                let attesa = cooldown
+                    .is_in_cooldown(name)
+                    .then(|| cooldown.seconds_remaining(name))
+                    .and_then(attesa_dichiarabile);
+                failures.push(f.into_provider_failure(name, &rp.model, attesa))
+            }
         }
     }
 
@@ -853,7 +871,7 @@ async fn run_fallback(
     // (transiente, cooldown, billing, mista) resta 500: ritentare puo' avere
     // senso, e il contratto coi client esistenti non si muove.
     let all_deterministic =
-        !failures.is_empty() && failures.iter().all(|f| f.class == "client_error");
+        !failures.is_empty() && failures.iter().all(|f| f.class == classe::CLIENT_ERROR);
     // La FRASE nasce dal PRIMO fallimento, con dominio Provider: e' l'unico
     // punto in cui provider, modello, status e codice esistono ancora. A valle
     // resterebbe solo l'aggregato "tutti i provider hanno fallito -> mistral
@@ -877,6 +895,16 @@ async fn run_fallback(
     Err(PipelineError::provider_with_details(message, details, facts))
 }
 
+/// Il residuo di un cooldown in forma DICHIARABILE al chiamante.
+///
+/// `seconds_remaining` tronca agli interi, quindi un residuo sub-secondo vale
+/// `0` — e `0` non e' un'attesa: e' un cooldown di fatto scaduto. Dichiararlo
+/// come attesa farebbe registrare al consumatore un'esclusione che non esiste.
+/// I negativi (residuo gia' passato) cadono nello stesso caso.
+fn attesa_dichiarabile(secs: i64) -> Option<u64> {
+    u64::try_from(secs).ok().filter(|s| *s > 0)
+}
+
 /// Fallimento di UN provider della chain, in forma STRUTTURATA (regola M).
 /// `class` e' il vocabolario chiuso condiviso col motore agentico:
 /// `billing` | `client_error` | `transient` (esito della chiamata) oppure
@@ -898,17 +926,32 @@ struct ProviderFailure {
     /// body. Alimenta la resa; NON entra in `to_json` (i `details` restano il
     /// canale delle decisioni macchina, regola M).
     upstream: Option<String>,
+    /// Secondi che restano da attendere su questo fornitore, quando il registro
+    /// dei cooldown ne ha uno attivo.
+    ///
+    /// E' un CAMPO e non un numero dentro `message` (regola Q): il residuo era
+    /// gia' noto e viaggiava dentro `"in cooldown, {secs}s rimanenti"`, dove
+    /// l'unico modo di leggerlo era una regex sulla prosa — cioe' esattamente
+    /// cio' che la regola M vieta a chi decide. Il consumatore e' mcp-core, che
+    /// da qui allinea il PROPRIO registro e smette di convocare un fornitore
+    /// che questo gateway rifiutera' comunque.
+    ///
+    /// `None` = nessun cooldown attivo su quel nome, oppure residuo non
+    /// dichiarabile. Non e' «zero»: chi legge non deve poter confondere «non
+    /// c'e' attesa» con «l'attesa non e' stata misurata».
+    retry_after_seconds: Option<u64>,
 }
 
 impl ProviderFailure {
     fn to_json(&self) -> Value {
         json!({
-            "provider": self.provider,
-            "model": self.model,
-            "class": self.class,
+            chiave::PROVIDER: self.provider,
+            chiave::MODELLO: self.model,
+            chiave::CLASSE: self.class,
             "status": self.status,
             "code": self.code,
             "message": self.message,
+            chiave::ATTESA_S: self.retry_after_seconds,
         })
     }
 
@@ -954,10 +997,10 @@ impl CallFailure {
         let http = err.chain().find_map(|c| c.downcast_ref::<ProviderHttpError>());
         Self {
             class: match kind {
-                ProviderErrorKind::Billing => "billing",
-                ProviderErrorKind::ClientError => "client_error",
-                ProviderErrorKind::ContextTooLong => "context_too_long",
-                ProviderErrorKind::Transient => "transient",
+                ProviderErrorKind::Billing => classe::BILLING,
+                ProviderErrorKind::ClientError => classe::CLIENT_ERROR,
+                ProviderErrorKind::ContextTooLong => classe::CONTEXT_TOO_LONG,
+                ProviderErrorKind::Transient => classe::TRANSIENT,
             },
             status: http.map(|h| h.status),
             code: http.and_then(|h| h.code.clone()),
@@ -973,7 +1016,7 @@ impl CallFailure {
     /// errore HTTP), la classe strutturata `empty_completion` porta l'informazione.
     fn empty_completion(finish_reason: &str) -> Self {
         Self {
-            class: "empty_completion",
+            class: classe::EMPTY_COMPLETION,
             status: None,
             code: None,
             message: format!(
@@ -991,7 +1034,7 @@ impl CallFailure {
     /// testo del messaggio.
     fn attempt_timeout(per_attempt: std::time::Duration) -> Self {
         Self {
-            class: "transient",
+            class: classe::TRANSIENT,
             status: None,
             code: Some("attempt_timeout".to_string()),
             message: format!(
@@ -1002,7 +1045,12 @@ impl CallFailure {
         }
     }
 
-    fn into_provider_failure(self, provider: &str, model: &str) -> ProviderFailure {
+    fn into_provider_failure(
+        self,
+        provider: &str,
+        model: &str,
+        retry_after_seconds: Option<u64>,
+    ) -> ProviderFailure {
         ProviderFailure {
             provider: provider.to_string(),
             model: Some(model.to_string()),
@@ -1011,6 +1059,7 @@ impl CallFailure {
             code: self.code,
             message: self.message,
             upstream: self.upstream,
+            retry_after_seconds,
         }
     }
 }
@@ -3821,6 +3870,121 @@ mod tests {
         let details = err.details.expect("details presenti");
         assert_eq!(details["primary_cause"], "cooldown_billing");
         assert_eq!(details["failures"][0]["class"], "cooldown_billing");
+    }
+
+    /// IL PONTE COL CONSUMATORE (regola O): il json che `run_fallback` compone
+    /// davvero viene letto dalla STESSA funzione che mcp-core usera' per
+    /// allineare il proprio registro dei cooldown. Un test che costruisse a
+    /// mano il blocco `details` proverebbe la propria imitazione, ed e'
+    /// esattamente il modo in cui questo confine e' rimasto muto finora: il
+    /// residuo esisteva, ma viveva dentro la prosa del messaggio.
+    ///
+    /// MUTAZIONI che lo fanno rosseggiare, entrambe col difetto reale:
+    ///   - `retry_after_seconds` non popolato nel ramo di skip -> `Nessuna`,
+    ///     cioe' mcp-core continua a convocare un fornitore che questo gateway
+    ///     sta gia' rifiutando;
+    ///   - classe di credito trattata come attesa -> `Attesa`, cioe' il credito
+    ///     tornerebbe disponibile allo scadere del timer di un altro processo
+    ///     invece che quando il probe accerta che c'e'.
+    #[tokio::test]
+    async fn il_residuo_del_cooldown_arriva_al_consumatore_come_campo() {
+        use nexus_types::provider_failure::EsclusioneDichiarata;
+
+        // (a) Attesa: cooldown transitorio attivo, fornitore saltato.
+        let p: Arc<dyn LlmProvider> = FakeProvider::new("groq", Behaviour::Ok);
+        let resolved = vec![ResolvedProvider {
+            provider: p,
+            model: "openai/gpt-oss-120b".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.mark_transient_after("groq", Some("rate limit".into()), Some(1800));
+        let err = run_fallback(
+            &resolved,
+            &cooldown,
+            &req(),
+            false,
+            TEST_PER_ATTEMPT,
+            far_deadline(),
+            &mut Vec::new(),
+        )
+        .await
+        .err()
+        .unwrap();
+        let details = err.details.expect("details presenti");
+        match EsclusioneDichiarata::dal_blocco_details(Some(&details)) {
+            EsclusioneDichiarata::Attesa { provider, secondi } => {
+                assert_eq!(provider, "groq");
+                assert!(
+                    (1700..=1800).contains(&secondi),
+                    "il residuo dichiarato deve essere quello del registro che lo ha scritto, \
+                     non un valore ricalcolato: {secondi}"
+                );
+            }
+            altro => panic!("atteso Attesa con il residuo dichiarato, avuto {altro:?}"),
+        }
+
+        // (b) Credito: la durata NON viaggia — a liberarlo e' chi lo verifica.
+        let q: Arc<dyn LlmProvider> = FakeProvider::new("anthropic", Behaviour::Ok);
+        let resolved = vec![ResolvedProvider {
+            provider: q,
+            model: "claude-opus-4-8".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.mark_billing("anthropic", Some("credit balance too low".into()));
+        let err = run_fallback(
+            &resolved,
+            &cooldown,
+            &req(),
+            false,
+            TEST_PER_ATTEMPT,
+            far_deadline(),
+            &mut Vec::new(),
+        )
+        .await
+        .err()
+        .unwrap();
+        let details = err.details.expect("details presenti");
+        assert_eq!(
+            EsclusioneDichiarata::dal_blocco_details(Some(&details)),
+            EsclusioneDichiarata::Credito {
+                provider: "anthropic".into()
+            }
+        );
+    }
+
+    /// Il fornitore SANO che fallisce per una causa deterministica non produce
+    /// alcuna esclusione: e' la meta' del criterio che protegge dal danno
+    /// opposto — escludere chi non ha nulla che non va, per un errore che
+    /// riguarda la richiesta e non lui.
+    #[tokio::test]
+    async fn un_errore_di_richiesta_non_esclude_il_fornitore() {
+        use nexus_types::provider_failure::EsclusioneDichiarata;
+
+        let p: Arc<dyn LlmProvider> = FakeProvider::new("deepseek", Behaviour::ErrClient);
+        let resolved = vec![ResolvedProvider {
+            provider: p,
+            model: "deepseek-chat".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        let err = run_fallback(
+            &resolved,
+            &cooldown,
+            &req(),
+            false,
+            TEST_PER_ATTEMPT,
+            far_deadline(),
+            &mut Vec::new(),
+        )
+        .await
+        .err()
+        .unwrap();
+        let details = err.details.expect("details presenti");
+        assert_eq!(
+            EsclusioneDichiarata::dal_blocco_details(Some(&details)),
+            EsclusioneDichiarata::Nessuna,
+            "client_error: il fornitore e' sano, escluderlo sarebbe un danno"
+        );
     }
 
     // ── Gate DLP sul pin + esclusioni per tier (POLICY_TIER_EXCLUDED) ─────────

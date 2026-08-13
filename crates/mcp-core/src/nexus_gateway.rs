@@ -2,6 +2,7 @@ use anyhow::Result;
 use nexus_types::error_presentation::{
     render_user_error, ErrorDomain, ErrorFacts, HasErrorFacts, RenderedError, TransportFacts,
 };
+use nexus_types::provider_failure::EsclusioneDichiarata;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -336,6 +337,20 @@ pub struct GatewayHttpError {
     pub user_code: Option<String>,
     /// Body grezzo: solo display/log, mai per decidere.
     pub body: String,
+}
+
+/// L'esclusione che il gateway ha dichiarato in QUESTA risposta d'errore.
+///
+/// Ponte fra il tipo dell'errore (che conosce solo questo modulo) e il criterio
+/// puro, che vive nel crate del contratto insieme al vocabolario delle classi:
+/// cosi' il json prodotto dal gateway e' letto dalla stessa funzione che i test
+/// del produttore attraversano, invece che da una copia scritta qui (regola O).
+///
+/// Il gateway che non parla questa versione del contratto — nessun `details`,
+/// o `failures` senza il residuo — produce [`EsclusioneDichiarata::Nessuna`]:
+/// un'assenza non autorizza a inventare per quanto tempo escludere qualcuno.
+pub(crate) fn esclusione_dichiarata(err: &GatewayHttpError) -> EsclusioneDichiarata {
+    EsclusioneDichiarata::dal_blocco_details(err.details.as_ref())
 }
 
 impl GatewayHttpError {
@@ -753,7 +768,25 @@ impl NexusGatewayClient {
             // il contratto del body del gateway — estrae `code` e `details`; il
             // punto di decisione (adapter agent-graph) fa downcast, non parsing
             // della stringa. Display identico al vecchio bail! per i log.
-            return Err(GatewayHttpError::from_response(status, body).into());
+            let errore = GatewayHttpError::from_response(status, body);
+            // ALLINEAMENTO DEI DUE REGISTRI. Sta QUI, allo stesso confine del
+            // governo del carico e per la stessa ragione: ogni chiamata al
+            // modello di mcp-core passa da `complete`, quindi l'esclusione che
+            // il gateway dichiara la impara TUTTO mcp-core — gate duale,
+            // motore agentico, purpose interni, wizard, classificatore — e non
+            // il solo percorso che la classificava per il failover.
+            //
+            // PORTATA dichiarata: restano fuori i due client che parlano lo
+            // stesso contratto wire da crate a MONTE di questo
+            // (`nexus-agent-tools::gateway_client` per i tool vision,
+            // `nexus-types::gateway_client` per admin-service e i worker). Non
+            // e' una lacuna dell'innesto: quel registro vive qui, e loro non
+            // possono vederlo ne' lo interrogano — nessuno dei due passa dalla
+            // selezione dei modelli che il registro governa.
+            crate::provider_cooldown::registra_esclusione_dichiarata(
+                &esclusione_dichiarata(&errore),
+            );
+            return Err(errore.into());
         }
 
         resp.json::<GwResponse>()
@@ -1338,5 +1371,95 @@ mod confine_wire_tests {
             nexus_ledger::DeclarationAudit::NonDichiarata,
             "un gateway muto su una chiamata con identita' e' un sospetto di doppio addebito"
         );
+    }
+
+    /// L'INNESTO, provato dove la produzione lo attraversa (regola O): una
+    /// chiamata vera di `complete` contro un gateway che risponde come il
+    /// gateway vero, e il registro locale che DOPO esclude quel fornitore.
+    ///
+    /// Perche' non basta provare il criterio: quello puro ha gia' i suoi test
+    /// in `nexus-types`, e resterebbero tutti verdi se `complete` non lo
+    /// chiamasse mai — cioe' proprio la forma in cui questo difetto e' vissuto
+    /// finora, col segnale che attraversava il confine e nessuno che ne
+    /// traesse la conseguenza.
+    ///
+    /// MUTAZIONE che lo fa rosseggiare, col difetto reale: togliere la chiamata
+    /// a `registra_esclusione_dichiarata` dal ramo d'errore di `complete` -> il
+    /// fornitore resta eleggibile e la selezione lo riconvoca, per tutta la
+    /// durata che il gateway sta onorando.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn complete_allinea_il_registro_locale_a_cio_che_il_gateway_rifiuta(db: sqlx::PgPool) {
+        use nexus_types::provider_failure::{chiave, classe};
+
+        // Nome irripetibile: il registro dei cooldown e' globale al processo e
+        // i test girano in parallelo.
+        let fornitore = "prova-innesto-complete";
+        assert!(
+            !crate::provider_cooldown::is_provider_in_cooldown(fornitore),
+            "premessa: il fornitore parte disponibile"
+        );
+
+        // Il corpo che il gateway compone davvero, con le chiavi del CONTRATTO
+        // (un rename le rompe qui a compile time, non in esercizio).
+        let corpo = serde_json::json!({
+            "code": "PROVIDER_ERROR",
+            "message": "tutti i provider hanno fallito",
+            "details": {
+                chiave::PRIMARY_CAUSE: classe::COOLDOWN,
+                chiave::FAILURES: [{
+                    chiave::PROVIDER: fornitore,
+                    chiave::MODELLO: "un-modello",
+                    chiave::CLASSE: classe::COOLDOWN,
+                    chiave::ATTESA_S: 900,
+                }],
+            },
+        })
+        .to_string();
+
+        // Gateway finto: una risposta sola, poi chiude.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("porta effimera");
+        let porta = listener.local_addr().expect("indirizzo").port();
+        let finto = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.expect("connessione");
+            let mut scarto = [0u8; 4096];
+            let _ = socket.read(&mut scarto).await;
+            // Il terminatore di riga di HTTP e' parte del protocollo, non dei
+            // fine-riga di questo file: dichiarato come costante perche' un
+            // normalizzatore d'albero non possa toccarlo.
+            const CRLF: &str = "\r\n";
+            let intestazioni = [
+                "HTTP/1.1 500 Internal Server Error",
+                "Content-Type: application/json",
+                &format!("Content-Length: {}", corpo.len()),
+                "Connection: close",
+                "",
+                "",
+            ]
+            .join(CRLF);
+            let _ = socket.write_all(intestazioni.as_bytes()).await;
+            let _ = socket.write_all(corpo.as_bytes()).await;
+            let _ = socket.flush().await;
+        });
+
+        let client = NexusGatewayClient::new(format!("http://127.0.0.1:{porta}"), db);
+        let esito = client
+            .complete(GwRequest {
+                model: "un-modello".into(),
+                messages: Vec::new(),
+                ..Default::default()
+            })
+            .await;
+        assert!(esito.is_err(), "il gateway ha risposto 500");
+        let _ = finto.await;
+
+        assert!(
+            crate::provider_cooldown::is_provider_in_cooldown(fornitore),
+            "dopo il rifiuto dichiarato la selezione non deve piu' convocarlo: e' il              difetto misurato il 12/08/2026 sul gate duale"
+        );
+
+        crate::provider_cooldown::remove_cooldown(fornitore);
     }
 }

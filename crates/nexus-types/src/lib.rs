@@ -27,6 +27,7 @@ pub mod gateway_client;
 pub mod git_exec;
 pub mod llm_json;
 pub mod long_running_dto;
+pub mod provider_failure;
 pub mod purpose;
 pub mod routing_client;
 pub mod settings_dto;

@@ -3149,6 +3149,40 @@ else
   echo "OK veto-in-eleggibilita: il gate duale dichiara soglia e veto"
 fi
 
+# ── esclusione-dichiarata-dal-gateway (2026-08-13) ──────────────────────────
+# «Questo fornitore e' utilizzabile adesso?» aveva DUE risposte in DUE processi,
+# e chi SCEGLIE consultava quella cieca: la selezione esclude i fornitori del
+# registro di mcp-core, che imparava solo dal proprio probe e dal pannello, mai
+# dai rifiuti che il gateway comunica a ogni chiamata. MISURATO il 12/08/2026
+# sul gate duale: tre validatori convocati (openai, kimi, openrouter) e tutte e
+# tre le astensioni con causa `cooldown` — il gateway li stava gia' rifiutando.
+#
+# Il vocabolario del wire vive in nexus-types (da cui dipendono ENTRAMBI i lati)
+# perche' un rename rompa la compilazione invece del trasporto (regola O).
+if ! grep -q 'nexus_types::provider_failure::{chiave, classe}' crates/nexus-gateway/src/server/routes.rs; then
+  echo "!! esclusione-dichiarata-dal-gateway: il gateway compone il blocco" >&2
+  echo "   details con chiavi e classi scritte in casa propria invece che col" >&2
+  echo "   vocabolario condiviso. Un rename da un lato lascerebbe l'altro a" >&2
+  echo "   leggere una chiave che non esiste, con i test verdi da entrambe le" >&2
+  echo "   parti." >&2
+  fail=1
+else
+  echo "OK esclusione-dichiarata-dal-gateway: il produttore usa il vocabolario condiviso"
+fi
+
+# L'INNESTO e' la meta' che si perde per prima: senza, il criterio resta perfetto
+# e mai raggiunto — cioe' la forma esatta in cui questo difetto e' vissuto finora.
+if ! grep -q 'registra_esclusione_dichiarata' crates/mcp-core/src/nexus_gateway.rs; then
+  echo "!! esclusione-dichiarata-dal-gateway: il confine da cui passa OGNI" >&2
+  echo "   chiamata al modello di mcp-core (NexusGatewayClient::complete) non" >&2
+  echo "   allinea piu' il registro locale a cio' che il gateway rifiuta: la" >&2
+  echo "   selezione torna a convocare fornitori gia' esclusi, per tutta la" >&2
+  echo "   durata che il gateway onora." >&2
+  fail=1
+else
+  echo "OK esclusione-dichiarata-dal-gateway: il confine allinea i due registri"
+fi
+
 # Prontezza di un fornitore (2026-08-09). `healthy: Option<bool>` faceva di
 # «mai interrogato», «nessuno lo interroghera'», «non configurato» e «gateway
 # spento» un unico `null`, reso come un unico pallino grigio: quattro situazioni

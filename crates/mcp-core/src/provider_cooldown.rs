@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
+use nexus_types::provider_failure::EsclusioneDichiarata;
+
 /// Tempi di health/cooldown provider, DB-driven (regola G). Inizializzati da
 /// `main.rs` all'avvio leggendo la tabella `settings` (chiavi `provider.*`,
 /// migrazioni 0253/0255). Se `init_provider_health_timings` non viene chiamato (es.
@@ -295,6 +297,78 @@ pub(crate) fn reset_provider_failures(provider: &str) {
     let store = PROVIDER_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = store.lock() {
         map.remove(&provider.to_lowercase());
+    }
+}
+
+/// Allinea il registro LOCALE all'esclusione che il gateway ha appena
+/// dichiarato sul wire (`details.failures[0]`).
+///
+/// ## Perche' esiste
+///
+/// La domanda «questo fornitore e' utilizzabile adesso?» aveva due risposte in
+/// due processi, e chi SCEGLIE consultava quella cieca: la selezione dei
+/// modelli esclude i fornitori di QUESTO registro
+/// ([`crate::orchestrator::model_selection::excluded_providers_lower`]), che
+/// pero' imparava solo dal probe periodico e dal pannello provider — mai dai
+/// rifiuti che il gateway comunica a ogni chiamata. Il segnale attraversava
+/// gia' il confine tipizzato e un consumatore lo leggeva gia' per il failover
+/// ([`crate::agent_graph_adapter::llm_gateway`]): mancava chi ne traesse la
+/// conseguenza sul registro.
+///
+/// MISURATO il 12/08/2026 sul gate duale: tre validatori convocati — `openai`,
+/// `kimi`, `openrouter` — e tutte e tre le astensioni con causa `cooldown`. Il
+/// gateway li stava rifiutando senza chiamarli, mentre la selezione li aveva
+/// appena scelti come i migliori disponibili.
+///
+/// ## Le due portate, e perche' la durata la decide chi guarisce
+///
+/// - [`EsclusioneDichiarata::Credito`] delega a
+///   [`put_provider_in_long_cooldown`], che e' il punto unico del credito:
+///   registra la severita' `Long`, persiste su Redis e mette il TTL su
+///   `nexus_provider_health`, cosi' il `billing_cooldown_recovery_loop` (probe
+///   -then-reenable) puo' liberarlo appena il credito torna. Il residuo
+///   dichiarato dal gateway NON viene usato come durata: il credito non scade
+///   col timer di un altro processo, e chi lo libera qui e' un ciclo che lo
+///   VERIFICA.
+/// - [`EsclusioneDichiarata::Attesa`] delega a
+///   [`put_provider_in_short_cooldown`] con i secondi dichiarati. Li' la
+///   durata E' l'informazione: viene dal `Retry-After` del fornitore o dal
+///   cooldown che il gateway ha appena impostato, e ricalcolarla la
+///   inventerebbe.
+///
+/// Nulla si registra su [`EsclusioneDichiarata::Nessuna`]: un errore di
+/// richiesta, un contesto troppo lungo o un turno vuoto non dicono nulla sulla
+/// disponibilita' del fornitore, ed escluderlo sarebbe un danno — la stessa
+/// asimmetria che `classify_provider_error` applica gia' al ripiego lessicale.
+pub fn registra_esclusione_dichiarata(esclusione: &EsclusioneDichiarata) {
+    match esclusione {
+        EsclusioneDichiarata::Credito { provider } => {
+            // Non si rinnova un cooldown lungo gia' attivo: ogni chiamata
+            // rifiutata ne allungherebbe la scadenza, e un fornitore ricaricato
+            // aspetterebbe l'ultimo rifiuto invece del primo.
+            if !is_provider_in_cooldown(provider) {
+                put_provider_in_long_cooldown(provider, "gateway: fornitore senza credito");
+                tracing::warn!(
+                    target: "provider_cooldown",
+                    provider = %provider,
+                    "esclusione dichiarata dal gateway: credito, registrata nel registro locale"
+                );
+            }
+        }
+        EsclusioneDichiarata::Attesa { provider, secondi } => {
+            put_provider_in_short_cooldown(
+                provider,
+                "gateway: attesa dichiarata dal fornitore",
+                *secondi,
+            );
+            tracing::warn!(
+                target: "provider_cooldown",
+                provider = %provider,
+                attesa_s = *secondi,
+                "esclusione dichiarata dal gateway: la selezione smette di convocarlo per questo tempo"
+            );
+        }
+        EsclusioneDichiarata::Nessuna => {}
     }
 }
 
@@ -1104,6 +1178,80 @@ mod tests {
         reset_provider_failures(p);
         // Il cooldown attivo rimane finche' non scade naturalmente, ma il
         // contatore failures e' stato resettato (verifica indiretta: assenza panic)
+    }
+}
+
+/// I DUE registri si allineano: cio' che il gateway dichiara di rifiutare
+/// smette di essere convocato da mcp-core.
+///
+/// Il criterio puro sta in `nexus-types` (dove entrambi i lati lo leggono) e ha
+/// i propri test; qui si prova la CONSEGUENZA — la sola cosa che conta per il
+/// gate duale: dopo la dichiarazione, il fornitore risulta escluso alla
+/// funzione che la SELEZIONE interroga davvero
+/// (`is_provider_in_cooldown`, letta da `excluded_providers_lower`).
+#[cfg(test)]
+mod tests_esclusione_dal_gateway {
+    use super::*;
+
+    /// L'incidente del 12/08/2026 nella sua forma minima: il gateway dichiara
+    /// un'attesa, e la selezione deve smettere di convocare quel fornitore.
+    ///
+    /// MUTAZIONE che la fa rosseggiare, col difetto reale: rendere
+    /// `registra_esclusione_dichiarata` un no-op sul ramo `Attesa` -> il
+    /// fornitore resta eleggibile, viene convocato di nuovo e si astiene di
+    /// nuovo con causa `cooldown`, per tutta la durata che il gateway onora.
+    #[test]
+    fn un_attesa_dichiarata_dal_gateway_esclude_il_fornitore_dalla_selezione() {
+        let p = "prova-attesa-dal-gateway";
+        assert!(!is_provider_in_cooldown(p), "premessa: parte disponibile");
+
+        registra_esclusione_dichiarata(&EsclusioneDichiarata::Attesa {
+            provider: p.to_string(),
+            secondi: 600,
+        });
+
+        assert!(
+            is_provider_in_cooldown(p),
+            "dichiarata l'attesa, la selezione non deve piu' convocarlo"
+        );
+        // La PORTATA e' il fornitore, come quella del gateway: registrare la
+        // sola coppia renderebbe mcp-core piu' permissivo di chi rifiuta.
+        assert!(is_model_in_cooldown(p, "un-modello-qualsiasi"));
+
+        remove_cooldown(p);
+    }
+
+    /// Il credito passa dal punto unico che registra la severita' `Long`: e'
+    /// quello che il ciclo probe-then-reenable riconosce, ed e' la ragione per
+    /// cui la durata dichiarata dal gateway non viene usata come scadenza.
+    #[test]
+    fn il_credito_dichiarato_registra_una_severita_da_verificare() {
+        let p = "prova-credito-dal-gateway";
+        registra_esclusione_dichiarata(&EsclusioneDichiarata::Credito {
+            provider: p.to_string(),
+        });
+
+        assert!(is_provider_in_cooldown(p));
+        let voce = cooldown_snapshot_entries()
+            .into_iter()
+            .find(|e| e.provider == p)
+            .expect("il fornitore e' nello snapshot");
+        assert_eq!(
+            voce.severity,
+            Some(CooldownSeverity::Long),
+            "il credito non e' un'attesa: a liberarlo dev'essere chi lo verifica"
+        );
+
+        remove_cooldown(p);
+    }
+
+    /// La meta' che protegge dal danno opposto: un fallimento che non parla
+    /// della disponibilita' del fornitore non lo esclude.
+    #[test]
+    fn nessuna_esclusione_dichiarata_non_tocca_il_registro() {
+        let p = "prova-nessuna-esclusione";
+        registra_esclusione_dichiarata(&EsclusioneDichiarata::Nessuna);
+        assert!(!is_provider_in_cooldown(p));
     }
 }
 
