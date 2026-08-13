@@ -444,6 +444,26 @@ pub fn message_tool_uses(m: &Message) -> Vec<(&str, &Value)> {
     out
 }
 
+/// Esito di UN blocco `ToolResult` dai suoi soli campi strutturati (regola M):
+/// `true` = fallito. Gerarchia: `exit_code` del tool-comando, e solo in sua
+/// assenza `is_error`.
+///
+/// PUNTO UNICO (regola L) del criterio, non della domanda che ci si costruisce
+/// sopra: [`message_tool_result_outcome`] lo aggrega su un intero messaggio,
+/// [`crate::decisions::stato_presupposto`] lo applica al blocco che risponde a
+/// UN `tool_use_id`. Due gerarchie separate divergerebbero al primo segnale
+/// nuovo, e proprio fra il criterio che dichiara fallito un passo e quello che
+/// lo mostra al giudice come prova.
+pub fn esito_di_blocco_tool_result(is_error: bool, exit_code: Option<i64>) -> bool {
+    match exit_code {
+        // Il tool-comando ha dichiarato il proprio exit code: e' il segnale
+        // primario, e un exit 0 vale successo anche se `is_error` non e' stato
+        // popolato dal costruttore del blocco.
+        Some(ec) => ec != 0,
+        None => is_error,
+    }
+}
+
 /// Valuta l'esito di UN messaggio se e' un tool_result: `Some(true)`=errore,
 /// `Some(false)`=successo, `None`=non e' un tool_result valutabile.
 ///
@@ -468,16 +488,6 @@ pub fn message_tool_uses(m: &Message) -> Vec<(&str, &Value)> {
 /// fallito?". Pubblica perche' la pone anche il rilevatore di anomalie del
 /// supervisore, che prima la risolveva per conto proprio e sul canale sbagliato.
 pub fn message_tool_result_outcome(m: &Message) -> Option<bool> {
-    /// Esito di un blocco `ToolResult` dai suoi soli campi strutturati.
-    fn esito_blocco(is_error: bool, exit_code: Option<i64>) -> bool {
-        match exit_code {
-            // Il tool-comando ha dichiarato il proprio exit code: e' il segnale
-            // primario, e un exit 0 vale successo anche se `is_error` non e'
-            // stato popolato dal costruttore del blocco.
-            Some(ec) => ec != 0,
-            None => is_error,
-        }
-    }
     /// Esito dei blocchi `ToolResult` presenti: `Some(true)` se ALMENO UNO
     /// dichiara un fallimento, `Some(false)` se ce n'e' almeno uno e nessuno lo
     /// dichiara, `None` se non ce ne sono. Un messaggio puo' portare i risultati
@@ -495,7 +505,7 @@ pub fn message_tool_result_outcome(m: &Message) -> Option<bool> {
             } = b
             {
                 trovato = true;
-                fallito |= esito_blocco(*is_error, *exit_code);
+                fallito |= esito_di_blocco_tool_result(*is_error, *exit_code);
             }
         }
         trovato.then_some(fallito)

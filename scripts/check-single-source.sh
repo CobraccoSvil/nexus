@@ -3608,6 +3608,39 @@ else
   echo "OK marker-di-debito-maiuscolo: il marker e' maiuscolo, la prosa non e' debito"
 fi
 
+# ── stato-presupposto (2026-08-13) ──────────────────────────────────────────
+# «Di cio' che questo batch presuppone, che cosa il run ha gia' prodotto?» ha UN
+# punto unico. Il difetto che ha chiuso: al gate duale arrivavano il passo, la
+# richiesta del turno e il contatore dei rimandi — nessuno step eseguito — e i
+# due mandati ordinano di trattare il buio come rifiuto. Misurato il 13/08/2026
+# (run cf44d0af): file scritto alle 08:37:40, `chmod +x verifica.sh &&
+# ./verifica.sh` rifiutato alle 08:38:54 perche' «non e' dimostrata l'esistenza
+# del file», run chiuso al secondo rimando.
+assert_single "stato-presupposto" 'pub fn stato_presupposto' \
+  'crates/nexus-agent-graph/src/decisions/stato_presupposto.rs' crates
+
+# Il CRITERIO dell'esito di un tool_result (exit_code prima di is_error) resta
+# uno: l'estratto lo applica al blocco che risponde a un tool_use_id, i segnali
+# lo aggregano su un messaggio. Due gerarchie divergerebbero proprio fra il
+# criterio che dichiara fallito un passo e quello che lo mostra al giudice.
+assert_single "stato-presupposto" 'pub fn esito_di_blocco_tool_result' \
+  'crates/nexus-agent-graph/src/routing/signals.rs' crates
+
+# Il CONSUMATORE: il messaggio ai due giudici deve rendere l'estratto. Senza
+# questa riga il campo viaggia fino all'adapter e nessuno lo scrive nel prompt —
+# il difetto tornerebbe intatto con tutti i test del criterio verdi, che e'
+# esattamente la forma in cui e' vissuto finora (regola O).
+if grep -qE 'stato_presupposto\.blocco\(\)' \
+     crates/mcp-core/src/agent_graph_adapter/step_validation.rs; then
+  echo "OK stato-presupposto: il messaggio ai giudici porta cio' che il run ha fatto"
+else
+  echo "!! stato-presupposto: blob_del_batch non rende piu' <stato_gia_prodotto>." >&2
+  echo "   I due giudici tornano a giudicare un passo senza sapere se lo stato" >&2
+  echo "   che presuppone esiste, e il loro mandato impone di rifiutare: e' il" >&2
+  echo "   reject strutturalmente obbligato misurato il 13/08/2026." >&2
+  fail=1
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1
