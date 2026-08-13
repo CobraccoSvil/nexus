@@ -182,6 +182,7 @@ fn payload_ricerca(query: &str, report: &rag::SemanticSearchReport) -> Value {
     out.insert("query".into(), json!(query));
     out.insert("count".into(), json!(report.hits.len()));
     out.insert("hits".into(), json!(report.hits));
+<<<<<<< HEAD
     if !report.collections_fallite.is_empty() {
         let fallite: Vec<Value> = report
             .collections_fallite
@@ -190,6 +191,39 @@ fn payload_ricerca(query: &str, report: &rag::SemanticSearchReport) -> Value {
             .collect();
         out.insert("collections_fallite".into(), Value::Array(fallite));
         out.insert("hint".into(), json!(HINT_FONTI_MUTE));
+=======
+    // Le fonti mute portano la CAUSA, non solo il nome: un'assenza e una
+    // caduta di Qdrant si leggono diverse anche dal modello, che sulla prima
+    // non deve nemmeno sperare in un riprovo piu' tardi (regola Q).
+    let mute: Vec<Value> = report
+        .non_hanno_risposto()
+        .map(|m| match &m.esito {
+            rag::search::Esito::CollectionAssente { scrittore } => json!({
+                "kind": m.kind,
+                "collection": m.collection,
+                "causa": "collection_assente",
+                "scritta_da": scrittore.punto(),
+            }),
+            rag::search::Esito::NonInterrogabile { errore } => json!({
+                "kind": m.kind,
+                "collection": m.collection,
+                "causa": "non_interrogabile",
+                "errore": errore,
+            }),
+            rag::search::Esito::Interrogata { .. } => Value::Null,
+        })
+        .collect();
+    if !mute.is_empty() {
+        out.insert("fonti_non_disponibili".into(), json!(mute));
+        out.insert(
+            "hint".into(),
+            json!(
+                "una o piu' fonti non hanno potuto rispondere: questo NON e' un \
+                 'non trovato'. Non ripetere la stessa query; usa read_file / \
+                 search_in_files sui percorsi che gia' conosci."
+            ),
+        );
+>>>>>>> worktree-agent-a54c7f154caf57c5e
     } else if report.hits.is_empty() {
         out.insert("hint".into(), json!(HINT_ZERO_PULITO));
     }
@@ -236,6 +270,7 @@ mod tests {
         serde_json::from_str(&risposta.testo).expect("il testo del tool e' JSON valido")
     }
 
+<<<<<<< HEAD
     /// Parte dal PRODUTTORE reale dell'errore (`errore_ricerca` sulla variante
     /// che il chiamato emette davvero), non da un JSON scritto a mano.
     #[test]
@@ -264,19 +299,30 @@ mod tests {
 
     /// RAMO NUDO: zero hit con collection fallite non e' un "non trovato", ed
     /// e' l'esito che prima usciva come successo. Parte dal produttore reale
+=======
+    /// Zero hit con una fonte muta: il risultato DISTINGUE il guasto dal
+    /// "non trovato" e l'hint vieta la ripetizione. Parte dal produttore reale
+>>>>>>> worktree-agent-a54c7f154caf57c5e
     /// (`render_search_result`), non da un JSON scritto a mano (regola O).
     #[test]
     fn una_collection_fallita_non_e_un_non_trovato() {
         let report = rag::SemanticSearchReport {
             hits: Vec::new(),
-            collections_fallite: vec![("code".into(), "HTTP 404 collection assente".into())],
+            esiti: vec![rag::search::EsitoDelKind {
+                kind: "code".into(),
+                collection: "project_code_index".into(),
+                esito: rag::search::Esito::NonInterrogabile {
+                    errore: "HTTP 503".into(),
+                },
+            }],
         };
         let out = render_search_result("frontend App counters", report);
         assert!(out.esito.e_fallito(), "{out:?}");
         assert_eq!(out.natura, Some(NaturaFallimento::DelSistema), "{out:?}");
         let v = payload_di(&out);
         assert_eq!(v["count"], 0);
-        assert_eq!(v["collections_fallite"][0]["kind"], "code");
+        assert_eq!(v["fonti_non_disponibili"][0]["kind"], "code");
+        assert_eq!(v["fonti_non_disponibili"][0]["causa"], "non_interrogabile");
         let hint = v["hint"].as_str().expect("hint presente");
         assert!(
             hint.contains("NON e' un 'non trovato'"),
@@ -284,6 +330,7 @@ mod tests {
         );
     }
 
+<<<<<<< HEAD
     /// Con almeno un hit la fonte muta NON boccia la ricerca: i risultati
     /// trovati sono utilizzabili, e l'hint resta nel payload per dichiararlo.
     #[test]
@@ -308,6 +355,38 @@ mod tests {
 
     /// Zero hit puliti: niente allarme (una ricerca andata a buon fine che non
     /// trova nulla e' un SUCCESSO), ma l'hint dice che insistere e' inutile.
+=======
+    /// Una collection ASSENTE si distingue da un guasto e nomina lo scrittore.
+    ///
+    /// E' il caso misurato il 13/08/2026 (`kb` -> `kb_chunks`, nessuno scrive
+    /// piu' li'): riprovare non cambia nulla, e senza il nome dello scrittore
+    /// chi legge la diagnosi non sa dove andare.
+    #[test]
+    fn una_collection_assente_dichiara_chi_avrebbe_dovuto_scriverla() {
+        let report = rag::SemanticSearchReport {
+            hits: Vec::new(),
+            esiti: vec![rag::search::EsitoDelKind {
+                kind: "kb".into(),
+                collection: "wiki_content".into(),
+                esito: rag::search::Esito::CollectionAssente {
+                    scrittore: rag::collezioni::Scrittore::Esterno {
+                        punto: "nexus-wiki::content_points",
+                    },
+                },
+            }],
+        };
+        let v: Value =
+            serde_json::from_str(&render_search_result("note di progetto", report)).unwrap();
+        assert_eq!(v["fonti_non_disponibili"][0]["causa"], "collection_assente");
+        assert_eq!(
+            v["fonti_non_disponibili"][0]["scritta_da"],
+            "nexus-wiki::content_points"
+        );
+        assert!(v["fonti_non_disponibili"][0].get("errore").is_none());
+    }
+
+    /// Zero hit puliti: niente allarme, ma l'hint dice che insistere e' inutile.
+>>>>>>> worktree-agent-a54c7f154caf57c5e
     /// E' il caso delle 8 ricerche identiche del run 49fbc5d7.
     #[test]
     fn zero_hit_puliti_scoraggiano_la_ripetizione() {
@@ -315,7 +394,7 @@ mod tests {
         assert!(!out.esito.e_fallito(), "{out:?}");
         let v = payload_di(&out);
         assert_eq!(v["count"], 0);
-        assert!(v.get("collections_fallite").is_none());
+        assert!(v.get("fonti_non_disponibili").is_none());
         let hint = v["hint"].as_str().expect("hint presente");
         assert!(hint.contains("ripetere la stessa query"), "hint: {hint}");
     }
@@ -333,7 +412,11 @@ mod tests {
                 score: 0.9,
                 metadata: Value::Null,
             }],
-            collections_fallite: Vec::new(),
+            esiti: vec![rag::search::EsitoDelKind {
+                kind: "code".into(),
+                collection: "project_code_index".into(),
+                esito: rag::search::Esito::Interrogata { hits: 1 },
+            }],
         };
         let out = render_search_result("App", report);
         assert!(!out.esito.e_fallito(), "{out:?}");

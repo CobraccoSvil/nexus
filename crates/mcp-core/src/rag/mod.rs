@@ -4,6 +4,7 @@
 //! "whole file" con chunking + embedding + similarity search su Qdrant.
 
 pub mod chunker;
+pub mod collezioni;
 mod config;
 pub mod indexer;
 pub mod qdrant_client;
@@ -33,6 +34,12 @@ pub enum RagError {
     Embed(String),
     #[error("qdrant fallito: {0}")]
     Qdrant(String),
+    /// L'indexer ha ricevuto un kind la cui collection e' scritta da ALTRI:
+    /// scriverci dentro ne romperebbe il payload. Distinta da [`Self::Qdrant`]
+    /// perche' non e' un guasto dell'infrastruttura, e' un errore di
+    /// programmazione (vedi [`collezioni::Scrittore`]).
+    #[error("collection non scritta dal RAG: {0}")]
+    ScritturaNonAmmessa(String),
     #[error("configurazione RAG invalida: {0}")]
     Config(String),
     #[error("db: {0}")]

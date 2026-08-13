@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use super::collezioni::collection_del_kind;
 use super::{chunker, current_config, qdrant_client, RagError, SourceKind};
 
 /// Embedding di un batch di testi tramite l'embedder ONNX in-process del bridge
@@ -41,6 +42,20 @@ pub async fn index_text(
     let cfg = current_config(db).await?;
     if !cfg.enabled {
         return Err(RagError::Disabled);
+    }
+    // Il RAG scrive SOLO nelle collection di cui e' lo scrittore. Delle otto
+    // sorgenti che interroga ne possiede tre; per le altre e' un lettore ospite,
+    // e scriverci dentro ne romperebbe il payload che il proprietario si
+    // aspetta. Il controllo sta qui, PRIMA di chunkare ed embeddare: un
+    // fallimento a valle costerebbe un embed per scoprire un errore statico.
+    let risolta = collection_del_kind(&cfg, source_kind);
+    if !risolta.scrittore.e_del_rag() {
+        return Err(RagError::ScritturaNonAmmessa(format!(
+            "kind '{}' -> collection '{}', scritta da {}",
+            source_kind.as_str(),
+            risolta.nome,
+            risolta.scrittore.punto()
+        )));
     }
     if text.trim().is_empty() {
         return Ok(0);
@@ -81,7 +96,7 @@ pub async fn index_text(
         }
     }
 
-    let collection = cfg.collection_for(source_kind).to_string();
+    let collection = risolta.nome;
     qdrant_client::ensure_collection(&http, &cfg.qdrant_url, &collection, cfg.embedding_dim)
         .await?;
 

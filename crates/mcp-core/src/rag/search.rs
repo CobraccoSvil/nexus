@@ -6,6 +6,8 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use super::collezioni::{collection_del_kind, Scrittore};
+use super::qdrant_client::EsitoRicerca;
 use super::{current_config, qdrant_client, RagError, SourceKind};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,20 +32,63 @@ async fn embed_query(query: &str) -> Result<Vec<f32>, RagError> {
         .map_err(|e| RagError::Embed(format!("embed_query spawn_blocking join: {e}")))
 }
 
-/// Esito della ricerca semantica: gli hit E le collection che non hanno
-/// potuto rispondere.
+/// Cosa e' successo interrogando UNA fonte.
 ///
-/// Una collection fallita non e' "zero risultati" (regola M): prima questo
-/// esito veniva inghiottito con un `warn!` e il chiamante — incluso il modello
-/// che decide la prossima mossa — vedeva `count: 0` identico a "cercato e non
-/// trovato". Misurato il 31/07/2026: il correttore post-review ha ripetuto 8
-/// ricerche sul codice contro una collection inesistente, leggendo ogni volta
-/// uno zero che sembrava una risposta, fino alla chiusura per loop.
+/// Le tre varianti hanno rimedi diversi e prima erano due sole — «ho degli
+/// hit» e «e' andata male, ecco la stringa» — con l'assenza della collection
+/// nascosta dentro la seconda. Un'assenza non si risolve riprovando: o lo
+/// scrittore non ha ancora scritto nulla, o si sta leggendo dove nessuno
+/// scrive (regola Q).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Esito {
+    /// La collection ha risposto (anche con zero hit: quello e' un «non c'e'»).
+    Interrogata { hits: usize },
+    /// La collection non esiste. Il campo dice CHI dovrebbe averla creata:
+    /// senza, la diagnosi manda a cercare a caso.
+    CollectionAssente { scrittore: Scrittore },
+    /// Qdrant ha risposto un guasto, o non ha risposto affatto.
+    NonInterrogabile { errore: String },
+}
+
+impl Esito {
+    /// True se la fonte ha davvero risposto: solo qui uno zero significa
+    /// «cercato e non trovato».
+    pub fn ha_risposto(&self) -> bool {
+        matches!(self, Esito::Interrogata { .. })
+    }
+}
+
+/// L'esito di UNA fonte, con la collection che l'ha (o non l'ha) servita.
+#[derive(Debug, Clone)]
+pub struct EsitoDelKind {
+    pub kind: String,
+    pub collection: String,
+    pub esito: Esito,
+}
+
+/// Esito della ricerca semantica: gli hit E, per ogni fonte interrogata, che
+/// cosa e' successo.
+///
+/// Una collection che non risponde non e' "zero risultati" (regola M): prima
+/// questo esito veniva inghiottito con un `warn!` e il chiamante — incluso il
+/// modello che decide la prossima mossa — vedeva `count: 0` identico a
+/// "cercato e non trovato". Misurato il 31/07/2026: il correttore post-review
+/// ha ripetuto 8 ricerche sul codice contro una collection inesistente,
+/// leggendo ogni volta uno zero che sembrava una risposta, fino alla chiusura
+/// per loop.
 #[derive(Debug, Default)]
 pub struct SemanticSearchReport {
     pub hits: Vec<SearchHit>,
-    /// `(kind, errore)` per ogni collection interrogata e fallita.
-    pub collections_fallite: Vec<(String, String)>,
+    /// Un elemento per ogni kind interrogato, nell'ordine di interrogazione.
+    pub esiti: Vec<EsitoDelKind>,
+}
+
+impl SemanticSearchReport {
+    /// Le fonti che NON hanno potuto rispondere (assenti o in guasto): il
+    /// perimetro su cui un chiamante decide se lo zero e' credibile.
+    pub fn non_hanno_risposto(&self) -> impl Iterator<Item = &EsitoDelKind> {
+        self.esiti.iter().filter(|e| !e.esito.ha_risposto())
+    }
 }
 
 /// I kind interrogati quando il chiamante non ne specifica: tutte le fonti
@@ -73,6 +118,37 @@ pub(crate) fn default_kinds() -> Vec<SourceKind> {
         SourceKind::ToolResult,
         SourceKind::Code,
     ]
+}
+
+/// I filtri di UNA interrogazione, nell'ordine in cui vengono applicati.
+///
+/// I filtri del KIND vengono PRIMA di quelli del chiamante e non sono
+/// un'opzione: sono cio' che isola la sorgente dentro una collection condivisa
+/// con altre (il wiki porta meta e progetto insieme). Sta in una funzione, e
+/// non inline nel ciclo, perche' l'invariante «il filtro del kind c'e' sempre»
+/// sia verificabile dove la produzione lo costruisce (regola O).
+fn filtri_della_interrogazione(
+    risolta: &super::collezioni::CollectionDelKind,
+    kind: SourceKind,
+    project_id: Option<Uuid>,
+    session_id: Option<Uuid>,
+    extra: &[(String, Value)],
+) -> Vec<(String, Value)> {
+    let mut filters: Vec<(String, Value)> = risolta.filtri_kind.clone();
+    // Non tutte le sorgenti portano `project_id` nel payload: Conversation usa
+    // `session_id`, MetaDoc e' globale dentro lo scope `meta`.
+    if let Some(p) = project_id {
+        if kind.supports_project_filter() {
+            filters.push(("project_id".to_string(), json!(p.to_string())));
+        }
+    }
+    if let Some(s) = session_id {
+        if kind.uses_session_filter() {
+            filters.push(("session_id".to_string(), json!(s.to_string())));
+        }
+    }
+    filters.extend(extra.iter().cloned());
+    filters
 }
 
 /// Cerca i top-K chunk piu' rilevanti per `query` filtrati su:
@@ -110,25 +186,19 @@ pub async fn search_semantic(
     let query_vec = embed_query(query).await?;
 
     let mut all_hits: Vec<SearchHit> = Vec::new();
-    let mut collections_fallite: Vec<(String, String)> = Vec::new();
+    let mut esiti: Vec<EsitoDelKind> = Vec::new();
     for kind in kinds {
-        let collection = cfg.collection_for(kind).to_string();
-        let mut filters: Vec<(String, Value)> = Vec::new();
-        // Filtri per-kind: alcune collection legacy non hanno project_id
-        // (Conversation usa session_id; MetaDoc e' globale).
-        if let Some(p) = project_id {
-            if kind.supports_project_filter() {
-                filters.push(("project_id".to_string(), json!(p.to_string())));
-            }
-        }
-        if let Some(s) = session_id {
-            if kind.uses_session_filter() {
-                filters.push(("session_id".to_string(), json!(s.to_string())));
-            }
-        }
-        for (k, v) in extra_filters.iter() {
-            filters.push((k.clone(), v.clone()));
-        }
+        // Nome, scrittore e filtri di isolamento dal punto unico: qui non si
+        // incide nessun nome di collection (vedi `rag::collezioni`).
+        let risolta = collection_del_kind(&cfg, kind);
+        let collection = risolta.nome.clone();
+        let filters = filtri_della_interrogazione(
+            &risolta,
+            kind,
+            project_id,
+            session_id,
+            &extra_filters,
+        );
         let hits = match qdrant_client::search_points(
             &http,
             &cfg.qdrant_url,
@@ -139,26 +209,59 @@ pub async fn search_semantic(
         )
         .await
         {
-            Ok(h) => h,
+            Ok(EsitoRicerca::Hits(h)) => h,
+            Ok(EsitoRicerca::CollectionAssente) => {
+                // Un'assenza si dichiara col suo scrittore: e' l'unica
+                // informazione che rende la diagnosi azionabile, e la sua
+                // mancanza e' il motivo per cui `kb_chunks` e' rimasta un WARN
+                // ripetuto a ogni run per due mesi.
+                tracing::warn!(
+                    kind = kind.as_str(),
+                    collection = %collection,
+                    scrittore = risolta.scrittore.punto(),
+                    "rag.search_semantic: collection assente su Qdrant"
+                );
+                esiti.push(EsitoDelKind {
+                    kind: kind.as_str().to_string(),
+                    collection,
+                    esito: Esito::CollectionAssente {
+                        scrittore: risolta.scrittore,
+                    },
+                });
+                continue;
+            }
             Err(e) => {
                 tracing::warn!(
-                    "rag.search_semantic: collection '{}' fallita: {}",
-                    collection,
-                    e
+                    kind = kind.as_str(),
+                    collection = %collection,
+                    errore = %e,
+                    "rag.search_semantic: collection non interrogabile"
                 );
                 // Il fallimento viaggia col risultato, non solo nel log: per
                 // il chiamante "collection irraggiungibile" e "cercato e non
                 // trovato" sono esiti DIVERSI (regola M).
-                collections_fallite.push((kind.as_str().to_string(), e.to_string()));
+                esiti.push(EsitoDelKind {
+                    kind: kind.as_str().to_string(),
+                    collection,
+                    esito: Esito::NonInterrogabile {
+                        errore: e.to_string(),
+                    },
+                });
                 continue;
             }
         };
+        esiti.push(EsitoDelKind {
+            kind: kind.as_str().to_string(),
+            collection,
+            esito: Esito::Interrogata { hits: hits.len() },
+        });
         for h in hits {
             let p = h.payload;
             // Estrazione testo flessibile: il RAG framework usa `chunk_text`,
-            // ma le collection legacy hanno schemi diversi (conversation_context
-            // -> `content`, nexus_meta_docs -> `body_md`/`title`,
-            // prompt_corrections -> `correction`/`text`). Proviamo in ordine.
+            // ma le collection di cui e' ospite hanno schemi diversi
+            // (conversation_context -> `content`, il wiki -> `title` col corpo
+            // in `wiki_docs`, prompt_corrections -> `correction`/`text`).
+            // Proviamo in ordine.
             let chunk_text = p
                 .get("chunk_text")
                 .or_else(|| p.get("content"))
@@ -198,13 +301,18 @@ pub async fn search_semantic(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     all_hits.truncate(top_k);
+    let mute = esiti.iter().filter(|e| !e.esito.ha_risposto()).count();
     tracing::info!(
-        "rag.search_semantic: query_len={} hits={} collections_fallite={}",
+        "rag.search_semantic: query_len={} hits={} fonti={} senza_risposta={}",
         query.chars().count(),
         all_hits.len(),
-        collections_fallite.len()
+        esiti.len(),
+        mute
     );
-    Ok(SemanticSearchReport { hits: all_hits, collections_fallite })
+    Ok(SemanticSearchReport {
+        hits: all_hits,
+        esiti,
+    })
 }
 
 #[cfg(test)]
@@ -221,6 +329,72 @@ mod tests {
         assert!(
             kinds.contains(&SourceKind::Code),
             "default_kinds deve includere Code: {kinds:?}"
+        );
+    }
+
+    /// Il filtro del KIND raggiunge la query, e ci arriva PRIMA di quelli del
+    /// chiamante. Passa dalla funzione che la produzione usa davvero (regola O):
+    /// costruire la lista a mano nel test fisserebbe proprio l'assunto da
+    /// verificare.
+    ///
+    /// MUTAZIONE: togliendo `risolta.filtri_kind` da
+    /// `filtri_della_interrogazione`, questo test fallisce — ed e' il caso in
+    /// cui `kb` leggerebbe anche i documenti del vault e `meta_doc` quelli di
+    /// ogni progetto.
+    #[test]
+    fn il_filtro_del_kind_arriva_alla_query() {
+        let risolta = super::super::collezioni::CollectionDelKind {
+            nome: "wiki_content".into(),
+            scrittore: Scrittore::Esterno { punto: "wiki" },
+            filtri_kind: vec![("scope".to_string(), json!("project"))],
+        };
+        let progetto = Uuid::nil();
+        let filtri = filtri_della_interrogazione(
+            &risolta,
+            SourceKind::Kb,
+            Some(progetto),
+            None,
+            &[("source_id".to_string(), json!("x"))],
+        );
+        assert_eq!(
+            filtri.first(),
+            Some(&("scope".to_string(), json!("project"))),
+            "il filtro del kind precede tutti: {filtri:?}"
+        );
+        assert!(filtri.contains(&("project_id".to_string(), json!(progetto.to_string()))));
+        assert!(filtri.contains(&("source_id".to_string(), json!("x"))));
+    }
+
+    /// Una fonte assente e una in guasto non collassano nello stesso «non ha
+    /// risposto»: le due cause hanno rimedi opposti, e solo la seconda si
+    /// risolve riprovando.
+    #[test]
+    fn le_fonti_mute_si_distinguono_dalle_altre() {
+        let report = SemanticSearchReport {
+            hits: Vec::new(),
+            esiti: vec![
+                EsitoDelKind {
+                    kind: "code".into(),
+                    collection: "project_code_index".into(),
+                    esito: Esito::Interrogata { hits: 0 },
+                },
+                EsitoDelKind {
+                    kind: "kb".into(),
+                    collection: "wiki_content".into(),
+                    esito: Esito::CollectionAssente {
+                        scrittore: Scrittore::Esterno { punto: "wiki" },
+                    },
+                },
+            ],
+        };
+        let mute: Vec<&str> = report
+            .non_hanno_risposto()
+            .map(|m| m.kind.as_str())
+            .collect();
+        assert_eq!(
+            mute,
+            vec!["kb"],
+            "uno zero da una fonte che HA risposto non e' una fonte muta"
         );
     }
 }
