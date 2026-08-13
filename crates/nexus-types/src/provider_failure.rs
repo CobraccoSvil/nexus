@@ -64,6 +64,11 @@ pub mod classe {
     pub const CLIENT_ERROR: &str = "client_error";
     /// Richiesta troppo grande per QUESTO modello: un altro puo' accettarla.
     pub const CONTEXT_TOO_LONG: &str = "context_too_long";
+    /// Ammissione rifiutata: la prenotazione della richiesta supera il credito
+    /// RESIDUO del fornitore, che pero' ha credito e sta servendo. Non e'
+    /// [`BILLING`]: li' il rimedio e' ricaricare e il cooldown dura ore, qui
+    /// basta una richiesta piu' piccola (o un altro fornitore, subito).
+    pub const REQUEST_EXCEEDS_CREDIT: &str = "request_exceeds_credit";
     /// HTTP 200 senza output utile: il fornitore e' sano, il turno improduttivo.
     pub const EMPTY_COMPLETION: &str = "empty_completion";
 }
@@ -350,6 +355,9 @@ mod tests {
         for c in [
             classe::CLIENT_ERROR,
             classe::CONTEXT_TOO_LONG,
+            // Il fornitore ha credito e sta servendo: e' la richiesta a non
+            // starci dentro. Escluderlo per sei ore e' il difetto del 13/08.
+            classe::REQUEST_EXCEEDS_CREDIT,
             classe::EMPTY_COMPLETION,
             "classe_che_non_esiste",
         ] {

@@ -131,6 +131,11 @@ mod tests {
             "cooldown_billing",
             "client_error",
             "context_too_long",
+            // Il fornitore ha rifiutato l'ammissione per capienza del credito:
+            // non e' il modello ad avere un problema, e contarlo contro di lui
+            // porterebbe all'auto-disable (la firma del difetto del 12/08 sul
+            // tetto a 1024).
+            "request_exceeds_credit",
             "sconosciuto",
         ] {
             assert_eq!(degrade_kind_for_turn(Some(cause)), None, "causa: {cause}");

@@ -2511,6 +2511,10 @@ passo a {}/{}",
             "Richiesta troppo grande per {provider}: passo a {}/{}",
             pick.provider, pick.model
         ),
+        Cause::RequestExceedsCredit => format!(
+            "Richiesta oltre il credito residuo su {provider}: passo a {}/{}",
+            pick.provider, pick.model
+        ),
         Cause::Cooldown | Cause::Unknown => format!(
             "Provider {provider} non disponibile: passo a {}/{}",
             pick.provider, pick.model
@@ -2546,6 +2550,11 @@ esegui il prossimo step concreto del compito."
             "Il provider precedente ha rifiutato la richiesta perche' \
 troppo grande per la sua finestra/limite (non un cooldown). Riprendi tu, sul nuovo provider a \
 finestra piu' ampia: esegui il prossimo step concreto del compito."
+        }
+        Cause::RequestExceedsCredit => {
+            "Il provider precedente ha rifiutato la richiesta perche' \
+il suo credito residuo non la copriva (ha credito, ma non abbastanza per questa: non e' un \
+cooldown). Riprendi tu, sul nuovo provider: esegui il prossimo step concreto del compito."
         }
         Cause::Cooldown | Cause::Unknown => {
             "Il provider precedente non e' disponibile (in cooldown). \
@@ -9651,9 +9660,15 @@ fn error_class_da_port_error(err: &crate::runtime::ports::PortError) -> Option<&
             Causa::Cooldown => Some("provider_error"),
             Causa::EmptyCompletion => Some("empty_completion"),
             Causa::ContextTooLong => Some("context_too_long"),
-            // Il fornitore e' sano: la richiesta era rifiutata, o esclusa da
-            // policy, o la causa non e' determinabile. Nessun cooldown.
-            Causa::ClientError | Causa::PolicyTierExcluded | Causa::Unknown => None,
+            // Il fornitore e' sano: la richiesta era rifiutata (per forma o per
+            // capienza del credito residuo), o esclusa da policy, o la causa non
+            // e' determinabile. Nessun cooldown — su `RequestExceedsCredit`
+            // sarebbe per giunta di credito, cioe' sei ore per un fornitore che
+            // sta servendo (misurato il 13/08/2026).
+            Causa::ClientError
+            | Causa::PolicyTierExcluded
+            | Causa::RequestExceedsCredit
+            | Causa::Unknown => None,
         },
         PortError::Llm(rendered) => match rendered.code.as_str() {
             "provider_quota" => Some("billing_error"),

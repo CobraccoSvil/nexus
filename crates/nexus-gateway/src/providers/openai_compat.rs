@@ -1462,6 +1462,17 @@ pub enum ProviderErrorKind {
     /// Crediti/quota/fatturazione: il provider e' inutilizzabile finche' non si
     /// ricarica. NIENTE retry; cooldown lungo (mark_billing).
     Billing,
+    /// La richiesta non e' stata AMMESSA perche' la sua prenotazione supera il
+    /// credito residuo: il fornitore ha credito e sta servendo, e' questa
+    /// richiesta a non starci dentro. Come [`Self::ContextTooLong`] — ritentare
+    /// identico e' inutile, il fornitore NON va in cooldown, il motore ripiega
+    /// cross-provider — ma la causa e' un'altra e con essa il rimedio: qui si
+    /// ricarica o si chiede meno, li' serve una finestra piu' grande.
+    ///
+    /// Distinta da [`Self::Billing`] perche' quel cooldown dura sei ore: sui 129
+    /// rifiuti misurati il credito residuo arrivava a 64811 token (vedi
+    /// [`normalizza_codice_provider`]).
+    RequestExceedsCredit,
     /// Errore lato richiesta o configurazione (4xx client): 400 invalid_request,
     /// 401/403 auth o modello non abilitato, 404 model not found, 422. Ritentare
     /// NON aiuta e mettere in cooldown il PROVIDER e' sbagliato (il problema e' la
@@ -1516,8 +1527,17 @@ impl ProviderHttpError {
     /// Costruisce dall'HTTP status + body grezzo, estraendo il codice d'errore
     /// STRUTTURATO dal JSON (non dalla prosa).
     pub fn from_response(provider: &str, status: u16, body: String) -> Self {
-        let code = extract_structured_error_code(&body)
-            .map(|c| normalizza_codice_provider(provider, status, &c, &body));
+        // La normalizzazione riceve anche il codice ASSENTE: OpenRouter mette in
+        // `error.code` il NUMERO 402, che non e' una stringa e non viene
+        // estratto — se la si chiamasse solo su un codice presente, quel
+        // fornitore non passerebbe mai di qui (vedi
+        // [`normalizza_codice_provider`]).
+        let code = normalizza_codice_provider(
+            provider,
+            status,
+            extract_structured_error_code(&body).as_deref(),
+            &body,
+        );
         Self {
             provider: provider.to_string(),
             status,
@@ -1627,6 +1647,15 @@ fn extract_structured_error_message(body: &str) -> Option<String> {
 /// [`classify_by_status_code`] lo riconosce senza sapere da quale provider venga.
 const CODICE_BILLING_NORMALIZZATO: &str = "billing_error";
 
+/// Codice emesso quando un fornitore rifiuta l'AMMISSIONE della richiesta
+/// perche' la prenotazione supera il credito residuo — non perche' il credito
+/// sia finito. NON contiene `quota`/`billing`: quelle parole portano al cooldown
+/// lungo, che e' proprio il rimedio sbagliato per questo caso.
+const CODICE_AMMISSIONE_CREDITO: &str = "request_exceeds_credit";
+
+/// HTTP 402 Payment Required.
+const STATUS_PAGAMENTO_RICHIESTO: u16 = 402;
+
 /// Traduce nel vocabolario comune un codice che il provider riporta AMBIGUO.
 ///
 /// Anthropic risponde al credito esaurito con status 400 e
@@ -1646,16 +1675,56 @@ const CODICE_BILLING_NORMALIZZATO: &str = "billing_error";
 /// Il testo e' consultato SOLO qui, SOLO per il provider che ha l'ambiguita' e
 /// SOLO sul `error.message` strutturato: e' il perimetro minimo, non una
 /// classificazione dalla prosa.
-fn normalizza_codice_provider(provider: &str, status: u16, code: &str, body: &str) -> String {
-    let e_anthropic = provider.trim().eq_ignore_ascii_case("anthropic");
-    if e_anthropic
+///
+/// ## Il secondo quirk: il 402 di OpenRouter non e' un saldo a zero
+///
+/// OpenRouter PRENOTA il costo massimo della richiesta contro il credito
+/// residuo e rifiuta con 402 se non ci sta. Il rimedio, che il fornitore stesso
+/// allega, e' «add credits **or lower max_tokens**»: cioe' una richiesta piu'
+/// piccola PASSA, e il fornitore sta servendo.
+///
+/// RIPRODOTTO il 13/08/2026 con 10,03 dollari di credito, a costo zero (il
+/// rifiuto precede l'esecuzione):
+///   - senza `max_tokens` -> «You requested up to 65536 tokens, but can only
+///     afford 17052». I 65536 non sono nostri (non compaiono in alcun sorgente)
+///     ne' il massimo del modello (o1-pro ne dichiara 100000): e' la
+///     prenotazione che OpenRouter applica quando il tetto non e' dichiarato;
+///   - con `max_tokens: 30000` -> «up to 30000», cioe' il numero e' il NOSTRO
+///     quando lo mandiamo;
+///   - con `max_tokens: 8000` (prenotazione 4,80 dollari, sotto il saldo) ->
+///     ammessa.
+///
+/// Sulle 129 righe registrate in `nexus_provider_health_history` il residuo
+/// dichiarato va da 432 a 64811 token, e le due piu' recenti (13/08) hanno
+/// 62186 e 64671: il fornitore aveva credito per quasi tutto, e veniva messo in
+/// cooldown di credito per SEI ORE.
+///
+/// Il quirk si isola qui perche' il segnale che lo distinguerebbe non esiste:
+/// `error.code` porta il NUMERO 402 (non una stringa), e i campi
+/// `metadata.limit_source`/`remedy_hint` compaiono solo in una parte delle
+/// risposte — un criterio costruito su di essi darebbe due classificazioni
+/// diverse per lo stesso rifiuto. Restano provider + status, entrambi segnali
+/// strutturati: il punto di decisione a valle non impara nulla di
+/// provider-specifico (regola M, punto 4).
+fn normalizza_codice_provider(
+    provider: &str,
+    status: u16,
+    code: Option<&str>,
+    body: &str,
+) -> Option<String> {
+    let e = |nome: &str| provider.trim().eq_ignore_ascii_case(nome);
+    if e("anthropic")
         && status == 400
-        && code == "invalid_request_error"
+        && code == Some("invalid_request_error")
         && dichiara_credito_esaurito(body)
     {
-        return CODICE_BILLING_NORMALIZZATO.to_string();
+        return Some(CODICE_BILLING_NORMALIZZATO.to_string());
     }
-    code.to_string()
+    // OpenRouter: il 402 e' un rifiuto di AMMISSIONE, non un saldo a zero.
+    if e("openrouter") && status == STATUS_PAGAMENTO_RICHIESTO {
+        return Some(CODICE_AMMISSIONE_CREDITO.to_string());
+    }
+    code.map(str::to_string)
 }
 
 /// Il body dichiara credito/saldo insufficiente? Guarda il `error.message`
@@ -1692,6 +1761,12 @@ fn classify_by_status_code(status: u16, code: Option<&str>) -> ProviderErrorKind
         // ordine invertito sarebbe una coincidenza di stringhe a deciderla.
         if c.contains("rate_limit") {
             return ProviderErrorKind::Transient;
+        }
+        // Ammissione rifiutata per capienza del credito: precede il credito
+        // perche' i due si somigliano e hanno rimedi opposti — qui il fornitore
+        // sta servendo, e sei ore di cooldown sarebbero un danno.
+        if c == CODICE_AMMISSIONE_CREDITO {
+            return ProviderErrorKind::RequestExceedsCredit;
         }
         // Credito/fatturazione: qui il rimedio e' ricaricare, non attendere, e
         // scambiare i due significa ritentare all'infinito un account sospeso.
@@ -2758,6 +2833,66 @@ mod tests {
             BODY_FORMATO_ANTHROPIC.to_string(),
         ));
         assert_eq!(classify_provider_error(&err), ProviderErrorKind::ClientError);
+    }
+
+    /// Il body REALE di un 402 OpenRouter, copiato da
+    /// `nexus_provider_health_history` (13/08/2026, credito residuo 62.186
+    /// token): `error.code` e' il NUMERO 402, quindi non viene estratto come
+    /// codice, e `metadata` porta il rimedio che il fornitore stesso allega.
+    const BODY_402_OPENROUTER: &str = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 65536 tokens, but can only afford 62186. To increase, visit https://openrouter.ai/settings/credits and add more credits","code":402,"metadata":{"limit_source":"openrouter_credits","remedy_hint":"Add credits at https://openrouter.ai/settings/credits, or lower max_tokens / prompt size to fit your remaining balance.","provider_name":null}}}"#;
+
+    /// IL CASO MISURATO. Il 402 di OpenRouter e' un rifiuto di AMMISSIONE — la
+    /// prenotazione supera il credito RESIDUO — e veniva letto come credito
+    /// esaurito: cooldown di sei ore su un fornitore che aveva credito per
+    /// 62.186 token e stava servendo. Sulle 129 righe registrate il residuo
+    /// arriva a 64.811.
+    ///
+    /// Attraversa il PRODUTTORE (`from_response`) e arriva al VERDETTO, non al
+    /// nome del codice: quel nome non lo legge nessuno, la classe si'.
+    ///
+    /// MUTAZIONE: togliere il ramo openrouter da `normalizza_codice_provider`
+    /// -> il codice resta `None`, si cade sulla tabella per status (402 ->
+    /// Billing) e questo test riporta il difetto reale.
+    #[test]
+    fn il_402_di_openrouter_non_e_un_credito_esaurito() {
+        let err = anyhow::Error::new(ProviderHttpError::from_response(
+            "openrouter",
+            402,
+            BODY_402_OPENROUTER.to_string(),
+        ));
+        assert_eq!(
+            classify_provider_error(&err),
+            ProviderErrorKind::RequestExceedsCredit,
+            "il fornitore ha credito e sta servendo: sei ore di cooldown sono il \
+             rimedio di un altro problema"
+        );
+    }
+
+    /// L'altro verso: un 402 di un fornitore che NON prenota cosi' resta un
+    /// credito esaurito. Senza, il fix diventerebbe «nessun 402 e' piu' billing»
+    /// e un account davvero a secco verrebbe ritentato a ogni turno.
+    #[test]
+    fn un_402_di_un_altro_fornitore_resta_billing() {
+        let err = anyhow::Error::new(ProviderHttpError::from_response(
+            "deepseek",
+            402,
+            BODY_402_OPENROUTER.to_string(),
+        ));
+        assert_eq!(classify_provider_error(&err), ProviderErrorKind::Billing);
+    }
+
+    /// Il codice STRUTTURATO di credito continua a vincere anche su openrouter:
+    /// se un giorno dichiarasse `insufficient_quota`, quello e' un saldo finito
+    /// e non un'ammissione rifiutata.
+    #[test]
+    fn un_codice_di_credito_dichiarato_resta_billing_anche_su_openrouter() {
+        let body = r#"{"error":{"type":"insufficient_quota","message":"balance exhausted"}}"#;
+        let err = anyhow::Error::new(ProviderHttpError::from_response(
+            "openrouter",
+            429,
+            body.to_string(),
+        ));
+        assert_eq!(classify_provider_error(&err), ProviderErrorKind::Billing);
     }
 
     #[test]

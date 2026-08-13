@@ -269,10 +269,11 @@ fn request_budget_exceeded_body(budget_seconds: u64) -> (StatusCode, Value) {
 fn provider_facts_from_error(err: &anyhow::Error, provider: &str, model: Option<&str>) -> ErrorFacts {
     let http = err.chain().find_map(|c| c.downcast_ref::<ProviderHttpError>());
     let class = match classify_provider_error(err) {
-        ProviderErrorKind::Billing => "billing",
-        ProviderErrorKind::ClientError => "client_error",
-        ProviderErrorKind::ContextTooLong => "context_too_long",
-        ProviderErrorKind::Transient => "transient",
+        ProviderErrorKind::Billing => classe::BILLING,
+        ProviderErrorKind::ClientError => classe::CLIENT_ERROR,
+        ProviderErrorKind::ContextTooLong => classe::CONTEXT_TOO_LONG,
+        ProviderErrorKind::RequestExceedsCredit => classe::REQUEST_EXCEEDS_CREDIT,
+        ProviderErrorKind::Transient => classe::TRANSIENT,
     };
     ErrorFacts {
         domain: ErrorDomain::Provider,
@@ -1028,6 +1029,7 @@ impl CallFailure {
                 ProviderErrorKind::Billing => classe::BILLING,
                 ProviderErrorKind::ClientError => classe::CLIENT_ERROR,
                 ProviderErrorKind::ContextTooLong => classe::CONTEXT_TOO_LONG,
+                ProviderErrorKind::RequestExceedsCredit => classe::REQUEST_EXCEEDS_CREDIT,
                 ProviderErrorKind::Transient => classe::TRANSIENT,
             },
             status: http.map(|h| h.status),
@@ -1300,17 +1302,22 @@ async fn complete_with_retry(
                         );
                         return Err(failure);
                     }
-                    ProviderErrorKind::ContextTooLong => {
-                        // 413 request_too_large: ritentare lo STESSO provider e' inutile
-                        // e NON va messo in cooldown (il provider e' sano, e' la
-                        // richiesta a superare la sua finestra/limite). Torniamo l'errore
-                        // con class "context_too_long": il motore (allows_cross_provider_failover,
-                        // causa != ClientError) ripieghera' su un provider a finestra piu'
-                        // grande invece di chiudere n/d.
+                    // Due cause, una conseguenza: la richiesta non sta in QUESTO
+                    // fornitore — per finestra (413) o per capienza del credito
+                    // residuo (402 di ammissione, misurato il 13/08/2026 con
+                    // 62.186 token disponibili). In entrambi i casi il fornitore
+                    // e' sano: niente retry (la stessa richiesta prende lo stesso
+                    // rifiuto), niente cooldown, e il motore ripiega
+                    // cross-provider perche' la causa non e' `ClientError`.
+                    // QUALE delle due sia lo dice il campo `class`, non due
+                    // prose diverse (regola Q).
+                    ProviderErrorKind::ContextTooLong
+                    | ProviderErrorKind::RequestExceedsCredit => {
                         tracing::warn!(
                             provider = name,
                             status = failure.status,
-                            "gateway: richiesta troppo grande per il provider (413) -> niente \
+                            class = failure.class,
+                            "gateway: richiesta non accettata da questo provider -> niente \
                              retry/cooldown, il motore fara' failover cross-provider"
                         );
                         return Err(failure);
@@ -1780,6 +1787,9 @@ async fn build_sse_stream(
                     ProviderErrorKind::ClientError => {}
                     // 413 troppo grande per il provider: sano, niente cooldown.
                     ProviderErrorKind::ContextTooLong => {}
+                    // 402 di ammissione: ha credito, e' la richiesta a non
+                    // starci. Sano, niente cooldown.
+                    ProviderErrorKind::RequestExceedsCredit => {}
                     // Anche sullo streaming il cooldown onora il `Retry-After`: il
                     // segnale e' lo stesso del path non-streaming, e una durata
                     // diversa a seconda del canale sarebbe due risposte alla stessa
@@ -2836,6 +2846,11 @@ mod tests {
         /// 429 con `Retry-After`: il tetto token di UN modello, nella forma
         /// misurata su groq il 13/08/2026 (TPD Limit 200000, 23m44,3s).
         ErrRateLimit,
+        /// 402 di OpenRouter: la prenotazione supera il credito RESIDUO. Il body
+        /// e' quello reale del 13/08/2026 (residuo 62.186 token), con
+        /// `error.code` NUMERICO — la forma che non produce un codice
+        /// strutturato e cadeva sulla tabella per status.
+        ErrOltreIlCredito,
         /// Risposta 200 DEGENERE: content vuoto, zero tool-call, finish
         /// "length", ma con un usage REALE — la forma della degenerazione da
         /// budget (Gemini col tetto consumato dal thinking). Il provider l'ha
@@ -3078,6 +3093,16 @@ mod tests {
                     message: "insufficient_quota".into(),
                 }
                 .into()),
+                // Passa dal PRODUTTORE (`from_response`) e non da una struct
+                // costruita a mano: e' li' che il codice viene estratto e
+                // normalizzato, cioe' il tratto che decide la classe.
+                Behaviour::ErrOltreIlCredito => Err(crate::providers::ProviderHttpError::from_response(
+                    &self.name,
+                    402,
+                    r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 65536 tokens, but can only afford 62186.","code":402,"metadata":{"limit_source":"openrouter_credits"}}}"#
+                        .to_string(),
+                )
+                .into()),
                 Behaviour::ErrRateLimit => Err(crate::providers::ProviderHttpError {
                     provider: self.name.clone(),
                     status: 429,
@@ -3187,7 +3212,10 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
-                Behaviour::Hang | Behaviour::Degenerate | Behaviour::ErrRateLimit => {
+                Behaviour::Hang
+                | Behaviour::Degenerate
+                | Behaviour::ErrRateLimit
+                | Behaviour::ErrOltreIlCredito => {
                     unreachable!("Behaviour usato solo da complete")
                 }
                 Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
@@ -3211,7 +3239,10 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
-                Behaviour::Hang | Behaviour::Degenerate | Behaviour::ErrRateLimit => {
+                Behaviour::Hang
+                | Behaviour::Degenerate
+                | Behaviour::ErrRateLimit
+                | Behaviour::ErrOltreIlCredito => {
                     unreachable!("Behaviour usato solo da complete")
                 }
                 Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
@@ -3233,7 +3264,10 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
-                Behaviour::Hang | Behaviour::Degenerate | Behaviour::ErrRateLimit => {
+                Behaviour::Hang
+                | Behaviour::Degenerate
+                | Behaviour::ErrRateLimit
+                | Behaviour::ErrOltreIlCredito => {
                     unreachable!("Behaviour usato solo da complete")
                 }
                 Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
@@ -3259,7 +3293,10 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
-                Behaviour::Hang | Behaviour::Degenerate | Behaviour::ErrRateLimit => {
+                Behaviour::Hang
+                | Behaviour::Degenerate
+                | Behaviour::ErrRateLimit
+                | Behaviour::ErrOltreIlCredito => {
                     unreachable!("Behaviour usato solo da complete")
                 }
                 Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
@@ -4141,6 +4178,63 @@ mod tests {
         );
     }
 
+    /// IL CASO MISURATO il 13/08/2026: OpenRouter rifiuta l'AMMISSIONE perche' la
+    /// prenotazione (65536 token, il suo default quando non dichiariamo un tetto)
+    /// supera il credito residuo — che c'era: 62.186 token, e sulle 129 righe
+    /// registrate arriva a 64.811. Trattato come credito esaurito, quel rifiuto
+    /// toglieva il fornitore per SEI ORE.
+    ///
+    /// Attraversa `run_fallback` e guarda la CONSEGUENZA (il registro, il wire),
+    /// non il nome della classe: il difetto stava tutto in cio' che accadeva
+    /// dopo la classificazione.
+    ///
+    /// MUTAZIONE: togliere il ramo openrouter da `normalizza_codice_provider`
+    /// -> si ricade su Billing, e cadono il primo e il terzo assert con il
+    /// difetto reale (fornitore in cooldown di credito, esclusione propagata).
+    #[tokio::test]
+    async fn un_402_di_ammissione_non_mette_il_fornitore_in_cooldown() {
+        use nexus_types::provider_failure::EsclusioneDichiarata;
+
+        let p: Arc<dyn LlmProvider> = FakeProvider::new("openrouter", Behaviour::ErrOltreIlCredito);
+        let resolved = vec![ResolvedProvider {
+            provider: p,
+            model: "qwen/qwen3-235b-a22b-2507".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+
+        let err = run_fallback(
+            &resolved,
+            &cooldown,
+            &req(),
+            false,
+            TEST_PER_ATTEMPT,
+            far_deadline(),
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("il fornitore ha rifiutato");
+
+        assert!(
+            !cooldown.is_in_cooldown("openrouter"),
+            "il fornitore ha credito e sta servendo: sei ore di cooldown sono il \
+             rimedio di un altro problema"
+        );
+        assert!(!cooldown.is_billing_cooldown("openrouter"));
+
+        let details = err.details.expect("details presenti");
+        assert_eq!(
+            details["failures"][0]["class"], "request_exceeds_credit",
+            "la classe deve dire di che rifiuto si tratta: `billing` manderebbe \
+             il consumatore a escludere il fornitore"
+        );
+        assert_eq!(
+            EsclusioneDichiarata::dal_blocco_details(Some(&details)),
+            EsclusioneDichiarata::Nessuna,
+            "nulla da propagare al registro di mcp-core: il fornitore e' sano"
+        );
+    }
+
     /// Il fornitore SANO che fallisce per una causa deterministica non produce
     /// alcuna esclusione: e' la meta' del criterio che protegge dal danno
     /// opposto — escludere chi non ha nulla che non va, per un errore che
@@ -4965,7 +5059,10 @@ aliases:
             1,
             "un solo tentativo: l'attesa di 40s non sta nel budget di 3s"
         );
-        assert!(cooldown.is_in_cooldown("google"));
+        // Il cooldown c'e' ed e' sulla COPPIA: un 429 e' un tetto del modello
+        // (portata introdotta il 13/08/2026 col caso groq). La domanda giusta
+        // qui e' quella che porra' chi sta per instradare questa richiesta.
+        assert!(cooldown.is_model_in_cooldown("google", "gemini"));
     }
 
     #[tokio::test]
