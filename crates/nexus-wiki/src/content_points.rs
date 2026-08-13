@@ -23,6 +23,28 @@ const DEFAULT_QDRANT_URL: &str = "http://localhost:6333";
 
 const DEFAULT_WIKI_CONTENT_COLLECTION: &str = "wiki_content";
 
+/// La chiave di payload che distingue meta e progetto DENTRO `wiki_content`.
+///
+/// La collection e' UNA sola per entrambi gli scope (nessun partizionamento:
+/// la discriminazione vive nel payload), quindi chi la interroga senza questo
+/// filtro legge anche i documenti degli ALTRI progetti. Il valore ammesso lo
+/// dichiara [`crate::model::WikiScope::as_str`], mai un letterale.
+pub const CHIAVE_SCOPE: &str = "scope";
+
+/// Punto unico (regola L) del NOME della collection del wiki.
+///
+/// Lo SCRITTORE e' questo modulo; i LETTORI sono due e stanno fuori — la
+/// famiglia `knowledge.*` (che passa dalle funzioni qui sotto) e il RAG di
+/// mcp-core, che per [`SourceKind::Kb`](nexus_types::source_kind::SourceKind)
+/// e `MetaDoc` interroga QUESTA collection e non una propria.
+///
+/// La funzione esiste perche' il secondo lettore aveva inciso due nomi suoi.
+/// Vedi `mcp-core::rag::collezioni` per la misura.
+pub async fn wiki_content_collection(db: &PgPool) -> anyhow::Result<String> {
+    let (_, collection) = qdrant_wiki_content_config(db).await?;
+    Ok(collection)
+}
+
 async fn qdrant_wiki_content_config(db: &PgPool) -> anyhow::Result<(String, String)> {
     let url = get_setting(db, "qdrant_url").await?.unwrap_or_else(|| {
         std::env::var("QDRANT_URL").unwrap_or_else(|_| DEFAULT_QDRANT_URL.to_string())

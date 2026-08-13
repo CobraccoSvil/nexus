@@ -72,10 +72,19 @@ fn map_rel_from_wiki(rel: &str) -> String {
 
 /// Filtro Qdrant standard per i doc del progetto corrente (scope + project_id).
 /// Punto unico del payload di filtro riusato da search e subgraph.
+///
+/// La CHIAVE e il VALORE dello scope vengono dal wiki, non da due letterali:
+/// `wiki_content` porta meta e progetto insieme, e un terzo lettore che
+/// scrivesse `"scope"`/`"project"` per conto proprio sarebbe la divergenza di
+/// domani. Il RAG di mcp-core costruisce lo stesso filtro dagli stessi due
+/// punti (`rag::collezioni`).
 fn project_qdrant_filter(project_id: Uuid) -> Value {
     json!({
         "must": [
-            { "key": "scope", "match": { "value": "project" } },
+            {
+                "key": nexus_wiki::content_points::CHIAVE_SCOPE,
+                "match": { "value": nexus_wiki::model::WikiScope::Project.as_str() }
+            },
             { "key": "project_id", "match": { "value": project_id.to_string() } }
         ]
     })

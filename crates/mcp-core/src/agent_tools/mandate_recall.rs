@@ -2,9 +2,9 @@
 //! pertinenza dall'indice vettoriale (pilastro 4 del processo standard, W4).
 //!
 //! Chiamata SOTTILE a [`crate::rag::search_semantic`] (funzione esistente:
-//! embed in-process, report con `collections_fallite` distinte da zero-hit)
-//! piu' un formatter locale hits -> blocco `<contesto_richiamato>` con fonte
-//! e score. NON generalizza `build_knowledge_context` (saldata ad
+//! embed in-process, report con l'esito PER FONTE — assente / in guasto /
+//! interrogata — distinto da zero-hit) piu' un formatter locale hits -> blocco
+//! `<contesto_richiamato>` con fonte e score. NON generalizza `build_knowledge_context` (saldata ad
 //! AppState/wiki) ne' `MemoryRecall` (inchiodato a prompt_corrections):
 //! riusarle costerebbe piu' della funzione nuova senza togliere strati.
 //!
@@ -158,7 +158,7 @@ pub(crate) async fn contesto_richiamato(
             return None;
         }
     };
-    dichiara_collection_fallite(&report);
+    dichiara_fonti_mute(&report);
     let sopra_soglia: Vec<&rag::search::SearchHit> = report
         .hits
         .iter()
@@ -170,11 +170,33 @@ pub(crate) async fn contesto_richiamato(
     Some(componi_blocco(&sopra_soglia))
 }
 
-/// Ogni collection fallita si dichiara una a una: «non ho potuto guardare»
-/// non deve confondersi con «non c'era nulla» (regola M).
-fn dichiara_collection_fallite(report: &rag::search::SemanticSearchReport) {
-    for (kind, errore) in &report.collections_fallite {
-        tracing::warn!(kind, errore, "collection non interrogabile durante il recall del mandato");
+/// Ogni fonte che non ha risposto si dichiara una a una: «non ho potuto
+/// guardare» non deve confondersi con «non c'era nulla» (regola M).
+///
+/// Le due cause hanno rimedi opposti e per questo non condividono piu' un
+/// messaggio. Un guasto passa da solo; una collection ASSENTE non passa mai —
+/// e' una configurazione permanente, quindi la riga nomina lo SCRITTORE che
+/// avrebbe dovuto crearla. Era proprio questa meta' a mancare: `kb` produceva
+/// un WARN identico per ogni figura convocata, a ogni run, e nessuna di quelle
+/// righe diceva che a scrivere quella collection non c'era piu' nessuno.
+fn dichiara_fonti_mute(report: &rag::search::SemanticSearchReport) {
+    for muta in report.non_hanno_risposto() {
+        match &muta.esito {
+            rag::search::Esito::CollectionAssente { scrittore } => tracing::warn!(
+                kind = %muta.kind,
+                collection = %muta.collection,
+                scrittore = scrittore.punto(),
+                "collection ASSENTE durante il recall del mandato: nessun punto la serve, \
+                 riprovare non cambia nulla"
+            ),
+            rag::search::Esito::NonInterrogabile { errore } => tracing::warn!(
+                kind = %muta.kind,
+                collection = %muta.collection,
+                errore = %errore,
+                "collection non interrogabile durante il recall del mandato"
+            ),
+            rag::search::Esito::Interrogata { .. } => {}
+        }
     }
 }
 

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use sqlx::{PgPool, Row};
 use tokio::sync::RwLock;
 
-use super::{RagError, SourceKind};
+use super::RagError;
 
 /// Snapshot immutabile della configurazione RAG.
 #[derive(Clone, Debug)]
@@ -17,8 +17,10 @@ pub struct RagConfig {
     pub top_k_default: usize,
     pub qdrant_url: String,
     pub embedding_dim: usize,
+    /// Le tre collection SCRITTE dall'indexer di questo modulo: qui il nome e'
+    /// davvero una configurazione, perche' `ensure_collection` la crea con
+    /// quello (lettore e scrittore sono la stessa funzione).
     pub collection_attachments: String,
-    pub collection_kb: String,
     pub collection_chat_history: String,
     pub collection_tool_results: String,
     /// Collection dell'indice di codice: risolta dal punto unico dello
@@ -27,24 +29,14 @@ pub struct RagConfig {
     /// inciso c'era — "code_embeddings" — ed era di una collection mai
     /// esistita: ogni ricerca sul codice rispondeva zero per costruzione.
     pub collection_code: String,
-}
-
-impl RagConfig {
-    /// Ritorna il nome collection Qdrant per un dato `SourceKind`.
-    pub fn collection_for(&self, kind: SourceKind) -> &str {
-        match kind {
-            SourceKind::Attachment => &self.collection_attachments,
-            SourceKind::Kb => &self.collection_kb,
-            SourceKind::ChatHistory => &self.collection_chat_history,
-            SourceKind::ToolResult => &self.collection_tool_results,
-            SourceKind::Code => &self.collection_code,
-            // Collection legacy (nomi fissi, come Code): popolate da
-            // vector_memory.rs, payload eterogeneo gestito in search.rs.
-            SourceKind::MetaDoc => "nexus_meta_docs",
-            SourceKind::Conversation => "conversation_context",
-            SourceKind::PromptCorrection => "prompt_corrections",
-        }
-    }
+    /// Collection del wiki (`nexus_wiki::content_points`), che serve i kind
+    /// `Kb` e `MetaDoc`: entrambi avevano qui un nome inciso, ed entrambi
+    /// nominavano una collection senza scrittore. Vedi [`super::collezioni`].
+    pub collection_wiki: String,
+    /// Collection del contesto conversazione (`vector_memory`).
+    pub collection_conversation: String,
+    /// Collection delle correzioni di prompt (`vector_memory`).
+    pub collection_corrections: String,
 }
 
 static CACHE: once_cell::sync::Lazy<RwLock<Option<(Arc<RagConfig>, Instant)>>> =
@@ -106,12 +98,26 @@ async fn load_uncached(db: &PgPool) -> Result<Arc<RagConfig>, RagError> {
         qdrant_url: get("agent.rag.qdrant_url", "http://localhost:6333"),
         embedding_dim: get("agent.rag.embedding_dim", "384").parse().unwrap_or(384),
         collection_attachments: get("agent.rag.collection_attachments", "attachment_chunks"),
-        collection_kb: get("agent.rag.collection_kb", "kb_chunks"),
         collection_chat_history: get("agent.rag.collection_chat_history", "chat_history_chunks"),
         collection_tool_results: get("agent.rag.collection_tool_results", "tool_results_chunks"),
-        // Dal punto unico dello scrittore, NON da una chiave agent.rag.*:
-        // lettore e scrittore devono divergere mai (regola L).
+        // Dal punto unico dello SCRITTORE, NON da una chiave agent.rag.*:
+        // lettore e scrittore non devono divergere mai (regola L). Le quattro
+        // collection qui sotto le crea e le popola qualcun altro; questo modulo
+        // e' un lettore ospite e non ne sceglie il nome.
         collection_code: crate::vector_memory::code_index_collection(db).await,
+        collection_wiki: nexus_wiki::content_points::wiki_content_collection(db)
+            .await
+            .map_err(|e| RagError::Config(format!("nome collection wiki non risolvibile: {e}")))?,
+        collection_conversation: crate::vector_memory::conversation_context_collection_name(db)
+            .await
+            .map_err(|e| {
+                RagError::Config(format!("nome collection conversazione non risolvibile: {e}"))
+            })?,
+        collection_corrections: crate::vector_memory::prompt_corrections_collection_name(db)
+            .await
+            .map_err(|e| {
+                RagError::Config(format!("nome collection correzioni non risolvibile: {e}"))
+            })?,
     };
 
     let arc = Arc::new(cfg);
@@ -120,29 +126,11 @@ async fn load_uncached(db: &PgPool) -> Result<Arc<RagConfig>, RagError> {
     Ok(arc)
 }
 
+/// Il caricamento senza cache, esposto ai test del modulo fratello
+/// [`super::collezioni`]: la domanda «quale collection risponde per questo
+/// kind» si verifica sulla config REALE letta dal DB migrato, non su una
+/// `RagConfig` costruita a mano (regola O).
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// L'INVARIANTE del fix: il lettore (questa config) risolve il nome della
-    /// collection di codice dallo STESSO punto unico dello scrittore
-    /// (`vector_memory::code_index_collection`), sullo stesso DB migrato.
-    /// Prima il lettore aveva inciso "code_embeddings", collection mai
-    /// esistita: ogni ricerca sul codice rispondeva zero per costruzione, e
-    /// nessun test poteva accorgersene perche' nessuno confrontava i due lati.
-    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
-    async fn il_lettore_cerca_dove_lo_scrittore_scrive(pool: sqlx::PgPool) {
-        let dal_lettore = load_uncached(&pool).await.expect("config RAG dal DB migrato");
-        let dello_scrittore = crate::vector_memory::code_index_collection(&pool).await;
-        assert_eq!(
-            dal_lettore.collection_for(SourceKind::Code),
-            dello_scrittore,
-            "lettore e scrittore devono risolvere la stessa collection di codice"
-        );
-        assert_ne!(
-            dal_lettore.collection_for(SourceKind::Code),
-            "code_embeddings",
-            "il nome inciso della collection mai esistita non deve riapparire"
-        );
-    }
+pub(super) async fn config_dal_db(db: &PgPool) -> Result<Arc<RagConfig>, RagError> {
+    load_uncached(db).await
 }

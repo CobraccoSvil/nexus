@@ -2724,6 +2724,35 @@ else
   echo "OK confine-wire-session-usage: fixture condivisa e i suoi due lati"
 fi
 
+# collection-dal-suo-scrittore — il RAG non incide il nome di una collection
+# che non scrive lui.
+#
+# Tre volte lo stesso difetto: `code_embeddings`, `kb_chunks`, `nexus_meta_docs`
+# erano nomi INCISI nel lettore, e nessuno dei tre corrispondeva a una
+# collection che qualcuno scrivesse. Non falliva niente: una search su una
+# collection inesistente ritorna uno zero indistinguibile da «non trovato».
+# L'unico posto in cui quei tre nomi possono ancora comparire come LETTERALE e'
+# il modulo che li dichiara morti nel proprio test di mutazione.
+#
+# Il pattern pretende che nulla sulla riga preceda il letterale con una barra:
+# cosi' colpisce il codice (`nome: "kb_chunks".to_string()`) e non la prosa che
+# racconta il difetto (`/// il lettore aveva inciso "code_embeddings"`), che
+# vive in tre file e deve restarci — e' la memoria di come e' andata.
+assert_single "collection-dal-suo-scrittore" \
+  '^[^/]*"(kb_chunks|nexus_meta_docs|code_embeddings)"' \
+  'crates/mcp-core/src/rag/collezioni.rs'
+
+# E il punto unico deve restare quello: chi risolve una collection per un kind
+# passa da `collection_del_kind`, che pretende anche il nome dello SCRITTORE.
+if ! grep -q 'pub fn collection_del_kind' crates/mcp-core/src/rag/collezioni.rs 2>/dev/null; then
+  echo "!! collection-dal-suo-scrittore: manca collection_del_kind nel punto unico" >&2
+  echo "   Nome e scrittore di una collection si dichiarano insieme:" >&2
+  echo "   separarli riapre la faglia kb_chunks (nome vivo, scrittore rimosso)." >&2
+  fail=1
+else
+  echo "OK collection-dal-suo-scrittore: nome e scrittore restano una cosa sola"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

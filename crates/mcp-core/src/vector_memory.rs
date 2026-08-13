@@ -75,6 +75,15 @@ async fn qdrant_config(db: &PgPool) -> anyhow::Result<(String, String)> {
     Ok((url, collection))
 }
 
+/// Punto unico (regola L) del NOME della collection delle correzioni di prompt.
+/// Esiste per la stessa ragione di [`code_index_collection`]: il RAG la LEGGE
+/// (kind `prompt_correction`) e la risolveva da un letterale proprio, che una
+/// chiave `qdrant_prompt_corrections_collection` valorizzata avrebbe reso falso.
+pub(crate) async fn prompt_corrections_collection_name(db: &PgPool) -> anyhow::Result<String> {
+    let (_, collection) = qdrant_config(db).await?;
+    Ok(collection)
+}
+
 async fn qdrant_project_context_config(db: &PgPool) -> anyhow::Result<(String, String)> {
     let url = crate::settings::resolve_qdrant_url(db).await;
 
@@ -1162,6 +1171,14 @@ async fn qdrant_conversation_context_config(db: &PgPool) -> anyhow::Result<(Stri
         .await?
         .unwrap_or_else(|| DEFAULT_CONVERSATION_CONTEXT_COLLECTION.to_string());
     Ok((url, collection))
+}
+
+/// Punto unico (regola L) del NOME della collection del contesto conversazione.
+/// Stessa ragione di [`prompt_corrections_collection_name`]: il RAG la legge
+/// (kind `conversation`) e non deve inciderne il nome per conto proprio.
+pub(crate) async fn conversation_context_collection_name(db: &PgPool) -> anyhow::Result<String> {
+    let (_, collection) = qdrant_conversation_context_config(db).await?;
+    Ok(collection)
 }
 
 async fn ensure_conversation_context_collection(db: &PgPool) -> anyhow::Result<()> {
