@@ -2535,15 +2535,20 @@ fn titolo_per_umano(
     }
 }
 
-/// Il primo motivo dichiarato da chi ha rifiutato: e' quello che l'utente
-/// legge nel nastro, quindi viene dai CAMPI del verdetto (regola Q), mai da
-/// una parafrasi.
+/// Il primo motivo dichiarato da chi ha espresso un giudizio CONTRARIO: e'
+/// quello che l'utente legge nel nastro, quindi viene dai CAMPI del verdetto
+/// (regola Q), mai da una parafrasi.
+///
+/// Comprende `NeedsHuman` per la stessa ragione della gemella
+/// [`motivi_di_rifiuto`], e con lo stesso difetto misurato dietro: un
+/// `needs_human` motivato che non compare qui fa leggere all'utente «motivo non
+/// dettagliato» mentre il motivo c'era, scritto.
 fn primo_motivo_di_rifiuto(report: &ports::StepValidationReport) -> &str {
     use crate::decisions::step_gate::StepVerdict;
     report
         .verdicts
         .iter()
-        .filter(|v| v.verdict == StepVerdict::Reject)
+        .filter(|v| matches!(v.verdict, StepVerdict::Reject | StepVerdict::NeedsHuman))
         .flat_map(|v| v.reasons.iter())
         .find_map(|r| r.get("description").and_then(Value::as_str))
         .unwrap_or("motivo non dettagliato")
@@ -2765,15 +2770,29 @@ fn testo_rimando(
     testo
 }
 
-/// L'elenco dei motivi dichiarati da chi ha RIFIUTATO, gia' impaginato. Vuoto
-/// quando nessuno ha espresso un verdetto: e' la forma in cui il modello legge
-/// che il blocco non nasce da un giudizio sul suo passo.
+/// L'elenco dei motivi dichiarati da chi ha ESPRESSO UN GIUDIZIO CONTRARIO,
+/// gia' impaginato. Vuoto solo quando nessuno si e' pronunciato: e' la forma in
+/// cui il modello legge che il blocco non nasce da un giudizio sul suo passo.
+///
+/// «Contrario» comprende `NeedsHuman`, non solo `Reject`, ed e' il fix di un
+/// difetto MISURATO il 13/08/2026 sul run `cf44d0af`: al primo blocco il
+/// gatekeeper aveva votato `needs_human` CON la motivazione compilata e il
+/// challenger si era astenuto per cooldown. Nessun `Reject` formale, quindi
+/// questo filtro buttava via l'unica motivazione esistente e l'agente riceveva
+/// «(nessun verdetto espresso dai validatori)» — cioe' un rimando VUOTO. Non
+/// sapendo cosa correggere ha riproposto lo stesso passo, il secondo rifiuto ha
+/// esaurito il tetto e il run si e' chiuso.
+///
+/// La stessa matrice del gate tratta gia' i due verdetti come giudizi
+/// contrari (`decide_step_gate`, e `classify_block` conta fra le prove
+/// dell'opposizione «un `NeedsHuman` deliberato»): filtrare solo `Reject` qui
+/// contraddiceva il vocabolario che il gate usa per decidere.
 fn motivi_di_rifiuto(report: &ports::StepValidationReport) -> String {
     use crate::decisions::step_gate::StepVerdict;
     let motivi: Vec<String> = report
         .verdicts
         .iter()
-        .filter(|v| v.verdict == StepVerdict::Reject)
+        .filter(|v| matches!(v.verdict, StepVerdict::Reject | StepVerdict::NeedsHuman))
         .flat_map(|v| {
             v.reasons.iter().map(move |r| {
                 format!(
@@ -4879,6 +4898,62 @@ mod tests {
             abstain_cause: None,
             cost_usd: Some(0.001),
         }
+    }
+
+    /// IL DIFETTO MISURATO il 13/08/2026 sul run `cf44d0af`: il primo rimando
+    /// arrivava VUOTO perche' i motivi si prendevano dai soli `Reject`.
+    ///
+    /// Lo stato reale era questo: gatekeeper `needs_human` CON la motivazione
+    /// compilata, challenger astenuto per cooldown. Nessun `Reject` formale,
+    /// quindi l'agente leggeva «(nessun verdetto espresso dai validatori)»,
+    /// non sapeva cosa correggere, riproponeva lo stesso passo, e il secondo
+    /// rifiuto esauriva il tetto chiudendo il run.
+    ///
+    /// MUTAZIONE che lo fa rosseggiare: rimettere il filtro sul solo
+    /// `StepVerdict::Reject`.
+    #[test]
+    fn un_needs_human_motivato_non_produce_un_rimando_vuoto() {
+        use crate::decisions::step_gate::StepVerdict;
+        let report = ports::StepValidationReport {
+            verdicts: vec![
+                verdetto("gatekeeper", StepVerdict::NeedsHuman),
+                ports::ValidatorVerdict {
+                    role: "challenger".into(),
+                    provider: "kimi".into(),
+                    model: "kimi-k2.6".into(),
+                    verdict: StepVerdict::Abstained,
+                    reasons: Vec::new(),
+                    safer_alternative: None,
+                    abstain_cause: Some("cooldown".into()),
+                    cost_usd: None,
+                },
+            ],
+            degraded: None,
+        };
+        let motivi = motivi_di_rifiuto(&report);
+        assert!(
+            !motivi.contains("nessun verdetto espresso"),
+            "un needs_human motivato E' un giudizio espresso: senza i suoi motivi \
+             l'agente non ha nulla su cui correggersi, e il tetto dei rimandi lo \
+             chiude. Motivi resi: {motivi}"
+        );
+        assert!(
+            motivi.contains("bersaglio fuori progetto"),
+            "la motivazione del gatekeeper deve raggiungere il modello: {motivi}"
+        );
+    }
+
+    /// Il contrappunto: dove NESSUNO si e' pronunciato, il rimando deve ancora
+    /// dichiarare il vuoto — altrimenti il modello correggerebbe un passo che
+    /// nessuno gli ha contestato (il giro dei nove script del 09/08).
+    #[test]
+    fn senza_alcun_giudizio_il_vuoto_resta_dichiarato() {
+        use crate::decisions::step_gate::StepVerdict;
+        let report = ports::StepValidationReport {
+            verdicts: vec![verdetto("gatekeeper", StepVerdict::Approve)],
+            degraded: Some("nessun provider candidato".into()),
+        };
+        assert!(motivi_di_rifiuto(&report).contains("nessun verdetto espresso"));
     }
 
     fn regole_kill() -> Vec<crate::decisions::step_gate::CriticalityRule> {
