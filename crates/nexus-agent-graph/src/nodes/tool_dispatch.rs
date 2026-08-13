@@ -1623,15 +1623,27 @@ impl ToolDispatchNode {
         let Some(gate) = ctx.step_gate.as_ref() else {
             return report_degradato("porta di validazione non cablata (setup non armato)");
         };
+        // I bersagli del batch si chiedono ai passi che stanno per partire, non
+        // ai `pending_tool_uses` grezzi: e' `critici` la selezione su cui il
+        // gate ha deciso di convocare, e giudicare su un insieme e cercare
+        // prove per un altro sarebbe la stessa doppia lettura che il campo
+        // vuole chiudere.
+        let batch: Vec<(&str, &Value)> = critici
+            .iter()
+            .map(|s| (s.tool_name.as_str(), &s.tool_input))
+            .collect();
+        let stato_presupposto =
+            crate::decisions::stato_presupposto::stato_presupposto(&state.messages, &batch);
         let req = ports::StepValidationRequest {
             run_id: run_id.to_string(),
             executor_provider: state.sticky_provider.clone().unwrap_or_default(),
-            steps: critici,
             level,
             plan_excerpt: crate::decisions::turn_task::current_turn_task(state)
                 .map(str::to_string),
             criteri_in_correzione: state.criteri_in_correzione.clone(),
+            stato_presupposto,
             prior_rejections,
+            steps: critici,
         };
         match gate.validate(req).await {
             Ok(r) => r,
@@ -5627,6 +5639,105 @@ mod tests {
         let _ = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(*gate.chiamate.lock().unwrap(), 0, "porta mai convocata sotto soglia");
         assert_eq!(tools.seen.lock().unwrap().len(), 1, "tool eseguito normalmente");
+    }
+
+    // ── (2a) Lo stato che il batch presuppone arriva ai giudici ──────────────
+
+    /// Porta che CATTURA la richiesta: cio' che i giudici ricevono nasce dal
+    /// NODO attraversando `convoca_porta` (regola O), non da una
+    /// `StepValidationRequest` costruita nel test.
+    struct GateCheCattura {
+        vista: std::sync::Mutex<Option<ports::StepValidationRequest>>,
+    }
+
+    #[async_trait]
+    impl ports::StepValidationPort for GateCheCattura {
+        async fn validate(
+            &self,
+            req: ports::StepValidationRequest,
+        ) -> Result<ports::StepValidationReport, PortError> {
+            use crate::decisions::step_gate::StepVerdict;
+            *self.vista.lock().unwrap() = Some(req);
+            Ok(ports::StepValidationReport {
+                verdicts: vec![
+                    verdetto("gatekeeper", StepVerdict::Approve),
+                    verdetto("challenger", StepVerdict::Approve),
+                ],
+                degraded: None,
+            })
+        }
+    }
+
+    /// IL CASO MISURATO (13/08/2026, run cf44d0af su prova-fix-10-08) portato
+    /// fino alla CONSEGUENZA (regola O, punto 2): non «il criterio sa comporre
+    /// un estratto», ma «il giudice convocato dal nodo riceve la prova che il
+    /// file esiste».
+    ///
+    /// Il dato c'era gia': `convoca_porta` riceve `&AgentState`, il cui primo
+    /// campo e' la cronologia integrale, e ne estraeva tre campi scartando il
+    /// resto. Due messaggi sopra il passo giudicato c'erano il `write_file` col
+    /// contenuto dello script e il suo tool_result riuscito.
+    ///
+    /// MUTAZIONE: togliere il campo `stato_presupposto` dalla richiesta
+    /// costruita in `convoca_porta` (o passargli `PrimoPasso`) -> questo test
+    /// rosseggia col difetto reale: al giudice non arriva il file che il run ha
+    /// appena scritto, e il suo mandato gli impone di rifiutare.
+    #[tokio::test]
+    async fn al_giudice_arriva_lo_stato_che_il_batch_presuppone() {
+        use crate::decisions::stato_presupposto::{EsitoFatto, StatoPresupposto};
+        let gate = Arc::new(GateCheCattura {
+            vista: std::sync::Mutex::new(None),
+        });
+        let (n, _s, _rc) = node(cfg_gate_0688(), Arc::new(MapToolExecutor::new()));
+        let ctx = AgentNodeCtx {
+            step_gate: Some(gate.clone()),
+            ..ctx_with(CancellationToken::new())
+        };
+        let mut st = state_with_pending(pending_dal_gateway(&[(
+            "run_command",
+            json!({"command": "chmod +x verifica.sh && ./verifica.sh"}),
+        )]));
+        // La history come la lascia il turno precedente: il file scritto e il
+        // suo risultato.
+        st.messages = vec![
+            Message::Ai {
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "toolu_pre".into(),
+                    name: "write_file".into(),
+                    input: json!({"path": "verifica.sh", "content": "#!/bin/bash\nnode --version\ndate"}),
+                    thought_signature: None,
+                }]),
+                tool_calls: Vec::new(),
+                reasoning: None,
+                thinking_signature: None,
+            },
+            Message::Human {
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "toolu_pre".into(),
+                    content: json!("File 'verifica.sh' scritto con successo (138 byte)"),
+                    is_error: false,
+                    exit_code: None,
+                }]),
+            },
+        ];
+
+        let _ = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+
+        let req = gate.vista.lock().unwrap().clone().expect("porta convocata");
+        let StatoPresupposto::Fatti { fatti, .. } = &req.stato_presupposto else {
+            panic!(
+                "il giudice non riceve il file che il run ha appena scritto: {:?}",
+                req.stato_presupposto
+            );
+        };
+        assert_eq!(fatti.len(), 1);
+        assert_eq!(fatti[0].tool_name, "write_file");
+        assert_eq!(fatti[0].esito, EsitoFatto::Riuscito);
+        assert!(fatti[0].input.contains("node --version"));
+        assert_eq!(
+            fatti[0].risultato.as_deref(),
+            Some("File 'verifica.sh' scritto con successo (138 byte)")
+        );
     }
 }
 

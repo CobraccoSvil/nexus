@@ -170,6 +170,7 @@ pub mod pagina_del_run;
 pub mod panel_quorum;
 pub mod severity;
 pub mod shell_command;
+pub mod stato_presupposto;
 pub mod predictive_cap;
 pub mod prodotto_del_run;
 pub mod progress_controller;

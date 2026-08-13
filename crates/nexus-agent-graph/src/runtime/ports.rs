@@ -760,8 +760,16 @@ pub trait ReviewPanelPort: Send + Sync {
 }
 
 /// La richiesta di validazione di un BATCH di passi critici (gate duale, mig
-/// 0677): il passo canonicalizzato + l'estratto del piano — MAI la history
-/// del run (il contesto del validatore e' minimo per contratto).
+/// 0677): il passo canonicalizzato, la richiesta del turno e l'ESTRATTO di cio'
+/// che il run ha gia' prodotto sui bersagli del batch.
+///
+/// Il contratto diceva «MAI la history del run (il contesto del validatore e'
+/// minimo per contratto)», e quel minimo rendeva il rifiuto obbligato per ogni
+/// passo che dipendesse da uno stato prodotto prima nello stesso run (caso
+/// misurato in [`crate::decisions::stato_presupposto`]). Non e' diventata la
+/// history: e' un estratto per bersaglio, cioe' la risposta alla sola domanda
+/// «lo stato che questo batch presuppone esiste?» — il contesto resta minimo,
+/// ma non piu' cieco.
 #[derive(Debug, Clone)]
 pub struct StepValidationRequest {
     pub run_id: String,
@@ -794,6 +802,15 @@ pub struct StepValidationRequest {
     /// NON e' un lasciapassare: allarga cio' che e' PERTINENTE, non cio' che e'
     /// reversibile. La soglia sull'irreversibilita' resta quella di prima.
     pub criteri_in_correzione: Vec<String>,
+    /// Che cosa il run ha GIA' PRODOTTO di cio' che il batch presuppone (punto
+    /// unico [`crate::decisions::stato_presupposto`]).
+    ///
+    /// Lo costruisce il NODO, come i `requirements` del panel di review e per la
+    /// stessa ragione: e' il nodo a conoscere lo stato del run e la porta a non
+    /// conoscerlo. Un concreto che se lo andasse a cercare per conto proprio
+    /// leggerebbe una history diversa da quella su cui il gate ha classificato
+    /// il batch.
+    pub stato_presupposto: crate::decisions::stato_presupposto::StatoPresupposto,
     /// Rimandi gia' consumati in questo run (per il cap anti ping-pong).
     pub prior_rejections: u32,
 }

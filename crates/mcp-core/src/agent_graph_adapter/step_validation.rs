@@ -589,6 +589,13 @@ fn blob_del_batch(req: &StepValidationRequest) -> String {
         ));
     }
     b.push_str("</batch_da_validare>\n");
+    // Cio' che il run ha GIA' prodotto sui bersagli del batch. La resa e' del
+    // punto unico che compone l'estratto (regola Q: il testo dai campi, in un
+    // posto solo) e il blocco si dichiara come dato, perche' porta contenuti di
+    // file e output di comandi. Senza, il giudice non poteva sapere che il file
+    // su cui il batch lavora era stato scritto due messaggi sopra, e il suo
+    // mandato gli imponeva di rifiutare.
+    b.push_str(&req.stato_presupposto.blocco());
     if let Some(piano) = req.plan_excerpt.as_deref().filter(|p| !p.trim().is_empty()) {
         b.push_str(&format!(
             "<richiesta_utente>\n{piano}\n</richiesta_utente>\n"
@@ -738,8 +745,10 @@ async fn setting_f64(db: &PgPool, chiave: &str, default: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nexus_agent_graph::decisions::stato_presupposto::{stato_presupposto, StatoPresupposto};
     use nexus_agent_graph::decisions::step_gate::StepCriticality;
     use nexus_agent_graph::runtime::ports::PendingStepInfo;
+    use nexus_agent_graph::state::message::{ContentBlock, Message, MessageContent};
 
     /// Sotto un rimando del gate, i validatori ricevono ANCHE il motivo per cui
     /// il run sta correggendo — separato dalla richiesta dell'utente.
@@ -835,8 +844,103 @@ mod tests {
             level: StepCriticality::Irreversible,
             plan_excerpt: Some("pulizia della cartella build".into()),
             criteri_in_correzione: Vec::new(),
+            stato_presupposto: StatoPresupposto::PrimoPasso,
             prior_rejections: 1,
         }
+    }
+
+    /// La history COME LA PRODUCE il motore (regola O): il tool_use in un
+    /// `Message::Ai` a blocchi, il tool_result in un `Message::Human` a blocchi.
+    fn turno_write_file(path: &str, contenuto: &str, esito: &str) -> Vec<Message> {
+        vec![
+            Message::Ai {
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "toolu_0".into(),
+                    name: "write_file".into(),
+                    input: json!({"path": path, "content": contenuto}),
+                    thought_signature: None,
+                }]),
+                tool_calls: Vec::new(),
+                reasoning: None,
+                thinking_signature: None,
+            },
+            Message::Human {
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "toolu_0".into(),
+                    content: json!(esito),
+                    is_error: false,
+                    exit_code: None,
+                }]),
+            },
+        ]
+    }
+
+    /// IL CASO MISURATO (13/08/2026, run cf44d0af su prova-fix-10-08) portato
+    /// fino al TESTO che i due giudici leggono davvero.
+    ///
+    /// Task: «crea uno script verifica.sh ... poi eseguilo». L'agente scrive il
+    /// file alle 08:37:40; alle 08:38:54 `chmod +x verifica.sh && ./verifica.sh`
+    /// viene rifiutato perche' «non e' dimostrata l'esistenza del file» e
+    /// «script dal contenuto non verificato»; al secondo rimando il run chiude
+    /// `retries_exhausted`. Il file esisteva: 138 byte su disco.
+    ///
+    /// L'estratto NON e' fabbricato qui: nasce da `stato_presupposto` sui
+    /// messaggi, che e' il produttore reale (regola O, punto 1) — costruirlo a
+    /// mano fisserebbe esattamente l'assunto da verificare.
+    ///
+    /// MUTAZIONE: togliere `b.push_str(&req.stato_presupposto.blocco())` da
+    /// `blob_del_batch` -> il tag sparisce dal messaggio e le asserzioni cadono
+    /// col difetto reale: il giudice torna a non sapere che il file esiste.
+    #[test]
+    fn il_giudice_vede_il_file_che_il_run_ha_appena_scritto() {
+        let messages = turno_write_file(
+            "verifica.sh",
+            "#!/bin/bash\nnode --version\ndate",
+            "File 'verifica.sh' scritto con successo (138 byte)",
+        );
+        let mut r = richiesta();
+        r.steps[0].tool_input = json!({"command": "chmod +x verifica.sh && ./verifica.sh"});
+        let batch: Vec<(&str, &Value)> = r
+            .steps
+            .iter()
+            .map(|s| (s.tool_name.as_str(), &s.tool_input))
+            .collect();
+        r.stato_presupposto = stato_presupposto(&messages, &batch);
+
+        let b = blob_del_batch(&r);
+        assert!(
+            b.contains("<stato_gia_prodotto>"),
+            "il contesto di cio' che il run ha gia' fatto non arriva al giudice:\n{b}"
+        );
+        assert!(
+            b.contains("write_file") && b.contains("verifica.sh"),
+            "manca il passo che ha creato il file:\n{b}"
+        );
+        assert!(
+            b.contains("138 byte"),
+            "manca la prova dell'esistenza che il giudice chiedeva:\n{b}"
+        );
+        assert!(
+            b.contains("node --version"),
+            "manca il contenuto: il giudice lo aveva contestato come non verificato:\n{b}"
+        );
+        assert!(
+            b.contains("NON prova che lo stato non esista"),
+            "l'estratto e' parziale per costruzione e deve dirlo:\n{b}"
+        );
+    }
+
+    /// L'assenza e' DICHIARATA, non taciuta (regola Q): al giudice va detto che
+    /// si e' guardato e non si e' trovato — che non e' il silenzio con cui il
+    /// gate ha convocato finora.
+    #[test]
+    fn anche_l_assenza_di_fatti_arriva_dichiarata() {
+        let b = blob_del_batch(&richiesta());
+        assert!(b.contains("<stato_gia_prodotto>"));
+        assert!(
+            b.contains("non ha ancora eseguito alcun passo"),
+            "un run senza passi va distinto da un estratto vuoto:\n{b}"
+        );
     }
 
     /// Il blob e' il CONTRATTO verso i validatori: porta il passo, la
