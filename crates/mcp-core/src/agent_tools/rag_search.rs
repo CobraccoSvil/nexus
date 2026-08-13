@@ -8,6 +8,13 @@
 //! testo, l'esito e la NATURA del fallimento stanno nei campi. Prima il
 //! fallimento viaggiava come marker anteposto al JSON: spezzava il payload, e
 //! chi doveva sapere com'era andata era costretto a rileggere il testo.
+//!
+//! Lo stesso principio vale un livello piu' sotto, sulle FONTI: il chiamato
+//! dichiara per ciascuna se ha risposto, se la sua collection non esiste o se
+//! e' caduta ([`rag::search::Esito`]), e questo modulo si limita a rendere quei
+//! campi. Le due cause hanno rimedi opposti — un'assenza non guarisce
+//! riprovando — e finche' erano una stringa d'errore sola nessuno a valle
+//! poteva distinguerle.
 
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -160,6 +167,12 @@ fn natura_rag(e: &RagError) -> NaturaFallimento {
         // nessun parametro della chiamata li cambia, e ripeterla ridara' lo
         // stesso errore. All'agente resta un'altra strada (search_in_files).
         RagError::Disabled | RagError::Config(_) | RagError::Db(_) => NaturaFallimento::DelSistema,
+        // Il RAG ha rifiutato di SCRIVERE in una collection di cui non e' lo
+        // scrittore: e' un errore di programmazione, non un guasto. Nessun
+        // riprovo lo scioglie — e sulla ricerca non e' nemmeno raggiungibile,
+        // ma il braccio resta esplicito perche' una variante nuova di RagError
+        // non erediti in silenzio la natura del vicino.
+        RagError::ScritturaNonAmmessa(_) => NaturaFallimento::DelSistema,
         // Le due chiamate di rete della ricerca: l'embedder del brain e Qdrant.
         // Un endpoint saturo o momentaneamente irraggiungibile e' esattamente il
         // caso in cui ritentare identico e' la strategia giusta.
@@ -175,6 +188,53 @@ fn errore_ricerca(e: &RagError) -> RispostaTool {
     RispostaTool::fallito(payload.to_string()).con_natura(natura_rag(e))
 }
 
+/// Una fonte che non ha risposto, resa DAI suoi campi (regola Q punto 3).
+///
+/// La CAUSA e' un campo del payload, non una sfumatura del messaggio: al
+/// modello serve sapere se ha senso riprovare, e per un'assenza la risposta e'
+/// no — nessuno scrive in quella collection. La riga nomina CHI avrebbe dovuto
+/// farlo, che e' l'unica informazione che rende la diagnosi azionabile: senza,
+/// chi la legge sa che manca qualcosa e non sa dove andare.
+fn fonte_muta(muta: &rag::search::EsitoDelKind) -> Option<Value> {
+    match &muta.esito {
+        rag::search::Esito::CollectionAssente { scrittore } => Some(json!({
+            "kind": muta.kind,
+            "collection": muta.collection,
+            "causa": "collection_assente",
+            "scritta_da": scrittore.punto(),
+        })),
+        rag::search::Esito::NonInterrogabile { errore } => Some(json!({
+            "kind": muta.kind,
+            "collection": muta.collection,
+            "causa": "non_interrogabile",
+            "errore": errore,
+        })),
+        // `non_hanno_risposto` non la produce; il ramo esiste perche' una fonte
+        // che ha risposto non finisca qui in silenzio se il filtro cambia.
+        rag::search::Esito::Interrogata { .. } => None,
+    }
+}
+
+/// La natura del fallimento quando la ricerca torna VUOTA e qualche fonte ha
+/// taciuto: viene dalla CAUSA delle fonti mute, non dal fatto che siano mute.
+///
+/// Una collection ASSENTE non guarisce riprovando — nessuno ci scrive — mentre
+/// un Qdrant che ha risposto 503 e' esattamente il caso in cui ritentare
+/// identico e' la strategia giusta, ed e' la stessa lettura che [`natura_rag`]
+/// da' allo stesso guasto quando fa cadere l'intera ricerca. Se le cause sono
+/// MISTE domina quella permanente: promettere un transitorio dove c'e' anche un
+/// difetto strutturale invita a ritentare per sempre.
+fn natura_delle_fonti_mute(report: &rag::SemanticSearchReport) -> NaturaFallimento {
+    let tutte_transitorie = report
+        .non_hanno_risposto()
+        .all(|m| matches!(m.esito, rag::search::Esito::NonInterrogabile { .. }));
+    if tutte_transitorie {
+        NaturaFallimento::Transitorio
+    } else {
+        NaturaFallimento::DelSistema
+    }
+}
+
 /// Il payload JSON dell'esito, composto DAI fatti del report (regola Q punto 3):
 /// il testo si compone dai campi, mai il contrario.
 fn payload_ricerca(query: &str, report: &rag::SemanticSearchReport) -> Value {
@@ -182,48 +242,10 @@ fn payload_ricerca(query: &str, report: &rag::SemanticSearchReport) -> Value {
     out.insert("query".into(), json!(query));
     out.insert("count".into(), json!(report.hits.len()));
     out.insert("hits".into(), json!(report.hits));
-<<<<<<< HEAD
-    if !report.collections_fallite.is_empty() {
-        let fallite: Vec<Value> = report
-            .collections_fallite
-            .iter()
-            .map(|(k, e)| json!({"kind": k, "errore": e}))
-            .collect();
-        out.insert("collections_fallite".into(), Value::Array(fallite));
-        out.insert("hint".into(), json!(HINT_FONTI_MUTE));
-=======
-    // Le fonti mute portano la CAUSA, non solo il nome: un'assenza e una
-    // caduta di Qdrant si leggono diverse anche dal modello, che sulla prima
-    // non deve nemmeno sperare in un riprovo piu' tardi (regola Q).
-    let mute: Vec<Value> = report
-        .non_hanno_risposto()
-        .map(|m| match &m.esito {
-            rag::search::Esito::CollectionAssente { scrittore } => json!({
-                "kind": m.kind,
-                "collection": m.collection,
-                "causa": "collection_assente",
-                "scritta_da": scrittore.punto(),
-            }),
-            rag::search::Esito::NonInterrogabile { errore } => json!({
-                "kind": m.kind,
-                "collection": m.collection,
-                "causa": "non_interrogabile",
-                "errore": errore,
-            }),
-            rag::search::Esito::Interrogata { .. } => Value::Null,
-        })
-        .collect();
+    let mute: Vec<Value> = report.non_hanno_risposto().filter_map(fonte_muta).collect();
     if !mute.is_empty() {
-        out.insert("fonti_non_disponibili".into(), json!(mute));
-        out.insert(
-            "hint".into(),
-            json!(
-                "una o piu' fonti non hanno potuto rispondere: questo NON e' un \
-                 'non trovato'. Non ripetere la stessa query; usa read_file / \
-                 search_in_files sui percorsi che gia' conosci."
-            ),
-        );
->>>>>>> worktree-agent-a54c7f154caf57c5e
+        out.insert("fonti_non_disponibili".into(), Value::Array(mute));
+        out.insert("hint".into(), json!(HINT_FONTI_MUTE));
     } else if report.hits.is_empty() {
         out.insert("hint".into(), json!(HINT_ZERO_PULITO));
     }
@@ -233,8 +255,8 @@ fn payload_ricerca(query: &str, report: &rag::SemanticSearchReport) -> Value {
 /// Rende l'esito della ricerca distinguendo i tre casi che prima collassavano
 /// tutti su `count: 0` (regola M):
 /// - hit trovati: il risultato utile;
-/// - zero hit con collection fallite: NON e' "non trovato" — la fonte non ha
-///   potuto rispondere;
+/// - zero hit con fonti mute: NON e' "non trovato" — la fonte non ha potuto
+///   rispondere, e il payload dice se e' assente o caduta;
 /// - zero hit puliti: la risposta e' davvero "qui non c'e'".
 ///
 /// Misurato il 31/07/2026 (run 49fbc5d7): 8 ricerche identiche a zero risultati
@@ -245,19 +267,19 @@ fn payload_ricerca(query: &str, report: &rag::SemanticSearchReport) -> Value {
 /// modo di accorgersene era leggere il campo `hint` dentro il JSON — cioe'
 /// nessuno, perche' anti-loop, supervisore e final_gate guardano l'esito. La
 /// ricerca non ha risposto "niente": non ha potuto guardare, e le due cose
-/// portano a decisioni opposte. La natura e' DEL SISTEMA perche' una collection
-/// assente o irraggiungibile non si corregge cambiando la chiamata, ed e' cio'
-/// che l'`hint` gia' diceva a parole ("Non ripetere la stessa query").
+/// portano a decisioni opposte. La natura la decide la CAUSA
+/// ([`natura_delle_fonti_mute`]), che e' l'informazione su cui si sceglie se
+/// riprovare o cambiare strada.
 ///
 /// Con almeno un hit resta un SUCCESSO anche se una fonte ha taciuto: i
-/// risultati ci sono e sono utilizzabili: bocciare l'intera ricerca butterebbe
-/// via cio' che ha trovato. L'`hint` resta nel payload per dirlo.
+/// risultati ci sono e sono utilizzabili, e bocciare l'intera ricerca
+/// butterebbe via cio' che ha trovato. L'`hint` resta nel payload per dirlo.
 fn render_search_result(query: &str, report: rag::SemanticSearchReport) -> RispostaTool {
-    let fonti_mute = !report.collections_fallite.is_empty();
+    let fonti_mute = report.non_hanno_risposto().next().is_some();
     let vuoto = report.hits.is_empty();
     let testo = payload_ricerca(query, &report).to_string();
     if fonti_mute && vuoto {
-        return RispostaTool::fallito(testo).con_natura(NaturaFallimento::DelSistema);
+        return RispostaTool::fallito(testo).con_natura(natura_delle_fonti_mute(&report));
     }
     RispostaTool::riuscito(testo)
 }
@@ -270,7 +292,37 @@ mod tests {
         serde_json::from_str(&risposta.testo).expect("il testo del tool e' JSON valido")
     }
 
-<<<<<<< HEAD
+    /// Una fonte che ha taciuto per GUASTO, nella forma che il chiamato produce.
+    fn in_guasto(kind: &str, errore: &str) -> rag::search::EsitoDelKind {
+        rag::search::EsitoDelKind {
+            kind: kind.into(),
+            collection: "project_code_index".into(),
+            esito: rag::search::Esito::NonInterrogabile {
+                errore: errore.into(),
+            },
+        }
+    }
+
+    /// Una fonte la cui collection NON ESISTE, con lo scrittore dichiarato.
+    fn assente(kind: &str, collection: &str, punto: &'static str) -> rag::search::EsitoDelKind {
+        rag::search::EsitoDelKind {
+            kind: kind.into(),
+            collection: collection.into(),
+            esito: rag::search::Esito::CollectionAssente {
+                scrittore: rag::collezioni::Scrittore::Esterno { punto },
+            },
+        }
+    }
+
+    /// Una fonte che HA risposto: `n` hit, anche zero.
+    fn interrogata(kind: &str, n: usize) -> rag::search::EsitoDelKind {
+        rag::search::EsitoDelKind {
+            kind: kind.into(),
+            collection: "project_code_index".into(),
+            esito: rag::search::Esito::Interrogata { hits: n },
+        }
+    }
+
     /// Parte dal PRODUTTORE reale dell'errore (`errore_ricerca` sulla variante
     /// che il chiamato emette davvero), non da un JSON scritto a mano.
     #[test]
@@ -297,28 +349,22 @@ mod tests {
         assert_eq!(out.natura, Some(NaturaFallimento::DelSistema), "{out:?}");
     }
 
-    /// RAMO NUDO: zero hit con collection fallite non e' un "non trovato", ed
-    /// e' l'esito che prima usciva come successo. Parte dal produttore reale
-=======
-    /// Zero hit con una fonte muta: il risultato DISTINGUE il guasto dal
-    /// "non trovato" e l'hint vieta la ripetizione. Parte dal produttore reale
->>>>>>> worktree-agent-a54c7f154caf57c5e
+    /// RAMO NUDO: zero hit con una fonte muta non e' un "non trovato", ed e'
+    /// l'esito che prima usciva come successo. Parte dal produttore reale
     /// (`render_search_result`), non da un JSON scritto a mano (regola O).
+    ///
+    /// Qui la fonte e' CADUTA (503): ritentare identico e' legittimo, ed e' la
+    /// stessa lettura che `natura_rag` da' allo stesso guasto quando fa cadere
+    /// l'intera ricerca.
     #[test]
-    fn una_collection_fallita_non_e_un_non_trovato() {
+    fn una_fonte_in_guasto_non_e_un_non_trovato() {
         let report = rag::SemanticSearchReport {
             hits: Vec::new(),
-            esiti: vec![rag::search::EsitoDelKind {
-                kind: "code".into(),
-                collection: "project_code_index".into(),
-                esito: rag::search::Esito::NonInterrogabile {
-                    errore: "HTTP 503".into(),
-                },
-            }],
+            esiti: vec![in_guasto("code", "HTTP 503")],
         };
         let out = render_search_result("frontend App counters", report);
         assert!(out.esito.e_fallito(), "{out:?}");
-        assert_eq!(out.natura, Some(NaturaFallimento::DelSistema), "{out:?}");
+        assert_eq!(out.natura, Some(NaturaFallimento::Transitorio), "{out:?}");
         let v = payload_di(&out);
         assert_eq!(v["count"], 0);
         assert_eq!(v["fonti_non_disponibili"][0]["kind"], "code");
@@ -330,7 +376,71 @@ mod tests {
         );
     }
 
-<<<<<<< HEAD
+    /// Una collection ASSENTE si distingue da un guasto: nomina lo SCRITTORE, e
+    /// la natura e' DEL SISTEMA perche' nessuno scrive li' e riprovare non
+    /// cambia nulla.
+    ///
+    /// E' il caso misurato il 13/08/2026: `kb` leggeva `kb_chunks`, il cui
+    /// scrittore era stato rimosso dalla migrazione al knowledge graph
+    /// unificato. Senza il nome dello scrittore, chi legge la diagnosi non sa
+    /// dove andare.
+    ///
+    /// MUTAZIONE: se `fonte_muta` tornasse a rendere le due cause con la stessa
+    /// forma, `causa`/`scritta_da` spariscono e questo test rosseggia.
+    #[test]
+    fn una_collection_assente_dichiara_chi_avrebbe_dovuto_scriverla() {
+        let report = rag::SemanticSearchReport {
+            hits: Vec::new(),
+            esiti: vec![assente("kb", "wiki_content", "nexus-wiki::content_points")],
+        };
+        let out = render_search_result("note di progetto", report);
+        assert!(out.esito.e_fallito(), "{out:?}");
+        assert_eq!(out.natura, Some(NaturaFallimento::DelSistema), "{out:?}");
+        let v = payload_di(&out);
+        assert_eq!(v["fonti_non_disponibili"][0]["causa"], "collection_assente");
+        assert_eq!(
+            v["fonti_non_disponibili"][0]["scritta_da"],
+            "nexus-wiki::content_points"
+        );
+        assert!(v["fonti_non_disponibili"][0].get("errore").is_none());
+    }
+
+    /// Cause MISTE: domina quella permanente. Dichiarare un transitorio dove
+    /// c'e' anche un difetto strutturale inviterebbe a ritentare per sempre.
+    #[test]
+    fn con_cause_miste_domina_la_permanente() {
+        let report = rag::SemanticSearchReport {
+            hits: Vec::new(),
+            esiti: vec![
+                in_guasto("code", "HTTP 503"),
+                assente("kb", "wiki_content", "nexus-wiki::content_points"),
+            ],
+        };
+        let out = render_search_result("query", report);
+        assert_eq!(out.natura, Some(NaturaFallimento::DelSistema), "{out:?}");
+        let v = payload_di(&out);
+        assert_eq!(v["fonti_non_disponibili"].as_array().map(Vec::len), Some(2));
+    }
+
+    /// Una fonte che HA risposto con zero hit non e' una fonte muta: e' un
+    /// "cercato e non trovato", e non deve comparire fra le indisponibili ne'
+    /// far fallire la ricerca.
+    #[test]
+    fn una_fonte_a_zero_hit_non_e_muta() {
+        let report = rag::SemanticSearchReport {
+            hits: Vec::new(),
+            esiti: vec![interrogata("code", 0)],
+        };
+        let out = render_search_result("query", report);
+        assert!(!out.esito.e_fallito(), "{out:?}");
+        let v = payload_di(&out);
+        assert!(v.get("fonti_non_disponibili").is_none(), "{v}");
+        assert!(v["hint"]
+            .as_str()
+            .expect("hint presente")
+            .contains("ripetere la stessa query"));
+    }
+
     /// Con almeno un hit la fonte muta NON boccia la ricerca: i risultati
     /// trovati sono utilizzabili, e l'hint resta nel payload per dichiararlo.
     #[test]
@@ -344,7 +454,7 @@ mod tests {
                 score: 0.7,
                 metadata: Value::Null,
             }],
-            collections_fallite: vec![("code".into(), "HTTP 503".into())],
+            esiti: vec![interrogata("kb", 1), in_guasto("code", "HTTP 503")],
         };
         let out = render_search_result("Send", report);
         assert!(!out.esito.e_fallito(), "{out:?}");
@@ -355,42 +465,11 @@ mod tests {
 
     /// Zero hit puliti: niente allarme (una ricerca andata a buon fine che non
     /// trova nulla e' un SUCCESSO), ma l'hint dice che insistere e' inutile.
-=======
-    /// Una collection ASSENTE si distingue da un guasto e nomina lo scrittore.
-    ///
-    /// E' il caso misurato il 13/08/2026 (`kb` -> `kb_chunks`, nessuno scrive
-    /// piu' li'): riprovare non cambia nulla, e senza il nome dello scrittore
-    /// chi legge la diagnosi non sa dove andare.
-    #[test]
-    fn una_collection_assente_dichiara_chi_avrebbe_dovuto_scriverla() {
-        let report = rag::SemanticSearchReport {
-            hits: Vec::new(),
-            esiti: vec![rag::search::EsitoDelKind {
-                kind: "kb".into(),
-                collection: "wiki_content".into(),
-                esito: rag::search::Esito::CollectionAssente {
-                    scrittore: rag::collezioni::Scrittore::Esterno {
-                        punto: "nexus-wiki::content_points",
-                    },
-                },
-            }],
-        };
-        let v: Value =
-            serde_json::from_str(&render_search_result("note di progetto", report)).unwrap();
-        assert_eq!(v["fonti_non_disponibili"][0]["causa"], "collection_assente");
-        assert_eq!(
-            v["fonti_non_disponibili"][0]["scritta_da"],
-            "nexus-wiki::content_points"
-        );
-        assert!(v["fonti_non_disponibili"][0].get("errore").is_none());
-    }
-
-    /// Zero hit puliti: niente allarme, ma l'hint dice che insistere e' inutile.
->>>>>>> worktree-agent-a54c7f154caf57c5e
     /// E' il caso delle 8 ricerche identiche del run 49fbc5d7.
     #[test]
     fn zero_hit_puliti_scoraggiano_la_ripetizione() {
-        let out = render_search_result("query senza riscontri", rag::SemanticSearchReport::default());
+        let out =
+            render_search_result("query senza riscontri", rag::SemanticSearchReport::default());
         assert!(!out.esito.e_fallito(), "{out:?}");
         let v = payload_di(&out);
         assert_eq!(v["count"], 0);
@@ -412,11 +491,7 @@ mod tests {
                 score: 0.9,
                 metadata: Value::Null,
             }],
-            esiti: vec![rag::search::EsitoDelKind {
-                kind: "code".into(),
-                collection: "project_code_index".into(),
-                esito: rag::search::Esito::Interrogata { hits: 1 },
-            }],
+            esiti: vec![interrogata("code", 1)],
         };
         let out = render_search_result("App", report);
         assert!(!out.esito.e_fallito(), "{out:?}");
@@ -446,7 +521,7 @@ mod tests {
         };
         let report = || rag::SemanticSearchReport {
             hits: vec![hit(0), hit(2)],
-            collections_fallite: Vec::new(),
+            esiti: vec![interrogata("code", 2)],
         };
         // Due ricerche con query DIVERSE che trovano gli stessi chunk: e' il
         // fatto misurato il 10/08/2026 (17 giri, sempre gli stessi quattro hit).

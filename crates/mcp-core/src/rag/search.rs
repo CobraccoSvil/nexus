@@ -66,6 +66,22 @@ pub struct EsitoDelKind {
     pub esito: Esito,
 }
 
+impl EsitoDelKind {
+    /// Costruttore unico dei tre esiti del ciclo di ricerca.
+    ///
+    /// Il `kind` diventa la sua forma di wire in UN punto: prima i tre rami
+    /// ripetevano `kind.as_str().to_string()`, e la ripetizione costava anche
+    /// due livelli di annidamento — l'`Esito` costruito dentro l'inizializzatore
+    /// della struct dentro il ramo dentro il ciclo.
+    fn nuovo(kind: SourceKind, collection: String, esito: Esito) -> Self {
+        Self {
+            kind: kind.as_str().to_string(),
+            collection,
+            esito,
+        }
+    }
+}
+
 /// Esito della ricerca semantica: gli hit E, per ogni fonte interrogata, che
 /// cosa e' successo.
 ///
@@ -97,20 +113,22 @@ impl SemanticSearchReport {
 /// tolta la faglia, escluderlo renderebbe la ricerca cieca proprio sui
 /// sorgenti — la domanda piu' frequente di un run di correzione.
 ///
-/// `Kb` NON e' qui, ed e' la stessa faglia di "code_embeddings" in forma
-/// estrema: la sua collection (`agent.rag.collection_kb` = `kb_chunks`) non ha
-/// alcuno SCRITTORE. MISURATO il 10/08/2026: `SourceKind::Kb` compare in tutto
-/// il workspace solo in lettura (qui, in `config::collection_for` e nel recall
-/// del mandato), Qdrant espone dieci collection e quella non c'e' — mentre le
-/// altre tre configurate esistono tutte. Una fonte che nessuno popola non e'
-/// una fonte vuota: e' una domanda a cui nessuno puo' rispondere, e chiederla
-/// a ogni ricerca produce un `collections_fallite` costante che segnala un
-/// guasto dove non ce n'e'.
+/// `Kb` NON e' qui, ma la RAGIONE non e' piu' quella per cui ne fu tolto il
+/// 10/08/2026 («la sua collection non ha alcuno scrittore»): quella premessa
+/// oggi e' falsa. `Kb` legge la collection del wiki (vedi
+/// [`super::collezioni`]), che uno scrittore ce l'ha ed e' popolata — MISURATO
+/// il 13/08/2026: 6733 punti di scope `project`.
 ///
-/// Il kind resta nel vocabolario e resta interrogabile a richiesta esplicita:
-/// il giorno in cui un percorso di ingest lo popolera', tornera' fra i default
-/// senza che nulla vada reinventato. La KB vera di Nexus vive altrove
-/// (`wiki_content`, interrogata da `knowledge_search`).
+/// Resta fuori dai default per un motivo DIVERSO e misurato: il payload del
+/// wiki porta il TITOLO del documento, non il chunk (il corpo vive in
+/// `wiki_docs`), quindi nei default competerebbe per gli stessi top-K con
+/// chunk di codice e allegati che il testo intero ce l'hanno — diluendoli con
+/// righe che da sole non bastano a rispondere.
+///
+/// Interrogabile a richiesta esplicita, ed e' cosi' che la usa chi la vuole:
+/// il recall del mandato chiede `kb,code` per configurazione
+/// (`agent.subagent.mandate_recall_kinds`), e la famiglia `knowledge_*`
+/// interroga la stessa collection idratando il corpo da Postgres.
 pub(crate) fn default_kinds() -> Vec<SourceKind> {
     vec![
         SourceKind::Attachment,
@@ -221,13 +239,10 @@ pub async fn search_semantic(
                     scrittore = risolta.scrittore.punto(),
                     "rag.search_semantic: collection assente su Qdrant"
                 );
-                esiti.push(EsitoDelKind {
-                    kind: kind.as_str().to_string(),
-                    collection,
-                    esito: Esito::CollectionAssente {
-                        scrittore: risolta.scrittore,
-                    },
-                });
+                let esito = Esito::CollectionAssente {
+                    scrittore: risolta.scrittore,
+                };
+                esiti.push(EsitoDelKind::nuovo(kind, collection, esito));
                 continue;
             }
             Err(e) => {
@@ -240,21 +255,15 @@ pub async fn search_semantic(
                 // Il fallimento viaggia col risultato, non solo nel log: per
                 // il chiamante "collection irraggiungibile" e "cercato e non
                 // trovato" sono esiti DIVERSI (regola M).
-                esiti.push(EsitoDelKind {
-                    kind: kind.as_str().to_string(),
-                    collection,
-                    esito: Esito::NonInterrogabile {
-                        errore: e.to_string(),
-                    },
-                });
+                let esito = Esito::NonInterrogabile {
+                    errore: e.to_string(),
+                };
+                esiti.push(EsitoDelKind::nuovo(kind, collection, esito));
                 continue;
             }
         };
-        esiti.push(EsitoDelKind {
-            kind: kind.as_str().to_string(),
-            collection,
-            esito: Esito::Interrogata { hits: hits.len() },
-        });
+        let esito = Esito::Interrogata { hits: hits.len() };
+        esiti.push(EsitoDelKind::nuovo(kind, collection, esito));
         for h in hits {
             let p = h.payload;
             // Estrazione testo flessibile: il RAG framework usa `chunk_text`,
