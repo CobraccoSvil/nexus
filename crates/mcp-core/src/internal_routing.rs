@@ -90,7 +90,7 @@ fn derive_error_class(body: &ProviderErrorPayload) -> Result<(String, Option<u64
 ///                       `nexus_provider_health.billing_cooldown_until`, la fonte
 ///                       persistente GIUSTA perche' scade). NON disabilita piu' il
 ///                       catalog/matrix: il routing salta i provider in cooldown
-///                       via `is_provider_in_cooldown`/`cooldown_snapshot`. La
+///                       via `is_provider_in_cooldown`/`fornitori_in_cooldown`. La
 ///                       `billing_cooldown_recovery_loop` (probe-then-reenable)
 ///                       azzera il TTL quando il provider torna 200.
 ///   - `rate_limit`    → cooldown breve con retry_after o default 60s
@@ -847,7 +847,19 @@ pub async fn resolve_purpose(
 /// unica fonte di verita' a runtime.
 #[derive(Debug, serde::Serialize)]
 pub struct CooldownEntry {
+    /// SEMPRE un nome di fornitore. Fino al 13/08/2026 questo campo portava la
+    /// CHIAVE del cooldown, che per una coppia era `provider\u{1}model`:
+    /// misurato sul sistema vivo, `{"provider":"groq\u{1}openai/gpt-oss-20b"}` —
+    /// una stringa che nessun `provider` del catalogo eguaglia.
     pub provider: String,
+    /// Valorizzato quando l'esclusione riguarda UN SOLO modello di quel
+    /// fornitore. `null` = tutto il fornitore.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// La portata, esplicita: `provider` o `model`. Ridondante con `model` e
+    /// deliberatamente: e' il campo su cui un consumatore DECIDE, e non deve
+    /// dedurlo dalla presenza di un altro.
+    pub scope: crate::provider_cooldown::PortataCooldown,
     pub seconds_remaining: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -855,7 +867,9 @@ pub struct CooldownEntry {
 
 #[derive(Debug, serde::Serialize)]
 pub struct CooldownSnapshotResponse {
-    /// Lista dei provider attualmente in cooldown (billing/quota/rate-limit).
+    /// Tutte le esclusioni attive (billing/quota/rate-limit), fornitori interi e
+    /// coppie col modello. Chi deve saltare un FORNITORE filtra su
+    /// `scope == "provider"`; chi instrada una COPPIA deve guardare entrambe.
     pub providers: Vec<CooldownEntry>,
 }
 
@@ -865,12 +879,14 @@ pub struct CooldownSnapshotResponse {
 /// duplicare il ragionamento sul cooldown (deprecazione di
 /// `registry._is_in_billing_cooldown` come fonte primaria).
 pub async fn cooldown_snapshot_handler(State(_state): State<AppState>) -> impl IntoResponse {
-    let providers: Vec<CooldownEntry> = crate::provider_cooldown::cooldown_snapshot()
+    let providers: Vec<CooldownEntry> = crate::provider_cooldown::cooldown_snapshot_entries()
         .into_iter()
-        .map(|(provider, seconds_remaining, reason)| CooldownEntry {
-            provider,
-            seconds_remaining,
-            reason,
+        .map(|e| CooldownEntry {
+            provider: e.chiave.provider().to_string(),
+            model: e.chiave.model().map(|m| m.to_string()),
+            scope: e.chiave.portata(),
+            seconds_remaining: e.remaining_seconds,
+            reason: e.reason,
         })
         .collect();
     (StatusCode::OK, Json(CooldownSnapshotResponse { providers })).into_response()

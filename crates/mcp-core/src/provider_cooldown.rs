@@ -118,7 +118,8 @@ pub fn provider_health_timings() -> ProviderHealthTimings {
     HEALTH_TIMINGS.get().copied().unwrap_or_default()
 }
 
-static PROVIDER_COOLDOWN: OnceLock<Mutex<HashMap<String, std::time::Instant>>> = OnceLock::new();
+static PROVIDER_COOLDOWN: OnceLock<Mutex<HashMap<ChiaveCooldown, std::time::Instant>>> =
+    OnceLock::new();
 
 // -- Circuit breaker state --
 // Traccia gli istanti dei fallimenti recenti per provider. Se la soglia di
@@ -157,7 +158,19 @@ fn should_reprobe_cooldown(provider: &str, interval: std::time::Duration) -> boo
     }
 }
 
-/// La chiave sotto cui vive un cooldown.
+/// La PORTATA di un cooldown: il solo fornitore, oppure una sua coppia col
+/// modello. Il vocabolario e' canonico e in inglese (regola N) perche' viaggia
+/// sul wire degli endpoint che mostrano lo stato dei cooldown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortataCooldown {
+    /// Il fornitore e' escluso per INTERO: ogni suo modello lo e' con lui.
+    Provider,
+    /// E' escluso un SOLO modello di quel fornitore; gli altri restano usabili.
+    Model,
+}
+
+/// La chiave sotto cui vive un cooldown: un fornitore, e l'eventuale MODELLO.
 ///
 /// PERCHE' DUE FORME. Un rate limit e' del MODELLO: i tetti token-al-minuto
 /// sono per singolo modello, e `gemini-2.5-flash` ha la sua quota anche mentre
@@ -173,15 +186,84 @@ fn should_reprobe_cooldown(provider: &str, interval: std::time::Duration) -> boo
 /// poco dopo rifunzionavano» — poco dopo erano i 60 secondi, perche' il
 /// fornitore non era mai stato guasto.
 ///
-/// L'effetto era cumulativo: con tre fornitori gia' fuori per credito, ogni
-/// esclusione di troppo riversava il carico sui rimanenti, che andavano in
-/// rate limit a loro volta.
-fn chiave_cooldown(provider: &str, model: Option<&str>) -> String {
-    match model {
-        Some(m) if !m.trim().is_empty() => {
-            format!("{}\u{1}{}", provider.to_lowercase(), m.trim().to_lowercase())
+/// PERCHE' E' UN TIPO E NON UNA STRINGA COMPOSTA. La portata per coppia nasce
+/// il 07/08/2026, e la chiave era `provider` oppure `provider\u{1}model`: una
+/// STRINGA, che lo snapshot proiettava in un campo di nome `provider` e nove
+/// consumatori fuori da questo modulo leggevano come nome di fornitore.
+/// MISURATO sul sistema vivo il 13/08/2026, `GET /api/internal/routing/cooldown`
+/// rispondeva `{"provider":"groq<U+0001>openai/gpt-oss-20b", ...}` — una stringa
+/// che nessun `provider` del catalogo eguagliera' mai. La conseguenza non era
+/// un errore visibile: la selezione del modello, che quella lista la inietta in
+/// `AND LOWER(provider) <> ALL($1)`, semplicemente non ANTICIPAVA piu' nulla —
+/// sceglieva la coppia in cooldown, la mandava, e il gateway (che il cooldown lo
+/// applica bene, via `is_model_in_cooldown`) la rifiutava attendendo
+/// (`attendo cooldown transitorio breve prima di ritentare wait_s=25`). Un giro
+/// di selezione sprecato piu' l'attesa, per ogni occorrenza.
+///
+/// Coi campi separati quello scambio non e' piu' rappresentabile: chi legge non
+/// riceve una stringa che POTREBBE essere un nome di fornitore, riceve il
+/// fornitore e — distinto — il modello, e deve dichiarare quale delle due
+/// domande sta ponendo. I campi sono privati e la costruzione passa dai
+/// costruttori, che normalizzano una volta sola.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ChiaveCooldown {
+    provider: String,
+    model: Option<String>,
+}
+
+impl ChiaveCooldown {
+    /// Tutto il fornitore: credito, credenziali, budget, endpoint irraggiungibile.
+    pub fn fornitore(provider: &str) -> Self {
+        Self::nuova(provider, None)
+    }
+
+    /// La sola coppia: un tetto che riguarda quel modello e nessun altro.
+    pub fn coppia(provider: &str, model: &str) -> Self {
+        Self::nuova(provider, Some(model))
+    }
+
+    /// Costruttore generale. `None` — e un modello vuoto o di soli spazi, che
+    /// non e' un modello — ricadono sul fornitore intero.
+    pub fn nuova(provider: &str, model: Option<&str>) -> Self {
+        let normalizza = |s: &str| s.trim().to_lowercase();
+        Self {
+            provider: normalizza(provider),
+            model: model.map(normalizza).filter(|m| !m.is_empty()),
         }
-        _ => provider.to_lowercase(),
+    }
+
+    /// Il fornitore, in lowercase. E' SEMPRE un nome di fornitore: mai una
+    /// chiave composta.
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// Il modello, se il cooldown ne riguarda uno solo.
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// True se l'esclusione vale per OGNI modello del fornitore.
+    pub fn esclude_il_fornitore(&self) -> bool {
+        self.model.is_none()
+    }
+
+    /// Il vocabolario della portata, per chi la deve mostrare o serializzare.
+    pub fn portata(&self) -> PortataCooldown {
+        if self.esclude_il_fornitore() {
+            PortataCooldown::Provider
+        } else {
+            PortataCooldown::Model
+        }
+    }
+
+    /// Testo per l'umano, composto DAI campi (regola Q punto 3): nessun codice
+    /// lo rilegge per ricavarne il fornitore.
+    pub fn etichetta(&self) -> String {
+        match &self.model {
+            Some(m) => format!("{}/{}", self.provider, m),
+            None => self.provider.clone(),
+        }
     }
 }
 
@@ -191,7 +273,7 @@ fn chiave_cooldown(provider: &str, model: Option<&str>) -> String {
 /// Chi deve scegliere una coppia fornitore+modello usa
 /// [`is_model_in_cooldown`], che e' la domanda completa.
 pub fn is_provider_in_cooldown(provider: &str) -> bool {
-    scaduto_o_attivo(&chiave_cooldown(provider, None))
+    scaduto_o_attivo(&ChiaveCooldown::fornitore(provider))
 }
 
 /// Questa COPPIA e' utilizzabile adesso?
@@ -201,10 +283,10 @@ pub fn is_provider_in_cooldown(provider: &str) -> bool {
 /// richiesta: entrambe le esclusioni la impediscono, ma per ragioni diverse e
 /// con durate diverse.
 pub fn is_model_in_cooldown(provider: &str, model: &str) -> bool {
-    is_provider_in_cooldown(provider) || scaduto_o_attivo(&chiave_cooldown(provider, Some(model)))
+    is_provider_in_cooldown(provider) || scaduto_o_attivo(&ChiaveCooldown::coppia(provider, model))
 }
 
-fn scaduto_o_attivo(chiave: &str) -> bool {
+fn scaduto_o_attivo(chiave: &ChiaveCooldown) -> bool {
     let store = PROVIDER_COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(map) = store.lock() {
         if let Some(&until) = map.get(chiave) {
@@ -239,13 +321,18 @@ pub enum CooldownSeverity {
 /// per gli altri billing, Beauty-Book, ma non per questi due). Qui la domanda
 /// "e' un cooldown lungo?" ha gia' una risposta certa: quale funzione lo ha
 /// creato, non cosa dice il messaggio.
-static PROVIDER_COOLDOWN_SEVERITY: OnceLock<Mutex<HashMap<String, CooldownSeverity>>> =
+/// Chiavato come le scadenze e i motivi: la severita' di un tetto su un modello
+/// e' del tetto, non del fornitore. Finche' questa mappa conosceva la sola forma
+/// «fornitore», un `Short` su una coppia sovrascriveva il `Long` dell'account, e
+/// il probe periodico — che da qui decide se il credito e' ancora KO — avrebbe
+/// tolto un cooldown billing in anticipo.
+static PROVIDER_COOLDOWN_SEVERITY: OnceLock<Mutex<HashMap<ChiaveCooldown, CooldownSeverity>>> =
     OnceLock::new();
 
-fn set_cooldown_severity(provider: &str, severity: CooldownSeverity) {
+fn set_cooldown_severity(chiave: &ChiaveCooldown, severity: CooldownSeverity) {
     let store = PROVIDER_COOLDOWN_SEVERITY.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = store.lock() {
-        map.insert(provider.to_lowercase(), severity);
+        map.insert(chiave.clone(), severity);
     }
 }
 
@@ -263,7 +350,7 @@ pub fn is_provider_in_billing_cooldown(provider: &str) -> bool {
     if !is_provider_in_cooldown(provider) {
         return false;
     }
-    let key = provider.to_lowercase();
+    let key = ChiaveCooldown::fornitore(provider);
     PROVIDER_COOLDOWN_SEVERITY
         .get()
         .and_then(|s| s.lock().ok())
@@ -300,24 +387,29 @@ pub(crate) fn reset_provider_failures(provider: &str) {
 
 /// Rimuove completamente il cooldown e il contatore failures per un provider.
 /// Usato dall'endpoint admin per forzare il rientro in servizio di un provider.
+///
+/// PORTATA della rimozione: TUTTO cio' che escludeva quel fornitore, comprese
+/// le sue coppie col modello. «Rimetti groq in servizio» non puo' lasciare in
+/// piedi il tetto su `groq/openai/gpt-oss-20b`: l'admin ha chiesto il fornitore,
+/// e un residuo per modello renderebbe l'azione vera a meta' senza dirlo.
 pub fn remove_cooldown(provider: &str) {
-    let key = provider.to_lowercase();
-    // Rimuovi cooldown timer
+    let key = provider.trim().to_lowercase();
+    // Rimuovi cooldown timer (fornitore + ogni sua coppia)
     let store = PROVIDER_COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = store.lock() {
-        map.remove(&key);
+        map.retain(|c, _| c.provider() != key);
     }
     // Rimuovi contatore failures (circuit breaker)
     reset_provider_failures(provider);
     // Rimuovi reason
     let reasons = PROVIDER_COOLDOWN_REASONS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = reasons.lock() {
-        map.remove(&key);
+        map.retain(|c, _| c.provider() != key);
     }
-    // Rimuovi severita' registrata
+    // Rimuovi severita' registrata (fornitore + ogni sua coppia)
     let severities = PROVIDER_COOLDOWN_SEVERITY.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = severities.lock() {
-        map.remove(&key);
+        map.retain(|c, _| c.provider() != key);
     }
     // Rimuovi da Redis (se persistito)
     if let Some(conn) = REDIS_CLIENT.get() {
@@ -392,7 +484,7 @@ pub(crate) fn put_provider_in_cooldown(provider: &str, retry_after_seconds: Opti
                 retry_after_seconds
             );
         }
-        map.insert(provider.to_lowercase(), until);
+        map.insert(ChiaveCooldown::fornitore(provider), until);
     }
 }
 
@@ -537,7 +629,7 @@ pub fn put_provider_in_long_cooldown(provider: &str, reason: &str) {
     let store = PROVIDER_COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = store.lock() {
         let until = std::time::Instant::now() + std::time::Duration::from_secs(long_secs);
-        map.insert(provider.to_lowercase(), until);
+        map.insert(ChiaveCooldown::fornitore(provider), until);
         tracing::warn!(
             "Provider '{}' in COOLDOWN LUNGO ({}s, {} ore) per: {}",
             provider,
@@ -549,9 +641,9 @@ pub fn put_provider_in_long_cooldown(provider: &str, reason: &str) {
     // Salva anche il motivo nel registro motivazioni
     let reasons = PROVIDER_COOLDOWN_REASONS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = reasons.lock() {
-        map.insert(provider.to_lowercase(), reason.to_string());
+        map.insert(ChiaveCooldown::fornitore(provider), reason.to_string());
     }
-    set_cooldown_severity(provider, CooldownSeverity::Long);
+    set_cooldown_severity(&ChiaveCooldown::fornitore(provider), CooldownSeverity::Long);
     // Persistenza Redis fire-and-forget. Stesso schema usato da
     // `gateway_providers_handler` (chiave `nexus:billing_cooldown:<provider>`)
     // cosi' il restore al riavvio funziona uniformemente.
@@ -655,7 +747,7 @@ pub fn metti_in_cooldown_breve(
     reason: &str,
     duration_secs: u64,
 ) {
-    let chiave = chiave_cooldown(provider, model);
+    let chiave = ChiaveCooldown::nuova(provider, model);
     let store = PROVIDER_COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = store.lock() {
         let until = std::time::Instant::now() + std::time::Duration::from_secs(duration_secs);
@@ -673,17 +765,21 @@ pub fn metti_in_cooldown_breve(
     }
     let reasons = PROVIDER_COOLDOWN_REASONS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = reasons.lock() {
-        map.insert(chiave, reason.to_string());
+        map.insert(chiave.clone(), reason.to_string());
     }
-    // La severita' resta registrata sul FORNITORE: la usa il recovery loop, che
-    // ragiona per account (chi ri-probare, con quale cadenza). Un cooldown di
-    // modello non cambia la natura del fornitore.
-    set_cooldown_severity(provider, CooldownSeverity::Short);
+    // La severita' si registra sulla STESSA chiave della scadenza. Il recovery
+    // loop ragiona per account e interroga la chiave del FORNITORE: un cooldown
+    // di modello non cambia la natura del fornitore, e scrivendolo sulla chiave
+    // del fornitore la cambierebbe — degradando a `Short` un `Long` di credito.
+    set_cooldown_severity(&chiave, CooldownSeverity::Short);
 }
 
 /// Registro dei motivi di cooldown ("credit balance too low", "rate limit", …).
-/// Esposto al frontend via `cooldown_snapshot()` → reason mostrato nel LED tooltip.
-static PROVIDER_COOLDOWN_REASONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+/// Esposto al frontend via [`cooldown_snapshot_entries`] → reason mostrato nel
+/// LED tooltip. Chiavato come le scadenze: il motivo di un tetto su un modello
+/// non e' il motivo del fornitore.
+static PROVIDER_COOLDOWN_REASONS: OnceLock<Mutex<HashMap<ChiaveCooldown, String>>> =
+    OnceLock::new();
 
 /// Una riga dello snapshot dei cooldown attivi.
 ///
@@ -697,7 +793,10 @@ static PROVIDER_COOLDOWN_REASONS: OnceLock<Mutex<HashMap<String, String>>> = Onc
 /// classificazione esisteva, ma non usciva dalla porta.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CooldownEntry {
-    pub provider: String,
+    /// CHI e' escluso: il fornitore, e l'eventuale modello. Non e' una stringa
+    /// (vedi [`ChiaveCooldown`]): il campo `provider` che c'era qui portava la
+    /// chiave GREZZA, e i consumatori la usavano come nome di fornitore.
+    pub chiave: ChiaveCooldown,
     pub remaining_seconds: u64,
     /// Motivo per l'umano. Riempito liberamente dai produttori, anche in
     /// italiano: mai un segnale su cui decidere (regola M/Q).
@@ -709,9 +808,18 @@ pub struct CooldownEntry {
     pub severity: Option<CooldownSeverity>,
 }
 
-/// Snapshot di tutti i provider attualmente in cooldown, con la severita'
-/// REGISTRATA. Lettore autoritativo dei tre registri (scadenze, motivi,
-/// severita'): [`cooldown_snapshot`] ne e' la proiezione a tre campi.
+/// Snapshot di TUTTI i cooldown attivi — fornitori interi e coppie col modello —
+/// con la severita' REGISTRATA. Lettore autoritativo dei tre registri (scadenze,
+/// motivi, severita'), ordinato per chiave cosi' che due letture della stessa
+/// situazione diano la stessa lista.
+///
+/// E' l'unica porta d'uscita: la proiezione a tre campi che c'era qui accanto
+/// (`cooldown_snapshot() -> Vec<(String, u64, Option<String>)>`) appiattiva la
+/// chiave in un `String` chiamato `provider`, ed e' il difetto D1 — nove
+/// consumatori la leggevano come nome di fornitore. Chi ha bisogno dei soli
+/// fornitori interi chiama [`cooldown_fornitori_entries`] o
+/// [`fornitori_in_cooldown`]; chi ha bisogno delle coppie chiama
+/// [`coppie_in_cooldown`]. Nessuna delle tre e' interscambiabile con le altre.
 pub fn cooldown_snapshot_entries() -> Vec<CooldownEntry> {
     let store = match PROVIDER_COOLDOWN.get() {
         Some(s) => s,
@@ -725,29 +833,67 @@ pub fn cooldown_snapshot_entries() -> Vec<CooldownEntry> {
     let severities = PROVIDER_COOLDOWN_SEVERITY.get().and_then(|s| s.lock().ok());
     let now = std::time::Instant::now();
     let mut out = Vec::new();
-    for (name, &until) in map.iter() {
+    for (chiave, &until) in map.iter() {
         if until > now {
             out.push(CooldownEntry {
-                provider: name.clone(),
+                // La severita' e' quella REGISTRATA per QUESTA chiave: un tetto
+                // su un modello ha la sua, e non eredita quella dell'account.
+                severity: severities.as_ref().and_then(|s| s.get(chiave).copied()),
+                reason: reasons.as_ref().and_then(|r| r.get(chiave).cloned()),
                 remaining_seconds: (until - now).as_secs().max(1),
-                reason: reasons.as_ref().and_then(|r| r.get(name).cloned()),
-                severity: severities.as_ref().and_then(|s| s.get(name).copied()),
+                chiave: chiave.clone(),
             });
         }
     }
+    out.sort_by(|a, b| a.chiave.cmp(&b.chiave));
     out
 }
 
-/// Proiezione a tre campi di [`cooldown_snapshot_entries`], per i consumatori
-/// che della severita' non hanno bisogno (elenchi, LED, esclusioni per nome).
-/// Chi deve DECIDERE in base alla natura del cooldown usa la forma completa: qui
-/// il campo che porta il criterio e' assente per costruzione, quindi nessuno puo'
-/// essere tentato di ricavarlo dalla `reason`.
-pub fn cooldown_snapshot() -> Vec<(String, u64, Option<String>)> {
+/// «Quali FORNITORI sono esclusi PER INTERO adesso?»
+///
+/// Le sole voci con portata [`PortataCooldown::Provider`]. Un tetto su un
+/// modello NON entra qui, ed e' il punto: rispondere di si' per tutto groq
+/// perche' `groq/openai/gpt-oss-20b` ha sforato e' esattamente il difetto che la
+/// portata per coppia ha chiuso il 07/08/2026 — riproporlo a valle, nel lettore,
+/// lo rimetterebbe in piedi.
+pub fn cooldown_fornitori_entries() -> Vec<CooldownEntry> {
     cooldown_snapshot_entries()
         .into_iter()
-        .map(|e| (e.provider, e.remaining_seconds, e.reason))
+        .filter(|e| e.chiave.esclude_il_fornitore())
         .collect()
+}
+
+/// I soli NOMI dei fornitori esclusi per intero, lowercase, ordinati e senza
+/// duplicati. E' la domanda di chi filtra per fornitore (una WHERE su
+/// `provider`, un elenco per un messaggio di fail-fast, un LED).
+pub fn fornitori_in_cooldown() -> Vec<String> {
+    let mut out: Vec<String> = cooldown_fornitori_entries()
+        .into_iter()
+        .map(|e| e.chiave.provider().to_string())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// «Quali COPPIE (fornitore, modello) sono escluse adesso?»
+///
+/// Solo le coppie: un fornitore escluso per intero non compare qui, perche' la
+/// sua esclusione e' gia' completa e non elencabile modello per modello (i
+/// modelli di un fornitore non li conosce questo modulo). Chi filtra deve
+/// applicare ENTRAMBE le liste — [`fornitori_in_cooldown`] e questa.
+pub fn coppie_in_cooldown() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = cooldown_snapshot_entries()
+        .into_iter()
+        .filter_map(|e| {
+            e.chiave
+                .model()
+                .map(|m| (e.chiave.provider().to_string(), m.to_string()))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Ripristina un cooldown (billing) da un timestamp letto da Redis dopo riavvio.
@@ -759,7 +905,7 @@ pub fn restore_cooldown(provider: &str, remaining_secs: u64, reason: &str) {
     let store = PROVIDER_COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = store.lock() {
         let until = std::time::Instant::now() + std::time::Duration::from_secs(remaining_secs);
-        map.insert(provider.to_lowercase(), until);
+        map.insert(ChiaveCooldown::fornitore(provider), until);
         tracing::info!(
             "Provider '{}' cooldown ripristinato da Redis: {}s rimanenti, motivo: {}",
             provider,
@@ -769,9 +915,9 @@ pub fn restore_cooldown(provider: &str, remaining_secs: u64, reason: &str) {
     }
     let reasons = PROVIDER_COOLDOWN_REASONS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = reasons.lock() {
-        map.insert(provider.to_lowercase(), reason.to_string());
+        map.insert(ChiaveCooldown::fornitore(provider), reason.to_string());
     }
-    set_cooldown_severity(provider, CooldownSeverity::Long);
+    set_cooldown_severity(&ChiaveCooldown::fornitore(provider), CooldownSeverity::Long);
 }
 
 /// Bootstrap del cooldown billing dal DB persistente al riavvio (ADR 0020).
@@ -858,19 +1004,23 @@ mod tests {
         put_provider_in_long_cooldown(p, "credit balance too low");
         assert!(is_provider_in_cooldown(p));
         // Snapshot deve contenere il provider con remaining > 0
-        let snap = cooldown_snapshot();
-        let found = snap.iter().find(|(name, _, _)| name == p);
+        let snap = cooldown_snapshot_entries();
+        let found = snap.iter().find(|e| e.chiave.provider() == p);
         assert!(
             found.is_some(),
-            "long cooldown deve apparire in cooldown_snapshot"
+            "long cooldown deve apparire in cooldown_snapshot_entries"
         );
-        let (_, secs, reason) = found.unwrap();
+        let found = found.unwrap();
         assert!(
-            *secs > 5 * 3600,
-            "long cooldown deve durare >= 5h, trovato {}s",
-            secs
+            found.chiave.esclude_il_fornitore(),
+            "il credito e' dell'account: la portata e' il fornitore intero"
         );
-        assert_eq!(reason.as_deref(), Some("credit balance too low"));
+        assert!(
+            found.remaining_seconds > 5 * 3600,
+            "long cooldown deve durare >= 5h, trovato {}s",
+            found.remaining_seconds
+        );
+        assert_eq!(found.reason.as_deref(), Some("credit balance too low"));
     }
 
     #[test]
@@ -901,11 +1051,11 @@ mod tests {
         assert!(!is_provider_in_cooldown(p));
         restore_cooldown(p, 3600, "billing_error from redis");
         assert!(is_provider_in_cooldown(p));
-        let snap = cooldown_snapshot();
-        let entry = snap.iter().find(|(name, _, _)| name == p);
+        let snap = cooldown_snapshot_entries();
+        let entry = snap.iter().find(|e| e.chiave.provider() == p);
         assert!(entry.is_some());
         assert_eq!(
-            entry.unwrap().2.as_deref(),
+            entry.unwrap().reason.as_deref(),
             Some("billing_error from redis")
         );
     }
@@ -971,8 +1121,8 @@ mod tests {
         // altri test paralleli). Verifichiamo solo che __test_snap_excluded
         // NON appaia perche' non e' mai stato messo in cooldown.
         let p_never = "__test_snap_never_in_cooldown";
-        let snap = cooldown_snapshot();
-        let found = snap.iter().find(|(name, _, _)| name == p_never);
+        let snap = cooldown_snapshot_entries();
+        let found = snap.iter().find(|e| e.chiave.provider() == p_never);
         assert!(
             found.is_none(),
             "provider mai messo in cooldown non deve apparire in snapshot"
@@ -992,10 +1142,14 @@ mod tests {
         put_provider_in_cooldown(p_hi, Some(99999));
         assert!(is_provider_in_cooldown(p_hi));
         // Verifica via snapshot che il cap superiore sia rispettato
-        let snap = cooldown_snapshot();
-        let entry_hi = snap.iter().find(|(name, _, _)| name == p_hi);
-        if let Some((_, secs, _)) = entry_hi {
-            assert!(*secs <= 3600, "cap superiore violato: {}s > 3600s", secs);
+        let snap = cooldown_snapshot_entries();
+        let entry_hi = snap.iter().find(|e| e.chiave.provider() == p_hi);
+        if let Some(e) = entry_hi {
+            assert!(
+                e.remaining_seconds <= 3600,
+                "cap superiore violato: {}s > 3600s",
+                e.remaining_seconds
+            );
         }
     }
 
@@ -1163,5 +1317,102 @@ mod tests_portata_cooldown {
             !is_model_in_cooldown("prova-b", "stesso-nome"),
             "lo stesso nome di modello sotto un ALTRO fornitore e' un'altra cosa"
         );
+    }
+
+    /// D1: lo snapshot non consegna piu' una CHIAVE dove il lettore si aspetta un
+    /// fornitore.
+    ///
+    /// MISURATO sul sistema vivo il 13/08/2026: `/api/internal/routing/cooldown`
+    /// rispondeva `{"provider":"groq\u{1}openai/gpt-oss-20b"}`. Quella stringa non
+    /// eguaglia nessun `provider` del catalogo, quindi ogni consumatore che ci
+    /// filtrava sopra filtrava a vuoto.
+    ///
+    /// La misura passa dal PRODUTTORE (`metti_in_cooldown_breve`) e dal LETTORE
+    /// (`cooldown_snapshot_entries`) reali, mai da una chiave scritta a mano
+    /// (regola O). MUTAZIONE: rimettendo una chiave composta come `provider`, il
+    /// primo assert rosseggia con la stringa `\u{1}` dentro.
+    #[test]
+    fn lo_snapshot_non_spaccia_una_chiave_per_un_fornitore() {
+        let p = "__test_d1_snapshot_fornitore";
+        metti_in_cooldown_breve(p, Some("openai/gpt-oss-20b"), "Rate limit raggiunto", 60);
+        let voce = cooldown_snapshot_entries()
+            .into_iter()
+            .find(|e| e.chiave.provider() == p)
+            .expect("la coppia messa in cooldown deve comparire nello snapshot");
+        assert_eq!(
+            voce.chiave.provider(),
+            p,
+            "il fornitore e' il fornitore, non la chiave composta"
+        );
+        assert_eq!(voce.chiave.model(), Some("openai/gpt-oss-20b"));
+        assert_eq!(voce.chiave.portata(), PortataCooldown::Model);
+        assert!(!voce.chiave.esclude_il_fornitore());
+        remove_cooldown(p);
+    }
+
+    /// Le due domande hanno risposte DIVERSE, ed e' il motivo per cui sono due
+    /// funzioni: chi filtra per fornitore non deve vedere il tetto di un modello.
+    ///
+    /// MUTAZIONE: far ricadere `fornitori_in_cooldown` su tutte le voci dello
+    /// snapshot -> il primo assert rosseggia, perche' un rate limit su un modello
+    /// tornerebbe a escludere il fornitore intero dalla selezione.
+    #[test]
+    fn fornitori_interi_e_coppie_sono_due_elenchi_distinti() {
+        let solo_modello = "__test_d1_solo_modello";
+        let tutto = "__test_d1_fornitore_intero";
+        metti_in_cooldown_breve(solo_modello, Some("m-saturo"), "Rate limit raggiunto", 60);
+        metti_in_cooldown_breve(tutto, None, "Provider non raggiungibile", 60);
+
+        let fornitori = fornitori_in_cooldown();
+        assert!(
+            !fornitori.iter().any(|p| p == solo_modello),
+            "un tetto di modello NON esclude il fornitore: {fornitori:?}"
+        );
+        assert!(
+            fornitori.iter().any(|p| p == tutto),
+            "un fornitore irraggiungibile e' escluso per intero: {fornitori:?}"
+        );
+
+        let coppie = coppie_in_cooldown();
+        assert!(
+            coppie.contains(&(solo_modello.to_string(), "m-saturo".to_string())),
+            "la coppia esclusa deve essere elencabile: {coppie:?}"
+        );
+        assert!(
+            !coppie.iter().any(|(p, _)| p == tutto),
+            "un fornitore intero non si elenca modello per modello: {coppie:?}"
+        );
+        remove_cooldown(solo_modello);
+        remove_cooldown(tutto);
+    }
+
+    /// «Rimetti il fornitore in servizio» vale anche per le sue coppie: un
+    /// residuo per modello renderebbe l'azione admin vera a meta' senza dirlo.
+    #[test]
+    fn rimuovere_il_cooldown_di_un_fornitore_toglie_anche_le_sue_coppie() {
+        let p = "__test_d1_remove_copre_le_coppie";
+        metti_in_cooldown_breve(p, Some("m1"), "Rate limit raggiunto", 60);
+        metti_in_cooldown_breve(p, None, "Provider non raggiungibile", 60);
+        assert!(is_model_in_cooldown(p, "m1"));
+        remove_cooldown(p);
+        assert!(!is_provider_in_cooldown(p));
+        assert!(
+            !is_model_in_cooldown(p, "m1"),
+            "il tetto sul modello non sopravvive al rientro in servizio del fornitore"
+        );
+    }
+
+    /// Un modello vuoto (o di soli spazi) NON e' un modello: ricade sul
+    /// fornitore, e la firma lo dichiara invece di produrre una chiave con un
+    /// separatore e niente dopo.
+    #[test]
+    fn un_modello_vuoto_ricade_sul_fornitore() {
+        let p = "__test_d1_modello_vuoto";
+        metti_in_cooldown_breve(p, Some("   "), "causa qualsiasi", 60);
+        assert!(
+            is_provider_in_cooldown(p),
+            "senza un modello la portata e' il fornitore"
+        );
+        remove_cooldown(p);
     }
 }

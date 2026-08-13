@@ -828,21 +828,24 @@ impl Orchestrator {
         }
 
         // La matrice ha prodotto una decisione (intent, mode) → (provider, model).
-        // E' servibile DIRETTAMENTE solo se non e' la sentinella `__no_model__` e il
-        // provider NON e' in cooldown. Altrimenti (nessun match, oppure provider
-        // scelto in cooldown) si consulta PRIMA il catalog tier-aware — punto unico
+        // E' servibile DIRETTAMENTE solo se non e' la sentinella `__no_model__` e la
+        // COPPIA non e' in cooldown. Altrimenti (nessun match, oppure coppia
+        // scelta in cooldown) si consulta PRIMA il catalog tier-aware — punto unico
         // `select_agentic_model` (regola L) — e SOLO come ultima spiaggia si cade sul
         // default per-provider. Prima il ramo `__no_model__` sceglieva un provider
         // "tier-blind" (candidates + default_model_for_provider) PRIMA del catalog:
         // con anthropic+openai in cooldown finiva su google col suo default generico
         // gemini-2.5-flash (modello LIGHT), che non converge sui task di coding heavy.
-        let (provider, model) = if !needs_catalog_fallback(&decision_provider) {
-            let model = if let Some(m) = model_override.filter(|v| !v.trim().is_empty()) {
-                m.to_string()
-            } else {
-                decision_model.clone()
-            };
-            (decision_provider, model)
+        //
+        // La domanda si pone sulla COPPIA che si sta per servire — quindi sul
+        // modello dell'override quando c'e', che e' quello che partira'.
+        let modello_da_servire = match model_override.filter(|v| !v.trim().is_empty()) {
+            Some(m) => m.to_string(),
+            None => decision_model.clone(),
+        };
+        let (provider, model) = if !needs_catalog_fallback(&decision_provider, &modello_da_servire)
+        {
+            (decision_provider, modello_da_servire)
         } else {
             self.resolve_via_catalog_fallback(
                 db,

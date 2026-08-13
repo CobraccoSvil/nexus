@@ -2724,6 +2724,58 @@ else
   echo "OK confine-wire-session-usage: fixture condivisa e i suoi due lati"
 fi
 
+# PORTATA di un cooldown (2026-08-13, difetto D1): la chiave di esclusione ha
+# DUE forme — il fornitore, oppure la coppia col modello — e finche' e' stata una
+# STRINGA i lettori ne conoscevano UNA. Lo snapshot proiettava la chiave grezza
+# in un campo di nome `provider`: misurato sul sistema vivo,
+# `/api/internal/routing/cooldown` rispondeva `{"provider":"groq<U+0001>openai/gpt-oss-20b"}`,
+# che nessun `provider` del catalogo eguaglia. Nove consumatori la leggevano come
+# nome di fornitore, e la selezione — che quella lista la inietta in una WHERE su
+# `provider` — smetteva di ANTICIPARE: sceglieva la coppia, la mandava, e il
+# gateway la rifiutava attendendo.
+#
+# Il tipo (`ChiaveCooldown`, campi privati) rende lo scambio non rappresentabile.
+# Questo guard difende le due meta' che un tipo non puo' difendere da solo.
+assert_single "portata-cooldown" 'struct ChiaveCooldown' \
+  'crates/mcp-core/src/provider_cooldown.rs' crates
+
+# (a) Chi legge lo snapshot COMPLETO deve avere una ragione per volerlo: le
+# esclusioni di fornitore e quelle di coppia sono due domande, e chi non
+# dichiara quale sta ponendo finisce per rispondere alla piu' comoda. I lettori
+# legittimi sono pochi e nominati: le due domande derivate stanno nel punto
+# unico (`fornitori_in_cooldown`, `coppie_in_cooldown`), gli altri MOSTRANO
+# tutto (i due endpoint) o filtrano per fornitore (la nota di chiusura del run).
+lettori_snapshot="$(grep -rn 'cooldown_snapshot_entries()' crates --include='*.rs' \
+  --exclude-dir=target 2>/dev/null | grep -v '^crates/mcp-core/src/provider_cooldown.rs:' || true)"
+lettori_non_ammessi="$(printf '%s\n' "$lettori_snapshot" \
+  | grep -vE '^crates/mcp-core/src/(internal_routing|environment)\.rs:' \
+  | grep -vE '^crates/mcp-core/src/chat_messages/agent_run\.rs:' || true)"
+if [[ -n "${lettori_non_ammessi// /}" ]]; then
+  echo "!! portata-cooldown: un lettore non dichiarato dello snapshot completo:" >&2
+  printf '%s\n' "$lettori_non_ammessi" >&2
+  echo "   Lo snapshot porta SIA i fornitori interi SIA le coppie col modello." >&2
+  echo "   Se ti servono i fornitori esclusi usa fornitori_in_cooldown() o" >&2
+  echo "   cooldown_fornitori_entries(); se ti servono le coppie," >&2
+  echo "   coppie_in_cooldown(). Leggere tutto e trattarlo come una lista di" >&2
+  echo "   fornitori e' il difetto D1 (13/08/2026)." >&2
+  fail=1
+else
+  echo "OK portata-cooldown: lo snapshot completo ha solo lettori dichiarati"
+fi
+
+# (b) La selezione deve ANTICIPARE anche la coppia: senza l'anti-join, il filtro
+# resta sul solo fornitore e un cooldown per modello non toglie nulla dai
+# candidati — il difetto misurato, che non fallisce nulla e si paga in attese.
+if ! grep -q 'coppia_esclusa' crates/mcp-core/src/orchestrator/model_selection.rs; then
+  echo "!! portata-cooldown: la tier-chain non esclude piu' le COPPIE in cooldown." >&2
+  echo "   build_tierchain_sql deve portare l'anti-join su unnest(\$2,\$3)" >&2
+  echo "   accanto al filtro per fornitore: il cooldown per modello e' la forma" >&2
+  echo "   che un rate limit prende dal 07/08/2026." >&2
+  fail=1
+else
+  echo "OK portata-cooldown: la selezione anticipa anche le coppie"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

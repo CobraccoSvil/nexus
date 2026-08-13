@@ -412,7 +412,7 @@ pub(crate) fn canonical_run_status(result: &crate::agent_types::AgentRunResult) 
 /// H): quando i provider buoni (anthropic/openai/google) sono in cooldown per
 /// quota/credito esaurito, l'agente non puo' produrre output, ma il sistema
 /// mostrava un generico "completamento vuoto, cambia modello" invece della causa
-/// reale. Qui si legge la fonte autoritativa `provider_cooldown::cooldown_snapshot()`
+/// reale. Qui si legge la fonte autoritativa `provider_cooldown::cooldown_snapshot_entries()`
 /// (regola L, stessa usata dal frontend e dal pre-check) e si dice all'utente cosa
 /// fare (ricaricare i crediti). `None` se nessun provider e' in cooldown: vale il
 /// placeholder generico.
@@ -482,10 +482,15 @@ fn cooldown_note_for_turn(
     if !error_class_indicates_cooldown(result.error_class.as_deref()) {
         return None;
     }
-    let involved = result.provider.to_lowercase();
+    let involved = result.provider.trim().to_lowercase();
+    // Il filtro e' sul FORNITORE della chiave, non sulla chiave: le esclusioni
+    // pertinenti al turno sono sia quella dell'account sia quella di un suo
+    // modello. Prima si confrontava la chiave grezza, quindi per una coppia il
+    // confronto era falso sempre e la nota taceva proprio quando aveva qualcosa
+    // di preciso da dire.
     let filtered: Vec<crate::provider_cooldown::CooldownEntry> = snap
         .iter()
-        .filter(|e| e.provider.to_lowercase() == involved)
+        .filter(|e| e.chiave.provider() == involved)
         .cloned()
         .collect();
     cooldown_note_from_snapshot(&filtered)
@@ -516,12 +521,16 @@ fn cooldown_note_from_snapshot(
         if matches!(e.severity, Some(CooldownSeverity::Long)) {
             any_billing = true;
         }
+        // L'etichetta la compone la chiave DAI suoi campi (regola Q punto 3):
+        // «groq/openai/gpt-oss-20b» dice all'utente che a essere fermo e' un
+        // modello, non tutto il fornitore.
+        let nome = e.chiave.etichetta();
         let r = e.reason.as_deref().unwrap_or("");
         if r.is_empty() {
             let mins = e.remaining_seconds.div_ceil(60);
-            parts.push(format!("{} (~{} min)", e.provider, mins));
+            parts.push(format!("{} (~{} min)", nome, mins));
         } else {
-            parts.push(format!("{} ({})", e.provider, r));
+            parts.push(format!("{} ({})", nome, r));
         }
     }
     let list = parts.join(", ");
@@ -8544,7 +8553,7 @@ mod tests_finalize_turn {
     fn snapshot_di(providers: &[&str]) -> Vec<crate::provider_cooldown::CooldownEntry> {
         crate::provider_cooldown::cooldown_snapshot_entries()
             .into_iter()
-            .filter(|e| providers.contains(&e.provider.as_str()))
+            .filter(|e| providers.contains(&e.chiave.provider()))
             .collect()
     }
 

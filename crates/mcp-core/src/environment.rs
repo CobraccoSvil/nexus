@@ -1029,11 +1029,22 @@ fn apply_health_error(p: &mut Value, h: &ProviderHealthRow) {
     }
 }
 
-/// Snapshot dei provider in cooldown come mappa `provider -> (secondi, motivo)`.
+/// I FORNITORI esclusi per intero, come mappa `provider -> (secondi, motivo)`.
+///
+/// Domanda: «questo fornitore e' fuori servizio?». Alimenta il LED, che scrive
+/// `healthy = false` sull'INTERO fornitore: un tetto su un singolo modello non
+/// risponde si' a quella domanda, e farlo rispondere si' spegnerebbe il LED di
+/// un fornitore che sta servendo tutti gli altri suoi modelli. Le esclusioni per
+/// coppia si vedono in `admin_cooldown_list`, che le MOSTRA distinte.
 fn fetch_cooldown_map() -> std::collections::HashMap<String, (u64, Option<String>)> {
-    crate::provider_cooldown::cooldown_snapshot()
+    crate::provider_cooldown::cooldown_fornitori_entries()
         .into_iter()
-        .map(|(name, secs, reason)| (name, (secs, reason)))
+        .map(|e| {
+            (
+                e.chiave.provider().to_string(),
+                (e.remaining_seconds, e.reason),
+            )
+        })
         .collect()
 }
 
@@ -1765,16 +1776,23 @@ pub async fn admin_recharge_provider_budget(
 }
 
 /// GET /api/admin/providers/cooldown
-/// Restituisce la lista di tutti i provider attualmente in cooldown.
+/// Restituisce la lista di TUTTE le esclusioni attive.
+///
+/// Qui la domanda e' «che cosa e' escluso adesso?», quindi si mostra tutto — ma
+/// distinguendo «tutto groq» da «un modello di groq»: `scope` porta la portata
+/// (`provider`/`model`) e `model` il modello quando ce n'e' uno. Prima il campo
+/// `provider` portava la CHIAVE grezza, e l'admin leggeva
+/// `groq\u{1}openai/gpt-oss-20b` come se fosse il nome di un fornitore.
 pub async fn admin_cooldown_list() -> Json<Value> {
-    let snapshot = crate::provider_cooldown::cooldown_snapshot();
-    let items: Vec<Value> = snapshot
+    let items: Vec<Value> = crate::provider_cooldown::cooldown_snapshot_entries()
         .into_iter()
-        .map(|(name, secs, reason)| {
+        .map(|e| {
             json!({
-                "provider": name,
-                "remaining_seconds": secs,
-                "reason": reason,
+                "provider": e.chiave.provider(),
+                "model": e.chiave.model(),
+                "scope": e.chiave.portata(),
+                "remaining_seconds": e.remaining_seconds,
+                "reason": e.reason,
             })
         })
         .collect();
