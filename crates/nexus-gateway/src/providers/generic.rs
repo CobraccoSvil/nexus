@@ -82,6 +82,17 @@ impl GenericOpenAiProvider {
         }
     }
 
+    /// Dichiara dove questo endpoint espone la lista modelli, quando il fornitore
+    /// non la tiene sotto la base delle completion (`nexus_provider_registry.models_path`,
+    /// mig 0705). `None` = il `/models` del dialetto OpenAI.
+    ///
+    /// Delega la normalizzazione al client, che e' il punto in cui quella URL si
+    /// compone: qui il valore viene dal registry e non si tocca.
+    pub fn with_models_path(mut self, path: Option<&str>) -> Self {
+        self.client = self.client.with_models_path(path);
+        self
+    }
+
     /// Aggancia il DB da cui gli INSTRADATORI leggono quale fornitore a valle
     /// preferire (`nexus_router_upstream_affinity`, mig 0657). Gli altri
     /// endpoint non lo interrogano: la domanda vale solo dove c'e' davvero

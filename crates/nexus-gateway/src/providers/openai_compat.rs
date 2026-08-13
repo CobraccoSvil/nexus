@@ -112,6 +112,9 @@ impl ResolvedReasoning {
 pub struct OpenAiCompatClient {
     http: Client,
     base_url: String,
+    /// Percorso della lista modelli RELATIVO a [`Self::base_url`]. Vedi
+    /// [`PERCORSO_MODELLI_DEFAULT`] e [`Self::url_lista_modelli`].
+    models_path: String,
     api_key: String,
     provider_name: String,
     cache_keying: PromptCacheKeying,
@@ -187,6 +190,10 @@ fn parse_upstream_order(csv: &str) -> Option<Vec<String>> {
     (!v.is_empty()).then_some(v)
 }
 
+/// Percorso della lista modelli nel dialetto OpenAI, che e' quello che tutti gli
+/// endpoint compat parlano finche' non dichiarano altrimenti.
+pub const PERCORSO_MODELLI_DEFAULT: &str = "/models";
+
 impl OpenAiCompatClient {
     /// Costruisce il client. `base_url` senza slash finale (es.
     /// `https://api.mistral.ai/v1`); l'endpoint `/chat/completions` viene
@@ -202,6 +209,7 @@ impl OpenAiCompatClient {
         Self {
             http,
             base_url,
+            models_path: PERCORSO_MODELLI_DEFAULT.to_string(),
             api_key: api_key.into(),
             provider_name: provider_name.into(),
             // Il default e' il provider che si arrangia: dichiarare una chiave a
@@ -213,6 +221,24 @@ impl OpenAiCompatClient {
             upstream_order: TtlCache::new(UPSTREAM_AFFINITY_TTL),
             ultimo_ordine_letto: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Dichiara dove questo endpoint espone la lista modelli, quando NON e' il
+    /// `/models` del dialetto OpenAI (vedi [`Self::url_lista_modelli`]).
+    ///
+    /// `None` o vuoto = il default: un percorso non dichiarato non deve poter
+    /// produrre una URL diversa da quella di prima (regola Q — l'assenza e' una
+    /// variante, non una stringa vuota da concatenare). Lo slash iniziale si
+    /// normalizza qui perche' e' il posto in cui il valore entra: normalizzarlo a
+    /// valle vorrebbe dire farlo in ognuno dei consumatori.
+    pub fn with_models_path(mut self, path: Option<&str>) -> Self {
+        let dichiarato = path.map(str::trim).filter(|p| !p.is_empty());
+        self.models_path = match dichiarato {
+            Some(p) if p.starts_with('/') => p.trim_end_matches('/').to_string(),
+            Some(p) => format!("/{}", p.trim_end_matches('/')),
+            None => PERCORSO_MODELLI_DEFAULT.to_string(),
+        };
+        self
     }
 
     /// Dichiara che questo endpoint riusa il prefisso solo con
@@ -473,10 +499,24 @@ impl OpenAiCompatClient {
         Ok(out.boxed())
     }
 
-    /// Probe di salute: una HEAD/GET su `{base_url}/models`. Ritorna `false` su
+    /// L'indirizzo della lista modelli di QUESTO endpoint. Punto unico (regola L)
+    /// dei due che la interrogano — [`Self::healthcheck`] e
+    /// [`Self::list_models_meta`] — perche' non e' un dettaglio di formattazione:
+    /// e' l'unica cosa che li distingue dal fallire insieme.
+    ///
+    /// MISURATO il 13/08/2026 su Perplexity, che espone le completion sulla radice
+    /// (`POST /chat/completions`) e i modelli sotto `/v1` (`GET /v1/models`).
+    /// Appendendo `/models` alla base delle completion si otteneva 404 su ENTRAMBI:
+    /// la discovery falliva a ogni sync, e lo healthcheck — che e' la stessa GET —
+    /// dichiarava il fornitore non sano per sempre, indipendentemente dal fornitore.
+    fn url_lista_modelli(&self) -> String {
+        format!("{}{}", self.base_url, self.models_path)
+    }
+
+    /// Probe di salute: una GET su [`Self::url_lista_modelli`]. Ritorna `false` su
     /// qualunque errore (rete, auth, status non 2xx).
     pub async fn healthcheck(&self) -> bool {
-        let url = format!("{}/models", self.base_url);
+        let url = self.url_lista_modelli();
         match self
             .http
             .get(url)
@@ -489,7 +529,7 @@ impl OpenAiCompatClient {
         }
     }
 
-    /// Autodiscovery live: `GET {base_url}/models` (Bearer) ed estrae `data[].id`.
+    /// Autodiscovery live: `GET` su [`Self::url_lista_modelli`] ed estrae `data[].id`.
     /// Dialetto OpenAI condiviso da OpenAI/Mistral/DeepSeek/vLLM (punto unico,
     /// regola L). Il parsing della risposta e' delegato a [`parse_models_response`]
     /// (puro, testabile senza rete).
@@ -507,7 +547,7 @@ impl OpenAiCompatClient {
     /// in `data[]`; OpenAI/DeepSeek non la espongono -> `None`). Un solo fetch
     /// (regola L): [`Self::list_models`] delega qui e proietta i soli id.
     pub async fn list_models_meta(&self) -> anyhow::Result<Vec<crate::provider::ModelMeta>> {
-        let url = format!("{}/models", self.base_url);
+        let url = self.url_lista_modelli();
         let resp = self.http.get(url).bearer_auth(&self.api_key).send().await?;
         let status = resp.status();
         if !status.is_success() {
