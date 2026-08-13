@@ -21,6 +21,7 @@
 mod audit_settings;
 mod battery_explain;
 mod capability_census;
+mod error_code_census;
 mod migrate;
 mod premessa;
 mod quality_scan;
@@ -61,6 +62,10 @@ fn main() -> Result<()> {
             let code = capability_census::run(&args[2..])?;
             std::process::exit(code);
         }
+        "error-code-census" => {
+            let code = error_code_census::run(&args[2..])?;
+            std::process::exit(code);
+        }
         "service-manifests" => {
             let code = service_manifests::run(&args[2..])?;
             std::process::exit(code);
@@ -79,6 +84,9 @@ fn main() -> Result<()> {
             );
             eprintln!(
                 "  capability-census [--gate]    Capability: copertura, lettori e prove (DB live)"
+            );
+            eprintln!(
+                "  error-code-census [--gate]    Codici errore fornitore: cosa sappiamo                  leggere e cosa no (DB live)"
             );
             eprintln!(
                 "  service-manifests [flags]     Manifest di servizio derivati dal catalogo (DB live)"

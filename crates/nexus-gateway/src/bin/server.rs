@@ -69,6 +69,18 @@ async fn main() -> anyhow::Result<()> {
         // runtime tokio.
     }
 
+    // Ricarica del catalogo dei codici errore. Loop DEDICATO e non appeso al
+    // re-probe (600s): una riga nuova in `nexus_provider_error_code` deve valere
+    // entro il minuto — e' la ragione per cui quel catalogo sta nel DB. Il
+    // difetto che chiude e' durato 14 giorni proprio perche' il rimedio
+    // richiedeva di toccare Rust e ridispiegare.
+    {
+        let _handle = nexus_gateway::tassonomia_errori::spawn_vocabolario_loop(
+            state.vocabolario_errori.clone(),
+            db.clone(),
+        );
+    }
+
     let max_body_bytes = nexus_gateway::resolve_max_body_bytes(&db).await;
     tracing::info!(
         max_body_mb = max_body_bytes / (1024 * 1024),

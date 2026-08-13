@@ -127,6 +127,13 @@ routing:
             jwt_secret,
             mcp_core_url: "http://localhost:4000".to_string(),
             cooldown: CooldownManager::new(),
+            // Questi test misurano l'AUTENTICAZIONE: nessuna richiesta arriva a
+            // un provider, quindi il catalogo non viene mai interrogato. Una
+            // mappa vuota qui e' la dichiarazione che non c'e' nulla da
+            // classificare, non un catalogo di comodo.
+            vocabolario_errori: crate::tassonomia_errori::VocabolarioErrori::con_mappa(
+                crate::tassonomia_errori::Mappa::da_righe([]),
+            ),
             runtime: Arc::new(tokio::sync::RwLock::new(runtime)),
         })
     }

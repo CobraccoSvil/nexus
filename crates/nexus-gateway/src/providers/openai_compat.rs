@@ -26,6 +26,7 @@ use sqlx::PgPool;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::provider::ChunkStream;
+use crate::tassonomia_errori::CandidatiErrore;
 use crate::types::{
     GeneratedImage, ImageGenResponse, LlmRequest, LlmResponse, LlmStreamChunk, LlmToolCall,
     LlmUsage, MessageContent, PromptCacheKeying, PromptCacheReporting, ReasoningTokens,
@@ -522,7 +523,8 @@ impl OpenAiCompatClient {
     /// Genera immagini via `POST {base_url}/images/generations` (dialetto OpenAI
     /// Images). Punto unico del trasporto image-gen OpenAI-compatibile (regola L):
     /// stesso `http` client e `bearer_auth(api_key)` di [`Self::complete`], stesso
-    /// status-check propagato al caller (che applica `is_billing_error` + cooldown).
+    /// status-check propagato al caller (che ne chiede il verdetto al catalogo
+    /// dei codici, `tassonomia_errori`, e applica il cooldown).
     ///
     /// Richiesta: `{model, prompt, n?, size?, response_format:"b64_json"}`.
     /// Risposta: `{data:[{b64_json|url}], ...}` -> [`GeneratedImage`]. Regola G:
@@ -571,8 +573,8 @@ impl OpenAiCompatClient {
     /// Trascrive audio via `POST {base_url}/audio/transcriptions` (dialetto OpenAI
     /// Audio, MULTIPART/form-data). Punto unico del trasporto audio-in OpenAI-
     /// compatibile (regola L): stesso `http` client e `bearer_auth(api_key)` di
-    /// [`Self::complete`], stesso status-check propagato al caller (che applica
-    /// `is_billing_error` + cooldown).
+    /// [`Self::complete`], stesso status-check propagato al caller (che ne chiede
+    /// il verdetto al catalogo dei codici, `tassonomia_errori`, e applica il cooldown).
     ///
     /// Form: `file=<bytes>` (con `file_name` + mime), `model`, `response_format=json`,
     /// `language` se presente. Risposta: `{"text":"..."}` -> [`TranscribeResponse`].
@@ -627,8 +629,8 @@ impl OpenAiCompatClient {
     /// Sintetizza audio via `POST {base_url}/audio/speech` (dialetto OpenAI Audio,
     /// JSON in -> BYTES binari out). Punto unico del trasporto audio-out OpenAI-
     /// compatibile (regola L): stesso `http` client e `bearer_auth(api_key)` di
-    /// [`Self::complete`], stesso status-check propagato al caller (che applica
-    /// `is_billing_error` + cooldown).
+    /// [`Self::complete`], stesso status-check propagato al caller (che ne chiede
+    /// il verdetto al catalogo dei codici, `tassonomia_errori`, e applica il cooldown).
     ///
     /// Body JSON: `model`, `input`, `voice` (se presente), `response_format`.
     /// Risposta: BYTES audio (NON JSON) + il Content-Type per il MIME reale.
@@ -1399,46 +1401,14 @@ fn normalize_finish_reason(raw: Option<&str>) -> String {
     .to_string()
 }
 
-/// Detection di errore di billing/crediti esauriti (LEGACY).
-///
-/// DEPRECATO (regola M): preferire [`classify_provider_error`] su status+codice
-/// strutturato. Mantenuto solo per retro-compatibilita' dei test e dei call site
-/// che leggono ancora `Display`/`to_string()` dell'errore HTTP.
-#[deprecated(note = "use classify_provider_error on ProviderHttpError status+code")]
-pub fn is_billing_error(msg: &str) -> bool {
-    let m = msg.to_lowercase();
-    m.contains("insufficient_quota")
-        || m.contains("exceeded your current quota")
-        || m.contains("payment required")
-        || m.contains("billing")
-        || (m.contains("credit balance") && m.contains("too low"))
-}
-
 /// Classe di errore provider ai fini della strategia retry/cooldown.
-/// Punto unico (regola L): i call site (`run_fallback`, streaming) NON
-/// reimplementano il match.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderErrorKind {
-    /// Crediti/quota/fatturazione: il provider e' inutilizzabile finche' non si
-    /// ricarica. NIENTE retry; cooldown lungo (mark_billing).
-    Billing,
-    /// Errore lato richiesta o configurazione (4xx client): 400 invalid_request,
-    /// 401/403 auth o modello non abilitato, 404 model not found, 422. Ritentare
-    /// NON aiuta e mettere in cooldown il PROVIDER e' sbagliato (il problema e' la
-    /// singola richiesta o il singolo modello). NIENTE retry, NIENTE cooldown.
-    ClientError,
-    /// Richiesta troppo grande per QUESTO provider (413 request_too_large: la
-    /// richiesta supera la finestra/limite del provider). Come `ClientError`,
-    /// ritentare lo STESSO provider e' inutile e NON va messo in cooldown (il
-    /// provider e' sano). MA un provider a finestra/limite piu' grande accetterebbe
-    /// la stessa richiesta -> a livello motore e' cross-provider-recuperabile
-    /// (failover), a differenza di un `ClientError` generico che rifallirebbe ovunque.
-    ContextTooLong,
-    /// Transitorio (429 rate-limit, 5xx, timeout, connessione) o ignoto:
-    /// ritentabile con backoff. Solo dopo l'esaurimento dei retry si applica un
-    /// cooldown breve (transient).
-    Transient,
-}
+///
+/// E' un RE-EXPORT: la definizione vive in `nexus-types` accanto al vocabolario
+/// di wire (`provider_failure::classe`), perche' la traduzione classe->stringa
+/// e' il contratto che mcp-core legge e finche' l'enum stava qui quella
+/// traduzione era scritta a mano in due punti (regola L). Il nome storico resta
+/// per non toccare i quattro `match` dei call site.
+pub use nexus_types::provider_failure::ClasseErrore as ProviderErrorKind;
 
 /// Errore HTTP di un provider, con lo status NUMERICO (segnale CERTO) e il
 /// codice d'errore STRUTTURATO estratto dal JSON (`error.code`/`error.type`/
@@ -1447,15 +1417,25 @@ pub enum ProviderErrorKind {
 /// cambiare per provider/versione/lingua, lo status e il codice no.
 ///
 /// `Display` e' IDENTICO al vecchio `bail!("{provider} HTTP {status}: {body}")`
-/// cosi' i chiamanti legacy che leggono `to_string()` (es. `is_billing_error`
-/// in `fallback.rs`) non cambiano comportamento, mentre il codice nuovo fa
-/// `downcast` per accedere ai campi strutturati.
+/// cosi' i chiamanti legacy che leggono `to_string()` non cambiano
+/// comportamento, mentre il codice nuovo fa `downcast` per accedere ai campi
+/// strutturati.
 #[derive(Debug)]
 pub struct ProviderHttpError {
     pub provider: String,
     pub status: u16,
     /// Codice d'errore strutturato dal body JSON (lowercase), se presente.
+    ///
+    /// E' il valore che viaggia sul WIRE (`failures[].code`, `ErrorFacts.code`)
+    /// e che i consumatori a valle confrontano per uguaglianza: resta quello
+    /// storico ([`CandidatiErrore::codice_esportato`]). Chi deve DECIDERE non
+    /// legge questo campo ma [`Self::candidati`], perche' un solo valore non
+    /// basta: e' l'aver collassato sei campi in uno che ha reso invisibile il
+    /// credito esaurito di openai per 14 giorni.
     pub code: Option<String>,
+    /// TUTTI i campi d'errore osservati nel body, in ordine di rango. Chi
+    /// classifica decide sul primo RICONOSCIUTO, non sul primo presente.
+    pub candidati: CandidatiErrore,
     /// Secondi indicati dall'header `Retry-After` (RFC 9457/7231), se il provider
     /// lo fornisce (es. Mistral/OpenAI su 429). Segnale AUTORITATIVO di quanto
     /// attendere prima di ritentare: ha precedenza sul backoff calcolato.
@@ -1476,12 +1456,15 @@ impl ProviderHttpError {
     /// Costruisce dall'HTTP status + body grezzo, estraendo il codice d'errore
     /// STRUTTURATO dal JSON (non dalla prosa).
     pub fn from_response(provider: &str, status: u16, body: String) -> Self {
-        let code = extract_structured_error_code(&body)
-            .map(|c| normalizza_codice_provider(provider, status, &c, &body));
+        let mut candidati = CandidatiErrore::dal_body(&body);
+        if let Some(sintetico) = quirk_del_fornitore(provider, status, &candidati, &body) {
+            candidati = candidati.con_quirk(sintetico);
+        }
         Self {
             provider: provider.to_string(),
             status,
-            code,
+            code: candidati.codice_esportato().map(str::to_string),
+            candidati,
             retry_after_seconds: None,
             message: body,
         }
@@ -1522,44 +1505,6 @@ pub async fn provider_http_error(provider: &str, resp: reqwest::Response) -> Pro
     ProviderHttpError::from_response(provider, status, body).with_retry_after(retry_after)
 }
 
-/// Estrae il codice d'errore STRUTTURATO da un body JSON di errore provider.
-/// Cerca (in ordine) `error.code` (se stringa), `error.type`, `error.status`
-/// (enum Google), e i corrispettivi top-level. Ritorna il valore in lowercase.
-/// NB: parsa CAMPI JSON del contratto macchina del provider, non testo libero.
-///
-/// L'ordine `code` PRIMA di `type` non e' un dettaglio: dove un provider valorizza
-/// entrambi, `code` e' l'identificatore dell'errore e `type` la sua categoria — e
-/// una categoria non basta a decidere. Misurato su groq il 2026-07-16: un rifiuto
-/// per tetto token/minuto arriva come
-///   {"error":{"type":"tokens","code":"rate_limit_exceeded"}}
-/// Preferendo `type` si legge "tokens", che non dice cosa sia successo: il
-/// rate-limit non veniva riconosciuto, restava la tabella per status (413 ->
-/// ContextTooLong) e il rifiuto diventava colpa del MODELLO. La batteria ha
-/// squalificato quattro modelli groq che nello stesso giro passavano chat_smoke e
-/// tool_smoke: il piano non regge 20k token al minuto, i modelli stanno benissimo.
-/// Dove i due campi coincidono (OpenAI: code=type=insufficient_quota) l'ordine e'
-/// indifferente; dove `code` e' numerico (Google) non e' una stringa e si scende
-/// a `status`. I test di questa funzione coprono tutti e tre i casi.
-fn extract_structured_error_code(body: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let candidates = [
-        v.pointer("/error/code"),
-        v.pointer("/error/type"),
-        v.pointer("/error/status"),
-        v.get("code"),
-        v.get("type"),
-        v.get("status"),
-    ];
-    for c in candidates.into_iter().flatten() {
-        if let Some(s) = c.as_str() {
-            if !s.is_empty() {
-                return Some(s.to_ascii_lowercase());
-            }
-        }
-    }
-    None
-}
-
 /// Estrae il MESSAGGIO d'errore leggibile dal body JSON di errore provider, per
 /// la DIAGNOSI (regola M): il campo `message` del contratto d'errore dice COSA
 /// e' invalido (es. Google: quale argomento e il limite atteso). Cerca (in
@@ -1583,9 +1528,15 @@ fn extract_structured_error_message(body: &str) -> Option<String> {
 }
 
 /// Codice di fatturazione emesso quando un provider segnala credito esaurito
-/// senza un identificatore proprio. Contiene `billing`, quindi
-/// [`classify_by_status_code`] lo riconosce senza sapere da quale provider venga.
-const CODICE_BILLING_NORMALIZZATO: &str = "billing_error";
+/// senza un identificatore proprio.
+///
+/// NON e' piu' una stringa che si fa riconoscere per la sottostringa `billing`:
+/// e' un valore DICHIARATO nel catalogo (mig 0705, riga
+/// `('anthropic','billing_error',400,'credit_exhausted')`), e un test contro la
+/// migrazione vera fallisce se il quirk emette un valore che nessuna riga
+/// dichiara. La dipendenza implicita — «lo riconoscono perche' contiene una
+/// parola» — era esattamente il meccanismo che questo intervento elimina.
+pub const CODICE_BILLING_NORMALIZZATO: &str = "billing_error";
 
 /// Traduce nel vocabolario comune un codice che il provider riporta AMBIGUO.
 ///
@@ -1606,16 +1557,25 @@ const CODICE_BILLING_NORMALIZZATO: &str = "billing_error";
 /// Il testo e' consultato SOLO qui, SOLO per il provider che ha l'ambiguita' e
 /// SOLO sul `error.message` strutturato: e' il perimetro minimo, non una
 /// classificazione dalla prosa.
-fn normalizza_codice_provider(provider: &str, status: u16, code: &str, body: &str) -> String {
+///
+/// Ritorna il candidato SINTETICO da AGGIUNGERE (rango massimo), non piu' un
+/// codice che sostituisce gli altri: il resto dei campi resta osservabile, cosi'
+/// il giorno in cui anthropic pubblichera' un identificatore distinto quel
+/// codice comparira' fra i non dichiarati e il quirk si potra' togliere.
+fn quirk_del_fornitore(
+    provider: &str,
+    status: u16,
+    candidati: &CandidatiErrore,
+    body: &str,
+) -> Option<&'static str> {
     let e_anthropic = provider.trim().eq_ignore_ascii_case("anthropic");
-    if e_anthropic
-        && status == 400
-        && code == "invalid_request_error"
-        && dichiara_credito_esaurito(body)
-    {
-        return CODICE_BILLING_NORMALIZZATO.to_string();
+    let dice_invalid_request = candidati
+        .iter()
+        .any(|c| c.valore == "invalid_request_error");
+    if e_anthropic && status == 400 && dice_invalid_request && dichiara_credito_esaurito(body) {
+        return Some(CODICE_BILLING_NORMALIZZATO);
     }
-    code.to_string()
+    None
 }
 
 /// Il body dichiara credito/saldo insufficiente? Guarda il `error.message`
@@ -1629,94 +1589,12 @@ fn dichiara_credito_esaurito(body: &str) -> bool {
     m.contains("credit balance") || m.contains("plans & billing")
 }
 
-/// Classifica in modo DETERMINISTICO da status HTTP + codice strutturato.
-/// Lo status e' il segnale primario; il codice ESCALA a Billing solo un 429/402
-/// quando e' un identificatore di credito inequivocabile (non prosa).
-fn classify_by_status_code(status: u16, code: Option<&str>) -> ProviderErrorKind {
-    // Codice STRUTTURATO di credito/fatturazione (identificatore macchina).
-    // Conservativo: solo codici inequivocabili, cosi' non si scambia un
-    // rate-limit (429) per un provider "down per credito".
-    if let Some(c) = code {
-        // Rate-limit DICHIARATO dal provider: vince sullo status, perche' lo
-        // status da solo mente. groq manda 413 (non 429) quando la richiesta
-        // supera il tetto token/minuto del piano: "on tokens per minute (TPM):
-        // Limit 8000, Requested 20083", code=rate_limit_exceeded. Leggendo solo
-        // il 413 lo si scambia per "richiesta troppo grande per la finestra" e
-        // il motore fa failover cross-provider su un altro provider, mentre la
-        // cura giusta e' aspettare: il provider e' sano e la stessa richiesta
-        // passera' fra un minuto.
-        //
-        // Va PRIMA del credito perche' i due vocabolari possono sfiorarsi: chi
-        // dichiara di essere un limite di FREQUENZA lo e', anche se nel nome
-        // compare la parola quota. La precedenza esplicita costa una riga; a
-        // ordine invertito sarebbe una coincidenza di stringhe a deciderla.
-        if c.contains("rate_limit") {
-            return ProviderErrorKind::Transient;
-        }
-        // Credito/fatturazione: qui il rimedio e' ricaricare, non attendere, e
-        // scambiare i due significa ritentare all'infinito un account sospeso.
-        //
-        // `quota` invece del piu' stretto `insufficient_quota`: MISURATO il
-        // 09/08/2026 sull'API Moonshot con un account a saldo zero — HTTP 429,
-        // `type: "exceeded_current_quota_error"`, "account is suspended due to
-        // insufficient balance, please recharge". Nessuno dei quattro termini
-        // riconosciuti vi compare, quindi cadeva sullo status: 429 -> Transient,
-        // cioe' un account sospeso trattato come una saturazione passeggera.
-        // La doc Moonshot distingue apposta tre 429 con rimedi opposti
-        // (`engine_overloaded_error`, `rate_limit_reached_error`,
-        // `exceeded_current_quota_error`): il primo e il secondo sono attese, il
-        // terzo no.
-        if c.contains("quota")
-            || c.contains("billing")
-            || c.contains("payment_required")
-            || c.contains("account_deactivated")
-        {
-            return ProviderErrorKind::Billing;
-        }
-    }
-    // Mappatura verificata sulle tabelle ufficiali (Anthropic/OpenAI, 2026):
-    //   402 billing_error (Anthropic) -> Billing;
-    //   400/401/403/404/422 (+ altri 4xx non ritentabili) -> ClientError:
-    //     ritentare NON aiuta (fallirebbe su qualunque provider);
-    //   413 request_too_large -> ContextTooLong: retry STESSO provider inutile (come
-    //     ClientError), ma cross-provider-recuperabile (un provider a finestra piu'
-    //     grande accetta) -> il motore fa failover invece di chiudere;
-    //   408/425/429 (timeout/too-early/rate-limit), 5xx e 529 overloaded (Anthropic)
-    //     -> Transient (ritentabili).
-    match status {
-        402 => ProviderErrorKind::Billing,
-        413 => ProviderErrorKind::ContextTooLong,
-        400 | 401 | 403 | 404 | 405 | 406 | 409 | 410 | 415 | 422 => {
-            ProviderErrorKind::ClientError
-        }
-        _ => ProviderErrorKind::Transient,
-    }
-}
-
-/// Classifica un errore provider in modo DETERMINISTICO (regola H, punto unico
-/// regola L). Ordine dei segnali CERTI:
-///   1. [`ProviderHttpError`] nella catena -> status + codice strutturato;
-///   2. `reqwest::Error` -> `status()` se presente, altrimenti timeout/connessione
-///      (predicati tipizzati) -> transitorio;
-///   3. sconosciuto (es. parse di un body 200) -> transitorio (default sicuro:
-///      ritentare e' innocuo, non penalizza un provider sano).
-/// NESSUNA classificazione basata sul testo del messaggio.
-pub fn classify_provider_error(err: &anyhow::Error) -> ProviderErrorKind {
-    for cause in err.chain() {
-        if let Some(http) = cause.downcast_ref::<ProviderHttpError>() {
-            return classify_by_status_code(http.status, http.code.as_deref());
-        }
-        if let Some(re) = cause.downcast_ref::<reqwest::Error>() {
-            if let Some(status) = re.status() {
-                return classify_by_status_code(status.as_u16(), None);
-            }
-            // Nessuno status = errore di trasporto (timeout/connessione/body):
-            // transitorio CERTO (predicati tipizzati, non testo).
-            return ProviderErrorKind::Transient;
-        }
-    }
-    ProviderErrorKind::Transient
-}
+/// Il codice esportato sul wire e i CANDIDATI da cui si classifica nascono
+/// insieme in [`ProviderHttpError::from_response`]. La classificazione vive nel
+/// punto unico [`crate::tassonomia_errori`]: qui resta solo la costruzione
+/// dell'errore, perche' decidere richiede il CATALOGO dei codici (mig 0705) e
+/// il catalogo richiede il DB — che questo modulo non ha e non deve avere sul
+/// percorso di una chiamata fallita.
 
 // ---------------------------------------------------------------------------
 // Tipi wire (formato OpenAI Chat Completions). Separati dai tipi di contratto
@@ -2689,47 +2567,58 @@ mod tests {
     /// che non parla di credito. Il discrimine e' solo questo.
     const BODY_FORMATO_ANTHROPIC: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1: Expected `thinking` or `redacted_thinking`, but found `text`"}}"#;
 
-    #[test]
-    fn credito_anthropic_esaurito_e_billing_non_errore_di_formato() {
-        // Attraversa il PRODUTTORE (from_response), non un codice scritto a mano:
-        // costruire l'errore a mano fisserebbe l'assunto da verificare (regola O).
-        let err = anyhow::Error::new(ProviderHttpError::from_response(
-            "anthropic",
-            400,
-            BODY_CREDITO_ANTHROPIC.to_string(),
-        ));
-        // Il VERDETTO, non la stringa: e' cio' su cui a valle si decidono
-        // cooldown e failover.
-        assert_eq!(
-            classify_provider_error(&err),
-            ProviderErrorKind::Billing,
-            "un credito esaurito non e' una richiesta malformata: senza questo il \
-             gateway ritenta sanificando la history e non mette in cooldown"
-        );
+    /// Il candidato che il quirk emette, quando lo emette. E' cio' che QUESTO
+    /// modulo produce: che poi valga `Billing` lo dice il catalogo dei codici, e
+    /// ha il suo test contro la migrazione vera
+    /// (`tassonomia_errori::il_quirk_emette_un_valore_che_il_catalogo_dichiara`).
+    fn quirk_emesso(provider: &str, status: u16, body: &str) -> Option<String> {
+        ProviderHttpError::from_response(provider, status, body.to_string())
+            .candidati
+            .iter()
+            .find(|c| c.campo == crate::tassonomia_errori::CampoErrore::QuirkFornitore)
+            .map(|c| c.valore.clone())
     }
 
     #[test]
-    fn un_400_di_formato_anthropic_resta_errore_client() {
+    fn credito_anthropic_esaurito_emette_il_candidato_sintetico() {
+        // Attraversa il PRODUTTORE (from_response), non un codice scritto a mano:
+        // costruire l'errore a mano fisserebbe l'assunto da verificare (regola O).
+        assert_eq!(
+            quirk_emesso("anthropic", 400, BODY_CREDITO_ANTHROPIC).as_deref(),
+            Some(CODICE_BILLING_NORMALIZZATO),
+            "senza il candidato sintetico nessun catalogo puo' vedere quel credito: \
+             anthropic lo dichiara con lo STESSO identificatore di una richiesta \
+             malformata"
+        );
+        // Il codice sul WIRE resta quello storico: i consumatori a valle lo
+        // confrontano per uguaglianza.
+        let err = ProviderHttpError::from_response(
+            "anthropic",
+            400,
+            BODY_CREDITO_ANTHROPIC.to_string(),
+        );
+        assert_eq!(err.code.as_deref(), Some(CODICE_BILLING_NORMALIZZATO));
+    }
+
+    #[test]
+    fn un_400_di_formato_anthropic_non_emette_nessun_quirk() {
         // La traduzione non deve inghiottire i 400 legittimi: stesso provider,
-        // stesso status, stesso codice, messaggio diverso -> resta ClientError.
-        let err = anyhow::Error::new(ProviderHttpError::from_response(
+        // stesso status, stesso codice, messaggio diverso -> nessun sintetico, e
+        // il codice resta quello del fornitore.
+        assert_eq!(quirk_emesso("anthropic", 400, BODY_FORMATO_ANTHROPIC), None);
+        let err = ProviderHttpError::from_response(
             "anthropic",
             400,
             BODY_FORMATO_ANTHROPIC.to_string(),
-        ));
-        assert_eq!(classify_provider_error(&err), ProviderErrorKind::ClientError);
+        );
+        assert_eq!(err.code.as_deref(), Some("invalid_request_error"));
     }
 
     #[test]
-    fn lo_stesso_messaggio_da_un_altro_provider_non_diventa_billing() {
-        // Il quirk resta isolato al provider che ce l'ha: un altro provider non
-        // viene reinterpretato qui (il suo caso, se esiste, avra' il suo ramo).
-        let err = anyhow::Error::new(ProviderHttpError::from_response(
-            "deepseek",
-            400,
-            BODY_CREDITO_ANTHROPIC.to_string(),
-        ));
-        assert_eq!(classify_provider_error(&err), ProviderErrorKind::ClientError);
+    fn lo_stesso_messaggio_da_un_altro_provider_non_emette_il_quirk() {
+        // Il quirk resta isolato al provider che ha l'ambiguita': un altro
+        // provider non viene reinterpretato qui.
+        assert_eq!(quirk_emesso("deepseek", 400, BODY_CREDITO_ANTHROPIC), None);
     }
 
     #[test]
@@ -3556,32 +3445,30 @@ mod tests {
         assert_eq!(mime_from_audio_format(Some("xyz")), "audio/mpeg");
     }
 
+    /// I sei campi storici, nell'ordine storico: e' il valore che finisce in
+    /// `failures[].code` e che i consumatori a valle confrontano per
+    /// uguaglianza. NON e' cio' su cui si DECIDE (per quello ci sono i
+    /// candidati): e' il contratto di wire, e cambiarlo sarebbe un cambiamento
+    /// di contratto travestito da miglioramento della classificazione.
     #[test]
-    #[allow(deprecated)]
-    fn billing_error_pattern() {
-        assert!(is_billing_error("Error: insufficient_quota for org"));
-        assert!(is_billing_error("You exceeded your current quota"));
-        assert!(is_billing_error("402 Payment Required"));
-        assert!(is_billing_error(
-            "Your credit balance is too low to access the API"
-        ));
-        assert!(is_billing_error("BILLING hard limit reached"));
-        assert!(!is_billing_error("rate limit exceeded, retry later"));
-        assert!(!is_billing_error("model not found"));
-    }
-
-    #[test]
-    fn extract_structured_error_code_da_json() {
+    fn il_codice_esportato_sul_wire_resta_quello_storico() {
+        let code = |provider: &str, status: u16, body: &str| {
+            ProviderHttpError::from_response(provider, status, body.to_string()).code
+        };
         // OpenAI/DeepSeek/Mistral: error.code / error.type.
         assert_eq!(
-            extract_structured_error_code(
+            code(
+                "openai",
+                429,
                 r#"{"error":{"code":"insufficient_quota","type":"insufficient_quota"}}"#
             )
             .as_deref(),
             Some("insufficient_quota")
         );
         assert_eq!(
-            extract_structured_error_code(
+            code(
+                "deepseek",
+                400,
                 r#"{"error":{"type":"invalid_request_error","message":"bad"}}"#
             )
             .as_deref(),
@@ -3589,24 +3476,39 @@ mod tests {
         );
         // Google: error.code e' NUMERICO -> si usa error.status (enum).
         assert_eq!(
-            extract_structured_error_code(
+            code(
+                "google",
+                400,
                 r#"{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"x"}}"#
             )
             .as_deref(),
             Some("invalid_argument")
         );
-        // groq: `type` e' la CATEGORIA ("tokens"), `code` e' l'errore. Preferendo
-        // `type` si perde l'unica informazione che decide, e un rate-limit del
-        // piano diventa un difetto del modello. Corpo VERBATIM del 2026-07-16.
+        // groq: `type` e' la CATEGORIA ("tokens"), `code` e' l'errore. Corpo
+        // VERBATIM del 2026-07-16.
         assert_eq!(
-            extract_structured_error_code(
+            code(
+                "groq",
+                413,
                 r#"{"error":{"message":"Request too large for model `openai/gpt-oss-120b` on tokens per minute (TPM): Limit 8000, Requested 20083","type":"tokens","code":"rate_limit_exceeded"}}"#
             )
             .as_deref(),
             Some("rate_limit_exceeded")
         );
+        // openrouter 402: il campo che DECIDE sta in `metadata.limit_source`, ma
+        // sul wire il code resta `null` come oggi (il /error/code e' numerico).
+        // Includerlo nell'export cambierebbe 127 righe senza che nessuno
+        // l'abbia chiesto.
+        assert_eq!(
+            code(
+                "openrouter",
+                402,
+                r#"{"error":{"message":"more credits","code":402,"metadata":{"limit_source":"openrouter_credits"}}}"#
+            ),
+            None
+        );
         // Body non-JSON o senza campi: None.
-        assert_eq!(extract_structured_error_code("502 Bad Gateway (html)"), None);
+        assert_eq!(code("openai", 502, "502 Bad Gateway (html)"), None);
     }
 
     #[test]
@@ -3653,141 +3555,10 @@ mod tests {
         assert_eq!(parse_retry_after(&h), None);
     }
 
-    /// LA REGRESSIONE, dal body alla classe: il 413 di groq attraversa
-    /// `from_response` (il produttore vero del `ProviderHttpError`, che estrae il
-    /// codice) e deve arrivare a `Transient`.
-    ///
-    /// Il 2026-07-16 finiva in `ContextTooLong` — cioe' "colpa della richiesta per
-    /// QUESTO modello" — e la batteria ha squalificato quattro modelli groq che
-    /// nello stesso giro passavano chat_smoke e tool_smoke. Il guard sul codice
-    /// c'era gia': non scattava perche' l'estrattore preferiva `type` ("tokens") a
-    /// `code` ("rate_limit_exceeded"). Un test sul solo `classify_by_status_code`
-    /// non poteva vederlo: passava un codice che in produzione non arrivava mai.
-    #[test]
-    fn il_413_di_groq_e_un_rate_limit_dal_body_alla_classe() {
-        let body = r#"{"error":{"message":"Request too large for model `openai/gpt-oss-120b` in organization `org_x` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Requested 20083, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing","type":"tokens","code":"rate_limit_exceeded"}}"#;
-        let err: anyhow::Error =
-            ProviderHttpError::from_response("groq", 413, body.to_string()).into();
-        assert_eq!(
-            classify_provider_error(&err),
-            ProviderErrorKind::Transient,
-            "il tetto token/minuto del piano e' transitorio: il provider e' sano e \
-             la stessa richiesta passa fra un minuto. Trattarlo come ContextTooLong \
-             lo attribuisce al modello e lo fa squalificare"
-        );
-    }
-
-    /// Il 429 di Moonshot per CREDITO ESAURITO e' fatturazione, non attesa.
-    ///
-    /// Corpo VERBATIM da una chiamata reale del 09/08/2026 con un account a saldo
-    /// zero (`/v1/users/me/balance` -> `available_balance: 0`). Il test parte dal
-    /// body e passa da `ProviderHttpError::from_response`, cioe' dal produttore
-    /// reale: costruire a mano il codice proverebbe che il `match` ritorna cio'
-    /// che c'e' scritto, non che l'estrattore quel codice lo produca (e' l'errore
-    /// che rese cieco per mesi il guard sul 413 di groq, qui sopra).
-    ///
-    /// Prima del fix nessuno dei quattro termini riconosciuti compariva in
-    /// `exceeded_current_quota_error`, quindi si cadeva sullo status 429 ->
-    /// `Transient`: un account SOSPESO trattato come saturazione passeggera,
-    /// cioe' ritentato per sempre invece di essere messo in cooldown.
-    ///
-    /// MUTAZIONE DI CONTROLLO: riportando il predicato a `insufficient_quota`,
-    /// questo test rosseggia con `Transient`.
-    #[test]
-    fn il_429_di_credito_esaurito_kimi_e_billing_dal_body_alla_classe() {
-        let body = r#"{"error":{"message":"Your account org-7870205d5982417a8a69c72cb690a1bb <ak-fbw7dp3on7u111gx4j6i> is suspended due to insufficient balance, please recharge your account or check your plan and billing details","type":"exceeded_current_quota_error"}}"#;
-        let err: anyhow::Error =
-            ProviderHttpError::from_response("kimi", 429, body.to_string()).into();
-        assert_eq!(
-            classify_provider_error(&err),
-            ProviderErrorKind::Billing,
-            "un account sospeso per saldo zero non si risolve aspettando: va in \
-             cooldown di fatturazione, non in coda di retry"
-        );
-
-        // Gli altri due 429 che Moonshot documenta restano attese, ed e' la
-        // ragione per cui il predicato non puo' essere lo status da solo.
-        for transitorio in ["engine_overloaded_error", "rate_limit_reached_error"] {
-            let body = format!(r#"{{"error":{{"message":"...","type":"{transitorio}"}}}}"#);
-            let err: anyhow::Error = ProviderHttpError::from_response("kimi", 429, body).into();
-            assert_eq!(
-                classify_provider_error(&err),
-                ProviderErrorKind::Transient,
-                "{transitorio}: il rimedio e' attendere, non ricaricare"
-            );
-        }
-    }
-
-    #[test]
-    fn classify_deterministica_da_status_e_codice() {
-        let http = |status, code: Option<&str>| {
-            anyhow::Error::new(ProviderHttpError {
-                provider: "p".into(),
-                status,
-                code: code.map(|c| c.to_string()),
-                retry_after_seconds: None,
-                message: "body".into(),
-            })
-        };
-        // Codice di credito strutturato -> Billing anche su 429 (OpenAI usa 429).
-        assert_eq!(
-            classify_provider_error(&http(429, Some("insufficient_quota"))),
-            ProviderErrorKind::Billing
-        );
-        assert_eq!(
-            classify_provider_error(&http(402, None)),
-            ProviderErrorKind::Billing
-        );
-        // 4xx client -> ClientError (niente retry, niente cooldown).
-        assert_eq!(
-            classify_provider_error(&http(400, Some("invalid_request_error"))),
-            ProviderErrorKind::ClientError
-        );
-        assert_eq!(
-            classify_provider_error(&http(403, Some("permission_denied"))),
-            ProviderErrorKind::ClientError
-        );
-        assert_eq!(
-            classify_provider_error(&http(404, None)),
-            ProviderErrorKind::ClientError
-        );
-        // 413 request_too_large: retry stesso provider inutile ma cross-provider
-        // recuperabile -> ContextTooLong (il motore fa failover, non chiude n/d).
-        assert_eq!(
-            classify_provider_error(&http(413, None)),
-            ProviderErrorKind::ContextTooLong
-        );
-        // 429 rate-limit puro (senza codice credito) -> Transient (ritentabile).
-        assert_eq!(
-            classify_provider_error(&http(429, Some("rate_limit_exceeded"))),
-            ProviderErrorKind::Transient
-        );
-        // MISURATO su groq il 2026-07-16: il tetto token/minuto del piano viene
-        // rifiutato con 413, NON con 429 ("TPM: Limit 8000, Requested 20083",
-        // code=rate_limit_exceeded). Il codice dichiarato vince sullo status: e'
-        // un rate-limit da aspettare, non una richiesta fuori finestra da mandare
-        // in failover su un altro provider.
-        assert_eq!(
-            classify_provider_error(&http(413, Some("rate_limit_exceeded"))),
-            ProviderErrorKind::Transient
-        );
-        assert_eq!(
-            classify_provider_error(&http(429, None)),
-            ProviderErrorKind::Transient
-        );
-        // 5xx server e 529 overloaded (Anthropic) -> Transient.
-        assert_eq!(
-            classify_provider_error(&http(503, None)),
-            ProviderErrorKind::Transient
-        );
-        assert_eq!(
-            classify_provider_error(&http(529, Some("overloaded_error"))),
-            ProviderErrorKind::Transient
-        );
-        // Errore non-HTTP (es. parse) -> default sicuro Transient.
-        assert_eq!(
-            classify_provider_error(&anyhow::anyhow!("json parse fallito")),
-            ProviderErrorKind::Transient
-        );
-    }
+    // I test "dal body alla CLASSE" (413 groq, 429 kimi, credito openai,
+    // mistral 1500) vivono ora in `tassonomia_errori`, dove girano contro il
+    // catalogo REALE caricato dalla migrazione 0705: qui la classe non e' piu'
+    // derivabile, perche' deciderla richiede il catalogo. Questo modulo resta
+    // responsabile di cio' che PRODUCE - i candidati e il codice di wire - e i
+    // suoi test misurano quello.
 }

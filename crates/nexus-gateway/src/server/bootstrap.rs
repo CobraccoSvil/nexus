@@ -24,6 +24,7 @@ use crate::providers::{
     MistralProvider, OpenAiProvider, VllmProvider,
 };
 use crate::redaction::presidio_client::PresidioClient;
+use crate::tassonomia_errori::VocabolarioErrori;
 use crate::types::SensitivityTier;
 
 use super::{AppState, RuntimeState};
@@ -501,11 +502,19 @@ pub async fn build_state(db: PgPool) -> Result<AppState> {
     let cooldown = CooldownManager::new();
     cooldown.attach_db(db.clone());
 
+    // Catalogo dei codici errore fornitore (mig 0705). Se non e' caricabile il
+    // gateway NON parte: senza catalogo ogni errore verrebbe classificato dal
+    // solo status, cioe' col difetto identico a prima e in SILENZIO. Non e' un
+    // modo di morire nuovo — qui non si parte gia' senza DB (`connect` eager in
+    // bin/server.rs) ne' senza listino (`assert_configured`).
+    let vocabolario_errori = VocabolarioErrori::carica_o_panica(&db).await;
+
     Ok(AppState {
         db,
         jwt_secret,
         mcp_core_url,
         cooldown,
+        vocabolario_errori,
         runtime: Arc::new(tokio::sync::RwLock::new(runtime)),
     })
 }

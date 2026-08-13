@@ -43,4 +43,8 @@ pub mod providers;
 pub mod rate_limiter;
 pub mod redaction;
 pub mod server;
+/// Punto unico della classificazione strutturale degli errori fornitore
+/// (mig 0705): il criterio, il catalogo dei codici e il registro di cio' che
+/// non sappiamo ancora leggere.
+pub mod tassonomia_errori;
 pub mod types;
