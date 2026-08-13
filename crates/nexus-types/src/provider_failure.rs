@@ -82,6 +82,23 @@ pub mod chiave {
     /// non una durata ricalcolata: qualunque ramo abbia messo il cooldown, il
     /// numero descrive lo stato vero al momento della risposta.
     pub const ATTESA_S: &str = "retry_after_seconds";
+    /// CHI e' escluso dall'attesa dichiarata: vedi [`super::portata`].
+    ///
+    /// Serve un campo suo perche' [`MODELLO`] risponde a un'altra domanda —
+    /// «quale modello si stava per chiamare» — ed e' valorizzato anche quando
+    /// l'esclusione riguarda tutto il fornitore. Leggerlo come portata
+    /// restringerebbe ogni esclusione alla coppia, cioe' renderebbe mcp-core
+    /// piu' permissivo del gateway che glielo ha detto.
+    pub const PORTATA: &str = "cooldown_scope";
+}
+
+/// I valori di [`chiave::PORTATA`]. Vocabolario chiuso e canonico (regola N).
+pub mod portata {
+    /// L'esclusione vale per tutto il fornitore (credito, auth, trasporto).
+    pub const PROVIDER: &str = "provider";
+    /// L'esclusione vale per la sola coppia fornitore+modello (tetto di
+    /// frequenza o di volume, che e' del modello).
+    pub const MODEL: &str = "model";
 }
 
 /// Cio' che il gateway ha dichiarato di stare rifiutando, in forma su cui si
@@ -89,13 +106,19 @@ pub mod chiave {
 /// viveva dentro `"in cooldown, {secs}s rimanenti"`, dove per leggerlo serviva
 /// una regex).
 ///
-/// La PORTATA e' il FORNITORE in entrambe le varianti, e non e' una
-/// semplificazione: e' fedelta'. Il `CooldownManager` del gateway ragiona per
-/// account — quando esclude, esclude tutti i modelli di quel fornitore — e cio'
-/// che questo tipo rappresenta non e' «che limite ha imposto il fornitore» ma
-/// «che cosa il gateway rifiutera' se glielo richiedo». Registrare la sola
-/// coppia fornitore+modello renderebbe mcp-core piu' permissivo del gateway, e
-/// la convocazione successiva finirebbe di nuovo contro un rifiuto.
+/// La PORTATA segue quella del gateway, e non e' una scelta di questo modulo:
+/// e' fedelta'. Cio' che il tipo rappresenta non e' «che limite ha imposto il
+/// fornitore» ma «che cosa il gateway rifiutera' se glielo richiedo», quindi
+/// escludere piu' di lui renderebbe mcp-core piu' restrittivo del suo stesso
+/// gateway, ed escludere meno lo manderebbe di nuovo contro un rifiuto.
+///
+/// Fino al 13/08/2026 quella portata era il FORNITORE in ogni caso, perche' il
+/// `CooldownManager` del gateway ragionava per account. Non era fedelta' alla
+/// CAUSA: un 429 come «Rate limit reached for model `openai/gpt-oss-20b` ...
+/// TPD Limit 200000» e' un tetto di QUEL modello, e groq spariva intero per 24
+/// minuti. Ora il gateway distingue e lo DICHIARA nominando il modello, quindi
+/// l'attesa puo' avere la portata giusta anche qui — il credito no: quello e'
+/// dell'account, e resta del fornitore.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EsclusioneDichiarata {
     /// Fuori per credito. La DURATA non viaggia: quanto tenerlo fuori lo decide
@@ -103,7 +126,16 @@ pub enum EsclusioneDichiarata {
     /// libera appena il credito torna), non chi trasporta la notizia.
     Credito { provider: String },
     /// Fuori per un tempo che il gateway ha DICHIARATO.
-    Attesa { provider: String, secondi: u64 },
+    ///
+    /// `model: None` = tutto il fornitore. E' cio' che si legge da un gateway
+    /// che non nomina il modello, e resta il comportamento prudente: escludere
+    /// di piu' costa una convocazione mancata, escludere di meno costa un
+    /// rifiuto certo.
+    Attesa {
+        provider: String,
+        model: Option<String>,
+        secondi: u64,
+    },
     /// Niente da propagare al registro locale: il fallimento non parla della
     /// disponibilita' del fornitore (errore di richiesta, contesto, turno
     /// vuoto), oppure parla di un'attesa di cui non e' stata dichiarata la
@@ -118,21 +150,40 @@ impl EsclusioneDichiarata {
     /// inventare per quanto tempo un fornitore resti fuori (regola G: niente
     /// magic fallback). L'errore cade dalla parte del convocare una volta di
     /// troppo, mai dell'escludere per un tempo che nessuno ha dichiarato.
-    pub fn dal_fallimento(classe: &str, provider: &str, attesa_s: Option<u64>) -> Self {
+    /// `portata` e' il valore di [`chiave::PORTATA`]: solo [`portata::MODEL`]
+    /// autorizza a restringere l'esclusione alla coppia. Assente o sconosciuta
+    /// vale fornitore — cioe' cio' che ogni gateway anteriore a questo campo
+    /// intendeva, e il verso che non manda mcp-core contro un rifiuto certo.
+    pub fn dal_fallimento(
+        classe: &str,
+        provider: &str,
+        model: Option<&str>,
+        portata: Option<&str>,
+        attesa_s: Option<u64>,
+    ) -> Self {
         let provider = provider.trim();
         if provider.is_empty() {
             return Self::Nessuna;
         }
-        match classe.trim() {
-            classe::BILLING | classe::COOLDOWN_BILLING => Self::Credito {
+        // Il modello entra SOLO se la portata lo autorizza, e normalizzato come
+        // il fornitore: la coppia e' una chiave, e due grafie della stessa
+        // coppia sarebbero due esclusioni diverse.
+        let model = portata
+            .map(str::trim)
+            .filter(|p| *p == portata::MODEL)
+            .and(model)
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_lowercase);
+        let attesa_dichiarata = attesa_s.filter(|s| *s > 0);
+        match (classe.trim(), attesa_dichiarata) {
+            (classe::BILLING | classe::COOLDOWN_BILLING, _) => Self::Credito {
                 provider: provider.to_lowercase(),
             },
-            classe::COOLDOWN | classe::TRANSIENT => match attesa_s {
-                Some(s) if s > 0 => Self::Attesa {
-                    provider: provider.to_lowercase(),
-                    secondi: s,
-                },
-                _ => Self::Nessuna,
+            (classe::COOLDOWN | classe::TRANSIENT, Some(secondi)) => Self::Attesa {
+                provider: provider.to_lowercase(),
+                model,
+                secondi,
             },
             _ => Self::Nessuna,
         }
@@ -163,6 +214,8 @@ impl EsclusioneDichiarata {
         Self::dal_fallimento(
             stringa(chiave::CLASSE),
             stringa(chiave::PROVIDER),
+            primo.get(chiave::MODELLO).and_then(|v| v.as_str()),
+            primo.get(chiave::PORTATA).and_then(|v| v.as_str()),
             primo.get(chiave::ATTESA_S).and_then(|v| v.as_u64()),
         )
     }
@@ -185,32 +238,110 @@ mod tests {
     fn le_classi_di_credito_producono_esclusione_per_credito() {
         for c in [classe::BILLING, classe::COOLDOWN_BILLING] {
             assert_eq!(
-                EsclusioneDichiarata::dal_fallimento(c, "Anthropic", Some(120)),
+                EsclusioneDichiarata::dal_fallimento(c, "Anthropic", None, None, Some(120)),
                 EsclusioneDichiarata::Credito {
                     provider: "anthropic".into()
                 },
                 "classe {c}: la durata non partecipa, il credito non scade col timer del gateway"
             );
         }
+        // Il credito e' dell'ACCOUNT: nemmeno una portata di modello lo
+        // restringe, o si continuerebbe a chiamare un fornitore senza credito
+        // con gli altri suoi modelli.
+        assert_eq!(
+            EsclusioneDichiarata::dal_fallimento(
+                classe::BILLING,
+                "anthropic",
+                Some("claude-sonnet"),
+                Some(portata::MODEL),
+                Some(120)
+            ),
+            EsclusioneDichiarata::Credito {
+                provider: "anthropic".into()
+            }
+        );
     }
 
     #[test]
     fn le_classi_di_attesa_pretendono_una_durata_dichiarata() {
         assert_eq!(
-            EsclusioneDichiarata::dal_fallimento(classe::COOLDOWN, "groq", Some(1800)),
+            EsclusioneDichiarata::dal_fallimento(classe::COOLDOWN, "groq", None, None, Some(1800)),
             EsclusioneDichiarata::Attesa {
                 provider: "groq".into(),
+                model: None,
                 secondi: 1800
             }
         );
         // Nessuna durata dichiarata: non si inventa per quanto tempo escludere.
         assert_eq!(
-            EsclusioneDichiarata::dal_fallimento(classe::TRANSIENT, "groq", None),
+            EsclusioneDichiarata::dal_fallimento(classe::TRANSIENT, "groq", None, None, None),
             EsclusioneDichiarata::Nessuna
         );
         assert_eq!(
-            EsclusioneDichiarata::dal_fallimento(classe::COOLDOWN, "groq", Some(0)),
+            EsclusioneDichiarata::dal_fallimento(classe::COOLDOWN, "groq", None, None, Some(0)),
             EsclusioneDichiarata::Nessuna
+        );
+    }
+
+    /// IL CASO MISURATO il 13/08/2026: groq risponde «Rate limit reached for
+    /// model `openai/gpt-oss-20b` ... TPD Limit 200000 ... try again in
+    /// 23m44.3s». Il tetto e' di QUEL modello: gli altri modelli groq hanno
+    /// quota propria e devono restare convocabili.
+    ///
+    /// MUTAZIONE: far ignorare la portata a `dal_fallimento` (leggere sempre il
+    /// modello, o mai) -> uno dei due assert cade, e cadono con il difetto reale
+    /// nei due versi opposti: fornitore intero escluso, oppure esclusione piu'
+    /// stretta di quella del gateway che l'ha dichiarata.
+    #[test]
+    fn la_portata_dichiarata_decide_se_l_attesa_e_del_modello() {
+        assert_eq!(
+            EsclusioneDichiarata::dal_fallimento(
+                classe::TRANSIENT,
+                "groq",
+                Some("openai/GPT-OSS-20B"),
+                Some(portata::MODEL),
+                Some(1424)
+            ),
+            EsclusioneDichiarata::Attesa {
+                provider: "groq".into(),
+                model: Some("openai/gpt-oss-20b".into()),
+                secondi: 1424
+            },
+            "un tetto di modello non toglie di mezzo tutto il fornitore"
+        );
+
+        // Il modello viaggia SEMPRE nel blocco (dice quale si stava per
+        // chiamare): senza una portata che lo autorizzi, non restringe nulla.
+        assert_eq!(
+            EsclusioneDichiarata::dal_fallimento(
+                classe::COOLDOWN,
+                "groq",
+                Some("openai/gpt-oss-20b"),
+                None,
+                Some(1424)
+            ),
+            EsclusioneDichiarata::Attesa {
+                provider: "groq".into(),
+                model: None,
+                secondi: 1424
+            },
+            "gateway che non parla questa versione del contratto: portata fornitore"
+        );
+
+        // Portata di modello ma modello assente: non si inventa una coppia.
+        assert_eq!(
+            EsclusioneDichiarata::dal_fallimento(
+                classe::COOLDOWN,
+                "groq",
+                Some("   "),
+                Some(portata::MODEL),
+                Some(60)
+            ),
+            EsclusioneDichiarata::Attesa {
+                provider: "groq".into(),
+                model: None,
+                secondi: 60
+            }
         );
     }
 
@@ -223,7 +354,7 @@ mod tests {
             "classe_che_non_esiste",
         ] {
             assert_eq!(
-                EsclusioneDichiarata::dal_fallimento(c, "openai", Some(600)),
+                EsclusioneDichiarata::dal_fallimento(c, "openai", None, None, Some(600)),
                 EsclusioneDichiarata::Nessuna,
                 "classe {c}: il fornitore e' sano, escluderlo sarebbe un danno"
             );
@@ -233,7 +364,7 @@ mod tests {
     #[test]
     fn senza_fornitore_non_si_registra_nulla() {
         assert_eq!(
-            EsclusioneDichiarata::dal_fallimento(classe::COOLDOWN, "   ", Some(60)),
+            EsclusioneDichiarata::dal_fallimento(classe::COOLDOWN, "   ", None, None, Some(60)),
             EsclusioneDichiarata::Nessuna
         );
     }
@@ -251,6 +382,7 @@ mod tests {
             EsclusioneDichiarata::dal_blocco_details(Some(&details)),
             EsclusioneDichiarata::Attesa {
                 provider: "kimi".into(),
+                model: None,
                 secondi: 300
             },
             "il primario e' failures[0], lo stesso da cui nasce primary_cause"

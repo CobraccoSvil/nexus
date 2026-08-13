@@ -3159,7 +3159,11 @@ fi
 #
 # Il vocabolario del wire vive in nexus-types (da cui dipendono ENTRAMBI i lati)
 # perche' un rename rompa la compilazione invece del trasporto (regola O).
-if ! grep -q 'nexus_types::provider_failure::{chiave, classe}' crates/nexus-gateway/src/server/routes.rs; then
+# Il match e' sul PREFISSO dell'import, non sulla lista esatta: dal 13/08/2026 il
+# vocabolario ha un terzo modulo (`portata`, che dichiara CHI resta escluso da
+# un'attesa - il fornitore o la sola coppia), e un elenco fissato qui renderebbe
+# rossa ogni estensione futura del contratto invece dei suoi abusi.
+if ! grep -qE 'use nexus_types::provider_failure::\{[^}]*chiave[^}]*classe[^}]*\}' crates/nexus-gateway/src/server/routes.rs; then
   echo "!! esclusione-dichiarata-dal-gateway: il gateway compone il blocco" >&2
   echo "   details con chiavi e classi scritte in casa propria invece che col" >&2
   echo "   vocabolario condiviso. Un rename da un lato lascerebbe l'altro a" >&2
@@ -3181,6 +3185,35 @@ if ! grep -q 'registra_esclusione_dichiarata' crates/mcp-core/src/nexus_gateway.
   fail=1
 else
   echo "OK esclusione-dichiarata-dal-gateway: il confine allinea i due registri"
+fi
+
+# ── portata-cooldown-gateway (2026-08-13) ──────────────────────────────────
+# Il `CooldownManager` del gateway era chiavato sul solo nome del fornitore, e
+# un tetto che groq dichiara di UN modello («Rate limit reached for model
+# `openai/gpt-oss-20b` ... TPD Limit 200000, try again in 23m44.3s») ne
+# escludeva nove per 24 minuti. mcp-core aveva gia' chiuso lo stesso difetto il
+# 07/08; dal 13/08 la portata del gateway si PROPAGA a mcp-core, quindi qui non
+# e' piu' un difetto di un processo solo.
+if ! grep -q 'fn chiave_cooldown' crates/nexus-gateway/src/cooldown.rs \
+  || ! grep -q 'enum PortataCooldown' crates/nexus-gateway/src/cooldown.rs; then
+  echo "!! portata-cooldown-gateway: la chiave del registro cooldown, o il" >&2
+  echo "   criterio che ne decide la PORTATA, non vive piu' nel suo punto" >&2
+  echo "   unico: un tetto del modello tornerebbe a spegnere il fornitore." >&2
+  fail=1
+else
+  echo "OK portata-cooldown-gateway: chiave e criterio nel punto unico"
+fi
+
+# La portata la decide la CAUSA, e chi sceglie pone la domanda sulla COPPIA:
+# senza, il criterio resta perfetto e nessuno glielo chiede (regola O).
+if ! grep -q 'PortataCooldown::da_segnale' crates/nexus-gateway/src/server/routes.rs \
+  || ! grep -q 'is_model_in_cooldown' crates/nexus-gateway/src/server/routes.rs; then
+  echo "!! portata-cooldown-gateway: il ciclo di chiamata non deriva piu' la" >&2
+  echo "   portata dai segnali strutturati, oppure sceglie i fornitori senza" >&2
+  echo "   chiedere della coppia: e' la forma in cui il difetto e' vissuto." >&2
+  fail=1
+else
+  echo "OK portata-cooldown-gateway: la causa decide la portata, la scelta guarda la coppia"
 fi
 
 # Prontezza di un fornitore (2026-08-09). `healthy: Option<bool>` faceva di

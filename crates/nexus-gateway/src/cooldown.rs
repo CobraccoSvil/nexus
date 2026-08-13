@@ -38,6 +38,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use nexus_cache::TtlCache;
+use nexus_types::provider_failure::portata;
 use sqlx::PgPool;
 
 use crate::provider::LlmProvider;
@@ -196,11 +197,105 @@ impl Default for Durations {
     }
 }
 
-/// Gestore dei cooldown per provider. Clonabile a basso costo (condivide lo
-/// store via `Arc`), cosi' puo' essere riposto nello stato applicativo e nel
-/// task di re-probe.
+/// Separatore fra fornitore e modello nella chiave di [`chiave_cooldown`].
+///
+/// `\u{1}` (SOH) e' lo stesso che usa il registro gemello di mcp-core
+/// (`provider_cooldown::chiave_cooldown`), e per la stessa ragione: non compare
+/// in nessun nome di fornitore ne' di modello, quindi la chiave e' invertibile.
+const SEPARATORE_CHIAVE: char = '\u{1}';
+
+/// La chiave sotto cui vive UN cooldown, e con essa la sua PORTATA.
+///
+/// `model: None` = tutto il fornitore (credito, autenticazione: sono
+/// dell'account). `Some(m)` = quella coppia soltanto, ed e' la forma giusta per
+/// un rate limit, che e' un tetto DEL MODELLO.
+///
+/// MISURATO il 13/08/2026: groq risponde
+/// «Rate limit reached for model `openai/gpt-oss-20b` ... TPD Limit 200000,
+/// Used 199788 ... try again in 23m44.3s» e il gateway escludeva groq INTERO per
+/// 24 minuti — cioe' anche i modelli che avevano quota propria e avrebbero
+/// servito. mcp-core aveva gia' chiuso lo stesso difetto il 07/08 (479 cooldown
+/// in una notte, di cui 205 per rate limit); il gateway non lo aveva recepito, e
+/// dal 13/08 la sua portata si PROPAGA a mcp-core attraverso
+/// `registra_esclusione_dichiarata`.
+pub fn chiave_cooldown(provider: &str, model: Option<&str>) -> String {
+    match model {
+        Some(m) if !m.trim().is_empty() => format!(
+            "{}{SEPARATORE_CHIAVE}{}",
+            provider.to_lowercase(),
+            m.trim().to_lowercase()
+        ),
+        _ => provider.to_lowercase(),
+    }
+}
+
+/// HTTP 429 Too Many Requests: un tetto di frequenza per definizione del
+/// protocollo, quindi non serve un codice del fornitore per riconoscerlo.
+const STATUS_TROPPE_RICHIESTE: u16 = 429;
+
+/// Frammento del codice STRUTTURATO con cui un fornitore dichiara un tetto di
+/// frequenza o di volume (`rate_limit_exceeded`, `rate_limit_error`, ...). E' lo
+/// stesso frammento su cui `classify_by_status_code` decide `Transient`: due
+/// vocabolari darebbero due idee di che cosa sia un rate limit.
+const CODICE_RATE_LIMIT: &str = "rate_limit";
+
+/// CHI resta escluso da un fallimento transitorio.
+///
+/// E' un tipo e non un `Option<&str>` sul call site perche' la domanda ha una
+/// risposta sola per ogni causa, e va data dove la causa si conosce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortataCooldown {
+    /// L'endpoint non ha risposto (trasporto, 5xx, timeout del tentativo): non
+    /// risponde per nessun modello.
+    Fornitore,
+    /// Un tetto di frequenza o di volume: e' del MODELLO. Un altro modello dello
+    /// stesso fornitore ha quota propria e resta usabile.
+    Modello,
+}
+
+impl PortataCooldown {
+    /// Il criterio, PURO, dai segnali STRUTTURATI (regola M): il codice d'errore
+    /// dichiarato dal fornitore e lo status HTTP, mai la prosa del messaggio.
+    ///
+    /// Il codice viene PRIMA dello status perche' lo status da solo mente: groq
+    /// manda `413` (non 429) quando la richiesta supera il tetto token del piano,
+    /// dichiarandolo in `code = rate_limit_exceeded` — la stessa asimmetria che
+    /// `classify_by_status_code` gia' documenta. Un `429` nudo e' un tetto di
+    /// frequenza per definizione HTTP.
+    pub fn da_segnale(status: Option<u16>, code: Option<&str>) -> Self {
+        if code.is_some_and(|c| c.contains(CODICE_RATE_LIMIT))
+            || status == Some(STATUS_TROPPE_RICHIESTE)
+        {
+            Self::Modello
+        } else {
+            Self::Fornitore
+        }
+    }
+
+    /// Il modello da passare a chi marca, dato quello della richiesta.
+    pub fn modello(self, model: &str) -> Option<&str> {
+        match self {
+            Self::Modello => Some(model),
+            Self::Fornitore => None,
+        }
+    }
+
+    /// Il valore da mettere in [`nexus_types::provider_failure::chiave::PORTATA`]
+    /// perche' mcp-core registri la stessa portata, invece di indovinarla.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Modello => portata::MODEL,
+            Self::Fornitore => portata::PROVIDER,
+        }
+    }
+}
+
+/// Gestore dei cooldown. Clonabile a basso costo (condivide lo store via `Arc`),
+/// cosi' puo' essere riposto nello stato applicativo e nel task di re-probe.
 #[derive(Clone)]
 pub struct CooldownManager {
+    /// Chiave = [`chiave_cooldown`]: il solo fornitore, oppure la coppia
+    /// fornitore+modello. La portata la decide chi conosce la CAUSA.
     states: Arc<DashMap<String, CooldownState>>,
     /// Cache delle durate lette dai settings (chiave unit: un solo set globale).
     durations: TtlCache<(), Durations>,
@@ -277,8 +372,8 @@ impl CooldownManager {
     ///
     /// Delega a [`Self::mark_transient_after`] senza `Retry-After`: la durata del
     /// cooldown transitorio si decide in UN punto solo (regola L).
-    pub fn mark_transient(&self, provider: &str, last_error: Option<String>) {
-        self.mark_transient_after(provider, last_error, None);
+    pub fn mark_transient(&self, provider: &str, model: Option<&str>, last_error: Option<String>) {
+        self.mark_transient_after(provider, model, last_error, None);
     }
 
     /// Marca un provider in cooldown transitorio ONORANDO il `Retry-After` che il
@@ -304,9 +399,14 @@ impl CooldownManager {
     /// presto, il nostro minimo resta una protezione nostra. Il tetto superiore lo
     /// mette gia' `parse_retry_after` (clamp difensivo a 3600s), quindi un provider
     /// che chiedesse giorni non blocca il fornitore oltre l'ora.
+    ///
+    /// `model` dichiara la PORTATA (vedi [`chiave_cooldown`]): un rate limit e'
+    /// del modello, un errore di trasporto e' del fornitore. Chi il modello lo
+    /// conosce lo passa; `None` esclude l'intero fornitore e va scelto sapendolo.
     pub fn mark_transient_after(
         &self,
         provider: &str,
+        model: Option<&str>,
         last_error: Option<String>,
         retry_after_seconds: Option<u64>,
     ) {
@@ -324,6 +424,7 @@ impl CooldownManager {
         };
         self.mark_at_con_origine(
             provider,
+            model,
             CooldownReason::Transient,
             last_error,
             Utc::now(),
@@ -332,10 +433,9 @@ impl CooldownManager {
         );
     }
 
-    /// Marca un provider con `now` e durata espliciti. Punto unico della logica
-    /// di marcatura (regola L): `mark_billing`/`mark_transient` e i test ci
-    /// delegano, cosi' il calcolo di `until` ha UNA sola implementazione e i test
-    /// possono iniettare un istante deterministico senza usare `Utc::now()`.
+    /// Marca un FORNITORE con `now` e durata espliciti, con la scadenza come
+    /// nostra stima. `mark_billing` e i test ci delegano, cosi' possono iniettare
+    /// un istante deterministico senza usare `Utc::now()`.
     pub fn mark_at(
         &self,
         provider: &str,
@@ -346,6 +446,7 @@ impl CooldownManager {
     ) {
         self.mark_at_con_origine(
             provider,
+            None,
             reason,
             last_error,
             now,
@@ -354,12 +455,19 @@ impl CooldownManager {
         );
     }
 
-    /// Come [`Self::mark_at`], dichiarando CHI ha stabilito la scadenza. Il
-    /// solo chiamante che passa `Dichiarata` e' quello che ha letto un
-    /// `Retry-After` dal fornitore.
+    /// Il punto unico della marcatura (regola L): dichiara CHI ha stabilito la
+    /// scadenza — il solo chiamante che passa `Dichiarata` e' quello che ha letto
+    /// un `Retry-After` dal fornitore — e su CHI vale (`model`).
+    ///
+    /// La chiave dello store la compone [`chiave_cooldown`]; la PERSISTENZA
+    /// riceve invece il solo `provider`, perche' `nexus_provider_health` e la sua
+    /// history sono per fornitore — scriverci una chiave composta significherebbe
+    /// inventare un fornitore che non esiste.
+    #[allow(clippy::too_many_arguments)]
     pub fn mark_at_con_origine(
         &self,
         provider: &str,
+        model: Option<&str>,
         reason: CooldownReason,
         last_error: Option<String>,
         now: DateTime<Utc>,
@@ -367,17 +475,18 @@ impl CooldownManager {
         origine: OrigineScadenza,
     ) {
         let until = now + chrono::Duration::seconds(duration_seconds);
-        // Regola F: logghiamo nome provider e durata, MAI il payload. last_error
-        // qui e' il messaggio d'errore del provider (no prompt utente).
+        // Regola F: logghiamo nome provider, modello e durata, MAI il payload.
+        // last_error qui e' il messaggio d'errore del provider (no prompt utente).
         tracing::warn!(
             provider,
+            model,
             reason = reason.as_str(),
             duration_seconds,
-            "gateway: provider in cooldown"
+            "gateway: cooldown"
         );
         self.persist_last_error(provider, reason, last_error.as_deref());
         self.states.insert(
-            provider.to_string(),
+            chiave_cooldown(provider, model),
             CooldownState {
                 until,
                 reason,
@@ -435,14 +544,36 @@ impl CooldownManager {
         self.states.get(provider).map(|s| s.clone())
     }
 
-    /// `true` se il provider e' in cooldown rispetto all'istante corrente.
+    /// Il FORNITORE e' escluso? Vero solo per i cooldown di account (credito,
+    /// auth, trasporto): un limite su un singolo modello non risponde si' a
+    /// questa domanda.
+    ///
+    /// Chi sta per instradare una richiesta conosce anche il MODELLO e deve
+    /// usare [`Self::is_model_in_cooldown`]: sono due domande, e confonderle e'
+    /// precisamente il difetto del 13/08/2026.
     pub fn is_in_cooldown(&self, provider: &str) -> bool {
         self.is_in_cooldown_at(provider, Utc::now())
     }
 
     /// Variante con istante iniettato (deterministica per i test).
     pub fn is_in_cooldown_at(&self, provider: &str, now: DateTime<Utc>) -> bool {
-        match self.states.get(provider) {
+        self.attivo_at(&chiave_cooldown(provider, None), now)
+    }
+
+    /// Questa COPPIA e' utilizzabile adesso? Vero se e' escluso il fornitore
+    /// come account, oppure questo modello in particolare.
+    pub fn is_model_in_cooldown(&self, provider: &str, model: &str) -> bool {
+        self.is_model_in_cooldown_at(provider, model, Utc::now())
+    }
+
+    /// Variante con istante iniettato (deterministica per i test).
+    pub fn is_model_in_cooldown_at(&self, provider: &str, model: &str, now: DateTime<Utc>) -> bool {
+        self.is_in_cooldown_at(provider, now)
+            || self.attivo_at(&chiave_cooldown(provider, Some(model)), now)
+    }
+
+    fn attivo_at(&self, chiave: &str, now: DateTime<Utc>) -> bool {
+        match self.states.get(chiave) {
             Some(s) => s.until > now,
             None => false,
         }
@@ -459,14 +590,53 @@ impl CooldownManager {
         }
     }
 
-    /// Secondi rimanenti di cooldown (0 se non in cooldown o scaduto).
+    /// Secondi rimanenti di cooldown del FORNITORE (0 se non in cooldown).
     pub fn seconds_remaining(&self, provider: &str) -> i64 {
         self.seconds_remaining_at(provider, Utc::now())
     }
 
     /// Variante con istante iniettato (deterministica per i test).
     pub fn seconds_remaining_at(&self, provider: &str, now: DateTime<Utc>) -> i64 {
-        match self.states.get(provider) {
+        self.residuo_at(&chiave_cooldown(provider, None), now)
+    }
+
+    /// Secondi rimanenti prima che questa COPPIA torni utilizzabile: il PIU'
+    /// LUNGO fra l'esclusione del fornitore e quella del modello, perche' finche'
+    /// una delle due vale la coppia resta fuori.
+    pub fn seconds_remaining_for_model(&self, provider: &str, model: &str) -> i64 {
+        self.seconds_remaining_for_model_at(provider, model, Utc::now())
+    }
+
+    /// Variante con istante iniettato (deterministica per i test).
+    pub fn seconds_remaining_for_model_at(
+        &self,
+        provider: &str,
+        model: &str,
+        now: DateTime<Utc>,
+    ) -> i64 {
+        self.seconds_remaining_at(provider, now)
+            .max(self.residuo_at(&chiave_cooldown(provider, Some(model)), now))
+    }
+
+    /// CHI e' escluso, se questa coppia lo e' adesso. `None` = nessuna
+    /// esclusione attiva.
+    ///
+    /// Il FORNITORE prevale sulla coppia quando entrambe le esclusioni sono
+    /// attive: e' cio' che questo gateway rifiutera' comunque, e dichiararla
+    /// piu' stretta manderebbe il chiamante a riprovare contro un muro.
+    pub fn portata_attiva(&self, provider: &str, model: &str) -> Option<PortataCooldown> {
+        let now = Utc::now();
+        if self.is_in_cooldown_at(provider, now) {
+            Some(PortataCooldown::Fornitore)
+        } else if self.attivo_at(&chiave_cooldown(provider, Some(model)), now) {
+            Some(PortataCooldown::Modello)
+        } else {
+            None
+        }
+    }
+
+    fn residuo_at(&self, chiave: &str, now: DateTime<Utc>) -> i64 {
+        match self.states.get(chiave) {
             Some(s) => (s.until - now).num_seconds().max(0),
             None => 0,
         }
@@ -484,10 +654,23 @@ impl CooldownManager {
     /// sano restava marcato down fino al prossimo giro del probe periodico
     /// separato di mcp-core, con cadenza propria non sincronizzata).
     pub fn clear(&self, provider: &str) {
-        if self.states.remove(provider).is_some() {
+        if self.states.remove(&chiave_cooldown(provider, None)).is_some() {
             tracing::info!(provider, "gateway: provider ripristinato (cooldown rimosso)");
             self.persist_recovery(provider);
         }
+    }
+
+    /// Libera la coppia fornitore+modello DOPO una sua risposta riuscita, e con
+    /// essa il fornitore.
+    ///
+    /// Un 200 su `modelA` prova che il fornitore serve, quindi il cooldown di
+    /// account cade; NON tocca `modelB`, il cui tetto e' suo e non e' stato
+    /// misurato da questa chiamata. E' la stessa asimmetria per cui il rate
+    /// limit nasce sulla coppia.
+    pub fn clear_model(&self, provider: &str, model: &str) {
+        self.states
+            .remove(&chiave_cooldown(provider, Some(model)));
+        self.clear(provider);
     }
 
     /// Persiste il ripristino: INSERT `healthy=true` in
@@ -506,10 +689,16 @@ impl CooldownManager {
     }
 
     /// Variante con istante iniettato (deterministica per i test).
+    /// Variante con istante iniettato (deterministica per i test).
+    ///
+    /// Riporta i soli cooldown di FORNITORE: `ProviderStatus.name` e' un
+    /// fornitore, e un modello a tetto raggiunto non rende il fornitore non
+    /// sano — dirlo qui rimetterebbe in circolo, in forma di stato esposto,
+    /// proprio la conflazione che questo modulo ha appena tolto.
     pub fn snapshot_at(&self, now: DateTime<Utc>) -> Vec<ProviderStatus> {
         self.states
             .iter()
-            .filter(|e| e.until > now)
+            .filter(|e| e.until > now && !e.key().contains(SEPARATORE_CHIAVE))
             .map(|e| {
                 let s = e.value();
                 ProviderStatus {
@@ -527,11 +716,16 @@ impl CooldownManager {
             .collect()
     }
 
-    /// Lista dei provider attualmente in cooldown (per il re-probe loop).
+    /// Lista dei FORNITORI attualmente in cooldown (per il re-probe loop).
+    ///
+    /// Le chiavi di coppia restano fuori di proposito: il probe e' un
+    /// `GET /models`, che parla del fornitore e non ha nulla da dire sul tetto
+    /// token di un singolo modello. Quei cooldown scadono da soli, alla durata
+    /// che il fornitore ha dichiarato.
     fn providers_in_cooldown(&self, now: DateTime<Utc>) -> Vec<String> {
         self.states
             .iter()
-            .filter(|e| e.until > now)
+            .filter(|e| e.until > now && !e.key().contains(SEPARATORE_CHIAVE))
             .map(|e| e.key().clone())
             .collect()
     }
@@ -1002,7 +1196,7 @@ mod tests {
     fn il_cooldown_transitorio_onora_il_retry_after_del_provider() {
         let m = CooldownManager::new();
         // 4m56s: il valore che groq indica quando e' il tetto giornaliero a scattare.
-        m.mark_transient_after("groq", Some("429 TPD".to_string()), Some(296));
+        m.mark_transient_after("groq", None, Some("429 TPD".to_string()), Some(296));
 
         let fra_un_minuto = Utc::now() + chrono::Duration::seconds(60);
         assert!(
@@ -1018,12 +1212,150 @@ mod tests {
         );
     }
 
+    /// IL CASO MISURATO il 13/08/2026. groq risponde
+    /// «Rate limit reached for model `openai/gpt-oss-20b` ... TPD Limit 200000,
+    /// Used 199788 ... try again in 23m44.3s»: e' il tetto GIORNALIERO di QUEL
+    /// modello, e il gateway escludeva groq intero per 24 minuti.
+    ///
+    /// MUTAZIONE: passare `None` come modello a `mark_transient_after` (cioe' la
+    /// firma di prima) -> `il_fornitore_resta_disponibile` cade, ed e' il difetto
+    /// reale: un modello a tetto raggiunto porta via anche chi ha quota propria.
+    #[test]
+    fn un_tetto_di_modello_non_esclude_il_fornitore() {
+        let m = CooldownManager::new();
+        // 1424s = 23m44,3s, il Retry-After misurato.
+        m.mark_transient_after(
+            "groq",
+            Some("openai/gpt-oss-20b"),
+            Some("429 rate_limit".to_string()),
+            Some(1424),
+        );
+
+        let fra_un_minuto = Utc::now() + chrono::Duration::seconds(60);
+        assert!(
+            m.is_model_in_cooldown_at("groq", "openai/gpt-oss-20b", fra_un_minuto),
+            "il modello che ha esaurito il proprio tetto resta fuori per l'attesa dichiarata"
+        );
+        assert!(
+            !m.is_in_cooldown_at("groq", fra_un_minuto),
+            "il FORNITORE non e' escluso: e' la domanda che la selezione pone quando \
+             sceglie fra i suoi altri modelli"
+        );
+        assert!(
+            !m.is_model_in_cooldown_at("groq", "llama-3.3-70b", fra_un_minuto),
+            "un altro modello dello stesso fornitore ha quota propria e resta usabile"
+        );
+
+        // Il residuo della coppia e' quello dichiarato; il fornitore non ne ha.
+        assert!(m.seconds_remaining_for_model("groq", "openai/gpt-oss-20b") > 1300);
+        assert_eq!(m.seconds_remaining("groq"), 0);
+        assert_eq!(
+            m.portata_attiva("groq", "openai/gpt-oss-20b"),
+            Some(PortataCooldown::Modello)
+        );
+        assert_eq!(m.portata_attiva("groq", "llama-3.3-70b"), None);
+    }
+
+    /// L'altro verso: cio' che e' del FORNITORE resta del fornitore, altrimenti
+    /// il fix diventerebbe «niente e' mai del fornitore» e un endpoint morto
+    /// verrebbe ritentato modello per modello.
+    #[test]
+    fn un_guasto_di_trasporto_esclude_tutto_il_fornitore() {
+        let m = CooldownManager::new();
+        m.mark_transient_after("acme", None, Some("connessione rifiutata".into()), Some(120));
+
+        let fra_un_minuto = Utc::now() + chrono::Duration::seconds(60);
+        assert!(m.is_in_cooldown_at("acme", fra_un_minuto));
+        for modello in ["modello-a", "modello-b"] {
+            assert!(
+                m.is_model_in_cooldown_at("acme", modello, fra_un_minuto),
+                "l'endpoint non risponde: nessun suo modello e' utilizzabile"
+            );
+        }
+        assert_eq!(
+            m.portata_attiva("acme", "modello-a"),
+            Some(PortataCooldown::Fornitore)
+        );
+    }
+
+    /// La portata la decide la CAUSA, letta dai segnali strutturati (regola M):
+    /// mai il testo del messaggio, che per groq direbbe «Rate limit reached for
+    /// model ...» e per un altro fornitore chissa'.
+    #[test]
+    fn la_portata_si_deriva_da_status_e_codice() {
+        // 429 nudo: tetto di frequenza per definizione HTTP.
+        assert_eq!(
+            PortataCooldown::da_segnale(Some(429), None),
+            PortataCooldown::Modello
+        );
+        // groq dichiara il rate limit su un 413: lo status da solo mentirebbe.
+        assert_eq!(
+            PortataCooldown::da_segnale(Some(413), Some("rate_limit_exceeded")),
+            PortataCooldown::Modello
+        );
+        // 5xx e assenza di segnali: l'endpoint, non il modello.
+        assert_eq!(
+            PortataCooldown::da_segnale(Some(503), None),
+            PortataCooldown::Fornitore
+        );
+        assert_eq!(
+            PortataCooldown::da_segnale(None, None),
+            PortataCooldown::Fornitore
+        );
+
+        assert_eq!(PortataCooldown::Modello.modello("m"), Some("m"));
+        assert_eq!(PortataCooldown::Fornitore.modello("m"), None);
+    }
+
+    /// Un 200 su un modello prova che il fornitore serve, non che il tetto di un
+    /// ALTRO suo modello sia rientrato.
+    #[test]
+    fn il_successo_libera_la_coppia_e_il_fornitore_ma_non_gli_altri_modelli() {
+        let m = CooldownManager::new();
+        m.mark_transient_after("groq", Some("modello-a"), None, Some(600));
+        m.mark_transient_after("groq", Some("modello-b"), None, Some(600));
+        m.mark_transient_after("groq", None, None, Some(600));
+
+        m.clear_model("groq", "modello-a");
+
+        assert!(!m.is_model_in_cooldown("groq", "modello-a"));
+        assert!(!m.is_in_cooldown("groq"));
+        assert!(
+            m.is_model_in_cooldown("groq", "modello-b"),
+            "nessuno ha misurato modello-b: il suo tetto resta dov'era"
+        );
+    }
+
+    /// Le due letture che parlano di FORNITORI non devono vedere le chiavi di
+    /// coppia: `/status` esporrebbe un fornitore «non sano» che sta servendo, e
+    /// il re-probe interrogherebbe `GET /models` per rispondere su un tetto
+    /// token — cioe' la conflazione appena tolta, rientrata da un'altra porta.
+    #[test]
+    fn le_letture_per_fornitore_ignorano_le_chiavi_di_coppia() {
+        let m = CooldownManager::new();
+        let now = t0();
+        m.mark_at_con_origine(
+            "groq",
+            Some("openai/gpt-oss-20b"),
+            CooldownReason::Transient,
+            Some("429".into()),
+            now,
+            600,
+            OrigineScadenza::Dichiarata,
+        );
+
+        assert!(m.snapshot_at(now + chrono::Duration::seconds(1)).is_empty());
+        assert!(m
+            .providers_in_cooldown(now + chrono::Duration::seconds(1))
+            .is_empty());
+    }
+
     /// Il controllo dell'altro verso: senza `Retry-After` resta il default (30s), cosi'
     /// il test sopra non passerebbe per una durata alzata a tutti.
     #[test]
     fn senza_retry_after_resta_il_cooldown_transitorio_di_default() {
         let m = CooldownManager::new();
-        m.mark_transient("acme", Some("timeout".to_string()));
+        m.mark_transient("acme", None, Some("timeout".to_string()));
 
         let fra_un_minuto = Utc::now() + chrono::Duration::seconds(60);
         assert!(
@@ -1093,7 +1425,7 @@ mod tests {
     async fn il_probe_non_abbrevia_una_scadenza_dichiarata_dal_fornitore() {
         let m = CooldownManager::new();
         // 429 con Retry-After: la scadenza la dichiara il fornitore.
-        m.mark_transient_after("groq", Some("429 rate_limit".into()), Some(565));
+        m.mark_transient_after("groq", None, Some("429 rate_limit".into()), Some(565));
         let groq = FakeProvider::new("groq", true); // /models risponde: e' il punto
         let providers: Vec<Arc<dyn LlmProvider>> = vec![groq.clone()];
 
@@ -1117,7 +1449,7 @@ mod tests {
     async fn una_scadenza_stimata_resta_revocabile_dal_probe() {
         let m = CooldownManager::new();
         // Nessun Retry-After: la durata e' la nostra.
-        m.mark_transient_after("mistral", Some("timeout".into()), None);
+        m.mark_transient_after("mistral", None, Some("timeout".into()), None);
         let mistral = FakeProvider::new("mistral", true);
         let providers: Vec<Arc<dyn LlmProvider>> = vec![mistral.clone()];
 

@@ -36,7 +36,7 @@ use crate::batch::{
     build_anthropic_batch_body, parse_anthropic_batch_id, parse_anthropic_results,
     parse_anthropic_status, BatchStatusResponse, CreateBatchBody, CreateBatchResponse,
 };
-use crate::cooldown::{CooldownManager, RetryPolicy};
+use crate::cooldown::{CooldownManager, PortataCooldown, RetryPolicy};
 use crate::history_sanitizer::{self, SanitizeMode};
 use crate::model_alias_resolver::{strip_provider_prefix, ModelAliasResolver};
 use crate::provider::LlmProvider;
@@ -58,7 +58,7 @@ use nexus_types::error_presentation::{render_user_error, ErrorDomain, ErrorFacts
 // vivono nel crate da cui dipendono ENTRAMBI i lati del confine, cosi' un
 // rename rompe la compilazione di chi legge invece di lasciare il trasporto
 // muto con tutti i test verdi (regola O).
-use nexus_types::provider_failure::{chiave, classe};
+use nexus_types::provider_failure::{chiave, classe, portata};
 use super::bootstrap::{build_http_client, build_runtime, GatewayConfig};
 use nexus_auth::llm_timeouts::LlmTimeouts;
 use super::AppState;
@@ -752,8 +752,11 @@ async fn run_fallback(
     for rp in resolved {
         let name = rp.provider.name();
 
-        if cooldown.is_in_cooldown(name) {
-            let secs = cooldown.seconds_remaining(name);
+        // La domanda e' sulla COPPIA: qui il modello risolto lo conosciamo, e un
+        // tetto raggiunto su un altro modello di questo fornitore non dice nulla
+        // su quello che stiamo per chiamare (difetto misurato il 13/08/2026).
+        if cooldown.is_model_in_cooldown(name, &rp.model) {
+            let secs = cooldown.seconds_remaining_for_model(name, &rp.model);
             if cooldown.is_billing_cooldown(name) {
                 // Billing: il provider e' inutilizzabile finche' non si ricarica.
                 // Il messaggio lo segnala cosi' il chiamante applica il cooldown
@@ -767,6 +770,9 @@ async fn run_fallback(
                     message: format!("cooldown billing, {secs}s rimanenti"),
                     upstream: None,
                     retry_after_seconds: attesa_dichiarabile(secs),
+                    // Il credito e' dell'account: fuori e' il fornitore, non la
+                    // coppia (e a valle `Credito` non guarda la portata).
+                    cooldown_scope: Some(portata::PROVIDER),
                 });
                 continue;
             }
@@ -801,6 +807,13 @@ async fn run_fallback(
                     message: format!("in cooldown, {secs}s rimanenti"),
                     upstream: None,
                     retry_after_seconds: attesa_dichiarabile(secs),
+                    // Chiediamo al registro CHI e' escluso: il fornitore, o solo
+                    // questa coppia. Dedurlo dal fatto che il modello sia
+                    // valorizzato darebbe sempre "modello", che e' il difetto
+                    // simmetrico a quello che stiamo chiudendo.
+                    cooldown_scope: cooldown
+                        .portata_attiva(name, &rp.model)
+                        .map(PortataCooldown::wire),
                 });
                 continue;
             }
@@ -824,9 +837,9 @@ async fn run_fallback(
         .await
         {
             Ok(resp) => {
-                // Successo reale: se il provider era in cooldown transitorio,
-                // liberalo subito (ha appena risposto 200).
-                cooldown.clear(name);
+                // Successo reale: se questa coppia (o il fornitore) era in
+                // cooldown transitorio, liberala subito — ha appena risposto 200.
+                cooldown.clear_model(name, &rp.model);
                 return Ok(resp);
             }
             // Il RESIDUO si legge dal registro che lo ha appena scritto, non si
@@ -836,10 +849,16 @@ async fn run_fallback(
             // domani marcasse in un modo nuovo lo dichiarerebbe da se'.
             Err(f) => {
                 let attesa = cooldown
-                    .is_in_cooldown(name)
-                    .then(|| cooldown.seconds_remaining(name))
+                    .is_model_in_cooldown(name, &rp.model)
+                    .then(|| cooldown.seconds_remaining_for_model(name, &rp.model))
                     .and_then(attesa_dichiarabile);
-                failures.push(f.into_provider_failure(name, &rp.model, attesa))
+                // Anche la PORTATA si legge dal registro che ha appena scritto,
+                // per la stessa ragione del residuo: qualunque ramo abbia messo
+                // il cooldown, qui si dichiara cio' che vale adesso.
+                let portata = attesa
+                    .and_then(|_| cooldown.portata_attiva(name, &rp.model))
+                    .map(PortataCooldown::wire);
+                failures.push(f.into_provider_failure(name, &rp.model, attesa, portata))
             }
         }
     }
@@ -940,6 +959,14 @@ struct ProviderFailure {
     /// dichiarabile. Non e' «zero»: chi legge non deve poter confondere «non
     /// c'e' attesa» con «l'attesa non e' stata misurata».
     retry_after_seconds: Option<u64>,
+    /// CHI e' escluso per quei secondi: `provider` o `model` (vocabolario
+    /// [`portata`]). `None` = nessuna attesa da dichiarare.
+    ///
+    /// Distinto da [`Self::model`], che dice quale modello si stava per
+    /// chiamare ed e' valorizzato anche quando fuori e' l'intero fornitore:
+    /// senza questo campo, mcp-core dovrebbe indovinare la portata da un campo
+    /// che risponde a un'altra domanda.
+    cooldown_scope: Option<&'static str>,
 }
 
 impl ProviderFailure {
@@ -952,6 +979,7 @@ impl ProviderFailure {
             "code": self.code,
             "message": self.message,
             chiave::ATTESA_S: self.retry_after_seconds,
+            chiave::PORTATA: self.cooldown_scope,
         })
     }
 
@@ -1050,6 +1078,7 @@ impl CallFailure {
         provider: &str,
         model: &str,
         retry_after_seconds: Option<u64>,
+        cooldown_scope: Option<&'static str>,
     ) -> ProviderFailure {
         ProviderFailure {
             provider: provider.to_string(),
@@ -1060,6 +1089,7 @@ impl CallFailure {
             message: self.message,
             upstream: self.upstream,
             retry_after_seconds,
+            cooldown_scope,
         }
     }
 }
@@ -1160,7 +1190,10 @@ async fn complete_with_retry(
                 // nessuna chiamata e' partita.
                 scarti.push(TentativoScartato::timeout(name, &req.model));
                 let failure = CallFailure::attempt_timeout(attempt_cap);
-                cooldown.mark_transient(name, Some(failure.message.clone()));
+                // Nessuna risposta affatto: e' l'endpoint a non aver risposto,
+                // quindi la portata e' il fornitore (nessun tetto e' stato
+                // dichiarato da nessuno).
+                cooldown.mark_transient(name, None, Some(failure.message.clone()));
                 return Err(failure);
             }
         };
@@ -1305,7 +1338,7 @@ async fn complete_with_retry(
                             // Il cooldown onora il `Retry-After` del provider: se ha
                             // detto quando tornera' a servire, ripresentarsi prima
                             // significa riprendere lo stesso errore (regola M).
-                            cooldown.mark_transient_after(name, Some(msg), retry_after);
+                            marca_transitorio(cooldown, name, &req.model, &failure, msg, retry_after);
                             return Err(failure);
                         }
                         tracing::warn!(
@@ -1321,6 +1354,28 @@ async fn complete_with_retry(
             }
         }
     }
+}
+
+/// Registra il cooldown di un fallimento transitorio i cui retry sono esauriti,
+/// con la PORTATA che la causa dichiara.
+///
+/// Vive qui e non dentro il ciclo perche' li' si e' gia' a sei livelli di
+/// indentazione, e perche' e' una decisione con un nome: un tetto di frequenza
+/// e' del MODELLO — groq risponde «Rate limit reached for model
+/// `openai/gpt-oss-20b` ... TPD Limit 200000» — mentre un guasto di trasporto e'
+/// del fornitore. Escludere il fornitore intero per il tetto di un suo modello
+/// toglie dalla selezione anche quelli che hanno quota propria (13/08/2026).
+fn marca_transitorio(
+    cooldown: &CooldownManager,
+    provider: &str,
+    model: &str,
+    failure: &CallFailure,
+    msg: String,
+    retry_after: Option<u64>,
+) {
+    let escluso =
+        PortataCooldown::da_segnale(failure.status, failure.code.as_deref()).modello(model);
+    cooldown.mark_transient_after(provider, escluso, Some(msg), retry_after);
 }
 
 /// Il `Retry-After` che il provider ha dichiarato, se l'errore lo porta.
@@ -1635,7 +1690,7 @@ async fn build_sse_stream(
         // richiesto dalla semantica pin.
         let Some(rp) = resolved
             .iter()
-            .find(|rp| !state.cooldown.is_in_cooldown(rp.provider.name()))
+            .find(|rp| !state.cooldown.is_model_in_cooldown(rp.provider.name(), &rp.model))
         else {
             let _ = tx
                 .send(Ok(Event::default()
@@ -1729,11 +1784,24 @@ async fn build_sse_stream(
                     // segnale e' lo stesso del path non-streaming, e una durata
                     // diversa a seconda del canale sarebbe due risposte alla stessa
                     // domanda (regola L).
-                    ProviderErrorKind::Transient => state.cooldown.mark_transient_after(
-                        name,
-                        Some(msg.clone()),
-                        retry_after_of(&err),
-                    ),
+                    // La portata segue la causa come nel path non-streaming: un
+                    // tetto del modello non spegne il fornitore (regola L: un
+                    // criterio solo, non uno per canale).
+                    ProviderErrorKind::Transient => {
+                        let http = err
+                            .chain()
+                            .find_map(|c| c.downcast_ref::<ProviderHttpError>());
+                        let portata = PortataCooldown::da_segnale(
+                            http.map(|h| h.status),
+                            http.and_then(|h| h.code.as_deref()),
+                        );
+                        state.cooldown.mark_transient_after(
+                            name,
+                            portata.modello(&req.model),
+                            Some(msg.clone()),
+                            retry_after_of(&err),
+                        )
+                    }
                 }
                 // Stesso corpo del path non-streaming: qui usciva il solo
                 // `err.to_string()`, cioe' il body grezzo del provider — la
@@ -2765,6 +2833,9 @@ mod tests {
         /// Non risponde mai: simula la chiamata APPESA che ha originato il fix
         /// (misurata sul campo: 197s senza alcun log, con le figure ferme).
         Hang,
+        /// 429 con `Retry-After`: il tetto token di UN modello, nella forma
+        /// misurata su groq il 13/08/2026 (TPD Limit 200000, 23m44,3s).
+        ErrRateLimit,
         /// Risposta 200 DEGENERE: content vuoto, zero tool-call, finish
         /// "length", ma con un usage REALE — la forma della degenerazione da
         /// budget (Gemini col tetto consumato dal thinking). Il provider l'ha
@@ -3007,6 +3078,16 @@ mod tests {
                     message: "insufficient_quota".into(),
                 }
                 .into()),
+                Behaviour::ErrRateLimit => Err(crate::providers::ProviderHttpError {
+                    provider: self.name.clone(),
+                    status: 429,
+                    code: Some("rate_limit_exceeded".into()),
+                    retry_after_seconds: Some(1424),
+                    message: "Rate limit reached for model `openai/gpt-oss-20b` on tokens \
+                              per day (TPD): Limit 200000, Used 199788"
+                        .into(),
+                }
+                .into()),
                 Behaviour::ErrClient => Err(crate::providers::ProviderHttpError {
                     provider: self.name.clone(),
                     status: 400,
@@ -3106,7 +3187,7 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
-                Behaviour::Hang | Behaviour::Degenerate => {
+                Behaviour::Hang | Behaviour::Degenerate | Behaviour::ErrRateLimit => {
                     unreachable!("Behaviour usato solo da complete")
                 }
                 Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
@@ -3130,7 +3211,7 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
-                Behaviour::Hang | Behaviour::Degenerate => {
+                Behaviour::Hang | Behaviour::Degenerate | Behaviour::ErrRateLimit => {
                     unreachable!("Behaviour usato solo da complete")
                 }
                 Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
@@ -3152,7 +3233,7 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
-                Behaviour::Hang | Behaviour::Degenerate => {
+                Behaviour::Hang | Behaviour::Degenerate | Behaviour::ErrRateLimit => {
                     unreachable!("Behaviour usato solo da complete")
                 }
                 Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
@@ -3178,7 +3259,7 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
-                Behaviour::Hang | Behaviour::Degenerate => {
+                Behaviour::Hang | Behaviour::Degenerate | Behaviour::ErrRateLimit => {
                     unreachable!("Behaviour usato solo da complete")
                 }
                 Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
@@ -3897,7 +3978,7 @@ mod tests {
             model: "openai/gpt-oss-120b".into(),
         }];
         let cooldown = CooldownManager::new();
-        cooldown.mark_transient_after("groq", Some("rate limit".into()), Some(1800));
+        cooldown.mark_transient_after("groq", None, Some("connessione".into()), Some(1800));
         let err = run_fallback(
             &resolved,
             &cooldown,
@@ -3912,8 +3993,17 @@ mod tests {
         .unwrap();
         let details = err.details.expect("details presenti");
         match EsclusioneDichiarata::dal_blocco_details(Some(&details)) {
-            EsclusioneDichiarata::Attesa { provider, secondi } => {
+            EsclusioneDichiarata::Attesa {
+                provider,
+                model,
+                secondi,
+            } => {
                 assert_eq!(provider, "groq");
+                assert_eq!(
+                    model, None,
+                    "l'endpoint non risponde: fuori e' il fornitore, e il modello che \
+                     viaggia nel blocco dice solo quale si stava per chiamare"
+                );
                 assert!(
                     (1700..=1800).contains(&secondi),
                     "il residuo dichiarato deve essere quello del registro che lo ha scritto, \
@@ -3949,6 +4039,105 @@ mod tests {
             EsclusioneDichiarata::Credito {
                 provider: "anthropic".into()
             }
+        );
+
+        // (c) IL CASO groq DEL 13/08/2026: il tetto e' del MODELLO, e la portata
+        // deve arrivare fino al registro di mcp-core — altrimenti il gateway
+        // esclude una coppia e il suo consumatore esclude un fornitore intero,
+        // che e' il difetto di partenza spostato di un processo.
+        let r: Arc<dyn LlmProvider> = FakeProvider::new("groq", Behaviour::Ok);
+        let modello = "openai/gpt-oss-20b";
+        let resolved = vec![ResolvedProvider {
+            provider: r,
+            model: modello.into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.mark_transient_after("groq", Some(modello), Some("429".into()), Some(1424));
+        let err = run_fallback(
+            &resolved,
+            &cooldown,
+            &req(),
+            false,
+            TEST_PER_ATTEMPT,
+            far_deadline(),
+            &mut Vec::new(),
+        )
+        .await
+        .err()
+        .unwrap();
+        let details = err.details.expect("details presenti");
+        match EsclusioneDichiarata::dal_blocco_details(Some(&details)) {
+            EsclusioneDichiarata::Attesa {
+                provider,
+                model,
+                secondi,
+            } => {
+                assert_eq!(provider, "groq");
+                assert_eq!(
+                    model.as_deref(),
+                    Some(modello),
+                    "il tetto e' di questo modello: gli altri modelli groq devono restare \
+                     convocabili anche a valle"
+                );
+                assert!((1300..=1424).contains(&secondi), "residuo: {secondi}");
+            }
+            altro => panic!("attesa un'esclusione di modello, avuto {altro:?}"),
+        }
+    }
+
+    /// L'INNESTO, non il criterio (regola O): dal 429 che il fornitore
+    /// restituisce fino a cio' che resta scritto nel registro. I test di
+    /// `PortataCooldown` provano che il criterio sa rispondere; questo prova che
+    /// qualcuno gliela pone, ed e' il tratto in cui il difetto e' vissuto —
+    /// `run_fallback` chiamava `mark_transient_after` col solo nome del
+    /// fornitore, quindi nessuna portata veniva mai scelta.
+    ///
+    /// MISURATO il 13/08/2026: groq risponde «Rate limit reached for model
+    /// `openai/gpt-oss-20b` ... TPD Limit 200000, Used 199788 ... try again in
+    /// 23m44.3s» e groq spariva INTERO per 24 minuti.
+    ///
+    /// MUTAZIONE: passare `None` invece di `portata.modello(&req.model)` nel
+    /// ramo `Transient` di `complete_with_retry` -> il secondo assert cade col
+    /// difetto reale (fornitore escluso), e con lui l'ultimo.
+    #[tokio::test]
+    async fn un_429_di_modello_lascia_il_fornitore_disponibile() {
+        let p: Arc<dyn LlmProvider> = FakeProvider::new("groq", Behaviour::ErrRateLimit);
+        let modello = "openai/gpt-oss-20b";
+        let resolved = vec![ResolvedProvider {
+            provider: p,
+            model: modello.into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+
+        let _ = run_fallback(
+            &resolved,
+            &cooldown,
+            &req(),
+            false,
+            TEST_PER_ATTEMPT,
+            far_deadline(),
+            &mut Vec::new(),
+        )
+        .await;
+
+        assert!(
+            cooldown.is_model_in_cooldown("groq", modello),
+            "il modello che ha esaurito il proprio tetto deve restare fuori"
+        );
+        assert!(
+            !cooldown.is_in_cooldown("groq"),
+            "il FORNITORE non ha nulla che non va: escluderlo toglie dalla selezione \
+             anche i suoi modelli con quota propria"
+        );
+        assert!(
+            !cooldown.is_model_in_cooldown("groq", "llama-3.3-70b"),
+            "un altro modello groq resta convocabile"
+        );
+        assert!(
+            cooldown.seconds_remaining_for_model("groq", modello) > 1300,
+            "il Retry-After dichiarato (1424s) resta onorato: e' il fix del 10/08 \
+             che questo cambiamento non deve disfare"
         );
     }
 
@@ -4819,7 +5008,7 @@ aliases:
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        cooldown.mark_transient("google", Some("test".into()));
+        cooldown.mark_transient("google", None, Some("test".into()));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(10),
