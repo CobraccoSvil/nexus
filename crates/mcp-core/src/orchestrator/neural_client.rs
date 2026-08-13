@@ -27,6 +27,7 @@
 //! Questo tipo e' ormai una facciata zero-sized che tiene in piedi le firme
 //! storiche dei call site — non un client di rete.
 
+use nexus_agent_graph::decisions::tetto_output::RichiestaOutput;
 use serde_json::{json, Value};
 
 // Nota: i tipi del vecchio proxy gRPC (`mcp_proto::neural`, generati da
@@ -128,12 +129,23 @@ impl NeuralCoreClient {
     /// costruzione del `NeuralCoreClient` (clonato in decine di contesti).
     /// La porta e' risolta da `settings` (regola G), non hardcoded.
     async fn gateway(&self) -> anyhow::Result<NexusGatewayClient> {
+        Ok(self.gateway_e_pool().await?.0)
+    }
+
+    /// Il client del gateway E il pool da cui nasce.
+    ///
+    /// Il pool lo si prendeva gia' — [`Self::gateway`] lo leggeva dal bridge e
+    /// lo consumava in `from_db` — e restituirlo e' cio' che permette al turno
+    /// agentico di chiedere al catalogo il proprio tetto senza propagare un
+    /// `PgPool` lungo la catena di costruzione del client (che e' zero-sized e
+    /// clonato in decine di contesti).
+    async fn gateway_e_pool(&self) -> anyhow::Result<(NexusGatewayClient, sqlx::PgPool)> {
         let bridge = crate::nexus_bridge::NexusBridge::global()
             .ok_or_else(|| anyhow::anyhow!("nexus bridge non inizializzato (gateway)"))?;
         let db = bridge
             .db()
             .ok_or_else(|| anyhow::anyhow!("nexus bridge senza pool DB (gateway)"))?;
-        Ok(NexusGatewayClient::from_db(db).await)
+        Ok((NexusGatewayClient::from_db(db).await, db.clone()))
     }
 
     /// Completion testuale one-shot. Cablata DIRETTAMENTE al Nexus LLM Gateway
@@ -210,7 +222,7 @@ impl NeuralCoreClient {
         model: &str,
         messages_json: &str,
         tools_json: &str,
-        max_tokens: u32,
+        richiesta: RichiestaOutput,
         system_text: &str,
     ) -> anyhow::Result<Value> {
         self.generate_agent_turn_with_thinking(
@@ -218,7 +230,7 @@ impl NeuralCoreClient {
             model,
             messages_json,
             tools_json,
-            max_tokens,
+            richiesta,
             system_text,
             None,
         )
@@ -238,11 +250,11 @@ impl NeuralCoreClient {
         model: &str,
         messages_json: &str,
         tools_json: &str,
-        max_tokens: u32,
+        richiesta: RichiestaOutput,
         system_text: &str,
         thinking: Option<crate::nexus_gateway::GwThinkingConfig>,
     ) -> anyhow::Result<Value> {
-        let gw = self.gateway().await?;
+        let (gw, db) = self.gateway_e_pool().await?;
 
         // Messaggi grezzi -> GwMessage. I call site passano sempre
         // `{role, content}` testuali (content stringa); la deserializzazione
@@ -289,10 +301,18 @@ impl NeuralCoreClient {
             }
         };
 
+        // IL TETTO LO DECIDE IL CATALOGO, non il chiamante (regola L). Questo e'
+        // il confine da cui passa ogni turno one-shot di mcp-core: risolverlo
+        // qui copre tutti i call site insieme, mentre risolverlo in ognuno
+        // lascerebbe scoperto il primo che se ne dimentica — che e' esattamente
+        // com'e' andata dal 12/08 al 13/08/2026, con `step_validation` corretto
+        // e gli altri undici rimasti col letterale.
+        let tetto = crate::capability::risolvi_richiesta(&db, provider, model, &richiesta).await;
+
         let req = GwRequest {
             model: model.to_string(),
             messages: all_messages,
-            max_tokens: Some(max_tokens),
+            max_tokens: tetto.tetto.max_tokens(),
             tools,
             pin_provider: Some(provider.to_string()),
             thinking,

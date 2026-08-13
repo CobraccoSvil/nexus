@@ -364,7 +364,7 @@ async fn chiamata_one_shot(
     .await;
     let resp = match llm
         .complete(richiesta_verdetto(
-            &cand, system, blob, run_id, forzatura, tetto,
+            &cand, system, blob, run_id, forzatura, tetto.tetto,
         ))
         .await
     {

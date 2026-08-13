@@ -265,7 +265,14 @@ async fn infer_call(
     let messages = serde_json::json!([{ "role": "user", "content": user_text }]).to_string();
     let resp = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_s),
-        neural.generate_agent_turn(provider, model, &messages, "[]", 1500, system_text),
+        neural.generate_agent_turn(
+            provider,
+            model,
+            &messages,
+            "[]",
+            nexus_agent_graph::decisions::tetto_output::RichiestaOutput::Visibile(1500),
+            system_text,
+        ),
     )
     .await;
     let value = match resp {

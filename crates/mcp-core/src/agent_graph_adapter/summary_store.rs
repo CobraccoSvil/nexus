@@ -46,9 +46,15 @@ conversazione preservando decisioni, fatti e stato; ometti dettagli ridondanti."
 /// soglia il nodo degrada a history invariata.
 const SUMMARY_TIMEOUT_SECS: u64 = 30;
 
-/// Cap dei token in output del riassunto (difensivo: un riassunto conciso non
-/// deve esplodere; oltre questo cap il guadagno di contesto svanirebbe).
-const SUMMARY_MAX_TOKENS: u32 = 1024;
+/// Quanto deve essere lungo il riassunto VISIBILE (difensivo: un riassunto
+/// conciso non deve esplodere; oltre questo, il guadagno di contesto
+/// svanirebbe).
+///
+/// E' cio' che si deve LEGGERE, non il tetto da mandare: come TOTALE, su un
+/// modello che ragiona questo numero produce un riassunto VUOTO e fatturato —
+/// 1024 e' esattamente il valore delle 15 righe `degenerate_hollow` che hanno
+/// fatto nascere `tetto_output`.
+const SUMMARY_VISIBILE_TOKENS: u32 = 1024;
 
 /// Adapter [`SummaryStore`] -> gateway LLM col modello economico.
 pub struct PgSummaryStore {
@@ -143,6 +149,15 @@ impl SummaryStore for PgSummaryStore {
 
         // 3. Prompt di sistema (template DB o default) + il prefisso da riassumere.
         let system = self.system_prompt().await;
+        // Il tetto lo decide il catalogo (regola L): qui si dichiara solo
+        // quanto riassunto si deve poter leggere.
+        let tetto = crate::capability::resolve_tetto_output(
+            &self.db,
+            &provider,
+            &model,
+            SUMMARY_VISIBILE_TOKENS,
+        )
+        .await;
         let req = GwRequest {
             model,
             messages: vec![
@@ -157,7 +172,7 @@ impl SummaryStore for PgSummaryStore {
                     ..Default::default()
                 },
             ],
-            max_tokens: Some(SUMMARY_MAX_TOKENS),
+            max_tokens: tetto.tetto.max_tokens(),
             temperature: Some(0.0),
             // Pin esplicito: provider+modello gia' decisi dal setting (regola G),
             // niente secondo routing nel gateway.

@@ -69,6 +69,7 @@ use sqlx::PgPool;
 use nexus_agent_graph::decisions::meta_reason::validate_move;
 use nexus_agent_graph::decisions::orchestration_reason::validate_orch_move;
 use nexus_agent_graph::decisions::scale_reason::validate_scale_move;
+use nexus_agent_graph::decisions::tetto_output::RichiestaOutput;
 use nexus_agent_graph::runtime::ports::{
     MetaReasonerPort, OrchestrationContext, OrchestrationMove, PortError, RecoveryMove,
     ScaleContext, ScaleMove, StallContext, SupervisorContext,
@@ -97,10 +98,13 @@ const STALL_TIMEOUT_SETTING: &str = "agent.stall_recovery.timeout_s";
 /// seminato dalla mig 0510 (stesso pattern di `verify_profile`).
 const STALL_TIMEOUT_DEFAULT: u64 = 20;
 
-/// Tetto di token in output: la decisione e' un piccolo oggetto JSON (una mossa +
-/// nudge breve). Basso di proposito (budget/costo: il reasoner gira sui run
-/// stallati, non deve esplodere in token).
-const STALL_MAX_TOKENS: u32 = 512;
+/// Quanto deve essere lunga la risposta VISIBILE: la decisione e' un piccolo
+/// oggetto JSON (una mossa + nudge breve).
+///
+/// E' cio' che questo modulo deve LEGGERE, non il tetto da mandare: quanto
+/// serva al modello per arrivarci — il ragionamento, che su alcuni fornitori
+/// non si spegne — lo calcola il catalogo (vedi `tetto_output`).
+const STALL_VISIBILE_TOKENS: u32 = 512;
 
 /// Purpose (regola G) del meta-reasoner di ORCHESTRAZIONE: risolve `(provider,
 /// model)` tier-aware da `nexus_purpose_model` (mig 0512). Unica fonte DB, nessun
@@ -123,10 +127,10 @@ const ORCH_TIMEOUT_SETTING: &str = "agent.orchestration.timeout_s";
 /// Safe-default numerico seminato dalla mig 0512 (stesso pattern di stall/verify).
 const ORCH_TIMEOUT_DEFAULT: u64 = 20;
 
-/// Tetto di token in output della decisione di orchestrazione: la mossa e' un
-/// piccolo oggetto JSON (enum + eventuali blocchi/task brevi). Basso di proposito
-/// (budget/costo: la decisione e' all'ingresso del run, non deve esplodere).
-const ORCH_MAX_TOKENS: u32 = 512;
+/// Quanto deve essere lunga la risposta VISIBILE della decisione di
+/// orchestrazione: la mossa e' un piccolo oggetto JSON (enum + eventuali
+/// blocchi/task brevi). Il margine per il ragionamento non e' cosa sua.
+const ORCH_VISIBILE_TOKENS: u32 = 512;
 
 /// Purpose (regola G) dello SCALE-CONTROLLER: risolve `(provider, model)`
 /// tier-aware da `nexus_purpose_model` (mig 0516). Unica fonte DB, nessun nome
@@ -160,10 +164,10 @@ const SCALE_TIMEOUT_SETTING: &str = "agent.scale.timeout_s";
 /// e' pre-crisi, non deve bloccare il run.
 const SCALE_TIMEOUT_DEFAULT: u64 = 15;
 
-/// Tetto di token in output della decisione di scala: la mossa e' un piccolo
-/// oggetto JSON (`{"move","tier","confidence"}`). Basso di proposito (budget/costo:
-/// il controller gira di frequente, non deve esplodere in token).
-const SCALE_MAX_TOKENS: u32 = 256;
+/// Quanto deve essere lunga la risposta VISIBILE della decisione di scala: la
+/// mossa e' un piccolo oggetto JSON (`{"move","tier","confidence"}`). Il
+/// margine per il ragionamento non e' cosa sua.
+const SCALE_VISIBILE_TOKENS: u32 = 256;
 
 /// Purpose (regola G) del supervisore worker.
 const SUPERVISOR_PURPOSE: &str = "supervisor_monitoring";
@@ -176,7 +180,17 @@ const SUPERVISOR_TIMEOUT_SETTING: &str = "agent.supervisor.timeout_s";
 
 const SUPERVISOR_TIMEOUT_DEFAULT: u64 = 25;
 
-const SUPERVISOR_MAX_TOKENS: u32 = 512;
+/// Quanto deve essere lunga la risposta VISIBILE del supervisore: un
+/// `{"action": ..., "message": ...}`.
+///
+/// MISURATO il 13/08/2026: questo numero viaggiava come TETTO TOTALE, e su
+/// `groq/openai/gpt-oss-20b` — che il purpose `supervisor_monitoring` puo'
+/// scegliere e che ragiona — il ragionamento se lo mangiava tutto:
+/// `finish_reason=length`, `completion_tokens` esattamente 512, contenuto
+/// vuoto, e il gateway classificava (correttamente) `empty_completion`. Tre
+/// occorrenze in un solo run di prova, tutte con la stessa firma. Lo stesso
+/// prompt senza tetto risponde `stop` in 348 token.
+const SUPERVISOR_VISIBILE_TOKENS: u32 = 512;
 
 /// Parametri STATICI (const) che distinguono i 3 scope del meta-reasoner LLM
 /// (recovery / orchestrazione / scala). Il FLUSSO a 6 passi e' UNICO
@@ -195,8 +209,9 @@ struct MetaConsultSpec {
     purpose: &'static str,
     /// Chiave del template di sistema (schema XML fuori-chat, regola D).
     template_key: &'static str,
-    /// Tetto di token in output (la mossa e' un piccolo oggetto JSON).
-    max_tokens: u32,
+    /// Quanto deve essere lunga la risposta VISIBILE (la mossa e' un piccolo
+    /// oggetto JSON). Il tetto da mandare lo calcola il catalogo.
+    visibile_tokens: u32,
     /// Valore del campo strutturato `metric` sui log di misconfig (preservato per
     /// scope: e' un contratto d'osservabilita', regola M).
     misconfig_metric: &'static str,
@@ -222,7 +237,7 @@ const STALL_SPEC: MetaConsultSpec = MetaConsultSpec {
     timeout_default: STALL_TIMEOUT_DEFAULT,
     purpose: STALL_PURPOSE,
     template_key: STALL_TEMPLATE_KEY,
-    max_tokens: STALL_MAX_TOKENS,
+    visibile_tokens: STALL_VISIBILE_TOKENS,
     misconfig_metric: "stall_recovery_misconfig",
     kind: "stall_recovery",
     user_prefix: "Stato di stallo strutturato (JSON):",
@@ -238,7 +253,7 @@ const ORCH_SPEC: MetaConsultSpec = MetaConsultSpec {
     timeout_default: ORCH_TIMEOUT_DEFAULT,
     purpose: ORCH_PURPOSE,
     template_key: ORCH_TEMPLATE_KEY,
-    max_tokens: ORCH_MAX_TOKENS,
+    visibile_tokens: ORCH_VISIBILE_TOKENS,
     misconfig_metric: "orchestration_misconfig",
     kind: "orchestration",
     user_prefix: "Contesto di orchestrazione strutturato (JSON):",
@@ -254,7 +269,7 @@ const SCALE_SPEC: MetaConsultSpec = MetaConsultSpec {
     timeout_default: SCALE_TIMEOUT_DEFAULT,
     purpose: SCALE_PURPOSE,
     template_key: SCALE_TEMPLATE_KEY,
-    max_tokens: SCALE_MAX_TOKENS,
+    visibile_tokens: SCALE_VISIBILE_TOKENS,
     misconfig_metric: "scale_controller_misconfig",
     kind: "scale",
     user_prefix: "Andamento del run strutturato (JSON):",
@@ -464,7 +479,7 @@ impl PgMetaReasonerPort {
                 &model,
                 &messages,
                 "[]",
-                spec.max_tokens,
+                RichiestaOutput::Visibile(spec.visibile_tokens),
                 &system_text,
             ),
         )
@@ -650,7 +665,7 @@ impl PgMetaReasonerPort {
                         &mdl,
                         messages_ref,
                         "[]",
-                        SUPERVISOR_MAX_TOKENS,
+                        RichiestaOutput::Visibile(SUPERVISOR_VISIBILE_TOKENS),
                         "",
                     ),
                 )

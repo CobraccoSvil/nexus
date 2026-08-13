@@ -20,7 +20,7 @@
 //! col TTL della routing matrix e degli altri letti-da-DB. Allineamento al DB
 //! entro 60s, niente redeploy.
 
-use nexus_agent_graph::decisions::tetto_output::{tetto_per, FattiTetto, TettoOutput};
+use nexus_agent_graph::decisions::tetto_output::{FattiTetto, RichiestaOutput, TettoOutput};
 use nexus_cache::TtlCache;
 use sqlx::PgPool;
 use std::sync::OnceLock;
@@ -239,9 +239,11 @@ pub async fn resolve_mandatory_thinking_budget(
     resolved
 }
 
-static TETTO_CACHE: OnceLock<TtlCache<String, FattiTetto>> = OnceLock::new();
+/// I fatti E la loro provenienza: cache-are i soli fatti rimetterebbe le tre
+/// risposte nello stesso silenzio a partire dal secondo turno.
+static TETTO_CACHE: OnceLock<TtlCache<String, (FattiTetto, DichiarazioneTetto)>> = OnceLock::new();
 
-fn tetto_cache() -> &'static TtlCache<String, FattiTetto> {
+fn tetto_cache() -> &'static TtlCache<String, (FattiTetto, DichiarazioneTetto)> {
     TETTO_CACHE.get_or_init(|| TtlCache::new(Duration::from_secs(TOOL_CHOICE_STYLE_TTL_SECS)))
 }
 
@@ -263,6 +265,53 @@ async fn fetch_fatti_tetto(
         .await
 }
 
+/// Che cosa il catalogo ha saputo dire di una coppia `(provider, model)` al
+/// momento in cui si e' deciso il suo tetto di output.
+///
+/// E' un TIPO e non l'assenza di un valore perche' le tre risposte hanno
+/// rimedi diversi e finivano tutte nello stesso silenzio: `FattiTetto::default()`
+/// valeva sia «modello non dichiarato» sia «catalogo non leggibile», e da fuori
+/// erano indistinguibili da «modello dichiarato che non pone limiti» (regola Q:
+/// l'ignoto e' una variante, non un valore comodo).
+///
+/// MISURATO il 13/08/2026 sul META vivo: **37 modelli ABILITATI su 129 non
+/// hanno una riga nella vista** — openrouter 17, openai 11, perplexity 3,
+/// anthropic 2, google 2, groq 2 — e per tutti e 37 chi decideva il tetto
+/// decideva al buio senza che nulla lo dichiarasse. La causa e' strutturale:
+/// `v_model_capabilities` nasce `FROM nexus_provider_capabilities LEFT JOIN
+/// ai_price_catalog`, mentre il discovery a runtime inserisce SOLO in
+/// `ai_price_catalog` (`model_catalog_sync::insert_new_chat_model`) — cioe' nel
+/// lato destro della join. Un modello scoperto dopo la migrazione del proprio
+/// fornitore e' invisibile alla vista per costruzione.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DichiarazioneTetto {
+    /// Il catalogo ha una riga per questa coppia: si decide sui fatti.
+    Presente,
+    /// Nessuna riga: il modello e' instradabile ma non dichiarato. Non si
+    /// scioglie aspettando (nessun ciclo a runtime scrive capability), ed e'
+    /// la stessa condizione che `DeclarationCoverage::richiede_intervento`
+    /// riporta aggregata per fornitore.
+    ModelloNonDichiarato,
+    /// La query e' fallita: non e' un fatto sul modello, e' un guasto nostro.
+    CatalogoNonLeggibile,
+}
+
+impl DichiarazioneTetto {
+    /// `true` quando il tetto e' stato deciso senza fatti. Non e' di per se' un
+    /// difetto — su un modello ignoto NON vincolare e' la scelta giusta,
+    /// misurata — ma chi decide deve poterlo sapere invece di dedurlo.
+    pub fn decide_al_buio(&self) -> bool {
+        !matches!(self, Self::Presente)
+    }
+}
+
+/// Il tetto, e su quali fatti lo si e' deciso.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TettoRisolto {
+    pub tetto: TettoOutput,
+    pub dichiarazione: DichiarazioneTetto,
+}
+
 /// Il tetto di output da imporre a `(provider, model)` per ottenere `visibile`
 /// token di risposta LEGGIBILE. Cache 60s.
 ///
@@ -272,34 +321,98 @@ async fn fetch_fatti_tetto(
 ///
 /// Su DB irraggiungibile o modello non a catalogo NON si inventa un numero: i
 /// fatti restano vuoti e il criterio decide (per un modello ignoto: nessun
-/// tetto, che e' il caso che non produce un vuoto fatturato).
+/// tetto, che e' il caso che non produce un vuoto fatturato). Quel «non si
+/// inventa» ora e' DICHIARATO nel valore di ritorno, non solo nel commento.
 pub async fn resolve_tetto_output(
     db: &PgPool,
     provider: &str,
     model: &str,
     visibile: u32,
-) -> TettoOutput {
-    let key = cache_key(provider, model);
-    if let Some(f) = tetto_cache().get(&key) {
-        return tetto_per(visibile, &f);
-    }
-    let fatti = match fetch_fatti_tetto(db, provider, model).await {
-        Ok(Some((thinking, default_out, hard))) => FattiTetto {
-            ragiona: thinking,
-            default_output: default_out.and_then(|v| u32::try_from(v).ok()),
-            massimo_fornitore: hard.and_then(|v| u32::try_from(v).ok()),
-        },
-        Ok(None) => {
-            tracing::debug!("tetto output: {provider}/{model} non a catalogo: nessun vincolo");
-            FattiTetto::default()
-        }
+) -> TettoRisolto {
+    risolvi_richiesta(db, provider, model, &RichiestaOutput::Visibile(visibile)).await
+}
+
+/// I fatti del catalogo per questa coppia, INSIEME alla loro provenienza.
+///
+/// Separata da [`risolvi_richiesta`] perche' e' la meta' con l'I/O: qui si
+/// legge e si classifica cio' che si e' letto, li' si decide e si mette in
+/// cache. Le tre risposte nascono TUTTE qui, che e' anche l'unico modo perche'
+/// nessun ramo dimentichi di dichiarare la propria.
+async fn fatti_con_provenienza(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+) -> (FattiTetto, DichiarazioneTetto) {
+    match fetch_fatti_tetto(db, provider, model).await {
+        Ok(Some((thinking, default_out, hard))) => (
+            FattiTetto {
+                ragiona: thinking,
+                default_output: default_out.and_then(|v| u32::try_from(v).ok()),
+                massimo_fornitore: hard.and_then(|v| u32::try_from(v).ok()),
+            },
+            DichiarazioneTetto::Presente,
+        ),
+        Ok(None) => (
+            FattiTetto::default(),
+            DichiarazioneTetto::ModelloNonDichiarato,
+        ),
         Err(e) => {
             tracing::warn!("tetto output: catalogo non leggibile per {provider}/{model}: {e}");
-            FattiTetto::default()
+            (
+                FattiTetto::default(),
+                DichiarazioneTetto::CatalogoNonLeggibile,
+            )
         }
-    };
-    tetto_cache().insert(key, fatti.clone());
-    tetto_per(visibile, &fatti)
+    }
+}
+
+/// Il tetto per una richiesta qualunque (punto unico, regola L).
+///
+/// `TotaleDichiarato` NON interroga il catalogo: chi misura un modello non puo'
+/// leggere da li' i fatti che sta derivando (regola O). E' anche l'unica strada
+/// per cui un numero letterale puo' ancora raggiungere `max_tokens`, e pretende
+/// un motivo scritto.
+pub async fn risolvi_richiesta(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    richiesta: &RichiestaOutput,
+) -> TettoRisolto {
+    if richiesta.scavalca_il_catalogo() {
+        return TettoRisolto {
+            tetto: richiesta.tetto(&FattiTetto::default()),
+            // Il catalogo non e' stato interrogato: dire «non dichiarato»
+            // accuserebbe il catalogo di un silenzio che nessuno gli ha chiesto.
+            dichiarazione: DichiarazioneTetto::Presente,
+        };
+    }
+    let key = cache_key(provider, model);
+    if let Some((fatti, dichiarazione)) = tetto_cache().get(&key) {
+        return TettoRisolto {
+            tetto: richiesta.tetto(&fatti),
+            dichiarazione,
+        };
+    }
+    let (fatti, dichiarazione) = fatti_con_provenienza(db, provider, model).await;
+    let tetto = richiesta.tetto(&fatti);
+    if dichiarazione.decide_al_buio() {
+        // WARN e non DEBUG: e' una decisione presa senza fatti su un modello
+        // che il sistema sta instradando, e nessun ciclo la riparera' da solo.
+        // La cache 60s la rende una riga per coppia per minuto, non per turno.
+        tracing::warn!(
+            provider,
+            model,
+            dichiarazione = ?dichiarazione,
+            vincolato = tetto.max_tokens().is_some(),
+            "tetto di output deciso senza i fatti del catalogo: il modello e' \
+             abilitato ma non compare in v_model_capabilities"
+        );
+    }
+    tetto_cache().insert(key, (fatti, dichiarazione));
+    TettoRisolto {
+        tetto,
+        dichiarazione,
+    }
 }
 
 #[cfg(test)]
@@ -390,5 +503,223 @@ mod tests {
         // La chiave deve distinguere coppie diverse anche con parti che si
         // concatenerebbero ambiguamente senza separatore.
         assert_ne!(cache_key("a", "bc"), cache_key("ab", "c"));
+    }
+
+    /// Le tre risposte non sono la stessa risposta: due di esse dicono che si
+    /// sta decidendo senza fatti, e i loro rimedi sono diversi (una migrazione
+    /// mancante contro un DB che non risponde).
+    #[test]
+    fn solo_la_dichiarazione_presente_non_decide_al_buio() {
+        assert!(!DichiarazioneTetto::Presente.decide_al_buio());
+        assert!(DichiarazioneTetto::ModelloNonDichiarato.decide_al_buio());
+        assert!(DichiarazioneTetto::CatalogoNonLeggibile.decide_al_buio());
+        assert_ne!(
+            DichiarazioneTetto::ModelloNonDichiarato,
+            DichiarazioneTetto::CatalogoNonLeggibile,
+            "collassarle e' il difetto che questo tipo chiude"
+        );
+    }
+
+    /// IL CASO MISURATO IL 13/08/2026, sullo schema che le migrazioni
+    /// producono: un modello ABILITATO che non ha riga di capability.
+    ///
+    /// E' la condizione dei 37 modelli reali (groq 2, openrouter 17, openai 11,
+    /// perplexity 3, anthropic 2, google 2), e non e' un caso di laboratorio:
+    /// `v_model_capabilities` nasce `FROM nexus_provider_capabilities LEFT JOIN
+    /// ai_price_catalog`, mentre il discovery a runtime inserisce solo nel lato
+    /// DESTRO — quindi un modello scoperto dopo la migrazione del proprio
+    /// fornitore e' invisibile alla vista per costruzione.
+    ///
+    /// Il tetto che ne esce e' `NonVincolabile`, ed e' la scelta GIUSTA:
+    /// MISURATO sull'API groq col prompt vero del supervisore, un tetto
+    /// prudente su un modello ignoto produce `finish_reason=length` e un turno
+    /// vuoto fatturato, mentre nessun tetto risponde `stop`. Cio' che mancava
+    /// non era il vincolo: era che qualcuno sapesse di aver deciso al buio.
+    ///
+    /// MUTAZIONE (regola O): far ritornare `DichiarazioneTetto::Presente` anche
+    /// sul ramo `Ok(None)` di `risolvi_richiesta` -> il primo assert cade, e con
+    /// esso il WARN che e' l'unico segnale al momento della decisione.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn un_modello_abilitato_fuori_dalla_vista_dichiara_di_decidere_al_buio(pool: PgPool) {
+        // Il trigger del gate 0629 respinge a `is_enabled=false` ogni riga senza
+        // prova di probe: si abilita dandogli quella prova, come fa il catalogo
+        // vero, invece di seminare lo stato finale a mano.
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+                (provider, model, display_name, input_cost_per_million_tokens, \
+                 output_cost_per_million_tokens, currency, is_enabled, capability_source) \
+             VALUES ('zeta', 'zeta-scoperto', 'zeta-scoperto', 1.0, 1.0, 'USD', true, 'auto')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed catalog");
+        sqlx::query(
+            "UPDATE ai_price_catalog SET is_enabled = true, last_probe_healthy_at = NOW(), \
+                    auto_disabled_reason = NULL, auto_disabled_at = NULL \
+              WHERE provider = 'zeta'",
+        )
+        .execute(&pool)
+        .await
+        .expect("abilita con la prova che il gate pretende");
+
+        let risolto = resolve_tetto_output(&pool, "zeta", "zeta-scoperto", 512).await;
+        assert_eq!(
+            risolto.dichiarazione,
+            DichiarazioneTetto::ModelloNonDichiarato,
+            "il modello e' instradabile e la vista non lo conosce: va DETTO"
+        );
+        assert!(risolto.dichiarazione.decide_al_buio());
+        assert_eq!(
+            risolto.tetto.max_tokens(),
+            None,
+            "su fatti ignoti non si inventa un tetto: e' il tetto inventato a \
+             produrre il turno vuoto fatturato"
+        );
+
+        // MUTAZIONE speculare: una coppia DICHIARATA, e per giunta dichiarata
+        // come modello che ragiona. Cambia provenienza E tetto; se restasse
+        // `ModelloNonDichiarato`, la lettura non starebbe guardando la vista.
+        //
+        // La coppia e' nuova e non la stessa di sopra perche' la cache 60s
+        // terrebbe il verdetto precedente — ed e' anche il modo in cui la
+        // produzione vede una riga scritta oggi.
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+                (provider, model, display_name, input_cost_per_million_tokens, \
+                 output_cost_per_million_tokens, currency, is_enabled, \
+                 capability_source, uses_thinking_mode) \
+             VALUES ('zeta', 'zeta-dichiarato', 'zeta-dichiarato', 1.0, 1.0, 'USD', \
+                     true, 'auto', true)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed catalog 2");
+        sqlx::query(
+            "INSERT INTO nexus_provider_capabilities \
+                (provider, model, default_max_output_tokens, max_output_tokens_hard) \
+             VALUES ('zeta', 'zeta-dichiarato', 4096, 16384)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed capability 2");
+
+        let dichiarato = resolve_tetto_output(&pool, "zeta", "zeta-dichiarato", 512).await;
+        assert_eq!(dichiarato.dichiarazione, DichiarazioneTetto::Presente);
+        assert!(!dichiarato.dichiarazione.decide_al_buio());
+        assert_eq!(
+            dichiarato.tetto.max_tokens(),
+            Some(4096),
+            "un modello che RAGIONA riceve lo spazio del catalogo, non il \
+             visibile: e' il margine che gli evita di finire i token pensando"
+        );
+    }
+
+    /// «Pensiero IGNOTO» non e' rappresentabile, e non per la vista: e' lo
+    /// SCHEMA. `ai_price_catalog.uses_thinking_mode` e' `NOT NULL DEFAULT
+    /// false`, quindi un modello nasce dichiarando di non ragionare e resta
+    /// cosi' finche' qualcuno non prova il contrario — e il ramo prudente del
+    /// criterio (`ragiona: None` -> si tratta come se ragionasse) e'
+    /// IRRAGGIUNGIBILE da questa query.
+    ///
+    /// La verifica va fatta sullo schema e non sul sospetto: il `COALESCE(
+    /// c.uses_thinking_mode, false)` della vista (mig 0478) suggerisce che
+    /// l'ignoto esista e venga appiattito li', e invece e' ridondante — a monte
+    /// quel NULL non puo' nascere. Due spiegazioni diverse dello stesso
+    /// comportamento, e solo una regge alla misura.
+    ///
+    /// E' una TRAPPOLA ARMATA, non un difetto attivo, perche' le due condizioni
+    /// che la farebbero scattare non si incontrano: un modello mai classificato
+    /// non ha nemmeno la riga di capability (il discovery scrive solo
+    /// `ai_price_catalog`, la riga la scrivono le migrazioni), quindi cade nel
+    /// ramo `ModelloNonDichiarato` del test qui sopra e NON riceve alcun tetto.
+    /// Scatterebbe il giorno in cui una migrazione dichiarasse un modello senza
+    /// dichiararne il pensiero: da li' in poi quel modello riceverebbe in
+    /// silenzio il tetto stretto `visibile * 2` — cioe' 1024 sul supervisore,
+    /// il valore delle 15 righe `degenerate_hollow`.
+    ///
+    /// MUTAZIONE: alzare il default della colonna a `true`, o togliere il
+    /// `NOT NULL`, fa cadere questo test — che e' il punto: il giorno in cui
+    /// l'ignoto diventa rappresentabile, il criterio cambia ramo e va saputo.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_pensiero_ignoto_non_e_rappresentabile_e_arriva_come_non_ragiona(pool: PgPool) {
+        // PREMESSA, chiesta allo schema che le migrazioni producono: la colonna
+        // non ammette NULL, quindi «non lo so» non ha dove stare.
+        let nullable: String = sqlx::query_scalar(
+            "SELECT is_nullable FROM information_schema.columns \
+              WHERE table_name = 'ai_price_catalog' AND column_name = 'uses_thinking_mode'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("lettura schema");
+        assert_eq!(
+            nullable, "NO",
+            "se questa colonna diventasse nullable, l'ignoto sarebbe finalmente \
+             rappresentabile e il criterio prenderebbe il ramo prudente"
+        );
+
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+                (provider, model, display_name, input_cost_per_million_tokens, \
+                 output_cost_per_million_tokens, currency, is_enabled, capability_source) \
+             VALUES ('zeta', 'zeta-muto', 'zeta-muto', 1.0, 1.0, 'USD', true, 'auto')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed catalog");
+        sqlx::query(
+            "INSERT INTO nexus_provider_capabilities \
+                (provider, model, default_max_output_tokens, max_output_tokens_hard) \
+             VALUES ('zeta', 'zeta-muto', 4096, 16384)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed capability");
+
+        // Nessuno ha detto nulla del pensiero, e il catalogo risponde «false».
+        let grezzo: bool = sqlx::query_scalar(
+            "SELECT uses_thinking_mode FROM ai_price_catalog \
+              WHERE provider='zeta' AND model='zeta-muto'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("lettura grezza");
+        assert!(
+            !grezzo,
+            "il default della colonna afferma che il modello non ragiona"
+        );
+
+        // CONSEGUENZA: il ramo «non ragiona», cioe' il tetto stretto
+        // `visibile * 2` invece dei 4096 che il catalogo dichiara.
+        let risolto = resolve_tetto_output(&pool, "zeta", "zeta-muto", 512).await;
+        assert_eq!(risolto.dichiarazione, DichiarazioneTetto::Presente);
+        assert_eq!(
+            risolto.tetto.max_tokens(),
+            Some(1024),
+            "un'affermazione mai verificata vale quanto una verificata, e stringe \
+             il tetto senza che nulla lo dichiari"
+        );
+    }
+
+    /// Chi MISURA non interroga il catalogo, e non viene percio' accusato di
+    /// decidere al buio: non ha chiesto nulla a nessuno.
+    ///
+    /// Il pool e' volutamente una coppia che NON esiste: se `risolvi_richiesta`
+    /// leggesse comunque il DB, la dichiarazione uscirebbe
+    /// `ModelloNonDichiarato` e questo test cadrebbe.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_totale_dichiarato_non_interroga_il_catalogo(pool: PgPool) {
+        let risolto = risolvi_richiesta(
+            &pool,
+            "fornitore-inesistente",
+            "modello-inesistente",
+            &RichiestaOutput::TotaleDichiarato {
+                totale: 256,
+                perche: "il probe dichiara il proprio budget",
+            },
+        )
+        .await;
+        assert_eq!(risolto.tetto.max_tokens(), Some(256));
+        assert_eq!(risolto.dichiarazione, DichiarazioneTetto::Presente);
+        assert!(!risolto.dichiarazione.decide_al_buio());
     }
 }

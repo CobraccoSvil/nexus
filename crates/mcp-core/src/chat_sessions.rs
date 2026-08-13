@@ -17,6 +17,12 @@ use crate::{
     AppState,
 };
 
+/// Quanto deve essere lungo il riassunto VISIBILE della compattazione. Il tetto
+/// da mandare lo calcola il catalogo (`tetto_output`): qui si dichiara solo cio'
+/// che si deve poter leggere.
+const RIASSUNTO: nexus_agent_graph::decisions::tetto_output::RichiestaOutput =
+    nexus_agent_graph::decisions::tetto_output::RichiestaOutput::Visibile(1500);
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatSessionsQuery {
@@ -670,7 +676,7 @@ pub(crate) async fn compact_session_core(
             let messages_json = &messages_json;
             async move {
                 match neural
-                    .generate_agent_turn(&prov, &mdl, messages_json, "[]", 1500, "")
+                    .generate_agent_turn(&prov, &mdl, messages_json, "[]", RIASSUNTO, "")
                     .await
                 {
                     Ok(v) => esito_tentativo_riassunto(v),
