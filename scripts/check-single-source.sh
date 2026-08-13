@@ -3608,6 +3608,40 @@ else
   echo "OK marker-di-debito-maiuscolo: il marker e' maiuscolo, la prosa non e' debito"
 fi
 
+# ── permesso-di-spegnere-il-pensiero (2026-08-13) ───────────────────────────
+# «Su questo modello il pensiero si puo' spegnere?» e' un fatto del FORNITORE che
+# varia per MODELLO, e si sa solo chiamando l'API. Fino al 13/08/2026 la risposta
+# era una premessa generalizzata scritta nel driver — «il pensiero su k3/k2.7-code
+# non e' disattivabile» — vera per meta' del parco e falsa per l'altra meta':
+# MISURATO, `thinking:{"type":"disabled"}` e' accettato da k2.6 e k3 ed e' 400 su
+# k2.7-code. Il dato vive in `ai_price_catalog.thinking_can_be_disabled` (mig
+# 0705) e nel codice di produzione non deve comparire alcun nome di modello: un
+# riconoscimento sul nome sbaglia in due direzioni opposte e in silenzio — 400 su
+# ogni chiamata da un lato, tetto di output bruciato dal ragionamento dall'altro.
+kimi_rs="crates/nexus-gateway/src/providers/kimi.rs"
+if ! grep -q 'thinking_can_be_disabled' "$kimi_rs"; then
+  echo "!! permesso-di-spegnere-il-pensiero: il driver kimi non legge piu' il" >&2
+  echo "   catalogo. Il permesso e' un dato (mig 0705, regola G), non una" >&2
+  echo "   premessa scritta nel codice." >&2
+  fail=1
+else
+  inizio_test=$(grep -n '#\[cfg(test)\]' "$kimi_rs" | head -1 | cut -d: -f1)
+  inizio_test=${inizio_test:-$(wc -l < "$kimi_rs")}
+  nomi=$(head -n "$((inizio_test - 1))" "$kimi_rs" \
+    | grep -nE '(contains|starts_with|ends_with|== *")' \
+    | grep -E 'kimi-k|moonshot-v' \
+    | grep -vE '^[0-9]+: *(//|///|\*)' || true)
+  if [[ -n "$nomi" ]]; then
+    echo "!! permesso-di-spegnere-il-pensiero: il driver kimi riconosce un modello" >&2
+    echo "   dal NOME. E' la premessa generalizzata che il 13/08/2026 e' stata" >&2
+    echo "   misurata falsa su meta' del parco: il fatto sta nel catalogo." >&2
+    echo "$nomi" >&2
+    fail=1
+  else
+    echo "OK permesso-di-spegnere-il-pensiero: il fatto viene dal catalogo, non dal nome"
+  fi
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1
