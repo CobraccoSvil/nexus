@@ -206,6 +206,23 @@ pub fn is_model_in_cooldown(provider: &str, model: &str) -> bool {
     is_provider_in_cooldown(provider) || scaduto_o_attivo(&chiave_cooldown(provider, Some(model)))
 }
 
+/// Secondi che restano su UNA chiave (0 se scaduta o assente).
+///
+/// Punto unico della lettura del residuo: `cooldown_snapshot_entries` risponde a
+/// un'altra domanda — «che cosa mostro» — e il suo campo `provider` porta la
+/// chiave grezza, quindi cercarvi un fornitore per nome non trova mai una coppia.
+pub fn residuo_della_chiave(chiave: &str) -> u64 {
+    let store = PROVIDER_COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()));
+    let now = std::time::Instant::now();
+    store
+        .lock()
+        .ok()
+        .and_then(|map| map.get(chiave).copied())
+        .filter(|until| *until > now)
+        .map(|until| (until - now).as_secs())
+        .unwrap_or(0)
+}
+
 fn scaduto_o_attivo(chiave: &str) -> bool {
     let store = PROVIDER_COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(map) = store.lock() {
@@ -330,11 +347,13 @@ pub(crate) fn reset_provider_failures(provider: &str) {
 ///   dichiarato dal gateway NON viene usato come durata: il credito non scade
 ///   col timer di un altro processo, e chi lo libera qui e' un ciclo che lo
 ///   VERIFICA.
-/// - [`EsclusioneDichiarata::Attesa`] delega a
-///   [`put_provider_in_short_cooldown`] con i secondi dichiarati. Li' la
-///   durata E' l'informazione: viene dal `Retry-After` del fornitore o dal
+/// - [`EsclusioneDichiarata::Attesa`] delega a [`metti_in_cooldown_breve`] con i
+///   secondi dichiarati, e con la PORTATA che il gateway ha dichiarato: li' la
+///   durata E' l'informazione (viene dal `Retry-After` del fornitore o dal
 ///   cooldown che il gateway ha appena impostato, e ricalcolarla la
-///   inventerebbe.
+///   inventerebbe), e dal 13/08/2026 lo e' anche CHI resta fuori — un tetto di
+///   frequenza e' del modello, e registrarlo sul fornitore toglierebbe dalla
+///   selezione modelli che hanno quota propria.
 ///
 /// Nulla si registra su [`EsclusioneDichiarata::Nessuna`]: un errore di
 /// richiesta, un contesto troppo lungo o un turno vuoto non dicono nulla sulla
@@ -355,7 +374,11 @@ pub fn registra_esclusione_dichiarata(esclusione: &EsclusioneDichiarata) {
                 );
             }
         }
-        EsclusioneDichiarata::Attesa { provider, secondi } => {
+        EsclusioneDichiarata::Attesa {
+            provider,
+            model,
+            secondi,
+        } => {
             // ALLINEARE, MAI ACCORCIARE. `metti_in_cooldown_breve` fa un insert
             // incondizionato e registra severita' `Short`: senza questa guardia
             // un'attesa da 30 secondi SOSTITUIREBBE un cooldown di credito da 6
@@ -370,29 +393,36 @@ pub fn registra_esclusione_dichiarata(esclusione: &EsclusioneDichiarata) {
             // aggiorna, una piu' corta si ignora. L'errore cade sul tenere
             // fuori qualcuno un po' piu' del necessario, mai sul rimettere in
             // gioco un fornitore che non puo' servire.
-            let residuo_noto = cooldown_snapshot_entries()
-                .into_iter()
-                .find(|e| e.provider.eq_ignore_ascii_case(provider))
-                .map(|e| e.remaining_seconds)
-                .unwrap_or(0);
+            // Il residuo da confrontare e' quello della STESSA chiave: un'attesa
+            // sulla coppia non si misura contro il cooldown del fornitore (sono
+            // due esclusioni distinte e non si accorciano a vicenda).
+            let model = model.as_deref();
+            let residuo_noto = residuo_della_chiave(&chiave_cooldown(provider, model));
             if *secondi <= residuo_noto {
                 tracing::debug!(
                     target: "provider_cooldown",
                     provider = %provider,
+                    model,
                     attesa_s = *secondi,
                     residuo_noto,
                     "esclusione dichiarata dal gateway: gia' escluso piu' a lungo, non si accorcia"
                 );
                 return;
             }
-            put_provider_in_short_cooldown(
+            // La PORTATA e' quella che il gateway ha dichiarato: un tetto di
+            // frequenza e' del modello, e registrarlo sul fornitore toglierebbe
+            // dalla selezione anche i modelli che hanno quota propria (difetto
+            // misurato il 13/08/2026 su groq).
+            metti_in_cooldown_breve(
                 provider,
+                model,
                 "gateway: attesa dichiarata dal fornitore",
                 *secondi,
             );
             tracing::warn!(
                 target: "provider_cooldown",
                 provider = %provider,
+                model,
                 attesa_s = *secondi,
                 "esclusione dichiarata dal gateway: la selezione smette di convocarlo per questo tempo"
             );
@@ -1236,6 +1266,7 @@ mod tests_esclusione_dal_gateway {
 
         registra_esclusione_dichiarata(&EsclusioneDichiarata::Attesa {
             provider: p.to_string(),
+            model: None,
             secondi: 600,
         });
 
@@ -1243,11 +1274,47 @@ mod tests_esclusione_dal_gateway {
             is_provider_in_cooldown(p),
             "dichiarata l'attesa, la selezione non deve piu' convocarlo"
         );
-        // La PORTATA e' il fornitore, come quella del gateway: registrare la
-        // sola coppia renderebbe mcp-core piu' permissivo di chi rifiuta.
+        // Senza modello dichiarato la PORTATA e' il fornitore, come quella del
+        // gateway: registrare la sola coppia renderebbe mcp-core piu' permissivo
+        // di chi rifiuta.
         assert!(is_model_in_cooldown(p, "un-modello-qualsiasi"));
 
         remove_cooldown(p);
+    }
+
+    /// IL CASO groq del 13/08/2026, dal lato di chi SCEGLIE: il gateway dichiara
+    /// che fuori e' il modello — «Rate limit reached for model
+    /// `openai/gpt-oss-20b` ... TPD Limit 200000» — e mcp-core deve registrare
+    /// la stessa portata, non una piu' larga.
+    ///
+    /// MUTAZIONE: rimettere `put_provider_in_short_cooldown(provider, ...)` (cioe'
+    /// ignorare il modello) in `registra_esclusione_dichiarata` -> l'ultimo
+    /// assert cade, e cade col difetto reale: il fornitore intero sparisce dalla
+    /// selezione per l'attesa di un modello solo.
+    #[test]
+    fn un_attesa_di_modello_non_esclude_gli_altri_modelli_del_fornitore() {
+        let p = "prova-attesa-di-modello";
+        let m = "openai/gpt-oss-20b";
+        assert!(!is_provider_in_cooldown(p), "premessa: parte disponibile");
+
+        registra_esclusione_dichiarata(&EsclusioneDichiarata::Attesa {
+            provider: p.to_string(),
+            model: Some(m.to_string()),
+            secondi: 1424,
+        });
+
+        assert!(
+            is_model_in_cooldown(p, m),
+            "il modello che ha esaurito il proprio tetto non va convocato"
+        );
+        assert!(
+            !is_provider_in_cooldown(p),
+            "il FORNITORE non e' escluso: un tetto per-modello non dice nulla dell'account"
+        );
+        assert!(
+            !is_model_in_cooldown(p, "llama-3.3-70b"),
+            "gli altri modelli hanno quota propria e restano convocabili"
+        );
     }
 
     /// Il credito passa dal punto unico che registra la severita' `Long`: e'
@@ -1292,6 +1359,7 @@ mod tests_esclusione_dal_gateway {
 
         registra_esclusione_dichiarata(&EsclusioneDichiarata::Attesa {
             provider: p.to_string(),
+            model: None,
             secondi: 30,
         });
 
@@ -1317,10 +1385,12 @@ mod tests_esclusione_dal_gateway {
         let p = "prova-attesa-piu-lunga";
         registra_esclusione_dichiarata(&EsclusioneDichiarata::Attesa {
             provider: p.to_string(),
+            model: None,
             secondi: 30,
         });
         registra_esclusione_dichiarata(&EsclusioneDichiarata::Attesa {
             provider: p.to_string(),
+            model: None,
             secondi: 1800,
         });
         let residuo = cooldown_snapshot_entries()

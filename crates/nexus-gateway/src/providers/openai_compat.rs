@@ -123,6 +123,9 @@ impl ResolvedReasoning {
 pub struct OpenAiCompatClient {
     http: Client,
     base_url: String,
+    /// Percorso della lista modelli RELATIVO a [`Self::base_url`]. Vedi
+    /// [`PERCORSO_MODELLI_DEFAULT`] e [`Self::url_lista_modelli`].
+    models_path: String,
     api_key: String,
     provider_name: String,
     cache_keying: PromptCacheKeying,
@@ -198,6 +201,10 @@ fn parse_upstream_order(csv: &str) -> Option<Vec<String>> {
     (!v.is_empty()).then_some(v)
 }
 
+/// Percorso della lista modelli nel dialetto OpenAI, che e' quello che tutti gli
+/// endpoint compat parlano finche' non dichiarano altrimenti.
+pub const PERCORSO_MODELLI_DEFAULT: &str = "/models";
+
 impl OpenAiCompatClient {
     /// Costruisce il client. `base_url` senza slash finale (es.
     /// `https://api.mistral.ai/v1`); l'endpoint `/chat/completions` viene
@@ -213,6 +220,7 @@ impl OpenAiCompatClient {
         Self {
             http,
             base_url,
+            models_path: PERCORSO_MODELLI_DEFAULT.to_string(),
             api_key: api_key.into(),
             provider_name: provider_name.into(),
             // Il default e' il provider che si arrangia: dichiarare una chiave a
@@ -224,6 +232,24 @@ impl OpenAiCompatClient {
             upstream_order: TtlCache::new(UPSTREAM_AFFINITY_TTL),
             ultimo_ordine_letto: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Dichiara dove questo endpoint espone la lista modelli, quando NON e' il
+    /// `/models` del dialetto OpenAI (vedi [`Self::url_lista_modelli`]).
+    ///
+    /// `None` o vuoto = il default: un percorso non dichiarato non deve poter
+    /// produrre una URL diversa da quella di prima (regola Q — l'assenza e' una
+    /// variante, non una stringa vuota da concatenare). Lo slash iniziale si
+    /// normalizza qui perche' e' il posto in cui il valore entra: normalizzarlo a
+    /// valle vorrebbe dire farlo in ognuno dei consumatori.
+    pub fn with_models_path(mut self, path: Option<&str>) -> Self {
+        let dichiarato = path.map(str::trim).filter(|p| !p.is_empty());
+        self.models_path = match dichiarato {
+            Some(p) if p.starts_with('/') => p.trim_end_matches('/').to_string(),
+            Some(p) => format!("/{}", p.trim_end_matches('/')),
+            None => PERCORSO_MODELLI_DEFAULT.to_string(),
+        };
+        self
     }
 
     /// Dichiara che questo endpoint riusa il prefisso solo con
@@ -484,10 +510,24 @@ impl OpenAiCompatClient {
         Ok(out.boxed())
     }
 
-    /// Probe di salute: una HEAD/GET su `{base_url}/models`. Ritorna `false` su
+    /// L'indirizzo della lista modelli di QUESTO endpoint. Punto unico (regola L)
+    /// dei due che la interrogano — [`Self::healthcheck`] e
+    /// [`Self::list_models_meta`] — perche' non e' un dettaglio di formattazione:
+    /// e' l'unica cosa che li distingue dal fallire insieme.
+    ///
+    /// MISURATO il 13/08/2026 su Perplexity, che espone le completion sulla radice
+    /// (`POST /chat/completions`) e i modelli sotto `/v1` (`GET /v1/models`).
+    /// Appendendo `/models` alla base delle completion si otteneva 404 su ENTRAMBI:
+    /// la discovery falliva a ogni sync, e lo healthcheck — che e' la stessa GET —
+    /// dichiarava il fornitore non sano per sempre, indipendentemente dal fornitore.
+    fn url_lista_modelli(&self) -> String {
+        format!("{}{}", self.base_url, self.models_path)
+    }
+
+    /// Probe di salute: una GET su [`Self::url_lista_modelli`]. Ritorna `false` su
     /// qualunque errore (rete, auth, status non 2xx).
     pub async fn healthcheck(&self) -> bool {
-        let url = format!("{}/models", self.base_url);
+        let url = self.url_lista_modelli();
         match self
             .http
             .get(url)
@@ -500,7 +540,7 @@ impl OpenAiCompatClient {
         }
     }
 
-    /// Autodiscovery live: `GET {base_url}/models` (Bearer) ed estrae `data[].id`.
+    /// Autodiscovery live: `GET` su [`Self::url_lista_modelli`] ed estrae `data[].id`.
     /// Dialetto OpenAI condiviso da OpenAI/Mistral/DeepSeek/vLLM (punto unico,
     /// regola L). Il parsing della risposta e' delegato a [`parse_models_response`]
     /// (puro, testabile senza rete).
@@ -518,7 +558,7 @@ impl OpenAiCompatClient {
     /// in `data[]`; OpenAI/DeepSeek non la espongono -> `None`). Un solo fetch
     /// (regola L): [`Self::list_models`] delega qui e proietta i soli id.
     pub async fn list_models_meta(&self) -> anyhow::Result<Vec<crate::provider::ModelMeta>> {
-        let url = format!("{}/models", self.base_url);
+        let url = self.url_lista_modelli();
         let resp = self.http.get(url).bearer_auth(&self.api_key).send().await?;
         let status = resp.status();
         if !status.is_success() {
@@ -1484,6 +1524,10 @@ impl ProviderHttpError {
     /// Costruisce dall'HTTP status + body grezzo, estraendo il codice d'errore
     /// STRUTTURATO dal JSON (non dalla prosa).
     pub fn from_response(provider: &str, status: u16, body: String) -> Self {
+        // Il quirk riceve i candidati OSSERVATI e il body, non un singolo
+        // codice: OpenRouter mette in `error.code` il NUMERO 402, che non e' una
+        // stringa e non produce alcun candidato — se il quirk dipendesse da un
+        // codice presente, quel fornitore non passerebbe mai di qui.
         let mut candidati = CandidatiErrore::dal_body(&body);
         if let Some(sintetico) = quirk_del_fornitore(provider, status, &candidati, &body) {
             candidati = candidati.con_quirk(sintetico);
@@ -1566,6 +1610,15 @@ fn extract_structured_error_message(body: &str) -> Option<String> {
 /// parola» — era esattamente il meccanismo che questo intervento elimina.
 pub const CODICE_BILLING_NORMALIZZATO: &str = "billing_error";
 
+/// Codice emesso quando un fornitore rifiuta l'AMMISSIONE della richiesta
+/// perche' la prenotazione supera il credito residuo — non perche' il credito
+/// sia finito. NON contiene `quota`/`billing`: quelle parole portano al cooldown
+/// lungo, che e' proprio il rimedio sbagliato per questo caso.
+const CODICE_AMMISSIONE_CREDITO: &str = "request_exceeds_credit";
+
+/// HTTP 402 Payment Required.
+const STATUS_PAGAMENTO_RICHIESTO: u16 = 402;
+
 /// Traduce nel vocabolario comune un codice che il provider riporta AMBIGUO.
 ///
 /// Anthropic risponde al credito esaurito con status 400 e
@@ -1590,18 +1643,58 @@ pub const CODICE_BILLING_NORMALIZZATO: &str = "billing_error";
 /// codice che sostituisce gli altri: il resto dei campi resta osservabile, cosi'
 /// il giorno in cui anthropic pubblichera' un identificatore distinto quel
 /// codice comparira' fra i non dichiarati e il quirk si potra' togliere.
+///
+/// ## Il secondo quirk: il 402 di OpenRouter non e' un saldo a zero
+///
+/// OpenRouter PRENOTA il costo massimo della richiesta contro il credito
+/// residuo e rifiuta con 402 se non ci sta. Il rimedio, che il fornitore stesso
+/// allega, e' «add credits **or lower max_tokens**»: cioe' una richiesta piu'
+/// piccola PASSA, e il fornitore sta servendo.
+///
+/// RIPRODOTTO il 13/08/2026 con 10,03 dollari di credito, a costo zero (il
+/// rifiuto precede l'esecuzione):
+///   - senza `max_tokens` -> «You requested up to 65536 tokens, but can only
+///     afford 17052». I 65536 non sono nostri (non compaiono in alcun sorgente)
+///     ne' il massimo del modello (o1-pro ne dichiara 100000): e' la
+///     prenotazione che OpenRouter applica quando il tetto non e' dichiarato;
+///   - con `max_tokens: 30000` -> «up to 30000», cioe' il numero e' il NOSTRO
+///     quando lo mandiamo;
+///   - con `max_tokens: 8000` (prenotazione 4,80 dollari, sotto il saldo) ->
+///     ammessa.
+///
+/// Sulle 129 righe registrate in `nexus_provider_health_history` il residuo
+/// dichiarato va da 432 a 64811 token, e le due piu' recenti (13/08) hanno
+/// 62186 e 64671: il fornitore aveva credito per quasi tutto, e veniva messo in
+/// cooldown di credito per SEI ORE.
+///
+/// Il quirk si isola qui perche' `error.code` porta il NUMERO 402 (non una
+/// stringa) e non produce alcun candidato: restano provider + status, entrambi
+/// segnali strutturati, e il punto di decisione a valle non impara nulla di
+/// provider-specifico (regola M, punto 4).
+///
+/// Il candidato sintetico vale solo se il CATALOGO lo dichiara: le due righe
+/// stanno in mig 0707 (`anthropic`/`billing_error`) e mig 0709
+/// (`openrouter`/`request_exceeds_credit`, che riassegna anche
+/// `openrouter_credits`). Senza la riga, `giudica` non riconoscerebbe il valore
+/// e ricadrebbe sulla tabella per status — per il 402 `Billing`, cioe' proprio
+/// il comportamento che questi quirk correggono. Il guard e'
+/// `tassonomia_errori::il_quirk_emette_un_valore_che_il_catalogo_dichiara`.
 fn quirk_del_fornitore(
     provider: &str,
     status: u16,
     candidati: &CandidatiErrore,
     body: &str,
 ) -> Option<&'static str> {
-    let e_anthropic = provider.trim().eq_ignore_ascii_case("anthropic");
+    let e = |nome: &str| provider.trim().eq_ignore_ascii_case(nome);
     let dice_invalid_request = candidati
         .iter()
         .any(|c| c.valore == "invalid_request_error");
-    if e_anthropic && status == 400 && dice_invalid_request && dichiara_credito_esaurito(body) {
+    if e("anthropic") && status == 400 && dice_invalid_request && dichiara_credito_esaurito(body) {
         return Some(CODICE_BILLING_NORMALIZZATO);
+    }
+    // OpenRouter: il 402 e' un rifiuto di AMMISSIONE, non un saldo a zero.
+    if e("openrouter") && status == STATUS_PAGAMENTO_RICHIESTO {
+        return Some(CODICE_AMMISSIONE_CREDITO);
     }
     None
 }
@@ -2642,6 +2735,55 @@ mod tests {
         assert_eq!(err.code.as_deref(), Some("invalid_request_error"));
     }
 
+    /// Il body REALE di un 402 OpenRouter, copiato da
+    /// `nexus_provider_health_history` (13/08/2026, credito residuo 62.186
+    /// token): `error.code` e' il NUMERO 402, quindi non viene estratto come
+    /// codice, e `metadata` porta il rimedio che il fornitore stesso allega.
+    const BODY_402_OPENROUTER: &str = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 65536 tokens, but can only afford 62186. To increase, visit https://openrouter.ai/settings/credits and add more credits","code":402,"metadata":{"limit_source":"openrouter_credits","remedy_hint":"Add credits at https://openrouter.ai/settings/credits, or lower max_tokens / prompt size to fit your remaining balance.","provider_name":null}}}"#;
+
+    /// IL CASO MISURATO. Il 402 di OpenRouter e' un rifiuto di AMMISSIONE — la
+    /// prenotazione supera il credito RESIDUO — e veniva letto come credito
+    /// esaurito: cooldown di sei ore su un fornitore che aveva credito per
+    /// 62.186 token e stava servendo. Sulle 129 righe registrate il residuo
+    /// arriva a 64.811.
+    ///
+    /// Attraversa il PRODUTTORE (`from_response`) e guarda il CANDIDATO che
+    /// questo modulo emette. La CLASSE non e' piu' asseribile qui: dopo il
+    /// vocabolario strutturale la decide `tassonomia_errori::giudica` a partire
+    /// dal CATALOGO, che questo modulo non ha (vedi `quirk_del_fornitore`).
+    ///
+    /// MUTAZIONE: togliere il ramo openrouter da `quirk_del_fornitore` -> non
+    /// viene emesso alcun candidato sintetico, si cade sulla tabella per status
+    /// (402 -> Billing) e torna il difetto reale.
+    #[test]
+    fn il_402_di_openrouter_emette_il_candidato_di_ammissione() {
+        assert_eq!(
+            quirk_emesso("openrouter", 402, BODY_402_OPENROUTER).as_deref(),
+            Some(CODICE_AMMISSIONE_CREDITO),
+            "il fornitore ha credito e sta servendo: sei ore di cooldown sono il \
+             rimedio di un altro problema"
+        );
+    }
+
+    /// L'altro verso: un 402 di un fornitore che NON prenota cosi' non riceve
+    /// alcun quirk, quindi resta un credito esaurito. Senza, il fix diventerebbe
+    /// «nessun 402 e' piu' billing» e un account davvero a secco verrebbe
+    /// ritentato a ogni turno.
+    #[test]
+    fn un_402_di_un_altro_fornitore_non_emette_il_quirk() {
+        assert_eq!(quirk_emesso("deepseek", 402, BODY_402_OPENROUTER), None);
+    }
+
+    /// Il quirk e' legato allo STATUS 402, che e' il rifiuto di ammissione. Su
+    /// un altro status non viene emesso, cosi' un codice di credito DICHIARATO
+    /// (`insufficient_quota`) resta l'unico candidato e continua a valere un
+    /// saldo finito anche su openrouter.
+    #[test]
+    fn un_codice_di_credito_dichiarato_non_viene_scavalcato_dal_quirk() {
+        let body = r#"{"error":{"type":"insufficient_quota","message":"balance exhausted"}}"#;
+        assert_eq!(quirk_emesso("openrouter", 429, body), None);
+    }
+
     #[test]
     fn lo_stesso_messaggio_da_un_altro_provider_non_emette_il_quirk() {
         // Il quirk resta isolato al provider che ha l'ambiguita': un altro
@@ -3523,17 +3665,26 @@ mod tests {
             .as_deref(),
             Some("rate_limit_exceeded")
         );
-        // openrouter 402: il campo che DECIDE sta in `metadata.limit_source`, ma
-        // sul wire il code resta `null` come oggi (il /error/code e' numerico).
-        // Includerlo nell'export cambierebbe 127 righe senza che nessuno
-        // l'abbia chiesto.
+        // openrouter 402: il QUIRK sostituisce anche il codice esportato, come
+        // gia' per anthropic/`billing_error`. E' un cambiamento di contratto
+        // DICHIARATO (127 righe storiche), e la direzione e' quella che non
+        // rompe nessuno: il valore passa da `null` a un identificatore, cioe'
+        // AGGIUNGE informazione dove non ce n'era, invece di spostare un valore
+        // che qualcuno stia gia' confrontando. L'unico consumatore per
+        // uguaglianza di `failures[].code` e'
+        // `ProviderUnavailableInfo::allows_cross_provider_failover` col
+        // vocabolario `routing.client_error_failover_codes`, consultato per i
+        // soli `ClientError`; qui la classe e' `request_exceeds_credit`.
+        // Lasciarlo `null` avrebbe l'effetto opposto: quelle righe porterebbero
+        // una classe nuova senza un codice che la spieghi.
         assert_eq!(
             code(
                 "openrouter",
                 402,
                 r#"{"error":{"message":"more credits","code":402,"metadata":{"limit_source":"openrouter_credits"}}}"#
-            ),
-            None
+            )
+            .as_deref(),
+            Some(CODICE_AMMISSIONE_CREDITO)
         );
         // Body non-JSON o senza campi: None.
         assert_eq!(code("openai", 502, "502 Bad Gateway (html)"), None);

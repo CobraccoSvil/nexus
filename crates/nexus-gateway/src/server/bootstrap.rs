@@ -98,16 +98,28 @@ struct ProviderDescriptor {
     tiers: Vec<i32>,
     max_context_tokens: i32,
     supports_tools: bool,
+    /// Percorso della lista modelli relativo a `base_url` (mig 0705). Perplexity
+    /// espone le completion sulla radice e i modelli sotto `/v1`: senza questo
+    /// campo la discovery E lo healthcheck di quel fornitore erano 404 fissi.
+    models_path: Option<String>,
 }
 
 /// Carica i descrittori provider dal registry (mig 0565), ordinati. Fallback ai 6
 /// provider noti se la tabella non esiste / e' vuota (fail-safe: se la migrazione
 /// non e' ancora applicata all'avvio, nessuna regressione).
 async fn load_provider_descriptors(db: &PgPool) -> Vec<ProviderDescriptor> {
+    // `models_path` si legge via `to_jsonb(r) ->> ...` e non come colonna: su un DB
+    // dove la mig 0705 non e' ancora applicata la chiave semplicemente non c'e' e il
+    // valore esce NULL, mentre nominarla direttamente sarebbe un errore SQL — e
+    // l'errore qui non degrada al default del campo, degrada all'INTERO registry
+    // (`unwrap_or_default` -> `fallback_descriptors`, cioe' sei provider al posto di
+    // dieci). Il costo di una colonna nuova non puo' essere la sparizione di quattro
+    // fornitori nella finestra fra il riavvio del gateway e le migrazioni.
     let rows = sqlx::query_as::<_, ProviderDescriptor>(
         "SELECT name, api_format, key_setting, enabled_setting, base_url_setting, \
-         base_url_default, activation, tiers, max_context_tokens, supports_tools \
-         FROM nexus_provider_registry WHERE is_active = true ORDER BY sort_order, name",
+         base_url_default, activation, tiers, max_context_tokens, supports_tools, \
+         to_jsonb(r) ->> 'models_path' AS models_path \
+         FROM nexus_provider_registry r WHERE is_active = true ORDER BY sort_order, name",
     )
     .fetch_all(db)
     .await
@@ -145,6 +157,9 @@ fn fallback_descriptors() -> Vec<ProviderDescriptor> {
             tiers,
             max_context_tokens: ctx,
             supports_tools: true,
+            // Nessuno dei sei di ripiego devia dal `/models` del dialetto OpenAI:
+            // il caso che ha motivato il campo (perplexity) non e' fra loro.
+            models_path: None,
         }
     }
     vec![
@@ -333,6 +348,9 @@ fn construct_provider(
                     d.max_context_tokens as u32,
                     d.supports_tools,
                 )
+                // Dove il fornitore non tiene la lista modelli sotto la base delle
+                // completion (perplexity: `/v1/models` contro `/chat/completions`).
+                .with_models_path(d.models_path.as_deref())
                 // Serve agli instradatori per leggere il fornitore a valle
                 // preferito; gli altri endpoint non lo interrogano mai.
                 .with_db(Some(db.clone())),
@@ -378,6 +396,180 @@ mod registry_tests {
     fn attivazione_base_url_vllm() {
         assert!(provider_is_active("base_url", true, false, true, false));
         assert!(!provider_is_active("base_url", true, false, false, false));
+    }
+
+    /// Server finto che risponde 200 SOLO al percorso atteso e 404 a ogni altro,
+    /// esattamente come fa Perplexity. Ritorna la porta e il canale su cui
+    /// pubblica i percorsi che ha davvero ricevuto: e' la sola prova di QUALE
+    /// indirizzo il client abbia interrogato — asserire sul valore del campo
+    /// proverebbe che la struct lo contiene, non che qualcuno lo usi.
+    async fn finge_perplexity(
+        percorso_servito: &'static str,
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("porta effimera");
+        let porta = listener.local_addr().expect("indirizzo").port();
+        let visti = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registro = visti.clone();
+
+        tokio::spawn(async move {
+            // Terminatore di riga del PROTOCOLLO: costante, cosi' un
+            // normalizzatore di fine-riga sull'albero non lo puo' toccare.
+            const CRLF: &str = "\r\n";
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut grezzo = Vec::new();
+                let mut buf = [0u8; 1024];
+                // Fino alla fine degli header: una GET non ha corpo.
+                while !grezzo.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => grezzo.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let richiesta = String::from_utf8_lossy(&grezzo).to_string();
+                let percorso = richiesta
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or_default()
+                    .to_string();
+                registro.lock().expect("registro").push(percorso.clone());
+
+                let (stato, corpo) = if percorso == percorso_servito {
+                    ("200 OK", r#"{"object":"list","data":[{"id":"sonar"}]}"#)
+                } else {
+                    ("404 Not Found", "")
+                };
+                let testa = [
+                    &format!("HTTP/1.1 {stato}"),
+                    "Content-Type: application/json",
+                    &format!("Content-Length: {}", corpo.len()),
+                    "Connection: close",
+                    "",
+                    "",
+                ]
+                .join(CRLF);
+                let _ = socket.write_all(testa.as_bytes()).await;
+                let _ = socket.write_all(corpo.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+
+        (porta, visti)
+    }
+
+    /// IL CASO MISURATO il 13/08/2026 contro l'API reale: Perplexity serve le
+    /// completion sulla radice e i modelli sotto `/v1`, e il registry porta UNA
+    /// base sola. La discovery chiedeva `GET https://api.perplexity.ai/models` e
+    /// prendeva 404 a ogni sync; lo healthcheck e' la STESSA richiesta, quindi per
+    /// il re-probe quel fornitore non sarebbe mai tornato sano.
+    ///
+    /// Attraversa la catena intera (regola O): migrazione reale -> riga di
+    /// `nexus_provider_registry` -> `load_provider_descriptors` -> factory ->
+    /// `list_models()` -> richiesta HTTP vera. Un test che passasse il percorso a
+    /// mano al client proverebbe la concatenazione di due stringhe; il difetto
+    /// stava fra il registry e il client, cioe' proprio nel tratto che quel test
+    /// non attraverserebbe.
+    ///
+    /// MUTAZIONE: togliere `.with_models_path(...)` dalla factory (oppure riportare
+    /// `models_path` a `/models` nella mig 0705) -> il server finto registra
+    /// `/models`, `list_models()` ritorna `perplexity HTTP 404` e questo test cade
+    /// sul difetto reale.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_lista_modelli_segue_il_percorso_dichiarato_dal_registry(db: PgPool) {
+        let (porta, visti) = finge_perplexity("/v1/models").await;
+
+        // La chiave attiva il provider; la base lo punta al server finto. Il
+        // PERCORSO non si tocca: e' quello che la migrazione ha scritto.
+        for (chiave, valore) in [
+            ("perplexity_api_key", "chiave-di-prova".to_string()),
+            ("perplexity_enabled", "true".to_string()),
+            ("perplexity_base_url", format!("http://127.0.0.1:{porta}")),
+        ] {
+            sqlx::query(
+                "INSERT INTO settings (key, value, category) VALUES ($1, $2, 'providers') \
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            )
+            .bind(chiave)
+            .bind(&valore)
+            .execute(&db)
+            .await
+            .expect("settings di prova");
+        }
+
+        let descrittori = load_provider_descriptors(&db).await;
+        let perplexity = descrittori
+            .iter()
+            .find(|d| d.name == "perplexity")
+            .expect("il registry conosce perplexity dalla mig 0568");
+        assert_eq!(
+            perplexity.models_path.as_deref(),
+            Some("/v1/models"),
+            "e' la mig 0705 a dichiararlo: senza, il campo non arriva fin qui"
+        );
+
+        let providers = build_providers(&db, &Client::new(), &descrittori).await;
+        let provider = providers
+            .iter()
+            .find(|p| p.name() == "perplexity")
+            .expect("chiave presente ed enabled: il provider e' attivo");
+
+        let modelli = provider
+            .list_models()
+            .await
+            .expect("il fornitore risponde 200 sul percorso che ha dichiarato");
+        assert_eq!(modelli, vec!["sonar".to_string()]);
+        assert!(
+            provider.healthcheck().await,
+            "lo healthcheck e' la stessa GET: se sbaglia percorso, il fornitore \
+             resta 'non sano' per sempre qualunque cosa faccia"
+        );
+
+        let interrogati = visti.lock().expect("registro").clone();
+        assert!(
+            !interrogati.is_empty() && interrogati.iter().all(|p| p == "/v1/models"),
+            "il client deve interrogare SOLO il percorso dichiarato, percorsi visti: {interrogati:?}"
+        );
+    }
+
+    /// L'altro verso: chi non dichiara nulla resta sul `/models` del dialetto
+    /// OpenAI. Senza questo, il test sopra passerebbe anche mandando tutti a
+    /// `/v1/models`, che romperebbe gli altri otto fornitori.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn chi_non_dichiara_un_percorso_resta_sul_dialetto_openai(db: PgPool) {
+        let (porta, visti) = finge_perplexity("/models").await;
+
+        for (chiave, valore) in [
+            ("mistral_api_key", "chiave-di-prova".to_string()),
+            ("mistral_enabled", "true".to_string()),
+            ("mistral_base_url", format!("http://127.0.0.1:{porta}")),
+        ] {
+            sqlx::query(
+                "INSERT INTO settings (key, value, category) VALUES ($1, $2, 'providers') \
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            )
+            .bind(chiave)
+            .bind(&valore)
+            .execute(&db)
+            .await
+            .expect("settings di prova");
+        }
+
+        let descrittori = load_provider_descriptors(&db).await;
+        let providers = build_providers(&db, &Client::new(), &descrittori).await;
+        let mistral = providers
+            .iter()
+            .find(|p| p.name() == "mistral")
+            .expect("chiave presente ed enabled");
+
+        assert_eq!(
+            mistral.list_models().await.expect("200 su /models"),
+            vec!["sonar".to_string()]
+        );
+        assert_eq!(visti.lock().expect("registro").as_slice(), ["/models"]);
     }
 
     #[test]

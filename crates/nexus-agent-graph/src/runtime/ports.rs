@@ -93,6 +93,14 @@ pub enum ProviderFailureCause {
     /// `ClientError`). Incidente reale: groq/128k dopo google/1M -> 413 -> niente
     /// secondo failover -> figura consiglio n/d.
     ContextTooLong,
+    /// La richiesta non e' stata AMMESSA perche' la sua prenotazione supera il
+    /// credito RESIDUO del fornitore (402 di OpenRouter, misurato il 13/08/2026
+    /// con credito disponibile). Il fornitore serve: e' questa richiesta a non
+    /// starci dentro, quindi failover cross-provider come `ContextTooLong` —
+    /// ma NON e' quello, e la differenza sta nel rimedio: li' serve una finestra
+    /// piu' grande, qui ricaricare o chiedere meno. Non e' nemmeno `Billing`,
+    /// che significherebbe fornitore fuori uso fino a ricarica.
+    RequestExceedsCredit,
     /// Non determinabile dai segnali disponibili.
     Unknown,
 }
@@ -107,6 +115,7 @@ impl ProviderFailureCause {
             Self::PolicyTierExcluded => "policy_tier_excluded",
             Self::EmptyCompletion => "empty_completion",
             Self::ContextTooLong => "context_too_long",
+            Self::RequestExceedsCredit => "request_exceeds_credit",
             Self::Unknown => "unknown",
         }
     }

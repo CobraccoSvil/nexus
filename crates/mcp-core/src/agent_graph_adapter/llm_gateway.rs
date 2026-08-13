@@ -274,6 +274,12 @@ fn classify_gateway_error(err: &anyhow::Error) -> PortError {
                 // cross-provider (ramo else != ClientError in allows_cross_provider_failover),
                 // invece di chiudere n/d. Simmetrico a `empty_completion`.
                 Some("context_too_long") => ProviderFailureCause::ContextTooLong,
+                // 402 di AMMISSIONE (OpenRouter prenota il costo massimo contro
+                // il credito residuo): il fornitore serve, e' questa richiesta a
+                // non starci. Causa dedicata e non `Billing`, che qui vorrebbe
+                // dire "fuori uso fino a ricarica", ne' `ContextTooLong`, che
+                // manderebbe l'escalation a cercare una finestra piu' grande.
+                Some("request_exceeds_credit") => ProviderFailureCause::RequestExceedsCredit,
                 // 200 degenere (content vuoto, zero tool-call, finish non
                 // terminale): il provider e' sano ma il turno e' improduttivo.
                 // Causa dedicata cosi' l'executor RIPIEGA cross-provider (ramo

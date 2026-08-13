@@ -823,6 +823,10 @@ fn classify_by_error_class(error_class: Option<&str>) -> ClasseStrutturata {
         Some("invalid_request")
         | Some("unprocessable")
         | Some("context_too_long")
+        // 402 di ammissione: il credito c'e' (misurato con 64.811 token di
+        // residuo), non ci sta questa richiesta. Un cooldown lo toglierebbe
+        // dalla selezione mentre serve.
+        | Some("request_exceeds_credit")
         | Some("unsupported") => C::NessunCooldown,
         _ => C::Sconosciuta,
     }

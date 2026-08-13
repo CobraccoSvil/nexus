@@ -370,6 +370,25 @@ pub enum CausaErrore {
     MalformedRequest,
     AuthDenied,
     RequestTooLarge,
+    /// Il credito C'E', e non copre QUESTA richiesta.
+    ///
+    /// Distinta da [`Self::CreditExhausted`] perche' i rimedi sono opposti e uno
+    /// dei due e' inutile: li' bisogna ricaricare e attendere (cooldown lungo),
+    /// qui basta abbassare `max_tokens` — oppure ricaricare — e il fornitore nel
+    /// frattempo STA SERVENDO, quindi tenerlo fuori per sei ore e' un danno.
+    ///
+    /// Nasce dal 402 di OpenRouter, che PRENOTA il costo massimo della richiesta
+    /// contro il saldo residuo e rifiuta se non ci sta, allegando il rimedio in
+    /// `metadata.remedy_hint`: «Add credits **or lower max_tokens**».
+    ///
+    /// La mig 0707 aveva concluso [`Self::CreditExhausted`] da una premessa
+    /// GIUSTA — 127 righe con `metadata.limit_source = openrouter_credits` — ma
+    /// quel campo dice DA DOVE viene il limite (il credito OpenRouter, non il
+    /// fornitore a valle), non che il credito sia zero. Smentito il 13/08/2026:
+    /// saldo misurato via `GET /api/v1/credits` a 10,01 dollari residui, e 41
+    /// messaggi distinti tutti nella forma «can only afford N» con N fra 432 e
+    /// 64811 token, cioe' mai zero. Vedi mig 0709.
+    RequestExceedsCredit,
 }
 
 impl CausaErrore {
@@ -385,6 +404,7 @@ impl CausaErrore {
             "malformed_request" => Some(Self::MalformedRequest),
             "auth_denied" => Some(Self::AuthDenied),
             "request_too_large" => Some(Self::RequestTooLarge),
+            "request_exceeds_credit" => Some(Self::RequestExceedsCredit),
             _ => None,
         }
     }
@@ -399,6 +419,7 @@ impl CausaErrore {
             Self::MalformedRequest => "malformed_request",
             Self::AuthDenied => "auth_denied",
             Self::RequestTooLarge => "request_too_large",
+            Self::RequestExceedsCredit => "request_exceeds_credit",
         }
     }
 
@@ -413,6 +434,11 @@ impl CausaErrore {
                 ClasseErrore::ClientError
             }
             Self::RequestTooLarge => ClasseErrore::ContextTooLong,
+            // NON `Billing`: quella classe si traduce sul wire in un'esclusione
+            // di CREDITO, che in mcp-core significa sei ore fuori
+            // (`EsclusioneDichiarata::Credito`). Qui il fornitore serve, e la
+            // conseguenza giusta e' nessun cooldown piu' failover cross-provider.
+            Self::RequestExceedsCredit => ClasseErrore::RequestExceedsCredit,
         }
     }
 }
@@ -1337,7 +1363,14 @@ mod tests {
                 status: 402,
                 body: r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 65536 tokens, but can only afford 62186.","code":402,"metadata":{"limit_source":"openrouter_credits","remedy_hint":"Add credits at https://openrouter.ai/settings/credits"}}}"#,
                 classe_oggi: ClasseErrore::Billing,
-                differenza_dichiarata: None,
+                differenza_dichiarata: Some(
+                    "VOLUTO (mig 0709): il 402 di openrouter e' un rifiuto di AMMISSIONE, non un \
+                     saldo a zero. Il fornitore prenota il costo massimo contro il residuo e \
+                     rifiuta se non ci sta; il saldo misurato il 13/08/2026 era 10,01 dollari e i \
+                     41 messaggi distinti dicono tutti \"can only afford N\" con N fra 432 e \
+                     64811. Da Billing (sei ore di cooldown su un fornitore che serve) a \
+                     RequestExceedsCredit (niente cooldown, failover cross-provider)",
+                ),
                 troncato_in_persistenza: true,
             },
             VoceCorpus {
@@ -1419,15 +1452,19 @@ mod tests {
     /// La voce del difetto: si riconosce dal campo che la DICHIARA tale, non
     /// dalla posizione nel vettore. Un riordino del corpus non deve poter
     /// spostare in silenzio l'oggetto di due test.
+    /// Le differenze dichiarate sono ora DUE (openai credito, openrouter
+    /// ammissione), quindi «l'unica dichiarata» non identifica piu' nulla: la
+    /// voce si riconosce dal CORPO che la produce, che e' la sua identita' e non
+    /// cambia con l'ordine del vettore ne' col numero delle altre.
     fn voce_del_difetto() -> VoceCorpus {
         let mut dichiarate: Vec<VoceCorpus> = corpus()
             .into_iter()
-            .filter(|v| v.differenza_dichiarata.is_some())
+            .filter(|v| v.differenza_dichiarata.is_some() && v.body == BODY_OPENAI_CREDITO)
             .collect();
         assert_eq!(
             dichiarate.len(),
             1,
-            "il corpus dichiara una sola differenza voluta: se ne compaiono altre,              vanno motivate una per una"
+            "il difetto openai e' UNA voce del corpus, identificata dal proprio corpo"
         );
         dichiarate.remove(0)
     }
