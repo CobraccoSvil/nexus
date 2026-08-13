@@ -356,6 +356,35 @@ pub fn registra_esclusione_dichiarata(esclusione: &EsclusioneDichiarata) {
             }
         }
         EsclusioneDichiarata::Attesa { provider, secondi } => {
+            // ALLINEARE, MAI ACCORCIARE. `metti_in_cooldown_breve` fa un insert
+            // incondizionato e registra severita' `Short`: senza questa guardia
+            // un'attesa da 30 secondi SOSTITUIREBBE un cooldown di credito da 6
+            // ore, e con la severita' cadrebbe anche
+            // `is_provider_in_billing_cooldown` — cioe' il probe periodico
+            // tornerebbe a interrogare un fornitore senza credito, che e' la
+            // protezione documentata poco sopra. Il percorso non e' teorico:
+            // basta una chiamata pinnata su quel fornitore (il probe stesso ne
+            // fa) perche' il gateway dichiari un'attesa breve.
+            //
+            // Il verso e' quello sicuro: un'attesa piu' LUNGA di quella nota
+            // aggiorna, una piu' corta si ignora. L'errore cade sul tenere
+            // fuori qualcuno un po' piu' del necessario, mai sul rimettere in
+            // gioco un fornitore che non puo' servire.
+            let residuo_noto = cooldown_snapshot_entries()
+                .into_iter()
+                .find(|e| e.provider.eq_ignore_ascii_case(provider))
+                .map(|e| e.remaining_seconds)
+                .unwrap_or(0);
+            if *secondi <= residuo_noto {
+                tracing::debug!(
+                    target: "provider_cooldown",
+                    provider = %provider,
+                    attesa_s = *secondi,
+                    residuo_noto,
+                    "esclusione dichiarata dal gateway: gia' escluso piu' a lungo, non si accorcia"
+                );
+                return;
+            }
             put_provider_in_short_cooldown(
                 provider,
                 "gateway: attesa dichiarata dal fornitore",
@@ -1240,6 +1269,68 @@ mod tests_esclusione_dal_gateway {
             voce.severity,
             Some(CooldownSeverity::Long),
             "il credito non e' un'attesa: a liberarlo dev'essere chi lo verifica"
+        );
+
+        remove_cooldown(p);
+    }
+
+    /// IL DIFETTO trovato dalla review avversaria del 13/08/2026, prima che
+    /// arrivasse in esercizio: un'attesa breve NON deve poter accorciare un
+    /// cooldown lungo. Senza la guardia, 30 secondi dichiarati dal gateway
+    /// sostituivano le 6 ore del credito e — degradando la severita' a `Short`
+    /// — spegnevano anche `is_provider_in_billing_cooldown`, cioe' la
+    /// protezione che tiene il probe periodico lontano da un fornitore senza
+    /// credito.
+    ///
+    /// MUTAZIONE che lo fa rosseggiare: togliere il confronto col residuo noto
+    /// in `registra_esclusione_dichiarata`.
+    #[test]
+    fn un_attesa_breve_non_accorcia_un_cooldown_lungo() {
+        let p = "prova-attesa-non-accorcia";
+        put_provider_in_long_cooldown(p, "credito esaurito");
+        assert!(is_provider_in_billing_cooldown(p), "premessa: e' fuori per credito");
+
+        registra_esclusione_dichiarata(&EsclusioneDichiarata::Attesa {
+            provider: p.to_string(),
+            secondi: 30,
+        });
+
+        assert!(
+            is_provider_in_billing_cooldown(p),
+            "un'attesa di 30s ha declassato un cooldown di credito: il probe \
+             tornerebbe a interrogare un fornitore che non puo' servire"
+        );
+        let residuo = cooldown_snapshot_entries()
+            .into_iter()
+            .find(|e| e.provider == p)
+            .map(|e| e.remaining_seconds)
+            .unwrap_or(0);
+        assert!(residuo > 30, "la scadenza lunga e' stata accorciata: {residuo}s");
+
+        remove_cooldown(p);
+    }
+
+    /// Il contrappunto, senza il quale il test sopra sarebbe compatibile con
+    /// «non registrare mai un'attesa»: piu' LUNGA della scadenza nota, aggiorna.
+    #[test]
+    fn un_attesa_piu_lunga_di_quella_nota_aggiorna() {
+        let p = "prova-attesa-piu-lunga";
+        registra_esclusione_dichiarata(&EsclusioneDichiarata::Attesa {
+            provider: p.to_string(),
+            secondi: 30,
+        });
+        registra_esclusione_dichiarata(&EsclusioneDichiarata::Attesa {
+            provider: p.to_string(),
+            secondi: 1800,
+        });
+        let residuo = cooldown_snapshot_entries()
+            .into_iter()
+            .find(|e| e.provider == p)
+            .map(|e| e.remaining_seconds)
+            .unwrap_or(0);
+        assert!(
+            residuo > 1000,
+            "un'attesa piu' lunga deve aggiornare la scadenza: {residuo}s"
         );
 
         remove_cooldown(p);
