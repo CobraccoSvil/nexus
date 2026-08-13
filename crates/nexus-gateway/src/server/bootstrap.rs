@@ -296,7 +296,15 @@ fn construct_provider(
         // registry, ma il ramo per nome precede il controllo sul formato. I
         // quirk (temperatura fissa, max_completion_tokens, Preserved Thinking)
         // sono nel dialetto, non qui.
-        "kimi" => Some(Arc::new(KimiProvider::new(http.clone(), k, base_url))),
+        // DB passato per: disattivabilita' del pensiero per modello (mig 0705,
+        // regola G). Senza, nessuna richiesta lo spegne e il tetto di output se
+        // lo prende il ragionamento.
+        "kimi" => Some(Arc::new(KimiProvider::with_db(
+            http.clone(),
+            k,
+            base_url,
+            Some(db.clone()),
+        ))),
         "vllm" => {
             // vLLM: base_url obbligatoria (l'attivazione 'base_url' l'ha garantita).
             let url = base_url?;

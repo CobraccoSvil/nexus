@@ -52,9 +52,9 @@ pub enum ReasoningDialect {
     /// `max_tokens` e accetta `reasoning_effort`; non espone il reasoning come
     /// testo, solo i `reasoning_tokens` in `completion_tokens_details`.
     OpenAiReasoning,
-    /// Moonshot/Kimi: il pensiero e' SEMPRE acceso e non si spegne, quindi il
-    /// dialetto non e' una preferenza da esprimere ma un contratto da rispettare.
-    /// Tre differenze dal dialetto base, tutte documentate:
+    /// Moonshot/Kimi: il pensiero e' sempre acceso di DEFAULT, e su una parte del
+    /// parco — non su tutto — si puo' spegnere. Quattro differenze dal dialetto
+    /// base, tutte documentate:
     ///
     /// - `temperature` e' FISSA sui modelli moderni e "passing any other value
     ///   returns an error" (doc `/docs/api/models-overview`): non si invia. Non e'
@@ -73,11 +73,21 @@ pub enum ReasoningDialect {
     ///   toglierlo lo fa ricominciare da capo su un modello che pensa sempre.
     ///   Non e' una difesa da un errore, e' la continuita' del pensiero.
     ///
-    /// Non emette `thinking` ne' `reasoning_effort`: i default del fornitore sono
-    /// dichiarati (k3 `max`, k2.x `enabled`) e nessun chiamante esprime oggi una
-    /// preferenza. Un ramo senza produttore sarebbe codice morto (regola O), e
-    /// per giunta rischioso: su `kimi-k2.7-code` un `thinking` esplicito diverso
-    /// da `{"type":"enabled","keep":"all"}` e' un errore.
+    /// - `extra_body.thinking.type = disabled` quando il chiamante vuole una
+    ///   risposta e non un ragionamento, E il catalogo dichiara che quel modello
+    ///   lo consente. MISURATO il 13/08/2026: `disabled` e' accettato da
+    ///   `kimi-k2.6` e `kimi-k3` (il reasoning scende da 575 token a 1) ed e'
+    ///   HTTP 400 «only type=enabled is allowed» su `kimi-k2.7-code` e
+    ///   `-highspeed`. Conta perche' qui `max_completion_tokens` limita l'output
+    ///   TOTALE: col pensiero acceso il tetto se lo prende il ragionamento e il
+    ///   `content` resta vuoto (`degenerate_hollow` a 1024) o la chiamata sfora il
+    ///   tempo (214,8s a 8192). Chi decide e' [`super::kimi::KimiProvider`], che
+    ///   legge il fatto dal catalogo; qui si applica soltanto.
+    ///
+    /// `reasoning_effort` non si emette: e' accettato dal solo `kimi-k3` e nessun
+    /// chiamante lo esprime oggi. Un ramo senza produttore sarebbe codice morto
+    /// (regola O), e la distinzione fra k3 e i k2.x va fatta con un dato (regola
+    /// G), non con un riconoscimento sul nome scritto qui prima che serva.
     Kimi,
 }
 
@@ -1002,14 +1012,32 @@ fn build_request_body(
         None
     };
 
-    // DeepSeek: thinking ufficiale via extra_body. Lo inviamo SOLO quando vogliamo
-    // forzare uno stato esplicito (disabled per task interni/tool; enabled su
-    // richiesta thinking). Senza extra_body DeepSeek usa il suo default.
-    let extra_body = if reasoning.dialect == ReasoningDialect::DeepSeek {
-        let kind = if reasoning.enabled { "enabled" } else { "disabled" };
-        Some(serde_json::json!({ "thinking": { "type": kind } }))
-    } else {
-        None
+    // Controllo del pensiero via `extra_body.thinking.type`: stesso campo per i
+    // due dialetti che lo documentano, ma NON la stessa forza, e la differenza e'
+    // deliberata.
+    //
+    // DeepSeek: si dichiarano ENTRAMBI gli stati. Lo inviamo solo quando vogliamo
+    // forzarne uno esplicito (disabled per task interni/tool; enabled su richiesta
+    // thinking); senza extra_body DeepSeek usa il suo default.
+    //
+    // Kimi: si dichiara SOLO lo spegnimento. L'accensione non si manda perche' non
+    // aggiungerebbe nulla — il pensiero e' gia' acceso di default su tutto il parco
+    // moderno — e perche' costerebbe un rischio non misurato: su `kimi-k2.7-code`
+    // la doc pretende esattamente `{"type":"enabled","keep":"all"}`, quindi un
+    // `{"type":"enabled"}` nudo e' una forma che nessuno ha provato. Cio' che e'
+    // MISURATO (13/08/2026) e' l'altro verso: `disabled` passa su k2.6 e k3, ed e'
+    // 400 su k2.7-code — per questo `enabled=false` puo' nascere solo da
+    // [`kimi::KimiProvider`] dopo aver chiesto al catalogo se quel modello lo
+    // consenta. Qui si applica soltanto.
+    let extra_body = match reasoning.dialect {
+        ReasoningDialect::DeepSeek => {
+            let kind = if reasoning.enabled { "enabled" } else { "disabled" };
+            Some(serde_json::json!({ "thinking": { "type": kind } }))
+        }
+        ReasoningDialect::Kimi if !reasoning.enabled => {
+            Some(serde_json::json!({ "thinking": { "type": "disabled" } }))
+        }
+        _ => None,
     };
 
     // tool_choice: dialetto OpenAI nativo, inoltrato tale e quale (canonicalizzato)
