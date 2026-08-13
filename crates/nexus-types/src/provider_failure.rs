@@ -68,6 +68,62 @@ pub mod classe {
     pub const EMPTY_COMPLETION: &str = "empty_completion";
 }
 
+/// La classe con cui il gateway decide retry e cooldown di UNA chiamata.
+///
+/// Vive QUI, accanto al vocabolario di wire, perche' la sua proiezione sul wire
+/// e' [`classe`] — che mcp-core legge gia' da questo crate. Finche' l'enum stava
+/// nel gateway, la traduzione `classe -> stringa` era scritta a mano in DUE
+/// punti a 700 righe di distanza (`provider_facts_from_error` e
+/// `CallFailure::from_error`): la stessa domanda con due risposte, che e'
+/// esattamente la forma di difetto che la regola L vieta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClasseErrore {
+    /// Crediti/quota/fatturazione: il fornitore e' inutilizzabile finche' non si
+    /// ricarica. NIENTE retry; cooldown lungo (`mark_billing`).
+    Billing,
+    /// Errore lato richiesta o configurazione (4xx client): ritentare NON aiuta
+    /// e mettere in cooldown il FORNITORE e' sbagliato (il problema e' la
+    /// singola richiesta o il singolo modello). NIENTE retry, NIENTE cooldown.
+    ClientError,
+    /// Richiesta troppo grande per QUESTO fornitore (413 request_too_large).
+    /// Come `ClientError` per il retry, ma cross-provider-RECUPERABILE: un
+    /// fornitore a finestra piu' grande accetterebbe la stessa richiesta, quindi
+    /// a livello motore e' un failover e non una chiusura.
+    ContextTooLong,
+    /// Transitorio (429 rate-limit, 5xx, timeout, connessione) o IGNOTO:
+    /// ritentabile con backoff. Dopo l'ultimo tentativo, cooldown breve.
+    Transient,
+}
+
+impl ClasseErrore {
+    /// L'UNICA traduzione classe -> stringa di wire.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Billing => classe::BILLING,
+            Self::ClientError => classe::CLIENT_ERROR,
+            Self::ContextTooLong => classe::CONTEXT_TOO_LONG,
+            Self::Transient => classe::TRANSIENT,
+        }
+    }
+
+    /// La semantica HTTP, e nient'altro: il 402 lo fissa l'RFC, non l'admin.
+    ///
+    /// E' l'ULTIMO anello della classificazione — quello che decide quando NON
+    /// sappiamo — e resta invariata rispetto alla tabella storica del gateway:
+    /// e' cio' che rende la migrazione al catalogo dei codici non-regressiva per
+    /// costruzione (dove nulla e' riconosciuto, il risultato e' identico a
+    /// prima). E' anche l'unico anello disponibile quando non c'e' un body:
+    /// MISURATE migliaia di righe di errore senza status ne' codice (trasporto).
+    pub fn da_status(status: u16) -> Self {
+        match status {
+            402 => Self::Billing,
+            413 => Self::ContextTooLong,
+            400 | 401 | 403 | 404 | 405 | 406 | 409 | 410 | 415 | 422 => Self::ClientError,
+            _ => Self::Transient,
+        }
+    }
+}
+
 /// Chiavi del blocco `details` che il gateway compone e mcp-core rilegge.
 pub mod chiave {
     /// Array dei fallimenti per fornitore, in ordine di tentativo.
@@ -180,6 +236,42 @@ impl EsclusioneDichiarata {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn la_classe_ha_una_sola_traduzione_sul_wire() {
+        // Le due copie storiche (routes.rs:271 e :999) producevano queste stesse
+        // quattro stringhe: se una delle due fosse andata in drift, il campo
+        // `class` avrebbe significato due cose a seconda del ramo che lo scrive.
+        assert_eq!(ClasseErrore::Billing.as_wire(), classe::BILLING);
+        assert_eq!(ClasseErrore::ClientError.as_wire(), classe::CLIENT_ERROR);
+        assert_eq!(
+            ClasseErrore::ContextTooLong.as_wire(),
+            classe::CONTEXT_TOO_LONG
+        );
+        assert_eq!(ClasseErrore::Transient.as_wire(), classe::TRANSIENT);
+    }
+
+    #[test]
+    fn la_tabella_per_status_resta_quella_storica() {
+        // E' l'anello che decide quando NON sappiamo: cambiarlo qui sposterebbe
+        // la classe di ogni errore non dichiarato, cioe' del caso piu' comune.
+        assert_eq!(ClasseErrore::da_status(402), ClasseErrore::Billing);
+        assert_eq!(ClasseErrore::da_status(413), ClasseErrore::ContextTooLong);
+        for s in [400, 401, 403, 404, 405, 406, 409, 410, 415, 422] {
+            assert_eq!(
+                ClasseErrore::da_status(s),
+                ClasseErrore::ClientError,
+                "status {s}"
+            );
+        }
+        for s in [408, 425, 429, 500, 502, 503, 529] {
+            assert_eq!(
+                ClasseErrore::da_status(s),
+                ClasseErrore::Transient,
+                "status {s}"
+            );
+        }
+    }
 
     #[test]
     fn le_classi_di_credito_producono_esclusione_per_credito() {

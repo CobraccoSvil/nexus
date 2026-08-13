@@ -31,6 +31,7 @@ use crate::model_alias_resolver::ModelAliasResolver;
 use crate::policy_engine::PolicyEngine;
 use crate::provider::LlmProvider;
 use crate::redaction::presidio_client::PresidioClient;
+use crate::tassonomia_errori::VocabolarioErrori;
 
 use self::bootstrap::GatewayConfig;
 
@@ -52,6 +53,11 @@ pub struct AppState {
     pub mcp_core_url: String,
     /// Manager dei cooldown (condiviso col re-probe loop).
     pub cooldown: CooldownManager,
+    /// Catalogo dei codici errore fornitore (mig 0705), condiviso col loop di
+    /// ricarica. Il percorso di decisione legge la mappa in memoria e non prende
+    /// mai una connessione: quando si classifica un errore, il DB puo' essere
+    /// proprio la cosa che sta male.
+    pub vocabolario_errori: VocabolarioErrori,
     /// Stato ricaricabile a caldo (provider/policy/alias) protetto da `RwLock`.
     pub runtime: Arc<tokio::sync::RwLock<RuntimeState>>,
 }

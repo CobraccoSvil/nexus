@@ -981,8 +981,8 @@ impl LlmProvider for GoogleProvider {
 
         let status = resp.status();
         if !status.is_success() {
-            // Regola F: body d'errore propagato al caller (cooldown Fase 3 lo
-            // classifica via is_billing_error), non loggato qui in chiaro.
+            // Regola F: body d'errore propagato al caller (che lo classifica col
+            // catalogo dei codici, `tassonomia_errori`), non loggato qui in chiaro.
             let text = resp.text().await.unwrap_or_default();
             return Err(
                 super::ProviderHttpError::from_response("google", status.as_u16(), text).into(),
@@ -1145,8 +1145,8 @@ impl LlmProvider for GoogleProvider {
         let resp = builder.json(&body).send().await?;
         let status = resp.status();
         if !status.is_success() {
-            // Regola F: body d'errore propagato al caller (cooldown lo classifica
-            // via is_billing_error), non loggato qui in chiaro.
+            // Regola F: body d'errore propagato al caller (che lo classifica col
+            // catalogo dei codici, `tassonomia_errori`), non loggato qui in chiaro.
             let text = resp.text().await.unwrap_or_default();
             return Err(
                 super::ProviderHttpError::from_response("google", status.as_u16(), text).into(),

@@ -149,6 +149,27 @@ bash scripts/quality-scan.sh --gate     # default: exit!=0 su regressione
 bash scripts/quality-scan.sh --update   # riallinea la baseline al ribasso dopo un refactor
 ```
 
+### Deroghe dichiarate (baseline alzata, e perche')
+
+Il ratchet ammette di alzare la baseline «se le violazioni sono giustificate».
+Una deroga senza il suo motivo e' pero' indistinguibile da una resa: qui si
+annota chi l'ha alzata e quale metrica.
+
+**2026-08-13, `total` 7367 -> 7388 (+21), classificazione strutturale degli
+errori fornitore (mig 0705).** I 21 findings sono TUTTI di categoria `style`
+(riga > 120 colonne) e stanno TUTTI dentro `mod tests`: sono i corpi d'errore
+JSON **verbatim** dei fornitori, che i test passano al produttore reale
+(`ProviderHttpError::from_response`). Nella parte di PRODUZIONE dei file nuovi
+le righe lunghe sono **zero** — verificato col filtro dello scanner, che esclude
+commenti e `use`. Spezzarli con `concat!` accorcerebbe le righe alterando
+l'oggetto della misura: quei byte sono la prova, non uno stile.
+
+Le altre tre metriche sono a **+0**, e non per deroga: `giudica` e `registra`
+sono state scomposte (la motivazione del quirk e' passata nella doc, e la
+programmazione della scrittura e' ora `programma_scrittura`), e i quattro
+`map_err` del media-gen sono tornati a una riga con l'helper `errore_provider` —
+senza il quale `run_text_to_speech` superava le 50 righe.
+
 Nota di attribuzione: il porting LangGraph->Rust (`nexus-agent-graph` +
 `nexus-gateway`) contribuisce solo ~15% dei findings, ~11% delle funzioni
 lunghe e ~9% della complessita estrema. Gli hotspot peggiori (complessita 104

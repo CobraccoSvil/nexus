@@ -40,7 +40,8 @@ use crate::cooldown::{CooldownManager, RetryPolicy};
 use crate::history_sanitizer::{self, SanitizeMode};
 use crate::model_alias_resolver::{strip_provider_prefix, ModelAliasResolver};
 use crate::provider::LlmProvider;
-use crate::providers::{classify_provider_error, ProviderErrorKind, ProviderHttpError};
+use crate::providers::{ProviderErrorKind, ProviderHttpError};
+use crate::tassonomia_errori::{VerdettoErrore, VocabolarioErrori};
 use crate::redaction::pipeline::{RedactionOptions, RedactionPipeline};
 use crate::redaction::sensitivity_classifier::SensitivityClassifier;
 use crate::types::{
@@ -187,13 +188,23 @@ impl PipelineError {
     /// Fallimento di una chiamata a UN provider quando l'errore tipizzato e'
     /// ancora nella catena (media-gen, stream SSE): i fatti si estraggono dal
     /// [`ProviderHttpError`], non dal suo `Display`.
-    fn provider_call_failed(provider: &str, model: &str, err: &anyhow::Error) -> Self {
+    fn provider_call_failed(
+        vocabolario: &VocabolarioErrori,
+        provider: &str,
+        model: &str,
+        err: &anyhow::Error,
+    ) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "PROVIDER_ERROR".to_string(),
             message: err.to_string(),
             details: None,
-            facts: Box::new(provider_facts_from_error(err, provider, Some(model))),
+            facts: Box::new(provider_facts_from_error(
+                vocabolario,
+                err,
+                provider,
+                Some(model),
+            )),
         }
     }
     fn invalid_request(message: impl Into<String>) -> Self {
@@ -266,14 +277,18 @@ fn request_budget_exceeded_body(budget_seconds: u64) -> (StatusCode, Value) {
 /// che lo trasporta (punto unico nel gateway, regola L+M): status e codice dal
 /// [`ProviderHttpError`] della catena, classe dal classificatore, `error.message`
 /// del provider come frase upstream, body integrale in `detail`.
-fn provider_facts_from_error(err: &anyhow::Error, provider: &str, model: Option<&str>) -> ErrorFacts {
+fn provider_facts_from_error(
+    vocabolario: &VocabolarioErrori,
+    err: &anyhow::Error,
+    provider: &str,
+    model: Option<&str>,
+) -> ErrorFacts {
     let http = err.chain().find_map(|c| c.downcast_ref::<ProviderHttpError>());
-    let class = match classify_provider_error(err) {
-        ProviderErrorKind::Billing => "billing",
-        ProviderErrorKind::ClientError => "client_error",
-        ProviderErrorKind::ContextTooLong => "context_too_long",
-        ProviderErrorKind::Transient => "transient",
-    };
+    // `verdetto_muto`: la RESA di un fallimento gia' classificato non deve
+    // registrare una seconda volta il codice ignoto, o lo stesso errore
+    // conterebbe due occorrenze - una per la decisione, una per il modo in cui
+    // la si racconta.
+    let class = vocabolario.verdetto_muto(err).classe.as_wire();
     ErrorFacts {
         domain: ErrorDomain::Provider,
         http_status: http.map(|h| h.status),
@@ -288,6 +303,20 @@ fn provider_facts_from_error(err: &anyhow::Error, provider: &str, model: Option<
         upstream_message: http.and_then(|h| h.structured_message()),
         detail: err.to_string(),
     }
+}
+
+/// Il fallimento di UNA chiamata provider, col verdetto del catalogo dei codici.
+///
+/// Esiste per non ripetere in ogni ramo media-gen il percorso fino al
+/// vocabolario: quattro `map_err` identici che nominano lo stesso campo dello
+/// stesso stato sono la stessa riga scritta quattro volte.
+fn errore_provider(
+    state: &AppState,
+    provider: &str,
+    model: &str,
+    e: &anyhow::Error,
+) -> PipelineError {
+    PipelineError::provider_call_failed(&state.vocabolario_errori, provider, model, e)
 }
 
 /// Guardia d'ingresso della pipeline (punto unico, regola L): una richiesta con
@@ -573,6 +602,7 @@ async fn run_complete(
     let esito_chain = run_fallback(
         &resolved,
         &state.cooldown,
+        &state.vocabolario_errori,
         &redacted_req,
         strict,
         timeouts.per_attempt,
@@ -737,9 +767,11 @@ fn resolve_pinned_provider(
 ///
 /// `strict = false` (chain multi-provider, path non-pin): un tentativo per
 /// provider, poi passa al successivo (comportamento storico).
+#[allow(clippy::too_many_arguments)]
 async fn run_fallback(
     resolved: &[ResolvedProvider],
     cooldown: &CooldownManager,
+    vocabolario: &VocabolarioErrori,
     base_req: &LlmRequest,
     strict: bool,
     per_attempt: std::time::Duration,
@@ -815,6 +847,7 @@ async fn run_fallback(
             &req,
             name,
             cooldown,
+            vocabolario,
             &policy,
             strict,
             per_attempt,
@@ -996,12 +1029,10 @@ impl CallFailure {
     fn from_error(kind: ProviderErrorKind, err: &anyhow::Error) -> Self {
         let http = err.chain().find_map(|c| c.downcast_ref::<ProviderHttpError>());
         Self {
-            class: match kind {
-                ProviderErrorKind::Billing => classe::BILLING,
-                ProviderErrorKind::ClientError => classe::CLIENT_ERROR,
-                ProviderErrorKind::ContextTooLong => classe::CONTEXT_TOO_LONG,
-                ProviderErrorKind::Transient => classe::TRANSIENT,
-            },
+            // UNA sola traduzione classe -> wire, in `nexus-types` accanto al
+            // vocabolario che mcp-core legge: questo `match` ne era la seconda
+            // copia, a 700 righe da quella di `provider_facts_from_error`.
+            class: kind.as_wire(),
             status: http.map(|h| h.status),
             code: http.and_then(|h| h.code.clone()),
             message: err.to_string(),
@@ -1086,6 +1117,7 @@ async fn complete_with_retry(
     req: &LlmRequest,
     name: &str,
     cooldown: &CooldownManager,
+    vocabolario: &VocabolarioErrori,
     policy: &RetryPolicy,
     strict: bool,
     per_attempt: std::time::Duration,
@@ -1195,9 +1227,18 @@ async fn complete_with_retry(
                 return Ok(resp);
             }
             Err(err) => {
-                // Classificazione DETERMINISTICA su status/codice strutturato
-                // (regola H): il testo del messaggio serve solo per log/display.
-                let kind = classify_provider_error(&err);
+                // Classificazione STRUTTURALE (regole H+M): decide il primo
+                // candidato RICONOSCIUTO dal catalogo dei codici (mig 0705), non
+                // il primo campo presente confrontato per sottostringa. Il testo
+                // del messaggio serve solo per log/display.
+                //
+                // E' `verdetto` e non `verdetto_muto`: qui l'errore viene
+                // classificato per DECIDERE, ed e' l'unico punto in cui un
+                // codice mai visto puo' essere scoperto - il log non basta,
+                // MISURATO: `code=` esce solo dal ramo ClientError e delle 4439
+                // chiamate sbagliate non e' rimasta una riga.
+                let verdetto: VerdettoErrore = vocabolario.verdetto(&err);
+                let kind = verdetto.classe;
                 let http = err
                     .chain()
                     .find_map(|c| c.downcast_ref::<ProviderHttpError>());
@@ -1213,7 +1254,7 @@ async fn complete_with_retry(
                     ProviderErrorKind::ClientError => {
                         let code = failure.code.as_deref();
                         let status = failure.status.unwrap_or(0);
-                        if history_sanitizer::is_invalid_model_error(code, status) {
+                        if history_sanitizer::is_invalid_model_error(verdetto.causa, status) {
                             tracing::warn!(
                                 provider = name,
                                 status = failure.status,
@@ -1223,7 +1264,7 @@ async fn complete_with_retry(
                             return Err(failure);
                         }
                         if retry_aggressivo_disponibile
-                            && history_sanitizer::is_history_related_client_error(code)
+                            && history_sanitizer::is_history_related_client_error(verdetto.causa)
                         {
                             retry_aggressivo_disponibile = false;
                             if !history_sanitizer::retry_changes_history(
@@ -1717,7 +1758,7 @@ async fn build_sse_stream(
             }
             Err(err) => {
                 let name = rp.provider.name();
-                let kind = classify_provider_error(&err);
+                let kind = state.vocabolario_errori.verdetto(&err).classe;
                 let msg = err.to_string();
                 match kind {
                     ProviderErrorKind::Billing => state.cooldown.mark_billing(name, Some(msg.clone())),
@@ -1741,9 +1782,14 @@ async fn build_sse_stream(
                 // guardava perche' lo streaming e' l'eccezione.
                 let _ = tx
                     .send(Ok(Event::default().data(
-                        PipelineError::provider_call_failed(name, &req.model, &err)
-                            .to_body()
-                            .to_string(),
+                        PipelineError::provider_call_failed(
+                            &state.vocabolario_errori,
+                            name,
+                            &req.model,
+                            &err,
+                        )
+                        .to_body()
+                        .to_string(),
                     )))
                     .await;
             }
@@ -1835,7 +1881,7 @@ async fn run_generate_image(
         .await
         // I fatti dal ProviderHttpError, non il suo Display: qui usciva il body
         // grezzo del provider come unico testo disponibile.
-        .map_err(|e| PipelineError::provider_call_failed(provider.name(), &req.model, &e))?;
+        .map_err(|e| errore_provider(state, provider.name(), &req.model, &e))?;
 
     // Consumo: le immagini prodotte si CONTANO sulla risposta, quindi la
     // quantita' e' misurata, non stimata.
@@ -2001,7 +2047,7 @@ async fn run_generate_video(
     let resp = provider
         .generate_video(&req)
         .await
-        .map_err(|e| PipelineError::provider_call_failed(provider.name(), &req.model, &e))?;
+        .map_err(|e| errore_provider(state, provider.name(), &req.model, &e))?;
 
     // Consumo: la risposta NON riporta la durata prodotta, quindi al massimo si
     // registra quella richiesta. Se il chiamante non l'ha indicata (il default e'
@@ -2170,7 +2216,7 @@ async fn run_transcribe_audio(
     let resp = provider
         .transcribe_audio(&req)
         .await
-        .map_err(|e| PipelineError::provider_call_failed(provider.name(), &req.model, &e))?;
+        .map_err(|e| errore_provider(state, provider.name(), &req.model, &e))?;
 
     // Consumo: la trascrizione si paga al secondo di audio, ma la durata non e'
     // nota da nessuna delle due parti — la richiesta porta i byte codificati (da
@@ -2335,7 +2381,7 @@ async fn run_text_to_speech(
     let resp = provider
         .text_to_speech(&req)
         .await
-        .map_err(|e| PipelineError::provider_call_failed(provider.name(), &req.model, &e))?;
+        .map_err(|e| errore_provider(state, provider.name(), &req.model, &e))?;
 
     // Consumo: il TTS si paga al carattere di input, e l'input lo conosciamo
     // esattamente. `chars()` e non `len()`: i byte UTF-8 non sono caratteri, e
@@ -2747,6 +2793,47 @@ mod tests {
         tokio::time::Instant::now() + std::time::Duration::from_secs(600)
     }
 
+    /// Le righe del catalogo (mig 0705) che i corpi d'errore di QUESTI test
+    /// producono. Non e' un catalogo di comodo: `il_vocabolario_di_prova_e_un_
+    /// sottoinsieme_del_seed_vero` lo confronta con la migrazione REALE, quindi
+    /// una divergenza rosseggia invece di far misurare a questi test un sistema
+    /// che non esiste (regola O).
+    ///
+    /// I test di questo modulo misurano il FLUSSO (retry, cooldown, corpo
+    /// d'errore); il catalogo ha i suoi test in `tassonomia_errori`.
+    const RIGHE_DI_PROVA: [(&str, &str, Option<i16>, Option<&str>); 4] = [
+        ("*", "insufficient_quota", None, Some("credit_exhausted")),
+        ("*", "rate_limit_exceeded", None, Some("rate_limit")),
+        ("*", "invalid_request_error", None, Some("malformed_request")),
+        ("groq", "tokens", None, None),
+    ];
+
+    fn vocabolario_di_prova() -> VocabolarioErrori {
+        VocabolarioErrori::con_mappa(crate::tassonomia_errori::Mappa::da_righe(RIGHE_DI_PROVA))
+    }
+
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_vocabolario_di_prova_e_un_sottoinsieme_del_seed_vero(pool: sqlx::PgPool) {
+        use crate::tassonomia_errori::{CausaErrore, Dichiarazione};
+        let vero = crate::tassonomia_errori::carica_mappa_per_test(&pool)
+            .await
+            .expect("catalogo dalla migrazione 0705");
+        for (provider, valore, status, causa) in RIGHE_DI_PROVA {
+            let atteso = match causa {
+                Some(c) => Dichiarazione::Causa(
+                    CausaErrore::dal_db(c).expect("causa del vocabolario"),
+                ),
+                None => Dichiarazione::Ambiguo,
+            };
+            assert_eq!(
+                vero.dichiarazione(provider, valore, status.unwrap_or(0) as u16),
+                atteso,
+                "({provider}, {valore}) e' cambiato nel seed 0705: questi test \
+                 starebbero misurando un catalogo che in produzione non esiste"
+            );
+        }
+    }
+
     // ── Provider finto (no rete) ────────────────────────────────────────────
     enum Behaviour {
         Ok,
@@ -2951,25 +3038,23 @@ mod tests {
             // Rate-limit permanente con Retry-After (429 quota): come Vertex
             // RESOURCE_EXHAUSTED. Ha precedenza su tutto: la quota non "torna".
             if let Some(secs) = self.transient_retry_after {
-                return Err(crate::providers::ProviderHttpError {
-                    provider: self.name.clone(),
-                    status: 429,
-                    code: Some("rate_limit_exceeded".into()),
-                    retry_after_seconds: Some(secs),
-                    message: "resource exhausted (quota test)".into(),
-                }
+                return Err(crate::providers::ProviderHttpError::from_response(
+                    &self.name,
+                    429,
+                    r#"{"error":{"message":"resource exhausted (quota test)","type":"tokens","code":"rate_limit_exceeded"}}"#
+                        .to_string(),
+                )
+                .with_retry_after(Some(secs))
                 .into());
             }
             // Prime `transient_fail_calls` chiamate: errore transitorio (503),
             // emesso come ProviderHttpError (status certo) come i provider reali.
             if idx < self.transient_fail_calls {
-                return Err(crate::providers::ProviderHttpError {
-                    provider: self.name.clone(),
-                    status: 503,
-                    code: None,
-                    retry_after_seconds: None,
-                    message: "service unavailable (transient test)".into(),
-                }
+                return Err(crate::providers::ProviderHttpError::from_response(
+                    &self.name,
+                    503,
+                    r#"{"error":{"message":"service unavailable (transient test)"}}"#.to_string(),
+                )
                 .into());
             }
             if matches!(self.behaviour, Behaviour::Hang) {
@@ -2999,21 +3084,19 @@ mod tests {
                     ledger: None,
                 }),
                 // Errori strutturati (status + codice), come i provider reali.
-                Behaviour::ErrBilling => Err(crate::providers::ProviderHttpError {
-                    provider: self.name.clone(),
-                    status: 402,
-                    code: Some("insufficient_quota".into()),
-                    retry_after_seconds: None,
-                    message: "insufficient_quota".into(),
-                }
+                Behaviour::ErrBilling => Err(crate::providers::ProviderHttpError::from_response(
+                    &self.name,
+                    402,
+                    r#"{"error":{"message":"insufficient_quota","code":"insufficient_quota"}}"#
+                        .to_string(),
+                )
                 .into()),
-                Behaviour::ErrClient => Err(crate::providers::ProviderHttpError {
-                    provider: self.name.clone(),
-                    status: 400,
-                    code: Some("invalid_request_error".into()),
-                    retry_after_seconds: None,
-                    message: "invalid request: bad field".into(),
-                }
+                Behaviour::ErrClient => Err(crate::providers::ProviderHttpError::from_response(
+                    &self.name,
+                    400,
+                    r#"{"error":{"message":"invalid request: bad field","code":"invalid_request_error"}}"#
+                        .to_string(),
+                )
                 .into()),
                 Behaviour::Hang => unreachable!("Behaviour::Hang: il sleep precede il match"),
                 Behaviour::Degenerate => Ok(LlmResponse {
@@ -3304,7 +3387,7 @@ mod tests {
             model: "gpt-x".into(),
         }];
         let cooldown = CooldownManager::new();
-        let resp = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new()).await.unwrap();
+        let resp = run_fallback(&resolved, &cooldown, &vocabolario_di_prova(), &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new()).await.unwrap();
         assert_eq!(resp.provider_used, "openai");
         assert_eq!(resp.model_used, "gpt-x");
     }
@@ -3353,7 +3436,7 @@ mod tests {
             },
         ];
         let cooldown = CooldownManager::new();
-        let resp = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new()).await.unwrap();
+        let resp = run_fallback(&resolved, &cooldown, &vocabolario_di_prova(), &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new()).await.unwrap();
         assert_eq!(resp.provider_used, "mistral");
         assert!(cooldown.is_in_cooldown("openai"));
     }
@@ -3369,7 +3452,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
+        let resp = run_fallback(&resolved, &cooldown, &vocabolario_di_prova(), &req(), true, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .unwrap();
         assert_eq!(resp.provider_used, "google");
@@ -3388,7 +3471,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
+        let err = run_fallback(&resolved, &cooldown, &vocabolario_di_prova(), &req(), true, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .err()
             .unwrap();
@@ -3408,7 +3491,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
+        let err = run_fallback(&resolved, &cooldown, &vocabolario_di_prova(), &req(), true, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .err()
             .unwrap();
@@ -3428,7 +3511,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
+        let err = run_fallback(&resolved, &cooldown, &vocabolario_di_prova(), &req(), true, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .err()
             .unwrap();
@@ -3471,6 +3554,7 @@ mod tests {
         let resp = run_fallback(
             &resolved,
             &cooldown,
+            &vocabolario_di_prova(),
             &req_con_firma_thinking(),
             true,
             TEST_PER_ATTEMPT,
@@ -3548,6 +3632,7 @@ mod tests {
         let err = run_fallback(
             &resolved,
             &cooldown,
+            &vocabolario_di_prova(),
             &richiesta,
             true,
             TEST_PER_ATTEMPT,
@@ -3587,7 +3672,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
+        let err = run_fallback(&resolved, &cooldown, &vocabolario_di_prova(), &req(), true, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .err()
             .unwrap();
@@ -3689,6 +3774,7 @@ mod tests {
         let err = run_fallback(
             &resolved,
             &cooldown,
+            &vocabolario_di_prova(),
             &req(),
             false,
             TEST_PER_ATTEMPT,
@@ -3756,6 +3842,7 @@ mod tests {
                 model: "mistral-small-latest".into(),
             }],
             &cooldown,
+            &vocabolario_di_prova(),
             &req(),
             false,
             TEST_PER_ATTEMPT,
@@ -3808,7 +3895,12 @@ mod tests {
         let err: anyhow::Error =
             ProviderHttpError::from_response("openai", 402, r#"{"error":{"message":"Your credit balance is too low","type":"insufficient_quota"}}"#.to_string())
                 .into();
-        let body = PipelineError::provider_call_failed("openai", "gpt-image-1", &err).to_body();
+        let body = PipelineError::provider_call_failed(
+            &vocabolario_di_prova(),
+            "openai",
+            "gpt-image-1",
+            &err,
+        ).to_body();
         assert_eq!(body["user_code"], "provider_quota");
         let user = body["user_message"].as_str().unwrap();
         assert!(
@@ -3839,7 +3931,7 @@ mod tests {
         ];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
+        let err = run_fallback(&resolved, &cooldown, &vocabolario_di_prova(), &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .err()
             .unwrap();
@@ -3863,7 +3955,7 @@ mod tests {
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
         cooldown.mark_billing("openai", Some("insufficient_quota".into()));
-        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
+        let err = run_fallback(&resolved, &cooldown, &vocabolario_di_prova(), &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .err()
             .unwrap();
@@ -3901,6 +3993,7 @@ mod tests {
         let err = run_fallback(
             &resolved,
             &cooldown,
+            &vocabolario_di_prova(),
             &req(),
             false,
             TEST_PER_ATTEMPT,
@@ -3934,6 +4027,7 @@ mod tests {
         let err = run_fallback(
             &resolved,
             &cooldown,
+            &vocabolario_di_prova(),
             &req(),
             false,
             TEST_PER_ATTEMPT,
@@ -3970,6 +4064,7 @@ mod tests {
         let err = run_fallback(
             &resolved,
             &cooldown,
+            &vocabolario_di_prova(),
             &req(),
             false,
             TEST_PER_ATTEMPT,
@@ -4066,7 +4161,7 @@ aliases:
             chrono::Utc::now(),
             2,
         );
-        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
+        let resp = run_fallback(&resolved, &cooldown, &vocabolario_di_prova(), &req(), true, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .unwrap();
         assert_eq!(resp.provider_used, "google");
@@ -4109,7 +4204,7 @@ aliases:
             model: "gpt-x".into(),
         }];
         let cooldown = CooldownManager::new();
-        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new()).await.err().unwrap();
+        let err = run_fallback(&resolved, &cooldown, &vocabolario_di_prova(), &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new()).await.err().unwrap();
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(err.message.contains("openai"));
     }
@@ -4171,7 +4266,7 @@ aliases:
         let cooldown = CooldownManager::new();
         cooldown.mark_billing("anthropic", Some("credit balance too low".into()));
 
-        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
+        let err = run_fallback(&resolved, &cooldown, &vocabolario_di_prova(), &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .expect_err("provider pinnato in cooldown deve fallire");
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -4192,7 +4287,7 @@ aliases:
         let resolved = vec![rp];
 
         let cooldown = CooldownManager::new();
-        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
+        let err = run_fallback(&resolved, &cooldown, &vocabolario_di_prova(), &req(), false, TEST_PER_ATTEMPT, far_deadline(), &mut Vec::new())
             .await
             .expect_err("provider pinnato fallito deve dare errore, non fallback");
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -4574,6 +4669,7 @@ aliases:
                 &req(),
                 "slow",
                 &cooldown,
+                &vocabolario_di_prova(),
                 &policy,
                 true,
                 cap,
@@ -4618,6 +4714,7 @@ aliases:
         let resp = run_fallback(
             &resolved,
             &cooldown,
+            &vocabolario_di_prova(),
             &req(),
             false,
             TEST_PER_ATTEMPT,
@@ -4660,6 +4757,7 @@ aliases:
                 &req(),
                 "slow",
                 &cooldown,
+                &vocabolario_di_prova(),
                 &policy,
                 true,
                 std::time::Duration::from_millis(50),
@@ -4691,6 +4789,7 @@ aliases:
             &req(),
             "slow",
             &cooldown,
+            &vocabolario_di_prova(),
             &policy,
             true,
             std::time::Duration::from_millis(50),
@@ -4729,6 +4828,7 @@ aliases:
             run_fallback(
                 &resolved,
                 &cooldown,
+                &vocabolario_di_prova(),
                 &req(),
                 false,
                 std::time::Duration::from_millis(50),
@@ -4764,7 +4864,7 @@ aliases:
         // neutralizzato il test fallisce NETTO qui (niente sleep di 40s).
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, deadline, &mut Vec::new()),
+            run_fallback(&resolved, &cooldown, &vocabolario_di_prova(), &req(), true, TEST_PER_ATTEMPT, deadline, &mut Vec::new()),
         )
         .await
         .expect("il gateway ha dormito oltre il budget della richiesta")
@@ -4793,7 +4893,7 @@ aliases:
         let deadline = tokio::time::Instant::now();
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, deadline, &mut Vec::new()),
+            run_fallback(&resolved, &cooldown, &vocabolario_di_prova(), &req(), true, TEST_PER_ATTEMPT, deadline, &mut Vec::new()),
         )
         .await
         .expect("budget esaurito: la chain deve rispondere subito")
@@ -4823,7 +4923,7 @@ aliases:
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, deadline, &mut Vec::new()),
+            run_fallback(&resolved, &cooldown, &vocabolario_di_prova(), &req(), true, TEST_PER_ATTEMPT, deadline, &mut Vec::new()),
         )
         .await
         .expect("il gateway ha atteso un cooldown oltre il budget della richiesta")

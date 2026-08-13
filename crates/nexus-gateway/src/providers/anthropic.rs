@@ -271,7 +271,8 @@ impl LlmProvider for AnthropicProvider {
         if !status.is_success() {
             // Regola F: il body d'errore non contiene prompt utente ma dettagli
             // del provider; lo propaghiamo al caller (il cooldown della Fase 3
-            // riconosce il billing via `is_billing_error`), senza loggarlo qui.
+            // riconosce il credito esaurito dal catalogo dei codici, non dalla
+            // prosa: vedi `tassonomia_errori`), senza loggarlo qui.
             let text = resp.text().await.unwrap_or_default();
             return Err(anthropic_http_error(status.as_u16(), text).into());
         }

@@ -3674,6 +3674,58 @@ else
   echo "   reject strutturalmente obbligato misurato il 13/08/2026." >&2
   fail=1
 fi
+# ── tassonomia-errori (2026-08-13) ──────────────────────────────────────────
+# «Di che cosa parla questo errore fornitore?» ha UN punto unico: il criterio
+# (`giudica`), il catalogo in memoria (`Mappa`) e l'unica lettura della tabella
+# dei codici. Il difetto che ha chiuso: l'estrattore prendeva il PRIMO campo
+# presente e il punto di decisione lo confrontava con un vocabolario di
+# SOTTOSTRINGHE. openai ha cambiato `error.code` il 30/07/2026 e
+# `credit_balance_exhausted` non contiene "quota": 4439 chiamate classificate
+# `transient` in 14 giorni, con un account senza credito ri-provato ogni ~62s.
+assert_single "tassonomia-errori" 'pub fn giudica\(' \
+  'crates/nexus-gateway/src/tassonomia_errori.rs' crates
+assert_single "tassonomia-errori" 'pub struct Mappa' \
+  'crates/nexus-gateway/src/tassonomia_errori.rs' crates
+# La lettura che ALIMENTA LE DECISIONI e' una sola. Il pattern nomina le colonne
+# del caricamento, non la tabella: `error-code-census` la interroga anch'esso, ma
+# per MOSTRARLA (quante righe, quali ignoti), che e' un'altra domanda — un guard
+# sulla sola tabella vieterebbe di diagnosticare.
+assert_single "tassonomia-errori" 'SELECT provider, valore, http_status, causa' \
+  'crates/nexus-gateway/src/tassonomia_errori.rs' crates
+# La tabella per status e' l'ULTIMO anello — quello che decide quando NON
+# sappiamo — e vive accanto al vocabolario di wire che mcp-core legge.
+assert_single "semantica-http-degli-errori" 'pub fn da_status\(' \
+  'crates/nexus-types/src/provider_failure.rs' crates
+
+# Nessun file deve piu' decidere una classe d'errore da una SOTTOSTRINGA del
+# codice del fornitore. L'elenco atteso e' VUOTO: il criterio confronta valori
+# ESATTI, e le varianti sono righe del catalogo, non pattern. Il costo
+# dell'alternativa e' misurato: `exceeded_current_quota_error` (Moonshot, account
+# sospeso) passava perche' conteneva "quota" per caso, e `credit_balance_exhausted`
+# non passava perche' non lo conteneva.
+# PORTATA: il gateway, dove la classificazione strutturale vive. Il ripiego
+# lessicale di mcp-core (`provider_error_classifier`, `classify_text`) e' fuori
+# portata DICHIARATA: li' il produttore ha gia' buttato via la struttura
+# (`e.to_string()` su 10 call site) ed e' la regola Q dal lato del produttore —
+# il passo giusto e' far arrivare `details.primary_cause` a quei chiamanti, non
+# allargare le regex. Le righe di COMMENTO sono escluse: quelle che restano
+# spiegano proprio il difetto chiuso qui.
+sottostringhe=$(grep -rnE \
+  'contains\("(quota|billing|payment_required|account_deactivated|rate_limit|invalid_model)"\)' \
+  crates/nexus-gateway crates/nexus-types --include=*.rs \
+  --exclude-dir=target 2>/dev/null \
+  | grep -vE '^[^:]+:[0-9]+: *(//|/\*|\*)' || true)
+if [[ -n "$sottostringhe" ]]; then
+  echo "!! niente-sottostringa-sui-codici-fornitore: una classe d'errore torna a" >&2
+  echo "   nascere da una sottostringa del codice:" >&2
+  echo "$sottostringhe" >&2
+  echo "   Il rimedio e' una RIGA in nexus_provider_error_code (mig 0705), che" >&2
+  echo "   vale in <=60s e senza redeploy; un pattern riconosce cio' che non" >&2
+  echo "   deve e non riconosce cio' che deve (regole M+H)." >&2
+  fail=1
+else
+  echo "OK niente-sottostringa-sui-codici-fornitore: i codici si confrontano per uguaglianza"
+fi
 
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2

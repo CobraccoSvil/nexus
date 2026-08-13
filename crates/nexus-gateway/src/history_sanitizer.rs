@@ -14,6 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::tassonomia_errori::CausaErrore;
 use crate::types::{LlmMessage, MessageContent};
 
 /// Modalita' di sanificazione: `Standard` applica le regole per-dialetto;
@@ -45,31 +46,31 @@ pub struct SanitizeReport {
 const SYNTHETIC_TOOL_RESULT: &str =
     "[tool result unavailable: history truncated or provider switch]";
 
-/// True se il codice strutturato indica un errore client causato dalla history /
-/// ordine messaggi / argomento invalido (retry con sanificazione aggressiva).
-pub fn is_history_related_client_error(code: Option<&str>) -> bool {
-    let Some(c) = code.map(str::to_ascii_lowercase) else {
-        return false;
-    };
-    c.starts_with("invalid_request")
-        || c == "invalid_argument"
-        || c == "invalid_request_error"
-        || c == "invalid_request_message_order"
-        || c == "malformed_function_call"
+/// True se l'errore client e' causato dalla history / ordine messaggi /
+/// argomento invalido (retry con sanificazione aggressiva).
+///
+/// Prende la CAUSA dichiarata dal catalogo dei codici
+/// ([`crate::tassonomia_errori`]), non piu' il codice grezzo: qui viveva un
+/// elenco di cinque letterali con dentro uno `starts_with`, cioe' il secondo
+/// vocabolario di stringhe del gateway. Ora e' una lettura della stessa riga che
+/// decide la classe — due elenchi in meno, non uno in piu' (regola L).
+pub fn is_history_related_client_error(causa: Option<CausaErrore>) -> bool {
+    matches!(causa, Some(CausaErrore::MalformedRequest))
 }
 
 /// True se l'errore indica un model_id inesistente/deprecato (auto-disable immediato).
-pub fn is_invalid_model_error(code: Option<&str>, status: u16) -> bool {
-    if status == 404 {
-        return true;
-    }
-    matches!(
-        code.map(str::to_ascii_lowercase).as_deref(),
-        Some(c) if c == "invalid_model"
-            || c == "model_not_found"
-            || c == "not_found"
-            || c.contains("invalid_model")
-    )
+///
+/// La regola dello status RESTA: un 404 dice «questo modello non esiste su
+/// questo endpoint» indipendentemente da come il fornitore lo chiami, ed e'
+/// l'unico segnale disponibile quando il body non porta un codice.
+///
+/// Il difetto che il catalogo chiude qui e' misurato: mistral risponde
+/// `400 {"type":"invalid_model","code":"1500"}` e il `contains("invalid_model")`
+/// guardava il solo `code`, che e' NUMERICO — `is_invalid_model_error("1500",
+/// 400)` era false e il ramo di auto-disable non e' MAI scattato (160 righe nei
+/// log del 12/08/2026).
+pub fn is_invalid_model_error(causa: Option<CausaErrore>, status: u16) -> bool {
+    status == 404 || matches!(causa, Some(CausaErrore::ModelNotFound))
 }
 
 /// Sanifica `messages` in-place per il provider `target_provider` (nome canonico
@@ -675,19 +676,67 @@ mod tests {
         assert_eq!(roles, vec!["user", "assistant", "tool"]);
     }
 
-    #[test]
-    fn history_client_error_codes() {
-        assert!(is_history_related_client_error(Some("invalid_request_error")));
-        assert!(is_history_related_client_error(Some("invalid_request_message_order")));
-        assert!(is_history_related_client_error(Some("invalid_argument")));
-        assert!(!is_history_related_client_error(Some("invalid_model")));
-        assert!(!is_history_related_client_error(None));
+    /// Dal body alla CAUSA per la strada della produzione: `from_response`
+    /// osserva i campi, `giudica` li confronta col catalogo. Costruire la causa
+    /// a mano proverebbe solo che un `matches!` ritorna cio' che c'e' scritto
+    /// (regola O).
+    fn causa_del_body(provider: &str, status: u16, body: &str) -> Option<CausaErrore> {
+        use crate::providers::ProviderHttpError;
+        use crate::tassonomia_errori::{giudica, Mappa};
+        let mappa = Mappa::da_righe([
+            ("*", "invalid_request_error", None, Some("malformed_request")),
+            ("*", "invalid_model", None, Some("model_not_found")),
+            ("mistral", "1500", None, Some("model_not_found")),
+            (
+                "openai",
+                "credit_balance_exhausted",
+                None,
+                Some("credit_exhausted"),
+            ),
+        ]);
+        let http = ProviderHttpError::from_response(provider, status, body.to_string());
+        giudica(provider, status, &http.candidati, &mappa).causa
     }
 
     #[test]
-    fn invalid_model_detection() {
-        assert!(is_invalid_model_error(Some("invalid_model"), 400));
+    fn il_400_di_formato_history_resta_riconoscibile_dal_body() {
+        // Corpo VERBATIM del 26/07: e' l'errore che DEVE innescare la
+        // sanificazione aggressiva.
+        let body = r#"{"error":{"message":"The reasoning_content in the thinking mode must be passed back to the API","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}"#;
+        let causa = causa_del_body("deepseek", 400, body);
+        assert!(is_history_related_client_error(causa));
+        assert!(!is_invalid_model_error(causa, 400));
+    }
+
+    #[test]
+    fn il_modello_inesistente_di_mistral_ora_lo_e_davvero() {
+        // IL SECONDO DIFETTO MISURATO (160 righe il 12/08/2026): il code e'
+        // NUMERICO, quindi `contains("invalid_model")` sul solo code era false e
+        // il ramo di auto-disable non scattava mai. Il type lo diceva.
+        let body = r#"{"object":"error","message":"Invalid model: codestral-mamba-latest","type":"invalid_model","param":null,"code":"1500","raw_status_code":400}"#;
+        let causa = causa_del_body("mistral", 400, body);
+        assert_eq!(causa, Some(CausaErrore::ModelNotFound));
+        assert!(is_invalid_model_error(causa, 400));
+        assert!(
+            !is_history_related_client_error(causa),
+            "un modello inesistente non si ripara sanificando la history"
+        );
+    }
+
+    #[test]
+    fn un_credito_esaurito_non_innesca_ne_sanificazione_ne_auto_disable() {
+        let body = r#"{"error":{"message":"You have no credits remaining.","type":"insufficient_quota","code":"credit_balance_exhausted"}}"#;
+        let causa = causa_del_body("openai", 429, body);
+        assert_eq!(causa, Some(CausaErrore::CreditExhausted));
+        assert!(!is_history_related_client_error(causa));
+        assert!(!is_invalid_model_error(causa, 429));
+    }
+
+    #[test]
+    fn la_regola_dello_status_404_resta_e_non_dipende_dal_catalogo() {
+        // E' l'unico segnale quando il body non porta un codice: un 404 dice che
+        // il modello non esiste su questo endpoint, comunque lo si chiami.
         assert!(is_invalid_model_error(None, 404));
-        assert!(!is_invalid_model_error(Some("invalid_request_error"), 400));
+        assert!(!is_invalid_model_error(None, 400));
     }
 }
