@@ -525,19 +525,27 @@ pub(crate) fn route_model_with_mode(
     // ma mai usati — il routing prendeva sempre il modello base.
     let est_i32: i32 = estimated_tokens.try_into().unwrap_or(i32::MAX);
 
-    // Helper: skip provider in cooldown — chiamarli produrrebbe billing/rate-limit
+    // Helper: skip la COPPIA in cooldown — chiamarla produrrebbe billing/rate-limit
     // error che farebbe fallire l'intera richiesta utente.
-    let in_cooldown = |p: &str| crate::provider_cooldown::is_provider_in_cooldown(p);
+    //
+    // La domanda e' sulla coppia, non sul solo fornitore: qui si sta scegliendo
+    // `(provider, model)`, e il modello e' gia' in mano. Chiedere solo del
+    // fornitore lascerebbe passare la coppia il cui MODELLO ha sforato — che dal
+    // 07/08/2026 e' la forma normale di un rate limit — per farla poi rifiutare
+    // dal gateway, che il cooldown lo applica e ATTENDE.
+    let in_cooldown =
+        |p: &str, m: &str| crate::provider_cooldown::is_model_in_cooldown(p, m);
 
     // 1. Lookup diretto (intent_key, mode) nella matrice DB con escalation
     if let Some((provider, model)) = matrix.lookup_with_budget(intent_key, mode, est_i32) {
-        if !in_cooldown(&provider) {
+        if !in_cooldown(&provider, &model) {
             // Branch: routing_matrix DB.
             return RoutingDecision { provider, model };
         }
         tracing::warn!(
-            "route_model_with_mode: skip provider {} (in cooldown)",
-            provider
+            "route_model_with_mode: skip {}/{} (in cooldown)",
+            provider,
+            model
         );
     }
 
@@ -546,13 +554,14 @@ pub(crate) fn route_model_with_mode(
         if let Some((provider, model)) =
             matrix.lookup_with_budget(intent_key, "bilanciata", est_i32)
         {
-            if !in_cooldown(&provider) {
+            if !in_cooldown(&provider, &model) {
                 // Branch: routing_matrix DB (mode fallback bilanciata).
                 return RoutingDecision { provider, model };
             }
             tracing::warn!(
-                "route_model_with_mode: skip provider {} su fallback bilanciata (in cooldown)",
-                provider
+                "route_model_with_mode: skip {}/{} su fallback bilanciata (in cooldown)",
+                provider,
+                model
             );
         }
     }
@@ -560,7 +569,7 @@ pub(crate) fn route_model_with_mode(
     // 2b. Fallback: cerca QUALSIASI mode per lo stesso intent_key con un provider non in cooldown
     for try_mode in &["bilanciata", "approfondita", "veloce", "economica"] {
         if let Some((provider, model)) = matrix.lookup_with_budget(intent_key, try_mode, est_i32) {
-            if !in_cooldown(&provider) {
+            if !in_cooldown(&provider, &model) {
                 // Branch: routing_matrix DB (cooldown bypass: any mode).
                 return RoutingDecision { provider, model };
             }
@@ -598,7 +607,12 @@ pub(crate) fn route_model_with_mode(
 
 /// True se la decisione della matrice statica NON e' direttamente servibile e
 /// serve il fallback tier-aware dal catalog: o non c'e' stato alcun match
-/// (sentinella `__no_model__`), o il provider scelto e' in cooldown.
+/// (sentinella `__no_model__`), o la COPPIA scelta e' in cooldown.
+///
+/// La domanda e' sulla coppia perche' la decisione E' una coppia: guardando il
+/// solo fornitore, una coppia il cui MODELLO ha sforato risultava servibile,
+/// veniva servita, e il gateway la rifiutava — mentre il catalog aveva altri
+/// modelli sani dello stesso fornitore da proporre.
 ///
 /// Punto unico (regola L) del TRIGGER del fallback catalog. Prima il ramo
 /// `__no_model__` in `resolve_agent_provider` scavalcava il catalog e cadeva su
@@ -608,9 +622,9 @@ pub(crate) fn route_model_with_mode(
 /// (`__no_model__` e cooldown) passano dallo STESSO punto unico
 /// `select_agentic_model`, che rispetta tier + capability dell'intent prima di
 /// qualsiasi default per-provider.
-pub(crate) fn needs_catalog_fallback(decision_provider: &str) -> bool {
+pub(crate) fn needs_catalog_fallback(decision_provider: &str, decision_model: &str) -> bool {
     decision_provider == "__no_model__"
-        || crate::provider_cooldown::is_provider_in_cooldown(decision_provider)
+        || crate::provider_cooldown::is_model_in_cooldown(decision_provider, decision_model)
 }
 
 #[derive(Debug, sqlx::FromRow)]

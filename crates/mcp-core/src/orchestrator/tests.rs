@@ -94,15 +94,40 @@ fn needs_catalog_fallback_include_no_model_e_provider_sani_no() {
     // default per-provider tier-blind (google/gemini-flash, modello light) per i
     // task di coding heavy quando anthropic+openai erano in cooldown.
     assert!(
-        needs_catalog_fallback("__no_model__"),
+        needs_catalog_fallback("__no_model__", "__no_model__"),
         "__no_model__ deve innescare il fallback catalog"
     );
     // Un provider mai messo in cooldown (nome univoco per non collidere con lo
     // stato globale di altri test) e' servibile direttamente: nessun fallback.
     assert!(
-        !needs_catalog_fallback("__test_healthy_provider_ncf"),
+        !needs_catalog_fallback("__test_healthy_provider_ncf", "un-modello-qualsiasi"),
         "un provider sano non deve innescare il fallback catalog"
     );
+}
+
+/// D1 — la decisione della matrice e' una COPPIA, e la domanda si pone sulla
+/// coppia. Guardando il solo fornitore, una coppia il cui MODELLO ha sforato
+/// risultava servibile: veniva servita, e il gateway la rifiutava attendendo,
+/// mentre il catalog aveva altri modelli sani dello stesso fornitore.
+///
+/// Il cooldown lo mette il PRODUTTORE reale (regola O), non una chiave scritta
+/// a mano. MUTAZIONE: riportare `needs_catalog_fallback` a
+/// `is_provider_in_cooldown` -> il primo assert rosseggia.
+#[test]
+fn needs_catalog_fallback_guarda_la_coppia_non_il_solo_fornitore() {
+    let p = "__test_ncf_coppia";
+    let saturo = "modello-saturo";
+    let sano = "modello-sano";
+    crate::provider_cooldown::metti_in_cooldown_breve(p, Some(saturo), "Rate limit raggiunto", 60);
+    assert!(
+        needs_catalog_fallback(p, saturo),
+        "la coppia in cooldown non e' servibile: serve il fallback catalog"
+    );
+    assert!(
+        !needs_catalog_fallback(p, sano),
+        "un altro modello dello stesso fornitore ha quota propria ed e' servibile"
+    );
+    crate::provider_cooldown::remove_cooldown(p);
 }
 
 #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]

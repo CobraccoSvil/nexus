@@ -31,23 +31,25 @@ impl CooldownBillingPort {
 #[async_trait]
 impl BillingCooldownPort for CooldownBillingPort {
     /// Delega alla fonte unica del cooldown di mcp-core
-    /// ([`crate::provider_cooldown::cooldown_snapshot`]): la STESSA lista che il
-    /// selettore di modello e l'handler `/api/internal/routing/cooldown` usano per
-    /// saltare i provider non disponibili (regola L, niente snapshot duplicato).
+    /// ([`crate::provider_cooldown::fornitori_in_cooldown`]): la STESSA lista che
+    /// il selettore di modello usa per saltare i FORNITORI non disponibili
+    /// (regola L, niente snapshot duplicato).
+    ///
+    /// PORTATA: solo i fornitori esclusi PER INTERO. Il consumatore e'
+    /// `billing_fail_fast_message`, che dichiara «i provider sono esauriti» e
+    /// ferma il run: un tetto su un singolo modello non e' un fornitore esaurito,
+    /// e contarlo qui fermerebbe un run che poteva girare sugli altri modelli
+    /// dello stesso fornitore. Prima quella lista portava le CHIAVI grezze del
+    /// cooldown, quindi il messaggio di fail-fast avrebbe nominato
+    /// `groq\u{1}openai/gpt-oss-20b` come se fosse un fornitore.
     ///
     /// Nomi in lowercase + ordinati alfabeticamente (parita' col Python
     /// `sorted(snap.keys())`, cosi' il messaggio di fail-fast e' deterministico).
-    /// FAIL-OPEN: `cooldown_snapshot()` non e' fallibile (ritorna `Vec` vuoto se la
-    /// mappa non e' ancora inizializzata o il lock e' avvelenato), quindi qui non
-    /// c'e' mai un `PortError` nel flusso normale.
+    /// FAIL-OPEN: la lettura non e' fallibile (ritorna `Vec` vuoto se la mappa non
+    /// e' ancora inizializzata o il lock e' avvelenato), quindi qui non c'e' mai
+    /// un `PortError` nel flusso normale.
     async fn billing_exhausted_providers(&self) -> Result<Vec<String>, PortError> {
-        let mut providers: Vec<String> = crate::provider_cooldown::cooldown_snapshot()
-            .into_iter()
-            .map(|(name, _secs, _reason)| name.to_lowercase())
-            .collect();
-        providers.sort();
-        providers.dedup();
-        Ok(providers)
+        Ok(crate::provider_cooldown::fornitori_in_cooldown())
     }
 }
 

@@ -1514,7 +1514,7 @@ async fn apply_provider_wide_cooldown(provider: &str, model: &str, kind: &str) {
     // (scritto da put_provider_in_long_cooldown, la fonte GIUSTA perche' ha
     // scadenza). NON disabilitano piu' il catalog/matrix: is_enabled significa
     // "il modello e' valido", non "ora senza credito". Il routing salta i
-    // provider in cooldown via is_provider_in_cooldown/cooldown_snapshot senza
+    // provider in cooldown via is_provider_in_cooldown/fornitori_in_cooldown senza
     // bisogno di is_enabled=false. La billing_cooldown_recovery_loop riprova il
     // provider (probe-then-reenable) e azzera il TTL quando il credito torna.
     // I transienti (rate_limit/connection) restano solo in-memory: tornano da

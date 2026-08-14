@@ -94,26 +94,54 @@ pub(crate) async fn default_scoring_weights(db: &PgPool) -> Result<ScoringWeight
     Ok(w)
 }
 
-/// Costruisce la lista dei provider da escludere dalla selezione, normalizzati
-/// in lowercase (regola L): provider attualmente in cooldown (snapshot
-/// in-memory) PIU' gli `extra` indicati dal chiamante, deduplicati.
+/// Cio' che la selezione NON puo' instradare adesso: i FORNITORI esclusi per
+/// intero e le COPPIE (fornitore, modello) escluse. Due liste perche' sono due
+/// domande — appiattirle in una sola era il difetto D1 (vedi
+/// [`crate::provider_cooldown::ChiaveCooldown`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct EsclusioniSelezione {
+    /// Nomi di fornitore in lowercase, deduplicati. Alimentano
+    /// `AND LOWER(provider) <> ALL(...)`.
+    pub fornitori: Vec<String>,
+    /// Coppie `(provider, model)` in lowercase. Alimentano l'anti-join sulle
+    /// coppie: escludono QUEL modello e lasciano gli altri del fornitore.
+    pub coppie: Vec<(String, String)>,
+}
+
+/// Costruisce le esclusioni della selezione, normalizzate in lowercase (regola
+/// L): cooldown attivi (quando `apply_cooldown`) PIU' gli `extra` indicati dal
+/// chiamante, deduplicati.
 ///
 /// Punto unico della normalizzazione: prima alcuni call site facevano
 /// `LOWER(provider)` mentre il ramo non-agentico di `best_model_for_tier`
 /// confrontava il nome RAW del catalog contro lo snapshot (gia' lowercase),
 /// con possibile mismatch. Qui la sorgente e' una sola.
-pub(crate) fn excluded_providers_lower(extra: &[String]) -> Vec<String> {
-    let mut excluded: Vec<String> = crate::provider_cooldown::cooldown_snapshot()
-        .into_iter()
-        .map(|(name, _, _)| name.to_lowercase())
-        .collect();
+///
+/// Gli `extra` del chiamante restano FORNITORI interi: chi li passa (veto del
+/// giudice, provider gia' tentati nel turno) intende escludere l'account, non
+/// una coppia.
+pub(crate) fn esclusioni_selezione(extra: &[String], apply_cooldown: bool) -> EsclusioniSelezione {
+    let mut fornitori: Vec<String> = if apply_cooldown {
+        crate::provider_cooldown::fornitori_in_cooldown()
+    } else {
+        Vec::new()
+    };
     for p in extra {
-        let pl = p.to_lowercase();
-        if !excluded.contains(&pl) {
-            excluded.push(pl);
+        let pl = p.trim().to_lowercase();
+        if !fornitori.contains(&pl) {
+            fornitori.push(pl);
         }
     }
-    excluded
+    EsclusioniSelezione {
+        fornitori,
+        // Le coppie hanno senso SOLO col cooldown attivo: nessun chiamante
+        // dichiara oggi un'esclusione per coppia che non venga da li'.
+        coppie: if apply_cooldown {
+            crate::provider_cooldown::coppie_in_cooldown()
+        } else {
+            Vec::new()
+        },
+    }
 }
 
 /// Predicato di ELEGGIBILITA' di un modello del catalog (FASE 2, regola L).
@@ -325,10 +353,24 @@ struct QueryShape {
 /// Costruisce la query di UN anello della tier-chain.
 ///
 /// I placeholder sono assegnati con un idx incrementale: $1 = array provider
-/// esclusi (sempre), poi tier, capability jsonb, min_context_window, only_provider.
+/// esclusi per intero, $2/$3 = le due colonne parallele delle COPPIE escluse
+/// (sempre presenti, anche vuote), poi tier, capability jsonb,
+/// min_context_window, only_provider.
 /// **L'ordine dei `push_str` qui DEVE combaciare con l'ordine dei `bind` nel
 /// chiamante**: e' un accoppiamento posizionale che il tipo non protegge, ed e'
 /// l'unica ragione per cui le due meta' vanno lette insieme.
+///
+/// L'anti-join sulle coppie e' il pezzo che fa ANTICIPARE la selezione. Prima
+/// qui c'era il solo filtro per fornitore, quindi un cooldown per coppia — la
+/// forma che un rate limit prende dal 07/08/2026 — non toglieva nulla dai
+/// candidati: la coppia veniva scelta, mandata, e rifiutata dal gateway, che il
+/// cooldown lo applica bene e ATTENDE («attendo cooldown transitorio breve prima
+/// di ritentare wait_s=25»). Un giro di selezione sprecato piu' l'attesa, per
+/// ogni occorrenza.
+///
+/// Due array PARALLELI e non una chiave concatenata: comporre
+/// `provider || sep || model` in SQL rimetterebbe la convenzione della chiave in
+/// un secondo posto, che e' precisamente il difetto da cui si viene (regola L).
 fn build_tierchain_sql(
     filter: &EligibilityFilter<'_>,
     shape: &QueryShape,
@@ -336,11 +378,16 @@ fn build_tierchain_sql(
     order_by: &str,
     limit: i64,
 ) -> String {
-    let mut idx = 1;
+    // $1 fornitori esclusi, $2/$3 coppie escluse: tre bind SEMPRE presenti.
+    let mut idx = 3;
     let mut sql = String::from(
         "SELECT provider, model, performance_tier FROM ai_price_catalog \
          WHERE is_enabled = TRUE \
            AND LOWER(provider) <> ALL($1) \
+           AND NOT EXISTS ( \
+                 SELECT 1 FROM unnest($2::text[], $3::text[]) AS coppia_esclusa(p, m) \
+                  WHERE coppia_esclusa.p = LOWER(ai_price_catalog.provider) \
+                    AND coppia_esclusa.m = LOWER(ai_price_catalog.model)) \
            AND (auto_disabled_reason IS NULL \
                 OR (auto_disabled_reason NOT LIKE 'invalid_model%' \
                     AND auto_disabled_reason NOT LIKE 'model_not_found%'))",
@@ -476,15 +523,12 @@ pub(super) async fn select_models_tierchain(
     limit: i64,
     min_distinct_providers: usize,
 ) -> Result<Vec<(String, String, Option<String>)>, String> {
-    let excluded: Vec<String> = if filter.apply_cooldown {
-        excluded_providers_lower(filter.exclude_providers)
-    } else {
-        filter
-            .exclude_providers
-            .iter()
-            .map(|p| p.to_lowercase())
-            .collect()
-    };
+    let esclusioni = esclusioni_selezione(filter.exclude_providers, filter.apply_cooldown);
+    let excluded = &esclusioni.fornitori;
+    // Le due colonne parallele dell'anti-join sulle coppie: stessa lunghezza per
+    // costruzione, perche' nascono dalla stessa lista.
+    let (coppie_provider, coppie_model): (Vec<String>, Vec<String>) =
+        esclusioni.coppie.iter().cloned().unzip();
 
     let tiers: Vec<Option<&str>> = if tier_chain.is_empty() {
         vec![None]
@@ -517,7 +561,10 @@ pub(super) async fn select_models_tierchain(
 
     for tier in tiers {
         let sql = build_tierchain_sql(filter, &shape, tier, order_by, limit);
-        let mut q = sqlx::query_as::<_, (String, String, Option<String>)>(&sql).bind(&excluded);
+        let mut q = sqlx::query_as::<_, (String, String, Option<String>)>(&sql)
+            .bind(excluded)
+            .bind(&coppie_provider)
+            .bind(&coppie_model);
         if let Some(t) = tier {
             q = q.bind(t);
         }
@@ -1349,14 +1396,107 @@ mod tests {
     }
 
     #[test]
-    fn excluded_providers_lower_normalizza_e_deduplica() {
-        // cooldown_snapshot e' vuoto in test (nessun provider messo in cooldown):
-        // verifichiamo la normalizzazione/dedup degli extra.
-        let out = excluded_providers_lower(&["OpenAI".into(), "openai".into(), "Google".into()]);
-        assert!(out.contains(&"openai".to_string()));
-        assert!(out.contains(&"google".to_string()));
+    fn esclusioni_selezione_normalizza_e_deduplica() {
+        // Cooldown NON applicato: verifichiamo la normalizzazione/dedup degli
+        // extra, che restano fornitori interi.
+        let out = esclusioni_selezione(&["OpenAI".into(), "openai".into(), "Google".into()], false);
+        assert!(out.fornitori.contains(&"openai".to_string()));
+        assert!(out.fornitori.contains(&"google".to_string()));
         // "OpenAI" e "openai" collassano in un solo elemento.
-        assert_eq!(out.iter().filter(|p| *p == "openai").count(), 1);
+        assert_eq!(out.fornitori.iter().filter(|p| *p == "openai").count(), 1);
+        assert!(
+            out.coppie.is_empty(),
+            "senza cooldown non ci sono coppie escluse"
+        );
+    }
+
+    /// D1 — la selezione ANTICIPA la coppia in cooldown.
+    ///
+    /// Il difetto misurato il 13/08/2026: `chiave_cooldown` produceva
+    /// `provider` oppure `provider\u{1}model`, e la selezione proiettava quella
+    /// chiave GREZZA in `AND LOWER(provider) <> ALL($1)`. Una chiave composta non
+    /// eguaglia nessun `provider` del catalogo, quindi la coppia in cooldown
+    /// restava fra i candidati: veniva scelta, mandata, e il gateway la rifiutava
+    /// attendendo — un giro di selezione sprecato piu' l'attesa, ogni volta.
+    ///
+    /// La misura attraversa la catena REALE (regola O): il produttore
+    /// `metti_in_cooldown_breve`, il punto unico `coppie_in_cooldown`, la query
+    /// costruita da `build_tierchain_sql` e il catalog con lo schema di
+    /// produzione. Nessuna chiave scritta a mano, nessun SQL ricopiato.
+    ///
+    /// MUTAZIONE 1: togliere l'anti-join sulle coppie da `build_tierchain_sql` ->
+    /// il primo assert rosseggia (la coppia satura torna fra i candidati).
+    /// MUTAZIONE 2: far ricadere `fornitori_in_cooldown` su tutte le voci dello
+    /// snapshot -> il secondo assert rosseggia (il modello sano dello stesso
+    /// fornitore sparisce, cioe' il difetto del 07/08 rientra dalla porta del
+    /// lettore).
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_selezione_anticipa_la_coppia_in_cooldown(pool: sqlx::PgPool) {
+        // Nomi propri di questo test: lo stato del cooldown e' globale al processo.
+        let fornitore = "__test_sel_coppia";
+        let saturo = "modello-saturo";
+        let sano = "modello-sano";
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ($1, $2, 1.0, 1.0, 'USD', now()), \
+             ($1, $3, 2.0, 2.0, 'USD', now())",
+        )
+        .bind(fornitore)
+        .bind(saturo)
+        .bind(sano)
+        .execute(&pool)
+        .await
+        .expect("insert");
+
+        let filtro = EligibilityFilter {
+            apply_cooldown: true,
+            ..gate_filter(false, false)
+        };
+        // Prima del cooldown entrambi i modelli sono candidati.
+        let prima = select_models_tierchain(
+            &pool,
+            &filtro,
+            &[],
+            "input_cost_per_million_tokens ASC",
+            10,
+            1,
+        )
+        .await
+        .expect("ok");
+        assert_eq!(prima.len(), 2, "premessa: entrambi eleggibili");
+
+        // Il rate limit colpisce UN modello: e' un tetto suo, non del fornitore.
+        crate::provider_cooldown::metti_in_cooldown_breve(
+            fornitore,
+            Some(saturo),
+            "Rate limit raggiunto",
+            60,
+        );
+        let dopo = select_models_tierchain(
+            &pool,
+            &filtro,
+            &[],
+            "input_cost_per_million_tokens ASC",
+            10,
+            1,
+        )
+        .await
+        .expect("ok");
+        let modelli: Vec<&str> = dopo.iter().map(|(_, m, _)| m.as_str()).collect();
+        assert!(
+            !modelli.contains(&saturo),
+            "la coppia in cooldown non deve essere nemmeno proposta: {modelli:?}"
+        );
+        assert!(
+            modelli.contains(&sano),
+            "l'altro modello dello stesso fornitore ha quota propria e resta candidato: {modelli:?}"
+        );
+        crate::provider_cooldown::remove_cooldown(fornitore);
     }
 
     // ── Gate di qualificazione (mig 0591/0592) ────────────────────────────────

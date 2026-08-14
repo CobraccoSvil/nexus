@@ -337,24 +337,15 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
                 //   - se in SHORT cooldown (rate_limit/timeout): rimuovo,
                 //     perche' "hi" e' sufficiente a verificare che il provider
                 //     non sia piu' rate-limited.
-                let long_kinds = [
-                    "billing_error",
-                    "quota_exceeded",
-                    "credit_balance_too_low",
-                    "billing_required",
-                ];
-                let is_in_long = crate::provider_cooldown::cooldown_snapshot()
-                    .iter()
-                    .find(|(name, _, _)| name == provider)
-                    .map(|(_, _, reason)| {
-                        reason.as_ref().is_some_and(|r| {
-                            long_kinds.iter().any(|k| r.contains(k))
-                                || r.contains("credit")
-                                || r.contains("quota")
-                                || r.contains("billing")
-                        })
-                    })
-                    .unwrap_or(false);
+                //
+                // «E' un cooldown LUNGO?» ha gia' un punto unico:
+                // `is_provider_in_billing_cooldown`, che legge la severita'
+                // REGISTRATA da chi il cooldown lo ha messo. Qui la domanda
+                // veniva ri-posta cercando 7 sottostringhe inglesi nella
+                // `reason` (regola M), su uno snapshot le cui chiavi potevano
+                // essere composte — quindi per una coppia il `find` non trovava
+                // nulla e il ramo degradava a "short" in silenzio.
+                let is_in_long = crate::provider_cooldown::is_provider_in_billing_cooldown(provider);
                 if is_provider_in_cooldown(provider) {
                     if is_in_long {
                         tracing::debug!(

@@ -271,17 +271,20 @@ pub async fn provider_models(
 /// non c'e' piu' un brain da interrogare con un probe live).
 pub async fn provider_health(Path(provider): Path<String>) -> impl IntoResponse {
     let provider = provider.trim().to_lowercase();
-    let cooldown = crate::provider_cooldown::cooldown_snapshot()
+    // Domanda: «questo FORNITORE risponde?». Un tetto su un suo modello non lo
+    // rende non contattabile — gli altri modelli hanno quota propria — quindi si
+    // guardano le sole esclusioni di fornitore intero.
+    let cooldown = crate::provider_cooldown::cooldown_fornitori_entries()
         .into_iter()
-        .find(|(name, _, _)| name == &provider);
+        .find(|e| e.chiave.provider() == provider);
 
     match cooldown {
-        Some((_, seconds_remaining, reason)) => Json(json!({
+        Some(e) => Json(json!({
             "provider": provider,
             "status": "cooldown",
             "ok": false,
-            "reason": reason.unwrap_or_else(|| "provider in cooldown".to_string()),
-            "seconds_remaining": seconds_remaining,
+            "reason": e.reason.unwrap_or_else(|| "provider in cooldown".to_string()),
+            "seconds_remaining": e.remaining_seconds,
         })),
         None => Json(json!({
             "provider": provider,
@@ -292,13 +295,17 @@ pub async fn provider_health(Path(provider): Path<String>) -> impl IntoResponse 
 }
 
 /// GET /providers/billing-cooldown (mount: `/api/neural/providers/billing-cooldown`).
-/// Snapshot dei provider in cooldown (secondi rimanenti per provider). Forma
-/// identica al brain: `{providers: {"anthropic": 540, ...}}`. Fonte: punto unico
-/// `provider_cooldown::cooldown_snapshot` (in-process).
+/// Snapshot dei FORNITORI esclusi per intero (secondi rimanenti per provider).
+/// Forma identica al brain: `{providers: {"anthropic": 540, ...}}`. Fonte: punto
+/// unico `provider_cooldown::cooldown_fornitori_entries` (in-process).
+///
+/// La forma della risposta e' chiavata PER FORNITORE: una coppia col modello non
+/// ha dove stare, e infilarcela con la chiave composta e' il difetto D1. Chi ha
+/// bisogno delle coppie usa `/api/internal/routing/cooldown`, che le dichiara.
 pub async fn billing_cooldown() -> impl IntoResponse {
-    let providers: HashMap<String, u64> = crate::provider_cooldown::cooldown_snapshot()
+    let providers: HashMap<String, u64> = crate::provider_cooldown::cooldown_fornitori_entries()
         .into_iter()
-        .map(|(name, seconds_remaining, _reason)| (name, seconds_remaining))
+        .map(|e| (e.chiave.provider().to_string(), e.remaining_seconds))
         .collect();
     Json(json!({ "providers": providers }))
 }
