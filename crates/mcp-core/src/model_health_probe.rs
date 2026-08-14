@@ -54,7 +54,21 @@ const PROBE_PROMPT: &str = "ping";
 /// Mistral che risolve a un modello Labs 403, o gemini-2.5-pro che ritorna
 /// MALFORMED_FUNCTION_CALL).
 const TOOL_PROBE_TOOL_NAME: &str = "nexus_probe_tool";
-const TOOL_PROBE_MAX_TOKENS: u32 = 256;
+
+/// Quanto deve essere lunga la risposta VISIBILE del tool-probe: una sola tool
+/// call su un tool fittizio ci sta ampiamente.
+///
+/// Viaggia come `Visibile` e non come tetto totale, ed e' il fix di un falso
+/// negativo latente della stessa famiglia misurata il 13/08/2026: con 256 come
+/// TOTALE, un modello che ragiona spende il budget pensando, non emette la tool
+/// call e il probe conclude `supports_tool_use=false`. Qui la conseguenza e'
+/// peggiore che altrove — non un turno vuoto, ma un modello DEGRADATO a
+/// catalogo per colpa di un nostro parametro.
+///
+/// Non e' circolare: il tool-probe misura la tool call, non il ragionamento, e
+/// su un modello ancora senza riga di capability il criterio non vincola nulla
+/// — cioe' la stessa strategia generosa che il probe di chat gia' adotta.
+const TOOL_PROBE_VISIBILE_TOKENS: u32 = 256;
 
 /// Timeout per la singola chiamata al modello. Piu' generoso del provider
 /// probe (30s) perche' i modelli "thinking" (gemini-2.5-pro) possono
@@ -1317,7 +1331,9 @@ async fn run_tool_probe(
             model,
             &messages_json,
             &tools_json,
-            TOOL_PROBE_MAX_TOKENS,
+            nexus_agent_graph::decisions::tetto_output::RichiestaOutput::Visibile(
+                TOOL_PROBE_VISIBILE_TOKENS,
+            ),
             &system_text,
         ),
     )

@@ -244,6 +244,12 @@ impl NextActionsDeriverAdapter {
         // 3. Prompt extractor (template DB o fallback hardcoded come Python).
         let prompt = self.build_extractor_prompt(assistant_text).await;
 
+        // Il tetto lo decide il catalogo (regola L): qui si dichiara solo
+        // quanto elenco di scelte si deve poter leggere. Come TOTALE, questo
+        // numero su un modello che ragiona produce un estratto vuoto.
+        let tetto =
+            crate::capability::resolve_tetto_output(&self.db, &provider, &model, 1024).await;
+
         let req = GwRequest {
             model,
             messages: vec![GwMessage {
@@ -255,7 +261,7 @@ impl NextActionsDeriverAdapter {
                 thinking_signature: None,
                 is_error: None,
             }],
-            max_tokens: Some(1024),
+            max_tokens: tetto.tetto.max_tokens(),
             temperature: Some(0.0),
             metadata: GwMetadata {
                 tenant_id: "internal".to_string(),

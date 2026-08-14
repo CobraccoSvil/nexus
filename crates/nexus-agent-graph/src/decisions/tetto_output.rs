@@ -89,6 +89,59 @@ impl TettoOutput {
     }
 }
 
+/// Cosa un chiamante CHIEDE, quando chiede spazio di output.
+///
+/// E' un TIPO e non un `u32` perche' le due domande sono diverse e un numero
+/// nudo non le distingue: «devo poter leggere 512 token» e «manda il tetto 512»
+/// si scrivono identiche e significano l'opposto su un modello che ragiona.
+/// MISURATO il 13/08/2026 su `groq/openai/gpt-oss-20b` col prompt VERO del
+/// supervisore (template `automation.supervisor_monitoring` dal DB): col tetto
+/// 512 la risposta e' `finish_reason=length`, `completion_tokens` ESATTAMENTE
+/// 512, 2314 caratteri di ragionamento e un JSON troncato a meta' stringa;
+/// senza tetto e' `finish_reason=stop`, 348 token e il JSON intero. Stessa
+/// firma delle 15 righe `degenerate_hollow` da 1024 token esatti che hanno
+/// fatto nascere questo modulo — su un altro fornitore e con un altro numero.
+///
+/// Finche' il parametro e' un `u32` chiamato `max_tokens`, il difetto e'
+/// SEMPRE riscrivibile: il tipo e' il solo posto in cui la distinzione non si
+/// puo' dimenticare (regola Q, il contratto e' la firma).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum RichiestaOutput {
+    /// «Devo poter LEGGERE questo». Il margine per il ragionamento NON e' cosa
+    /// del chiamante: lo calcola [`tetto_per`] dai fatti del catalogo.
+    Visibile(u32),
+    /// «Manda ESATTAMENTE questo tetto, non chiedere al catalogo».
+    ///
+    /// Esiste per chi MISURA il modello — il probe e il qualificatore — e non
+    /// puo' ereditare dal catalogo i fatti che sta derivando: leggerli li'
+    /// significherebbe misurare la propria premessa (regola O). Il `perche` e'
+    /// obbligatorio perche' questa variante scavalca il criterio, e uno
+    /// scavalco senza motivo scritto e' indistinguibile da una svista.
+    TotaleDichiarato {
+        totale: u32,
+        perche: &'static str,
+    },
+}
+
+impl RichiestaOutput {
+    /// Quanto chiedere, dati i fatti del catalogo. Unico punto in cui la
+    /// richiesta diventa un numero: le due varianti non si mescolano altrove.
+    pub fn tetto(&self, fatti: &FattiTetto) -> TettoOutput {
+        match self {
+            Self::Visibile(v) => tetto_per(*v, fatti),
+            Self::TotaleDichiarato { totale, .. } => TettoOutput::Dichiarato {
+                visibile: *totale,
+                totale: *totale,
+            },
+        }
+    }
+
+    /// `true` se il catalogo non va interrogato: chi misura non eredita.
+    pub fn scavalca_il_catalogo(&self) -> bool {
+        matches!(self, Self::TotaleDichiarato { .. })
+    }
+}
+
 /// Quanto spazio lasciare al ragionamento, in multipli del visibile.
 ///
 /// Non e' una stima della lunghezza del pensiero — non e' dichiarata da nessuno
@@ -218,6 +271,78 @@ mod tests {
             massimo_fornitore: Some(300),
         };
         assert_eq!(tetto_per(256, &stretto).max_tokens(), Some(300));
+    }
+
+    /// IL CASO MISURATO IL 13/08/2026, nella forma in cui il chiamante lo
+    /// produceva: `SUPERVISOR_MAX_TOKENS = 512` come TOTALE, su un modello che
+    /// ragiona e che il catalogo non dichiara affatto (groq non ha nemmeno una
+    /// riga nella vista).
+    ///
+    /// Le due richieste hanno lo stesso numero e devono dare esiti OPPOSTI:
+    /// chiedere «512 di totale» e' cio' che ha prodotto il turno vuoto
+    /// fatturato; chiedere «512 di visibile» su fatti ignoti non manda alcun
+    /// tetto, che e' l'unico esito che quel turno lo evita.
+    ///
+    /// MUTAZIONE: far ritornare a `RichiestaOutput::Visibile` lo stesso tetto
+    /// del `TotaleDichiarato` (cioe' reintrodurre il letterale) -> questo test
+    /// cade col valore del difetto reale, 512.
+    #[test]
+    fn lo_stesso_numero_significa_l_opposto_nelle_due_richieste() {
+        let ignoto = FattiTetto::default();
+        assert_eq!(
+            RichiestaOutput::Visibile(512).tetto(&ignoto).max_tokens(),
+            None,
+            "512 da LEGGERE su un modello non dichiarato: nessun tetto, o il \
+             ragionamento se lo mangia e il turno esce vuoto e fatturato"
+        );
+        assert_eq!(
+            RichiestaOutput::TotaleDichiarato {
+                totale: 512,
+                perche: "misura",
+            }
+            .tetto(&ignoto)
+            .max_tokens(),
+            Some(512),
+            "chi MISURA riceve esattamente cio' che ha dichiarato"
+        );
+    }
+
+    /// Chi misura non eredita: il catalogo non va nemmeno interrogato, o si
+    /// misurerebbe la propria premessa (regola O).
+    #[test]
+    fn solo_il_totale_dichiarato_scavalca_il_catalogo() {
+        assert!(!RichiestaOutput::Visibile(256).scavalca_il_catalogo());
+        assert!(RichiestaOutput::TotaleDichiarato {
+            totale: 256,
+            perche: "il probe non puo' leggere cio' che sta derivando",
+        }
+        .scavalca_il_catalogo());
+    }
+
+    /// Il `TotaleDichiarato` ignora i fatti anche quando ci SONO: e' il punto
+    /// della variante. Se li leggesse, il qualificatore proverebbe il modello
+    /// col tetto che il catalogo gia' gli attribuisce.
+    #[test]
+    fn il_totale_dichiarato_non_guarda_i_fatti() {
+        let ricchi = FattiTetto {
+            ragiona: Some(true),
+            default_output: Some(8192),
+            massimo_fornitore: Some(16384),
+        };
+        assert_eq!(
+            RichiestaOutput::TotaleDichiarato {
+                totale: 256,
+                perche: "misura",
+            }
+            .tetto(&ricchi)
+            .max_tokens(),
+            Some(256)
+        );
+        // La gemella, sugli STESSI fatti, delega al criterio.
+        assert_eq!(
+            RichiestaOutput::Visibile(256).tetto(&ricchi).max_tokens(),
+            Some(8192)
+        );
     }
 
     /// Un visibile grande porta con se' il proprio margine anche quando il

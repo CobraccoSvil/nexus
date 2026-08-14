@@ -156,13 +156,22 @@ pub(super) async fn discover_services_agentic(
         "content": "Analizza i file di configurazione forniti e restituisci esclusivamente il JSON dei servizi."
     }])
     .to_string();
-    let max_tokens = load_u64(db, "agent.service_discovery.max_tokens", 2000, 256).await as u32;
+    // Il setting dichiara quanto JSON di servizi si deve poter LEGGERE; il
+    // margine per il ragionamento lo aggiunge il catalogo (regola L).
+    let visibile = load_u64(db, "agent.service_discovery.max_tokens", 2000, 256).await as u32;
 
     // 5. Completion one-shot (nessun tool).
     let raw = match state
         .orchestrator
         .neural
-        .generate_agent_turn(&provider, &model, &messages, "[]", max_tokens, &system)
+        .generate_agent_turn(
+            &provider,
+            &model,
+            &messages,
+            "[]",
+            nexus_agent_graph::decisions::tetto_output::RichiestaOutput::Visibile(visibile),
+            &system,
+        )
         .await
     {
         Ok(v) => v,

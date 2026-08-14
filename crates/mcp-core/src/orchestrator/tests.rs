@@ -439,7 +439,7 @@ async fn test_generate_agent_turn_no_grpc_al_brain() {
             "gpt-x",
             "[{\"role\":\"user\",\"content\":\"hi\"}]",
             "[]",
-            256,
+            nexus_agent_graph::decisions::tetto_output::RichiestaOutput::Visibile(256),
             "",
         )
         .await;

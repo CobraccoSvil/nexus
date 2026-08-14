@@ -773,7 +773,14 @@ async fn run_narrative_llm(
     match state
         .orchestrator
         .neural
-        .generate_agent_turn(provider, model, &messages_json, "[]", 600, "")
+        .generate_agent_turn(
+            provider,
+            model,
+            &messages_json,
+            "[]",
+            nexus_agent_graph::decisions::tetto_output::RichiestaOutput::Visibile(600),
+            "",
+        )
         .await
     {
         Ok(v) => {

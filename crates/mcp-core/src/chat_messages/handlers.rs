@@ -2845,7 +2845,7 @@ async fn precheck_raw_verdict(
             &model_pf,
             messages_json,
             "[]",
-            300,
+            nexus_agent_graph::decisions::tetto_output::RichiestaOutput::Visibile(300),
             system_prompt,
         )
         .await
@@ -3031,7 +3031,14 @@ async fn feedback_assist_suggestion(
     let neural = &state.orchestrator.neural;
     let attempt = |prov: String, mdl: String| async move {
         match neural
-            .generate_agent_turn(&prov, &mdl, messages_json, "[]", 400, system_prompt)
+            .generate_agent_turn(
+                &prov,
+                &mdl,
+                messages_json,
+                "[]",
+                nexus_agent_graph::decisions::tetto_output::RichiestaOutput::Visibile(400),
+                system_prompt,
+            )
             .await
         {
             Ok(v) if !crate::orchestrator::neural_value_is_failure(&v) => AttemptOutcome::Done(

@@ -3399,6 +3399,43 @@ else
   echo "OK vocabolario-capability: il censimento delega il criterio al punto unico"
 fi
 
+# --- tetto-non-si-dichiara-a-mano -------------------------------------------
+# Il confine da cui passa ogni turno one-shot di mcp-core deve CHIEDERE il tetto
+# di output al catalogo, mai metterci il numero del chiamante.
+#
+# MISURATO il 13/08/2026: `tetto_output` esisteva dal 12/08 e un solo call site
+# su dodici lo interrogava. Gli altri undici mandavano un letterale come TOTALE,
+# e su `groq/openai/gpt-oss-20b` il tetto 512 del supervisore usciva
+# `finish_reason=length`, `completion_tokens` esattamente 512, contenuto vuoto —
+# tre volte in un solo run di prova. Il tipo `RichiestaOutput` rende il difetto
+# non riscrivibile al confine; questo guard difende il confine stesso.
+nc="crates/mcp-core/src/orchestrator/neural_client.rs"
+if ! grep -q 'capability::risolvi_richiesta' "$nc"; then
+  echo "!! tetto-di-output: il turno agentico non chiede piu' il tetto al catalogo." >&2
+  echo "   Senza quella delega ogni chiamante torna a dichiarare un TOTALE, che su" >&2
+  echo "   un modello che ragiona e' un turno vuoto FATTURATO (regola L)." >&2
+  fail=1
+elif grep -qE 'max_tokens: Some\([0-9]' "$nc"; then
+  echo "!! tetto-di-output: un tetto LETTERALE e' tornato nel confine del turno" >&2
+  echo "   agentico. Il numero lo decide il catalogo, non il chiamante." >&2
+  fail=1
+else
+  echo "OK tetto-di-output: il confine del turno agentico delega il tetto al catalogo"
+fi
+
+# Le tre provenienze non possono ricollassare in un silenzio solo: "modello non
+# dichiarato" e "catalogo non leggibile" hanno rimedi diversi, e nessuno dei due
+# e' "modello dichiarato che non pone limiti" (regola Q).
+cap="crates/mcp-core/src/capability.rs"
+for variante in ModelloNonDichiarato CatalogoNonLeggibile decide_al_buio; do
+  if ! grep -q "$variante" "$cap"; then
+    echo "!! tetto-di-output: sparita '$variante' da capability.rs. Chi decide il" >&2
+    echo "   tetto tornerebbe a non sapere se sta decidendo sui fatti o al buio," >&2
+    echo "   che e' la condizione dei 37 modelli abilitati fuori dalla vista." >&2
+    fail=1
+  fi
+done
+
 # --- nascita-riga-run -------------------------------------------------------
 # La riga iniziale di `agent_runs` nasce da UN punto solo, che ne dichiara
 # l'esito. I tre percorsi (turno agentico, nessun provider capace, ripresa)

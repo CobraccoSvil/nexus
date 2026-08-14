@@ -466,7 +466,14 @@ async fn distill_project(
     let resp = state
         .orchestrator
         .neural
-        .generate_agent_turn(&provider, &model, &messages_json, "[]", 1200, "")
+        .generate_agent_turn(
+            &provider,
+            &model,
+            &messages_json,
+            "[]",
+            nexus_agent_graph::decisions::tetto_output::RichiestaOutput::Visibile(1200),
+            "",
+        )
         .await
         .context("generate_agent_turn distill")?;
     let content = resp

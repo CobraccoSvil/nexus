@@ -31,7 +31,18 @@ use nexus_model_eligibility::{
     KEY_BACKOFF_HOURS, KEY_MAX_PER_ROUND, KEY_ROUND_ENABLED, KEY_TTL_DAYS, STALE_PROBING_MINUTES,
 };
 
+use nexus_agent_graph::decisions::tetto_output::RichiestaOutput;
+
 use crate::orchestrator::Orchestrator;
+
+/// Perche' la batteria scavalca il catalogo nel chiedere il tetto di output.
+///
+/// La `thinking_matrix` deriva proprio la policy di pensiero del modello:
+/// leggere da `v_model_capabilities` il margine per il ragionamento
+/// significherebbe misurare la propria premessa (regola O).
+const PERCHE_BUDGET_DELLA_BATTERIA: &str =
+    "la batteria dichiara il proprio budget: leggere il catalogo \
+     significherebbe misurare la premessa";
 
 /// Cap del backoff esponenziale (7 giorni): oltre non ha senso attendere di piu'.
 const BACKOFF_CAP_HOURS: i64 = 168;
@@ -1277,7 +1288,7 @@ impl ProbeCtx<'_> {
                 self.model,
                 messages_json,
                 tools_json,
-                self.params.max_tokens,
+                self.params.richiesta_output(),
                 system_text,
                 None,
             )
@@ -1583,8 +1594,29 @@ async fn insert_evidence(
 struct ProfileParams {
     repeat: u32,
     timeout_s: u64,
+    /// Il tetto TOTALE che la batteria dichiara per una passata.
+    ///
+    /// Non passa dal catalogo, e non e' una dimenticanza: la
+    /// `thinking_matrix` deriva proprio la policy di thinking del modello, e
+    /// leggere da `v_model_capabilities` il margine per il ragionamento
+    /// significherebbe misurare la propria premessa (regola O). Viaggia percio'
+    /// come [`RichiestaOutput::TotaleDichiarato`], che e' l'unica variante che
+    /// il catalogo non lo interroga.
     max_tokens: u32,
     promote_min: u32,
+}
+
+impl ProfileParams {
+    /// La richiesta di output della batteria: un TOTALE dichiarato, mai un
+    /// visibile. Unico punto in cui si costruisce (regola L): le due passate
+    /// del loop la scrivevano identica, e due copie divergerebbero al primo
+    /// ritocco del motivo.
+    fn richiesta_output(&self) -> RichiestaOutput {
+        RichiestaOutput::TotaleDichiarato {
+            totale: self.max_tokens,
+            perche: PERCHE_BUDGET_DELLA_BATTERIA,
+        }
+    }
 }
 
 /// Il contesto STABILE di una batteria su un modello: fra una passata e l'altra
@@ -1652,7 +1684,7 @@ impl ProbeCtx<'_> {
                     self.model,
                     messages_json,
                     tools_json,
-                    self.params.max_tokens,
+                    self.params.richiesta_output(),
                     system_text,
                     thinking,
                 ),
