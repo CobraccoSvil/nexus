@@ -674,19 +674,19 @@ pub async fn create_figure(
         )
     })?;
 
-    // (2) Selezione modello TIER-ONLY: provider/model_id VUOTI di proposito
-    //     (regola G + direttiva utente). Il modello concreto lo sceglie
-    //     `best_model_for_tier` dal catalog a ogni convocazione, cosi' la figura
-    //     segue il catalog invece di fossilizzare il nome del modello di oggi.
-    //     `requires_tool_use = true` non e' un default inventato: e' derivato
-    //     dalla whitelist non vuota gia' validata (un modello senza tool_use non
-    //     potrebbe eseguire un solo tool della figura). `required_capability`
-    //     resta NULL: il payload non la dichiara e imporre 'reasoning' qui
-    //     restringerebbe il catalog di nascosto.
+    // (2) Selezione modello TIER-ONLY (regola G + direttiva utente; dalla mig
+    //     0723 le colonne del pin statico non esistono piu'). Il modello
+    //     concreto lo sceglie il resolver dal catalog a ogni convocazione,
+    //     cosi' la figura segue il catalog invece di fossilizzare il nome del
+    //     modello di oggi. `requires_tool_use = true` non e' un default
+    //     inventato: e' derivato dalla whitelist non vuota gia' validata (un
+    //     modello senza tool_use non potrebbe eseguire un solo tool della
+    //     figura). `required_capability` resta NULL: il payload non la dichiara
+    //     e imporre 'reasoning' qui restringerebbe il catalog di nascosto.
     sqlx::query(
         r#"INSERT INTO nexus_purpose_model
-               (purpose, provider, model_id, tier, required_capability, requires_tool_use, notes)
-           VALUES ($1, '', '', $2, NULL, true, $3)"#,
+               (purpose, tier, required_capability, requires_tool_use, notes)
+           VALUES ($1, $2, NULL, true, $3)"#,
     )
     .bind(&purpose)
     .bind(&req.tier)

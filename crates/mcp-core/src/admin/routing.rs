@@ -10,14 +10,11 @@ use crate::AppState;
 #[derive(Debug, Serialize)]
 pub struct PurposeModelEntry {
     pub purpose: String,
-    /// Il (provider, model_id) scritto in tabella. ATTENZIONE: quando `tier` e'
-    /// valorizzato questi campi NON vengono usati — vedi [`PurposeModelEntry::resolved`].
-    pub provider: String,
-    pub model_id: String,
-    /// Fascia di capacita' usata come selezione dinamica dal catalog (mig 0203).
-    /// Quando e' valorizzata, `resolve_purpose_core` e' TIER-ONLY: provider e
-    /// model_id qui sopra non sono un fallback, sono IGNORATI (regola H:
-    /// fail-loud, niente ripiego su un modello statico).
+    /// Fascia di capacita' della selezione dinamica dal catalog (mig 0203,
+    /// tier-only). Il pin statico provider/model_id NON esiste piu' (mig 0723):
+    /// mostrava una configurazione che il resolver ignorava — misurato il
+    /// 2026-07-16, figure dichiarate deepseek giravano su groq. `None` = riga
+    /// storica senza tier: non risolvibile, e l'update la rifiuta (400).
     pub tier: Option<String>,
     pub required_capability: Option<String>,
     pub requires_tool_use: bool,
@@ -55,15 +52,13 @@ pub async fn list_purpose_models(
 ) -> Result<Json<ListPurposeModelsResponse>, StatusCode> {
     let rows: Vec<(
         String,
-        String,
-        String,
         Option<String>,
         Option<String>,
         bool,
         Option<String>,
         String,
     )> = sqlx::query_as(
-        r#"SELECT purpose, provider, model_id, tier, required_capability,
+        r#"SELECT purpose, tier, required_capability,
                   requires_tool_use, notes, updated_at::text
            FROM nexus_purpose_model
            ORDER BY purpose"#,
@@ -73,13 +68,11 @@ pub async fn list_purpose_models(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let mut items = Vec::with_capacity(rows.len());
-    for (purpose, provider, model_id, tier, required_capability, requires_tool_use, notes, updated_at) in
-        rows
-    {
+    for (purpose, tier, required_capability, requires_tool_use, notes, updated_at) in rows {
         // La risoluzione si CHIEDE al resolver, non si ri-deriva qui (regola L):
         // e' lo stesso codice che decide durante un run, quindi il pannello non
-        // puo' divergere da cio' che accade davvero. Solo per i purpose
-        // tier-based: senza tier il modello statico E' la risposta.
+        // puo' divergere da cio' che accade davvero. Senza tier non c'e' nulla
+        // da chiedere: il purpose non risolve (il pin statico non esiste piu').
         let resolved = if tier.is_some() {
             resolve_live(&state, &purpose).await
         } else {
@@ -87,8 +80,6 @@ pub async fn list_purpose_models(
         };
         items.push(PurposeModelEntry {
             purpose,
-            provider,
-            model_id,
             tier,
             required_capability,
             requires_tool_use,
@@ -122,10 +113,10 @@ async fn resolve_live(state: &AppState, purpose: &str) -> Option<ResolvedPurpose
 
 #[derive(Debug, Deserialize)]
 pub struct UpdatePurposeModelRequest {
-    pub provider: String,
-    pub model_id: String,
-    /// Categoria di modelli: 'light' | 'medium' | 'heavy', oppure null/""/"static"
-    /// per disattivare la selezione tier e usare il (provider, model_id) statico.
+    /// Categoria di modelli sulla scala a 5 livelli (light..frontier).
+    /// OBBLIGATORIA dalla mig 0723: senza pin statico un purpose senza tier
+    /// non risolve nulla (NotFound a runtime), e il pannello non deve poter
+    /// produrre quello stato — ''/'static'/'none' rispondono 400.
     #[serde(default)]
     pub tier: Option<String>,
     #[serde(default)]
@@ -150,13 +141,15 @@ pub async fn update_purpose_model(
     if purpose.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    if body.provider.trim().is_empty() || body.model_id.trim().is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
 
     // Normalizza il tier (punto unico testabile). 400 se valore non valido.
-    let tier: Option<String> =
-        normalize_tier(body.tier.as_deref()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    // Il `None` normalizzato (''/'static'/'none') e' a sua volta un 400: senza
+    // pin statico (mig 0723) un purpose senza tier e' configurazione morta, e
+    // il pannello non deve poterla scrivere.
+    let Some(tier) = normalize_tier(body.tier.as_deref()).map_err(|_| StatusCode::BAD_REQUEST)?
+    else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
     let required_capability: Option<String> = body
         .required_capability
         .as_deref()
@@ -166,20 +159,16 @@ pub async fn update_purpose_model(
 
     sqlx::query(
         r#"INSERT INTO nexus_purpose_model
-               (purpose, provider, model_id, tier, required_capability, requires_tool_use, notes)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
+               (purpose, tier, required_capability, requires_tool_use, notes)
+           VALUES ($1, $2, $3, $4, $5)
            ON CONFLICT (purpose)
-           DO UPDATE SET provider = EXCLUDED.provider,
-                         model_id = EXCLUDED.model_id,
-                         tier = EXCLUDED.tier,
+           DO UPDATE SET tier = EXCLUDED.tier,
                          required_capability = EXCLUDED.required_capability,
                          requires_tool_use = EXCLUDED.requires_tool_use,
                          notes = EXCLUDED.notes,
                          updated_at = NOW()"#,
     )
     .bind(purpose)
-    .bind(body.provider.trim().to_lowercase())
-    .bind(body.model_id.trim())
     .bind(tier)
     .bind(required_capability)
     .bind(requires_tool_use)
@@ -203,7 +192,9 @@ pub async fn update_purpose_model(
 /// alla scala a 5 livelli light|medium|high|heavy|frontier dalla mig 0547):
 ///   - 'light' | 'medium' | 'high' | 'heavy' | 'frontier' (case-insensitive)
 ///     -> Some(valore normalizzato)
-///   - None / '' / 'static' / 'none' -> None (selezione statica)
+///   - None / '' / 'static' / 'none' -> None (NESSUN tier: la "selezione
+///     statica" non esiste piu' dalla mig 0723, e `update_purpose_model`
+///     risponde 400 su questo esito)
 ///   - qualunque altro valore -> Err (il chiamante risponde 400)
 fn normalize_tier(raw: Option<&str>) -> Result<Option<String>, ()> {
     match raw.map(|s| s.trim().to_ascii_lowercase()) {

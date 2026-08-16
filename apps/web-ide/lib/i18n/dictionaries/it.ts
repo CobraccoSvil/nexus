@@ -581,7 +581,7 @@ export const it: PartialDictionary = {
     "settings.gerarchiaGlobaleProvider": "Gerarchia globale provider",
     "settings.overridePerIntent": "Override per intent",
     "settings.allineaAlGlobale": "Allinea al globale",
-    "settings.categoriaModelloTierStatico": "Categoria modello (tier). Statico = modello fisso scelto manualmente.",
+    "settings.categoriaModelloTierStatico": "Categoria modello (tier): il modello concreto lo risolve il catalogo a ogni chiamata.",
     "settings.salvaQuestoPurposeModel": "Salva questo purpose model",
     "settings.testaLaRisoluzioneRuntime": "Testa la risoluzione runtime del fallback su loop",
     "settings.purposeModels": "Purpose models",

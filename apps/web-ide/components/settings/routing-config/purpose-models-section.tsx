@@ -5,8 +5,6 @@ import {
   PURPOSE_KEYS,
   PURPOSE_TIER_OPTIONS,
   inputStyle,
-  labelProvider,
-  type ProviderName,
   type RoutingConfigState,
 } from "./shared";
 import { useI18n } from "../../../lib/i18n";
@@ -14,8 +12,6 @@ import { useI18n } from "../../../lib/i18n";
 interface PurposeModelsSectionProps {
   config: RoutingConfigState;
   setConfig: React.Dispatch<React.SetStateAction<RoutingConfigState>>;
-  providers: string[];
-  modelsByProvider: Record<string, string[]>;
   purposeLoading: boolean;
   purposeSaved: boolean;
   purposeError: string | null;
@@ -26,11 +22,18 @@ interface PurposeModelsSectionProps {
   testPurposeModel: (purpose: string) => void;
 }
 
+/**
+ * Pannello dei purpose model, TIER-ONLY (mig 0723).
+ *
+ * I due select provider/modello sono stati rimossi col pin statico: mostravano
+ * una configurazione che il resolver ignorava (misurato il 2026-07-16: figure
+ * dichiarate deepseek giravano su groq). Qui si sceglie la FASCIA; chi risponde
+ * davvero lo dice `resolved`, chiesto al resolver — lo stesso codice che decide
+ * durante un run (regola L), quindi il pannello non puo' divergere dall'effetto.
+ */
 export function PurposeModelsSection({
   config,
   setConfig,
-  providers,
-  modelsByProvider,
   purposeLoading,
   purposeSaved,
   purposeError,
@@ -71,31 +74,21 @@ export function PurposeModelsSection({
       )}
       <div style={{ display: "grid", gap: 10 }}>
         {PURPOSE_KEYS.map((p) => {
-          const defaultProvider = providers[0] ?? "anthropic";
           const pm = config.purposeModels[p.key] ?? {
-            provider: defaultProvider as ProviderName,
-            model_id: modelsByProvider[defaultProvider]?.[0] ?? "",
             notes: null,
             tier: null,
+            required_capability: null,
+            requires_tool_use: false,
+            resolved: null,
           };
-          // Provider e modelli mostrati includono sempre il valore corrente, anche
-          // se non piu' nella lista (provider disabilitato / modello legacy).
-          const providerOptions = providers.includes(pm.provider)
-            ? providers
-            : [pm.provider, ...providers];
-          const modelList = modelsByProvider[pm.provider] ?? [];
-          const modelOptions = pm.model_id && !modelList.includes(pm.model_id)
-            ? [pm.model_id, ...modelList]
-            : modelList;
           const currentTier = pm.tier ?? "";
-          const tierActive = currentTier !== "";
           const savingThis = !!purposeSaving[p.key];
           const testBusy = !!purposeTestBusy[p.key];
           const testMsg = purposeTestMsg[p.key];
           return (
             <div key={p.key} style={{
               display: "grid",
-              gridTemplateColumns: "170px 150px 160px 1fr auto auto",
+              gridTemplateColumns: "220px 150px 1fr auto auto",
               gap: 10,
               alignItems: "center",
               padding: "8px 10px",
@@ -111,11 +104,6 @@ export function PurposeModelsSection({
                   {p.desc}
                 </div>
                 <div style={{ fontSize: 10, color: tc.textMuted, marginTop: 2, fontFamily: "var(--font-mono)" }}>{p.key}</div>
-                {tierActive && (
-                  <div style={{ marginTop: 4, fontSize: 10, color: tc.textMuted }}>
-                    Selezione dinamica dal catalog per categoria. Provider/modello sono usati solo come fallback statico.
-                  </div>
-                )}
                 {!!testMsg && (
                   <div style={{ marginTop: 4, fontSize: 10, color: testMsg.startsWith("OK:") ? tc.success : tc.error }}>
                     {testMsg}
@@ -139,51 +127,27 @@ export function PurposeModelsSection({
                 style={{ ...inputStyle(tc), padding: "6px 8px", fontSize: 12 }}
                 title={t("settings.categoriaModelloTierStatico")}
               >
+                {/* Riga storica senza tier: si mostra vuoto finche' l'admin
+                    non sceglie una fascia (il salvataggio la pretende). */}
+                {currentTier === "" && <option value="">{"—"}</option>}
                 {PURPOSE_TIER_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value}>{opt.label}</option>
                 ))}
               </select>
 
-              <select
-                value={pm.provider}
-                onChange={(e) => {
-                  const provider = e.target.value as ProviderName;
-                  const firstModel = modelsByProvider[provider]?.[0] ?? "";
-                  setConfig((c) => ({
-                    ...c,
-                    purposeModels: {
-                      ...c.purposeModels,
-                      [p.key]: { ...pm, provider, model_id: firstModel || pm.model_id },
-                    },
-                  }));
-                }}
-                style={{ ...inputStyle(tc), padding: "6px 8px", fontSize: 12 }}
-              >
-                {providerOptions.map((prov) => (
-                  <option key={prov} value={prov}>{labelProvider(prov)}</option>
-                ))}
-              </select>
-
-              <select
-                value={pm.model_id}
-                onChange={(e) => {
-                  const model_id = e.target.value;
-                  setConfig((c) => ({
-                    ...c,
-                    purposeModels: { ...c.purposeModels, [p.key]: { ...pm, model_id } },
-                  }));
-                }}
-                style={{ ...inputStyle(tc), padding: "6px 8px", fontSize: 12 }}
-              >
-                {modelOptions.length === 0 && pm.model_id && (
-                  <option value={pm.model_id}>{pm.model_id}</option>
+              <div style={{ fontSize: 11, color: tc.textMuted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {pm.resolved ? (
+                  <span title={pm.resolved.rationale}>
+                    {"→"} {pm.resolved.provider}/{pm.resolved.model}
+                  </span>
+                ) : currentTier !== "" ? (
+                  <span style={{ color: tc.error }} title="Nessun modello risolvibile ora: catalog, gate di qualificazione o provider in cooldown">
+                    {"→"} non risolvibile ora
+                  </span>
+                ) : (
+                  <span style={{ color: tc.error }}>senza tier: non risolvibile</span>
                 )}
-                {modelOptions.map((m) => (
-                  <option key={m} value={m}>
-                    {m}{modelList.includes(m) ? "" : " (corrente — non nel catalogo)"}
-                  </option>
-                ))}
-              </select>
+              </div>
 
               <button
                 onClick={() => void savePurposeModel(p.key)}

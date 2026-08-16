@@ -1079,12 +1079,11 @@ mod tests {
                 .expect("pulizia");
         }
         // La riga REALE del purpose: tier `medium`, capability `reasoning`,
-        // tool use. Le colonne provider/model_id restano valorizzate come in
-        // produzione, proprio per mostrare che non partecipano alla decisione.
+        // tool use. Tier-only (mig 0723): il pin statico non esiste piu'.
         sqlx::query(
             "INSERT INTO nexus_purpose_model \
-               (purpose, provider, model_id, tier, required_capability, requires_tool_use) \
-             VALUES ($1, 'openai', 'gpt-4o-mini', 'medium', 'reasoning', true)",
+               (purpose, tier, required_capability, requires_tool_use) \
+             VALUES ($1, 'medium', 'reasoning', true)",
         )
         .bind(PURPOSE)
         .execute(&pool)

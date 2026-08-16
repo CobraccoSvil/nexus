@@ -165,7 +165,7 @@ async fn subagent_kinds_seedati_con_purpose_validi() {
     for r in &rows {
         let purpose: String = r.try_get("model_purpose").unwrap_or_default();
         let exists: Option<(String,)> =
-            sqlx::query_as("SELECT provider FROM nexus_purpose_model WHERE purpose = $1")
+            sqlx::query_as("SELECT purpose FROM nexus_purpose_model WHERE purpose = $1")
                 .bind(&purpose)
                 .fetch_optional(&pool)
                 .await

@@ -1264,8 +1264,8 @@ mod tests {
         )
         .await;
         sqlx::query(
-            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, requires_tool_use) \
-             VALUES ('loop_fallback_default', 'mistral', 'mistral-small-latest', 'heavy', true)",
+            "INSERT INTO nexus_purpose_model (purpose, tier, requires_tool_use) \
+             VALUES ('loop_fallback_default', 'heavy', true)",
         )
         .execute(pool)
         .await
@@ -1833,8 +1833,8 @@ mod tests {
         // Il cross-provider si risolve per TIER (regola G): `frontier` esiste solo
         // su openai, quindi il candidato e' openai e non un secondo anthropic.
         sqlx::query(
-            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, requires_tool_use) \
-             VALUES ('loop_fallback_default', 'fallback-provider', 'fallback-model', 'frontier', true)",
+            "INSERT INTO nexus_purpose_model (purpose, tier, requires_tool_use) \
+             VALUES ('loop_fallback_default', 'frontier', true)",
         )
         .execute(pool)
         .await

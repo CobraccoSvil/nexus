@@ -1069,8 +1069,8 @@ mod tests {
             .await
             .expect("pulizia purpose model");
         sqlx::query(
-            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, required_capability, requires_tool_use) \
-             VALUES ('reviewer', 'fallback-provider', 'fallback-model', 'high', NULL, true)",
+            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
+             VALUES ('reviewer', 'high', NULL, true)",
         )
         .execute(&pool)
         .await
@@ -1142,8 +1142,8 @@ mod tests {
             .await
             .expect("pulizia purpose model");
         sqlx::query(
-            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, required_capability, requires_tool_use) \
-             VALUES ('reviewer', 'fallback-provider', 'fallback-model', 'high', NULL, true)",
+            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
+             VALUES ('reviewer', 'high', NULL, true)",
         )
         .execute(&pool)
         .await
@@ -1202,8 +1202,8 @@ mod tests {
             .await
             .expect("pulizia purpose model");
         sqlx::query(
-            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, required_capability, requires_tool_use) \
-             VALUES ('multi_provider_advisory', 'fallback-provider', 'fallback-model', 'medium', 'reasoning', true)",
+            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
+             VALUES ('multi_provider_advisory', 'medium', 'reasoning', true)",
         )
         .execute(&pool)
         .await
@@ -1258,7 +1258,7 @@ mod tests {
             .await
             .expect("pulizia purpose model");
         sqlx::query(
-            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, required_capability, requires_tool_use)              VALUES ('multi_provider_advisory', 'fallback-provider', 'fallback-model', 'heavy', 'reasoning', true)",
+            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use)              VALUES ('multi_provider_advisory', 'heavy', 'reasoning', true)",
         )
         .execute(&pool)
         .await
@@ -1323,8 +1323,8 @@ mod tests {
             .await
             .expect("pulizia purpose model");
         sqlx::query(
-            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, required_capability, requires_tool_use)
-             VALUES ('multi_provider_advisory', 'fallback-provider', 'fallback-model', 'medium', 'reasoning', true)",
+            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use)
+             VALUES ('multi_provider_advisory', 'medium', 'reasoning', true)",
         )
         .execute(&pool)
         .await
@@ -1499,8 +1499,8 @@ mod tests {
     async fn auto_remediation_risolto_valorizza_entrambi_gli_override(pool: sqlx::PgPool) {
         crea_tabella_purpose(&pool).await;
         sqlx::query(
-            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, required_capability, requires_tool_use) \
-             VALUES ('auto_remediation', 'fallback-provider', 'fallback-model', 'heavy', NULL, true)",
+            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
+             VALUES ('auto_remediation', 'heavy', NULL, true)",
         )
         .execute(&pool)
         .await
@@ -1537,8 +1537,8 @@ mod tests {
         // Purpose presente ma tier NULL -> NotFound (tier-only). Il rimedio NON
         // si blocca: (None, None) = routing di default, comportamento odierno.
         sqlx::query(
-            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, required_capability, requires_tool_use) \
-             VALUES ('auto_remediation', 'fallback-provider', 'fallback-model', NULL, NULL, true)",
+            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
+             VALUES ('auto_remediation', NULL, NULL, true)",
         )
         .execute(&pool)
         .await
@@ -1556,8 +1556,8 @@ mod tests {
         // Tier valorizzato ma NESSUN modello capace nel catalog -> NoCapableModel
         // -> (None, None). Stessa strada del produttore, ramo diverso.
         sqlx::query(
-            "INSERT INTO nexus_purpose_model (purpose, provider, model_id, tier, required_capability, requires_tool_use) \
-             VALUES ('auto_remediation', 'fallback-provider', 'fallback-model', 'heavy', NULL, true)",
+            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
+             VALUES ('auto_remediation', 'heavy', NULL, true)",
         )
         .execute(&pool)
         .await

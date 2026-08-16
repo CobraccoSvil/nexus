@@ -579,7 +579,7 @@ export const es: PartialDictionary = {
     "settings.gerarchiaGlobaleProvider": "Jerarquia global de proveedores",
     "settings.overridePerIntent": "Anulacion por intencion",
     "settings.allineaAlGlobale": "Alinear con el global",
-    "settings.categoriaModelloTierStatico": "Categoria del modelo (tier). Estatico = modelo fijo elegido manualmente.",
+    "settings.categoriaModelloTierStatico": "Categoria del modelo (tier): el modelo concreto se resuelve del catalogo en cada llamada.",
     "settings.salvaQuestoPurposeModel": "Guardar este purpose model",
     "settings.testaLaRisoluzioneRuntime": "Prueba la resolucion en runtime del respaldo por bucle",
     "settings.purposeModels": "Purpose models",

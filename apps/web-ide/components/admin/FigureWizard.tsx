@@ -17,8 +17,9 @@
  * col segnaposto della lente ancora intatto.
  *
  * Selezione modello TIER-ONLY: qui non si sceglie mai un nome di modello. Il
- * purpose nasce con provider/model_id vuoti e il modello concreto lo risolve
- * best_model_for_tier dal catalog a ogni convocazione (regola G).
+ * purpose nasce col solo tier (le colonne del pin statico non esistono piu',
+ * mig 0723) e il modello concreto lo risolve il resolver dal catalog a ogni
+ * convocazione (regola G).
  *
  * Riusabile: montato sia nell'editor definitions (/admin/orchestrator/subagents)
  * sia nella pagina del consiglio (/admin/council).
@@ -517,7 +518,7 @@ export function FigureWizard({ open, onClose, onCreated }: FigureWizardProps) {
                 target="nexus_purpose_model"
                 lines={[
                   `purpose: ${purposePreview}`,
-                  `tier: ${tier} (provider e modello vuoti: li sceglie best_model_for_tier)`,
+                  `tier: ${tier} (il modello lo risolve il catalog a ogni convocazione)`,
                 ]}
               />
               <SummaryItem

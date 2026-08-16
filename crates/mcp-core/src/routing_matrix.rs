@@ -59,13 +59,11 @@ pub struct RoutingMatrix {
     pub by_intent_mode: HashMap<(String, String), (String, String)>,
     /// Default model per provider (provider -> model_id)
     pub default_models: HashMap<String, String>,
-    /// Modello per task interni (purpose -> (provider, model_id)).
-    /// Vedi migrazione 0102: chat_title_generator, chat_feedback_generator,
-    /// docs_generator, custom_instructions, admin_fallback_default, google_batch.
-    pub purpose_models: HashMap<String, (String, String)>,
     /// Regole tier-based per purpose (mig 0203): purpose -> tier/capability/tool.
     /// Se un purpose e' qui, il suo modello e' risolto dinamicamente dal
-    /// catalog; `purpose_models` resta come ultimo fallback.
+    /// catalog. Il fallback statico `purpose_models` (purpose -> provider+model)
+    /// e' stato RIMOSSO (mig 0723): il resolver era gia' tier-only e la mappa
+    /// non aveva alcun lettore decisionale — solo un len() nel log di init.
     pub purpose_tiers: HashMap<String, PurposeTierRule>,
     /// Regole di escalation token-based per (intent, behavior_mode).
     /// NB: una entry esiste solo se l'admin ha configurato escalation per
@@ -122,7 +120,8 @@ impl RoutingMatrix {
 
     /// Regola tier-based per un purpose, se configurata (mig 0203).
     /// Se ritorna Some, il chiamante deve risolvere il modello dinamicamente
-    /// dal catalog (tier+capability); `purpose_models` resta come ultimo fallback.
+    /// dal catalog (tier+capability); None = purpose non risolvibile (il
+    /// fallback statico non esiste piu', mig 0723).
     pub fn purpose_tier(&self, purpose: &str) -> Option<PurposeTierRule> {
         self.purpose_tiers.get(purpose).cloned()
     }
@@ -254,7 +253,6 @@ impl RoutingMatrix {
         Self {
             by_intent_mode,
             default_models,
-            purpose_models: HashMap::new(),
             purpose_tiers: HashMap::new(),
             escalations: HashMap::new(),
             manual_overrides: HashSet::new(),
@@ -294,17 +292,6 @@ async fn fetch_from_db(db: &PgPool) -> Result<RoutingMatrix, String> {
     .fetch_all(db)
     .await
     .map_err(|e| format!("query nexus_provider_default_model fallita: {e}"))?;
-
-    // Purpose models (mig 0102). NON ignoriamo errori — se la tabella non
-    // esiste l'admin deve applicare la migrazione.
-    let purpose_rows = sqlx::query_as::<_, (String, String, String)>(
-        r#"SELECT purpose, provider, model_id FROM nexus_purpose_model"#,
-    )
-    .fetch_all(db)
-    .await
-    .map_err(|e| {
-        format!("query nexus_purpose_model fallita: {e}. Hai applicato la migrazione 0102?")
-    })?;
 
     // Regole tier-based per purpose (mig 0203). GRACEFUL: se le colonne non
     // esistono (migrazione non ancora applicata) ignoriamo senza bloccare —
@@ -367,10 +354,6 @@ async fn fetch_from_db(db: &PgPool) -> Result<RoutingMatrix, String> {
     }
 
     let default_models: HashMap<String, String> = default_rows.into_iter().collect();
-    let purpose_models: HashMap<String, (String, String)> = purpose_rows
-        .into_iter()
-        .map(|(purpose, provider, model)| (purpose, (provider, model)))
-        .collect();
     let purpose_tiers: HashMap<String, PurposeTierRule> = purpose_tier_rows
         .into_iter()
         .filter_map(|(purpose, tier, capability, requires_tool_use)| {
@@ -390,7 +373,6 @@ async fn fetch_from_db(db: &PgPool) -> Result<RoutingMatrix, String> {
     Ok(RoutingMatrix {
         by_intent_mode,
         default_models,
-        purpose_models,
         purpose_tiers,
         escalations,
         manual_overrides,
@@ -421,10 +403,10 @@ impl RoutingMatrixCache {
             match fetch_from_db(&db).await {
                 Ok(m) => {
                     info!(
-                        "routing_matrix: caricata da DB ({} routing, {} default per-provider, {} purpose-models)",
+                        "routing_matrix: caricata da DB ({} routing, {} default per-provider, {} purpose-tier)",
                         m.by_intent_mode.len(),
                         m.default_models.len(),
-                        m.purpose_models.len()
+                        m.purpose_tiers.len()
                     );
                     initial = Some(Arc::new(m));
                     last_err = None;
@@ -534,15 +516,9 @@ mod tests {
         let mut default_models = HashMap::new();
         default_models.insert("openai".to_string(), "gpt-4o-mini".to_string());
         default_models.insert("anthropic".to_string(), "claude-sonnet-4-6".to_string());
-        let mut purpose_models = HashMap::new();
-        purpose_models.insert(
-            "chat_title_generator".to_string(),
-            ("openai".to_string(), "gpt-4.1-nano".to_string()),
-        );
         RoutingMatrix {
             by_intent_mode,
             default_models,
-            purpose_models,
             purpose_tiers: HashMap::new(),
             escalations: HashMap::new(),
             manual_overrides: HashSet::new(),
@@ -674,19 +650,6 @@ mod tests {
         let m = RoutingMatrix::fallback_safe();
         assert_eq!(m.lookup("file_ops", "ultra_veloce"), None);
         assert_eq!(m.lookup("chat_breve", ""), None);
-    }
-
-    #[test]
-    fn purpose_models_contiene_tupla_provider_modello() {
-        // La risoluzione purpose in produzione passa dal punto unico tier-only
-        // (internal_routing::resolve_purpose_model); qui validiamo solo che il
-        // campo purpose_models (fallback statico) sia popolato correttamente.
-        let m = make_test_matrix();
-        assert_eq!(
-            m.purpose_models.get("chat_title_generator"),
-            Some(&("openai".to_string(), "gpt-4.1-nano".to_string()))
-        );
-        assert_eq!(m.purpose_models.get("inesistente"), None);
     }
 
     #[test]

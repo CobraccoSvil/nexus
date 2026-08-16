@@ -210,7 +210,7 @@ fn parse_docs_generator_json(resp_text: &str, doc_type: &str) -> Result<Value, S
             Err(format!(
                 "[Errore] Generazione '{}' fallita: il modello docs_generator ha \
                  prodotto un JSON privo dell'array 'sections'. Riprova; se persiste, \
-                 verifica provider/modello in nexus_purpose_model (purpose='docs_generator').",
+                 verifica il tier in nexus_purpose_model (purpose='docs_generator').",
                 doc_type
             ))
         }

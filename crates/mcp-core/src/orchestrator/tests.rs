@@ -49,7 +49,6 @@ fn test_route_model_with_mode_no_hardcoded_last_resort() {
     let empty = RoutingMatrix {
         by_intent_mode: HashMap::new(),
         default_models: HashMap::new(),
-        purpose_models: HashMap::new(),
         purpose_tiers: HashMap::new(),
         escalations: HashMap::new(),
         manual_overrides: std::collections::HashSet::new(),

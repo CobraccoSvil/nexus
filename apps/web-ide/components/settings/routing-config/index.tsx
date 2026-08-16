@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useTheme, useThemeColors } from "../../../lib/theme";
 import { NexusMetricsPanel } from "../nexus-metrics-panel";
 import { NexusWorkersPanel } from "../nexus-workers-panel";
-import { listAdminPurposeModels, resolveInternalPurposeModel, updateAdminPurposeModel, getProviderRegistry, getModels, type PurposeModelEntry } from "../../../lib/api-client";
+import { listAdminPurposeModels, resolveInternalPurposeModel, updateAdminPurposeModel, getProviderRegistry, type PurposeModelEntry } from "../../../lib/api-client";
 import {
   API_BASE,
   FALLBACK_PROVIDERS,
@@ -34,11 +34,10 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
   const { t } = useI18n();
   const tc = useThemeColors();
   const { resolved } = useTheme();
-  // Provider e modelli dal registry/catalog (fonte unica, regola G): niente piu'
-  // lista hardcoded a 5. Fallback ai noti finche' il fetch non completa.
+  // Provider dal registry (fonte unica, regola G): niente piu' lista
+  // hardcoded a 5. Fallback ai noti finche' il fetch non completa.
   const [providers, setProviders] = useState<string[]>(FALLBACK_PROVIDERS);
   const [providersError, setProvidersError] = useState<string | null>(null);
-  const [modelsByProvider, setModelsByProvider] = useState<Record<string, string[]>>({});
   const [config, setConfig] = useState<RoutingConfigState>(() => buildRoutingState(settings, FALLBACK_PROVIDERS));
   const [purposeLoading, setPurposeLoading] = useState(false);
   const [purposeError, setPurposeError] = useState<string | null>(null);
@@ -68,20 +67,16 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
     setNexusRoutingPct(Math.max(0, Math.min(100, parsedNexusPct)));
   }, [settings, providers]);
 
-  // Carica la lista provider (registry, is_active per sortOrder, incluso vllm che
-  // partecipa legittimamente alle catene) e i modelli abilitati per provider.
+  // Carica la lista provider (registry, is_active per sortOrder, incluso vllm
+  // che partecipa legittimamente alle catene). I modelli per provider non
+  // servono piu' qui: il pannello purpose e' tier-only (mig 0723).
   useEffect(() => {
     let active = true;
-    Promise.all([getProviderRegistry(), getModels()])
-      .then(([reg, cat]) => {
+    getProviderRegistry()
+      .then((reg) => {
         if (!active) return;
         const names = (reg.providers ?? []).filter((p) => p.isActive).map((p) => p.name);
         if (names.length > 0) setProviders(names);
-        const byProvider: Record<string, string[]> = {};
-        for (const m of cat.models ?? []) {
-          (byProvider[m.provider] ??= []).push(m.model);
-        }
-        setModelsByProvider(byProvider);
         setProvidersError(null);
       })
       .catch((e: unknown) => {
@@ -106,16 +101,14 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
         if (!active) return;
         const pm: RoutingConfigState["purposeModels"] = {};
         for (const it of (res.items ?? []) as PurposeModelEntry[]) {
-          const prov = it.provider as ProviderName;
-          // Nessun filtro sui provider: il dato DB e' autoritativo, accettiamo
-          // qualunque provider (inclusi quelli onboardati via registry).
+          // Tier-only (mig 0723): niente piu' provider/model_id statici. Cio'
+          // che risponde davvero lo dice `resolved`, chiesto al resolver.
           pm[it.purpose] = {
-            provider: prov,
-            model_id: it.model_id,
             notes: it.notes ?? null,
             tier: it.tier ?? null,
             required_capability: it.required_capability ?? null,
             requires_tool_use: it.requires_tool_use ?? false,
+            resolved: it.resolved ?? null,
           };
         }
         setConfig((prev) => ({ ...prev, purposeModels: pm }));
@@ -215,15 +208,19 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
   const savePurposeModel = async (purpose: string) => {
     const pm = config.purposeModels[purpose];
     if (!pm) return;
+    // Tier obbligatorio (mig 0723): senza pin statico un purpose senza tier
+    // non risolve nulla, e il backend lo rifiuta con 400.
+    if (!pm.tier) {
+      setPurposeError(`Il purpose '${purpose}' richiede un tier: scegli la fascia prima di salvare.`);
+      return;
+    }
     setPurposeSaving((prev) => ({ ...prev, [purpose]: true }));
     setPurposeError(null);
     setPurposeSaved(false);
     try {
       await updateAdminPurposeModel(purpose, {
-        provider: pm.provider,
-        model_id: pm.model_id,
+        tier: pm.tier,
         notes: pm.notes ?? null,
-        tier: pm.tier ?? null,
         required_capability: pm.required_capability ?? null,
         requires_tool_use: pm.requires_tool_use ?? false,
       });
@@ -322,8 +319,6 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
           <PurposeModelsSection
             config={config}
             setConfig={setConfig}
-            providers={providers}
-            modelsByProvider={modelsByProvider}
             purposeLoading={purposeLoading}
             purposeSaved={purposeSaved}
             purposeError={purposeError}

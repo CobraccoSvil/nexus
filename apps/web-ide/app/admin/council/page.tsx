@@ -1026,12 +1026,19 @@ function Badge({ tc, label, tone }: { tc: ThemeColors; label: string; tone: "ok"
  */
 function ModelloRisolto({ tc, pm }: { tc: ThemeColors; pm: PurposeModelEntry }) {
   const stile: CSSProperties = { color: tc.textMuted, fontSize: 11 };
-  // Purpose statico: nessun tier -> provider/model_id SONO la risposta.
+  // Riga storica senza tier: dal drop del pin statico (mig 0723) non c'e' piu'
+  // una risposta statica da mostrare — il resolver risponde NotFound.
   if (!pm.tier) {
     return (
       <span style={stile}>
         {" "}
-        · statico · {pm.provider}/{pm.model_id}
+        · senza tier ·{" "}
+        <span
+          style={{ color: tc.error }}
+          title="Il pin statico e' stato rimosso (mig 0723): un purpose senza tier non risolve nulla. Assegna un tier dal pannello routing."
+        >
+          non risolvibile
+        </span>
       </span>
     );
   }

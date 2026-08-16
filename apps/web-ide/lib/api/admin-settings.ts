@@ -64,18 +64,16 @@ export interface ResolvedPurposeModel {
 
 export interface PurposeModelEntry {
   purpose: string;
-  /** Il valore in tabella. Quando `tier` e' valorizzato NON viene usato: il
-   *  resolver e' tier-only. Mostrare questo campo come "il modello del purpose"
-   *  e' la bugia che il pannello raccontava (vedi `resolved`). */
-  provider: string;
-  model_id: string;
+  /** Fascia della selezione dinamica dal catalog (tier-only, mig 0723: il pin
+   *  statico provider/model_id non esiste piu'). `null` = riga storica senza
+   *  tier: non risolvibile. */
   notes?: string | null;
   tier?: string | null;
   required_capability?: string | null;
   requires_tool_use?: boolean;
   updated_at: string;
-  /** Cosa risolve davvero. `null` = purpose statico (senza tier: allora
-   *  provider/model_id SONO la risposta) oppure non risolvibile ora. */
+  /** Cosa risolve davvero il resolver ADESSO. `null` = non risolvibile ora
+   *  (catalog, gate di qualificazione o cooldown) oppure tier assente. */
   resolved?: ResolvedPurposeModel | null;
 }
 
@@ -86,10 +84,10 @@ export async function listAdminPurposeModels(): Promise<{ items: PurposeModelEnt
 export async function updateAdminPurposeModel(
   purpose: string,
   body: {
-    provider: string;
-    model_id: string;
+    /** Obbligatorio dalla mig 0723: senza pin statico un purpose senza tier
+     *  non risolve nulla, e il pannello non deve poter produrre quello stato. */
+    tier: string;
     notes?: string | null;
-    tier?: string | null;
     required_capability?: string | null;
     requires_tool_use?: boolean;
   },

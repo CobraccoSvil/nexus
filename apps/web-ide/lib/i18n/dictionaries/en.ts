@@ -588,7 +588,7 @@ export const en = {
     "settings.gerarchiaGlobaleProvider": "Global provider hierarchy",
     "settings.overridePerIntent": "Per-intent override",
     "settings.allineaAlGlobale": "Align to global",
-    "settings.categoriaModelloTierStatico": "Model category (tier). Static = fixed model chosen manually.",
+    "settings.categoriaModelloTierStatico": "Model category (tier): the concrete model is resolved from the catalog at every call.",
     "settings.salvaQuestoPurposeModel": "Save this purpose model",
     "settings.testaLaRisoluzioneRuntime": "Test runtime resolution of the loop fallback",
     "settings.purposeModels": "Purpose models",

@@ -28,18 +28,21 @@ export interface RoutingConfigState {
 }
 
 export interface PurposeModelConfig {
-  provider: ProviderName;
-  model_id: string;
+  // Tier-only (mig 0723): il pin statico provider/model_id non esiste piu'.
   notes?: string | null;
   tier?: string | null;
   required_capability?: string | null;
   requires_tool_use?: boolean;
+  /** Chi risponde DAVVERO adesso, chiesto al resolver (sola lettura). */
+  resolved?: { provider: string; model: string; rationale: string } | null;
 }
 
 // Scala di capacita' a 5 livelli (light < medium < high < heavy < frontier),
 // allineata a ai_price_catalog.performance_tier (mig 0528) e ai CHECK vivi (0547).
+// L'opzione "Statico (modello fisso)" e' stata rimossa con la mig 0723: senza
+// pin statico un purpose senza tier non risolve nulla, e il pannello non deve
+// poterlo produrre.
 export const PURPOSE_TIER_OPTIONS: Array<{ value: string; label: string }> = [
-  { value: "", label: "Statico (modello fisso)" },
   { value: "light", label: "Light" },
   { value: "medium", label: "Medium" },
   { value: "high", label: "High" },
