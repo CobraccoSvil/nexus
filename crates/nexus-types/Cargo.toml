@@ -19,5 +19,10 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+# I test dell'A/B lingua (templates.rs) girano sulla migrazione REALE
+# (regola O): il set incorporato e' lo stesso che la produzione applica.
+nexus-migrations-embedded = { path = "../nexus-migrations-embedded" }
+
 [lints]
 workspace = true

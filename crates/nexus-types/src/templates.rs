@@ -147,3 +147,132 @@ pub async fn get_template_or_default(db: &PgPool, cache: &TemplateCache, key: &s
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Le 4 chiavi dell'A/B lingua (fase 5b, mig 0725).
+    const CHIAVI_AB: [&str; 4] = [
+        "automation.supervisor_monitoring",
+        "subagent.step_gatekeeper.base",
+        "subagent.step_challenger.base",
+        "system.choices_extractor",
+    ];
+
+    /// L'istruzione che le sole varianti EN del gate duale portano in coda
+    /// (vincolo 6 del report: reason/evidence affiorano nei pannelli UI).
+    const ISTRUZIONE_CAMPI_ITALIANI: &str =
+        "Write the human-readable reason and evidence fields in Italian.";
+
+    /// STESSA regex per entrambe le varianti (regola O): un confronto fatto
+    /// con due estrattori diversi confronterebbe due idee di placeholder.
+    fn placeholder_di(testo: &str) -> BTreeSet<String> {
+        let re = regex::Regex::new(r"\{\{[a-zA-Z_]+\}\}").expect("regex placeholder");
+        re.find_iter(testo).map(|m| m.as_str().to_string()).collect()
+    }
+
+    async fn contenuto_attivo(db: &PgPool, key: &str) -> Option<String> {
+        fetch_active_content(db, key).await.expect("lettura template")
+    }
+
+    /// MUTAZIONE: togliere un placeholder (o una riga .en) dalla mig 0725 fa
+    /// rosseggiare questo test — un placeholder perso e' un template che smette
+    /// di riempirsi in silenzio.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn le_varianti_en_esistono_e_conservano_i_placeholder_delle_it(db: PgPool) {
+        for chiave in CHIAVI_AB {
+            let it = contenuto_attivo(&db, chiave)
+                .await
+                .unwrap_or_else(|| panic!("riga IT '{chiave}' assente"));
+            let en = contenuto_attivo(&db, &format!("{chiave}{ENGLISH_VARIANT_SUFFIX}"))
+                .await
+                .unwrap_or_else(|| panic!("riga EN '{chiave}.en' assente o disattiva"));
+            assert_eq!(
+                placeholder_di(&it),
+                placeholder_di(&en),
+                "placeholder divergenti fra IT ed EN su '{chiave}'"
+            );
+        }
+        // Il setting selettore nasce vuoto: default = tutto italiano.
+        let valore: Option<String> =
+            sqlx::query_scalar("SELECT value FROM settings WHERE key = $1")
+                .bind(ENGLISH_VARIANTS_SETTING_KEY)
+                .fetch_optional(&db)
+                .await
+                .expect("lettura setting");
+        assert_eq!(valore.as_deref(), Some(""), "il selettore deve nascere vuoto");
+    }
+
+    /// MUTAZIONE: spostare l'istruzione sui campi italiani su un template non
+    /// del gate (o toglierla da un giudice) fa rosseggiare questo test.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn solo_i_giudici_del_gate_ordinano_i_campi_liberi_in_italiano(db: PgPool) {
+        for chiave in CHIAVI_AB {
+            let en = contenuto_attivo(&db, &format!("{chiave}{ENGLISH_VARIANT_SUFFIX}"))
+                .await
+                .unwrap_or_else(|| panic!("riga EN '{chiave}.en' assente"));
+            let e_giudice = chiave.starts_with("subagent.step_");
+            assert_eq!(
+                en.contains(ISTRUZIONE_CAMPI_ITALIANI),
+                e_giudice,
+                "istruzione campi-in-italiano fuori posto su '{chiave}.en'"
+            );
+        }
+    }
+
+    /// MUTAZIONE (eseguita durante lo sviluppo): spegnere la consultazione del
+    /// CSV in `get_template_or_default` (ramo `variante_inglese_selezionata`)
+    /// fa rosseggiare il caso "chiave nel CSV -> esce la EN".
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_selezione_segue_il_csv_e_degrada_dichiarando(db: PgPool) {
+        const CHIAVE_GATE: &str = "subagent.step_gatekeeper.base";
+
+        // 1) CSV vuoto (default della migrazione) -> esce la riga italiana.
+        let testo = get_template_or_default(&db, &TemplateCache::new(), CHIAVE_GATE).await;
+        assert!(
+            testo.contains("Sei il GATEKEEPER"),
+            "col CSV vuoto deve uscire la riga italiana"
+        );
+
+        // 2) Chiave nel CSV -> esce la variante inglese.
+        sqlx::query("UPDATE settings SET value = $1 WHERE key = $2")
+            .bind(CHIAVE_GATE)
+            .bind(ENGLISH_VARIANTS_SETTING_KEY)
+            .execute(&db)
+            .await
+            .expect("flip del setting");
+        // La scrittura avviene con una query propria: la cache dei settings va
+        // invalidata come da contratto di `invalidate_setting_cache`.
+        nexus_auth::invalidate_setting_cache(&db, ENGLISH_VARIANTS_SETTING_KEY);
+        let testo = get_template_or_default(&db, &TemplateCache::new(), CHIAVE_GATE).await;
+        assert!(
+            testo.contains("You are the GATEKEEPER"),
+            "con la chiave nel CSV deve uscire la variante EN"
+        );
+
+        // 3) Chiave nel CSV ma riga .en ASSENTE -> degrado dichiarato: esce la
+        //    riga italiana, nessun errore, mai un prompt vuoto.
+        sqlx::query(
+            "INSERT INTO nexus_prompt_templates (key, category, title, content) \
+             VALUES ('test.variante_assente', 'system', 'Solo IT', 'CONTENUTO ITALIANO')",
+        )
+        .execute(&db)
+        .await
+        .expect("seed riga solo-IT");
+        sqlx::query("UPDATE settings SET value = $1 WHERE key = $2")
+            .bind("test.variante_assente")
+            .bind(ENGLISH_VARIANTS_SETTING_KEY)
+            .execute(&db)
+            .await
+            .expect("flip del setting");
+        nexus_auth::invalidate_setting_cache(&db, ENGLISH_VARIANTS_SETTING_KEY);
+        let testo =
+            get_template_or_default(&db, &TemplateCache::new(), "test.variante_assente").await;
+        assert_eq!(
+            testo, "CONTENUTO ITALIANO",
+            "riga .en assente: si degrada alla riga italiana"
+        );
+    }
+}
