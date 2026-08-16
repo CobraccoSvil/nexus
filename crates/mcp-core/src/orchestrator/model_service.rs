@@ -55,7 +55,7 @@
 
 use sqlx::PgPool;
 
-use nexus_agent_graph::decisions::tiers::{tier_chain_up, tier_rank, tier_rank_sql};
+use nexus_agent_graph::decisions::tiers::{tier_chain_up, tier_rank};
 
 use super::model_routing::{agentic_tier_chain, AGENTIC_COST_FIRST_ORDER, AGENTIC_FAILOVER_ORDER};
 use super::{qualification_gate, select_models_tierchain, EligibilityFilter};
@@ -140,19 +140,16 @@ pub enum Rank {
     NonAgenticSafe,
     /// Finestra piu' ampia prima (upscale per contesto), poi costo.
     WidestWindow,
-    /// Capacita' DECRESCENTE per tier — l'UNICO modo di ordinare per tier.
-    /// L'espressione viene generata da [`tier_rank_sql`], cioe' dallo stesso
-    /// vocabolario di [`tier_rank`]: una scala sola, verificata contro Postgres.
-    HighestTierFirst,
-    /// Piu' veloce prima (behavior_mode "veloce"), poi costo. `speed_tier` e' un
-    /// vocabolario SUO (fast/medium/slow), distinto dal performance_tier.
-    Fastest,
-    /// Il piu' capace/caro DENTRO il tier gia' promosso (behavior_mode
-    /// "approfondita"): featured prima, poi costo DECRESCENTE. Non e'
-    /// `HighestTierFirst`: li' il tier e' gia' fissato dal chiamante, qui si
-    /// sceglie il migliore al suo interno.
-    MostCapable,
 }
+
+// Le varianti `HighestTierFirst`, `Fastest` e `MostCapable` sono state RIMOSSE
+// (fase 3, lotto 2): `route_model_from_catalog` riceveva `mode` SEMPRE
+// "dinamico" dai due call site di produzione, quindi i rami "veloce"/
+// "approfondita" che le sceglievano erano irraggiungibili, e `HighestTierFirst`
+// aveva call site solo nei test. I behavior_mode restano vivi nel solo canale
+// matrix statico (`route_model_with_mode`). Recupero: git, se un giorno un
+// mode reale arrivera' al catalog. La scala tier->SQL resta presidiata da
+// `tier_rank_sql` (min_tier in model_selection) e dal suo test ponte.
 
 impl Rank {
     /// La clausola SQL. Nessun `CASE` scritto a mano: quello per tier lo genera
@@ -166,17 +163,6 @@ impl Rank {
                 .to_string(),
             Rank::WidestWindow => {
                 "context_window DESC, input_cost_per_million_tokens ASC NULLS LAST".to_string()
-            }
-            Rank::HighestTierFirst => format!(
-                "{} DESC, input_cost_per_million_tokens DESC NULLS LAST, \
-                 output_cost_per_million_tokens DESC NULLS LAST",
-                tier_rank_sql("performance_tier")
-            ),
-            Rank::Fastest => "CASE speed_tier WHEN 'fast' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, \
-                 input_cost_per_million_tokens ASC"
-                .to_string(),
-            Rank::MostCapable => {
-                "is_featured DESC, input_cost_per_million_tokens DESC".to_string()
             }
         }
     }

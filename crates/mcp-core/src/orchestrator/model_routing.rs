@@ -209,9 +209,14 @@ fn floor_tier_for_agentic<'a>(
     }
 }
 
-/// Seleziona il modello ottimale dal catalogo DB per la modalità richiesta.
-/// La modalità "dinamico" sceglie il modello più adatto per capability+tier,
-/// privilegiando il costo più basso a parità di tier richiesto.
+/// Seleziona il modello ottimale dal catalogo DB per capability+tier,
+/// privilegiando il costo piu' basso a parita' di tier richiesto.
+///
+/// Il parametro `mode` e' stato RIMOSSO (fase 3, lotto 2): i due call site di
+/// produzione passavano SEMPRE il letterale "dinamico", quindi i rami
+/// "veloce"/"approfondita" (promozione di tier + Rank dedicati) erano
+/// irraggiungibili. I behavior_mode vivono nel solo canale matrix statico
+/// (`route_model_with_mode`), dove gia' vivono. Recupero: git.
 ///
 /// `is_agentic_turn` (regola L: deciso dal chiamante che conosce l'intent;
 /// convenzione del progetto `intent != "chat"`) attiva il PAVIMENTO di tier
@@ -243,52 +248,17 @@ pub(crate) async fn route_model_from_catalog(
     db: &PgPool,
     base_tier: &str,
     capability: &str,
-    mode: &str,
     is_agentic_turn: bool,
 ) -> Option<DynamicRoutingDecision> {
-    // Promozione/declassamento del tier in base al behavior_mode.
-    // "approfondita" scala in alto, "veloce"/"economica" scala in basso.
     // Il `base_tier` arriva gia' risolto dal chiamante via IntentCapabilityMap
     // (mig 0110), che applica le soglie di token threshold per l'intent.
-    // Scala a 5 tier (light<medium<high<heavy<frontier): "approfondita" sale di UN
-    // gradino, "veloce"/"economica" scende di UN gradino con pavimento a 'medium'
-    // (non si va sotto medium per un intent di velocita'/costo).
-    let mode_tier = match mode {
-        "approfondita" => match base_tier {
-            "light" => "medium",
-            "medium" => "high",
-            "high" => "heavy",
-            "heavy" => "frontier",
-            other => other,
-        },
-        "veloce" | "economica" => match base_tier {
-            "frontier" => "heavy",
-            "heavy" => "high",
-            "high" => "medium",
-            other => other,
-        },
-        _ => base_tier,
-    };
-
+    //
     // PAVIMENTO AGENTICO (regola L, punto unico della selezione dinamica/catalog):
     // per i turni a tool il tier minimo e' alzato al pavimento DB-driven. La
     // tier-chain sotto degrada comunque verso il basso (graceful), quindi se il
     // tier minimo non ha candidati disponibili il run NON fallisce.
     let floor = agentic_min_tier(db).await;
-    let required_tier = floor_tier_for_agentic(is_agentic_turn, mode_tier, &floor);
-
-    // L'ordinamento per behavior_mode. `Rank` e' un enum CHIUSO: prima erano 4
-    // stringhe SQL scritte qui, e da un `order_by: &str` libero e' entrata (e
-    // sopravvissuta per mesi) la scala tier a 3 livelli di agent_run.rs.
-    // "veloce" ordina per speed_tier; "economica"/dinamico per costo (il tier gia'
-    // garantisce la capacita', regola costi); "approfondita" preferisce il piu'
-    // capace/caro DENTRO il tier gia' promosso.
-    let rank = match mode {
-        "veloce" => crate::orchestrator::model_service::Rank::Fastest,
-        "economica" => crate::orchestrator::model_service::Rank::CostFirst,
-        "approfondita" => crate::orchestrator::model_service::Rank::MostCapable,
-        _ => crate::orchestrator::model_service::Rank::CostFirst,
-    };
+    let required_tier = floor_tier_for_agentic(is_agentic_turn, base_tier, &floor);
 
     // SERVIZIO UNICO (regola L). `Degrade`: il primo tier con un candidato
     // eleggibile vince; se il tier minimo (incluso il pavimento agentico) e' tutto
@@ -303,7 +273,6 @@ pub(crate) async fn route_model_from_catalog(
         db,
         &crate::orchestrator::model_service::ModelRequest::agentic(required_tier)
             .capability(Some(capability))
-            .rank(rank)
             .governed(true),
     )
     .await
@@ -1597,7 +1566,7 @@ mod agentic_tier_floor_tests {
         .expect("insert");
         // base_tier 'light' (come un intent fix_semplice a token bassi), turno
         // agentico: il pavimento default 'medium' deve scartare il LIGHT.
-        let d = route_model_from_catalog(&pool, "light", "code", "dinamico", true)
+        let d = route_model_from_catalog(&pool, "light", "code", true)
             .await
             .expect("una decisione");
         assert_eq!(d.provider, "mdprov");
@@ -1618,7 +1587,7 @@ mod agentic_tier_floor_tests {
         .expect("insert");
         // Chat semplice (is_agentic_turn=false): il pavimento NON si applica,
         // base_tier 'light' resta 'light' -> sceglie il light economico.
-        let d = route_model_from_catalog(&pool, "light", "chat", "dinamico", false)
+        let d = route_model_from_catalog(&pool, "light", "chat", false)
             .await
             .expect("una decisione");
         assert_eq!(d.provider, "flprov2");
@@ -1639,7 +1608,7 @@ mod agentic_tier_floor_tests {
         .execute(&pool)
         .await
         .expect("insert");
-        let d = route_model_from_catalog(&pool, "light", "code", "dinamico", true)
+        let d = route_model_from_catalog(&pool, "light", "code", true)
             .await
             .expect("degrado graceful al light, nessun fallimento");
         assert_eq!(d.provider, "onlyfl");
@@ -1667,7 +1636,7 @@ mod agentic_tier_floor_tests {
         .execute(&pool)
         .await
         .expect("insert catalog");
-        let d = route_model_from_catalog(&pool, "light", "code", "dinamico", true)
+        let d = route_model_from_catalog(&pool, "light", "code", true)
             .await
             .expect("una decisione");
         assert_eq!(d.provider, "hvprov3");

@@ -150,7 +150,6 @@ fn modalita() -> Vec<(TierPolicy, Profile, Rank)> {
                 Rank::FailoverSafe,
                 Rank::NonAgenticSafe,
                 Rank::WidestWindow,
-                Rank::HighestTierFirst,
             ] {
                 v.push((policy, profile, rank));
             }
@@ -327,44 +326,10 @@ async fn il_gate_che_svuota_il_pool_si_distingue_dal_parco_fermo(pool: PgPool) {
     );
 }
 
-/// I7: `HighestTierFirst` ordina per capacita' REALE su tutti e 5 i livelli.
-/// E' il test che `agent_run.rs:3525` non ha mai avuto, ed e' il motivo per cui
-/// una scala a 3 livelli e' sopravvissuta li' per mesi.
-#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
-async fn highest_tier_first_mette_il_frontier_sopra_il_medium(pool: PgPool) {
-    // Schema REALE (regola O): il DELETE isola dal catalog di produzione.
-    sqlx::query("DELETE FROM ai_price_catalog")
-        .execute(&pool)
-        .await
-        .expect("pulizia catalog");
-    // Il frontier e' il PIU' ECONOMICO: se l'ordinamento per tier non funzionasse,
-    // il tie-break sul costo lo mascherebbe. (E' esattamente cio' che rendeva
-    // silenzioso il difetto reale: `costo DESC` pescava i modelli cari.)
-    sqlx::query(
-        "INSERT INTO ai_price_catalog \
-         (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
-          performance_tier, capabilities, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, \
-          last_probe_healthy_at) VALUES \
-         ('p', 'il-frontier', true, true, 'none', 'frontier', '[\"code\"]'::jsonb, 1.0, 1.0, 'USD', now()), \
-         ('p', 'il-medium',   true, true, 'none', 'medium',   '[\"code\"]'::jsonb, 50.0, 50.0, 'USD', now()), \
-         ('p', 'il-light',    true, true, 'none', 'light',    '[\"code\"]'::jsonb, 99.0, 99.0, 'USD', now())",
-    )
-    .execute(&pool)
-    .await
-    .expect("seed");
-
-    let req = ModelRequest::agentic("heavy")
-        .capability(Some("code"))
-        .tier_policy(TierPolicy::AnyTier)
-        .rank(Rank::HighestTierFirst);
-    let c = select_model_with_gate(&pool, &req, gate(false)).await.expect("c'e' un modello");
-    assert_eq!(
-        c.model, "il-frontier",
-        "'sali al piu' capace' deve scegliere il FRONTIER, non un medium: col CASE \
-         a 3 livelli frontier e high collassavano su light e questa asserzione era \
-         rossa sul codice reale"
-    );
-}
+// Il test I7 su `Rank::HighestTierFirst` e' stato rimosso con la variante
+// (fase 3, lotto 2): quel Rank non aveva call site di produzione. La scala
+// tier->SQL resta presidiata da `tier_rank_sql_coincide_col_rank_rust` in
+// model_selection (il ponte Rust<->Postgres del vocabolario) e dal min_tier.
 
 /// I4: `degraded` e' coerente col tier effettivo, e NON scatta quando il tier
 /// richiesto e' disponibile (niente ripieghi gratuiti).
@@ -411,19 +376,6 @@ fn la_catena_dipende_dalla_policy_non_dallo_strato() {
     assert_eq!(chain_for(&exact), vec!["heavy"], "Exact non degrada");
     let any = ModelRequest::agentic("heavy").tier_policy(TierPolicy::AnyTier);
     assert!(chain_for(&any).is_empty(), "AnyTier non filtra per tier");
-}
-
-/// `Rank::HighestTierFirst` deriva la scala dal vocabolario unico: nessun CASE
-/// scritto a mano puo' rientrare da qui.
-#[test]
-fn il_rank_per_tier_viene_dal_vocabolario_unico() {
-    let sql = Rank::HighestTierFirst.to_sql();
-    for t in nexus_agent_graph::decisions::tiers::PERFORMANCE_TIERS {
-        assert!(
-            sql.contains(&format!("WHEN '{t}' THEN {}", tier_rank(t))),
-            "il livello '{t}' manca nell'ordinamento per tier: {sql}"
-        );
-    }
 }
 
 /// IL PAVIMENTO (misurato sul campo il 16/07): un modello sotto la soglia non
