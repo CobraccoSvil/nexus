@@ -606,6 +606,31 @@ else
   echo "OK veto-alle-porte: la porta di escalation nasce col veto del giudice"
 fi
 
+# ── il giro di batteria non si spende su un fornitore in cooldown ────────────
+# Il check del cooldown vivo (fornitore O coppia) vive in salta_se_in_cooldown
+# e qualify_claimed DEVE delegarvi come prima cosa: i test attraversano il
+# criterio ma non il consumatore (un Orchestrator vero costa troppo in test),
+# quindi la chiamata rimossa lascerebbe tutti i test verdi mentre la batteria
+# torna a spendere round contro fornitori saturi incrementando il backoff —
+# il difetto misurato sui groq gpt-oss (attempts=4 senza una sola misura).
+batteria_scollegata=""
+blocco_qualify="$(grep -A6 'async fn qualify_claimed' -A12 \
+  crates/mcp-core/src/model_qualification.rs 2>/dev/null | head -30 || true)"
+if [[ -z "$blocco_qualify" ]]; then
+  batteria_scollegata="  qualify_claimed: funzione non trovata in model_qualification.rs"
+elif ! printf '%s' "$blocco_qualify" | grep -q 'salta_se_in_cooldown'; then
+  batteria_scollegata="  qualify_claimed: non delega piu' a salta_se_in_cooldown in testa"
+fi
+if [[ -n "$batteria_scollegata" ]]; then
+  echo "!! batteria-senza-round-a-vuoto: il giro si spende su fornitori saturi:" >&2
+  echo "$batteria_scollegata" >&2
+  echo "   Il round contro un fornitore in cooldown non misura il modello e non" >&2
+  echo "   deve contare come tentativo. Criterio: salta_se_in_cooldown." >&2
+  fail=1
+else
+  echo "OK batteria-senza-round-a-vuoto: qualify_claimed delega al criterio del cooldown"
+fi
+
 # ── sizing dei pool verso il DB per-progetto ─────────────────────────────────
 # Lo stesso DB <slug>_nexus veniva aperto con due tetti decisi in due punti che
 # si ignoravano: 5 sul percorso caldo di mcp-core, 3 in nexus-project-pools. Una

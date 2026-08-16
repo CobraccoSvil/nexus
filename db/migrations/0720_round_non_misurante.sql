@@ -1,4 +1,4 @@
--- 0716_round_non_misurante.sql
+-- 0720_round_non_misurante.sql
 -- Il round della batteria che NON ha potuto guardare il modello non e' un
 -- tentativo del modello.
 --

@@ -2734,7 +2734,7 @@ struct RoundConfig {
     suite_version: i32,
     ttl_days: i64,
     backoff_hours: i64,
-    /// Backoff FISSO (minuti) del round non misurante (mig 0716): niente
+    /// Backoff FISSO (minuti) del round non misurante (mig 0720): niente
     /// esponenziale per un giro che il modello non l'ha mai guardato.
     not_measuring_backoff_minutes: i64,
 }
