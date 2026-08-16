@@ -5,9 +5,17 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 sqlx.workspace = true
 tracing.workspace = true
 nexus-auth = { path = "../nexus-auth" }
+
+[dev-dependencies]
+# Schema META (`db/migrations`) per i `#[sqlx::test]`: le finestre di prezzo si
+# leggono dal database VERO, col seed applicato dalla migrazione 0715, mai da
+# una fixture ricopiata (regola O).
+nexus-migrations-embedded = { path = "../nexus-migrations-embedded" }
+tokio.workspace = true
 
 [lints]
 workspace = true

@@ -40,8 +40,17 @@
 //!   sul percorso della richiesta degradano esplicitamente invece di respingerla.
 //! - **`i64` sui token**: le copie divergevano tra `i32` e `i64`. Il cast int->int
 //!   in Rust e' wrapping, quindi la firma stretta era un troncamento latente.
+//! - **Finestre orarie di prezzo** (`ai_price_window`, mig 0715): il catalogo
+//!   porta il prezzo BASE (= off-peak per deepseek) e una finestra attiva
+//!   moltiplica TUTTE le voci. Il moltiplicatore si applica QUI, all'istante
+//!   della risoluzione: l'ingresso pubblico usa `Utc::now()`. NB per le stime
+//!   di esecuzioni DIFFERITE (batch): andrebbero risolte con l'ora di
+//!   esecuzione PREVISTA, non con l'ora della stima — oggi nessun chiamante lo
+//!   fa (fase futura), e chi lo fara' dovra' passare da una variante con
+//!   l'istante esplicito.
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, NaiveTime, Utc};
 use sqlx::PgPool;
 
 /// Chiave del setting che dichiara la currency di piattaforma.
@@ -160,11 +169,28 @@ pub async fn resolve_active_price(db: &PgPool, provider: &str, model: &str) -> R
 
 /// Come [`resolve_active_price`] ma con la currency gia' risolta dal chiamante
 /// (evita di rileggere il setting quando ne serve piu' d'uno nello stesso giro).
+///
+/// Il prezzo ritornato e' quello IN VIGORE ADESSO: prezzo base del catalogo per
+/// il moltiplicatore della finestra oraria attiva (`ai_price_window`, mig 0715),
+/// se ce n'e' una. `Utc::now()` si fissa qui, all'ingresso pubblico: la variante
+/// interna con l'istante esplicito esiste per i test (regola O).
 pub async fn resolve_active_price_in(
     db: &PgPool,
     provider: &str,
     model: &str,
     currency: &str,
+) -> Result<PriceLookup> {
+    resolve_active_price_at(db, provider, model, currency, Utc::now()).await
+}
+
+/// La domanda completa con l'ISTANTE come parametro: i test iniettano l'ora
+/// invece di aspettare la fascia giusta.
+async fn resolve_active_price_at(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    currency: &str,
+    at: DateTime<Utc>,
 ) -> Result<PriceLookup> {
     // NB: nessun filtro `is_enabled` — vedi la doc del modulo.
     let row = sqlx::query_as::<_, CatalogPriceRow>(
@@ -191,7 +217,18 @@ pub async fn resolve_active_price_in(
     .await
     .with_context(|| format!("lettura listino di {provider}/{model} fallita"))?;
 
-    Ok(interpret_row(row))
+    let lookup = interpret_row(row);
+    // Le finestre si leggono solo dove c'e' un prezzo da moltiplicare: su
+    // Unknown/NotInCatalog non esiste una voce a cui applicarle, e il percorso
+    // degradato del ledger non paga una query in piu'.
+    if lookup.is_missing() {
+        return Ok(lookup);
+    }
+    let finestre = finestre_del_provider(db, provider).await?;
+    Ok(applica_moltiplicatore(
+        lookup,
+        moltiplicatore_finestra(&finestre, model, at),
+    ))
 }
 
 /// Listino attivo di TUTTI i modelli di un provider, in una sola query.
@@ -212,6 +249,19 @@ pub async fn resolve_active_prices_in(
     db: &PgPool,
     provider: &str,
     currency: &str,
+) -> Result<std::collections::HashMap<String, PriceLookup>> {
+    resolve_active_prices_at(db, provider, currency, Utc::now()).await
+}
+
+/// La lettura batch con l'ISTANTE come parametro, come
+/// [`resolve_active_price_at`] per la lettura singola. Le finestre del provider
+/// si caricano UNA volta e si applicano modello per modello: una finestra
+/// specifica vince sul jolly solo per il suo modello.
+async fn resolve_active_prices_at(
+    db: &PgPool,
+    provider: &str,
+    currency: &str,
+    at: DateTime<Utc>,
 ) -> Result<std::collections::HashMap<String, PriceLookup>> {
     // `DISTINCT ON (model)` + lo stesso ORDER BY della lettura singola: di ogni
     // modello si tiene la riga di listino piu' recente ancora in vigore.
@@ -237,11 +287,16 @@ pub async fn resolve_active_prices_in(
     .await
     .with_context(|| format!("lettura listino dei modelli di {provider} fallita"))?;
 
+    let finestre = finestre_del_provider(db, provider).await?;
     Ok(rows
         .into_iter()
         .map(|r| {
             let model = r.model.clone();
-            (model, interpret_row(Some(r.into())))
+            let lookup = applica_moltiplicatore(
+                interpret_row(Some(r.into())),
+                moltiplicatore_finestra(&finestre, &model, at),
+            );
+            (model, lookup)
         })
         .collect())
 }
@@ -307,6 +362,107 @@ fn interpret_row(row: Option<CatalogPriceRow>) -> PriceLookup {
             currency: r.currency,
         }),
     }
+}
+
+// ── Finestre orarie di prezzo (peak/off-peak) ───────────────────────────────
+//
+// Il catalogo porta il prezzo BASE; `ai_price_window` (mig 0715) dichiara le
+// fasce in cui il fornitore lo moltiplica. E' la forma del listino deepseek
+// (peak = 2x l'off-peak su OGNI voce, fasce 01:00-04:00 e 06:00-10:00 UTC):
+// una seconda riga di catalogo per fascia direbbe due volte lo stesso prezzo
+// base e nessuno saprebbe quale delle due e' "quella vera" fuori fascia.
+
+/// Una finestra oraria di prezzo, come dichiarata in `ai_price_window`.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct FinestraPrezzo {
+    /// `None` = vale per TUTTI i modelli del provider (jolly). `Some` = vale
+    /// per quel solo modello, e VINCE sul jolly.
+    pub model: Option<String>,
+    /// Orario UTC di parete, intervallo SEMIAPERTO `[start, end)`: alle 04:00
+    /// il peak 01:00-04:00 e' gia' finito, come nel listino del fornitore.
+    pub start_utc: NaiveTime,
+    pub end_utc: NaiveTime,
+    pub multiplier: f64,
+}
+
+impl FinestraPrezzo {
+    /// La finestra e' in vigore all'istante dato? `start > end` = la finestra
+    /// scavalca la mezzanotte (23:00-01:00 copre 23:30 E 00:30). `start = end`
+    /// non esiste: lo schema lo rifiuta (`finestra_non_degenere`).
+    fn attiva(&self, at: DateTime<Utc>) -> bool {
+        let t = at.time();
+        if self.start_utc < self.end_utc {
+            t >= self.start_utc && t < self.end_utc
+        } else {
+            t >= self.start_utc || t < self.end_utc
+        }
+    }
+}
+
+/// Criterio PURO: il moltiplicatore in vigore per (model, at) date le finestre
+/// del provider. `1.0` = nessuna finestra attiva, il prezzo base vale cosi'
+/// com'e'.
+///
+/// La finestra SPECIFICA per il modello vince sul jolly: se il fornitore
+/// dichiara una fascia diversa per un modello, quella e' la sua verita' e il
+/// jolly non la media. Fra finestre attive di pari specificita' decide l'ordine
+/// della slice (il caricamento ordina per `start_utc`): non e' una forma di
+/// listino che un fornitore pratichi — le fasce non si sovrappongono — ma
+/// l'esito deve restare deterministico anche su dati mal dichiarati.
+///
+/// La firma porta il MODELLO oltre a `at` (il design nominava solo le finestre
+/// e l'istante): senza, la regola "la specifica vince sul jolly" non avrebbe
+/// dove decidere.
+pub fn moltiplicatore_finestra(
+    finestre: &[FinestraPrezzo],
+    model: &str,
+    at: DateTime<Utc>,
+) -> f64 {
+    let vincente = finestre
+        .iter()
+        .find(|f| f.model.as_deref() == Some(model) && f.attiva(at))
+        .or_else(|| finestre.iter().find(|f| f.model.is_none() && f.attiva(at)));
+    vincente.map_or(1.0, |f| f.multiplier)
+}
+
+/// Applica il moltiplicatore a TUTTE le voci del listino: e' la forma del
+/// listino a fasce (peak = 2x ogni voce), non una scelta nostra. Su
+/// `Unknown`/`NotInCatalog` non c'e' nulla da moltiplicare e l'esito passa
+/// invariato.
+fn applica_moltiplicatore(lookup: PriceLookup, multiplier: f64) -> PriceLookup {
+    if multiplier == 1.0 {
+        return lookup;
+    }
+    match lookup {
+        PriceLookup::Priced(p) => PriceLookup::Priced(PriceSnapshot {
+            input_cost_per_million_tokens: p.input_cost_per_million_tokens * multiplier,
+            output_cost_per_million_tokens: p.output_cost_per_million_tokens * multiplier,
+            cache_read_cost_per_million_tokens: p
+                .cache_read_cost_per_million_tokens
+                .map(|t| t * multiplier),
+            cache_creation_cost_per_million_tokens: p
+                .cache_creation_cost_per_million_tokens
+                .map(|t| t * multiplier),
+            currency: p.currency,
+        }),
+        other => other,
+    }
+}
+
+/// Le finestre di prezzo di un provider, in ordine deterministico: le
+/// specifiche prima del jolly (cosi' l'iterazione del criterio le incontra
+/// nell'ordine in cui contano), poi per orario di inizio.
+async fn finestre_del_provider(db: &PgPool, provider: &str) -> Result<Vec<FinestraPrezzo>> {
+    sqlx::query_as::<_, FinestraPrezzo>(
+        "SELECT model, start_utc, end_utc, multiplier::float8 AS multiplier \
+           FROM ai_price_window \
+          WHERE provider = $1 \
+          ORDER BY model NULLS LAST, start_utc",
+    )
+    .bind(provider)
+    .fetch_all(db)
+    .await
+    .with_context(|| format!("lettura finestre di prezzo di {provider} fallita"))
 }
 
 /// Token di una chiamata, nella convenzione del sistema: `prompt_tokens` e' il
@@ -1218,5 +1374,195 @@ mod tests {
         assert_eq!(u.total_tokens(), 1_070);
         // Il caso ex-ante non inventa cache.
         assert_eq!(TokenUsage::senza_cache(100, 20).total_tokens(), 120);
+    }
+
+    // ── Finestre orarie di prezzo (peak/off-peak) ──────────────────────────
+
+    fn quasi(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    fn t(ore: u32, minuti: u32) -> NaiveTime {
+        NaiveTime::from_hms_opt(ore, minuti, 0).unwrap()
+    }
+
+    /// Un istante UTC a orologio fissato: i test iniettano l'ora invece di
+    /// aspettare la fascia giusta (regola O). Il giorno e' irrilevante: le
+    /// finestre sono orari di parete.
+    fn alle(ore: u32, minuti: u32) -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(2026, 8, 20, ore, minuti, 0).unwrap()
+    }
+
+    /// Le due fasce peak del listino deepseek, nella forma del seed della
+    /// mig 0715 (jolly di provider, 2x).
+    fn fasce_deepseek() -> Vec<FinestraPrezzo> {
+        vec![
+            FinestraPrezzo {
+                model: None,
+                start_utc: t(1, 0),
+                end_utc: t(4, 0),
+                multiplier: 2.0,
+            },
+            FinestraPrezzo {
+                model: None,
+                start_utc: t(6, 0),
+                end_utc: t(10, 0),
+                multiplier: 2.0,
+            },
+        ]
+    }
+
+    /// Il criterio sulle fasce reali: alle 02:00 UTC il peak e' in vigore (2x),
+    /// alle 12:00 no (1x). I confini sono SEMIAPERTI come nel listino del
+    /// fornitore: alle 01:00 il peak e' gia' cominciato, alle 04:00 e' gia'
+    /// finito.
+    ///
+    /// MUTAZIONE: chiudere l'intervallo a destra (`t <= end`) fa rosseggiare
+    /// l'asserzione delle 04:00; un criterio che ignora le finestre (1.0 fisso)
+    /// fa rosseggiare quella delle 02:00.
+    #[test]
+    fn il_peak_e_in_vigore_alle_due_e_non_a_mezzogiorno() {
+        let fasce = fasce_deepseek();
+        let m = |ore, minuti| moltiplicatore_finestra(&fasce, "deepseek-v4-flash", alle(ore, minuti));
+        assert_eq!(m(2, 0), 2.0);
+        assert_eq!(m(12, 0), 1.0);
+        // Confini semiaperti [start, end).
+        assert_eq!(m(1, 0), 2.0);
+        assert_eq!(m(4, 0), 1.0);
+        // La seconda fascia (06:00-10:00) e' indipendente dalla prima, e il
+        // buco fra le due (04:00-06:00) resta off-peak.
+        assert_eq!(m(5, 0), 1.0);
+        assert_eq!(m(7, 30), 2.0);
+        assert_eq!(m(10, 0), 1.0);
+    }
+
+    /// `start > end` = la finestra scavalca la mezzanotte: 23:00-01:00 copre
+    /// 23:30 E 00:30, non l'intervallo vuoto.
+    ///
+    /// MUTAZIONE: trattare il wrap come intervallo ordinario
+    /// (`t >= start && t < end`) rende la finestra vuota e le prime due
+    /// asserzioni rosseggiano.
+    #[test]
+    fn la_finestra_che_scavalca_la_mezzanotte_copre_entrambi_i_lati() {
+        let fasce = vec![FinestraPrezzo {
+            model: None,
+            start_utc: t(23, 0),
+            end_utc: t(1, 0),
+            multiplier: 3.0,
+        }];
+        let m = |ore, minuti| moltiplicatore_finestra(&fasce, "m", alle(ore, minuti));
+        assert_eq!(m(23, 30), 3.0);
+        assert_eq!(m(0, 30), 3.0);
+        assert_eq!(m(12, 0), 1.0);
+        // Stessi confini semiaperti dell'intervallo ordinario.
+        assert_eq!(m(23, 0), 3.0);
+        assert_eq!(m(1, 0), 1.0);
+    }
+
+    /// La finestra col modello dichiarato vince sul jolly del provider, e vale
+    /// SOLO per quel modello; una specifica NON attiva non copre il jolly
+    /// attivo.
+    ///
+    /// MUTAZIONE: cercare prima il jolly (o ignorare `model` nel confronto) da'
+    /// 2.0 anche a `speciale` e la prima asserzione rosseggia.
+    #[test]
+    fn la_finestra_specifica_vince_sul_jolly_solo_per_il_suo_modello() {
+        let jolly = FinestraPrezzo {
+            model: None,
+            start_utc: t(1, 0),
+            end_utc: t(4, 0),
+            multiplier: 2.0,
+        };
+        let specifica = |start: NaiveTime, end: NaiveTime| FinestraPrezzo {
+            model: Some("speciale".into()),
+            start_utc: start,
+            end_utc: end,
+            multiplier: 1.5,
+        };
+
+        let fasce = vec![specifica(t(1, 0), t(4, 0)), jolly.clone()];
+        assert_eq!(moltiplicatore_finestra(&fasce, "speciale", alle(2, 0)), 1.5);
+        assert_eq!(moltiplicatore_finestra(&fasce, "altro", alle(2, 0)), 2.0);
+
+        // Specifica fuori orario: per quel modello decide il jolly.
+        let fasce = vec![specifica(t(20, 0), t(21, 0)), jolly];
+        assert_eq!(moltiplicatore_finestra(&fasce, "speciale", alle(2, 0)), 2.0);
+    }
+
+    /// Il moltiplicatore tocca TUTTE le voci del listino (input, output, cache
+    /// read, cache creation): e' la forma del listino a fasce del fornitore
+    /// (peak = 2x ogni voce). Su un listino ignoto non c'e' nulla da
+    /// moltiplicare, e a moltiplicatore 1.0 il prezzo passa invariato.
+    #[test]
+    fn il_moltiplicatore_tocca_tutte_le_voci_del_listino() {
+        let base = || interpret_row(row_con_cache(0.22, 0.66, Some(0.007), Some(0.0)));
+        match applica_moltiplicatore(base(), 2.0) {
+            PriceLookup::Priced(p) => {
+                assert!(quasi(p.input_cost_per_million_tokens, 0.44));
+                assert!(quasi(p.output_cost_per_million_tokens, 1.32));
+                assert!(quasi(p.cache_read_cost_per_million_tokens.unwrap(), 0.014));
+                // 0 e' un prezzo REALE (la scrittura in cache deepseek non si
+                // paga): 0 x 2 = 0, e resta un prezzo — non diventa None.
+                assert_eq!(p.cache_creation_cost_per_million_tokens, Some(0.0));
+            }
+            other => panic!("atteso Priced, ottenuto {other:?}"),
+        }
+        // NULL a listino resta NULL: "tariffa ignota" moltiplicata resta ignota.
+        match applica_moltiplicatore(interpret_row(row(0.22, 0.66, "priced")), 2.0) {
+            PriceLookup::Priced(p) => {
+                assert_eq!(p.cache_read_cost_per_million_tokens, None);
+            }
+            other => panic!("atteso Priced, ottenuto {other:?}"),
+        }
+        assert_eq!(
+            applica_moltiplicatore(PriceLookup::Unknown, 2.0),
+            PriceLookup::Unknown
+        );
+        assert_eq!(applica_moltiplicatore(base(), 1.0), base());
+    }
+
+    /// Dal seed della migrazione VERA al prezzo risolto: alle 02:00 UTC il
+    /// listino deepseek v4 raddoppia, alle 12:00 e' il prezzo base off-peak.
+    /// Finestre E prezzi arrivano dalla mig 0715 applicata dal migrator: il
+    /// test non semina nulla (regola O).
+    ///
+    /// MUTAZIONE: togliere la moltiplicazione da `resolve_active_price_at` (o
+    /// non leggere le finestre) lascia 0.22 alle 02:00 e la meta' peak
+    /// rosseggia; togliere dal seed della 0715 una delle due fasce fa
+    /// rosseggiare l'ora corrispondente.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn in_fascia_peak_il_listino_deepseek_raddoppia(pool: PgPool) {
+        let prezzo_alle = |pool: PgPool, ore: u32| async move {
+            let lookup =
+                resolve_active_price_at(&pool, "deepseek", "deepseek-v4-flash", "USD", alle(ore, 0))
+                    .await
+                    .expect("lettura listino");
+            match lookup {
+                PriceLookup::Priced(p) => p,
+                other => panic!("atteso Priced dal seed della 0715, ottenuto {other:?}"),
+            }
+        };
+
+        let peak = prezzo_alle(pool.clone(), 2).await;
+        assert!(quasi(peak.input_cost_per_million_tokens, 0.44), "input peak: {}", peak.input_cost_per_million_tokens);
+        assert!(quasi(peak.output_cost_per_million_tokens, 1.32));
+        assert!(quasi(peak.cache_read_cost_per_million_tokens.expect("tariffa curata"), 0.014));
+        assert_eq!(peak.cache_creation_cost_per_million_tokens, Some(0.0));
+
+        let off = prezzo_alle(pool.clone(), 12).await;
+        assert!(quasi(off.input_cost_per_million_tokens, 0.22), "input off-peak: {}", off.input_cost_per_million_tokens);
+        assert!(quasi(off.output_cost_per_million_tokens, 0.66));
+        assert!(quasi(off.cache_read_cost_per_million_tokens.expect("tariffa curata"), 0.007));
+
+        // La lettura BATCH (catena di escalation) applica le stesse finestre
+        // della lettura singola: due percorsi, un solo criterio.
+        let tutti = resolve_active_prices_at(&pool, "deepseek", "USD", alle(2, 0))
+            .await
+            .expect("listino batch");
+        assert_eq!(
+            tutti.get("deepseek-v4-flash"),
+            Some(&PriceLookup::Priced(peak))
+        );
     }
 }

@@ -264,8 +264,12 @@ pub(crate) struct VoceCatalog<'a> {
 /// nel test, cioe' misurare una sua imitazione (regola O).
 ///
 /// L'UPDATE dei flag avviene SOLO se `capability_source='auto'` (le righe
-/// `manual` curate da admin/migrazioni sono protette, ADR 0024). I costi e la
-/// finestra si aggiornano sempre.
+/// `manual` curate da admin/migrazioni sono protette, ADR 0024). I costi si
+/// aggiornano dove `price_locked` e' false (mig 0715: le righe col listino
+/// curato — deepseek v4, il cui prezzo base e' l'off-peak delle finestre orarie
+/// — non si fanno riscrivere dalla fonte); la finestra di contesto si aggiorna
+/// sempre. `pricing_state` non e' toccato da questa query (il trigger della
+/// 0583 promuove solo 'unknown' -> 'priced' e non degrada mai).
 ///
 /// Il TIER non compare: lo scrive `refresh_tier_prior` (punto unico) dopo questo
 /// upsert, dall'agentic_index della riga (unico seme, mig 0608). All'INSERT
@@ -305,19 +309,31 @@ const SQL_UPSERT_VOCE_CATALOG: &str = r#"INSERT INTO ai_price_catalog (
               ) VALUES ($1, $2, $3, $4, 'USD', $5, $6, $7, $8, $9, 'auto', FALSE, $2, NULL, NULL,
                         $10, $11)
               ON CONFLICT (provider, model) DO UPDATE SET
-                input_cost_per_million_tokens = EXCLUDED.input_cost_per_million_tokens,
-                output_cost_per_million_tokens = EXCLUDED.output_cost_per_million_tokens,
+                -- Il lucchetto dei prezzi curati (mig 0715): dove price_locked e'
+                -- true i 4 campi prezzo vengono da una migrazione (es. il listino
+                -- OFF-PEAK deepseek, il cui peak lo produce ai_price_window) e la
+                -- fonte NON li sovrascrive — LiteLLM non conosce le fasce orarie
+                -- e il suo numero cancellerebbe il prezzo base. Stesso pattern di
+                -- capability_source='manual' qui sotto.
+                input_cost_per_million_tokens = CASE WHEN ai_price_catalog.price_locked
+                    THEN ai_price_catalog.input_cost_per_million_tokens
+                    ELSE EXCLUDED.input_cost_per_million_tokens END,
+                output_cost_per_million_tokens = CASE WHEN ai_price_catalog.price_locked
+                    THEN ai_price_catalog.output_cost_per_million_tokens
+                    ELSE EXCLUDED.output_cost_per_million_tokens END,
                 -- La fonte ARRICCHISCE, non cancella: si aggiorna solo quando
                 -- LiteLLM porta la tariffa. Assegnare EXCLUDED secco azzererebbe a
                 -- NULL i valori curati dalle migrazioni 0130/0403 ogni volta che la
                 -- fonte tace su quel modello, e quei token tornerebbero a tariffa
                 -- piena senza che nessuno lo abbia deciso.
-                cache_read_cost_per_million_tokens = COALESCE(
-                    EXCLUDED.cache_read_cost_per_million_tokens,
-                    ai_price_catalog.cache_read_cost_per_million_tokens),
-                cache_creation_cost_per_million_tokens = COALESCE(
-                    EXCLUDED.cache_creation_cost_per_million_tokens,
-                    ai_price_catalog.cache_creation_cost_per_million_tokens),
+                cache_read_cost_per_million_tokens = CASE WHEN ai_price_catalog.price_locked
+                    THEN ai_price_catalog.cache_read_cost_per_million_tokens
+                    ELSE COALESCE(EXCLUDED.cache_read_cost_per_million_tokens,
+                    ai_price_catalog.cache_read_cost_per_million_tokens) END,
+                cache_creation_cost_per_million_tokens = CASE WHEN ai_price_catalog.price_locked
+                    THEN ai_price_catalog.cache_creation_cost_per_million_tokens
+                    ELSE COALESCE(EXCLUDED.cache_creation_cost_per_million_tokens,
+                    ai_price_catalog.cache_creation_cost_per_million_tokens) END,
                 context_window = EXCLUDED.context_window,
                 supports_tool_use = CASE WHEN ai_price_catalog.capability_source = 'auto'
                                          THEN EXCLUDED.supports_tool_use
@@ -1175,5 +1191,78 @@ mod tests {
         .await
         .expect("riga di catalog");
         assert_eq!(letto, None, "l'assenza di tariffa non e' uno zero");
+    }
+
+    /// Il lucchetto dei prezzi curati (mig 0715): la riga deepseek v4 porta il
+    /// listino OFF-PEAK — il peak lo produce `ai_price_window`, non una tariffa
+    /// diversa in tabella — e il sync NON deve riscriverne i 4 campi prezzo il
+    /// giorno in cui LiteLLM matchasse quei modelli: il suo numero, che le
+    /// fasce orarie non le conosce, cancellerebbe il prezzo base.
+    ///
+    /// La riga arriva LOCKED dalla migrazione reale via META_MIGRATOR: il test
+    /// non la crea e non la marca (regola O).
+    ///
+    /// MUTAZIONE: togliere i `CASE WHEN price_locked` da
+    /// `SQL_UPSERT_VOCE_CATALOG` fa rosseggiare le quattro asserzioni sui
+    /// prezzi (0.22 diventa 9.9); un CASE scritto al contrario (tutto locked)
+    /// fa rosseggiare il controllo sulla riga non locked in coda.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_sync_non_riscrive_i_prezzi_di_una_riga_locked(pool: PgPool) {
+        let caps = caps();
+        let voce_sync = |model| VoceCatalog {
+            provider: "deepseek",
+            model,
+            input_cost: 9.9,
+            output_cost: 9.9,
+            context_window: 65_536,
+            caps: &caps,
+            cache_read_cost: Some(9.9),
+            cache_creation_cost: Some(9.9),
+        };
+
+        // La riga esiste gia' (seed 0715): questo e' l'UPDATE del sync.
+        assert!(
+            !upsert_voce_catalog(&pool, &voce_sync("deepseek-v4-flash"))
+                .await
+                .expect("upsert riga locked"),
+            "la riga deve arrivare dalla migrazione, non da questo test"
+        );
+
+        let (input, output, cache_read, cache_creation, locked) =
+            sqlx::query_as::<_, (f64, f64, Option<f64>, Option<f64>, bool)>(
+                "SELECT input_cost_per_million_tokens::float8, \
+                        output_cost_per_million_tokens::float8, \
+                        cache_read_cost_per_million_tokens::float8, \
+                        cache_creation_cost_per_million_tokens::float8, \
+                        price_locked \
+                   FROM ai_price_catalog \
+                  WHERE provider = 'deepseek' AND model = 'deepseek-v4-flash'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("riga di catalog");
+
+        assert!(locked, "il lucchetto viene dalla mig 0715");
+        assert!(quasi(input, 0.22), "input riscritto dal sync: {input}");
+        assert!(quasi(output, 0.66), "output riscritto dal sync: {output}");
+        assert!(quasi(cache_read.expect("tariffa curata"), 0.007));
+        assert!(quasi(cache_creation.expect("tariffa curata"), 0.0));
+
+        // Il controllo: una riga NON locked riceve i prezzi del sync come
+        // sempre. Senza, un CASE invertito passerebbe le asserzioni sopra.
+        upsert_voce_catalog(&pool, &voce_sync("deepseek-chat"))
+            .await
+            .expect("upsert riga non locked");
+        let input_libero = sqlx::query_scalar::<_, f64>(
+            "SELECT input_cost_per_million_tokens::float8 FROM ai_price_catalog \
+              WHERE provider = 'deepseek' AND model = 'deepseek-chat'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("riga di catalog");
+        assert!(
+            quasi(input_libero, 9.9),
+            "la riga non locked deve aggiornarsi: {input_libero}"
+        );
     }
 }

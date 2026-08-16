@@ -2542,8 +2542,11 @@ name = "nexus-pricing"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "nexus-auth",
+ "nexus-migrations-embedded",
  "sqlx",
+ "tokio",
  "tracing",
 ]
 
