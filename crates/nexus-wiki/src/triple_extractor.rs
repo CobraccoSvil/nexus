@@ -547,10 +547,10 @@ pub async fn extract_triples_for_doc(state: &WikiDeps, doc_id: Uuid) -> Result<E
                     } else {
                         format!("provider error_class={}", ec.unwrap_or("unknown"))
                     };
-                    state
-                        .ai
-                        .notify_provider_llm_failure(&provider, ec, &msg)
-                        .await;
+                    // Nessuna notifica di cooldown da qui: la chiamata e' gia'
+                    // passata dal confine che allinea il registro a cio' che il
+                    // gateway ha dichiarato (classe E portata). Quello che segue
+                    // e' il failover di QUESTO giro, non un'esclusione di sistema.
                     if exclude_providers.len() < 3 {
                         exclude_providers.push(provider.to_ascii_lowercase());
                         tracing::warn!(
@@ -569,10 +569,6 @@ pub async fn extract_triples_for_doc(state: &WikiDeps, doc_id: Uuid) -> Result<E
             }
             Err(e) => {
                 let msg = e.to_string();
-                state
-                    .ai
-                    .notify_provider_llm_failure(&provider, None, &msg)
-                    .await;
                 if exclude_providers.len() < 3 {
                     exclude_providers.push(provider.to_ascii_lowercase());
                     tracing::warn!(

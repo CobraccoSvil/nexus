@@ -497,9 +497,9 @@ fn completion_value_from_gw(provider: &str, model: &str, resp: &GwResponse) -> V
 /// di nuovo disponibile. Un rate-limit si aspetta, un credito finito si ricarica: la
 /// confusione fra i due toglie dal routing un fornitore sano.
 ///
-/// E' la stessa regressione del 2026-07-16 gia' chiusa sul path agentico e in
-/// `agent_turn_setup::classe_dal_ripiego_lessicale`: restava aperta QUI, l'unico ramo
-/// da cui passa il probe di salute.
+/// E' la stessa regressione del 2026-07-16 gia' chiusa sul path agentico e nel
+/// ripiego lessicale di `agent_turn_setup` (rimosso col suo scrittore il
+/// 13/08/2026): restava aperta QUI, l'unico ramo da cui passa il probe di salute.
 /// Quale dei due canali interni sta ricevendo l'errore. I due `Value` hanno contratti
 /// diversi (la completion porta `metadata.usage`, il turno agentico porta
 /// `stop_reason` e i blocchi tool), quindi la FORMA va dichiarata; tutto il resto —

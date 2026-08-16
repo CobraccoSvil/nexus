@@ -3878,6 +3878,115 @@ else
   echo "OK portata-cooldown: la selezione anticipa anche le coppie"
 fi
 
+# ── scrittori-di-esclusione (2026-08-13, difetto D2) ───────────────────────
+# «CHI puo' togliere un fornitore dalla selezione, e su quale PROVA.»
+#
+# Erano tre, e due classificavano per conto proprio:
+#
+#   - `agent_turn_setup::apply_provider_cooldown`, alimentato da un SECONDO
+#     vocabolario di classi che non conosceva `transient`, `empty_completion`
+#     ne' `request_budget_exceeded` — tre delle classi che il produttore emette
+#     — e che su tutto il resto ricadeva sulla PROSA. La sua firma non aveva un
+#     parametro `model`: non poteva esprimere una portata, e ogni cooldown che
+#     scriveva era del FORNITORE INTERO. MISURATO il 13/08/2026 nei log di
+#     mcp-core: alle 18:32:47.743443 il tetto TPD di `groq/openai/gpt-oss-20b`
+#     produce il cooldown corretto sulla COPPIA, e 439 microsecondi dopo questo
+#     scrittore riclassifica lo STESSO evento `billing_error` — la parola
+#     `billing` sta dentro l'URL di documentazione che groq mette nel messaggio
+#     — spegnendo groq intero. Stessa forma su mistral e openrouter.
+#   - `internal_routing::provider_error_handler` (`POST
+#     /api/internal/provider-error`): stessa deduzione dalla prosa, stessa
+#     portata cieca, e come unico client un `brain/cooldown_bridge.py` che non
+#     esiste piu'.
+#
+# Restano gli scrittori DICHIARATI, ognuno con una prova sua:
+#   provider_cooldown.rs      il punto unico (le definizioni, il verdetto che
+#                             il gateway dichiara sul wire, il circuit breaker,
+#                             il ripristino dal DB al boot)
+#   model_health_probe.rs     ha INTERROGATO quel modello
+#   provider_health_probe.rs  ha letto il budget interno del fornitore
+#   environment.rs            il gateway dichiara `billing_error` nello stato
+#                             provider che il pannello sta leggendo
+#
+# Il filtro salta i moduli `#[cfg(test)]` e i file di soli test: senza,
+# l'elenco degli ammessi diventerebbe una lista di file in cui basta un test
+# che semina un cooldown per autorizzarvi uno scrittore di produzione. La fine
+# del modulo di test e' la graffa in COLONNA 0, non un conteggio delle graffe:
+# una graffa dentro una stringa sbilancia il conteggio, e sbilanciarsi verso
+# "sono ancora nei test" renderebbe il guard cieco proprio dove serve.
+scrittori_awk='
+/^#\[cfg\(test\)\]/ { attesa=1; next }
+attesa && /mod +[A-Za-z0-9_]+ *\{/ { dentro=1; attesa=0; next }
+attesa { attesa=0 }
+dentro { if ($0 ~ /^\}/) dentro=0; next }
+/^[[:space:]]*(\/\/|\*)/ { next }
+/(put_provider_in_long_cooldown|put_provider_in_short_cooldown|put_provider_in_cooldown|metti_in_cooldown_breve)\(/ { print FILENAME ":" FNR }
+'
+file_scrittori="$(grep -rlE '(put_provider_in_long_cooldown|put_provider_in_short_cooldown|put_provider_in_cooldown|metti_in_cooldown_breve)\(' \
+  crates --include='*.rs' --exclude-dir=target 2>/dev/null \
+  | grep -vE '(^|/)tests\.rs$|/tests/' || true)"
+if [[ -z "${file_scrittori// /}" ]]; then
+  echo "!! scrittori-di-esclusione: nessun file nomina piu' gli scrittori di" >&2
+  echo "   cooldown. O sono stati rinominati — e allora aggiorna il pattern —" >&2
+  echo "   oppure questo check e' verde per assenza (regola O)." >&2
+  fail=1
+else
+  righe_scrittori="$(printf '%s\n' "$file_scrittori" | xargs awk "$scrittori_awk" 2>/dev/null || true)"
+  # Il punto unico deve comparire fra i misurati: se non c'e', il filtro ha
+  # mangiato tutto e l'elenco vuoto non significa "nessun abuso".
+  if ! printf '%s\n' "$righe_scrittori" | grep -q '^crates/mcp-core/src/provider_cooldown\.rs:'; then
+    echo "!! scrittori-di-esclusione: il punto unico non compare fra i file" >&2
+    echo "   misurati: il filtro sui moduli di test sta scartando codice di" >&2
+    echo "   produzione, quindi questo check non sta guardando nulla." >&2
+    fail=1
+  else
+    non_dichiarati="$(printf '%s\n' "$righe_scrittori" \
+      | grep -vE '^crates/mcp-core/src/(provider_cooldown|model_health_probe|provider_health_probe|environment)\.rs:' \
+      | grep -v '^$' || true)"
+    if [[ -n "${non_dichiarati// /}" ]]; then
+      echo "!! scrittori-di-esclusione: uno scrittore di cooldown non dichiarato:" >&2
+      printf '%s\n' "$non_dichiarati" >&2
+      echo "   Un'esclusione si scrive su una PROVA: il verdetto che il gateway" >&2
+      echo "   dichiara sul wire (registra_esclusione_dichiarata), un probe che" >&2
+      echo "   ha interrogato il fornitore, il budget interno. Se stai" >&2
+      echo "   registrando cio' che il gateway ha appena rifiutato, quel" >&2
+      echo "   percorso passa gia' da NexusGatewayClient::complete e non serve" >&2
+      echo "   un secondo scrittore; se stai classificando l'errore per conto" >&2
+      echo "   tuo, la classe va aggiunta al catalogo nexus_provider_error_code" >&2
+      echo "   (mig 0707), non dedotta qui." >&2
+      fail=1
+    else
+      echo "OK scrittori-di-esclusione: solo scrittori dichiarati, ognuno con la sua prova"
+    fi
+  fi
+fi
+
+# Il file che ospitava il secondo scrittore resta FUORI dal registro dei
+# cooldown: l'elenco sopra lo direbbe comunque, ma solo dopo che qualcuno ha
+# gia' riscritto la chiamata. Qui la porta e' chiusa prima.
+if grep -nE 'provider_cooldown::' crates/mcp-core/src/agent_turn_setup.rs \
+   | grep -qvE '^[0-9]+:[[:space:]]*(//|\*)'; then
+  echo "!! scrittori-di-esclusione: agent_turn_setup torna a toccare il registro" >&2
+  echo "   dei cooldown. Li' viveva il secondo scrittore, e la sua firma non" >&2
+  echo "   aveva un parametro 'model': qualunque cosa scrivesse era del" >&2
+  echo "   fornitore intero (misurato su groq il 13/08/2026)." >&2
+  fail=1
+else
+  echo "OK scrittori-di-esclusione: la preparazione del turno non scrive cooldown"
+fi
+
+# E la rotta del bridge morto non torna: era il terzo scrittore, classificava
+# dalla prosa di `error_text` e poteva spegnere un fornitore per sei ore.
+if grep -rlE '"/api/internal/provider-error"' crates --include='*.rs' --exclude-dir=target >/dev/null 2>&1; then
+  echo "!! scrittori-di-esclusione: la rotta /api/internal/provider-error e'" >&2
+  echo "   tornata. Era il bridge del brain Python (rimosso col porting" >&2
+  echo "   zero-Python): deduceva la classe dal testo e metteva in cooldown" >&2
+  echo "   lungo un fornitore intero, senza alcun client che la chiamasse." >&2
+  fail=1
+else
+  echo "OK scrittori-di-esclusione: nessun bridge che classifichi dalla prosa"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

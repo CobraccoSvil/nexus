@@ -450,8 +450,15 @@ pub(crate) fn reset_provider_failures(provider: &str) {
 ///
 /// Nulla si registra su [`EsclusioneDichiarata::Nessuna`]: un errore di
 /// richiesta, un contesto troppo lungo o un turno vuoto non dicono nulla sulla
-/// disponibilita' del fornitore, ed escluderlo sarebbe un danno — la stessa
-/// asimmetria che `classify_provider_error` applica gia' al ripiego lessicale.
+/// disponibilita' del fornitore, ed escluderlo sarebbe un danno.
+///
+/// Dal 13/08/2026 questo e' l'UNICO punto in cui un rifiuto del gateway diventa
+/// un'esclusione locale. Accanto ne esistevano altri due, e classificavano per
+/// conto proprio: `agent_turn_setup::apply_provider_cooldown` (secondo
+/// vocabolario di classi, ripiego sulla prosa, e nessun parametro `model` —
+/// quindi ogni sua scrittura era del fornitore intero) e il bridge REST
+/// `/api/internal/provider-error` del brain Python. Chi puo' ancora scrivere
+/// un'esclusione, e su quale prova, lo enumera il guard `scrittori-di-esclusione`.
 pub fn registra_esclusione_dichiarata(esclusione: &EsclusioneDichiarata) {
     match esclusione {
         EsclusioneDichiarata::Credito { provider } => {

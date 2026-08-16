@@ -1462,4 +1462,123 @@ mod confine_wire_tests {
 
         crate::provider_cooldown::remove_cooldown(fornitore);
     }
+
+    /// Un tetto TPD di UN modello esclude la COPPIA, e lascia in servizio il
+    /// resto del fornitore — lungo la catena vera, dai segnali reali.
+    ///
+    /// IL DIFETTO. Fino al 13/08/2026 mcp-core teneva un SECONDO scrittore di
+    /// esclusioni accanto a questo (`agent_turn_setup::apply_provider_cooldown`,
+    /// alimentato da un secondo classificatore il cui vocabolario non conosceva
+    /// `transient`), e la sua firma non aveva un parametro `model`: qualunque
+    /// cosa scrivesse era del FORNITORE INTERO. Misurato nei log: alle
+    /// 18:32:47.743443 il cooldown corretto sulla coppia
+    /// `groq/openai/gpt-oss-20b`, e 439 microsecondi dopo lo STESSO evento
+    /// riclassificato `billing_error` — la parola `billing` sta nell'URL di
+    /// documentazione che groq mette nel messaggio — con groq intero spento.
+    ///
+    /// I SEGNALI SONO QUELLI VERI e la portata la deriva il PRODUTTORE
+    /// (`PortataCooldown::da_segnale`, nel gateway): il test non decide da se'
+    /// che un 429 con `rate_limit_exceeded` sia un tetto di modello — lo chiede
+    /// al codice che comporra' quel campo in produzione (regola O). Ricopiare
+    /// `"model"` a mano qui renderebbe verde il test anche se il gateway
+    /// smettesse di dichiararlo.
+    ///
+    /// MUTAZIONE che lo fa rosseggiare, col difetto reale: rimettere il ripiego
+    /// lessicale e il suo scrittore, cioe' aggiungere dopo la costruzione di
+    /// `errore` una qualunque forma di
+    /// `put_provider_in_long_cooldown(fornitore, ...)` /
+    /// `put_provider_in_short_cooldown(fornitore, ...)` -> il secondo assert
+    /// fallisce con «fornitore intero escluso per un limite di modello».
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn un_tetto_del_modello_non_spegne_il_fornitore(db: sqlx::PgPool) {
+        use nexus_gateway::cooldown::PortataCooldown;
+        use nexus_types::provider_failure::{chiave, classe};
+
+        // Nome irripetibile: il registro dei cooldown e' globale al processo.
+        let fornitore = "prova-tpd-groq";
+        let modello_saturo = "openai/gpt-oss-20b";
+        let modello_sano = "llama-3.3-70b-versatile";
+
+        // I segnali REALI del 429 TPD di groq. Il messaggio porta la parola che
+        // traeva in inganno il ripiego lessicale: senza, il test non misurerebbe
+        // il difetto.
+        let status = 429u16;
+        let codice = "rate_limit_exceeded";
+        let messaggio = "Rate limit reached for model `openai/gpt-oss-20b` in organization \
+             org_01 service tier `on_demand` on tokens per day (TPD): Limit 200000, \
+             Used 199512. Need more tokens? Upgrade at https://console.groq.com/settings/billing";
+        let portata = PortataCooldown::da_segnale(Some(status), Some(codice));
+        assert_eq!(
+            portata,
+            PortataCooldown::Modello,
+            "premessa: e' il gateway a stabilire che un tetto di frequenza e' del modello"
+        );
+
+        let corpo = serde_json::json!({
+            "code": "PROVIDER_ERROR",
+            "message": format!("tutti i provider hanno fallito -> {fornitore} ({messaggio})"),
+            "details": {
+                chiave::PRIMARY_CAUSE: classe::TRANSIENT,
+                chiave::FAILURES: [{
+                    chiave::PROVIDER: fornitore,
+                    chiave::MODELLO: modello_saturo,
+                    chiave::CLASSE: classe::TRANSIENT,
+                    chiave::PORTATA: portata.wire(),
+                    chiave::ATTESA_S: 1424,
+                }],
+            },
+        })
+        .to_string();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("porta effimera");
+        let porta = listener.local_addr().expect("indirizzo").port();
+        let finto = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.expect("connessione");
+            let mut scarto = [0u8; 4096];
+            let _ = socket.read(&mut scarto).await;
+            const CRLF: &str = "\r\n";
+            let intestazioni = [
+                "HTTP/1.1 500 Internal Server Error",
+                "Content-Type: application/json",
+                &format!("Content-Length: {}", corpo.len()),
+                "Connection: close",
+                "",
+                "",
+            ]
+            .join(CRLF);
+            let _ = socket.write_all(intestazioni.as_bytes()).await;
+            let _ = socket.write_all(corpo.as_bytes()).await;
+            let _ = socket.flush().await;
+        });
+
+        let client = NexusGatewayClient::new(format!("http://127.0.0.1:{porta}"), db);
+        let esito = client
+            .complete(GwRequest {
+                model: modello_saturo.into(),
+                messages: Vec::new(),
+                ..Default::default()
+            })
+            .await;
+        assert!(esito.is_err(), "il gateway ha risposto 500");
+        let _ = finto.await;
+
+        assert!(
+            crate::provider_cooldown::is_model_in_cooldown(fornitore, modello_saturo),
+            "la coppia che ha sforato il tetto deve uscire dalla selezione"
+        );
+        assert!(
+            !crate::provider_cooldown::is_provider_in_cooldown(fornitore),
+            "fornitore intero escluso per un limite di modello: e' il difetto del \
+             13/08/2026, un secondo scrittore senza portata che spegne l'account"
+        );
+        assert!(
+            !crate::provider_cooldown::is_model_in_cooldown(fornitore, modello_sano),
+            "gli altri modelli dello stesso fornitore hanno quota propria"
+        );
+
+        crate::provider_cooldown::remove_cooldown(fornitore);
+    }
 }

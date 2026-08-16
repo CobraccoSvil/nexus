@@ -90,34 +90,8 @@ async fn reset_cooldown_endpoint_idempotente() {
     assert_eq!(r2.status().as_u16(), 200);
 }
 
-#[tokio::test]
-async fn provider_error_bridge_billing_attiva_cooldown_lungo() {
-    // Endpoint interno: simula un brain bridge call per billing_error.
-    // Verifica che il provider venga messo in cooldown e poi possa essere
-    // rimosso via reset-cooldown.
-    let Some(client) = client().await else { return };
-    // Mark cooldown via bridge.
-    let bridge_url = format!("{}/api/internal/provider-error", base_url());
-    let r = client
-        .post(&bridge_url)
-        .json(&serde_json::json!({
-            "provider": "contract_test_provider",
-            "error_class": "billing_error",
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert!(r.status().is_success(), "bridge call deve essere 2xx");
-    // Reset cooldown.
-    let reset_url = format!(
-        "{}/api/admin/providers/contract_test_provider/reset-cooldown",
-        base_url()
-    );
-    let r2 = client
-        .post(&reset_url)
-        .header("Cookie", cookie_header().await)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r2.status().as_u16(), 200);
-}
+// Il contract test del bridge `POST /api/internal/provider-error` e' caduto col
+// bridge (13/08/2026): era un terzo scrittore di esclusioni che classificava
+// dalla prosa, e il suo unico client Python non esiste piu'. L'esclusione che
+// conta oggi la dichiara il gateway a ogni chiamata, ed e' provata in-process
+// dove la produzione la attraversa (`mcp_core::nexus_gateway` -> `complete`).

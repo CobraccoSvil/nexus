@@ -118,14 +118,10 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
             "/api/internal/learning/feedback",
             post(internal_learning::submit_feedback),
         )
-        // /api/internal/provider-error — bridge cooldown: il brain Python
-        // notifica errori provider non osservati da Rust (es. catena
-        // classificatore). Applica cooldown appropriato (lungo per billing,
-        // breve per rate_limit/overloaded).
-        .route(
-            "/api/internal/provider-error",
-            post(internal_routing::provider_error_handler),
-        )
+        // `/api/internal/provider-error` e' stata rimossa il 13/08/2026: era un
+        // terzo scrittore di esclusioni che classificava dalla prosa, e il suo
+        // unico client (`brain/cooldown_bridge.py`) non esiste piu'. Chi scrive
+        // un cooldown lo enumera il guard `scrittori-di-esclusione`.
         .route(
             "/api/internal/prompt-templates/batch-assign-tools",
             post(prompt_templates::internal_batch_assign_tools_handler),

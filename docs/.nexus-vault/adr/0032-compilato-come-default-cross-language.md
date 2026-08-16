@@ -31,6 +31,13 @@ La decisione vive in Rust; il Python invia dati grezzi e delega via uno dei
   retrocompatibile: un chiamante che conosce gia' la classe per le proprie
   decisioni locali (es. `registry.py` billing) puo' ancora passare
   `error_class`.
+  **Aggiornamento 2026-08-13**: l'endpoint e' stato rimosso col porting
+  zero-Python (nessun client vivo). L'esempio resta valido come forma — dati
+  grezzi al punto unico, decisione in Rust — ma qui il punto unico si e'
+  spostato ancora piu' vicino alla fonte: classifica il GATEWAY, che i segnali
+  strutturati del fornitore li ha di prima mano (`tassonomia_errori`, mig
+  0707), e mcp-core riceve il verdetto gia' fatto sul wire
+  (`EsclusioneDichiarata`).
 
 ### (b) Accessor sottile su un punto unico nel DB → paritetico legittimo
 
