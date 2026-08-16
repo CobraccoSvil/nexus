@@ -26,7 +26,9 @@
 //! `settings` con cache TTL ([`nexus_cache::TtlCache`], punto unico regola L).
 //! Le costanti di questo modulo sono SOLO il fallback di sicurezza usato se il
 //! DB e' irraggiungibile, documentate come tali. Chiavi lette:
-//!   - `gateway.cooldown.billing_seconds`   (default 3600s)
+//!   - `provider.cooldown_long_s`           (default 21600s) — la stessa che
+//!     legge mcp-core: la durata dell'esclusione per credito e' UNA, e il
+//!     perche' sta in [`nexus_types::provider_failure::durata`]
 //!   - `gateway.cooldown.transient_seconds` (default 30s)
 //!   - `gateway.cooldown.reprobe_interval_seconds` (default 600s)
 //!
@@ -38,15 +40,18 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use nexus_cache::TtlCache;
-use nexus_types::provider_failure::portata;
+use nexus_types::provider_failure::{durata, portata, stato_salute};
 use sqlx::PgPool;
 
 use crate::provider::LlmProvider;
 use crate::types::ProviderStatus;
 
-/// Fallback durata cooldown billing se il DB e' irraggiungibile: 1 ora. NON e'
-/// un valore di business (quello sta in `settings`), e' la rete di sicurezza.
-pub const DEFAULT_BILLING_SECONDS: i64 = 3600;
+/// Fallback durata cooldown billing se il DB e' irraggiungibile. NON e' un
+/// valore di business (quello sta in `settings`), e' la rete di sicurezza — e
+/// non e' piu' un numero di questo modulo: la durata dell'esclusione per credito
+/// e' UNA, dichiarata in [`durata`] insieme al perche' vinca il tetto di sei ore
+/// sull'attesa cieca di un'ora che stava scritta qui.
+pub const DEFAULT_BILLING_SECONDS: i64 = durata::COOLDOWN_LUNGO_DEFAULT_S as i64;
 
 /// Fallback durata cooldown transitorio (errori di rete/5xx): 30 secondi.
 pub const DEFAULT_TRANSIENT_SECONDS: i64 = 30;
@@ -109,10 +114,29 @@ pub enum CooldownReason {
 }
 
 impl CooldownReason {
+    /// La ragione del COOLDOWN, per il log. Due valori, perche' due sono le
+    /// durate che questo manager sa applicare.
     fn as_str(self) -> &'static str {
         match self {
             CooldownReason::Billing => "billing",
             CooldownReason::Transient => "transient",
+        }
+    }
+
+    /// Il nome con cui questo stato si registra in
+    /// `nexus_provider_health_history.error_kind`, dal vocabolario condiviso coi
+    /// due scrittori di quella colonna ([`stato_salute`]).
+    ///
+    /// NON e' [`Self::as_str`], e la differenza e' il difetto misurato il
+    /// 13/08/2026: quella colonna vuole una CAUSA, e vi finiva la CLASSE con cui
+    /// questo modulo decide. Percio' openai senza credito compariva come
+    /// `billing` scritto da qui e come `credit_balance_too_low` scritto dal probe
+    /// di mcp-core, nello stesso millisecondo, e nessun filtro li trovava
+    /// entrambi.
+    fn nome_nello_storico(self) -> &'static str {
+        match self {
+            CooldownReason::Billing => stato_salute::CREDIT_BALANCE_TOO_LOW,
+            CooldownReason::Transient => stato_salute::TRANSIENT,
         }
     }
 }
@@ -340,7 +364,7 @@ impl CooldownManager {
         self.durations.insert(
             (),
             Durations {
-                billing_seconds: 3600,
+                billing_seconds: DEFAULT_BILLING_SECONDS,
                 transient_seconds: 30,
                 retry_max_attempts: 3,
                 retry_base_delay_ms: 1,
@@ -512,7 +536,8 @@ impl CooldownManager {
         // prompt/response. Troncato a 500 char come la history del probe.
         let message = truncate_chars(last_error.unwrap_or(""), 500);
         let provider = provider.to_lowercase();
-        let kind = reason.as_str();
+        // La colonna e' `error_kind`: vuole la causa, non la classe di cooldown.
+        let kind = reason.nome_nello_storico();
         self.spawn_persist(move |pool| persist_provider_error(pool, provider, kind, message));
     }
 
@@ -739,15 +764,19 @@ impl CooldownManager {
             return;
         }
 
+        // `provider.cooldown_long_s` e non piu' `gateway.cooldown.billing_seconds`:
+        // vedi [`durata`]. La chiave e' nominata dalla costante condivisa, cosi'
+        // il giorno in cui cambia non resta un letterale a divergere.
         let rows = sqlx::query_as::<_, (String, String)>(
             "SELECT key, value FROM settings \
-             WHERE key IN ('gateway.cooldown.billing_seconds', \
+             WHERE key IN ($1, \
                            'gateway.cooldown.transient_seconds', \
                            'gateway.retry.max_attempts', \
                            'gateway.retry.base_delay_ms', \
                            'gateway.retry.max_backoff_ms', \
                            'gateway.retry.wait_short_cooldown_cap_s')",
         )
+        .bind(durata::CHIAVE_COOLDOWN_LUNGO)
         .fetch_all(pool)
         .await;
 
@@ -757,7 +786,7 @@ impl CooldownManager {
                 for (key, value) in &rows {
                     let v = value.trim();
                     match key.as_str() {
-                        "gateway.cooldown.billing_seconds" => {
+                        k if k == durata::CHIAVE_COOLDOWN_LUNGO => {
                             if let Ok(n) = v.parse::<i64>() {
                                 d.billing_seconds = n;
                             }
@@ -1139,6 +1168,91 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// IL DIFETTO DEL NOME (misurato il 13/08/2026): questo scrittore metteva in
+    /// `error_kind` la CLASSE del cooldown (`billing`), mentre il probe di
+    /// mcp-core metteva la CAUSA (`credit_balance_too_low`) per lo STESSO stato —
+    /// due righe nello stesso millisecondo per openai, e nessun filtro capace di
+    /// trovarle entrambe.
+    ///
+    /// Il test attraversa il produttore reale (`mark_billing` -> persistenza) e
+    /// asserisce il valore CANONICO condiviso, non una stringa ricopiata: se
+    /// qualcuno cambia il vocabolario in `nexus-types`, i due lati si muovono
+    /// insieme o rosseggiano insieme.
+    ///
+    /// MUTAZIONE: rimettere `reason.as_str()` in `persist_last_error` -> il valore
+    /// letto e' `billing` e l'assert cade con la stringa del difetto reale.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn error_kind_del_cooldown_billing_e_il_nome_canonico(pool: PgPool) {
+        let m = CooldownManager::new();
+        m.attach_db(pool.clone());
+
+        m.mark_billing("anthropic", Some("credit balance too low".to_string()));
+
+        let kind = attendi_error_kind(&pool, "anthropic").await;
+        assert_eq!(
+            kind,
+            stato_salute::CREDIT_BALANCE_TOO_LOW,
+            "la colonna error_kind vuole la causa condivisa coi due scrittori, non la classe di cooldown"
+        );
+    }
+
+    /// La durata dell'esclusione per credito la legge da `provider.cooldown_long_s`,
+    /// la STESSA chiave di mcp-core: prima ne aveva una propria
+    /// (`gateway.cooldown.billing_seconds`, 3600) e lo stesso evento aveva due
+    /// durate nei due processi.
+    ///
+    /// Il valore di prova e' DISTINTO dal fallback apposta: se la query tornasse a
+    /// nominare la chiave vecchia non troverebbe nulla e cadrebbe sul fallback —
+    /// che, essendo ora lo stesso 21600 del setting, renderebbe muto un test
+    /// scritto sul valore di default.
+    ///
+    /// MUTAZIONE: rimettere `'gateway.cooldown.billing_seconds'` nella `IN (...)`
+    /// -> il residuo torna al fallback e l'assert cade.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_durata_billing_viene_dalla_chiave_condivisa(pool: PgPool) {
+        const PROVA_S: i64 = 12345;
+        sqlx::query("UPDATE settings SET value = $1 WHERE key = $2")
+            .bind(PROVA_S.to_string())
+            .bind(durata::CHIAVE_COOLDOWN_LUNGO)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let m = CooldownManager::new();
+        m.refresh_settings(&pool, true).await;
+        let now = t0();
+        m.mark_at(
+            "openai",
+            CooldownReason::Billing,
+            None,
+            now,
+            m.current_durations().billing_seconds,
+        );
+
+        assert_eq!(m.seconds_remaining_at("openai", now), PROVA_S);
+    }
+
+    /// Poll fino a 2s per l'`error_kind` dell'ultima riga non sana del provider.
+    /// Stessa ragione di [`attendi_riga_healthy`]: la persistenza e'
+    /// fire-and-forget e non c'e' un handle da attendere.
+    async fn attendi_error_kind(pool: &PgPool, provider: &str) -> String {
+        for _ in 0..20 {
+            if let Some(Some(kind)) = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT error_kind FROM nexus_provider_health_history \
+                 WHERE provider = $1 AND healthy = false ORDER BY checked_at DESC LIMIT 1",
+            )
+            .bind(provider)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+            {
+                return kind;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("nessuna riga con error_kind per '{provider}' entro 2s");
     }
 
     /// Poll fino a 2s per una riga con l'esatto `healthy` atteso (non

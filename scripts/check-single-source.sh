@@ -3987,6 +3987,83 @@ else
   echo "OK scrittori-di-esclusione: nessun bridge che classifichi dalla prosa"
 fi
 
+# --- durata-esclusione-credito ----------------------------------------------
+# UNA durata per l'esclusione di un fornitore senza credito, UNA chiave. Il
+# 13/08/2026 il gateway registrava `duration_seconds=3600`
+# (`gateway.cooldown.billing_seconds`) e mcp-core scriveva sei ore
+# (`provider.cooldown_long_s`) per lo stesso evento e nello stesso istante.
+# Mig 0712: la chiave del gateway e' rimossa, entrambi leggono quella di
+# `nexus_types::provider_failure::durata`.
+# I COMMENTI restano ammessi: la chiave va NOMINATA per spiegare perche' non
+# esiste piu'. Il filtro scarta le righe il cui contenuto (dopo `file:riga:`)
+# comincia con un marcatore di commento Rust o SQL.
+chiave_morta="$(grep -rn "gateway\.cooldown\.billing_seconds" crates db/migrations \
+  --include='*.rs' --include='*.sql' --exclude-dir=target 2>/dev/null \
+  | grep -v '^db/migrations/0418_gateway_rust_settings\.sql:' \
+  | grep -v '^db/migrations/0712_' \
+  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(///|//!|//|/\*|\*|--)' || true)"
+if [[ -n "${chiave_morta// /}" ]]; then
+  echo "!! durata-esclusione-credito: 'gateway.cooldown.billing_seconds' e' tornata viva:" >&2
+  printf '%s\n' "$chiave_morta" >&2
+  echo "   La mig 0712 l'ha rimossa da settings: leggerla darebbe sempre il" >&2
+  echo "   fallback, e scriverla creerebbe un valore che nessuno applica." >&2
+  echo "   La chiave e' nexus_types::provider_failure::durata::CHIAVE_COOLDOWN_LUNGO." >&2
+  fail=1
+else
+  echo "OK durata-esclusione-credito: una sola chiave per la durata del cooldown di credito"
+fi
+
+# Il default non si ricopia: il gateway e mcp-core devono prenderlo dalla
+# costante condivisa, o le due reti di sicurezza divergono in silenzio.
+for f in crates/nexus-gateway/src/cooldown.rs crates/mcp-core/src/provider_cooldown.rs; do
+  if ! grep -q 'durata::COOLDOWN_LUNGO_DEFAULT_S' "$f"; then
+    echo "!! durata-esclusione-credito: $f non usa piu' il default condiviso." >&2
+    echo "   Un numero scritto a mano li' e' la seconda durata che rientra." >&2
+    fail=1
+  fi
+done
+
+# --- nome-stato-salute -------------------------------------------------------
+# `nexus_provider_health_history.error_kind` ha DUE scrittori in due processi:
+# devono nominare lo stesso stato allo stesso modo (mig 0712). Il nome vive in
+# `nexus_types::provider_failure::stato_salute`.
+for f in crates/nexus-gateway/src/cooldown.rs crates/mcp-core/src/provider_health_probe.rs; do
+  if ! grep -q 'stato_salute::CREDIT_BALANCE_TOO_LOW' "$f"; then
+    echo "!! nome-stato-salute: $f non nomina piu' lo stato dal vocabolario condiviso." >&2
+    echo "   Prima il gateway scriveva 'billing' e il probe 'credit_balance_too_low'" >&2
+    echo "   per lo stesso fornitore senza credito: una query ne trovava una meta'." >&2
+    fail=1
+  fi
+done
+if [[ "$fail" -eq 0 ]]; then
+  echo "OK nome-stato-salute: i due scrittori di error_kind usano lo stesso vocabolario"
+fi
+
+# --- freno-reprobe -----------------------------------------------------------
+# Il freno del recovery loop si consulta SEMPRE. La guardia era
+# `is_provider_in_cooldown(p) && !should_reprobe_cooldown(...)`: il
+# corto-circuito `&&` saltava la seconda meta' a cooldown scaduto, quindi
+# l'intervallo di 600s non entrava mai in vigore (cadenza reale misurata 120s).
+# Anche qui i commenti nominano il vecchio simbolo per spiegare il difetto: si
+# guarda il CODICE, cioe' le righe che non cominciano con un marcatore.
+freno_vecchio="$(grep -n 'should_reprobe_cooldown' crates/mcp-core/src/provider_cooldown.rs 2>/dev/null \
+  | grep -vE '^[0-9]+:[[:space:]]*(///|//!|//|/\*|\*)' || true)"
+if [[ -n "${freno_vecchio// /}" ]]; then
+  echo "!! freno-reprobe: 'should_reprobe_cooldown' e' tornato:" >&2
+  printf '%s\n' "$freno_vecchio" >&2
+  echo "   Il freno e' permesso_di_riprovare -> PermessoRiprova, e va chiamato" >&2
+  echo "   senza congiunzioni: la domanda e' quanto tempo e' passato dall'ultimo" >&2
+  echo "   probe, e non dipende dal fatto che il cooldown sia attivo." >&2
+  fail=1
+elif grep -q 'is_provider_in_cooldown(&provider)' crates/mcp-core/src/provider_cooldown.rs; then
+  echo "!! freno-reprobe: il recovery loop torna a condizionare il freno al cooldown." >&2
+  echo "   E' il corto-circuito del 13/08/2026: con il cooldown scaduto il freno" >&2
+  echo "   non veniva consultato e l'intervallo non valeva mai." >&2
+  fail=1
+else
+  echo "OK freno-reprobe: il freno del recovery loop non e' condizionato al cooldown"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

@@ -5,7 +5,7 @@
 //! `reset_provider_failures` sono usati anche fuori dal loop agente
 //! (es. `orchestrator.rs`).
 
-use nexus_types::provider_failure::EsclusioneDichiarata;
+use nexus_types::provider_failure::{durata, EsclusioneDichiarata};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
@@ -48,7 +48,11 @@ impl Default for ProviderHealthTimings {
             cooldown_default_s: 300,
             cooldown_min_s: 10,
             cooldown_max_s: 3600,
-            cooldown_long_s: 6 * 3600,
+            // Il tetto dell'esclusione per credito e' UNO e vive in
+            // `nexus-types` insieme alla sua chiave `settings`: lo legge anche il
+            // `CooldownManager` del gateway, che fino al 13/08/2026 ne aveva uno
+            // proprio da un'ora (vedi `nexus_types::provider_failure::durata`).
+            cooldown_long_s: durata::COOLDOWN_LUNGO_DEFAULT_S,
             circuit_breaker_window_s: 60,
             circuit_breaker_threshold: 3,
             circuit_breaker_extended_cooldown_s: 600,
@@ -134,29 +138,62 @@ static PROVIDER_FAILURES: OnceLock<Mutex<HashMap<String, Vec<std::time::Instant>
 /// del cooldown lungo (6h) ma si riprova ogni 10 minuti.
 const BILLING_REPROBE_INTERVAL_S: u64 = 600;
 
-/// Ultimo istante in cui il recovery loop ha ri-probato un provider ancora in
-/// cooldown. Limita la frequenza dei re-probe (vedi BILLING_REPROBE_INTERVAL_S),
-/// cosi' il probe periodico non martella il provider ad ogni giro del loop.
+/// Ultimo istante in cui il recovery loop ha ri-probato un provider. Limita la
+/// frequenza dei re-probe (vedi BILLING_REPROBE_INTERVAL_S), cosi' il loop non
+/// martella il fornitore ad ogni suo giro.
 static LAST_RECOVERY_PROBE: OnceLock<Mutex<HashMap<String, std::time::Instant>>> = OnceLock::new();
 
-/// True se il provider in cooldown va ri-probato adesso (mai probato, o ultimo
-/// probe piu' vecchio di `interval`); in tal caso aggiorna il timestamp.
-fn should_reprobe_cooldown(provider: &str, interval: std::time::Duration) -> bool {
+/// Il freno del recovery loop puo' far partire un altro probe adesso?
+///
+/// E' un tipo e non un `bool` perche' i casi sono TRE, e il terzo non e' un «no»
+/// come gli altri: il registro puo' essere non interrogabile (mutex avvelenato),
+/// e chiamarlo «troppo presto» direbbe al log un'attesa che nessuno ha misurato
+/// (regola Q: l'ignoto e' una variante, non un valore comodo).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PermessoRiprova {
+    /// Nessun probe recente: si procede, e l'istante viene annotato.
+    Concesso,
+    /// L'ultimo probe e' troppo recente: mancano `attesa_s` secondi.
+    TroppoPresto { attesa_s: u64 },
+    /// Il registro dei probe non e' leggibile: non si procede, e lo si dichiara
+    /// invece di far passare la richiesta senza freno (un mutex avvelenato non
+    /// e' un buon motivo per una raffica di chiamate a pagamento).
+    RegistroNonInterrogabile,
+}
+
+/// Il freno, con l'istante iniettato: e' la stessa funzione che il loop chiama,
+/// con l'orologio come parametro perche' la cadenza si possa misurare senza
+/// aspettare (regola O).
+///
+/// Annota `ora` SOLO quando concede: e' l'unico modo perche' l'intervallo misuri
+/// la distanza fra due probe EFFETTUATI, e non fra due tentativi di chiederne uno.
+pub(crate) fn permesso_di_riprovare_at(
+    provider: &str,
+    intervallo: std::time::Duration,
+    ora: std::time::Instant,
+) -> PermessoRiprova {
     let store = LAST_RECOVERY_PROBE.get_or_init(|| Mutex::new(HashMap::new()));
-    match store.lock() {
-        Ok(mut map) => {
-            let now = std::time::Instant::now();
-            let due = map
-                .get(provider)
-                .map(|last| now.duration_since(*last) >= interval)
-                .unwrap_or(true);
-            if due {
-                map.insert(provider.to_string(), now);
-            }
-            due
+    let Ok(mut map) = store.lock() else {
+        return PermessoRiprova::RegistroNonInterrogabile;
+    };
+    if let Some(&ultimo) = map.get(provider) {
+        let trascorso = ora.saturating_duration_since(ultimo);
+        if trascorso < intervallo {
+            return PermessoRiprova::TroppoPresto {
+                attesa_s: (intervallo - trascorso).as_secs(),
+            };
         }
-        Err(_) => false,
     }
+    map.insert(provider.to_string(), ora);
+    PermessoRiprova::Concesso
+}
+
+/// [`permesso_di_riprovare_at`] sull'orologio reale.
+pub(crate) fn permesso_di_riprovare(
+    provider: &str,
+    intervallo: std::time::Duration,
+) -> PermessoRiprova {
+    permesso_di_riprovare_at(provider, intervallo, std::time::Instant::now())
 }
 
 /// La PORTATA di un cooldown: il solo fornitore, oppure una sua coppia col
@@ -661,6 +698,39 @@ pub fn init_db_pool(pool: sqlx::PgPool) {
     let _ = DB_POOL.set(pool);
 }
 
+/// Che cosa il recovery loop fa dell'esito di UN probe.
+///
+/// E' un tipo e non tre rami scritti dentro il loop perche' il caso che conta e'
+/// quello in cui non si fa NIENTE: un'assenza di codice non si puo' asserire, e
+/// il difetto misurato il 13/08/2026 e' nato proprio come una riga di troppo in
+/// quel ramo (vedi [`AzioneRecovery::LasciaInvariata`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AzioneRecovery {
+    /// Il fornitore ha risposto: esce dal cooldown e la colonna si azzera.
+    Riabilita,
+    /// Il credito e' ancora esaurito. E' un fatto NUOVO, osservato adesso:
+    /// rinnovare la scadenza e' legittimo, ed e' l'unico ramo che scrive.
+    RinnovaEsclusione { causa: String },
+    /// Esito NON conclusivo (rate limit, timeout, rete). Non e' una misura del
+    /// credito: non si accorcia, non si allunga, non si declassa la severita'.
+    /// Il prossimo tentativo lo pianifica il freno.
+    LasciaInvariata { causa: String },
+}
+
+/// Il criterio, PURO: dall'esito del probe all'azione. Nessun I/O, cosi' il ramo
+/// che non deve toccare niente e' una decisione asseribile invece di una riga
+/// mancante.
+pub(crate) fn azione_dal_probe(
+    esito: crate::provider_health_probe::ProbeOutcome,
+) -> AzioneRecovery {
+    use crate::provider_health_probe::ProbeOutcome;
+    match esito {
+        ProbeOutcome::Healthy => AzioneRecovery::Riabilita,
+        ProbeOutcome::Billing(causa) => AzioneRecovery::RinnovaEsclusione { causa },
+        ProbeOutcome::Transient(causa) => AzioneRecovery::LasciaInvariata { causa },
+    }
+}
+
 /// Worker periodico: ogni `interval_secs` controlla i provider che hanno righe
 /// ancora disabilitate dal billing cooldown e, se il cooldown locale e' scaduto,
 /// li riabilita nel DB **solo dopo un probe attivo andato a buon fine**
@@ -674,10 +744,16 @@ pub fn init_db_pool(pool: sqlx::PgPool) {
 ///   - probe Billing    -> il credito e' ancora KO: rinnova il cooldown lungo,
 ///                         niente riabilitazione.
 ///   - probe Transient  -> errore non conclusivo (rate-limit/timeout/rete):
-///                         applica un cooldown breve e riprova al prossimo giro.
+///                         NON si tocca niente e si riprova al giro consentito
+///                         successivo (vedi il ramo per il perche').
 ///
 /// `interval_secs` e il timeout del probe sono DB-driven (settings `provider.*`,
 /// migrazione 0252) — vedi `provider_health_timings()`.
+///
+/// LA SCADENZA AUTORITATIVA E' LA COLONNA, non la mappa in memoria: la query qui
+/// sotto legge anche il residuo di `billing_cooldown_until` e lo passa a
+/// [`allinea_cooldown_lungo_dal_db`] a ogni giro, cosi' il registro in-process
+/// resta la CACHE di quel timestamp e non una seconda verita' che diverge.
 pub async fn billing_cooldown_recovery_loop(
     orchestrator: Arc<crate::orchestrator::Orchestrator>,
     db: sqlx::PgPool,
@@ -690,46 +766,88 @@ pub async fn billing_cooldown_recovery_loop(
     loop {
         ticker.tick().await;
 
-        let providers_disabled: Vec<String> = match sqlx::query_scalar::<_, String>(
-            "SELECT LOWER(provider) FROM nexus_provider_health \
+        // Il residuo esce dal DB gia' calcolato: e' quella colonna a dire fino a
+        // quando, e ricalcolarlo qui da una durata di configurazione
+        // rimetterebbe in piedi il secondo numero.
+        let providers_disabled: Vec<(String, Option<String>, Option<f64>)> =
+            match sqlx::query_as::<_, (String, Option<String>, Option<f64>)>(
+                "SELECT LOWER(provider), last_error, \
+                    EXTRACT(EPOCH FROM (billing_cooldown_until - NOW()))::float8 \
+             FROM nexus_provider_health \
              WHERE billing_cooldown_until IS NOT NULL",
-        )
-        .fetch_all(&db)
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("billing_cooldown_recovery: query fallita: {}", e);
-                continue;
-            }
-        };
-
-        for provider in providers_disabled {
-            // Cooldown ancora attivo: di norma si aspetta la scadenza. MA per i
-            // billing-cooldown (6h) la ricarica del credito e' un evento esterno
-            // imprevedibile: ri-proviamo a intervalli regolari (BILLING_REPROBE_
-            // INTERVAL_S) invece di tenere il provider giu' per ore dopo che
-            // l'utente ha gia' ricaricato.
-            if is_provider_in_cooldown(&provider)
-                && !should_reprobe_cooldown(
-                    &provider,
-                    std::time::Duration::from_secs(BILLING_REPROBE_INTERVAL_S),
-                )
+            )
+            .fetch_all(&db)
+            .await
             {
-                continue;
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("billing_cooldown_recovery: query fallita: {}", e);
+                    continue;
+                }
+            };
+
+        for (provider, last_error, residuo_s) in providers_disabled {
+            // La cache in-process si riallinea alla colonna PRIMA di qualunque
+            // decisione, e a ogni giro: un restart, un cooldown breve finito
+            // sopra la chiave del fornitore o un Redis svuotato lasciano la
+            // memoria piu' corta del fatto persistito, e li' il fornitore
+            // tornerebbe eleggibile mentre il DB dice ancora di no.
+            allinea_cooldown_lungo_dal_db(
+                &provider,
+                residuo_s.unwrap_or(0.0),
+                last_error
+                    .as_deref()
+                    .unwrap_or("billing_cooldown (allineamento dal DB)"),
+            );
+            // IL FRENO SI CONSULTA SEMPRE. Prima la condizione era
+            // `is_provider_in_cooldown(p) && !should_reprobe_cooldown(p, 600s)`:
+            // il corto-circuito `&&` fa si' che con il cooldown SCADUTO la
+            // seconda meta' non venga nemmeno chiamata, quindi l'istante
+            // dell'ultimo probe non veniva mai annotato e l'intervallo di 600s
+            // non valeva mai. Bastava un esito non conclusivo — che allora
+            // scriveva un cooldown breve di 60s — perche' quello scadesse al
+            // tick seguente e il ciclo ripartisse: cadenza reale MISURATA 120s
+            // per 4h29m, cinque volte piu' frequente del previsto, con una
+            // chiamata a pagamento ogni volta.
+            //
+            // Essere o non essere in cooldown non cambia piu' la risposta: la
+            // domanda e' «quanto tempo e' passato dall'ultimo probe di questo
+            // loop», e ha una risposta sola.
+            match permesso_di_riprovare(
+                &provider,
+                std::time::Duration::from_secs(BILLING_REPROBE_INTERVAL_S),
+            ) {
+                PermessoRiprova::Concesso => {}
+                PermessoRiprova::TroppoPresto { attesa_s } => {
+                    tracing::trace!(
+                        target: "provider_cooldown",
+                        provider = %provider,
+                        attesa_s,
+                        "probe-then-reenable: freno attivo, non riprovo adesso"
+                    );
+                    continue;
+                }
+                PermessoRiprova::RegistroNonInterrogabile => {
+                    tracing::warn!(
+                        target: "provider_cooldown",
+                        provider = %provider,
+                        "probe-then-reenable: registro dei re-probe non interrogabile, salto il giro"
+                    );
+                    continue;
+                }
             }
             // Probe-then-reenable: il cooldown e' scaduto (o e' ora di ri-provare)
             // ma prima di riabilitare accertiamo che il provider sia DAVVERO
             // tornato operativo.
             let probe_timeout = provider_health_timings().recovery_probe_timeout_s;
-            match crate::provider_health_probe::probe_provider_once(
+            let esito = crate::provider_health_probe::probe_provider_once(
                 &orchestrator,
                 &provider,
                 probe_timeout,
             )
-            .await
-            {
-                crate::provider_health_probe::ProbeOutcome::Healthy => {
+            .await;
+            match azione_dal_probe(esito) {
+                AzioneRecovery::Riabilita => {
                     tracing::info!(
                         target: "provider_cooldown",
                         provider = %provider,
@@ -740,24 +858,47 @@ pub async fn billing_cooldown_recovery_loop(
                     // remove_cooldown azzera anche il TTL su nexus_provider_health.
                     remove_cooldown(&provider);
                 }
-                crate::provider_health_probe::ProbeOutcome::Billing(kind) => {
+                AzioneRecovery::RinnovaEsclusione { causa } => {
                     tracing::warn!(
                         target: "provider_cooldown",
                         provider = %provider,
-                        kind = %kind,
+                        kind = %causa,
                         "probe-then-reenable: billing ancora KO, rinnovo cooldown lungo (niente riabilitazione)"
                     );
-                    put_provider_in_long_cooldown(&provider, &kind);
+                    put_provider_in_long_cooldown(&provider, &causa);
                 }
-                crate::provider_health_probe::ProbeOutcome::Transient(kind) => {
-                    let slow = provider_health_timings().slow_cooldown_s;
+                AzioneRecovery::LasciaInvariata { causa } => {
+                    // NON SI TOCCA NIENTE. Qui si guarda un fornitore che la
+                    // colonna dichiara escluso per CREDITO, e il probe non ha
+                    // saputo dire ne' si' ne' no: un rate limit, un timeout, la
+                    // rete. Una non-osservazione non e' una misura, e non puo'
+                    // riscrivere lo stato (regola Q).
+                    //
+                    // Prima questo ramo chiamava `put_provider_in_short_cooldown`,
+                    // che scrive sulla chiave del FORNITORE — la stessa del
+                    // cooldown di credito — e faceva quindi DUE danni in una
+                    // riga: sostituiva la scadenza di sei ore con 60 secondi
+                    // (mentre `nexus_provider_health.billing_cooldown_until`
+                    // continuava a dire sei ore: le due verita' divergevano
+                    // proprio qui), e declassava la severita' registrata da
+                    // `Long` a `Short`. Con la severita' declassata
+                    // `is_provider_in_billing_cooldown` diventa falso, quindi il
+                    // probe periodico generico — che i billing li salta apposta,
+                    // incidente Beauty-Book — tornava a interrogare un fornitore
+                    // senza credito: MISURATE 583 righe `openai/transient` in
+                    // `nexus_provider_health_history` a cadenza ~336s, ognuna una
+                    // chiamata a pagamento contro un 429 «You have no credits
+                    // remaining». E i 60 secondi scadevano entro il tick
+                    // successivo, che e' la meta' del difetto del freno: con il
+                    // cooldown scaduto il vecchio `&&` non lo consultava nemmeno.
+                    //
+                    // Il nuovo tentativo lo pianifica gia' il freno qui sopra.
                     tracing::warn!(
                         target: "provider_cooldown",
                         provider = %provider,
-                        kind = %kind,
-                        "probe-then-reenable: esito non conclusivo, cooldown breve e nuovo tentativo al prossimo giro"
+                        kind = %causa,
+                        "probe-then-reenable: esito non conclusivo, esclusione invariata e nuovo tentativo al giro consentito"
                     );
-                    put_provider_in_short_cooldown(&provider, &kind, slow);
                 }
             }
         }
@@ -1071,6 +1212,60 @@ pub fn restore_cooldown(provider: &str, remaining_secs: u64, reason: &str) {
     set_cooldown_severity(&ChiaveCooldown::fornitore(provider), CooldownSeverity::Long);
 }
 
+/// Allinea la CACHE in-process alla scadenza AUTORITATIVA gia' scritta in
+/// `nexus_provider_health.billing_cooldown_until`.
+///
+/// PERCHE' NON E' `put_provider_in_long_cooldown`. Quella funzione CALCOLA una
+/// scadenza nuova dalla durata di configurazione e la PERSISTE (Redis + colonna):
+/// e' la reazione a un fatto appena osservato. Qui il fatto e' gia' registrato e
+/// la colonna e' l'unica a dire fino a quando — ricalcolarlo significherebbe
+/// spostare la scadenza in avanti ogni volta che qualcuno la legge. Al boot lo
+/// faceva: `restore_billing_cooldowns_from_db` chiamava
+/// `put_provider_in_long_cooldown` per ogni riga trovata, quindi ogni riavvio di
+/// mcp-core prolungava di sei ore piene un'esclusione che magari stava per
+/// finire, e riscriveva la colonna con la nuova scadenza — la cache che detta
+/// legge alla fonte, cioe' esattamente la seconda verita'.
+///
+/// NON ACCORCIA MAI: se la memoria dice piu' del DB, la si lascia stare. E' la
+/// stessa disciplina di `registra_esclusione_dichiarata`, e l'errore cade dalla
+/// parte di tenere fuori qualcuno un po' piu' del necessario.
+///
+/// `residuo_s` viene dal DB, gia' calcolato li'
+/// (`EXTRACT(EPOCH FROM (billing_cooldown_until - NOW()))::float8`). Un residuo
+/// nullo, negativo o non confrontabile non e' un'esclusione da ricreare.
+pub fn allinea_cooldown_lungo_dal_db(provider: &str, residuo_s: f64, reason: &str) {
+    // NaN compreso: un residuo non confrontabile non e' un'esclusione.
+    if residuo_s.is_nan() || residuo_s <= 0.0 {
+        return;
+    }
+    let residuo = residuo_s as u64;
+    let chiave = ChiaveCooldown::fornitore(provider);
+    if residuo_della_chiave(&chiave) >= residuo {
+        return;
+    }
+    let store = PROVIDER_COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut map) = store.lock() {
+        map.insert(
+            chiave.clone(),
+            std::time::Instant::now() + std::time::Duration::from_secs(residuo),
+        );
+    }
+    let reasons = PROVIDER_COOLDOWN_REASONS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut map) = reasons.lock() {
+        map.insert(chiave.clone(), reason.to_string());
+    }
+    // La severita' e' `Long` per COSTRUZIONE, non per deduzione dal testo: la
+    // colonna `billing_cooldown_until` la scrive solo
+    // `put_provider_in_long_cooldown` (writer unico, ADR 0020).
+    set_cooldown_severity(&chiave, CooldownSeverity::Long);
+    tracing::info!(
+        target: "provider_cooldown",
+        provider = %provider,
+        residuo_s = residuo,
+        "cache del cooldown allineata alla scadenza persistita (nexus_provider_health)"
+    );
+}
+
 /// Bootstrap del cooldown billing dal DB persistente al riavvio (ADR 0020).
 ///
 /// Principio: il polling di health e' l'UNICO che testa i provider; un run di
@@ -1085,9 +1280,14 @@ pub fn restore_cooldown(provider: &str, remaining_secs: u64, reason: &str) {
 ///
 /// I provider il cui credito e' stato nel frattempo ricaricato vengono riabilitati
 /// dal `billing_cooldown_recovery_loop` (probe-then-reenable) al primo giro.
+///
+/// Si RIPRISTINA il residuo, non si ricomincia da capo: la colonna dice fino a
+/// quando, e questo e' un lettore. Vedi [`allinea_cooldown_lungo_dal_db`] per il
+/// difetto che chiude (ogni riavvio prolungava di sei ore piene).
 pub async fn restore_billing_cooldowns_from_db(db: &sqlx::PgPool) {
-    let rows = match sqlx::query_as::<_, (String, Option<String>)>(
-        "SELECT LOWER(provider), last_error \
+    let rows = match sqlx::query_as::<_, (String, Option<String>, Option<f64>)>(
+        "SELECT LOWER(provider), last_error, \
+                EXTRACT(EPOCH FROM (billing_cooldown_until - NOW()))::float8 \
          FROM nexus_provider_health \
          WHERE billing_cooldown_until IS NOT NULL AND billing_cooldown_until > NOW()",
     )
@@ -1101,11 +1301,10 @@ pub async fn restore_billing_cooldowns_from_db(db: &sqlx::PgPool) {
         }
     };
     let n = rows.len();
-    for (provider, reason) in rows {
-        // Billing/quota e' persistente -> cooldown lungo (6h). Il recovery loop
-        // (probe-then-reenable) lo rimuovera' appena il provider torna 200.
-        put_provider_in_long_cooldown(
+    for (provider, reason, residuo_s) in rows {
+        allinea_cooldown_lungo_dal_db(
             &provider,
+            residuo_s.unwrap_or(0.0),
             reason
                 .as_deref()
                 .unwrap_or("billing_cooldown (ripristino DB al boot)"),
@@ -1782,5 +1981,209 @@ mod tests_portata_cooldown {
             "senza un modello la portata e' il fornitore"
         );
         remove_cooldown(p);
+    }
+}
+
+/// Il freno del recovery loop, la sua cadenza, e l'azione che il loop trae da un
+/// probe.
+#[cfg(test)]
+mod tests_freno_e_azione {
+    use super::*;
+    use crate::provider_health_probe::ProbeOutcome;
+    use std::time::{Duration, Instant};
+
+    /// IL DIFETTO DEL FRENO, misurato: la guardia era
+    /// `is_provider_in_cooldown(p) && !should_reprobe_cooldown(p, 600s)`. Il
+    /// corto-circuito `&&` salta la seconda meta' quando il cooldown e' SCADUTO,
+    /// quindi l'istante dell'ultimo probe non veniva annotato e l'intervallo di
+    /// 600s non entrava mai in vigore. Con l'esito non conclusivo che scriveva
+    /// 60 secondi di cooldown, quel cooldown scadeva entro il tick successivo e
+    /// il ciclo ripartiva: cadenza reale MISURATA 120s per 4h29m.
+    ///
+    /// Qui il tempo e' iniettato e si percorre un'ORA di tick del loop
+    /// (`provider.billing_recovery_interval_s` = 60s) contando i probe concessi.
+    ///
+    /// MUTAZIONE VERIFICATA: togliendo l'annotazione di `ora` in
+    /// `permesso_di_riprovare_at` i concessi diventano 60, uno per tick — lo
+    /// stesso effetto che il corto-circuito produceva in esercizio.
+    #[test]
+    fn il_freno_concede_un_probe_ogni_600s_non_uno_ogni_120() {
+        const TICK_LOOP: Duration = Duration::from_secs(60);
+        const ORA_INTERA: u32 = 60; // 60 tick da 60s
+        let p = "__test_freno_cadenza";
+        let intervallo = Duration::from_secs(BILLING_REPROBE_INTERVAL_S);
+
+        let inizio = Instant::now();
+        let mut concessi = 0;
+        for tick in 0..ORA_INTERA {
+            let ora = inizio + TICK_LOOP * tick;
+            if permesso_di_riprovare_at(p, intervallo, ora) == PermessoRiprova::Concesso {
+                concessi += 1;
+            }
+        }
+
+        // 3600s / 600s = 6, contando il primo giro (nessun probe precedente).
+        assert_eq!(
+            concessi, 6,
+            "in un'ora di tick il freno deve concedere un probe ogni 600s, non uno ogni 120s"
+        );
+    }
+
+    /// Il freno non dipende dal cooldown: e' la meta' che il corto-circuito
+    /// rendeva condizionale. Con il fornitore NON in cooldown la risposta deve
+    /// essere la stessa.
+    #[test]
+    fn il_freno_vale_anche_a_cooldown_scaduto() {
+        let p = "__test_freno_senza_cooldown";
+        let intervallo = Duration::from_secs(BILLING_REPROBE_INTERVAL_S);
+        let inizio = Instant::now();
+
+        assert!(
+            !is_provider_in_cooldown(p),
+            "premessa: il fornitore non e' in cooldown"
+        );
+        assert_eq!(
+            permesso_di_riprovare_at(p, intervallo, inizio),
+            PermessoRiprova::Concesso
+        );
+        let dopo_un_tick = permesso_di_riprovare_at(p, intervallo, inizio + Duration::from_secs(60));
+        assert_eq!(
+            dopo_un_tick,
+            PermessoRiprova::TroppoPresto { attesa_s: 540 },
+            "il freno deve valere anche senza cooldown attivo, ed e' quello che il corto-circuito impediva"
+        );
+    }
+
+    /// IL DECLASSAMENTO: un esito NON conclusivo non e' una misura del credito, e
+    /// non deve riscrivere lo stato. Il ramo che lo dichiara e' un valore, cosi'
+    /// il "non fare niente" e' asseribile.
+    ///
+    /// MUTAZIONE: far tornare `LasciaInvariata` da `Billing`, o reintrodurre un
+    /// cooldown breve nel ramo del loop -> l'assert cade.
+    #[test]
+    fn un_esito_non_conclusivo_lascia_l_esclusione_invariata() {
+        assert_eq!(
+            azione_dal_probe(ProbeOutcome::Transient("timeout".into())),
+            AzioneRecovery::LasciaInvariata {
+                causa: "timeout".into()
+            }
+        );
+        assert_eq!(
+            azione_dal_probe(ProbeOutcome::Billing("credit_balance_too_low".into())),
+            AzioneRecovery::RinnovaEsclusione {
+                causa: "credit_balance_too_low".into()
+            }
+        );
+        assert_eq!(
+            azione_dal_probe(ProbeOutcome::Healthy),
+            AzioneRecovery::Riabilita
+        );
+    }
+
+    /// IL MECCANISMO del danno che il ramo `LasciaInvariata` evita, dimostrato
+    /// sul codice vero: un cooldown breve sulla chiave del FORNITORE cancella
+    /// insieme la scadenza lunga e la severita' registrata — e senza severita'
+    /// `Long` il probe periodico generico torna a interrogare un fornitore senza
+    /// credito.
+    #[test]
+    fn un_cooldown_breve_sul_fornitore_distrugge_quello_di_credito() {
+        let p = "__test_declassamento_severita";
+        put_provider_in_long_cooldown(p, "credit_balance_too_low");
+        assert!(is_provider_in_billing_cooldown(p));
+        let lungo = residuo_della_chiave(&ChiaveCooldown::fornitore(p));
+        assert!(lungo > 5 * 3600, "premessa: sei ore di esclusione, {lungo}s");
+
+        put_provider_in_short_cooldown(p, "timeout", 60);
+
+        assert!(
+            residuo_della_chiave(&ChiaveCooldown::fornitore(p)) <= 60,
+            "la scadenza di credito e' stata sostituita da 60 secondi"
+        );
+        assert!(
+            !is_provider_in_billing_cooldown(p),
+            "la severita' e' stata declassata a Short: il probe periodico ricomincia a martellare"
+        );
+        remove_cooldown(p);
+    }
+
+    /// LA SCADENZA AUTORITATIVA E' LA COLONNA. Al boot il registro in-process si
+    /// ricostruisce dal RESIDUO di `billing_cooldown_until`, non da una durata
+    /// ricalcolata: prima `restore_billing_cooldowns_from_db` chiamava
+    /// `put_provider_in_long_cooldown`, che riparte da `provider.cooldown_long_s`
+    /// e RISCRIVE la colonna — quindi ogni riavvio di mcp-core prolungava di sei
+    /// ore piene un'esclusione che stava per finire, con la cache che detta
+    /// legge alla fonte.
+    ///
+    /// Il test attraversa la funzione di produzione contro lo schema vero
+    /// (META_MIGRATOR, regola O) — ed e' servito subito: la prima versione della
+    /// query chiedeva `EXTRACT(EPOCH ...)` senza cast, che Postgres consegna come
+    /// `numeric` e sqlx rifiuta di decodificare in `f64`. L'errore era ingoiato
+    /// da un `warn` + `return`, quindi in produzione il ripristino non avrebbe
+    /// avuto alcun effetto senza che nulla lo dicesse.
+    ///
+    /// MUTAZIONE VERIFICATA: rimettendo `put_provider_in_long_cooldown` nel ciclo,
+    /// il residuo in memoria diventa 21599s invece di 90.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_boot_ripristina_il_residuo_non_una_durata_nuova(pool: sqlx::PgPool) {
+        const RESIDUO_S: i64 = 90;
+        let p = "__test_boot_residuo";
+        // Solo la riga di questo test: il ripristino le legge tutte, e una riga
+        // altrui sporcherebbe il registro globale condiviso fra i test.
+        sqlx::query("DELETE FROM nexus_provider_health")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO nexus_provider_health (provider, billing_cooldown_until, last_error) \
+             VALUES ($1, NOW() + ($2 || ' seconds')::interval, 'credit_balance_too_low')",
+        )
+        .bind(p)
+        .bind(RESIDUO_S.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        restore_billing_cooldowns_from_db(&pool).await;
+
+        let residuo = residuo_della_chiave(&ChiaveCooldown::fornitore(p));
+        assert!(
+            residuo > 0 && residuo <= RESIDUO_S as u64,
+            "il boot deve ripristinare i {RESIDUO_S}s che restano, non ricominciare da capo: {residuo}s"
+        );
+        assert!(
+            is_provider_in_billing_cooldown(p),
+            "la severita' e' Long per costruzione: quella colonna la scrive solo il cooldown di credito"
+        );
+        remove_cooldown(p);
+    }
+
+    /// La cache non si ACCORCIA mai su un residuo piu' corto di quello che gia'
+    /// conosce: l'errore cade dalla parte di tenere fuori qualcuno un po' piu'
+    /// del necessario, mai su rimetterlo in gioco troppo presto.
+    #[test]
+    fn l_allineamento_non_accorcia_un_esclusione_gia_piu_lunga() {
+        let p = "__test_allineamento_non_accorcia";
+        put_provider_in_long_cooldown(p, "credit_balance_too_low");
+        let prima = residuo_della_chiave(&ChiaveCooldown::fornitore(p));
+
+        allinea_cooldown_lungo_dal_db(p, 30.0, "residuo piu' corto");
+
+        let dopo = residuo_della_chiave(&ChiaveCooldown::fornitore(p));
+        assert!(
+            dopo > 5 * 3600,
+            "un residuo piu' corto non accorcia l'esclusione nota ({prima}s -> {dopo}s)"
+        );
+        remove_cooldown(p);
+    }
+
+    /// Scadenza gia' passata: non si registra niente. Un residuo nullo o
+    /// negativo non e' un'esclusione da ricreare.
+    #[test]
+    fn l_allineamento_ignora_una_scadenza_gia_passata() {
+        let p = "__test_allineamento_scaduto";
+        allinea_cooldown_lungo_dal_db(p, -5.0, "scaduto");
+        assert!(!is_provider_in_cooldown(p));
+        allinea_cooldown_lungo_dal_db(p, 0.0, "scaduto");
+        assert!(!is_provider_in_cooldown(p));
     }
 }

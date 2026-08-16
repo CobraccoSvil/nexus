@@ -568,7 +568,12 @@ fn outcome_from_error_class(ec: &str) -> ProbeOutcome {
 /// valore->valore, nessun pattern (la classificazione e' nel brain).
 fn kind_from_error_class(ec: &str) -> String {
     match ec {
-        "billing_error" => "credit_balance_too_low".to_string(),
+        // Il nome viene dal vocabolario CONDIVISO con l'altro scrittore di
+        // `nexus_provider_health_history.error_kind`, il `CooldownManager` del
+        // gateway: finche' erano due letterali indipendenti, lo stesso stato
+        // usciva come `credit_balance_too_low` da qui e come `billing` da li'.
+        "billing_error" => nexus_types::provider_failure::stato_salute::CREDIT_BALANCE_TOO_LOW
+            .to_string(),
         // 401: credenziali invalide -> tutte le chiamate falliranno, il provider
         // va messo in cooldown (vedi outcome_from_error_class -> Billing).
         "auth_error" => "auth_error".to_string(),
@@ -693,9 +698,11 @@ mod tests {
 
     #[test]
     fn kind_from_error_class_mappa_billing() {
+        // Il valore atteso e' la COSTANTE condivisa, non una stringa ricopiata:
+        // e' cosi' che questo scrittore e quello del gateway restano legati.
         assert_eq!(
             kind_from_error_class("billing_error"),
-            "credit_balance_too_low"
+            nexus_types::provider_failure::stato_salute::CREDIT_BALANCE_TOO_LOW
         );
         assert_eq!(kind_from_error_class("auth_error"), "auth_error");
         assert_eq!(kind_from_error_class("rate_limit"), "rate_limit");
