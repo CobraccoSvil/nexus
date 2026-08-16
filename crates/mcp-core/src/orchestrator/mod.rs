@@ -38,6 +38,7 @@ mod cost_rank;
 mod intent;
 pub(crate) mod model_routing;
 mod model_selection;
+mod slot_routing;
 pub(crate) mod model_service;
 pub(crate) mod neural_client;
 pub(crate) mod provider_choice;

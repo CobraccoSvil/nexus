@@ -193,7 +193,7 @@ pub(crate) async fn agentic_min_tier(db: &PgPool) -> String {
 /// agentici e' un no-op (ritorna `required_tier` invariato): la chat semplice
 /// resta libera di usare 'light'. Se `required_tier` e' gia' >= `floor` non lo
 /// abbassa MAI (es. un task heavy resta heavy anche con pavimento 'medium').
-fn floor_tier_for_agentic<'a>(
+pub(super) fn floor_tier_for_agentic<'a>(
     is_agentic_turn: bool,
     required_tier: &'a str,
     floor: &'a str,

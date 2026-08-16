@@ -99,10 +99,13 @@ impl Orchestrator {
     /// la decisione (utile per audit telemetria + UI debug).
     ///
     /// La slot-matrix esprime solo TIER+capability (mig 0357): la scelta del
-    /// provider+modello concreto e' delegata al punto unico tier-based
-    /// `select_models_for_requirement` - lo stesso scoring che governa la
-    /// routing matrix per intent. Niente piu' modelli pinnati (regola G/H/L).
-    /// `db` serve a leggere il catalog sano al momento della decisione.
+    /// provider+modello concreto e' delegata a `slot_routing::decidi`, che a
+    /// flag `routing.slots_via_select_model` acceso passa dal SERVIZIO UNICO
+    /// `select_model` (pavimento agentico, cooldown per coppia, gate, esito
+    /// tipizzato) e a flag spento serve il percorso storico dello scoring a
+    /// pesi con lo shadow-compare della delega (mig 0724). Niente modelli
+    /// pinnati (regola G/H/L). `db` serve a leggere il catalog sano al
+    /// momento della decisione.
     pub async fn route_by_slots(
         &self,
         db: &sqlx::PgPool,
@@ -142,9 +145,9 @@ impl Orchestrator {
                 return None;
             }
         };
-        let candidates = slot_routing_candidates(db, &req, slots).await?;
-        let (provider, model) = pick_slot_candidate_out_of_cooldown(&candidates, &req, slots)?;
-        Some((provider, model, "slots_matrix"))
+        super::slot_routing::decidi(db, &req, slots)
+            .await
+            .map(|(provider, model)| (provider, model, "slots_matrix"))
     }
 
     /// Helper unico: estrae preferred_provider per intent (da nexus_intent_capability,
@@ -1755,97 +1758,6 @@ async fn resolve_web_search_model(
     }
     tracing::warn!(
         "ricerca_web: nessun modello web_search disponibile (sonar disabilitato / provider non configurato), fallback al routing normale"
-    );
-    None
-}
-
-/// Candidati (provider, model) sani per una richiesta slot-routed, dal punto
-/// unico tier-based `select_models_for_requirement`: ordinati per score, uno per
-/// provider — la rotazione provider per disponibilita' vale quindi anche per le
-/// richieste slot-routed. Estratti da [`Orchestrator::route_by_slots`]: `None`
-/// (col medesimo logging) sia su errore di selezione sia su lista vuota, cosi'
-/// il chiamante cade sul routing intent classico.
-async fn slot_routing_candidates(
-    db: &sqlx::PgPool,
-    req: &crate::routing_slots::SlotRequirement,
-    slots: &crate::routing_slots::ActionSlots,
-) -> Option<Vec<(String, String)>> {
-    let candidates = match crate::routing_matrix_auto_promoter::select_models_for_requirement(
-        db,
-        &req.preferred_tier,
-        &req.required_capabilities,
-        req.requires_tool_use,
-        &req.cost_direction,
-    )
-    .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                "route_by_slots: selezione tier-based fallita ({e}), fallback intent classico"
-            );
-            return None;
-        }
-    };
-    if candidates.is_empty() {
-        tracing::debug!(
-            "route_by_slots: nessun candidato per tier {} (slots {}, {}, {}, {})",
-            req.preferred_tier,
-            slots.action_verb,
-            slots.target_type,
-            slots.framework,
-            slots.scope,
-        );
-        return None;
-    }
-    Some(candidates)
-}
-
-/// Cooldown-awareness del routing slot-first: ritorna il primo candidato con
-/// provider NON in cooldown, oppure `None` (col WARN "tutti in cooldown") se non
-/// ce n'e' nessuno. Estratta da [`Orchestrator::route_by_slots`]: stessa
-/// iterazione, stesso logging. Il tag di sorgente `"slots_matrix"` resta al
-/// chiamante.
-fn pick_slot_candidate_out_of_cooldown(
-    candidates: &[(String, String)],
-    req: &crate::routing_slots::SlotRequirement,
-    slots: &crate::routing_slots::ActionSlots,
-) -> Option<(String, String)> {
-    let mut skipped: Vec<String> = Vec::new();
-    for (provider, model) in candidates {
-        if crate::provider_cooldown::is_provider_in_cooldown(provider) {
-            skipped.push(provider.clone());
-            continue;
-        }
-        if !skipped.is_empty() {
-            tracing::info!(
-                "route_by_slots: skip provider in cooldown [{}], scelto {}/{} (tier {}, pos {}/{})",
-                skipped.join(","),
-                provider,
-                model,
-                req.preferred_tier,
-                skipped.len() + 1,
-                candidates.len(),
-            );
-        } else {
-            tracing::info!(
-                "route_by_slots: slots=({}, {}, {}, {}) tier={} → {}/{}",
-                slots.action_verb,
-                slots.target_type,
-                slots.framework,
-                slots.scope,
-                req.preferred_tier,
-                provider,
-                model,
-            );
-        }
-        return Some((provider.clone(), model.clone()));
-    }
-    // Tutti i provider candidati sono in cooldown.
-    tracing::warn!(
-        "route_by_slots: TUTTI i {} provider candidati in cooldown [{}], fallback intent classico",
-        candidates.len(),
-        skipped.join(",")
     );
     None
 }
