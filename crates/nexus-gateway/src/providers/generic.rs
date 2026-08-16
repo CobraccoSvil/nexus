@@ -102,6 +102,16 @@ impl GenericOpenAiProvider {
         self
     }
 
+    /// Dichiara gli header extra del registry
+    /// (`nexus_provider_registry.extra_headers`, mig 0714): il client li
+    /// applica a ogni richiesta HTTP. Openrouter li usa per l'attribuzione
+    /// (`HTTP-Referer`/`X-Title`); per gli altri il campo e' NULL e la lista
+    /// arriva vuota.
+    pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.client = self.client.with_extra_headers(headers);
+        self
+    }
+
     /// Garanzia difensiva (regola H): se il provider dichiara `supports_tools=false`
     /// (es. Perplexity sonar, che rifiuta le tool definitions con HTTP 400), rimuove
     /// `tools`/`tool_choice` dalla richiesta PRIMA dell'invio. La garanzia PRIMARIA

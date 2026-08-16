@@ -102,23 +102,30 @@ struct ProviderDescriptor {
     /// espone le completion sulla radice e i modelli sotto `/v1`: senza questo
     /// campo la discovery E lo healthcheck di quel fornitore erano 404 fissi.
     models_path: Option<String>,
+    /// Header extra dichiarati dal registry (mig 0714), come testo del JSONB
+    /// (oggetto piatto nome->valore). Consumato dal SOLO provider generico:
+    /// gli adapter dedicati compongono le proprie richieste e non lo leggono.
+    /// Oggi lo dichiara openrouter per l'attribuzione (HTTP-Referer/X-Title).
+    extra_headers: Option<String>,
 }
 
 /// Carica i descrittori provider dal registry (mig 0565), ordinati. Fallback ai 6
 /// provider noti se la tabella non esiste / e' vuota (fail-safe: se la migrazione
 /// non e' ancora applicata all'avvio, nessuna regressione).
 async fn load_provider_descriptors(db: &PgPool) -> Vec<ProviderDescriptor> {
-    // `models_path` si legge via `to_jsonb(r) ->> ...` e non come colonna: su un DB
-    // dove la mig 0705 non e' ancora applicata la chiave semplicemente non c'e' e il
-    // valore esce NULL, mentre nominarla direttamente sarebbe un errore SQL — e
-    // l'errore qui non degrada al default del campo, degrada all'INTERO registry
-    // (`unwrap_or_default` -> `fallback_descriptors`, cioe' sei provider al posto di
-    // dieci). Il costo di una colonna nuova non puo' essere la sparizione di quattro
-    // fornitori nella finestra fra il riavvio del gateway e le migrazioni.
+    // `models_path` ed `extra_headers` si leggono via `to_jsonb(r) ->> ...` e non
+    // come colonne: su un DB dove la loro migrazione (0705, 0714) non e' ancora
+    // applicata la chiave semplicemente non c'e' e il valore esce NULL, mentre
+    // nominarle direttamente sarebbe un errore SQL — e l'errore qui non degrada al
+    // default del campo, degrada all'INTERO registry (`unwrap_or_default` ->
+    // `fallback_descriptors`, cioe' sei provider al posto di dieci). Il costo di
+    // una colonna nuova non puo' essere la sparizione di quattro fornitori nella
+    // finestra fra il riavvio del gateway e le migrazioni.
     let rows = sqlx::query_as::<_, ProviderDescriptor>(
         "SELECT name, api_format, key_setting, enabled_setting, base_url_setting, \
          base_url_default, activation, tiers, max_context_tokens, supports_tools, \
-         to_jsonb(r) ->> 'models_path' AS models_path \
+         to_jsonb(r) ->> 'models_path' AS models_path, \
+         to_jsonb(r) ->> 'extra_headers' AS extra_headers \
          FROM nexus_provider_registry r WHERE is_active = true ORDER BY sort_order, name",
     )
     .fetch_all(db)
@@ -160,6 +167,9 @@ fn fallback_descriptors() -> Vec<ProviderDescriptor> {
             // Nessuno dei sei di ripiego devia dal `/models` del dialetto OpenAI:
             // il caso che ha motivato il campo (perplexity) non e' fra loro.
             models_path: None,
+            // Idem per gli header extra: li dichiara il solo openrouter (mig
+            // 0714), che non e' fra i sei di ripiego.
+            extra_headers: None,
         }
     }
     vec![
@@ -269,6 +279,26 @@ async fn build_providers(
     providers
 }
 
+/// Legge gli header extra del registry (JSONB oggetto piatto, mig 0714) nella
+/// forma che il client applica alle richieste. Funzione PURA, testabile.
+///
+/// Entrano le sole coppie con valore STRINGA: un valore di altro tipo non ha
+/// una resa HTTP ovvia e si scarta, e un JSON non-oggetto o non parsabile vale
+/// "nessun header" — l'attribuzione e' un miglioramento, non una condizione di
+/// avvio, e un registry malformato non deve spegnere il provider.
+fn parse_extra_headers(raw: &str) -> Vec<(String, String)> {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Object(campi)) => campi
+            .into_iter()
+            .filter_map(|(nome, valore)| match valore {
+                serde_json::Value::String(s) => Some((nome, s)),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Factory: mappa un descrittore ATTIVO al costruttore concreto. Gli adapter con
 /// quirk sono selezionati per nome (o-series OpenAI, XML/thinking DeepSeek, cache
 /// Anthropic, Vertex Google, placeholder vLLM); un `api_format='openai_compat'`
@@ -351,6 +381,14 @@ fn construct_provider(
                 // Dove il fornitore non tiene la lista modelli sotto la base delle
                 // completion (perplexity: `/v1/models` contro `/chat/completions`).
                 .with_models_path(d.models_path.as_deref())
+                // Header di attribuzione dichiarati dal registry (mig 0714):
+                // openrouter chiede HTTP-Referer/X-Title su ogni richiesta.
+                .with_extra_headers(
+                    d.extra_headers
+                        .as_deref()
+                        .map(parse_extra_headers)
+                        .unwrap_or_default(),
+                )
                 // Serve agli instradatori per leggere il fornitore a valle
                 // preferito; gli altri endpoint non lo interrogano mai.
                 .with_db(Some(db.clone())),
@@ -570,6 +608,239 @@ mod registry_tests {
             vec!["sonar".to_string()]
         );
         assert_eq!(visti.lock().expect("registro").as_slice(), ["/models"]);
+    }
+
+    /// Server finto che registra la TESTA integrale di ogni richiesta (riga di
+    /// richiesta + header): e' la sola prova di QUALI header siano partiti
+    /// davvero — asserire sul campo del descrittore proverebbe che la
+    /// migrazione l'ha scritto, non che qualcuno lo mandi sul wire.
+    /// Risponde 200 con una lista modelli al solo `GET /models`, 404 al resto.
+    async fn finge_endpoint_che_registra_le_teste(
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("porta effimera");
+        let porta = listener.local_addr().expect("indirizzo").port();
+        let teste = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registro = teste.clone();
+
+        tokio::spawn(async move {
+            const CRLF: &str = "\r\n";
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut grezzo = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !grezzo.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => grezzo.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let testa = String::from_utf8_lossy(&grezzo).to_string();
+                let prima_riga = testa.lines().next().unwrap_or_default().to_string();
+                registro.lock().expect("registro").push(testa);
+
+                let (stato, corpo) = if prima_riga.starts_with("GET /models") {
+                    ("200 OK", r#"{"object":"list","data":[{"id":"z-ai/glm-5.2"}]}"#)
+                } else {
+                    ("404 Not Found", "")
+                };
+                let risposta = [
+                    &format!("HTTP/1.1 {stato}"),
+                    "Content-Type: application/json",
+                    &format!("Content-Length: {}", corpo.len()),
+                    "Connection: close",
+                    "",
+                    "",
+                ]
+                .join(CRLF);
+                let _ = socket.write_all(risposta.as_bytes()).await;
+                let _ = socket.write_all(corpo.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+
+        (porta, teste)
+    }
+
+    /// Richiesta chat minima per provare che gli header partono anche sul POST
+    /// delle completion, non solo sulle GET di discovery.
+    fn richiesta_chat() -> crate::types::LlmRequest {
+        use crate::types::{LlmMessage, LlmRequest, MessageContent, RequestMetadata};
+        LlmRequest {
+            model: "z-ai/glm-5.2".to_string(),
+            messages: vec![LlmMessage {
+                role: "user".to_string(),
+                content: MessageContent::Text("ciao".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+                name: None,
+                thinking_signature: None,
+                reasoning: None,
+                is_error: None,
+            }],
+            temperature: None,
+            max_tokens: Some(16),
+            tools: None,
+            response_format: None,
+            stream: None,
+            thinking: None,
+            tool_choice: None,
+            pin_provider: None,
+            metadata: RequestMetadata {
+                tenant_id: "t".to_string(),
+                user_id: "u".to_string(),
+                request_id: "r".to_string(),
+                sensitivity_tier: 0,
+                feature: "f".to_string(),
+            },
+            run_timeout_secs: None,
+        }
+    }
+
+    /// Gli header di attribuzione dichiarati dal registry partono su OGNI
+    /// richiesta. Attraversa la catena intera (regola O): migrazione reale
+    /// (0714) -> riga openrouter di `nexus_provider_registry` ->
+    /// `load_provider_descriptors` -> factory -> richieste HTTP vere (GET
+    /// lista modelli + POST completion). Un test che passasse gli header a
+    /// mano al client proverebbe che il client sa applicarli, non che il
+    /// registry glieli consegni: il tratto da coprire e' la giunzione.
+    ///
+    /// MUTAZIONE: togliere `.with_extra_headers(...)` dalla factory, oppure
+    /// l'applicazione in `OpenAiCompatClient::con_extra_headers` -> le teste
+    /// registrate non portano piu' i due header e il test rosseggia.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn gli_header_di_attribuzione_del_registry_partono_su_ogni_richiesta(db: PgPool) {
+        let (porta, teste) = finge_endpoint_che_registra_le_teste().await;
+
+        for (chiave, valore) in [
+            ("openrouter_api_key", "chiave-di-prova".to_string()),
+            ("openrouter_enabled", "true".to_string()),
+            ("openrouter_base_url", format!("http://127.0.0.1:{porta}")),
+        ] {
+            sqlx::query(
+                "INSERT INTO settings (key, value, category) VALUES ($1, $2, 'providers') \
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            )
+            .bind(chiave)
+            .bind(&valore)
+            .execute(&db)
+            .await
+            .expect("settings di prova");
+        }
+
+        let descrittori = load_provider_descriptors(&db).await;
+        let openrouter = descrittori
+            .iter()
+            .find(|d| d.name == "openrouter")
+            .expect("il registry conosce openrouter dalla mig 0567");
+        let dichiarati = openrouter
+            .extra_headers
+            .as_deref()
+            .map(parse_extra_headers)
+            .unwrap_or_default();
+        assert_eq!(
+            dichiarati.len(),
+            2,
+            "e' la mig 0714 a dichiararli: senza, il campo non arriva fin qui"
+        );
+
+        let providers = build_providers(&db, &Client::new(), &descrittori).await;
+        let provider = providers
+            .iter()
+            .find(|p| p.name() == "openrouter")
+            .expect("chiave presente ed enabled: il provider e' attivo");
+
+        assert_eq!(
+            provider.list_models().await.expect("200 su /models"),
+            vec!["z-ai/glm-5.2".to_string()]
+        );
+        // Il POST delle completion prende 404 dal server finto e l'esito qui
+        // non conta: conta la testa della richiesta, che parte comunque.
+        let _ = provider.complete(&richiesta_chat()).await;
+
+        let registrate = teste.lock().expect("registro").clone();
+        assert!(
+            registrate.len() >= 2,
+            "attese almeno la GET modelli e il POST completion, viste: {}",
+            registrate.len()
+        );
+        for testa in &registrate {
+            // hyper serializza i nomi header in minuscolo: si confronta la
+            // testa minuscolata, i VALORI della mig 0714 sono gia' minuscoli
+            // tranne "Nexus".
+            let minuscola = testa.to_lowercase();
+            assert!(
+                minuscola.contains("http-referer: https://cobracco.it/nexus"),
+                "manca HTTP-Referer nella testa: {testa}"
+            );
+            assert!(
+                minuscola.contains("x-title: nexus"),
+                "manca X-Title nella testa: {testa}"
+            );
+        }
+    }
+
+    /// L'altro verso: chi non dichiara header extra non ne manda. Senza
+    /// questo, il test sopra passerebbe anche applicando i due header a TUTTI
+    /// i fornitori, che e' un'attribuzione falsa verso chi non l'ha chiesta.
+    /// Groq e non mistral perche' groq passa dallo STESSO ramo generico della
+    /// factory: e' li' che una consegna indiscriminata nascerebbe.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn chi_non_dichiara_header_extra_non_ne_manda(db: PgPool) {
+        let (porta, teste) = finge_endpoint_che_registra_le_teste().await;
+
+        for (chiave, valore) in [
+            ("groq_api_key", "chiave-di-prova".to_string()),
+            ("groq_enabled", "true".to_string()),
+            ("groq_base_url", format!("http://127.0.0.1:{porta}")),
+        ] {
+            sqlx::query(
+                "INSERT INTO settings (key, value, category) VALUES ($1, $2, 'providers') \
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            )
+            .bind(chiave)
+            .bind(&valore)
+            .execute(&db)
+            .await
+            .expect("settings di prova");
+        }
+
+        let descrittori = load_provider_descriptors(&db).await;
+        let providers = build_providers(&db, &Client::new(), &descrittori).await;
+        let groq = providers
+            .iter()
+            .find(|p| p.name() == "groq")
+            .expect("chiave presente ed enabled");
+        assert_eq!(
+            groq.list_models().await.expect("200 su /models"),
+            vec!["z-ai/glm-5.2".to_string()]
+        );
+
+        let registrate = teste.lock().expect("registro").clone();
+        assert!(!registrate.is_empty());
+        for testa in &registrate {
+            let minuscola = testa.to_lowercase();
+            assert!(
+                !minuscola.contains("http-referer:") && !minuscola.contains("x-title:"),
+                "un fornitore senza dichiarazione non deve portare header di \
+                 attribuzione: {testa}"
+            );
+        }
+    }
+
+    /// I casi di bordo del parse, che la catena sopra non esercita: valori non
+    /// stringa scartati, JSON malformato o non-oggetto = nessun header.
+    #[test]
+    fn parse_extra_headers_ammette_solo_oggetti_di_stringhe() {
+        assert_eq!(
+            parse_extra_headers(r#"{"X-Title": "Nexus", "X-Num": 7, "X-Null": null}"#),
+            vec![("X-Title".to_string(), "Nexus".to_string())]
+        );
+        assert!(parse_extra_headers("{").is_empty());
+        assert!(parse_extra_headers(r#"["X-Title"]"#).is_empty());
+        assert!(parse_extra_headers("{}").is_empty());
     }
 
     #[test]

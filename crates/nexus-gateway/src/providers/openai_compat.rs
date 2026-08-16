@@ -150,6 +150,13 @@ pub struct OpenAiCompatClient {
     /// riuscita, quindi una riga rimossa o disattivata vi finisce come `None`.
     /// Copre il solo caso in cui il DB non ha parlato.
     ultimo_ordine_letto: Arc<DashMap<String, Option<Vec<String>>>>,
+    /// Header HTTP aggiuntivi dichiarati dal registry
+    /// (`nexus_provider_registry.extra_headers`, mig 0714), applicati a OGNI
+    /// richiesta di questo client — chat, stream, lista modelli, healthcheck,
+    /// immagini, audio — perche' cio' che trasportano (openrouter:
+    /// `HTTP-Referer`/`X-Title` di attribuzione) non dipende dal verbo.
+    /// Vuoto = nessun header extra, il default di tutti i fornitori diretti.
+    extra_headers: Vec<(String, String)>,
 }
 
 /// TTL della cache delle preferenze di fornitore (come `policy_engine`/`cooldown`).
@@ -231,7 +238,15 @@ impl OpenAiCompatClient {
             db: None,
             upstream_order: TtlCache::new(UPSTREAM_AFFINITY_TTL),
             ultimo_ordine_letto: Arc::new(DashMap::new()),
+            extra_headers: Vec::new(),
         }
+    }
+
+    /// Dichiara gli header extra che ogni richiesta di questo client deve
+    /// portare (dal registry, mig 0714). Vuoto = nessun header aggiuntivo.
+    pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = headers;
+        self
     }
 
     /// Dichiara dove questo endpoint espone la lista modelli, quando NON e' il
@@ -341,6 +356,32 @@ impl OpenAiCompatClient {
         format!("{}/chat/completions", self.base_url)
     }
 
+    /// PUNTO UNICO (regola L) della richiesta POST autenticata di questo
+    /// client: bearer + header extra del registry. Ogni verbo passa da qui o
+    /// dal gemello GET: un call site che componesse a mano
+    /// `.post(url).bearer_auth(..)` perderebbe gli header di attribuzione
+    /// senza che nulla fallisca — la richiesta funziona lo stesso, e' solo
+    /// anonima verso chi chiedeva di sapere chi chiama.
+    fn post_autenticata(&self, url: String) -> reqwest::RequestBuilder {
+        self.con_extra_headers(self.http.post(url).bearer_auth(&self.api_key))
+    }
+
+    /// Gemello GET di [`Self::post_autenticata`] (healthcheck, lista modelli).
+    fn get_autenticata(&self, url: String) -> reqwest::RequestBuilder {
+        self.con_extra_headers(self.http.get(url).bearer_auth(&self.api_key))
+    }
+
+    /// Applica gli header dichiarati dal registry alla richiesta in
+    /// composizione. Nomi/valori arrivano da una migrazione (mig 0714): un
+    /// valore non rappresentabile come header HTTP fallira' alla `send()` con
+    /// l'errore del builder, che e' il posto in cui reqwest lo dichiara.
+    fn con_extra_headers(&self, mut rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        for (nome, valore) in &self.extra_headers {
+            rb = rb.header(nome.as_str(), valore.as_str());
+        }
+        rb
+    }
+
     /// PUNTO UNICO (regola L) del corpo che parte da QUESTO client: risolve la
     /// preferenza di fornitore a valle, costruisce il body col dialetto di cache
     /// che il client DICHIARA, e applica i quirk di forma dell'endpoint.
@@ -391,9 +432,7 @@ impl OpenAiCompatClient {
         let start = Instant::now();
 
         let resp = self
-            .http
-            .post(self.endpoint())
-            .bearer_auth(&self.api_key)
+            .post_autenticata(self.endpoint())
             .json(&body)
             .send()
             .await?;
@@ -442,9 +481,7 @@ impl OpenAiCompatClient {
         let body = self.corpo_della_richiesta(req, true, reasoning).await;
 
         let resp = self
-            .http
-            .post(self.endpoint())
-            .bearer_auth(&self.api_key)
+            .post_autenticata(self.endpoint())
             .json(&body)
             .send()
             .await?;
@@ -528,13 +565,7 @@ impl OpenAiCompatClient {
     /// qualunque errore (rete, auth, status non 2xx).
     pub async fn healthcheck(&self) -> bool {
         let url = self.url_lista_modelli();
-        match self
-            .http
-            .get(url)
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-        {
+        match self.get_autenticata(url).send().await {
             Ok(r) => r.status().is_success(),
             Err(_) => false,
         }
@@ -559,7 +590,7 @@ impl OpenAiCompatClient {
     /// (regola L): [`Self::list_models`] delega qui e proietta i soli id.
     pub async fn list_models_meta(&self) -> anyhow::Result<Vec<crate::provider::ModelMeta>> {
         let url = self.url_lista_modelli();
-        let resp = self.http.get(url).bearer_auth(&self.api_key).send().await?;
+        let resp = self.get_autenticata(url).send().await?;
         let status = resp.status();
         if !status.is_success() {
             // Errore strutturato anche sulla lista modelli (regola M): status +
@@ -598,9 +629,7 @@ impl OpenAiCompatClient {
         let start = Instant::now();
 
         let resp = self
-            .http
-            .post(format!("{}/images/generations", self.base_url))
-            .bearer_auth(&self.api_key)
+            .post_autenticata(format!("{}/images/generations", self.base_url))
             .json(&body)
             .send()
             .await?;
@@ -654,9 +683,7 @@ impl OpenAiCompatClient {
 
         let start = Instant::now();
         let resp = self
-            .http
-            .post(format!("{}/audio/transcriptions", self.base_url))
-            .bearer_auth(&self.api_key)
+            .post_autenticata(format!("{}/audio/transcriptions", self.base_url))
             .multipart(form)
             .send()
             .await?;
@@ -705,9 +732,7 @@ impl OpenAiCompatClient {
         }
 
         let resp = self
-            .http
-            .post(format!("{}/audio/speech", self.base_url))
-            .bearer_auth(&self.api_key)
+            .post_autenticata(format!("{}/audio/speech", self.base_url))
             .json(&body)
             .send()
             .await?;
