@@ -1071,7 +1071,11 @@ async fn fetch_provider_health_timings(
         settings::get_setting(db, "provider.cooldown_default_s"),
         settings::get_setting(db, "provider.cooldown_min_s"),
         settings::get_setting(db, "provider.cooldown_max_s"),
-        settings::get_setting(db, "provider.cooldown_long_s"),
+        // Chiave dal punto unico: la legge anche il gateway (regola L).
+        settings::get_setting(
+            db,
+            nexus_types::provider_failure::durata::CHIAVE_COOLDOWN_LUNGO,
+        ),
         settings::get_setting(db, "provider.circuit_breaker_window_s"),
         settings::get_setting(db, "provider.circuit_breaker_threshold"),
         settings::get_setting(db, "provider.circuit_breaker_extended_cooldown_s"),

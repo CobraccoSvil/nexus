@@ -179,6 +179,100 @@ pub mod portata {
     pub const MODEL: &str = "model";
 }
 
+/// Con quale NOME uno stato di salute del fornitore si registra nella colonna
+/// `nexus_provider_health_history.error_kind`.
+///
+/// PERCHE' STA QUI. Quella colonna ha DUE scrittori in due processi — il probe
+/// periodico di mcp-core e il `CooldownManager` di nexus-gateway — e fino al
+/// 13/08/2026 nominavano lo STESSO stato in due modi. MISURATO sul DB vivo:
+/// openai senza credito produceva due righe nello stesso millisecondo,
+/// `18:32:09.333824 billing` (gateway) e `18:32:09.335162 credit_balance_too_low`
+/// (probe); sull'intero storico, 4245 righe `billing` contro 4893
+/// `credit_balance_too_low`. Una query che filtra `error_kind = 'billing'` conta
+/// anthropic e perde openai, e viceversa — cioe' la colonna su cui si diagnostica
+/// non risponde alla domanda che le si pone.
+///
+/// PERCHE' VINCE `credit_balance_too_low`, e non `billing`:
+///   - la colonna vuole una CAUSA, e il suo vocabolario e' dichiarato dalla
+///     mig 0097 (`quota_exceeded`, `credit_balance_too_low`, `billing_required`,
+///     `rate_limit`, `timeout`, `auth_error`, `connection_error`, `unknown`):
+///     `credit_balance_too_low` vi appartiene, `billing` no;
+///   - `billing` non e' una causa, e' la CLASSE con cui il gateway decide
+///     ([`ClasseErrore::Billing`], due valori), e non identifica uno stato solo:
+///     `ClasseErrore::da_status(402)` ci fa cadere anche il 402 di ammissione di
+///     openrouter, che fino alla mig 0709 era credito esaurito per errore e non
+///     lo e' mai stato (saldo misurato a 10,01 dollari residui);
+///   - `credit_balance_too_low` e' gia' il valore su cui DECIDONO
+///     `provider_health_probe::outcome_from_error_class`,
+///     `model_health_probe::is_reprobe_candidate` (che lo rilegge da
+///     `ai_price_catalog.disabled_reason`, cioe' da dati persistiti) e
+///     `agent_turn_setup::classify_by_error_class`. Coniare un terzo nome
+///     canonico costringerebbe a riscrivere quei dati per un guadagno estetico.
+///
+/// Il posto e' `nexus-types` perche' e' l'unico crate che entrambi gli scrittori
+/// vedono: nexus-gateway non dipende da mcp-core, e mcp-core dipende da
+/// nexus-gateway ma non viceversa.
+pub mod stato_salute {
+    /// Il fornitore non ha credito: nessuna sua chiamata passa finche' non si
+    /// ricarica. E' lo stato che [`ClasseErrore::Billing`] rappresenta al
+    /// gateway e che `error_class = "billing_error"` rappresenta in mcp-core.
+    pub const CREDIT_BALANCE_TOO_LOW: &str = "credit_balance_too_low";
+    /// Guasto non conclusivo (rete, 5xx, timeout, tetto di frequenza): non dice
+    /// che il fornitore sia inutilizzabile, dice che questa chiamata non e'
+    /// riuscita. I due scrittori usavano gia' questa stessa parola.
+    pub const TRANSIENT: &str = "transient";
+}
+
+/// La DURATA dell'esclusione di un fornitore senza credito: una sola, in un
+/// solo posto.
+///
+/// IL DIFETTO CHE CHIUDE. Il 13/08/2026 lo stesso evento aveva due durate in due
+/// processi: il gateway registrava `duration_seconds=3600`
+/// (`gateway.cooldown.billing_seconds`) e mcp-core scriveva
+/// `billing_cooldown_until` a sei ore (`provider.cooldown_long_s`), nello stesso
+/// istante e per lo stesso fornitore.
+///
+/// PERCHE' SOPRAVVIVE LA PIU' LUNGA. Non sono due opinioni sullo stesso numero:
+/// sono un TETTO e un'ATTESA CIECA, e solo una delle due e' la cosa giusta per
+/// un'esclusione che finisce quando qualcuno RICARICA. In mcp-core il numero e'
+/// un tetto, perche' il `billing_cooldown_recovery_loop` riprova con una
+/// completion vera — che il credito lo esercita — e libera al primo successo:
+/// sbagliare per eccesso costa al massimo un intervallo di re-probe. Nel gateway
+/// non c'e' niente che possa accorciarlo con cognizione: il suo `healthcheck()`
+/// e' un `GET /models`, che risponde 200 mentre le completion sono rifiutate per
+/// credito (regola O: lo strumento non raggiunge il suo oggetto). Adottare 3600
+/// significherebbe prendere il numero prodotto dal processo SENZA verificatore e
+/// imporlo a quello che ce l'ha: dopo un'ora il fornitore senza credito
+/// tornerebbe eleggibile e lo si riscoprirebbe con una chiamata a pagamento.
+///
+/// MISURATO il 14/08/2026 fra le 03:31 e le 04:47 su `nexus_provider_health_history`:
+/// il cooldown billing del gateway e' stato azzerato OTTO volte in 76 minuti,
+/// sempre ~600s dopo essere stato messo, dal suo `GET /models` — l'alternanza
+/// `healthy=f billing` / `healthy=t` per openai e anthropic ogni ~10 minuti. I
+/// 3600 non sono mai stati la durata di niente: la vera esclusione del gateway
+/// durava l'intervallo di re-probe. Allinearla al tetto non allunga percio'
+/// nessuna esclusione osservata; toglie il secondo numero che una diagnosi
+/// poteva leggere.
+///
+/// CONSEGUENZA DA CONOSCERE PRIMA DI STRINGERE IL RILASCIO DEL GATEWAY: finche'
+/// il gateway tiene un cooldown billing, una richiesta pinnata su quel fornitore
+/// viene respinta in `run_fallback` SENZA raggiungerlo — e il verificatore di
+/// mcp-core e' esattamente una richiesta pinnata. Oggi quella finestra e'
+/// limitata dal rilascio reattivo descritto sopra (~600s); chi un domani
+/// rendesse `il_probe_puo_liberare` piu' severo anche per il billing la
+/// porterebbe a coincidere con questo tetto, e con essa il ritardo con cui una
+/// ricarica viene notata.
+pub mod durata {
+    /// La chiave `settings` UNICA da cui entrambi i processi leggono la durata
+    /// dell'esclusione per credito (mig 0253). `gateway.cooldown.billing_seconds`
+    /// e' stata rimossa dalla mig 0712: un secondo valore che nessuno legge e'
+    /// una trappola per chi lo modifica aspettandosi un effetto.
+    pub const CHIAVE_COOLDOWN_LUNGO: &str = "provider.cooldown_long_s";
+    /// Rete di sicurezza usata SOLO se il DB e' irraggiungibile: 6 ore, lo
+    /// stesso valore che la mig 0253 mette nella chiave qui sopra.
+    pub const COOLDOWN_LUNGO_DEFAULT_S: u64 = 6 * 3600;
+}
+
 /// Cio' che il gateway ha dichiarato di stare rifiutando, in forma su cui si
 /// puo' decidere (regola Q: l'esito nel campo, mai nella prosa — il residuo
 /// viveva dentro `"in cooldown, {secs}s rimanenti"`, dove per leggerlo serviva
