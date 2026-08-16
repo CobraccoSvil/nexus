@@ -973,6 +973,45 @@ mod tests {
         );
     }
 
+    /// Il tetto OPENROUTER attraversa l'intera catena dal body del fornitore al
+    /// wire del gateway: body verbatim (campione del 16/08/2026) -> parser REALE
+    /// (`parse_models_meta_response`, il produttore del valore: regola O) ->
+    /// corpo composto come lo compone la rotta (`models_for_provider`) ->
+    /// `GwModelsResponse`. Costruire qui il `ModelMeta` a mano fisserebbe
+    /// l'assunto da verificare: che il parser quel campo lo legga davvero.
+    ///
+    /// MUTAZIONE: togliere la lettura di `top_provider.max_completion_tokens`
+    /// dal parser openai_compat -> l'assert sul tetto cade; togliere il ramo
+    /// `context_length` dalla cascata della finestra -> cade quello sulla
+    /// finestra.
+    #[test]
+    fn il_tetto_openrouter_attraversa_dal_parser_al_wire() {
+        let body = serde_json::json!({
+            "data": [{
+                "id": "z-ai/glm-4.7-flash",
+                "name": "Z.ai: GLM 4.7 Flash",
+                "context_length": 202752,
+                "top_provider": {
+                    "context_length": 202752,
+                    "max_completion_tokens": 16384,
+                    "is_moderated": false
+                },
+                "pricing": { "prompt": "0.00000006", "completion": "0.0000004" }
+            }]
+        });
+        let metas = ::nexus_gateway::providers::openai_compat::parse_models_meta_response(&body);
+        let ids: Vec<&str> = metas.iter().map(|m| m.id.as_str()).collect();
+        let corpo =
+            serde_json::json!({ "provider": "openrouter", "models": ids, "models_meta": metas });
+        let parsed: GwModelsResponse =
+            serde_json::from_value(corpo).expect("parse del corpo composto dalla rotta");
+        let letti = parsed.into_metas();
+        assert_eq!(letti.len(), 1);
+        assert_eq!(letti[0].id, "z-ai/glm-4.7-flash");
+        assert_eq!(letti[0].context_window, Some(202_752));
+        assert_eq!(letti[0].output_token_limit, Some(16_384));
+    }
+
     #[test]
     fn parse_models_response_lista_vuota() {
         // Provider configurato ma senza modelli: lista vuota valida (il worker

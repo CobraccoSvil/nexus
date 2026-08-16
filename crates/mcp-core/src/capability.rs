@@ -249,30 +249,74 @@ fn tetto_cache() -> &'static TtlCache<String, (FattiTetto, DichiarazioneTetto)> 
 
 /// I fatti del catalogo per la domanda del tetto di output. Nessun giudizio: il
 /// criterio e' [`nexus_agent_graph::decisions::tetto_output::tetto_per`].
+///
+/// La quarta colonna (`declared_max_output_tokens`, mig 0716) e' il tetto
+/// dichiarato dal FORNITORE sul wire di discovery: sul ramo `Presente` viene
+/// letta e IGNORATA (non-regressione: per la coppia curata la dichiarazione
+/// umana resta l'unica fonte dei fatti; la colonna in vista serve all'audit dei
+/// mismatch e a tenere UNA query). Il suo consumatore con conseguenze e'
+/// [`fetch_dichiarazione_wire`], sul ramo in cui la vista tace.
 async fn fetch_fatti_tetto(
     db: &PgPool,
     provider: &str,
     model: &str,
-) -> Result<Option<(Option<bool>, Option<i32>, Option<i32>)>, sqlx::Error> {
+) -> Result<Option<(Option<bool>, Option<i32>, Option<i32>, Option<i32>)>, sqlx::Error> {
     let sql = format!(
-        "SELECT thinking, default_max_output_tokens, max_output_tokens_hard \
+        "SELECT thinking, default_max_output_tokens, max_output_tokens_hard, \
+                declared_max_output_tokens \
            FROM {V_MODEL_CAPABILITIES} WHERE provider = $1 AND model = $2"
     );
-    sqlx::query_as::<_, (Option<bool>, Option<i32>, Option<i32>)>(&sql)
+    sqlx::query_as::<_, (Option<bool>, Option<i32>, Option<i32>, Option<i32>)>(&sql)
         .bind(provider)
         .bind(model)
         .fetch_optional(db)
         .await
 }
 
+/// I fatti del CATALOGO per un modello che la vista non conosce: la sola
+/// dichiarazione del FORNITORE dal wire di discovery
+/// (`ai_price_catalog.declared_max_output_tokens`, mig 0716; scrittore:
+/// `model_catalog_sync`). E' il secondo I/O di questo concern, ed e' DICHIARATO
+/// qui accanto al primo perche' le due letture rispondono alla stessa domanda
+/// su due insiemi disgiunti: la vista per la coppia CURATA, la tabella per il
+/// modello scoperto a runtime che nella vista non entra per costruzione.
+///
+/// `uses_thinking_mode` NON entra nei fatti: quella colonna la scrive
+/// un'euristica sul NOME (`capability_source='auto'`, vedi
+/// [[permesso-di-spegnere-il-pensiero]] in CLAUDE.md) e per `kimi-k2.6`
+/// conclude «non ragiona» su un modello che ragiona — trattarla come
+/// dichiarazione reintrodurrebbe il tetto stretto `visibile * 2`, cioe' il
+/// `degenerate_hollow`, esattamente sui modelli openrouter per cui questo fix
+/// nasce. Il pensiero resta NON dichiarato (`ragiona: None`, prudente).
+async fn fetch_dichiarazione_wire(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+) -> Result<Option<u32>, sqlx::Error> {
+    let declared: Option<Option<i32>> = sqlx::query_scalar(
+        "SELECT declared_max_output_tokens FROM ai_price_catalog \
+          WHERE provider = $1 AND model = $2",
+    )
+    .bind(provider)
+    .bind(model)
+    .fetch_optional(db)
+    .await?;
+    Ok(declared
+        .flatten()
+        .filter(|v| *v > 0)
+        .and_then(|v| u32::try_from(v).ok()))
+}
+
 /// Che cosa il catalogo ha saputo dire di una coppia `(provider, model)` al
 /// momento in cui si e' deciso il suo tetto di output.
 ///
-/// E' un TIPO e non l'assenza di un valore perche' le tre risposte hanno
-/// rimedi diversi e finivano tutte nello stesso silenzio: `FattiTetto::default()`
+/// E' un TIPO e non l'assenza di un valore perche' le risposte hanno rimedi
+/// diversi e finivano tutte nello stesso silenzio: `FattiTetto::default()`
 /// valeva sia «modello non dichiarato» sia «catalogo non leggibile», e da fuori
 /// erano indistinguibili da «modello dichiarato che non pone limiti» (regola Q:
-/// l'ignoto e' una variante, non un valore comodo).
+/// l'ignoto e' una variante, non un valore comodo). Dalla mig 0716 c'e' una
+/// quarta risposta, `DichiaratoDalFornitore`: la vista tace ma il listing di
+/// discovery il tetto lo ha dichiarato, e deciderci sopra non e' un buio.
 ///
 /// MISURATO il 13/08/2026 sul META vivo: **37 modelli ABILITATI su 129 non
 /// hanno una riga nella vista** — openrouter 17, openai 11, perplexity 3,
@@ -287,6 +331,12 @@ async fn fetch_fatti_tetto(
 pub enum DichiarazioneTetto {
     /// Il catalogo ha una riga per questa coppia: si decide sui fatti.
     Presente,
+    /// Nessuna riga curata, ma il FORNITORE ha dichiarato il proprio tetto di
+    /// output nel listing di discovery
+    /// (`ai_price_catalog.declared_max_output_tokens`, mig 0716): si decide su
+    /// quel fatto, non al buio. E' la condizione dei modelli openrouter/google
+    /// scoperti a runtime, che nella vista non entrano per costruzione.
+    DichiaratoDalFornitore,
     /// Nessuna riga: il modello e' instradabile ma non dichiarato. Non si
     /// scioglie aspettando (nessun ciclo a runtime scrive capability), ed e'
     /// la stessa condizione che `DeclarationCoverage::richiede_intervento`
@@ -300,8 +350,10 @@ impl DichiarazioneTetto {
     /// `true` quando il tetto e' stato deciso senza fatti. Non e' di per se' un
     /// difetto — su un modello ignoto NON vincolare e' la scelta giusta,
     /// misurata — ma chi decide deve poterlo sapere invece di dedurlo.
+    /// `DichiaratoDalFornitore` NON decide al buio: il fatto c'e', e lo ha
+    /// dichiarato chi il tetto lo fa rispettare.
     pub fn decide_al_buio(&self) -> bool {
-        !matches!(self, Self::Presente)
+        !matches!(self, Self::Presente | Self::DichiaratoDalFornitore)
     }
 }
 
@@ -336,15 +388,33 @@ pub async fn resolve_tetto_output(
 ///
 /// Separata da [`risolvi_richiesta`] perche' e' la meta' con l'I/O: qui si
 /// legge e si classifica cio' che si e' letto, li' si decide e si mette in
-/// cache. Le tre risposte nascono TUTTE qui, che e' anche l'unico modo perche'
-/// nessun ramo dimentichi di dichiarare la propria.
+/// cache. Le quattro risposte nascono TUTTE qui, che e' anche l'unico modo
+/// perche' nessun ramo dimentichi di dichiarare la propria.
+/// Il verdetto comune ai DUE punti in cui una query sul catalogo puo' fallire
+/// (la vista, e la tabella del dichiarato wire): non e' un fatto sul modello,
+/// e' un guasto nostro, e va detto una volta sola.
+fn catalogo_non_leggibile(
+    provider: &str,
+    model: &str,
+    e: &sqlx::Error,
+) -> (FattiTetto, DichiarazioneTetto) {
+    tracing::warn!("tetto output: catalogo non leggibile per {provider}/{model}: {e}");
+    (
+        FattiTetto::default(),
+        DichiarazioneTetto::CatalogoNonLeggibile,
+    )
+}
+
 async fn fatti_con_provenienza(
     db: &PgPool,
     provider: &str,
     model: &str,
 ) -> (FattiTetto, DichiarazioneTetto) {
     match fetch_fatti_tetto(db, provider, model).await {
-        Ok(Some((thinking, default_out, hard))) => (
+        // Il dichiarato dal wire (quarta colonna) sul ramo curato si legge e si
+        // IGNORA: non-regressione stretta, la dichiarazione umana vince e resta
+        // l'unica fonte dei fatti per la coppia che ce l'ha.
+        Ok(Some((thinking, default_out, hard, _declared_wire))) => (
             FattiTetto {
                 ragiona: thinking,
                 default_output: default_out.and_then(|v| u32::try_from(v).ok()),
@@ -352,17 +422,28 @@ async fn fatti_con_provenienza(
             },
             DichiarazioneTetto::Presente,
         ),
-        Ok(None) => (
-            FattiTetto::default(),
-            DichiarazioneTetto::ModelloNonDichiarato,
-        ),
-        Err(e) => {
-            tracing::warn!("tetto output: catalogo non leggibile per {provider}/{model}: {e}");
-            (
+        // La vista tace: prima di dichiarare il buio si chiede alla TABELLA se
+        // il FORNITORE il proprio tetto lo abbia dichiarato nel listing
+        // (mig 0716). Solo il massimo entra nei fatti: il pensiero resta non
+        // dichiarato (`ragiona: None`, prudente — vedi il doc di
+        // `fetch_dichiarazione_wire` per il perche' `uses_thinking_mode` non
+        // e' una dichiarazione).
+        Ok(None) => match fetch_dichiarazione_wire(db, provider, model).await {
+            Ok(Some(hard)) => (
+                FattiTetto {
+                    ragiona: None,
+                    default_output: None,
+                    massimo_fornitore: Some(hard),
+                },
+                DichiarazioneTetto::DichiaratoDalFornitore,
+            ),
+            Ok(None) => (
                 FattiTetto::default(),
-                DichiarazioneTetto::CatalogoNonLeggibile,
-            )
-        }
+                DichiarazioneTetto::ModelloNonDichiarato,
+            ),
+            Err(e) => catalogo_non_leggibile(provider, model, &e),
+        },
+        Err(e) => catalogo_non_leggibile(provider, model, &e),
     }
 }
 
@@ -505,12 +586,18 @@ mod tests {
         assert_ne!(cache_key("a", "bc"), cache_key("ab", "c"));
     }
 
-    /// Le tre risposte non sono la stessa risposta: due di esse dicono che si
-    /// sta decidendo senza fatti, e i loro rimedi sono diversi (una migrazione
-    /// mancante contro un DB che non risponde).
+    /// Le quattro risposte non sono la stessa risposta: due di esse dicono che
+    /// si sta decidendo senza fatti, e i loro rimedi sono diversi (una
+    /// migrazione mancante contro un DB che non risponde). Le altre due hanno
+    /// fatti: quelli curati e quelli dichiarati dal fornitore sul wire.
     #[test]
-    fn solo_la_dichiarazione_presente_non_decide_al_buio() {
+    fn solo_chi_ha_fatti_non_decide_al_buio() {
         assert!(!DichiarazioneTetto::Presente.decide_al_buio());
+        assert!(
+            !DichiarazioneTetto::DichiaratoDalFornitore.decide_al_buio(),
+            "il tetto dichiarato dal fornitore E' un fatto: accusare di buio \
+             chi lo usa terrebbe acceso un WARN su una decisione fondata"
+        );
         assert!(DichiarazioneTetto::ModelloNonDichiarato.decide_al_buio());
         assert!(DichiarazioneTetto::CatalogoNonLeggibile.decide_al_buio());
         assert_ne!(
@@ -697,6 +784,109 @@ mod tests {
             Some(1024),
             "un'affermazione mai verificata vale quanto una verificata, e stringe \
              il tetto senza che nulla lo dichiari"
+        );
+    }
+
+    /// IL CASO PER CUI LA MIG 0716 NASCE: un modello ABILITATO senza riga di
+    /// capability, ma col tetto DICHIARATO dal fornitore nel listing di
+    /// discovery (`declared_max_output_tokens`, scritto da
+    /// `model_catalog_sync`). Prima usciva `ModelloNonDichiarato` ->
+    /// `NonVincolabile` -> nessun `max_tokens` sul wire, con la prenotazione al
+    /// massimo del modello; ora si decide sul fatto dichiarato: margine
+    /// `visibile * 8` sotto il tetto duro del fornitore.
+    ///
+    /// MUTAZIONI (regola O):
+    /// - far ritornare `ModelloNonDichiarato` anche col dichiarato presente
+    ///   (togliere la seconda query dal ramo `Ok(None)`) -> il primo assert
+    ///   cade, e con esso sparirebbe il tetto (terzo assert);
+    /// - passare `ragiona: Some(false)` dal ramo wire -> il tetto scenderebbe a
+    ///   `visibile * 2` = 1024 e l'assert sul 4096 cade — che e' esattamente la
+    ///   trappola del `degenerate_hollow` (il pensiero non dichiarato NON
+    ///   degrada a «non ragiona»).
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_tetto_dichiarato_dal_fornitore_vincola_senza_riga_curata(pool: PgPool) {
+        // Coppie NUOVE e non riusate da altri test: la cache 60s del modulo e'
+        // di processo, e una coppia gia' risolta altrove porterebbe qui il suo
+        // verdetto.
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+                (provider, model, display_name, input_cost_per_million_tokens, \
+                 output_cost_per_million_tokens, currency, is_enabled, \
+                 capability_source, declared_max_output_tokens) \
+             VALUES ('zeta', 'zeta-wire-largo', 'zeta-wire-largo', 1.0, 1.0, 'USD', \
+                     true, 'auto', 65536), \
+                    ('zeta', 'zeta-wire-stretto', 'zeta-wire-stretto', 1.0, 1.0, 'USD', \
+                     true, 'auto', 2048)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed catalog con dichiarato dal wire");
+
+        let largo = resolve_tetto_output(&pool, "zeta", "zeta-wire-largo", 512).await;
+        assert_eq!(
+            largo.dichiarazione,
+            DichiarazioneTetto::DichiaratoDalFornitore,
+            "la vista tace ma il fornitore ha dichiarato: non e' un buio"
+        );
+        assert!(!largo.dichiarazione.decide_al_buio());
+        assert_eq!(
+            largo.tetto.max_tokens(),
+            Some(4096),
+            "512 visibili * margine 8 sotto il tetto dichiarato 65536"
+        );
+
+        let stretto = resolve_tetto_output(&pool, "zeta", "zeta-wire-stretto", 512).await;
+        assert_eq!(
+            stretto.dichiarazione,
+            DichiarazioneTetto::DichiaratoDalFornitore
+        );
+        assert_eq!(
+            stretto.tetto.max_tokens(),
+            Some(2048),
+            "il dichiarato del fornitore ha l'ultima parola quando e' piu' \
+             stretto del margine"
+        );
+    }
+
+    /// NON-REGRESSIONE curato-vince: una coppia con riga di capability E
+    /// dichiarato dal wire decide ESATTAMENTE come prima della mig 0716 — la
+    /// dichiarazione umana e' la sola fonte dei fatti, il dichiarato del wire
+    /// sul ramo `Presente` si legge e si ignora.
+    ///
+    /// MUTAZIONE: far entrare il dichiarato del wire nei fatti del ramo
+    /// `Presente` (es. come `massimo_fornitore`) -> l'assert sul 8192 resta
+    /// verde solo finche' il wire e' piu' largo del curato, quindi il caso
+    /// stretto qui sotto (wire 1024 < default 8192) cade.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_riga_curata_vince_sul_dichiarato_del_wire(pool: PgPool) {
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+                (provider, model, display_name, input_cost_per_million_tokens, \
+                 output_cost_per_million_tokens, currency, is_enabled, \
+                 capability_source, uses_thinking_mode, declared_max_output_tokens) \
+             VALUES ('zeta', 'zeta-curato-wire', 'zeta-curato-wire', 1.0, 1.0, 'USD', \
+                     true, 'auto', true, 1024)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed catalog");
+        sqlx::query(
+            "INSERT INTO nexus_provider_capabilities \
+                (provider, model, default_max_output_tokens, max_output_tokens_hard) \
+             VALUES ('zeta', 'zeta-curato-wire', 8192, 16384)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed capability");
+
+        let risolto = resolve_tetto_output(&pool, "zeta", "zeta-curato-wire", 512).await;
+        assert_eq!(risolto.dichiarazione, DichiarazioneTetto::Presente);
+        assert_eq!(
+            risolto.tetto.max_tokens(),
+            Some(8192),
+            "il default CURATO decide, anche con un dichiarato wire piu' \
+             stretto (1024) nella stessa riga: sul ramo Presente il wire non \
+             entra nei fatti"
         );
     }
 

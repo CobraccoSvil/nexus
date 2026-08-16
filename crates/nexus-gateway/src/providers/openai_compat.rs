@@ -618,10 +618,12 @@ impl OpenAiCompatClient {
             .collect())
     }
 
-    /// Autodiscovery live CON METADATI: id + finestra di contesto dichiarata
-    /// dal provider quando il dialetto la espone (Mistral: `max_context_length`
-    /// in `data[]`; OpenAI/DeepSeek non la espongono -> `None`). Un solo fetch
-    /// (regola L): [`Self::list_models`] delega qui e proietta i soli id.
+    /// Autodiscovery live CON METADATI: id + finestra di contesto + tetto di
+    /// output dichiarati dal provider quando il dialetto li espone (Mistral:
+    /// `max_context_length`; OpenRouter: `context_length` e
+    /// `top_provider.max_completion_tokens`; OpenAI/DeepSeek non li espongono
+    /// -> `None`). Un solo fetch (regola L): [`Self::list_models`] delega qui
+    /// e proietta i soli id.
     pub async fn list_models_meta(&self) -> anyhow::Result<Vec<crate::provider::ModelMeta>> {
         let url = self.url_lista_modelli();
         let resp = self.get_autenticata(url).send().await?;
@@ -864,11 +866,12 @@ pub fn parse_models_response(body: &serde_json::Value) -> Vec<String> {
 }
 
 /// Variante CON METADATI di [`parse_models_response`] (punto unico del parsing,
-/// regola L: la versione nomi-soli vi delega). Oltre all'`id`, estrae la
-/// finestra di contesto DICHIARATA dal provider quando il dialetto la espone:
-/// Mistral usa `max_context_length` in `data[]` (OpenAI/DeepSeek non hanno il
-/// campo -> `None`). Valori non positivi sono trattati come non dichiarati:
-/// meglio "ignota" di una finestra inventata (regola H, incidente 2026-07-06).
+/// regola L: la versione nomi-soli vi delega). Oltre all'`id`, estrae finestra
+/// di contesto e tetto di output DICHIARATI dal provider quando il dialetto li
+/// espone: Mistral `max_context_length`, OpenRouter `context_length` +
+/// `top_provider.max_completion_tokens` (OpenAI/DeepSeek non hanno i campi ->
+/// `None`). Valori non positivi sono trattati come non dichiarati: meglio
+/// "ignoto" di un limite inventato (regola H, incidente 2026-07-06).
 /// Ordinamento/dedup per id come la versione nomi-soli (output deterministico).
 pub fn parse_models_meta_response(body: &serde_json::Value) -> Vec<crate::provider::ModelMeta> {
     let items = body.get("data").and_then(|d| d.as_array());
@@ -881,10 +884,20 @@ pub fn parse_models_meta_response(body: &serde_json::Value) -> Vec<crate::provid
 }
 
 /// Mappa UN elemento di `data[]` (dialetto OpenAI) in [`ModelMeta`]: `id`
-/// trimmato non-vuoto obbligatorio; `max_context_length` (Mistral) come
-/// finestra dichiarata solo se positiva. Nessun dialetto OpenAI-compat
-/// dichiara un tetto di output nel listing: `output_token_limit` resta `None`
-/// (lo espone il solo listing Google, vedi `google_model_meta_of`).
+/// trimmato non-vuoto obbligatorio; finestra e tetto di output DICHIARATI solo
+/// se positivi (un valore non positivo e' «non dichiarato», mai un limite:
+/// regola H, incidente 2026-07-06).
+///
+/// Finestra: Mistral usa `max_context_length`, OpenRouter `context_length`
+/// al primo livello. I nomi si interrogano IN CASCATA e non per provider
+/// (stesso principio di `WireUsage::cached_input_tokens`): un dialetto che
+/// riusa il nome viene letto senza che nessuno lo nomini.
+///
+/// Tetto di output: OpenRouter lo dichiara in
+/// `top_provider.max_completion_tokens` — MISURATO il 16/08/2026 sul body vero
+/// di `GET /v1/models` (364 modelli su 413 lo portano). OpenAI/DeepSeek non
+/// hanno alcuno dei campi -> `None` (il listing Google lo espone come
+/// `outputTokenLimit`, vedi `google_model_meta_of`).
 fn openai_model_meta_of(m: &serde_json::Value) -> Option<crate::provider::ModelMeta> {
     let id = m
         .get("id")
@@ -893,12 +906,18 @@ fn openai_model_meta_of(m: &serde_json::Value) -> Option<crate::provider::ModelM
         .filter(|s| !s.is_empty())?;
     let context_window = m
         .get("max_context_length")
+        .or_else(|| m.get("context_length"))
+        .and_then(serde_json::Value::as_i64)
+        .filter(|w| *w > 0);
+    let output_token_limit = m
+        .get("top_provider")
+        .and_then(|tp| tp.get("max_completion_tokens"))
         .and_then(serde_json::Value::as_i64)
         .filter(|w| *w > 0);
     Some(crate::provider::ModelMeta {
         id,
         context_window,
-        output_token_limit: None,
+        output_token_limit,
     })
 }
 
@@ -2875,6 +2894,8 @@ mod tests {
     fn parse_models_meta_estrae_finestra_dichiarata() {
         // Dialetto Mistral: `max_context_length` in data[]. OpenAI/DeepSeek non
         // hanno il campo -> None (finestra IGNOTA, mai inventata: regola H).
+        // Un `max_context_length` presente VINCE sulla cascata (nessun altro
+        // campo viene consultato): il caso Mistral resta invariato.
         let body = serde_json::json!({
             "object": "list",
             "data": [
@@ -2891,6 +2912,60 @@ mod tests {
         assert_eq!(metas[1].context_window, None);
         // Valore non positivo = non dichiarato (mai una finestra inventata).
         assert_eq!(metas[2].context_window, None);
+    }
+
+    /// Dialetto OpenRouter: finestra in `context_length` (primo livello) e
+    /// tetto di output in `top_provider.max_completion_tokens`.
+    ///
+    /// Il primo elemento e' un CAMPIONE VERBATIM (ridotto ai campi che il
+    /// parser tocca, piu' `name`/`pricing` per fedelta' di forma) del body
+    /// reale di `GET https://openrouter.ai/api/v1/models`, scaricato il
+    /// 16/08/2026 (regola O: i nomi campo vengono dal wire vero, non dalla
+    /// doc). E' anche il caso di produzione: i modelli openrouter da discovery
+    /// non hanno riga capability e senza questo tetto dichiarato il criterio
+    /// non puo' vincolarli.
+    ///
+    /// MUTAZIONE: togliere la lettura di `top_provider` -> l'assert sul tetto
+    /// cade (None); togliere il ramo `context_length` dalla cascata -> cade
+    /// l'assert sulla finestra.
+    #[test]
+    fn parse_models_meta_estrae_tetto_output_openrouter() {
+        let body = serde_json::json!({
+            "data": [
+                {
+                    "id": "z-ai/glm-4.7-flash",
+                    "name": "Z.ai: GLM 4.7 Flash",
+                    "context_length": 202752,
+                    "top_provider": {
+                        "context_length": 202752,
+                        "max_completion_tokens": 16384,
+                        "is_moderated": false
+                    },
+                    "pricing": { "prompt": "0.00000006", "completion": "0.0000004" }
+                },
+                // top_provider presente ma senza tetto dichiarato -> None
+                // (49 modelli su 413 nel body misurato).
+                {
+                    "id": "a/senza-tetto",
+                    "context_length": 8192,
+                    "top_provider": { "is_moderated": false }
+                },
+                // Tetto non positivo = non dichiarato, mai un limite.
+                {
+                    "id": "b/tetto-zero",
+                    "top_provider": { "max_completion_tokens": 0 }
+                },
+            ]
+        });
+        let metas = parse_models_meta_response(&body);
+        assert_eq!(metas.len(), 3);
+        // Ordinati per id: a/senza-tetto, b/tetto-zero, z-ai/glm-4.7-flash.
+        assert_eq!(metas[2].id, "z-ai/glm-4.7-flash");
+        assert_eq!(metas[2].context_window, Some(202752));
+        assert_eq!(metas[2].output_token_limit, Some(16384));
+        assert_eq!(metas[0].context_window, Some(8192));
+        assert_eq!(metas[0].output_token_limit, None);
+        assert_eq!(metas[1].output_token_limit, None);
     }
 
     #[test]

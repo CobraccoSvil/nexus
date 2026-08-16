@@ -437,6 +437,24 @@ pub const COLONNE: &[ColonnaCapability] = &[
             motivo: "si prova chiedendo un video",
         },
     },
+    // --- tetto di output dichiarato dal wire (mig 0716) ----------------------
+    ColonnaCapability {
+        nome: "declared_max_output_tokens",
+        // Il consumatore con CONSEGUENZE legge dalla TABELLA
+        // (`fetch_dichiarazione_wire`), sul ramo in cui la vista tace per
+        // costruzione (LEFT JOIN guidata dalla capability: il modello da
+        // discovery non vi compare). La colonna in vista serve alla coppia
+        // curata per l'audit dei mismatch, e li' viene letta e ignorata
+        // (`fetch_fatti_tetto`, quarta colonna). Il tipo ammette UN punto:
+        // si dichiara quello che decide.
+        lettura: Lettura::DallaTabella {
+            punto: "mcp-core/src/capability.rs (fetch_dichiarazione_wire)",
+        },
+        proprieta: Proprieta::DelFornitore,
+        accertamento: Accertamento::DallEsercizio {
+            segnale: "finish_reason=length / HTTP 400-402 su un tetto dichiarato piu' alto del vero",
+        },
+    },
 ];
 
 /// Le colonne che nessuno legge, in ordine di vista. E' il numero che il
@@ -502,7 +520,8 @@ mod tests {
     fn la_misura_del_10_08_2026_e_dichiarata() {
         // Il numero che giustifica il modulo, tenuto come test perche' e' cio'
         // che cambierebbe se qualcuno collegasse (o scollegasse) una colonna:
-        // 3 di dati lette dalla vista (5 con l'identita'), 7 dalla tabella,
+        // 3 di dati lette dalla vista (5 con l'identita'), 8 dalla tabella
+        // (le 7 misurate il 10/08 piu' `declared_max_output_tokens`, mig 0716),
         // 20 senza alcun lettore.
         let via_vista = COLONNE
             .iter()
@@ -515,7 +534,7 @@ mod tests {
         let orfane = senza_lettore().count();
         // provider e model contano fra le lette-via-vista: sono la clausola
         // WHERE delle tre query, non tre colonne di dati in piu'.
-        assert_eq!((via_vista, dalla_tabella, orfane), (5, 7, 20));
+        assert_eq!((via_vista, dalla_tabella, orfane), (5, 8, 20));
         assert_eq!(via_vista + dalla_tabella + orfane, COLONNE.len());
     }
 
