@@ -72,14 +72,31 @@ pub(crate) struct ProbeProfile {
     pub certifies_tier: Option<String>,
 }
 
+/// A CHI e' attribuibile l'esito di UN tentativo (regola Q: la causa in un
+/// campo tipato alla fonte, mai ri-parsata da `reason`). La distinzione fra le
+/// due varianti inconclusive e' cio' che permette a [`classifica_inconcluso`]
+/// di dire se il round ha MISURATO il modello o lo ha solo aspettato.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EsitoAttribuito {
+    /// Conclusivo: parla del MODELLO (pass o fail).
+    Modello { pass: bool },
+    /// Inconclusivo che la tassonomia classifica transient/provider-wide: il
+    /// modello NON e' stato guardato, il giro si e' speso contro il fornitore.
+    InconclusivoFornitore,
+    /// Inconclusivo di causa non classificata (probe_timeout, stop_reason=error
+    /// senza classe, profilo non costruibile): prudenza — resta il regime
+    /// storico (attempts+1, backoff esponenziale), che tra l'altro impedisce
+    /// l'hot-loop su un profilo rotto.
+    InconclusivoIgnoto,
+}
+
 /// Esito STRUTTURATO di UN tentativo (regola M): deriva da error_class /
 /// stop_reason / tool_use_blocks / content, mai dalla prosa.
 #[derive(Debug, Clone)]
 pub(crate) struct AttemptOutcome {
-    pub pass: bool,
-    /// `true` = esito non attribuibile al modello (transient, provider-wide,
-    /// timeout): non conta ne' come pass ne' come fail conclusivo.
-    pub inconclusive: bool,
+    /// A chi e' attribuibile l'esito. I lettori storici del pass/fail passano
+    /// dagli accessor [`Self::pass`]/[`Self::inconclusive`].
+    pub esito: EsitoAttribuito,
     pub reason: String,
     pub error_class: Option<String>,
     pub tool_call_count: i64,
@@ -94,6 +111,18 @@ pub(crate) struct AttemptOutcome {
     /// 93 fail del 2026-07-17 (il modello si arrende, non un bug di misura).
     /// `None` per i profili single-turn, che hanno gia' i loro segnali in colonna.
     pub derived: Option<Value>,
+}
+
+impl AttemptOutcome {
+    /// Il tentativo e' un pass conclusivo del modello.
+    fn pass(&self) -> bool {
+        matches!(self.esito, EsitoAttribuito::Modello { pass: true })
+    }
+
+    /// Il tentativo NON e' attribuibile al modello (fornitore o ignoto).
+    fn inconclusive(&self) -> bool {
+        !matches!(self.esito, EsitoAttribuito::Modello { .. })
+    }
 }
 
 // Qui viveva `error_class_from_gateway`, il ponte structured->error_class del
@@ -152,10 +181,9 @@ struct TurnSignals {
 impl TurnSignals {
     /// Compone l'esito portandosi dietro i segnali misurati. I campi di misura
     /// accompagnano OGNI verdetto: senza, un fallimento non sarebbe diagnosticabile.
-    fn outcome(self, pass: bool, inconclusive: bool, reason: String) -> AttemptOutcome {
+    fn outcome(self, esito: EsitoAttribuito, reason: String) -> AttemptOutcome {
         AttemptOutcome {
-            pass,
-            inconclusive,
+            esito,
             reason,
             error_class: self.error_class,
             tool_call_count: self.tool_call_count,
@@ -207,13 +235,24 @@ fn read_turn_signals(turn: &Value) -> TurnSignals {
 
 /// La classificazione canonica decide se l'errore e' colpa del modello
 /// (conclusivo) o no (inconclusivo). Punto unico riusato dal probe (regola L).
-fn verdict_from_error_class(ec: &str) -> (bool, bool, String) {
+/// L'ATTRIBUZIONE nasce qui, tipata: Transient/ProviderWide sono esiti del
+/// FORNITORE (il modello non e' stato guardato), mai ricavati a valle dal
+/// testo della reason (regola Q).
+fn verdict_from_error_class(ec: &str) -> (EsitoAttribuito, String) {
     use crate::model_health_probe::Classification;
     match crate::model_health_probe::classification_from_error_class(ec) {
-        Classification::ModelSpecific(kind, _) => (false, false, format!("error_class:{kind}")),
-        Classification::ProviderWide(kind, _) => (false, true, format!("provider_wide:{kind}")),
-        Classification::Transient(kind, _) => (false, true, format!("transient:{kind}")),
-        Classification::Ok => (false, false, format!("error_class:{ec}")),
+        Classification::ModelSpecific(kind, _) => {
+            (EsitoAttribuito::Modello { pass: false }, format!("error_class:{kind}"))
+        }
+        Classification::ProviderWide(kind, _) => {
+            (EsitoAttribuito::InconclusivoFornitore, format!("provider_wide:{kind}"))
+        }
+        Classification::Transient(kind, _) => {
+            (EsitoAttribuito::InconclusivoFornitore, format!("transient:{kind}"))
+        }
+        Classification::Ok => {
+            (EsitoAttribuito::Modello { pass: false }, format!("error_class:{ec}"))
+        }
     }
 }
 
@@ -327,16 +366,17 @@ fn needle_missing(turn: &Value, predicate: &Value) -> bool {
 pub(crate) fn evaluate_attempt(turn: &Value, predicate: &Value, latency_ms: i64) -> AttemptOutcome {
     let sig = read_turn_signals(turn);
     if let Some(ec) = sig.error_class.clone() {
-        let (pass, inconclusive, reason) = verdict_from_error_class(&ec);
-        return sig.outcome(pass, inconclusive, reason);
+        let (esito, reason) = verdict_from_error_class(&ec);
+        return sig.outcome(esito, reason);
     }
-    // stop_reason=error senza classe: inconclusivo (stessa prudenza del probe).
+    // stop_reason=error senza classe: inconclusivo IGNOTO (stessa prudenza del
+    // probe): senza una classe non si attribuisce al fornitore.
     if sig.stop_reason == "error" {
-        return sig.outcome(false, true, "stop_reason_error".into());
+        return sig.outcome(EsitoAttribuito::InconclusivoIgnoto, "stop_reason_error".into());
     }
     match predicate_fail_reason(turn, predicate, &sig, latency_ms) {
-        None => sig.outcome(true, false, "ok".into()),
-        Some(reason) => sig.outcome(false, false, reason),
+        None => sig.outcome(EsitoAttribuito::Modello { pass: true }, "ok".into()),
+        Some(reason) => sig.outcome(EsitoAttribuito::Modello { pass: false }, reason),
     }
 }
 
@@ -393,6 +433,11 @@ pub(crate) struct ProfileRun {
     pub passes: u32,
     pub conclusive_fails: u32,
     pub inconclusive: u32,
+    /// Quanti degli `inconclusive` sono attribuiti al FORNITORE
+    /// ([`EsitoAttribuito::InconclusivoFornitore`]): e' il numeratore con cui
+    /// [`classifica_inconcluso`] distingue «non ho potuto guardare il modello»
+    /// da «l'ho guardato a meta'». Gli ignoti restano fuori per prudenza.
+    pub inconclusive_fornitore: u32,
     /// Pass minimi per promuovere (dal `pass_predicate`, default = repeat).
     pub promote_min: u32,
     pub first_fail_reason: Option<String>,
@@ -411,14 +456,52 @@ impl ProfileRun {
     }
 }
 
+/// Il giro inconclusivo ha MISURATO il modello? (regola Q: la distinzione in
+/// un campo, portata fino alla scrittura — le due varianti hanno contabilita'
+/// OPPOSTE su `qualification_attempts` e sul backoff.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EsitoInconcluso {
+    /// Almeno un tentativo conclusivo, o inconclusivi di causa ignota, sui
+    /// profili bloccanti sotto soglia: il modello e' stato guardato (o non
+    /// sappiamo perche' non lo e' stato). attempts+1, backoff esponenziale —
+    /// il regime storico.
+    RoundMeasured,
+    /// OGNI profilo bloccante sotto soglia ha 0 tentativi conclusivi e i suoi
+    /// inconclusivi sono TUTTI del fornitore: il round si e' speso contro un
+    /// fornitore saturo e il modello non e' mai stato guardato. «Non ho potuto
+    /// guardare» non e' un tentativo: attempts INVARIATO, backoff breve fisso.
+    RoundNotMeasuring,
+}
+
+/// Il criterio PURO del round non misurante. I run bloccanti PASSATI non
+/// contano contro (hanno misurato e non negano il verdetto); un run
+/// parzialmente misurato (`passes > 0` ma sotto soglia) e' comunque una misura
+/// (prudenza: regime storico); gli inconclusivi IGNOTI non assolvono.
+pub(crate) fn classifica_inconcluso(runs: &[ProfileRun]) -> EsitoInconcluso {
+    let mut sotto_soglia = runs.iter().filter(|r| r.is_blocking && !r.passed()).peekable();
+    if sotto_soglia.peek().is_none() {
+        return EsitoInconcluso::RoundMeasured;
+    }
+    let tutti_del_fornitore = sotto_soglia.all(|r| {
+        r.conclusivi() == 0 && r.inconclusive > 0 && r.inconclusive_fornitore == r.inconclusive
+    });
+    if tutti_del_fornitore {
+        EsitoInconcluso::RoundNotMeasuring
+    } else {
+        EsitoInconcluso::RoundMeasured
+    }
+}
+
 /// Stato derivato dall'esecuzione della batteria.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DerivedState {
     Qualified,
     Disqualified,
     /// Nessun verdetto attribuibile al modello (transient/provider-wide):
-    /// stato invariato + backoff, MAI punitivo (regola H).
-    Inconclusive,
+    /// stato invariato, MAI punitivo (regola H). La variante dice se il round
+    /// ha almeno MISURATO ([`EsitoInconcluso`]): decide quale delle due
+    /// scritture parte — attempts+1 con esponenziale, o backoff breve fisso.
+    Inconclusive(EsitoInconcluso),
 }
 
 #[derive(Debug, Clone)]
@@ -709,16 +792,24 @@ fn blocking_verdict(runs: &[ProfileRun]) -> Option<Derived> {
             });
         }
     }
-    runs.iter()
-        .any(|r| r.is_blocking && !r.passed())
-        .then(|| Derived {
-            state: DerivedState::Inconclusive,
+    runs.iter().any(|r| r.is_blocking && !r.passed()).then(|| {
+        let esito = classifica_inconcluso(runs);
+        Derived {
+            state: DerivedState::Inconclusive(esito),
             qualified_capabilities: Vec::new(),
-            reason: "inconclusive_round".into(),
+            // `inconclusive_round` resta invariato per le query storiche; il
+            // round NON misurante dichiara il suo nome canonico (regola N).
+            reason: match esito {
+                EsitoInconcluso::RoundMeasured => "inconclusive_round".into(),
+                EsitoInconcluso::RoundNotMeasuring => {
+                    "round_not_measuring:provider_saturated".into()
+                }
+            },
             thinking: None,
             measured_tier: None,
-                measured_score: None,
-        })
+            measured_score: None,
+        }
+    })
 }
 
 /// Il PROVATO: unione dei grants dei profili passati, piu' i tag dichiarati che
@@ -1421,8 +1512,9 @@ impl ProbeCtx<'_> {
 /// detector) — ora esiste in un solo posto.
 fn outcome_inconclusivo(reason: String) -> AttemptOutcome {
     AttemptOutcome {
-        pass: false,
-        inconclusive: true,
+        // IGNOTO, non del fornitore: chi passa da qui (timeout, cap nostro,
+        // mondo non costruibile) non ha una classe del fornitore in mano.
+        esito: EsitoAttribuito::InconclusivoIgnoto,
         reason,
         error_class: None,
         tool_call_count: 0,
@@ -1545,9 +1637,9 @@ async fn insert_evidence(
     outcome: &AttemptOutcome,
     seme: Option<i64>,
 ) -> Option<i64> {
-    let verdict = if outcome.inconclusive {
+    let verdict = if outcome.inconclusive() {
         "inconclusive"
-    } else if outcome.pass {
+    } else if outcome.pass() {
         "pass"
     } else {
         "fail"
@@ -1714,16 +1806,22 @@ impl ProfileRun {
     /// attribuibile al modello, e tenerli distinti e' cio' che impedisce alla
     /// batteria di squalificare per colpa della rete.
     fn tally(&mut self, outcome: &AttemptOutcome) {
-        if outcome.inconclusive {
-            self.inconclusive += 1;
-            return; // niente somme: il silenzio non entra nello score
-        }
-        if outcome.pass {
-            self.passes += 1;
-        } else {
-            self.conclusive_fails += 1;
-            if self.first_fail_reason.is_none() {
-                self.first_fail_reason = Some(outcome.reason.clone());
+        match outcome.esito {
+            EsitoAttribuito::InconclusivoFornitore => {
+                self.inconclusive += 1;
+                self.inconclusive_fornitore += 1;
+                return; // niente somme: il silenzio non entra nello score
+            }
+            EsitoAttribuito::InconclusivoIgnoto => {
+                self.inconclusive += 1;
+                return; // idem
+            }
+            EsitoAttribuito::Modello { pass: true } => self.passes += 1,
+            EsitoAttribuito::Modello { pass: false } => {
+                self.conclusive_fails += 1;
+                if self.first_fail_reason.is_none() {
+                    self.first_fail_reason = Some(outcome.reason.clone());
+                }
             }
         }
         // Le somme continue, dai FATTI del tentativo (le `measures` che
@@ -1760,6 +1858,7 @@ async fn run_profile_attempts(
         passes: 0,
         conclusive_fails: 0,
         inconclusive: 0,
+        inconclusive_fornitore: 0,
         promote_min: ctx.params.promote_min,
         first_fail_reason: None,
         somme: SommeConclusive::default(),
@@ -1855,6 +1954,9 @@ fn unbuildable_run(
         passes: 0,
         conclusive_fails: 0,
         inconclusive: params.repeat,
+        // IGNOTI, non del fornitore: un profilo non costruibile e' un difetto
+        // NOSTRO, e il backoff esponenziale impedisce l'hot-loop su di esso.
+        inconclusive_fornitore: 0,
         promote_min: params.promote_min,
         first_fail_reason: None,
         somme: SommeConclusive::default(),
@@ -2142,17 +2244,30 @@ const SQL_INCONCLUSIVE: &str = "UPDATE ai_price_catalog SET \
          LEAST($4::int * (1 << LEAST(qualification_attempts, 6)), $5::int)) \
  WHERE provider = $1 AND model = $2";
 
-/// Una scrittura dello stato derivato: raggruppa cio' che le tre query hanno in
-/// comune, cosi' ogni ramo dichiara solo i propri bind.
+/// ROUND NON MISURANTE: «non ho potuto guardare» non e' un tentativo del
+/// modello. attempts INVARIATO, backoff breve FISSO: si riprova al prossimo
+/// giro utile, senza che il fornitore saturo costi giorni di esponenziale a
+/// un modello mai interrogato.
+const SQL_NOT_MEASURING: &str = "UPDATE ai_price_catalog SET \
+     qualification_state = CASE \
+         WHEN qualification_state = 'qualified' THEN 'qualified' \
+         ELSE 'unqualified' END, \
+     qualification_reason = $3, \
+     qualification_started_at = NULL, \
+     qualification_backoff_until = NOW() + make_interval(mins => $4::int) \
+ WHERE provider = $1 AND model = $2";
+
+/// Una scrittura dello stato derivato: raggruppa cio' che le query hanno in
+/// comune, cosi' ogni ramo dichiara solo i propri bind. La configurazione del
+/// giro viaggia intera ([`RoundConfig`]): ogni ramo prende da li' i numeri
+/// che gli servono.
 struct DerivedWrite<'a> {
     db: &'a PgPool,
     provider: &'a str,
     model: &'a str,
-    profiles_suite: i32,
     derived: &'a Derived,
     evidence_id: Option<i64>,
-    ttl_days: i64,
-    backoff_base_hours: i64,
+    cfg: &'a RoundConfig,
 }
 
 type WriteResult = Result<sqlx::postgres::PgQueryResult, sqlx::Error>;
@@ -2176,8 +2291,8 @@ impl DerivedWrite<'_> {
             .bind(self.provider)
             .bind(self.model)
             .bind(json!(self.derived.qualified_capabilities))
-            .bind(self.ttl_days as i32)
-            .bind(self.profiles_suite)
+            .bind(self.cfg.ttl_days as i32)
+            .bind(self.cfg.suite_version)
             .bind(&self.derived.reason)
             .bind(self.evidence_id)
             .bind(policy)
@@ -2201,8 +2316,14 @@ impl DerivedWrite<'_> {
             apply_tier(&mut **tx, self.provider, self.model, tier, TierSource::Measured).await?;
         }
         if let Some(score) = self.derived.measured_score {
-            apply_measured_score(&mut **tx, self.provider, self.model, score, self.profiles_suite)
-                .await?;
+            apply_measured_score(
+                &mut **tx,
+                self.provider,
+                self.model,
+                score,
+                self.cfg.suite_version,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -2213,7 +2334,7 @@ impl DerivedWrite<'_> {
             .bind(self.model)
             .bind(&self.derived.reason)
             .bind(self.evidence_id)
-            .bind(self.backoff_base_hours as i32)
+            .bind(self.cfg.backoff_hours as i32)
             .bind(BACKOFF_CAP_HOURS as i32)
             .execute(self.db)
             .await
@@ -2224,39 +2345,48 @@ impl DerivedWrite<'_> {
             .bind(self.provider)
             .bind(self.model)
             .bind(&self.derived.reason)
-            .bind(self.backoff_base_hours as i32)
+            .bind(self.cfg.backoff_hours as i32)
             .bind(BACKOFF_CAP_HOURS as i32)
+            .execute(self.db)
+            .await
+    }
+
+    async fn not_measuring(&self) -> WriteResult {
+        sqlx::query(SQL_NOT_MEASURING)
+            .bind(self.provider)
+            .bind(self.model)
+            .bind(&self.derived.reason)
+            .bind(self.cfg.not_measuring_backoff_minutes as i32)
             .execute(self.db)
             .await
     }
 }
 
 /// Scrive lo stato derivato sulla riga (writer UNICO della promozione).
-#[allow(clippy::too_many_arguments)]
 async fn apply_derived(
     db: &PgPool,
     provider: &str,
     model: &str,
-    profiles_suite: i32,
     derived: &Derived,
     evidence_id: Option<i64>,
-    ttl_days: i64,
-    backoff_base_hours: i64,
+    cfg: &RoundConfig,
 ) {
     let w = DerivedWrite {
         db,
         provider,
         model,
-        profiles_suite,
         derived,
         evidence_id,
-        ttl_days,
-        backoff_base_hours,
+        cfg,
     };
     let res = match derived.state {
         DerivedState::Qualified => w.qualified().await,
         DerivedState::Disqualified => w.disqualified().await,
-        DerivedState::Inconclusive => w.inconclusive().await,
+        DerivedState::Inconclusive(EsitoInconcluso::RoundMeasured) => w.inconclusive().await,
+        // Il round che NON ha misurato ha la sua scrittura: attempts invariato,
+        // backoff breve. Instradarlo su `inconclusive()` e' il difetto che
+        // questa variante chiude (lo skip contato come tentativo).
+        DerivedState::Inconclusive(EsitoInconcluso::RoundNotMeasuring) => w.not_measuring().await,
     };
     if let Err(e) = res {
         tracing::warn!(
@@ -2282,6 +2412,12 @@ pub(crate) async fn run_qualification_round(orchestrator: &Orchestrator, db: &Pg
         setting_i64(db, KEY_MAX_PER_ROUND, nexus_model_eligibility::DEFAULT_MAX_PER_ROUND).await;
     let ttl_days = setting_i64(db, KEY_TTL_DAYS, 30).await;
     let backoff_hours = setting_i64(db, KEY_BACKOFF_HOURS, 24).await;
+    let not_measuring_backoff_minutes = setting_i64(
+        db,
+        nexus_model_eligibility::KEY_NOT_MEASURING_BACKOFF_MINUTES,
+        nexus_model_eligibility::DEFAULT_NOT_MEASURING_BACKOFF_MINUTES,
+    )
+    .await;
 
     let profiles = load_profiles(db).await;
     if profiles.is_empty() {
@@ -2297,6 +2433,7 @@ pub(crate) async fn run_qualification_round(orchestrator: &Orchestrator, db: &Pg
         ),
         ttl_days,
         backoff_hours,
+        not_measuring_backoff_minutes,
     };
     let claimed = claim_candidates(db, max_per_round, cfg.suite_version).await;
     if claimed.is_empty() {
@@ -2462,6 +2599,9 @@ struct RoundConfig {
     suite_version: i32,
     ttl_days: i64,
     backoff_hours: i64,
+    /// Backoff FISSO (minuti) del round non misurante (mig 0716): niente
+    /// esponenziale per un giro che il modello non l'ha mai guardato.
+    not_measuring_backoff_minutes: i64,
 }
 
 /// I candidati del giro, reclamati col CAS di `nexus_model_eligibility::sql_claim`.
@@ -2506,29 +2646,32 @@ fn coppie_escluse_etichettate() -> Vec<String> {
         .collect()
 }
 
-/// Il provider e' in cooldown: il giro NON e' un fallimento del modello, e
-/// registrarlo come tale lo squalificherebbe per colpa d'altri.
+/// Il provider (o questa coppia) e' in cooldown: il giro NON e' un fallimento
+/// del modello ne' un suo tentativo — round NON MISURANTE, attempts invariato.
 async fn mark_provider_cooldown(db: &PgPool, provider: &str, model: &str, cfg: &RoundConfig) {
-    let inconclusive = Derived {
-        state: DerivedState::Inconclusive,
+    let non_misurante = Derived {
+        state: DerivedState::Inconclusive(EsitoInconcluso::RoundNotMeasuring),
         qualified_capabilities: Vec::new(),
-        reason: "provider_in_cooldown".into(),
+        reason: "round_not_measuring:provider_cooldown".into(),
         thinking: None,
         // Un giro non attribuibile al modello non misura nessuna banda.
         measured_tier: None,
-                measured_score: None,
+        measured_score: None,
     };
-    apply_derived(
-        db,
-        provider,
-        model,
-        cfg.suite_version,
-        &inconclusive,
-        None,
-        cfg.ttl_days,
-        cfg.backoff_hours,
-    )
-    .await;
+    apply_derived(db, provider, model, &non_misurante, None, cfg).await;
+}
+
+/// Il candidato gia' CLAIMATO che il registro cooldown dichiara inutilizzabile
+/// ADESSO — il fornitore intero O questa coppia, che e' la domanda completa
+/// (`is_model_in_cooldown`). `true` = giro non speso, esito registrato come
+/// round non misurante. E' la rete di sicurezza per la race snapshot->claim:
+/// il grosso lo ferma gia' l'eleggibilita' (`fuori_cooldown_breve`).
+async fn salta_se_in_cooldown(db: &PgPool, provider: &str, model: &str, cfg: &RoundConfig) -> bool {
+    if !crate::provider_cooldown::is_model_in_cooldown(provider, model) {
+        return false;
+    }
+    mark_provider_cooldown(db, provider, model, cfg).await;
+    true
 }
 
 /// Qualifica UN candidato gia' claimato. `false` = giro non speso (il modello non
@@ -2542,9 +2685,8 @@ async fn qualify_claimed(
     profiles: &[ProbeProfile],
     cfg: &RoundConfig,
 ) -> bool {
-    // Provider in cooldown: non sprecare il giro (esito non attribuibile).
-    if crate::provider_cooldown::is_provider_in_cooldown(provider) {
-        mark_provider_cooldown(db, provider, model, cfg).await;
+    // Cooldown vivo (fornitore o coppia): non sprecare il giro, e non contarlo.
+    if salta_se_in_cooldown(db, provider, model, cfg).await {
         return false;
     }
     let declared: Vec<String> = caps
@@ -2566,17 +2708,7 @@ async fn qualify_claimed(
         qualified_capabilities = %json!(derived.qualified_capabilities),
         "model_qualification: verdetto"
     );
-    apply_derived(
-        db,
-        provider,
-        model,
-        cfg.suite_version,
-        &derived,
-        evidence_id,
-        cfg.ttl_days,
-        cfg.backoff_hours,
-    )
-    .await;
+    apply_derived(db, provider, model, &derived, evidence_id, cfg).await;
     true
 }
 
@@ -2602,6 +2734,7 @@ mod tests {
             passes,
             conclusive_fails: fails,
             inconclusive,
+            inconclusive_fornitore: 0,
             promote_min,
             first_fail_reason: first_fail.map(str::to_owned),
             somme: SommeConclusive::default(),
@@ -2691,7 +2824,8 @@ mod tests {
             None,
         )];
         let d = derive_capabilities(&declared, &runs);
-        assert_eq!(d.state, DerivedState::Inconclusive);
+        // 1 pass su 3: il modello E' stato guardato -> round misurato.
+        assert_eq!(d.state, DerivedState::Inconclusive(EsitoInconcluso::RoundMeasured));
     }
 
     /// Isteresi: `hold_min_passes` non e' usato dalla promozione (promote_min
@@ -2710,7 +2844,7 @@ mod tests {
             None,
         )];
         let d = derive_capabilities(&declared, &runs);
-        assert_eq!(d.state, DerivedState::Inconclusive);
+        assert_eq!(d.state, DerivedState::Inconclusive(EsitoInconcluso::RoundMeasured));
     }
 
     // ── evaluate_attempt: il verdetto di UN tentativo dai segnali strutturati ──
@@ -2719,8 +2853,8 @@ mod tests {
     fn attempt_empty_completion_e_fail_conclusivo() {
         let turn = json!({ "error_class": "empty_completion" });
         let out = evaluate_attempt(&turn, &json!({"min_tool_calls": 1}), 100);
-        assert!(!out.pass);
-        assert!(!out.inconclusive, "empty_completion e' MODEL-specific");
+        assert!(!out.pass());
+        assert!(!out.inconclusive(), "empty_completion e' MODEL-specific");
         assert!(out.reason.starts_with("error_class:"));
     }
 
@@ -2728,8 +2862,32 @@ mod tests {
     fn attempt_rate_limit_e_inconclusivo() {
         let turn = json!({ "error_class": "rate_limit" });
         let out = evaluate_attempt(&turn, &json!({}), 100);
-        assert!(!out.pass);
-        assert!(out.inconclusive, "rate_limit non e' colpa del modello");
+        assert!(!out.pass());
+        assert!(out.inconclusive(), "rate_limit non e' colpa del modello");
+    }
+
+    /// L'ATTRIBUZIONE nasce dal classificatore REALE (regola O: il test
+    /// attraversa `verdict_from_error_class` -> `classification_from_error_class`,
+    /// non fissa l'esito a mano) e distingue il fornitore dall'ignoto.
+    ///
+    /// MUTAZIONI che lo fanno rosseggiare: attribuire al fornitore il timeout o
+    /// lo stop_reason=error senza classe (il backoff breve si aprirebbe a cause
+    /// che possono essere NOSTRE, hot-loop su un profilo rotto); attribuire al
+    /// modello un transient (tornerebbe la squalifica per colpa della rete).
+    #[test]
+    fn l_attribuzione_nasce_dal_classificatore_reale() {
+        // Transient dalla tassonomia -> FORNITORE.
+        let out = evaluate_attempt(&json!({"error_class": "rate_limit"}), &json!({}), 10);
+        assert_eq!(out.esito, EsitoAttribuito::InconclusivoFornitore);
+        // Model-specific -> fail conclusivo del MODELLO.
+        let out = evaluate_attempt(&json!({"error_class": "empty_completion"}), &json!({}), 10);
+        assert_eq!(out.esito, EsitoAttribuito::Modello { pass: false });
+        // stop_reason=error senza classe -> IGNOTO, mai del fornitore.
+        let out = evaluate_attempt(&json!({"stop_reason": "error"}), &json!({}), 10);
+        assert_eq!(out.esito, EsitoAttribuito::InconclusivoIgnoto);
+        // Timeout e cap nostri (outcome_inconclusivo) -> IGNOTO.
+        let (out, _) = esito_inconclusivo("probe_timeout:90s".into(), 10);
+        assert_eq!(out.esito, EsitoAttribuito::InconclusivoIgnoto);
     }
 
     #[test]
@@ -2737,11 +2895,43 @@ mod tests {
         let ok = json!({ "stop_reason": "tool_use",
                          "tool_use_blocks": [{"name": "read_file"}] });
         let out = evaluate_attempt(&ok, &json!({"min_tool_calls": 1}), 100);
-        assert!(out.pass, "{}", out.reason);
+        assert!(out.pass(), "{}", out.reason);
         let ko = json!({ "stop_reason": "end_turn", "content": "chiacchiere" });
         let out = evaluate_attempt(&ko, &json!({"min_tool_calls": 1}), 100);
-        assert!(!out.pass);
+        assert!(!out.pass());
         assert!(out.reason.starts_with("no_tool_call"));
+    }
+
+    /// Il criterio PURO del round non misurante, sulle QUATTRO forme che
+    /// decidono la contabilita'. La fixture (a) e' il fatto del 16/08: tool_smoke
+    /// bloccante PASSA, il profilo agentico bloccante ha SOLO inconclusivi del
+    /// fornitore — il modello non e' mai stato guardato.
+    ///
+    /// MUTAZIONI che lo fanno rosseggiare: invertire il criterio; contare gli
+    /// IGNOTI come fornitore (la (c) e la (d) rosseggerebbero); trattare un run
+    /// parzialmente misurato come non-misura (la (b)).
+    #[test]
+    fn il_round_speso_contro_il_fornitore_non_e_una_misura() {
+        // (a) LA fixture del fatto: skip/attese tutte del fornitore.
+        let mut agentic = profile_run("agentic_real", &[], true, 0, 0, 3, 3, None);
+        agentic.inconclusive_fornitore = 3;
+        let runs = vec![profile_run("tool_smoke", &[], true, 1, 0, 0, 1, None), agentic];
+        assert_eq!(classifica_inconcluso(&runs), EsitoInconcluso::RoundNotMeasuring);
+
+        // (b) Parzialmente misurato (1 pass su 3): il modello E' stato guardato.
+        let mut parziale = profile_run("agentic_real", &[], true, 1, 0, 2, 3, None);
+        parziale.inconclusive_fornitore = 2;
+        assert_eq!(classifica_inconcluso(&[parziale]), EsitoInconcluso::RoundMeasured);
+
+        // (c) Profilo non costruibile (inconclusivi IGNOTI): regime storico —
+        // l'esponenziale impedisce l'hot-loop su un difetto NOSTRO.
+        let unbuildable = profile_run("agentic_real", &[], true, 0, 0, 3, 3, None);
+        assert_eq!(classifica_inconcluso(&[unbuildable]), EsitoInconcluso::RoundMeasured);
+
+        // (d) Misto fornitore+ignoto: l'ignoto non assolve.
+        let mut misto = profile_run("agentic_real", &[], true, 0, 0, 3, 3, None);
+        misto.inconclusive_fornitore = 2;
+        assert_eq!(classifica_inconcluso(&[misto]), EsitoInconcluso::RoundMeasured);
     }
 
     /// IL TEST DI CONTRATTO (incidente 2026-07-15). Non costruisce il turno a
@@ -3000,7 +3190,7 @@ mod tests {
         // Il predicato REALE del profilo chat_smoke (mig 0593).
         let out = evaluate_attempt(&turn, &json!({"min_content_chars": 1}), 505);
         assert!(
-            out.pass,
+            out.pass(),
             "un modello che risponde 'ok' DEVE passare chat_smoke; verdetto: {} \
              (turno prodotto dal gateway: {turn})",
             out.reason
@@ -3017,7 +3207,7 @@ mod tests {
         let turn = json!({ "stop_reason": "tool_use",
                            "tool_use_blocks": [{"name": "read_file"}] });
         let out = evaluate_attempt(&turn, &json!({"min_tool_calls": 1, "max_latency_ms": 30000}), 45000);
-        assert!(!out.pass);
+        assert!(!out.pass());
         assert!(out.reason.starts_with("latency:"));
     }
 
@@ -3148,6 +3338,7 @@ mod tests {
             passes,
             conclusive_fails: 4 - passes,
             inconclusive: 0,
+            inconclusive_fornitore: 0,
             promote_min,
             first_fail_reason: None,
             somme: SommeConclusive::default(),
@@ -3170,6 +3361,7 @@ mod tests {
             passes,
             conclusive_fails: 0,
             inconclusive: 4 - passes,
+            inconclusive_fornitore: 0,
             promote_min,
             first_fail_reason: None,
             somme: SommeConclusive::default(),
@@ -3357,6 +3549,7 @@ mod tests {
             passes: 0,
             conclusive_fails: 0,
             inconclusive: 0,
+            inconclusive_fornitore: 0,
             promote_min: 3,
             first_fail_reason: None,
             somme: SommeConclusive::default(),
@@ -3379,6 +3572,7 @@ mod tests {
             passes,
             conclusive_fails: fails,
             inconclusive: 0,
+            inconclusive_fornitore: 0,
             promote_min: 3,
             first_fail_reason: None,
             somme: SommeConclusive::default(),
@@ -3586,6 +3780,7 @@ mod tests {
             passes: 0,
             conclusive_fails: 0,
             inconclusive: 4,
+            inconclusive_fornitore: 0,
             promote_min: 4,
             first_fail_reason: None,
             somme: SommeConclusive::default(),
@@ -3686,7 +3881,7 @@ mod tests {
             measured_score: None,
         };
         for model in ["stimato", "curato"] {
-            apply_derived(&pool, "p", model, 2, &derived, None, 30, 24).await;
+            apply_derived(&pool, "p", model, &derived, None, &cfg_round(2)).await;
         }
 
         let stimato: (Option<String>, Option<String>) = sqlx::query_as(
@@ -3735,9 +3930,9 @@ mod tests {
             reason: "suite_passed".into(),
             thinking: None,
             measured_tier: None,
-                measured_score: None,
+            measured_score: None,
         };
-        apply_derived(&pool, "p", "m", 2, &derived, None, 30, 24).await;
+        apply_derived(&pool, "p", "m", &derived, None, &cfg_round(2)).await;
         let r: (Option<String>, Option<String>) = sqlx::query_as(
             "SELECT performance_tier, tier_source FROM ai_price_catalog WHERE model='m'",
         )
@@ -3877,7 +4072,7 @@ mod tests {
             measured_tier: None,
             measured_score: Some(74.375),
         };
-        apply_derived(&pool, "p", "m", 5, &con_score, None, 30, 24).await;
+        apply_derived(&pool, "p", "m", &con_score, None, &cfg_round(5)).await;
         let riga: (Option<f64>, Option<i32>) = sqlx::query_as(
             "SELECT measured_score, measured_score_suite FROM ai_price_catalog WHERE model='m'",
         )
@@ -3889,7 +4084,7 @@ mod tests {
         // Il giro successivo NON produce score (pesi assenti, componente muta):
         // le colonne restano quelle di ieri, mai azzerate.
         let senza_score = Derived { measured_score: None, ..con_score };
-        apply_derived(&pool, "p", "m", 5, &senza_score, None, 30, 24).await;
+        apply_derived(&pool, "p", "m", &senza_score, None, &cfg_round(5)).await;
         let riga: (Option<f64>, Option<i32>) = sqlx::query_as(
             "SELECT measured_score, measured_score_suite FROM ai_price_catalog WHERE model='m'",
         )
@@ -4142,6 +4337,138 @@ mod tests {
         );
     }
 
+    /// La RoundConfig dei test di scrittura: i numeri del seed di produzione.
+    fn cfg_round(suite: i32) -> RoundConfig {
+        RoundConfig {
+            suite_version: suite,
+            ttl_days: 30,
+            backoff_hours: 24,
+            not_measuring_backoff_minutes: 60,
+        }
+    }
+
+    /// La CONTABILITA' delle due varianti inconclusive e' opposta, ed e' il
+    /// fix: il round NON misurante non tocca `qualification_attempts` e mette
+    /// un backoff breve fisso; il round misurato tiene il regime storico
+    /// (attempts+1, backoff esponenziale).
+    ///
+    /// MUTAZIONE che lo fa rosseggiare: instradare `RoundNotMeasuring` su
+    /// `SQL_INCONCLUSIVE` (attempts passerebbe a 5 e il backoff a ore) — cioe'
+    /// esattamente il comportamento che questo commit chiude.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_round_non_misurante_non_conta_come_tentativo(pool: PgPool) {
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, qualification_state, qualification_attempts, qualification_started_at, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) \
+             VALUES ('p', 'm', 'probing', 4, now(), 1.0, 1.0, 'USD', now())",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        let base = Derived {
+            state: DerivedState::Inconclusive(EsitoInconcluso::RoundNotMeasuring),
+            qualified_capabilities: Vec::new(),
+            reason: "round_not_measuring:provider_saturated".into(),
+            thinking: None,
+            measured_tier: None,
+            measured_score: None,
+        };
+        apply_derived(&pool, "p", "m", &base, None, &cfg_round(2)).await;
+        let (attempts, reason, started, backoff_breve): (i32, Option<String>, Option<String>, Option<bool>) =
+            sqlx::query_as(
+                "SELECT qualification_attempts, qualification_reason, \
+                        qualification_started_at::text, \
+                        qualification_backoff_until BETWEEN NOW() + interval '55 minutes' \
+                                                        AND NOW() + interval '65 minutes' \
+                   FROM ai_price_catalog WHERE model = 'm'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("riga");
+        assert_eq!(attempts, 4, "«non ho potuto guardare» NON e' un tentativo");
+        assert_eq!(reason.as_deref(), Some("round_not_measuring:provider_saturated"));
+        assert_eq!(started, None, "il lock del claim si libera");
+        assert_eq!(backoff_breve, Some(true), "backoff breve FISSO (~60 min), mai esponenziale");
+
+        // Il round MISURATO tiene il regime storico: attempts 4 -> 5 e backoff
+        // esponenziale (24h * 2^4 = 384h, cap 168h: comunque > 100h).
+        let misurato = Derived {
+            state: DerivedState::Inconclusive(EsitoInconcluso::RoundMeasured),
+            reason: "inconclusive_round".into(),
+            ..base
+        };
+        apply_derived(&pool, "p", "m", &misurato, None, &cfg_round(2)).await;
+        let (attempts, backoff_lungo): (i32, Option<bool>) = sqlx::query_as(
+            "SELECT qualification_attempts, \
+                    qualification_backoff_until > NOW() + interval '100 hours' \
+               FROM ai_price_catalog WHERE model = 'm'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("riga");
+        assert_eq!(attempts, 5, "il round misurato resta un tentativo");
+        assert_eq!(backoff_lungo, Some(true), "e tiene il backoff esponenziale");
+    }
+
+    /// Lo skip a valle del claim vede anche la portata COPPIA (la race
+    /// snapshot->claim del caso groq/gpt-oss) e il suo esito e' un round non
+    /// misurante: attempts INVARIATO. Il cooldown lo scrive il PRODUTTORE
+    /// reale e il criterio attraversato e' `salta_se_in_cooldown`, lo stesso
+    /// che `qualify_claimed` chiama (regola O).
+    ///
+    /// MUTAZIONE: tornare a `is_provider_in_cooldown` — la coppia non sarebbe
+    /// vista e il primo assert rosseggia.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn lo_skip_da_cooldown_vede_la_coppia_e_non_incrementa(pool: PgPool) {
+        // Nome DEDICATO: registro globale di processo (regola F).
+        let prov = "prov-salta-cd";
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, qualification_state, qualification_attempts, qualification_started_at, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) \
+             VALUES ($1, 'm', 'probing', 4, now(), 1.0, 1.0, 'USD', now())",
+        )
+        .bind(prov)
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        crate::provider_cooldown::metti_in_cooldown_breve(
+            prov,
+            Some("m"),
+            "test skip coppia",
+            120,
+        );
+        let saltato = salta_se_in_cooldown(&pool, prov, "m", &cfg_round(2)).await;
+        crate::provider_cooldown::remove_cooldown(prov);
+        assert!(
+            saltato,
+            "la COPPIA in cooldown deve fermare il giro: is_provider_in_cooldown \
+             da solo non la vede"
+        );
+        let (attempts, reason): (i32, Option<String>) = sqlx::query_as(
+            "SELECT qualification_attempts, qualification_reason \
+               FROM ai_price_catalog WHERE provider = $1",
+        )
+        .bind(prov)
+        .fetch_one(&pool)
+        .await
+        .expect("riga");
+        assert_eq!(attempts, 4, "lo skip non e' un tentativo del modello");
+        assert_eq!(reason.as_deref(), Some("round_not_measuring:provider_cooldown"));
+
+        // Senza cooldown il giro procede: nessuno skip.
+        assert!(!salta_se_in_cooldown(&pool, prov, "m", &cfg_round(2)).await);
+    }
+
     /// FRONTIER: il needle sta a META' della history, mai nel system prompt.
     #[test]
     fn la_history_pianta_il_needle_a_meta_del_pagliaio() {
@@ -4164,17 +4491,17 @@ mod tests {
         // Ha ritrovato il fatto: passa (anche con contorno).
         let turn = json!({ "content": format!("Il codice e' {LONG_CTX_NEEDLE}."),
                            "stop_reason": "end_turn" });
-        assert!(evaluate_attempt(&turn, &pred, 100).pass);
+        assert!(evaluate_attempt(&turn, &pred, 100).pass());
         // Risposta plausibile ma SENZA il fatto: fallisce. E' il caso che conta —
         // un modello che "sembra" aver capito ma non ha letto la history.
         let turn = json!({ "content": "Non trovo alcun codice nel testo fornito.",
                            "stop_reason": "end_turn" });
         let out = evaluate_attempt(&turn, &pred, 100);
-        assert!(!out.pass);
+        assert!(!out.pass());
         assert_eq!(out.reason, "needle_not_found");
         // Un codice INVENTATO (allucinato) non passa: deve essere QUELLO.
         let turn = json!({ "content": "CODICE-PRATICA: AB12CD34", "stop_reason": "end_turn" });
-        assert!(!evaluate_attempt(&turn, &pred, 100).pass, "un codice inventato non e' un recupero");
+        assert!(!evaluate_attempt(&turn, &pred, 100).pass(), "un codice inventato non e' un recupero");
     }
 
     /// Il predicato non e' invasivo: senza `requires_needle` gli altri profili
@@ -4183,7 +4510,7 @@ mod tests {
     fn senza_requires_needle_gli_altri_profili_non_cambiano() {
         let pred = json!({"min_content_chars": 1});
         let turn = json!({ "content": "ok", "stop_reason": "end_turn" });
-        assert!(evaluate_attempt(&turn, &pred, 100).pass);
+        assert!(evaluate_attempt(&turn, &pred, 100).pass());
     }
 
     /// REGRESSIONE del giro muto del 2026-07-17: 32 tentativi su 32 inconclusive con
@@ -4376,7 +4703,7 @@ mod tests {
     #[tokio::test]
     async fn il_giro_completo_promuove_chi_riporta_il_token_dell_errore() {
         let out = giro_completo_recupero(true).await;
-        assert!(out.pass, "recupero riuscito deve dare pass, non '{}'", out.reason);
+        assert!(out.pass(), "recupero riuscito deve dare pass, non '{}'", out.reason);
         assert_eq!(out.reason, "ok");
         // `derived` porta i FATTI dietro il verdetto (regola O: un verdetto senza i
         // suoi fatti non e' contestabile). Prima era una colonna morta (mig 0591).
@@ -4395,7 +4722,7 @@ mod tests {
     #[tokio::test]
     async fn il_giro_completo_boccia_chi_non_riporta_il_token() {
         let out = giro_completo_recupero(false).await;
-        assert!(!out.pass);
+        assert!(!out.pass());
         assert_eq!(out.reason, "no_recovery");
         assert_eq!(
             out.derived.as_ref().and_then(|d| d.pointer("/recovered")).and_then(Value::as_bool),
@@ -4622,7 +4949,7 @@ mod tests {
         for seme in SEMI {
             let (out, anelli) = giro_completo_catena(Strategia::Oro, seme).await;
             assert!(
-                out.pass,
+                out.pass(),
                 "seme {seme}: la traiettoria intesa DEVE passare, invece '{}' ({anelli} anelli)",
                 out.reason
             );
@@ -4651,7 +4978,7 @@ mod tests {
             for strategia in [Strategia::CercaCurrent, Strategia::PrimoRef, Strategia::SenzaRitorno] {
                 let (out, anelli) = giro_completo_catena(strategia, seme).await;
                 assert!(
-                    !out.pass,
+                    !out.pass(),
                     "seme {seme}: la strategia {strategia:?} NON deve passare, invece \
                      ha chiuso {anelli} anelli con verdetto '{}'",
                     out.reason

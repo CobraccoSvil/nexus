@@ -26,11 +26,17 @@ pub const KEY_ROUND_ENABLED: &str = "agent.model_qualification.round_enabled";
 pub const KEY_MAX_PER_ROUND: &str = "agent.model_qualification.max_models_per_round";
 pub const KEY_TTL_DAYS: &str = "agent.model_qualification.requalify_ttl_days";
 pub const KEY_BACKOFF_HOURS: &str = "agent.model_qualification.backoff_hours";
+/// Minuti di backoff FISSO dopo un round NON MISURANTE (mig 0716): il giro che
+/// non ha potuto guardare il modello (fornitore in cooldown, inconclusivi tutti
+/// del fornitore) non e' un tentativo — niente attempts+1, niente esponenziale.
+pub const KEY_NOT_MEASURING_BACKOFF_MINUTES: &str =
+    "agent.model_qualification.not_measuring_backoff_minutes";
 
 /// Default dei settings sopra, quando la chiave manca dal DB. Sono i valori che
 /// il worker usa davvero: l'explain deve dichiarare il numero VERO del giro, non
 /// un suo simile.
 pub const DEFAULT_MAX_PER_ROUND: i64 = 4;
+pub const DEFAULT_NOT_MEASURING_BACKOFF_MINUTES: i64 = 60;
 
 /// Lock `probing` stantio: oltre questa eta' il claim e' di un worker morto e la
 /// riga torna reclamabile.
