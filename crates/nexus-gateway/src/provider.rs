@@ -32,6 +32,12 @@ pub struct ModelMeta {
     pub id: String,
     /// Finestra di contesto in token dichiarata dal provider, se esposta.
     pub context_window: Option<i64>,
+    /// Tetto di output in token DICHIARATO DAL PROVIDER nel listing
+    /// (`outputTokenLimit` di Google e' oggi l'unico che lo espone): `None`
+    /// quando l'API non lo dichiara. MAI inventato a valle (regole G/H): un
+    /// tetto stretto indovinato e' cio' che produce il turno vuoto fatturato
+    /// (vedi [[tetto-di-output]] e [[dichiarazione_fornitore]] in CLAUDE.md).
+    pub output_token_limit: Option<i64>,
 }
 
 /// Contratto di un provider LLM. `Send + Sync` perche' i provider vengono
@@ -92,6 +98,7 @@ pub trait LlmProvider: Send + Sync {
             .map(|id| ModelMeta {
                 id,
                 context_window: None,
+                output_token_limit: None,
             })
             .collect())
     }

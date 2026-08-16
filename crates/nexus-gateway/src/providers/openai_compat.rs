@@ -823,7 +823,9 @@ pub fn parse_models_meta_response(body: &serde_json::Value) -> Vec<crate::provid
 
 /// Mappa UN elemento di `data[]` (dialetto OpenAI) in [`ModelMeta`]: `id`
 /// trimmato non-vuoto obbligatorio; `max_context_length` (Mistral) come
-/// finestra dichiarata solo se positiva.
+/// finestra dichiarata solo se positiva. Nessun dialetto OpenAI-compat
+/// dichiara un tetto di output nel listing: `output_token_limit` resta `None`
+/// (lo espone il solo listing Google, vedi `google_model_meta_of`).
 fn openai_model_meta_of(m: &serde_json::Value) -> Option<crate::provider::ModelMeta> {
     let id = m
         .get("id")
@@ -834,7 +836,11 @@ fn openai_model_meta_of(m: &serde_json::Value) -> Option<crate::provider::ModelM
         .get("max_context_length")
         .and_then(serde_json::Value::as_i64)
         .filter(|w| *w > 0);
-    Some(crate::provider::ModelMeta { id, context_window })
+    Some(crate::provider::ModelMeta {
+        id,
+        context_window,
+        output_token_limit: None,
+    })
 }
 
 /// Parser SSE riusabile: accumula righe, le decodifica in [`LlmStreamChunk`] e

@@ -1510,7 +1510,11 @@ pub fn parse_google_models_meta_response(
 /// Mappa UN elemento del listing Google in [`ModelMeta`]: `name` normalizzato
 /// a basename ("publishers/google/models/X" -> "X", "models/X" -> "X",
 /// "X" -> "X"); `inputTokenLimit` (Gemini direct) come finestra dichiarata
-/// solo se positiva (Vertex non ha il campo -> `None`).
+/// solo se positiva (Vertex non ha il campo -> `None`); `outputTokenLimit`
+/// (stesso listing) come tetto di output dichiarato, con lo stesso filtro:
+/// Google e' l'unico fornitore che lo espone, e il trasporto senza questo
+/// campo era il buco per cui `nexus_provider_capabilities` non poteva che
+/// portare default inventati (vedi [[dichiarazione_fornitore]]).
 fn google_model_meta_of(m: &serde_json::Value) -> Option<crate::provider::ModelMeta> {
     let id = m
         .get("name")
@@ -1522,7 +1526,15 @@ fn google_model_meta_of(m: &serde_json::Value) -> Option<crate::provider::ModelM
         .get("inputTokenLimit")
         .and_then(serde_json::Value::as_i64)
         .filter(|w| *w > 0);
-    Some(crate::provider::ModelMeta { id, context_window })
+    let output_token_limit = m
+        .get("outputTokenLimit")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|w| *w > 0);
+    Some(crate::provider::ModelMeta {
+        id,
+        context_window,
+        output_token_limit,
+    })
 }
 
 /// Fonde l'elenco (autorevole) dei modelli Vertex con le finestre di contesto
@@ -1538,7 +1550,14 @@ fn merge_ids_with_declared_windows(
     ids.into_iter()
         .map(|id| {
             let context_window = declared_windows.get(&id).copied();
-            crate::provider::ModelMeta { id, context_window }
+            // Il ramo Vertex fonde i soli id con le FINESTRE dichiarate da
+            // Gemini direct: il tetto di output non passa da questa mappa e
+            // resta ignoto, mai un valore inventato (regola G/H).
+            crate::provider::ModelMeta {
+                id,
+                context_window,
+                output_token_limit: None,
+            }
         })
         .collect()
 }
@@ -3142,16 +3161,21 @@ mod tests {
             ]
         });
         let metas = parse_google_models_meta_response(&body);
+        // MUTAZIONE: togliere la lettura di `outputTokenLimit` in
+        // `google_model_meta_of` fa rosseggiare i due tetti attesi qui sotto —
+        // il campo e' nella fixture REALE del listing e deve arrivare nel meta.
         assert_eq!(
             metas,
             vec![
                 crate::provider::ModelMeta {
                     id: "gemini-2.5-flash".to_string(),
                     context_window: Some(1_048_576),
+                    output_token_limit: Some(65_536),
                 },
                 crate::provider::ModelMeta {
                     id: "gemma-3-27b-it".to_string(),
                     context_window: Some(131_072),
+                    output_token_limit: Some(8_192),
                 },
             ]
         );
@@ -3171,6 +3195,10 @@ mod tests {
         let metas = parse_google_models_meta_response(&body);
         assert_eq!(metas.len(), 3);
         assert!(metas.iter().all(|m| m.context_window.is_none()));
+        assert!(
+            metas.iter().all(|m| m.output_token_limit.is_none()),
+            "campo assente: il tetto resta ignoto, mai inventato"
+        );
     }
 
     #[test]
@@ -3188,6 +3216,7 @@ mod tests {
             vec![crate::provider::ModelMeta {
                 id: "gemini-2.5-pro".to_string(),
                 context_window: None,
+                output_token_limit: None,
             }]
         );
     }

@@ -844,6 +844,13 @@ pub struct GwModelMeta {
     /// del provider non la espone (il catalogo scrive 0 = ignota, regola H).
     #[serde(default)]
     pub context_window: Option<i64>,
+    /// Tetto di output in token dichiarato dal provider nel listing
+    /// (`outputTokenLimit`: oggi lo espone il solo Google); `None` se non
+    /// dichiarato, oppure gateway anteriore al campo. MAI inventato a valle
+    /// (regola G/H): la persistenza a catalogo/capability e' un passo
+    /// successivo, qui il campo deve solo attraversare il wire.
+    #[serde(default)]
+    pub output_token_limit: Option<i64>,
 }
 
 /// Risposta di `GET /v1/models/{provider}` del gateway.
@@ -869,6 +876,7 @@ impl GwModelsResponse {
             .map(|id| GwModelMeta {
                 id,
                 context_window: None,
+                output_token_limit: None,
             })
             .collect()
     }
@@ -924,10 +932,45 @@ mod tests {
             metas[0],
             GwModelMeta {
                 id: "mistral-medium-3".into(),
-                context_window: Some(131072)
+                context_window: Some(131072),
+                output_token_limit: None,
             }
         );
         assert_eq!(metas[1].context_window, None);
+    }
+
+    #[test]
+    fn il_tetto_di_output_dichiarato_attraversa_il_wire_dei_meta() {
+        // Il corpo e' composto COME LO COMPONE LA ROTTA del gateway
+        // (`models_for_provider`: json! con i ModelMeta serializzati), non
+        // ricopiato a mano (regola O): se il campo cambiasse nome da un lato
+        // solo, questo test rosseggia. MUTAZIONE: togliere `output_token_limit`
+        // da GwModelMeta (o la lettura di `outputTokenLimit` nel parser google,
+        // che e' l'unico produttore del valore) fa rosseggiare l'assert sul
+        // tetto; un gateway VECCHIO senza campo degrada a None (secondo meta).
+        let metas = vec![
+            ::nexus_gateway::provider::ModelMeta {
+                id: "gemini-2.5-flash".into(),
+                context_window: Some(1_048_576),
+                output_token_limit: Some(65_536),
+            },
+            ::nexus_gateway::provider::ModelMeta {
+                id: "gemini-2.5-pro".into(),
+                context_window: None,
+                output_token_limit: None,
+            },
+        ];
+        let ids: Vec<&str> = metas.iter().map(|m| m.id.as_str()).collect();
+        let corpo =
+            serde_json::json!({ "provider": "google", "models": ids, "models_meta": metas });
+        let parsed: GwModelsResponse =
+            serde_json::from_value(corpo).expect("parse del corpo composto dalla rotta");
+        let letti = parsed.into_metas();
+        assert_eq!(letti[0].output_token_limit, Some(65_536));
+        assert_eq!(
+            letti[1].output_token_limit, None,
+            "non dichiarato resta ignoto: mai un tetto inventato (regola G/H)"
+        );
     }
 
     #[test]
