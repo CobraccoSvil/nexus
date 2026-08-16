@@ -228,9 +228,20 @@ impl TentativoScartato {
 
 /// Scrive nel ledger i tentativi scartati della richiesta (best-effort).
 ///
-/// Stesso contratto d'identita' di [`record_usage_to_ledger`]: senza
-/// `tenant_id`/`user_id` utilizzabili il ledger non scrive MAI — ma qui il
-/// silenzio si DICE, perche' e' spesa reale che nessun report vedra'.
+/// A differenza di [`record_usage_to_ledger`] la riga si scrive ANCHE senza
+/// identita' contabile, con le due colonne a NULL (mig 0711): una richiesta di
+/// sistema — `GwMetadata::default`, o i segnaposto 'internal'/'system' dei
+/// percorsi interni — non ha nessuno a cui addebitare, ma i suoi scarti sono
+/// spesa reale verso un fornitore reale. Finche' l'unica forma disponibile per
+/// "non lo so" era la riga assente, quella spesa era indistinguibile dal non
+/// essere mai avvenuta, e il WARN che la dichiarava viveva in un log che nessun
+/// report interroga.
+///
+/// Il percorso di SUCCESSO non cambia e non e' una dimenticanza: li' una riga
+/// senza identita' potrebbe raddoppiare l'addebito di una prenotazione che
+/// mcp-core sta per finalizzare (`Declaration::audit` -> `IdentitaPersa`), e
+/// dai soli metadata il gateway non sa distinguere i due casi. Uno scarto,
+/// invece, nessuna prenotazione lo copre.
 pub async fn record_discarded_attempts(
     db: &PgPool,
     req: &LlmRequest,
@@ -239,13 +250,17 @@ pub async fn record_discarded_attempts(
     if scarti.is_empty() {
         return;
     }
-    let Some(identity) = identita(req) else {
-        tracing::warn!(
+    let identity = identita(req);
+    if identity.is_none() {
+        // Non e' piu' una perdita: la riga c'e' e dichiara l'assenza. Resta
+        // tracciato QUALE percorso non porta identita', che e' l'unica cosa
+        // che la riga non puo' dire da sola.
+        tracing::debug!(
             scarti = scarti.len(),
-            "gateway-ledger: tentativi scartati NON registrati, identita' assente o non-UUID"
+            feature = %req.metadata.feature,
+            "gateway-ledger: scarti di una chiamata di sistema, righe senza titolare contabile"
         );
-        return;
-    };
+    }
     for s in scarti {
         nexus_ledger::record_discarded(
             db,
@@ -805,14 +820,79 @@ mod tests {
         // Identita' e correlazione al run, come le righe vere.
         assert_eq!(degenere.get::<Uuid, _>("user_id"), user);
         assert_eq!(degenere.get::<Option<Uuid>, _>("run_id"), Some(run));
+    }
 
-        // Senza identita' non si scrive nulla (stesso contratto del resto).
+    /// Gli scarti di una chiamata di SISTEMA entrano nel ledger lo stesso, con
+    /// l'identita' dichiarata assente (mig 0711).
+    ///
+    /// E' il caso osservato il 13/08/2026: una risposta degenere di groq su una
+    /// richiesta senza `tenant_id`/`user_id`, un WARN nel log e nessuna riga da
+    /// nessuna parte. La spesa verso un fornitore non dipende da chi ha
+    /// chiamato, e la riga porta cio' che serve a misurarla: provider, modello,
+    /// causa, token, costo.
+    ///
+    /// MUTAZIONE: rimettendo il `return` anticipato sulla guardia d'identita' in
+    /// `record_discarded_attempts` questo test rosseggia con 0 righe invece di 2
+    /// — cioe' con la forma esatta del difetto. Facendo invece scrivere una
+    /// mezza identita' (solo `user_id`) rosseggia il CHECK di atomicita' a
+    /// schema, e la riga non viene scritta affatto.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn gli_scarti_di_sistema_entrano_senza_titolare(pool: PgPool) {
+        seed_listino(&pool).await;
+
+        let scarti = vec![
+            TentativoScartato::degenere(
+                "anthropic",
+                "claude-x",
+                crate::types::LlmUsage::normalized(
+                    crate::types::PromptCacheReporting::CachedIncludedInPrompt,
+                    1_000_000,
+                    0,
+                    None,
+                    None,
+                    crate::types::ReasoningTokens::IncludedInOutput,
+                ),
+            ),
+            TentativoScartato::timeout("anthropic", "claude-x"),
+        ];
+        // `req` senza tenant_id/user_id: la forma di `GwMetadata::default`.
         record_discarded_attempts(&pool, &req(vec!["ciao"], None), &scarti).await;
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ai_usage_ledger")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(n, 2, "identita' assente: nessuna riga nuova");
+
+        let righe = sqlx::query(
+            "SELECT discard_reason, status, user_id, project_id, provider, \
+                    total_cost::float8 AS total_cost \
+               FROM ai_usage_ledger ORDER BY discard_reason",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("lettura righe");
+        assert_eq!(
+            righe.len(),
+            2,
+            "la spesa di una chiamata di sistema deve avere una riga: senza, e' \
+             indistinguibile dal non essere mai avvenuta"
+        );
+        for r in &righe {
+            assert_eq!(r.get::<String, _>("status"), "discarded");
+            assert!(
+                r.get::<Option<Uuid>, _>("user_id").is_none()
+                    && r.get::<Option<Uuid>, _>("project_id").is_none(),
+                "l'identita' e' una coppia: assente su entrambe le colonne o su nessuna"
+            );
+            assert_eq!(r.get::<String, _>("provider"), "anthropic");
+        }
+        // La causa e il COSTO restano quelli veri: e' il dato su cui si decide
+        // se un fornitore che fallisce spesso convenga.
+        let degenere = &righe[1]; // attempt_timeout < degenerate_hollow
+        assert_eq!(
+            degenere.get::<String, _>("discard_reason"),
+            "degenerate_hollow"
+        );
+        assert!(
+            (degenere.get::<f64, _>("total_cost") - 3.0).abs() < 1e-9,
+            "1M di prompt a 3.0/M: {}",
+            degenere.get::<f64, _>("total_cost")
+        );
     }
 
     /// La domanda che decide se rilasciare una prenotazione e' "il gateway ha

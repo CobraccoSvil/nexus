@@ -317,7 +317,7 @@ async fn la_spesa_scartata_e_visibile_e_conta_in_quota_solo_se_osservata(pool: P
     };
     nexus_ledger::record_discarded(
         &pool,
-        identity,
+        Some(identity),
         "anthropic",
         "claude-x",
         DiscardReason::DegenerateHollow,
@@ -330,7 +330,7 @@ async fn la_spesa_scartata_e_visibile_e_conta_in_quota_solo_se_osservata(pool: P
     // Il cap per-tentativo scaduto: nessun usage osservato.
     nexus_ledger::record_discarded(
         &pool,
-        identity,
+        Some(identity),
         "anthropic",
         "claude-x",
         DiscardReason::AttemptTimeout,

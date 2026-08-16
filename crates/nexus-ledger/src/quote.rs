@@ -616,6 +616,82 @@ mod tests {
         assert_eq!(somma, totale, "la ripartizione non somma al totale");
     }
 
+    /// Una riga SENZA titolare contabile (mig 0711) non consuma la quota di
+    /// nessuno, e non serve un filtro per ottenerlo.
+    ///
+    /// E' la verifica che la mig 0711 doveva fare PRIMA di ammettere quelle
+    /// righe: la spesa di sistema entra nel ledger, quindi diventa visibile a
+    /// chiunque sommi la tabella — e la domanda «erode la quota di qualcuno?»
+    /// non si risponde leggendo la SQL, si misura. La risposta e' no per
+    /// COSTRUZIONE: `l.user_id = q.user_id` con `l.user_id` NULL non e' mai
+    /// vero in SQL.
+    ///
+    /// Le due righe sono identiche in tutto tranne il titolare, e passano
+    /// entrambe dal produttore vero (`record_discarded`): e' la causa
+    /// `degenerate_hollow`, l'unica che consuma quota, quindi il test misura la
+    /// differenza fatta dal solo `None`.
+    ///
+    /// MUTAZIONE: scrivendo l'assenza come UUID nil invece che NULL — la forma
+    /// "comoda" che eviterebbe la migrazione — la riga di sistema comincia a
+    /// consumare la quota di uno scope inesistente e questo test rosseggia con
+    /// 2000 invece di 1000. Idem se il JOIN passasse a `IS NOT DISTINCT FROM`.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn una_riga_senza_titolare_non_consuma_la_quota_di_nessuno(pool: PgPool) {
+        let id = identita(&pool).await;
+        let tokens = nexus_pricing::TokenUsage {
+            prompt_tokens: 900,
+            completion_tokens: 100,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        // Stessa chiamata, due titolari diversi: uno c'e', l'altro no.
+        crate::record_discarded(
+            &pool,
+            Some(id),
+            "mistral",
+            "m1",
+            crate::DiscardReason::DegenerateHollow,
+            Some(&tokens),
+            "",
+            "chat",
+        )
+        .await;
+        crate::record_discarded(
+            &pool,
+            None,
+            "mistral",
+            "m1",
+            crate::DiscardReason::DegenerateHollow,
+            Some(&tokens),
+            "",
+            "rolling_summary",
+        )
+        .await;
+
+        // Le righe sono DUE: la spesa di sistema e' registrata.
+        let righe: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ai_usage_ledger WHERE status = 'discarded'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("conteggio");
+        assert_eq!(righe, 2, "entrambe le chiamate hanno lasciato la loro riga");
+
+        // E la quota ne vede una sola, su ognuno dei tre scope.
+        let da = Utc::now() - Duration::hours(1);
+        let a = Utc::now() + Duration::hours(1);
+        for scope in ["user", "project", "user_project"] {
+            let consumo = usage_for_scope(&pool, scope, id.user_id, id.project_id, da, a)
+                .await
+                .expect("consumo");
+            assert_eq!(
+                consumo.tokens, 1000,
+                "scope '{scope}': la riga senza titolare non e' di nessuno, \
+                 non puo' erodere la quota di questo"
+            );
+        }
+    }
+
     /// Nessun run: zero senza interrogare il DB (e senza `ANY('{}')`).
     #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn senza_run_il_consumo_e_zero(pool: PgPool) {
