@@ -990,6 +990,65 @@ pub(crate) fn banda_measured(
     }
 }
 
+/// Esito della GUARDIA sul riancoraggio (regola Q: la decisione in un campo).
+///
+/// Il riancoraggio puo' muovere il tier di un modello SENZA che quel modello
+/// sia stato ri-provato (si e' mosso il leader, la scala e' relativa): quando
+/// lo spostamento supera UN gradino, la scala e' cambiata abbastanza da
+/// rendere la misura vecchia non piu' descrittiva del presente — si avanza di
+/// un solo gradino e si chiede la rimisura, invece di teletrasportare il tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EsitoRiancoraggio {
+    /// Spostamento entro UN gradino (o nessun riferimento canonico da cui
+    /// misurarlo): si applica la proposta com'e'.
+    Applica { banda: &'static str },
+    /// Oltre un gradino, nessuna rimisura pendente: si avanza di UN solo
+    /// gradino verso la proposta e si anticipa la scadenza della
+    /// qualificazione, cosi' il claim (`da_misurare`) riprende il modello.
+    UnGradinoERimisura { banda: &'static str },
+    /// Oltre un gradino MA la rimisura e' gia' stata chiesta e non e' ancora
+    /// avvenuta: il tier resta fermo. Senza questa variante il clamp
+    /// degenererebbe in «spostamento pieno, un gradino per giro», perche' il
+    /// riancoraggio gira a OGNI fine giro anche senza nuove misure.
+    AttendeRimisura,
+}
+
+/// La banda della scala canonica al rank dato (1-based, come `tier_rank`).
+fn banda_al_rank(rank: u8) -> &'static str {
+    nexus_types::tiers::PERFORMANCE_TIERS[usize::from(rank) - 1]
+}
+
+/// La guardia PURA sul riancoraggio dei tier measured.
+///
+/// `attuale` e' il `performance_tier` corrente della riga, QUALUNQUE fonte
+/// (la precedenza fra le fonti resta di `apply_tier`: qui si decide solo di
+/// quanto muoversi); `proposta` e' l'uscita di [`banda_measured`], isteresi
+/// gia' applicata; `rimisura_pendente` = la scadenza della qualificazione e'
+/// gia' matura (chiesta da noi o dal TTL) e la rimisura non e' ancora
+/// avvenuta.
+pub(crate) fn guardia_riancoraggio(
+    attuale: Option<&str>,
+    proposta: &'static str,
+    rimisura_pendente: bool,
+) -> EsitoRiancoraggio {
+    use nexus_agent_graph::decisions::tiers::tier_rank;
+    // Nessun gradino da cui muoversi (tier NULL o fuori scala): coerente con
+    // come `derive_tier_measured` tratta il fuori-scala — vale la proposta.
+    let Some(acquisita) = attuale.and_then(banda_canonica) else {
+        return EsitoRiancoraggio::Applica { banda: proposta };
+    };
+    let da = i16::from(tier_rank(acquisita));
+    let delta = i16::from(tier_rank(proposta)) - da;
+    if delta.abs() <= 1 {
+        return EsitoRiancoraggio::Applica { banda: proposta };
+    }
+    if rimisura_pendente {
+        return EsitoRiancoraggio::AttendeRimisura;
+    }
+    let clampata = banda_al_rank((da + delta.signum()) as u8);
+    EsitoRiancoraggio::UnGradinoERimisura { banda: clampata }
+}
+
 // ── Orchestrazione (I/O) ────────────────────────────────────────────────────
 
 async fn setting_i64(db: &PgPool, key: &str, default: i64) -> i64 {
@@ -2522,14 +2581,27 @@ async fn riancora_bande_measured(db: &PgPool, suite: i32) {
     applica_bande_measured(db, &righe, ancora, &bands, cfg.demote_margin).await;
 }
 
-/// Una riga misurata a suite corrente: (provider, model, score, tier, fonte).
-type RigaMisurata = (String, String, f64, Option<String>, Option<String>);
+/// Una riga misurata a suite corrente. Struct nominata e non tupla: coi sei
+/// campi (di cui tre Option) lo scambio posizionale diventerebbe il difetto
+/// che `run_summary` documenta — invisibile al compilatore e ai test.
+#[derive(Debug, sqlx::FromRow)]
+struct RigaMisurata {
+    provider: String,
+    model: String,
+    measured_score: f64,
+    performance_tier: Option<String>,
+    tier_source: Option<String>,
+    /// La scadenza della qualificazione: gia' matura = rimisura CHIESTA e non
+    /// ancora avvenuta, l'ingrediente `rimisura_pendente` della guardia.
+    qualification_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
 
 /// Le righe con uno score alla suite corrente: il PERIMETRO del ri-ancoraggio
 /// (score di suite diverse non sono confrontabili).
 async fn leggi_score_suite(db: &PgPool, suite: i32) -> Vec<RigaMisurata> {
     sqlx::query_as(
-        "SELECT provider, model, measured_score, performance_tier, tier_source \
+        "SELECT provider, model, measured_score, performance_tier, tier_source, \
+                qualification_expires_at \
            FROM ai_price_catalog \
           WHERE measured_score IS NOT NULL AND measured_score_suite = $1",
     )
@@ -2550,8 +2622,8 @@ async fn ancora_measured_aggiornata(
     use crate::orchestrator::model_service::{persist_anchor, resolve_anchor};
     let leader = righe
         .iter()
-        .max_by(|a, b| a.2.total_cmp(&b.2))
-        .map(|r| (format!("{}/{}", r.0, r.1), r.2))?;
+        .max_by(|a, b| a.measured_score.total_cmp(&b.measured_score))
+        .map(|r| (format!("{}/{}", r.provider, r.model), r.measured_score))?;
     let attuale = leggi_ancora_measured(db).await;
     let (ancora, persisti) = resolve_anchor(attuale, leader.1, cfg.deadband_pct);
     if persisti {
@@ -2562,8 +2634,28 @@ async fn ancora_measured_aggiornata(
     Some(ancora)
 }
 
-/// Applica la banda relativa a ogni riga del perimetro. La precedenza delle
-/// fonti resta di `apply_tier`: la curatela `manual` non si tocca.
+/// La misura vecchia non parla piu' del presente: si anticipa la scadenza,
+/// cosi' il claim (condizione `da_misurare`) riprende il modello al prossimo
+/// giro utile. Non tocca il backoff: quello racconta i fallimenti.
+async fn anticipa_rimisura(db: &PgPool, provider: &str, model: &str) {
+    if let Err(e) = sqlx::query(
+        "UPDATE ai_price_catalog SET qualification_expires_at = NOW() \
+          WHERE provider = $1 AND model = $2 \
+            AND (qualification_expires_at IS NULL OR qualification_expires_at > NOW())",
+    )
+    .bind(provider)
+    .bind(model)
+    .execute(db)
+    .await
+    {
+        tracing::warn!(provider = %provider, model = %model, error = %e,
+            "riancora_bande_measured: anticipo rimisura fallito");
+    }
+}
+
+/// Applica la banda relativa a ogni riga del perimetro, sotto la GUARDIA di
+/// [`guardia_riancoraggio`]: uno spostamento oltre un gradino avanza di UNO e
+/// chiede la rimisura.
 async fn applica_bande_measured(
     db: &PgPool,
     righe: &[RigaMisurata],
@@ -2571,15 +2663,58 @@ async fn applica_bande_measured(
     bands: &crate::orchestrator::model_service::RelativeBands,
     demote_margin: f64,
 ) {
+    let adesso = chrono::Utc::now();
+    for r in righe {
+        applica_banda_riga(db, r, ancora, bands, demote_margin, adesso).await;
+    }
+}
+
+/// La banda di UNA riga, sotto la guardia. La precedenza delle fonti resta di
+/// `apply_tier`: la curatela `manual` non si tocca, e non riceve nemmeno
+/// rimisure anticipate (la scadenza si anticipa SOLO se `apply_tier` ha
+/// scritto davvero).
+async fn applica_banda_riga(
+    db: &PgPool,
+    r: &RigaMisurata,
+    ancora: f64,
+    bands: &crate::orchestrator::model_service::RelativeBands,
+    demote_margin: f64,
+    adesso: chrono::DateTime<chrono::Utc>,
+) {
     use crate::orchestrator::model_service::{apply_tier, TierSource};
-    for (provider, model, score, tier, source) in righe {
-        let acquisita = (source.as_deref() == Some("measured"))
-            .then_some(tier.as_deref())
-            .flatten();
-        let banda = banda_measured(*score, acquisita, ancora, bands, demote_margin);
-        if let Err(e) = apply_tier(db, provider, model, banda, TierSource::Measured).await {
-            tracing::warn!(provider = %provider, model = %model, error = %e,
-                "riancora_bande_measured: apply_tier fallita");
+    let acquisita = (r.tier_source.as_deref() == Some("measured"))
+        .then_some(r.performance_tier.as_deref())
+        .flatten();
+    let banda = banda_measured(r.measured_score, acquisita, ancora, bands, demote_margin);
+    let pendente = r.qualification_expires_at.is_some_and(|t| t <= adesso);
+    match guardia_riancoraggio(r.performance_tier.as_deref(), banda, pendente) {
+        EsitoRiancoraggio::Applica { banda } => {
+            if let Err(e) = apply_tier(db, &r.provider, &r.model, banda, TierSource::Measured).await
+            {
+                tracing::warn!(provider = %r.provider, model = %r.model, error = %e,
+                    "riancora_bande_measured: apply_tier fallita");
+            }
+        }
+        EsitoRiancoraggio::UnGradinoERimisura { banda: applicata } => {
+            // L'evento e' dichiarato, non silente: la scala si e' mossa di
+            // piu' di quanto una misura vecchia possa coprire.
+            tracing::info!(provider = %r.provider, model = %r.model,
+                da = r.performance_tier.as_deref().unwrap_or("-"),
+                proposta = banda, applicata = applicata,
+                "riancora_bande_measured: scala mossa oltre un gradino, si avanza di UNO e si chiede la rimisura");
+            match apply_tier(db, &r.provider, &r.model, applicata, TierSource::Measured).await {
+                // Solo se la scrittura e' avvenuta: su `manual` apply_tier
+                // rifiuta, e una rimisura per un tier che non si muovera'
+                // sarebbe un posto di giro sprecato.
+                Ok(true) => anticipa_rimisura(db, &r.provider, &r.model).await,
+                Ok(false) => {}
+                Err(e) => tracing::warn!(provider = %r.provider, model = %r.model, error = %e,
+                    "riancora_bande_measured: apply_tier fallita"),
+            }
+        }
+        EsitoRiancoraggio::AttendeRimisura => {
+            tracing::debug!(provider = %r.provider, model = %r.model, proposta = banda,
+                "riancora_bande_measured: spostamento largo con rimisura gia' chiesta, il tier resta fermo");
         }
     }
 }
@@ -3808,6 +3943,56 @@ mod tests {
         assert_eq!(banda_measured(63.0, Some("boh"), 100.0, &b, 3.0), "high");
     }
 
+    /// LA GUARDIA sul riancoraggio: uno spostamento oltre un gradino avanza di
+    /// UNO verso la proposta, in ENTRAMBE le direzioni; entro un gradino (o
+    /// senza riferimento canonico) la proposta passa intera.
+    ///
+    /// MUTAZIONI che lo fanno rosseggiare: togliere il clamp (ritornare sempre
+    /// la proposta — medium salterebbe a frontier in un colpo); clampare anche
+    /// il gradino singolo (high->heavy si fermerebbe).
+    #[test]
+    fn la_guardia_muove_il_tier_di_un_gradino_alla_volta() {
+        use EsitoRiancoraggio::*;
+        // Oltre un gradino, in salita e in discesa: UN gradino verso la proposta.
+        assert_eq!(
+            guardia_riancoraggio(Some("medium"), "frontier", false),
+            UnGradinoERimisura { banda: "high" }
+        );
+        assert_eq!(
+            guardia_riancoraggio(Some("heavy"), "medium", false),
+            UnGradinoERimisura { banda: "high" }
+        );
+        // Un gradino esatto, o nessuno: si applica.
+        assert_eq!(guardia_riancoraggio(Some("high"), "heavy", false), Applica { banda: "heavy" });
+        assert_eq!(guardia_riancoraggio(Some("heavy"), "heavy", false), Applica { banda: "heavy" });
+        // Nessun riferimento canonico (tier NULL o fuori scala): vale la
+        // proposta, coerente con `derive_tier_measured` sul fuori-scala.
+        assert_eq!(guardia_riancoraggio(None, "frontier", false), Applica { banda: "frontier" });
+        assert_eq!(
+            guardia_riancoraggio(Some("boh"), "frontier", false),
+            Applica { banda: "frontier" }
+        );
+    }
+
+    /// Con la rimisura gia' PENDENTE lo spostamento largo resta fermo: senza,
+    /// il clamp degenererebbe in «spostamento pieno, un gradino per giro»
+    /// perche' il riancoraggio gira a ogni fine giro anche senza nuove misure.
+    ///
+    /// MUTAZIONE: ignorare `rimisura_pendente` (il secondo gradino verrebbe
+    /// applicato mentre la misura non e' ancora arrivata).
+    #[test]
+    fn la_guardia_attende_la_rimisura_prima_del_secondo_gradino() {
+        assert_eq!(
+            guardia_riancoraggio(Some("high"), "frontier", true),
+            EsitoRiancoraggio::AttendeRimisura
+        );
+        // Entro un gradino la pendenza non trattiene: il movimento e' lecito.
+        assert_eq!(
+            guardia_riancoraggio(Some("heavy"), "frontier", true),
+            EsitoRiancoraggio::Applica { banda: "frontier" }
+        );
+    }
+
     /// LA MISURA DEVE RAGGIUNGERE CHI L'EURISTICA CLASSIFICA MALE (mig 0658).
     ///
     /// La `thinking_matrix` era gated su
@@ -4035,11 +4220,15 @@ mod tests {
                 // 99.0 ma di SUITE VECCHIA: fuori dal leader e fuori dal pass.
                 ("fuori-suite".into(), Some("medium".into()), Some("synced".into())),
                 ("primo".into(), Some("frontier".into()), Some("measured".into())),
-                ("secondo".into(), Some("heavy".into()), Some("measured".into())),
+                // 60/80=75% e' banda heavy, ma da medium sono DUE gradini: la
+                // guardia del riancoraggio ne concede UNO (high) e chiede la
+                // rimisura — vedi il_riancoraggio_avanza_di_un_gradino....
+                ("secondo".into(), Some("high".into()), Some("measured".into())),
                 ("terzo".into(), Some("high".into()), Some("measured".into())),
             ],
-            "a popolazione raggiunta il leader (80) e' frontier, 60/80=75% e' \
-             heavy, 40/80=50% e' high; la suite vecchia resta fuori"
+            "a popolazione raggiunta il leader (80) e' frontier, 60/80=75% \
+             (heavy, clampata a high dalla guardia), 40/80=50% e' high; la \
+             suite vecchia resta fuori"
         );
         let ancora: (String,) = sqlx::query_as(
             "SELECT value FROM settings WHERE key = 'catalog.measured_band.anchor'",
@@ -4048,6 +4237,78 @@ mod tests {
         .await
         .expect("ancora");
         assert_eq!(ancora.0, "80", "l'ancora e' il leader misurato a suite corrente");
+    }
+
+    /// Il riancoraggio ATTRAVERSATO per intero (`riancora_bande_measured`, non
+    /// una sua imitazione, regola O), su due giri consecutivi:
+    ///
+    ///   giro 1 — `bersaglio` (medium synced, score da frontier) avanza di UN
+    ///   solo gradino (high, measured) e la sua scadenza viene anticipata;
+    ///   `unpasso` (heavy, a un gradino) si muove intero SENZA rimisura;
+    ///   `manuale` resta intatto, scadenza compresa.
+    ///
+    ///   giro 2 — nessuna nuova misura: `bersaglio` (rimisura pendente) NON
+    ///   prende il secondo gradino.
+    ///
+    /// MUTAZIONI che lo fanno rosseggiare: (a) togliere `anticipa_rimisura` ->
+    /// la scadenza di bersaglio resta NULL; (b) applicare la banda piena ->
+    /// bersaglio a frontier al primo giro; (c) trattare `AttendeRimisura` come
+    /// `UnGradinoERimisura` -> bersaglio a frontier al secondo giro; (d)
+    /// anticipare la rimisura incondizionatamente -> la scadenza di `unpasso`
+    /// o di `manuale` non e' piu' NULL.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_riancoraggio_avanza_di_un_gradino_e_chiede_la_rimisura(pool: PgPool) {
+        colonne_e_settings_score(&pool).await;
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, performance_tier, tier_source, measured_score, measured_score_suite, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('p', 'leader',    NULL,     NULL,     100.0, 5, 1.0, 1.0, 'USD', now()), \
+             ('p', 'bersaglio', 'medium', 'synced',  95.0, 5, 1.0, 1.0, 'USD', now()), \
+             ('p', 'unpasso',   'heavy',  'synced',  95.0, 5, 1.0, 1.0, 'USD', now()), \
+             ('p', 'manuale',   'medium', 'manual',  95.0, 5, 1.0, 1.0, 'USD', now())",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        riancora_bande_measured(&pool, 5).await;
+
+        let righe: Vec<(String, Option<String>, Option<String>, Option<bool>)> = sqlx::query_as(
+            "SELECT model, performance_tier, tier_source, qualification_expires_at <= NOW() \
+               FROM ai_price_catalog ORDER BY model",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("righe");
+        assert_eq!(
+            righe,
+            vec![
+                // 95/100 e' banda frontier, ma da medium si avanza di UN
+                // gradino: high, con la rimisura CHIESTA (scadenza matura).
+                ("bersaglio".into(), Some("high".into()), Some("measured".into()), Some(true)),
+                ("leader".into(), Some("frontier".into()), Some("measured".into()), None),
+                // La curatela non si tocca e non riceve rimisure inutili.
+                ("manuale".into(), Some("medium".into()), Some("manual".into()), None),
+                // A UN gradino la banda passa intera e nessuna rimisura serve.
+                ("unpasso".into(), Some("frontier".into()), Some("measured".into()), None),
+            ],
+            "primo giro: un gradino per chi salta, banda piena per chi e' adiacente"
+        );
+
+        // Secondo giro, NESSUNA nuova misura: la rimisura di bersaglio e'
+        // pendente e il secondo gradino non si prende.
+        riancora_bande_measured(&pool, 5).await;
+        let (tier, fonte): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT performance_tier, tier_source FROM ai_price_catalog WHERE model='bersaglio'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("bersaglio");
+        assert_eq!(
+            (tier.as_deref(), fonte.as_deref()),
+            (Some("high"), Some("measured")),
+            "secondo giro senza rimisura: il tier resta fermo (AttendeRimisura)"
+        );
     }
 
     /// Lo SCORE atterra nella stessa transazione del verdetto (DerivedWrite::
