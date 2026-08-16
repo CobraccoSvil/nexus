@@ -112,4 +112,60 @@ mod tests {
         let p = MistralProvider::new(Client::new(), "key", None);
         assert_eq!(p.client.cache_keying(), PromptCacheKeying::RequiresKey);
     }
+
+    /// Mistral NON ha deprecato `max_tokens`: il tetto resta sul campo
+    /// standard del dialetto condiviso. E' il verso opposto del test gemello
+    /// in openai.rs (`anche_un_modello_chat_porta_max_completion_tokens`):
+    /// insieme fissano che la dichiarazione e' PER FORNITORE, non un default
+    /// del client condiviso — `max_completion_tokens` verso chi non lo
+    /// documenta sarebbe un campo sconosciuto.
+    ///
+    /// Attraversa `corpo_della_richiesta` reale col client che il costruttore
+    /// compone (regola O). MUTAZIONE: accendere il default nel costruttore di
+    /// `OpenAiCompatClient`, o aggiungere `.with_tetto_su_completion()` al
+    /// costruttore mistral -> il body porta `max_completion_tokens`: rosso.
+    #[tokio::test]
+    async fn il_tetto_di_output_resta_su_max_tokens() {
+        use crate::providers::openai_compat::ResolvedReasoning;
+        use crate::types::{LlmMessage, MessageContent, RequestMetadata};
+
+        let p = MistralProvider::new(Client::new(), "key", None);
+        let req = LlmRequest {
+            model: "mistral-small-latest".to_string(),
+            messages: vec![LlmMessage {
+                role: "user".to_string(),
+                content: MessageContent::Text("ciao".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+                name: None,
+                thinking_signature: None,
+                reasoning: None,
+                is_error: None,
+            }],
+            temperature: Some(0.5),
+            max_tokens: Some(64),
+            tools: None,
+            response_format: None,
+            stream: None,
+            thinking: None,
+            tool_choice: None,
+            pin_provider: None,
+            metadata: RequestMetadata {
+                tenant_id: "t".to_string(),
+                user_id: "u".to_string(),
+                request_id: "r".to_string(),
+                sensitivity_tier: 0,
+                feature: "f".to_string(),
+            },
+            run_timeout_secs: None,
+        };
+        let corpo = serde_json::to_value(
+            p.client
+                .corpo_della_richiesta(&req, false, &ResolvedReasoning::none())
+                .await,
+        )
+        .expect("serializza");
+        assert_eq!(corpo["max_tokens"], 64);
+        assert!(corpo.get("max_completion_tokens").is_none());
+    }
 }

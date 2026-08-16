@@ -4,8 +4,11 @@
 //! `brain/providers/openai_provider.py`. Delega il trasporto al client condiviso
 //! [`OpenAiCompatClient`] (composizione, regola L); aggiunge la detection
 //! o-series (per nome modello) che cambia il dialetto reasoning: i modelli
-//! reasoning (o1/o3/o4, gpt-5*, gpt-4.5*) usano `max_completion_tokens` al posto
-//! di `max_tokens`, non accettano temperatura e ammettono `reasoning_effort`.
+//! reasoning (o1/o3/o4, gpt-5*, gpt-4.5*) non accettano temperatura e ammettono
+//! `reasoning_effort`. Il tetto di output in `max_completion_tokens` NON e' del
+//! dialetto: OpenAI ha deprecato `max_tokens` per l'INTERO parco, chat compresi,
+//! e lo dichiara il costruttore (vedi
+//! [`OpenAiCompatClient::with_tetto_su_completion`]).
 
 use std::time::Duration;
 
@@ -97,8 +100,15 @@ impl OpenAiProvider {
             // mistral-small, che pure cachea da solo, ha riusato il prefisso
             // una volta su due. Rischio nullo (campo nativo del dialetto),
             // guadagno atteso sui carichi distribuiti.
+            // TETTO: `max_tokens` e' deprecato dal PROVIDER per l'intera
+            // famiglia (doc API reference: "deprecated in favor of
+            // max_completion_tokens"), non dai soli modelli reasoning — anche
+            // i chat (gpt-4o*) lo accettano. Percio' la dichiarazione sta sul
+            // client e non sul dialetto: finche' viveva nel dialetto, un
+            // modello non-reasoning partiva col campo deprecato.
             client: OpenAiCompatClient::new(http, base_url, api_key, "openai")
-                .with_prompt_cache_keying(PromptCacheKeying::RequiresKey),
+                .with_prompt_cache_keying(PromptCacheKeying::RequiresKey)
+                .with_tetto_su_completion(),
             db,
             reasoning_effort: TtlCache::new(SETTINGS_TTL),
         }
@@ -261,9 +271,75 @@ fn audio_filename(mime: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{LlmMessage, MessageContent, RequestMetadata};
 
     fn provider() -> OpenAiProvider {
         OpenAiProvider::new(Client::new(), "sk-test", None)
+    }
+
+    fn richiesta(model: &str) -> LlmRequest {
+        LlmRequest {
+            model: model.to_string(),
+            messages: vec![LlmMessage {
+                role: "user".to_string(),
+                content: MessageContent::Text("ciao".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+                name: None,
+                thinking_signature: None,
+                reasoning: None,
+                is_error: None,
+            }],
+            temperature: Some(0.5),
+            max_tokens: Some(64),
+            tools: None,
+            response_format: None,
+            stream: None,
+            thinking: None,
+            tool_choice: None,
+            pin_provider: None,
+            metadata: RequestMetadata {
+                tenant_id: "t".to_string(),
+                user_id: "u".to_string(),
+                request_id: "r".to_string(),
+                sensitivity_tier: 0,
+                feature: "f".to_string(),
+            },
+            run_timeout_secs: None,
+        }
+    }
+
+    /// La deprecazione di `max_tokens` e' del PROVIDER, non del dialetto: anche
+    /// un modello chat non-reasoning parte con `max_completion_tokens`. Prima
+    /// il tetto viveva nel predicato sul dialetto (`OpenAiReasoning | Kimi`) e
+    /// un `gpt-4o-mini` — dialetto base — usciva col campo che la doc OpenAI
+    /// dichiara deprecato.
+    ///
+    /// Attraversa `resolve` e `corpo_della_richiesta` REALI (regola O): e' la
+    /// coppia dialetto+client che parte in produzione, non una composta a mano.
+    /// Il verso opposto (mistral resta su `max_tokens`) e' il test gemello in
+    /// mistral.rs: insieme fissano che la dichiarazione e' per-fornitore.
+    ///
+    /// MUTAZIONE: togliere `.with_tetto_su_completion()` dal costruttore, o
+    /// riportare il tetto sul dialetto in `build_request_body` -> gpt-4o-mini
+    /// risolve dialetto base e il body torna a `max_tokens`: rosso.
+    #[tokio::test]
+    async fn anche_un_modello_chat_porta_max_completion_tokens() {
+        let p = provider();
+        let req = richiesta("gpt-4o-mini");
+        let reasoning = p.resolve(&req).await;
+        assert_eq!(
+            reasoning.dialect,
+            ReasoningDialect::None,
+            "premessa: gpt-4o-mini non e' o-series"
+        );
+        let corpo =
+            serde_json::to_value(p.client.corpo_della_richiesta(&req, false, &reasoning).await)
+                .expect("serializza");
+        assert_eq!(corpo["max_completion_tokens"], 64);
+        assert!(corpo.get("max_tokens").is_none());
+        // La temperatura resta materia del DIALETTO: un chat la manda ancora.
+        assert_eq!(corpo["temperature"], 0.5);
     }
 
     /// OpenAI cachea anche senza la chiave (misurato: 11.392 token su 11.469),

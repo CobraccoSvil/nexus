@@ -49,9 +49,12 @@ pub enum ReasoningDialect {
     /// (enabled/disabled); il reasoning torna nel campo `reasoning_content`
     /// (response e stream delta).
     DeepSeek,
-    /// OpenAI o-series / gpt-5 / gpt-4.5: usa `max_completion_tokens` al posto di
-    /// `max_tokens` e accetta `reasoning_effort`; non espone il reasoning come
-    /// testo, solo i `reasoning_tokens` in `completion_tokens_details`.
+    /// OpenAI o-series / gpt-5 / gpt-4.5: temperatura rifiutata dall'API e
+    /// `reasoning_effort` ammesso; non espone il reasoning come testo, solo i
+    /// `reasoning_tokens` in `completion_tokens_details`. Il tetto in
+    /// `max_completion_tokens` NON e' di questo dialetto: e' del PROVIDER
+    /// openai per l'intero parco, chat compresi, e lo dichiara il costruttore
+    /// del client (vedi [`OpenAiCompatClient::with_tetto_su_completion`]).
     OpenAiReasoning,
     /// Moonshot/Kimi: il pensiero e' sempre acceso di DEFAULT, e su una parte del
     /// parco — non su tutto — si puo' spegnere. Quattro differenze dal dialetto
@@ -63,7 +66,9 @@ pub enum ReasoningDialect {
     ///   (`summary_store`, `next_actions_deriver`, `wizard`) e prenderebbero 400
     ///   su ogni chiamata;
     /// - `max_tokens` e' deprecato in favore di `max_completion_tokens`
-    ///   (doc `/docs/api/chat`);
+    ///   (doc `/docs/api/chat`) — e' un fatto del FORNITORE, non del dialetto,
+    ///   e lo dichiara il costruttore di `KimiProvider` via
+    ///   [`OpenAiCompatClient::with_tetto_su_completion`];
     /// - Preserved Thinking: per `kimi-k3` e `kimi-k2.7-code` la doc prescrive
     ///   di rimandare indietro l'assistant "completo e inalterato,
     ///   `reasoning_content` compreso" (`/docs/guide/use-thinking-models`).
@@ -157,6 +162,14 @@ pub struct OpenAiCompatClient {
     /// `HTTP-Referer`/`X-Title` di attribuzione) non dipende dal verbo.
     /// Vuoto = nessun header extra, il default di tutti i fornitori diretti.
     extra_headers: Vec<(String, String)>,
+    /// QUESTO endpoint pretende il tetto di output in `max_completion_tokens`
+    /// invece del deprecato `max_tokens`. E' una proprieta' del FORNITORE, non
+    /// del dialetto reasoning: OpenAI ha deprecato `max_tokens` per l'intera
+    /// famiglia (doc API reference, "deprecated in favor of
+    /// max_completion_tokens"), anche per i modelli chat non-reasoning, e
+    /// Moonshot/Kimi idem (doc `/docs/api/chat`). Il dialetto continua a
+    /// governare temperatura, `reasoning_effort` e `extra_body.thinking`.
+    tetto_su_completion: bool,
 }
 
 /// TTL della cache delle preferenze di fornitore (come `policy_engine`/`cooldown`).
@@ -239,6 +252,11 @@ impl OpenAiCompatClient {
             upstream_order: TtlCache::new(UPSTREAM_AFFINITY_TTL),
             ultimo_ordine_letto: Arc::new(DashMap::new()),
             extra_headers: Vec::new(),
+            // Il default e' il campo standard del dialetto: la deprecazione di
+            // `max_tokens` e' di singoli fornitori (openai, kimi), non del
+            // dialetto condiviso — mistral/groq/openrouter/deepseek/perplexity
+            // documentano `max_tokens` e basta.
+            tetto_su_completion: false,
         }
     }
 
@@ -246,6 +264,16 @@ impl OpenAiCompatClient {
     /// portare (dal registry, mig 0714). Vuoto = nessun header aggiuntivo.
     pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
         self.extra_headers = headers;
+        self
+    }
+
+    /// Dichiara che questo FORNITORE ha deprecato `max_tokens`: il tetto di
+    /// output parte in `max_completion_tokens` su ogni richiesta, anche coi
+    /// modelli non-reasoning (vedi [`Self::tetto_su_completion`]). Lo chiamano
+    /// i costruttori di `OpenAiProvider` e `KimiProvider`; per gli altri il
+    /// default resta `max_tokens`.
+    pub fn with_tetto_su_completion(mut self) -> Self {
+        self.tetto_su_completion = true;
         self
     }
 
@@ -405,8 +433,14 @@ impl OpenAiCompatClient {
         reasoning: &ResolvedReasoning,
     ) -> ChatCompletionRequest {
         let ordine = self.upstream_order_for(&req.model).await;
-        let mut body =
-            build_request_body(req, stream, reasoning, self.cache_keying, ordine.as_deref());
+        let mut body = build_request_body(
+            req,
+            stream,
+            reasoning,
+            self.cache_keying,
+            ordine.as_deref(),
+            self.tetto_su_completion,
+        );
         if provider_requires_user_or_tool_last(&self.provider_name) {
             strip_trailing_assistant(&mut body.messages);
         }
@@ -924,12 +958,15 @@ impl SseParser {
 /// conteggio token nell'ultimo chunk (parita' col TS).
 ///
 /// `reasoning` governa le differenze di dialetto (regola L, punto unico):
-///   - [`ReasoningDialect::None`] (Mistral, vLLM, OpenAI chat): `max_tokens`
-///     standard, nessun parametro reasoning;
-///   - [`ReasoningDialect::OpenAiReasoning`] (o-series/gpt-5): `max_tokens`
-///     diventa `max_completion_tokens`, temperatura omessa (non accettata) e si
-///     invia `reasoning_effort` se presente;
+///   - [`ReasoningDialect::None`] (Mistral, vLLM, OpenAI chat): nessun
+///     parametro reasoning;
+///   - [`ReasoningDialect::OpenAiReasoning`] (o-series/gpt-5): temperatura
+///     omessa (non accettata) e `reasoning_effort` inviato se presente;
 ///   - [`ReasoningDialect::DeepSeek`]: `extra_body.thinking.type` enabled/disabled.
+///
+/// `tetto_su_completion` NON e' del dialetto: e' la dichiarazione del CLIENT
+/// che il fornitore ha deprecato `max_tokens` (openai per l'intero parco, kimi;
+/// vedi [`OpenAiCompatClient::tetto_su_completion`]).
 /// Identificatore stabile del gruppo di chiamate che condividono il prefisso,
 /// per i soli endpoint [`PromptCacheKeying::RequiresKey`].
 ///
@@ -1008,6 +1045,7 @@ fn build_request_body(
     reasoning: &ResolvedReasoning,
     cache_keying: PromptCacheKeying,
     upstream_order: Option<&[String]>,
+    tetto_su_completion: bool,
 ) -> ChatCompletionRequest {
     let mut messages: Vec<WireMessage> = req.messages.iter().map(to_wire_message).collect();
 
@@ -1054,18 +1092,21 @@ fn build_request_body(
             .collect()
     });
 
-    // Tetto di output via `max_completion_tokens` invece di `max_tokens`, e
-    // temperatura NON inviata: due dialetti lo pretendono per ragioni diverse e
+    // Temperatura NON inviata: due dialetti la rifiutano per ragioni diverse e
     // il codice le tiene distinte, perche' il giorno in cui una delle due
     // cambia si tocca un predicato solo. o-series: l'API rifiuta la temperatura
-    // sui modelli reasoning. Kimi: la temperatura e' un valore FISSO del modello
-    // e "passing any other value returns an error", mentre `max_tokens` e'
-    // deprecato (doc Moonshot, vedi [`ReasoningDialect::Kimi`]).
-    let tetto_su_completion = matches!(
+    // sui modelli reasoning. Kimi: la temperatura e' un valore FISSO del
+    // modello e "passing any other value returns an error" (doc Moonshot, vedi
+    // [`ReasoningDialect::Kimi`]).
+    let temperatura_rifiutata = matches!(
         reasoning.dialect,
         ReasoningDialect::OpenAiReasoning | ReasoningDialect::Kimi
     );
-    let temperatura_rifiutata = tetto_su_completion;
+    // Il tetto di output lo decide invece il CLIENT, non il dialetto: la
+    // deprecazione di `max_tokens` e' del FORNITORE per l'intero parco (openai
+    // anche sui chat non-reasoning, kimi idem), e finche' viveva nel predicato
+    // qui sopra un `gpt-4o-mini` — dialetto base — partiva col campo che la
+    // doc dichiara deprecato. Vedi [`OpenAiCompatClient::tetto_su_completion`].
     let (max_tokens, max_completion_tokens) = if tetto_su_completion {
         (None, req.max_tokens)
     } else {
@@ -1785,7 +1826,8 @@ pub(crate) struct ChatCompletionRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
-    /// Tetto di output per i modelli o-series/gpt-5 (al posto di `max_tokens`).
+    /// Tetto di output per i fornitori che hanno deprecato `max_tokens`
+    /// (openai — intero parco, chat compresi — e kimi).
     #[serde(rename = "max_completion_tokens", skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
     /// Livello di reasoning (low/medium/high) per i modelli o-series.
@@ -2172,6 +2214,7 @@ mod tests {
                 &ResolvedReasoning::none(),
                 PromptCacheKeying::ProviderManaged,
                 None,
+                false,
             );
             serde_json::to_value(body).expect("serializza")
         };
@@ -2302,6 +2345,7 @@ mod tests {
             &ResolvedReasoning::none(),
             PromptCacheKeying::RequiresKey,
             None,
+            false,
         ))
         .expect("serializza");
         let chiave = con
@@ -2322,6 +2366,7 @@ mod tests {
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
             None,
+            false,
         ))
         .expect("serializza");
         assert!(senza.get("prompt_cache_key").is_none());
@@ -2340,6 +2385,7 @@ mod tests {
             &ResolvedReasoning::none(),
             PromptCacheKeying::RequiresSessionId,
             None,
+            false,
         ))
         .expect("serializza");
         assert_eq!(sticky.get("session_id").and_then(|v| v.as_str()), Some(chiave));
@@ -2384,6 +2430,7 @@ mod tests {
             &ResolvedReasoning::none(),
             PromptCacheKeying::RequiresSessionId,
             Some(&ordine),
+            false,
         ))
         .expect("serializza");
         let p = instradatore
@@ -2418,6 +2465,7 @@ mod tests {
                 &ResolvedReasoning::none(),
                 keying,
                 Some(&ordine),
+                false,
             ))
             .expect("serializza");
             assert!(
@@ -2435,6 +2483,7 @@ mod tests {
             &ResolvedReasoning::none(),
             PromptCacheKeying::RequiresSessionId,
             Some(&[]),
+            false,
         ))
         .expect("serializza");
         assert!(
@@ -2871,6 +2920,7 @@ mod tests {
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
             None,
+            false,
         );
         let json = serde_json::to_value(&body).unwrap();
 
@@ -2927,7 +2977,14 @@ mod tests {
             enabled: true,
             effort: None,
         };
-        let body = build_request_body(&req, false, &deepseek, PromptCacheKeying::ProviderManaged, None);
+        let body = build_request_body(
+            &req,
+            false,
+            &deepseek,
+            PromptCacheKeying::ProviderManaged,
+            None,
+            false,
+        );
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(
             json["messages"][0]["reasoning_content"], "ho ragionato cosi'",
@@ -2946,6 +3003,7 @@ mod tests {
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
             None,
+            false,
         );
         let json_base = serde_json::to_value(&body_base).unwrap();
         assert!(
@@ -2980,6 +3038,7 @@ mod tests {
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
             None,
+            false,
         ))
             .unwrap();
         assert_eq!(json["tool_choice"], "required");
@@ -2991,6 +3050,7 @@ mod tests {
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
             None,
+            false,
         ))
             .unwrap();
         assert_eq!(json["tool_choice"]["type"], "function");
@@ -3009,6 +3069,7 @@ mod tests {
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
             None,
+            false,
         ))
             .unwrap();
         assert!(json.get("tool_choice").is_none());
@@ -3021,6 +3082,7 @@ mod tests {
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
             None,
+            false,
         ))
             .unwrap();
         assert!(json2.get("tool_choice").is_none());
@@ -3035,6 +3097,7 @@ mod tests {
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
             None,
+            false,
         );
         let json = serde_json::to_value(&body).unwrap();
 
@@ -3043,19 +3106,34 @@ mod tests {
     }
 
     // --- Dialetti reasoning (passo 2) --------------------------------------
+    //
+    // Nei due test o-series il tetto (`true`) e' passato a mano perche' in
+    // produzione la coppia nasce cosi': l'unico produttore del dialetto
+    // OpenAiReasoning e' OpenAiProvider, il cui client dichiara SEMPRE il
+    // tetto su completion. La catena vera provider -> corpo e' coperta dai
+    // test in openai.rs e mistral.rs (regola O); qui si fissa il criterio del
+    // body a coppie gia' risolte.
 
     #[test]
-    fn dialetto_openai_reasoning_usa_max_completion_tokens() {
+    fn dialetto_openai_reasoning_omette_temperatura_e_invia_effort() {
         let req = sample_request();
         let reasoning = ResolvedReasoning {
             dialect: ReasoningDialect::OpenAiReasoning,
             enabled: true,
             effort: Some("high".to_string()),
         };
-        let json =
-            serde_json::to_value(build_request_body(&req, false, &reasoning, PromptCacheKeying::ProviderManaged, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            &reasoning,
+            PromptCacheKeying::ProviderManaged,
+            None,
+            true,
+        ))
+        .unwrap();
 
-        // max_tokens -> max_completion_tokens; temperatura omessa; effort inviato.
+        // Dialetto: temperatura omessa, effort inviato. Client: il tetto in
+        // max_completion_tokens.
         assert!(json.get("max_tokens").is_none());
         assert_eq!(json["max_completion_tokens"], 256);
         assert!(json.get("temperature").is_none());
@@ -3070,8 +3148,15 @@ mod tests {
             enabled: true,
             effort: None,
         };
-        let json =
-            serde_json::to_value(build_request_body(&req, false, &reasoning, PromptCacheKeying::ProviderManaged, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            &reasoning,
+            PromptCacheKeying::ProviderManaged,
+            None,
+            true,
+        ))
+        .unwrap();
         assert_eq!(json["max_completion_tokens"], 256);
         // Nessun effort configurato: il campo non c'e' (default del modello).
         assert!(json.get("reasoning_effort").is_none());
@@ -3085,8 +3170,15 @@ mod tests {
             enabled: true,
             effort: None,
         };
-        let json =
-            serde_json::to_value(build_request_body(&req, false, &reasoning, PromptCacheKeying::ProviderManaged, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            &reasoning,
+            PromptCacheKeying::ProviderManaged,
+            None,
+            false,
+        ))
+        .unwrap();
 
         // extra_body appiattito nel body radice: thinking.type=enabled.
         assert_eq!(json["thinking"]["type"], "enabled");
@@ -3103,8 +3195,15 @@ mod tests {
             enabled: false,
             effort: None,
         };
-        let json =
-            serde_json::to_value(build_request_body(&req, false, &reasoning, PromptCacheKeying::ProviderManaged, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            &reasoning,
+            PromptCacheKeying::ProviderManaged,
+            None,
+            false,
+        ))
+        .unwrap();
         assert_eq!(json["thinking"]["type"], "disabled");
     }
 
@@ -3519,6 +3618,7 @@ mod tests {
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
             None,
+            false,
         ))
             .unwrap();
 
@@ -3543,6 +3643,7 @@ mod tests {
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
             None,
+            false,
         ))
             .unwrap();
         let arr = json["messages"][0]["content"].as_array().unwrap();
@@ -3561,6 +3662,7 @@ mod tests {
             &ResolvedReasoning::none(),
             PromptCacheKeying::ProviderManaged,
             None,
+            false,
         ))
             .unwrap();
         assert!(json["messages"][0]["content"].is_string());

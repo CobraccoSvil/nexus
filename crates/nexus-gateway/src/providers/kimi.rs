@@ -166,8 +166,13 @@ impl KimiProvider {
     ) -> Self {
         let base_url = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         Self {
+            // TETTO: Moonshot dichiara `max_tokens` deprecato in favore di
+            // `max_completion_tokens` (doc `/docs/api/chat`). E' un fatto del
+            // FORNITORE e sta sul client, non sul dialetto reasoning — che
+            // continua a governare temperatura, round-trip e spegnimento.
             client: OpenAiCompatClient::new(http, base_url, api_key, PROVIDER_NAME)
-                .with_prompt_cache_keying(PromptCacheKeying::RequiresKey),
+                .with_prompt_cache_keying(PromptCacheKeying::RequiresKey)
+                .with_tetto_su_completion(),
             db,
             spegnibile: TtlCache::new(CATALOG_TTL),
         }
