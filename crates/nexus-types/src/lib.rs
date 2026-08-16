@@ -6,7 +6,9 @@ use uuid::Uuid;
 pub use nexus_auth::Claims;
 
 mod templates;
-pub use templates::{get_template_or_default, TemplateCache};
+pub use templates::{
+    get_template_or_default, TemplateCache, ENGLISH_VARIANTS_SETTING_KEY, ENGLISH_VARIANT_SUFFIX,
+};
 
 pub mod fs_browse;
 pub use fs_browse::{
