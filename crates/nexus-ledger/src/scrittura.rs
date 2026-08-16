@@ -340,9 +340,17 @@ type InsertChiusura<'q> =
 /// cinque importi, la currency. L'ORDINE e' il contratto con le SQL gemelle,
 /// che condividono lo stesso prefisso di colonne fino a `currency` ($16);
 /// cio' che segue ($17+) lo lega il chiamante.
+///
+/// `identity` e' un'opzione perche' una delle due righe puo' nascere senza
+/// titolare (mig 0711): l'identita' e' una COPPIA, e `None` la lascia NULL su
+/// entrambe le colonne — mezza identita' non e' rappresentabile ne' qui ne' a
+/// schema. Quale delle due INSERT possa permetterselo NON si decide qui: lo
+/// impone il CHECK `ai_usage_ledger_identita_solo_su_discarded_check`, e
+/// `record_tokens` non offre nemmeno la possibilita' di provarci (la sua firma
+/// pretende un'`Identity`).
 fn bind_chiusura<'q>(
     q: InsertChiusura<'q>,
-    identity: Identity,
+    identity: Option<Identity>,
     run_uuid: Option<Uuid>,
     provider: &str,
     model: &str,
@@ -350,8 +358,8 @@ fn bind_chiusura<'q>(
     costo: &CostBreakdown,
     currency: &str,
 ) -> InsertChiusura<'q> {
-    q.bind(identity.user_id)
-        .bind(identity.project_id)
+    q.bind(identity.map(|i| i.user_id))
+        .bind(identity.map(|i| i.project_id))
         .bind(run_uuid)
         .bind(provider.to_string())
         .bind(model.to_string())
@@ -378,7 +386,7 @@ fn bind_chiusura<'q>(
 async fn esegui_chiusura(
     db: &PgPool,
     sql: &'static str,
-    identity: Identity,
+    identity: Option<Identity>,
     provider: &str,
     model: &str,
     tokens: &TokenUsage,
@@ -437,7 +445,7 @@ pub async fn record_tokens(
     );
 
     let res = esegui_chiusura(
-        db, SQL_INSERT_FINALIZED, identity, provider, model, tokens,
+        db, SQL_INSERT_FINALIZED, Some(identity), provider, model, tokens,
         &costo, &currency, None, request_id, details,
     )
     .await;
@@ -532,9 +540,23 @@ const SQL_INSERT_DISCARDED: &str = r#"
 /// risposta al chiamante non si interrompe. A differenza di `record_tokens`
 /// non ritorna una [`LedgerEntry`]: nessun chiamante deve decidere un
 /// "non addebitare due volte" su una riga che non e' mai finalizzabile.
+///
+/// `identity = None` e' la chiamata di SISTEMA: la richiesta non portava
+/// un'identita' contabile utilizzabile e la riga nasce senza titolare (mig
+/// 0711, colonne NULL). E' l'unica INSERT a cui lo schema lo consente, e la
+/// ragione e' contabile e non prudenziale: uno scarto non e' coperto da nessuna
+/// prenotazione — la prenotazione di chi ha chiamato viene finalizzata coi
+/// numeri del tentativo RIUSCITO — quindi scriverlo non puo' duplicare un
+/// addebito. Sul percorso di successo lo stesso silenzio resta, e resta
+/// dichiarato ([`crate::LedgerOutcome::NoIdentity`]): li' "identita' assente"
+/// e "identita' persa fra i due processi" hanno la stessa faccia, e la seconda
+/// ha gia' una riga altrove.
+///
+/// Il costo NON dipende dal titolare: la riga porta comunque provider, modello,
+/// token e importo, che sono cio' che serve a misurare un fornitore.
 pub async fn record_discarded(
     db: &PgPool,
-    identity: Identity,
+    identity: Option<Identity>,
     provider: &str,
     model: &str,
     reason: DiscardReason,
@@ -956,4 +978,51 @@ mod tests {
         }
     }
 
+    /// Il confine della mig 0711 lo tiene lo SCHEMA, non la buona volonta' di
+    /// chi scrive: senza titolare si puo' nascere solo `discarded`, e
+    /// l'identita' e' una coppia.
+    ///
+    /// Qui la INSERT e' grezza, e non e' una violazione della regola O: le due
+    /// righe che questo test prova a scrivere NON sono producibili dal codice
+    /// (`record_tokens` pretende un'`Identity`, `bind_chiusura` lega sempre
+    /// entrambe le colonne dalla stessa opzione), quindi l'unico modo di
+    /// dimostrare che il vincolo regge e' chiederlo al database. Se un domani
+    /// qualcuno rendesse quelle forme producibili, e' questo CHECK a fermarlo:
+    /// il test verifica che ci sia.
+    ///
+    /// MUTAZIONE: togliendo dalla 0711 il CHECK
+    /// `ai_usage_ledger_identita_solo_su_discarded_check` la prima INSERT passa
+    /// e il test rosseggia — ed e' il caso in cui una riga `finalized` senza
+    /// titolare puo' affiancare la prenotazione che mcp-core sta per
+    /// finalizzare, cioe' il doppio addebito del 2026-07-27 in forma nuova.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn senza_titolare_si_nasce_solo_discarded(pool: PgPool) {
+        let finalized_senza_titolare = sqlx::query(
+            "INSERT INTO ai_usage_ledger (user_id, project_id, provider, model, currency, status) \
+             VALUES (NULL, NULL, 'mistral', 'm1', 'USD', 'finalized')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            finalized_senza_titolare.is_err(),
+            "una riga finalized senza titolare non deve essere rappresentabile: \
+             potrebbe raddoppiare l'addebito di una prenotazione gia' aperta"
+        );
+
+        // Utente VERO: se fosse inventato la INSERT fallirebbe per la FK, e il
+        // test sarebbe verde senza dire niente sull'atomicita' (regola O).
+        let id = crate::test_support::identita(&pool).await;
+        let mezza_identita = sqlx::query(
+            "INSERT INTO ai_usage_ledger (user_id, project_id, provider, model, currency, \
+                                          status, discard_reason) \
+             VALUES ($1, NULL, 'mistral', 'm1', 'USD', 'discarded', 'degenerate_hollow')",
+        )
+        .bind(id.user_id)
+        .execute(&pool)
+        .await;
+        assert!(
+            mezza_identita.is_err(),
+            "l'identita' contabile e' una COPPIA: mezza non deve essere scrivibile"
+        );
+    }
 }

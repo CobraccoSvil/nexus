@@ -44,6 +44,72 @@ Main logic: `crates/mcp-core/src/billing.rs` and `crates/mcp-core/src/orchestrat
 
 This guarantees each AI execution attempt leaves a billing trail.
 
+## Orizzonte temporale del ledger: la contabilita' segue la vita del progetto
+
+`ai_usage_ledger.project_id` ha un `FOREIGN KEY ... REFERENCES projects(id) ON
+DELETE CASCADE` (e lo stesso vale per `user_id` verso `users`). **Cancellare un
+progetto porta via anche tutta la sua contabilita'**, e con essa ogni misura
+economica che vi si appoggiava.
+
+Non e' un difetto ed e' voluto (isolamento per progetto, regola E): va saputo
+perche' il sintomo e' indistinguibile da una perdita di dati. Misurato il
+13/08/2026 sul meta vivo: `ai_usage_ledger` a zero righe subito dopo la
+rimozione dei progetti di test, con `pg_stat_user_tables` che riportava 37.322
+tuple cancellate — nessuna delle quali da un `DELETE` sul ledger. La stessa
+cascata svuota le altre 40 tabelle figlie di `projects` (fra cui
+`nexus_learned_instructions`, `nexus_port_allocations`, `file_mutations`).
+
+Conseguenza pratica per chi analizza i costi: **l'orizzonte di qualunque
+aggregato e' la vita del progetto piu' vecchio ancora esistente**. Domande come
+"quanto abbiamo speso questo mese" non sono piu' rispondibili dopo una pulizia
+dei progetti, e una serie storica che deve sopravvivere va estratta prima
+(oppure letta da `ai_usage_analytics_view`, che pero' aggrega le stesse righe e
+sparisce con loro). Le sole righe immuni sono quelle senza titolare (sezione
+seguente): con `project_id` NULL nessuna cascata le raggiunge.
+
+## Spesa senza titolare contabile (mig 0711)
+
+Il gateway scrive nel ledger solo se la richiesta porta un'identita' contabile
+utilizzabile: due UUID in `metadata.tenant_id` (= progetto) e `metadata.user_id`,
+criterio unico `nexus_ledger::identity_from_metadata`. Le chiamate di SISTEMA non
+ne hanno: `GwMetadata::default` (`NeuralCoreClient::generate_completion`) le manda
+vuote, e i percorsi interni (`rolling_summary`, `choices_extractor`) mandano i
+segnaposto `internal`/`system`, che UUID non sono.
+
+Dalla mig 0711 le due colonne sono NULLable e valgono queste regole:
+
+- `user_id` e `project_id` sono NULL **insieme o mai** (CHECK di atomicita': e'
+  la stessa forma del tipo `nexus_ledger::Identity`);
+- l'assenza e' ammessa **solo su `status = 'discarded'`** (CHECK). Uno scarto non
+  e' coperto da nessuna prenotazione — quella di mcp-core viene finalizzata coi
+  numeri del tentativo riuscito — quindi scriverlo non puo' duplicare un
+  addebito. Sul percorso di SUCCESSO il gateway continua a non scrivere e a
+  dichiararlo (`LedgerOutcome::NoIdentity`): li' "identita' assente" e "identita'
+  persa fra i due processi" (`Declaration::audit` -> `IdentitaPersa`) hanno la
+  stessa faccia, e nel secondo caso una riga in piu' sarebbe il doppio addebito
+  del 2026-07-27 in forma nuova;
+- le **quote non le vedono**, senza bisogno di alcun filtro: `usage_for_quotas`
+  aggancia con `l.user_id = q.user_id`, e in SQL un confronto con NULL non e' mai
+  vero. Verificato da `una_riga_senza_titolare_non_consuma_la_quota_di_nessuno`
+  (`crates/nexus-ledger/src/quote.rs`), non assunto.
+
+Cosa chiedere a quelle righe:
+
+```sql
+-- spesa di sistema (nessun titolare), per fornitore e causa
+SELECT provider, model, discard_reason,
+       count(*) AS chiamate, sum(total_tokens) AS token, sum(total_cost) AS costo
+  FROM ai_usage_ledger
+ WHERE user_id IS NULL
+ GROUP BY provider, model, discard_reason
+ ORDER BY costo DESC;
+```
+
+`ai_usage_analytics_view` (mig 0702) aggrega per `(provider, model, ora)` senza
+nominare l'identita': le colonne `discarded_*` includono quindi anche la spesa di
+sistema, ed e' quella la lettura giusta per "un fornitore che costa poco ma
+fallisce spesso conviene davvero?".
+
 ## API Endpoints
 
 ### Admin
