@@ -68,6 +68,11 @@ pub struct SlotsRoutingEntry {
     pub required_capabilities: Vec<String>,
     pub requires_tool_use: bool,
     pub cost_direction: String,
+    /// La capability che DEFINISCE il compito (mig 0722, F3-02): e' quella che
+    /// la delega al servizio unico passa a `ModelRequest.capability`. `None` =
+    /// nessun filtro. Le `required_capabilities` sopra restano il vocabolario
+    /// dello scoring del percorso storico (flag OFF) e muoiono col flip.
+    pub base_capability: Option<String>,
 }
 
 /// Requisito di routing derivato dal lookup di una chiave slot. Non contiene
@@ -80,6 +85,9 @@ pub struct SlotRequirement {
     pub required_capabilities: Vec<String>,
     pub requires_tool_use: bool,
     pub cost_direction: String,
+    /// Vedi [`SlotsRoutingEntry::base_capability`]: la capability del compito
+    /// per la delega al servizio unico (mig 0722, F3-02).
+    pub base_capability: Option<String>,
 }
 
 /// Matrice slots in memoria. Cache TTL 60s, refresh background.
@@ -145,6 +153,7 @@ impl SlotsRoutingMatrix {
             required_capabilities: e.required_capabilities.clone(),
             requires_tool_use: e.requires_tool_use,
             cost_direction: e.cost_direction.clone(),
+            base_capability: e.base_capability.clone(),
         })
     }
 
@@ -248,10 +257,11 @@ async fn fetch_slots_from_db(db: &PgPool) -> Result<SlotsRoutingMatrix, String> 
         Vec<String>,
         bool,
         String,
+        Option<String>,
     )> = sqlx::query_as(
         r#"SELECT action_verb, target_type, framework, scope,
                       preferred_tier, required_capabilities, requires_tool_use,
-                      cost_direction
+                      cost_direction, base_capability
                  FROM nexus_routing_slots_matrix
                 WHERE is_active = TRUE"#,
     )
@@ -261,7 +271,7 @@ async fn fetch_slots_from_db(db: &PgPool) -> Result<SlotsRoutingMatrix, String> 
     let entries: Vec<SlotsRoutingEntry> = rows
         .into_iter()
         .map(
-            |(av, tt, fw, sc, tier, caps, tool_use, cost)| SlotsRoutingEntry {
+            |(av, tt, fw, sc, tier, caps, tool_use, cost, base)| SlotsRoutingEntry {
                 action_verb: av,
                 target_type: tt,
                 framework: fw,
@@ -270,6 +280,7 @@ async fn fetch_slots_from_db(db: &PgPool) -> Result<SlotsRoutingMatrix, String> 
                 required_capabilities: caps,
                 requires_tool_use: tool_use,
                 cost_direction: cost,
+                base_capability: base,
             },
         )
         .collect();
@@ -358,6 +369,13 @@ mod tests {
             required_capabilities: caps.iter().map(|s| s.to_string()).collect(),
             requires_tool_use: true,
             cost_direction: cost.into(),
+            // Stessa derivazione del seed di mig 0722: 'code' se presente,
+            // altrimenti il primo elemento, None per gli array vuoti.
+            base_capability: caps
+                .iter()
+                .find(|c| **c == "code")
+                .or(caps.first())
+                .map(|s| s.to_string()),
         }
     }
 
@@ -419,6 +437,24 @@ mod tests {
         };
         let req = m.lookup(&slots).unwrap();
         assert_eq!(req.preferred_tier, "medium");
+    }
+
+    #[test]
+    fn lookup_porta_base_capability_nel_requisito() {
+        // mig 0722 (F3-02): la capability che DEFINISCE il compito viaggia dal
+        // lookup fino al requisito che la delega passa al servizio unico.
+        // MUTAZIONE: se `match_probe` smette di copiarla (base_capability: None
+        // fisso), questo test rosseggia.
+        let m = make_test_matrix();
+        let slots = ActionSlots {
+            action_verb: "resolve".into(),
+            target_type: "tests".into(),
+            framework: "playwright".into(),
+            scope: "multi_file".into(),
+            confidence: 0.9,
+        };
+        let req = m.lookup(&slots).unwrap();
+        assert_eq!(req.base_capability.as_deref(), Some("code"));
     }
 
     #[test]
