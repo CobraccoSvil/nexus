@@ -51,10 +51,20 @@ COMMENT ON TABLE ai_price_window IS
 CREATE UNIQUE INDEX IF NOT EXISTS ai_price_window_chiave
   ON ai_price_window (provider, COALESCE(model, '*'), start_utc, end_utc);
 
--- (2) Seed: le due fasce peak di deepseek, valide per tutti i suoi modelli.
+-- (2) Seed: le due fasce peak di deepseek, PER MODELLO e non a jolly. La
+-- finestra vale solo dove il prezzo BASE e' stato ri-basato all'off-peak (le
+-- due righe curate al punto 4): un jolly di provider moltiplicherebbe x2 anche
+-- le righe legacy (deepseek-chat, r1, v3...), che portano il prezzo flat del
+-- sync LiteLLM e NON l'off-peak — in fascia peak il ledger le fatturerebbe
+-- il doppio di una base sbagliata, e senza lucchetto il sync potrebbe
+-- riscriverle mentre la finestra continua a moltiplicarle. L'invariante
+-- «catalogo = base off-peak» vale solo dove il lock lo custodisce, e la
+-- finestra deve coprire esattamente quel perimetro (review avversaria 16/08).
 INSERT INTO ai_price_window (provider, model, start_utc, end_utc, multiplier, label) VALUES
-  ('deepseek', NULL, TIME '01:00', TIME '04:00', 2.0, 'peak'),
-  ('deepseek', NULL, TIME '06:00', TIME '10:00', 2.0, 'peak')
+  ('deepseek', 'deepseek-v4-flash', TIME '01:00', TIME '04:00', 2.0, 'peak'),
+  ('deepseek', 'deepseek-v4-flash', TIME '06:00', TIME '10:00', 2.0, 'peak'),
+  ('deepseek', 'deepseek-v4-pro',   TIME '01:00', TIME '04:00', 2.0, 'peak'),
+  ('deepseek', 'deepseek-v4-pro',   TIME '06:00', TIME '10:00', 2.0, 'peak')
 ON CONFLICT (provider, COALESCE(model, '*'), start_utc, end_utc) DO NOTHING;
 
 -- (3) Il lucchetto sui prezzi curati. Protegge le righe qui sotto dal giorno in
