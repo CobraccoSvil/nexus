@@ -181,11 +181,26 @@ pub fn tetto_per(visibile: u32, fatti: &FattiTetto) -> TettoOutput {
             let totale = limita(d.max(visibile.saturating_mul(MARGINE_RAGIONAMENTO)));
             TettoOutput::Dichiarato { visibile, totale }
         }
-        // Nessun default: il pensiero c'e' (o potrebbe esserci) e nessuno ha
-        // dichiarato quanto gli serve. Un numero inventato qui e' esattamente il
-        // difetto che questo modulo esiste per chiudere.
-        _ => TettoOutput::NonVincolabile {
-            motivo: "il modello ragiona e il catalogo non dichiara quanto output regge",
+        // Nessun default curato, ma il FORNITORE dichiara il proprio massimo
+        // (dal wire di discovery, mig 0716): il margine e' lo stesso del ramo
+        // curato (`visibile * MARGINE_RAGIONAMENTO`), col massimo dichiarato
+        // come tetto duro. NON e' un numero inventato: il moltiplicatore e' il
+        // criterio gia' misurato (~4x reale, fattore 8) e il limite superiore
+        // e' una dichiarazione del fornitore. Senza questo ramo, verso un
+        // modello openrouter da discovery non parte alcun `max_tokens` e la
+        // PRENOTAZIONE sale al massimo del modello (65536): un 402 su crediti
+        // bassi per una richiesta da 512 token visibili.
+        _ => match fatti.massimo_fornitore {
+            Some(h) if h > 0 => TettoOutput::Dichiarato {
+                visibile,
+                totale: visibile.saturating_mul(MARGINE_RAGIONAMENTO).min(h),
+            },
+            // Nessun fatto: il pensiero c'e' (o potrebbe esserci) e nessuno ha
+            // dichiarato quanto gli serve. Un numero inventato qui e'
+            // esattamente il difetto che questo modulo esiste per chiudere.
+            _ => TettoOutput::NonVincolabile {
+                motivo: "il modello ragiona e il catalogo non dichiara quanto output regge",
+            },
         },
     }
 }
@@ -342,6 +357,42 @@ mod tests {
         assert_eq!(
             RichiestaOutput::Visibile(256).tetto(&ricchi).max_tokens(),
             Some(8192)
+        );
+    }
+
+    /// IL RAMO NUOVO (mig 0716): nessun default curato, ma il FORNITORE
+    /// dichiara il proprio massimo nel listing di discovery. E' la condizione
+    /// dei modelli openrouter/google scoperti a runtime: prima usciva
+    /// `NonVincolabile` e verso quei modelli non partiva alcun `max_tokens`,
+    /// con la prenotazione al massimo del modello.
+    ///
+    /// Il margine e' lo stesso del ramo curato (`visibile * 8`), col massimo
+    /// dichiarato come tetto duro; quando il dichiarato e' PIU' stretto del
+    /// margine, vince il dichiarato (oltre e' un 400/402).
+    ///
+    /// MUTAZIONE: rimuovere il ramo (tornare a `NonVincolabile` su default
+    /// assente) -> entrambi gli assert cadono con `None`.
+    #[test]
+    fn il_massimo_dichiarato_dal_fornitore_basta_a_vincolare() {
+        let dal_wire = FattiTetto {
+            ragiona: None,
+            default_output: None,
+            massimo_fornitore: Some(65_536),
+        };
+        assert_eq!(
+            tetto_per(512, &dal_wire).max_tokens(),
+            Some(512 * MARGINE_RAGIONAMENTO),
+            "il margine del ragionamento sotto il tetto dichiarato"
+        );
+        let stretto = FattiTetto {
+            ragiona: None,
+            default_output: None,
+            massimo_fornitore: Some(1000),
+        };
+        assert_eq!(
+            tetto_per(512, &stretto).max_tokens(),
+            Some(1000),
+            "il dichiarato del fornitore ha l'ultima parola anche qui"
         );
     }
 

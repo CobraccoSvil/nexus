@@ -33,10 +33,11 @@ pub struct ModelMeta {
     /// Finestra di contesto in token dichiarata dal provider, se esposta.
     pub context_window: Option<i64>,
     /// Tetto di output in token DICHIARATO DAL PROVIDER nel listing
-    /// (`outputTokenLimit` di Google e' oggi l'unico che lo espone): `None`
-    /// quando l'API non lo dichiara. MAI inventato a valle (regole G/H): un
-    /// tetto stretto indovinato e' cio' che produce il turno vuoto fatturato
-    /// (vedi [[tetto-di-output]] e [[dichiarazione_fornitore]] in CLAUDE.md).
+    /// (`outputTokenLimit` di Google; `top_provider.max_completion_tokens` di
+    /// OpenRouter, misurato sul body vero il 16/08/2026): `None` quando l'API
+    /// non lo dichiara. MAI inventato a valle (regole G/H): un tetto stretto
+    /// indovinato e' cio' che produce il turno vuoto fatturato (vedi
+    /// [[tetto-di-output]] e [[dichiarazione_fornitore]] in CLAUDE.md).
     pub output_token_limit: Option<i64>,
 }
 

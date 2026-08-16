@@ -983,6 +983,12 @@ mod provider_names_tests {
         std::collections::HashMap::new()
     }
 
+    /// Nessun saldo osservato: la mappa vuota e' lo stato di partenza di ogni
+    /// provider (regola Q: l'assenza e' assenza, non uno 0).
+    fn saldi_vuoti() -> std::collections::HashMap<String, SaldoOsservato> {
+        std::collections::HashMap::new()
+    }
+
     fn health_row(healthy: bool, error_kind: Option<&str>, error_message: Option<&str>) -> ProviderHealthRow {
         ProviderHealthRow {
             provider: "deepseek".to_string(),
@@ -1010,7 +1016,7 @@ mod provider_names_tests {
         let cooldown_map = std::collections::HashMap::new(); // cooldown scaduto/mai applicato
         let api_keys = std::collections::HashMap::new();
 
-        let entry = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys, &catalog_facts());
+        let entry = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys, &catalog_facts(), &saldi_vuoti());
 
         assert_eq!(entry["healthy"], json!(false));
         assert_eq!(entry["error_kind"], json!("timeout"));
@@ -1034,7 +1040,7 @@ mod provider_names_tests {
         );
         let api_keys = std::collections::HashMap::new();
 
-        let entry = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys, &catalog_facts());
+        let entry = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys, &catalog_facts(), &saldi_vuoti());
 
         assert_eq!(entry["error"], json!("rate limit raggiunto ora"));
         assert_eq!(entry["cooldown_seconds_remaining"], json!(42));
@@ -1048,10 +1054,43 @@ mod provider_names_tests {
         let cooldown_map = std::collections::HashMap::new();
         let api_keys = std::collections::HashMap::new();
 
-        let entry = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys, &catalog_facts());
+        let entry = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys, &catalog_facts(), &saldi_vuoti());
 
         assert_eq!(entry["healthy"], json!(true));
         assert!(entry.get("error").is_none());
+    }
+
+    /// Il saldo osservato (mig 0719) entra sul wire SOLO quando osservato:
+    /// per il provider con osservazione compaiono i tre campi, per gli altri
+    /// nessuno — mai uno 0 di comodo (regola Q).
+    ///
+    /// MUTAZIONE che lo fa rosseggiare: scrivere `balance_usd: 0` quando la
+    /// mappa non ha il provider (il secondo assert vede il campo fantasma),
+    /// oppure smettere di copiare la fonte (il primo assert cade).
+    #[test]
+    fn saldo_osservato_compare_solo_quando_osservato() {
+        let health_map = std::collections::HashMap::new();
+        let cooldown_map = std::collections::HashMap::new();
+        let api_keys = std::collections::HashMap::new();
+        let quando = chrono::Utc::now();
+        let mut saldi = std::collections::HashMap::new();
+        saldi.insert(
+            "openrouter".to_string(),
+            SaldoOsservato {
+                balance_usd: 10.4,
+                observed_at: quando,
+                source: "auth_key_fallback".to_string(),
+            },
+        );
+
+        let con_saldo = build_provider_status_entry("openrouter", &health_map, &cooldown_map, &api_keys, &catalog_facts(), &saldi);
+        assert_eq!(con_saldo["balance_usd"], json!(10.4));
+        assert_eq!(con_saldo["balance_source"], json!("auth_key_fallback"));
+        assert_eq!(con_saldo["balance_observed_at"], json!(quando.to_rfc3339()));
+
+        let senza = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys, &catalog_facts(), &saldi);
+        assert!(senza.get("balance_usd").is_none(), "mai osservato = campo assente, non 0");
+        assert!(senza.get("balance_source").is_none());
     }
 }
 
@@ -1262,17 +1301,19 @@ async fn build_patched_providers(
     providers_patched
 }
 
-/// Le CINQUE fonti da cui si compone lo stato dei provider. Stanno insieme
-/// perche' i due handler che lo espongono le vogliono tutte e cinque, e
+/// Le SEI fonti da cui si compone lo stato dei provider. Stanno insieme
+/// perche' i due handler che lo espongono le vogliono tutte, e
 /// caricarle a mano in due punti significa che il giorno in cui se ne aggiunge
-/// una — com'e' appena successo con i fatti di catalogo — uno dei due risponde
-/// con meno informazione dell'altro senza che nulla fallisca (regola L).
+/// una — com'e' successo con i fatti di catalogo, e di nuovo col saldo
+/// osservato — uno dei due risponde con meno informazione dell'altro senza che
+/// nulla fallisca (regola L).
 struct FontiStatoProvider {
     health_map: std::collections::HashMap<String, ProviderHealthRow>,
     api_key_configured: std::collections::HashMap<String, bool>,
     cooldown_map: std::collections::HashMap<String, (u64, Option<String>)>,
     provider_names: Vec<String>,
     catalog_facts: std::collections::HashMap<String, Vec<crate::provider_readiness::ModelFact>>,
+    saldo_map: std::collections::HashMap<String, SaldoOsservato>,
 }
 
 impl FontiStatoProvider {
@@ -1283,14 +1324,69 @@ impl FontiStatoProvider {
         // Dipende dalle chiavi appena lette: l'ordine non e' cosmetico.
         let provider_names = provider_names_for_status(db, &api_key_configured).await;
         let catalog_facts = crate::provider_readiness::carica_fatti_catalogo(db).await;
+        let saldo_map = fetch_saldi_osservati(db).await;
         Self {
             health_map,
             api_key_configured,
             cooldown_map,
             provider_names,
             catalog_facts,
+            saldo_map,
         }
     }
+}
+
+/// Il saldo REALE osservato dall'endpoint del fornitore (worker
+/// `provider_balance_sync`, mig 0719). Presente SOLO per i provider con
+/// un'osservazione: l'assenza dalla mappa e' "mai osservato", mai uno 0 di
+/// comodo (regola Q).
+struct SaldoOsservato {
+    balance_usd: f64,
+    observed_at: chrono::DateTime<chrono::Utc>,
+    source: String,
+}
+
+/// Legge i saldi osservati da `provider_budget_remaining_view` (le tre colonne
+/// della mig 0719). Su un DB dove la migrazione non e' ancora applicata la
+/// query fallisce e la mappa resta vuota: il campo semplicemente non compare
+/// sul wire, che e' gia' il significato di "mai osservato".
+async fn fetch_saldi_osservati(
+    db: &sqlx::PgPool,
+) -> std::collections::HashMap<String, SaldoOsservato> {
+    let rows: Vec<(String, f64, chrono::DateTime<chrono::Utc>, String)> = sqlx::query_as(
+        "SELECT provider, last_known_balance_usd::float8, balance_observed_at, balance_source
+           FROM provider_budget_remaining_view
+          WHERE last_known_balance_usd IS NOT NULL
+            AND balance_observed_at IS NOT NULL
+            AND balance_source IS NOT NULL",
+    )
+    .fetch_all(db)
+    .await
+    // Il guasto di lettura NON deve rompere lo stato provider (il saldo e' una
+    // fonte accessoria), ma nemmeno tacere: un typo di colonna nella vista
+    // renderebbe l'esposizione muta PER SEMPRE con tutti i test verdi — lo
+    // zero-silenzioso che la regola O documenta. Il WARN lo rende visibile al
+    // primo giro.
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            target: "provider_balance_sync",
+            errore = %e,
+            "lettura saldi osservati dalla vista fallita: stato provider senza saldi"
+        );
+        Vec::new()
+    });
+    rows.into_iter()
+        .map(|(provider, balance_usd, observed_at, source)| {
+            (
+                provider,
+                SaldoOsservato {
+                    balance_usd,
+                    observed_at,
+                    source,
+                },
+            )
+        })
+        .collect()
 }
 
 pub async fn gateway_providers_handler(
@@ -1621,6 +1717,7 @@ pub async fn providers_status_internal(
                 &f.cooldown_map,
                 &f.api_key_configured,
                 &f.catalog_facts,
+                &f.saldo_map,
             )
         })
         .collect();
@@ -1638,8 +1735,16 @@ fn build_provider_status_entry(
     cooldown_map: &std::collections::HashMap<String, (u64, Option<String>)>,
     api_key_configured: &std::collections::HashMap<String, bool>,
     catalog_facts: &std::collections::HashMap<String, Vec<crate::provider_readiness::ModelFact>>,
+    saldo_map: &std::collections::HashMap<String, SaldoOsservato>,
 ) -> Value {
     let mut p = entry_con_prontezza(name, health_map, api_key_configured, catalog_facts);
+    // Il saldo osservato entra SOLO quando c'e' un'osservazione (mig 0719):
+    // l'assenza del campo e' "mai osservato" (regola Q, niente 0 di comodo).
+    if let Some(s) = saldo_map.get(name) {
+        p["balance_usd"] = json!(s.balance_usd);
+        p["balance_observed_at"] = json!(s.observed_at.to_rfc3339());
+        p["balance_source"] = json!(s.source);
+    }
     if let Some(h) = health_map.get(name) {
         p["healthy"] = json!(h.healthy);
         p["last_check"] = json!(h.checked_at.to_rfc3339());

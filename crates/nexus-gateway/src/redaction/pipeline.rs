@@ -546,6 +546,8 @@ mod tests {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 reasoning_tokens: None,
+                declared_cost_usd: None,
+                upstream_cost_usd: None,
             },
             model_used: "gw-test".into(),
             provider_used: "test".into(),

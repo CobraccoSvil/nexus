@@ -462,6 +462,19 @@ pub struct LlmUsage {
     /// [`ReasoningTokens`]). Valorizzato oggi dal solo adapter Google.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u32>,
+    /// Costo TOTALE della chiamata dichiarato dal fornitore sul wire (USD).
+    /// Oggi lo emette il solo OpenRouter (usage accounting, opt-in nel body:
+    /// mig 0717). E' un FATTO del wire che il ledger REGISTRA, non un prezzo
+    /// che qualcuno calcola: il listino resta `nexus-pricing` (regola L), e la
+    /// precedenza fra dichiarato e riprezzato la decide il ledger in un punto
+    /// solo. `None` = il fornitore non lo dichiara.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_cost_usd: Option<f64>,
+    /// Costo dell'inference a valle dichiarato da un aggregatore (openrouter
+    /// `cost_details.upstream_inference_cost`). Solo telemetria: finisce nei
+    /// `details` della riga di ledger, nessuna decisione lo legge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_cost_usd: Option<f64>,
 }
 
 /// Convenzione con cui un provider riporta i token di ragionamento, dichiarata
@@ -538,7 +551,22 @@ impl LlmUsage {
             cache_read_tokens,
             cache_creation_tokens,
             reasoning_tokens,
+            // I costi dichiarati non c'entrano con la normalizzazione dei
+            // token: li valorizza il solo adapter che li legge dal wire, con
+            // [`Self::with_declared_cost`].
+            declared_cost_usd: None,
+            upstream_cost_usd: None,
         }
+    }
+
+    /// Aggiunge il costo DICHIARATO dal fornitore sul wire (USD). Lo chiama il
+    /// solo adapter che lo legge (oggi il dialetto OpenAI-compat per
+    /// openrouter); per tutti gli altri i campi restano `None` = non
+    /// dichiarato, che non e' un costo zero (regola Q).
+    pub fn with_declared_cost(mut self, total: Option<f64>, upstream: Option<f64>) -> Self {
+        self.declared_cost_usd = total;
+        self.upstream_cost_usd = upstream;
+        self
     }
 }
 
@@ -938,6 +966,8 @@ mod tests {
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 reasoning_tokens: None,
+                declared_cost_usd: None,
+                upstream_cost_usd: None,
             },
             model_used: "m".to_string(),
             provider_used: "p".to_string(),

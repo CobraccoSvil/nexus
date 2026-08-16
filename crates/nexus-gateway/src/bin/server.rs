@@ -81,6 +81,13 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Snapshot periodico delle osservazioni di rate limit (mig 0718): persiste
+    // le voci cambiate del registro in-process. Solo sensore, nessuna
+    // decisione automatica su quelle righe.
+    {
+        let _handle = nexus_gateway::rate_limit_headers::spawn_snapshot_flusher(db.clone());
+    }
+
     let max_body_bytes = nexus_gateway::resolve_max_body_bytes(&db).await;
     tracing::info!(
         max_body_mb = max_body_bytes / (1024 * 1024),

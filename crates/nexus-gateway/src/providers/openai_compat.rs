@@ -170,6 +170,12 @@ pub struct OpenAiCompatClient {
     /// Moonshot/Kimi idem (doc `/docs/api/chat`). Il dialetto continua a
     /// governare temperatura, `reasoning_effort` e `extra_body.thinking`.
     tetto_su_completion: bool,
+    /// QUESTO endpoint vuole l'opt-in di usage accounting nel body
+    /// (`usage: {"include": true}`) per dichiarare il costo esatto della
+    /// chiamata in `usage.cost` (registry `usage_accounting`, mig 0717).
+    /// Oggi lo dichiara il solo openrouter; per i fornitori diretti il campo
+    /// non parte — un campo sconosciuto e' il solo verso che puo' fare danno.
+    usage_accounting: bool,
 }
 
 /// TTL della cache delle preferenze di fornitore (come `policy_engine`/`cooldown`).
@@ -257,7 +263,19 @@ impl OpenAiCompatClient {
             // dialetto condiviso — mistral/groq/openrouter/deepseek/perplexity
             // documentano `max_tokens` e basta.
             tetto_su_completion: false,
+            // Il default e' non chiedere nulla: l'usage accounting e' un campo
+            // che solo chi lo documenta (openrouter) accetta nel body.
+            usage_accounting: false,
         }
+    }
+
+    /// Dichiara che questo endpoint vuole `usage: {"include": true}` nel body
+    /// per riportare il costo dichiarato della chiamata (registry
+    /// `usage_accounting`, mig 0717). Lo applica il punto unico
+    /// [`Self::corpo_della_richiesta`], quindi vale per complete E stream.
+    pub fn with_usage_accounting(mut self, attivo: bool) -> Self {
+        self.usage_accounting = attivo;
+        self
     }
 
     /// Dichiara gli header extra che ogni richiesta di questo client deve
@@ -444,6 +462,14 @@ impl OpenAiCompatClient {
         if provider_requires_user_or_tool_last(&self.provider_name) {
             strip_trailing_assistant(&mut body.messages);
         }
+        // Opt-in di usage accounting (mig 0717): messo QUI e non in
+        // `build_request_body` perche' e' una proprieta' del CLIENT (del
+        // fornitore, dal registry), e il punto unico garantisce che complete e
+        // stream lo ereditino insieme — un set su un percorso solo sarebbe un
+        // costo dichiarato che sparisce appena la chiamata va in streaming.
+        body.usage = self
+            .usage_accounting
+            .then_some(UsageAccountingOptIn { include: true });
         body
     }
 
@@ -470,6 +496,12 @@ impl OpenAiCompatClient {
             .json(&body)
             .send()
             .await?;
+
+        // Sensore degli header di rate limit (mig 0718): si legge PRIMA del
+        // ramo d'errore, perche' un 429 porta gli header piu' informativi.
+        if let Some(oss) = crate::rate_limit_headers::osserva(resp.headers(), chrono::Utc::now()) {
+            crate::rate_limit_headers::registra(&self.provider_name, &req.model, oss);
+        }
 
         let status = resp.status();
         if !status.is_success() {
@@ -519,6 +551,12 @@ impl OpenAiCompatClient {
             .json(&body)
             .send()
             .await?;
+
+        // Come nel non-streaming: gli header arrivano con la risposta
+        // iniziale, prima del body, e si leggono anche sui non-2xx.
+        if let Some(oss) = crate::rate_limit_headers::osserva(resp.headers(), chrono::Utc::now()) {
+            crate::rate_limit_headers::registra(&self.provider_name, &req.model, oss);
+        }
 
         let status = resp.status();
         if !status.is_success() {
@@ -618,10 +656,12 @@ impl OpenAiCompatClient {
             .collect())
     }
 
-    /// Autodiscovery live CON METADATI: id + finestra di contesto dichiarata
-    /// dal provider quando il dialetto la espone (Mistral: `max_context_length`
-    /// in `data[]`; OpenAI/DeepSeek non la espongono -> `None`). Un solo fetch
-    /// (regola L): [`Self::list_models`] delega qui e proietta i soli id.
+    /// Autodiscovery live CON METADATI: id + finestra di contesto + tetto di
+    /// output dichiarati dal provider quando il dialetto li espone (Mistral:
+    /// `max_context_length`; OpenRouter: `context_length` e
+    /// `top_provider.max_completion_tokens`; OpenAI/DeepSeek non li espongono
+    /// -> `None`). Un solo fetch (regola L): [`Self::list_models`] delega qui
+    /// e proietta i soli id.
     pub async fn list_models_meta(&self) -> anyhow::Result<Vec<crate::provider::ModelMeta>> {
         let url = self.url_lista_modelli();
         let resp = self.get_autenticata(url).send().await?;
@@ -864,11 +904,12 @@ pub fn parse_models_response(body: &serde_json::Value) -> Vec<String> {
 }
 
 /// Variante CON METADATI di [`parse_models_response`] (punto unico del parsing,
-/// regola L: la versione nomi-soli vi delega). Oltre all'`id`, estrae la
-/// finestra di contesto DICHIARATA dal provider quando il dialetto la espone:
-/// Mistral usa `max_context_length` in `data[]` (OpenAI/DeepSeek non hanno il
-/// campo -> `None`). Valori non positivi sono trattati come non dichiarati:
-/// meglio "ignota" di una finestra inventata (regola H, incidente 2026-07-06).
+/// regola L: la versione nomi-soli vi delega). Oltre all'`id`, estrae finestra
+/// di contesto e tetto di output DICHIARATI dal provider quando il dialetto li
+/// espone: Mistral `max_context_length`, OpenRouter `context_length` +
+/// `top_provider.max_completion_tokens` (OpenAI/DeepSeek non hanno i campi ->
+/// `None`). Valori non positivi sono trattati come non dichiarati: meglio
+/// "ignoto" di un limite inventato (regola H, incidente 2026-07-06).
 /// Ordinamento/dedup per id come la versione nomi-soli (output deterministico).
 pub fn parse_models_meta_response(body: &serde_json::Value) -> Vec<crate::provider::ModelMeta> {
     let items = body.get("data").and_then(|d| d.as_array());
@@ -881,10 +922,20 @@ pub fn parse_models_meta_response(body: &serde_json::Value) -> Vec<crate::provid
 }
 
 /// Mappa UN elemento di `data[]` (dialetto OpenAI) in [`ModelMeta`]: `id`
-/// trimmato non-vuoto obbligatorio; `max_context_length` (Mistral) come
-/// finestra dichiarata solo se positiva. Nessun dialetto OpenAI-compat
-/// dichiara un tetto di output nel listing: `output_token_limit` resta `None`
-/// (lo espone il solo listing Google, vedi `google_model_meta_of`).
+/// trimmato non-vuoto obbligatorio; finestra e tetto di output DICHIARATI solo
+/// se positivi (un valore non positivo e' «non dichiarato», mai un limite:
+/// regola H, incidente 2026-07-06).
+///
+/// Finestra: Mistral usa `max_context_length`, OpenRouter `context_length`
+/// al primo livello. I nomi si interrogano IN CASCATA e non per provider
+/// (stesso principio di `WireUsage::cached_input_tokens`): un dialetto che
+/// riusa il nome viene letto senza che nessuno lo nomini.
+///
+/// Tetto di output: OpenRouter lo dichiara in
+/// `top_provider.max_completion_tokens` — MISURATO il 16/08/2026 sul body vero
+/// di `GET /v1/models` (364 modelli su 413 lo portano). OpenAI/DeepSeek non
+/// hanno alcuno dei campi -> `None` (il listing Google lo espone come
+/// `outputTokenLimit`, vedi `google_model_meta_of`).
 fn openai_model_meta_of(m: &serde_json::Value) -> Option<crate::provider::ModelMeta> {
     let id = m
         .get("id")
@@ -893,12 +944,18 @@ fn openai_model_meta_of(m: &serde_json::Value) -> Option<crate::provider::ModelM
         .filter(|s| !s.is_empty())?;
     let context_window = m
         .get("max_context_length")
+        .or_else(|| m.get("context_length"))
+        .and_then(serde_json::Value::as_i64)
+        .filter(|w| *w > 0);
+    let output_token_limit = m
+        .get("top_provider")
+        .and_then(|tp| tp.get("max_completion_tokens"))
         .and_then(serde_json::Value::as_i64)
         .filter(|w| *w > 0);
     Some(crate::provider::ModelMeta {
         id,
         context_window,
-        output_token_limit: None,
+        output_token_limit,
     })
 }
 
@@ -1217,6 +1274,9 @@ fn build_request_body(
         } else {
             None
         },
+        // L'opt-in di usage accounting e' del CLIENT, non della richiesta: lo
+        // valorizza `corpo_della_richiesta` dal flag del registry.
+        usage: None,
     }
 }
 
@@ -1401,6 +1461,14 @@ fn from_chat_completion(
     // `prompt_tokens`, che e' quindi gia' il LORDO voluto dal sistema. Il punto
     // unico `LlmUsage::normalized` (regola L) non tocca il conteggio; qui si
     // dichiara solo la convenzione del formato.
+    // Costo dichiarato dal wire (openrouter, usage accounting): estratto dal
+    // punto unico `WireUsage::declared_cost` e agganciato all'usage col metodo
+    // esplicito — la normalizzazione dei token non c'entra col costo.
+    let (declared_total, declared_upstream) = resp
+        .usage
+        .as_ref()
+        .map(|u| u.declared_cost())
+        .unwrap_or((None, None));
     let usage = LlmUsage::normalized(
         PromptCacheReporting::CachedIncludedInPrompt,
         resp.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
@@ -1414,7 +1482,8 @@ fn from_chat_completion(
         // un addendo): vale per o1/o3, per il `reasoning_content` DeepSeek e per
         // ogni compatibile. Sommarlo qui raddoppierebbe l'addebito.
         ReasoningTokens::IncludedInOutput,
-    );
+    )
+    .with_declared_cost(declared_total, declared_upstream);
 
     // Citazioni top-level (Perplexity): estratte prima di costruire la risposta.
     let citations = resp.citations.filter(|c| !c.is_empty());
@@ -1455,6 +1524,9 @@ fn chunk_from_sse(
     model_used: &str,
 ) -> Option<LlmStreamChunk> {
     let usage = chunk.usage.map(|u| {
+        // Il costo dichiarato arriva nell'ULTIMO chunk insieme all'usage:
+        // stesso punto unico di estrazione del non-streaming.
+        let (declared_total, declared_upstream) = u.declared_cost();
         LlmUsage::normalized(
             PromptCacheReporting::CachedIncludedInPrompt,
             u.prompt_tokens,
@@ -1464,6 +1536,7 @@ fn chunk_from_sse(
             // Come nel non-streaming: gia' dentro `completion_tokens`.
             ReasoningTokens::IncludedInOutput,
         )
+        .with_declared_cost(declared_total, declared_upstream)
     });
 
     let choice = chunk.choices.into_iter().next();
@@ -1845,6 +1918,12 @@ pub(crate) struct ChatCompletionRequest {
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
+    /// Opt-in di usage accounting (openrouter, mig 0717): chiede al fornitore
+    /// di dichiarare `usage.cost` sulla risposta. Lo setta il solo
+    /// [`OpenAiCompatClient::corpo_della_richiesta`], dal flag del registry;
+    /// omesso per tutti gli altri endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<UsageAccountingOptIn>,
     /// Campi extra appiattiti nel body radice (DeepSeek `thinking`): il client
     /// OpenAI ufficiale fonde `extra_body` nel top-level, quindi facciamo lo
     /// stesso con `serde(flatten)`. `None` => nessun campo aggiunto.
@@ -1855,6 +1934,13 @@ pub(crate) struct ChatCompletionRequest {
 #[derive(Debug, Serialize)]
 struct StreamOptions {
     include_usage: bool,
+}
+
+/// Il corpo dell'opt-in di usage accounting: `{"include": true}`. Tipizzato e
+/// non un `json!` sciolto, cosi' il campo ha un solo produttore possibile.
+#[derive(Debug, Serialize)]
+struct UsageAccountingOptIn {
+    include: bool,
 }
 
 /// Preferenza di fornitore a valle, dialetto degli instradatori (OpenRouter
@@ -2072,6 +2158,64 @@ struct WireUsage {
     /// parte (la firma del `thoughtsTokenCount` di Google).
     #[serde(default)]
     cached_tokens: Option<u32>,
+    /// Costo dichiarato dal fornitore (usage accounting, mig 0717). Il wire ha
+    /// DUE forme REALI e il campo le accetta entrambe: numero secco in USD
+    /// (openrouter) e oggetto con `total_cost` (perplexity, che vi include il
+    /// `request_cost` della search — un costo che il riprezzamento da catalogo
+    /// non vede). MISURATO il 16/08/2026: col tipo `Option<f64>` secco la
+    /// risposta 200 di perplexity diventava INDECODIFICABILE per intero
+    /// («invalid type: map, expected f64») e il provider risultava rosso nel
+    /// pannello — un campo di telemetria non deve poter abbattere la risposta
+    /// che lo trasporta.
+    #[serde(default, deserialize_with = "opzionale_tollerante")]
+    cost: Option<WireCost>,
+    /// OpenRouter: dettaglio del costo, con l'inference del fornitore a valle.
+    /// Stessa tolleranza di forma di `cost`, per la stessa ragione.
+    #[serde(default, deserialize_with = "opzionale_tollerante")]
+    cost_details: Option<WireCostDetails>,
+}
+
+/// Le forme reali di `usage.cost` sul wire. `Altro` e' il fornitore di domani:
+/// non rompe la risposta e si dichiara nel log ([`WireUsage::declared_cost`]),
+/// mai in silenzio (regola Q: l'ignoto e' una variante, non un crash).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WireCost {
+    /// openrouter: costo totale in USD, numero secco.
+    Numero(f64),
+    /// perplexity: oggetto `{input_tokens_cost, output_tokens_cost,
+    /// request_cost, total_cost}` — si legge il solo totale.
+    Oggetto {
+        #[serde(default)]
+        total_cost: Option<f64>,
+    },
+    /// Forma non riconosciuta: conservata per il log, mai un errore.
+    Altro(serde_json::Value),
+}
+
+/// Il dettaglio di costo di un aggregatore (openrouter `cost_details`).
+#[derive(Debug, Deserialize)]
+struct WireCostDetails {
+    /// Costo dell'inference presso il fornitore a valle (USD). Telemetria.
+    #[serde(default)]
+    upstream_inference_cost: Option<f64>,
+}
+
+/// Deserializza `Option<T>` DEGRADANDO a `None` la forma inattesa invece di
+/// abbattere l'intera risposta: i campi di telemetria del wire (costo
+/// dichiarato, dettaglio costi) non possono essere il punto in cui una
+/// risposta 200 valida diventa un errore di provider. La forma scartata non e'
+/// muta: chi consuma il campo la dichiara nel log.
+fn opzionale_tollerante<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_value::<T>(value).ok())
 }
 
 impl WireUsage {
@@ -2089,6 +2233,33 @@ impl WireUsage {
             .or_else(|| self.prompt_tokens_details.as_ref().and_then(|d| d.cached_tokens))
             .or(self.cached_tokens);
         hit.filter(|&n| n > 0)
+    }
+
+    /// Costo dichiarato dal wire, nella forma `(totale, upstream)` che
+    /// [`LlmUsage::with_declared_cost`] riceve. Punto unico dei DUE percorsi
+    /// che lo consegnano (non-streaming e ultimo chunk SSE): con due estrazioni
+    /// separate, lo streaming — dove openrouter manda l'usage davvero —
+    /// potrebbe perdere il campo con tutti i test del non-streaming verdi.
+    fn declared_cost(&self) -> (Option<f64>, Option<f64>) {
+        let totale = match &self.cost {
+            Some(WireCost::Numero(n)) => Some(*n),
+            Some(WireCost::Oggetto { total_cost }) => *total_cost,
+            Some(WireCost::Altro(forma)) => {
+                tracing::warn!(
+                    target: "usage_accounting",
+                    forma = %forma,
+                    "usage.cost in forma non riconosciuta: costo dichiarato ignorato"
+                );
+                None
+            }
+            None => None,
+        };
+        (
+            totale,
+            self.cost_details
+                .as_ref()
+                .and_then(|d| d.upstream_inference_cost),
+        )
     }
 }
 
@@ -2875,6 +3046,8 @@ mod tests {
     fn parse_models_meta_estrae_finestra_dichiarata() {
         // Dialetto Mistral: `max_context_length` in data[]. OpenAI/DeepSeek non
         // hanno il campo -> None (finestra IGNOTA, mai inventata: regola H).
+        // Un `max_context_length` presente VINCE sulla cascata (nessun altro
+        // campo viene consultato): il caso Mistral resta invariato.
         let body = serde_json::json!({
             "object": "list",
             "data": [
@@ -2891,6 +3064,60 @@ mod tests {
         assert_eq!(metas[1].context_window, None);
         // Valore non positivo = non dichiarato (mai una finestra inventata).
         assert_eq!(metas[2].context_window, None);
+    }
+
+    /// Dialetto OpenRouter: finestra in `context_length` (primo livello) e
+    /// tetto di output in `top_provider.max_completion_tokens`.
+    ///
+    /// Il primo elemento e' un CAMPIONE VERBATIM (ridotto ai campi che il
+    /// parser tocca, piu' `name`/`pricing` per fedelta' di forma) del body
+    /// reale di `GET https://openrouter.ai/api/v1/models`, scaricato il
+    /// 16/08/2026 (regola O: i nomi campo vengono dal wire vero, non dalla
+    /// doc). E' anche il caso di produzione: i modelli openrouter da discovery
+    /// non hanno riga capability e senza questo tetto dichiarato il criterio
+    /// non puo' vincolarli.
+    ///
+    /// MUTAZIONE: togliere la lettura di `top_provider` -> l'assert sul tetto
+    /// cade (None); togliere il ramo `context_length` dalla cascata -> cade
+    /// l'assert sulla finestra.
+    #[test]
+    fn parse_models_meta_estrae_tetto_output_openrouter() {
+        let body = serde_json::json!({
+            "data": [
+                {
+                    "id": "z-ai/glm-4.7-flash",
+                    "name": "Z.ai: GLM 4.7 Flash",
+                    "context_length": 202752,
+                    "top_provider": {
+                        "context_length": 202752,
+                        "max_completion_tokens": 16384,
+                        "is_moderated": false
+                    },
+                    "pricing": { "prompt": "0.00000006", "completion": "0.0000004" }
+                },
+                // top_provider presente ma senza tetto dichiarato -> None
+                // (49 modelli su 413 nel body misurato).
+                {
+                    "id": "a/senza-tetto",
+                    "context_length": 8192,
+                    "top_provider": { "is_moderated": false }
+                },
+                // Tetto non positivo = non dichiarato, mai un limite.
+                {
+                    "id": "b/tetto-zero",
+                    "top_provider": { "max_completion_tokens": 0 }
+                },
+            ]
+        });
+        let metas = parse_models_meta_response(&body);
+        assert_eq!(metas.len(), 3);
+        // Ordinati per id: a/senza-tetto, b/tetto-zero, z-ai/glm-4.7-flash.
+        assert_eq!(metas[2].id, "z-ai/glm-4.7-flash");
+        assert_eq!(metas[2].context_window, Some(202752));
+        assert_eq!(metas[2].output_token_limit, Some(16384));
+        assert_eq!(metas[0].context_window, Some(8192));
+        assert_eq!(metas[0].output_token_limit, None);
+        assert_eq!(metas[1].output_token_limit, None);
     }
 
     #[test]
@@ -3873,4 +4100,172 @@ mod tests {
     // derivabile, perche' deciderla richiede il catalogo. Questo modulo resta
     // responsabile di cio' che PRODUCE - i candidati e il codice di wire - e i
     // suoi test misurano quello.
+
+    // ── Usage accounting openrouter (mig 0717) ─────────────────
+
+    /// Il costo DICHIARATO dal fornitore attraversa il parser reale fino alla
+    /// `LlmUsage` (regola O: dal produttore `parse_chat_completion` +
+    /// `from_chat_completion`, non da una struct composta a mano).
+    ///
+    /// Body nella forma dell'usage accounting OpenRouter (`usage.cost` +
+    /// `cost_details.upstream_inference_cost`, doc "Usage Accounting"; il
+    /// riscontro sul wire vivo con `usage:{include:true}` resta da annotare al
+    /// primo esercizio).
+    ///
+    /// MUTAZIONE: togliendo `cost` da `WireUsage` (o l'aggancio
+    /// `with_declared_cost` in `from_chat_completion`) il primo assert cade con
+    /// `None` — che e' la forma esatta del difetto: la chiamata entra nel
+    /// ledger a costo 0. Togliendo `cost_details`, cade il secondo.
+    #[test]
+    fn il_costo_dichiarato_dal_wire_arriva_alla_llm_usage() {
+        let body = r#"{
+            "id": "gen-123",
+            "provider": "DeepInfra",
+            "model": "qwen/qwen3-235b-a22b-2507",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "ciao"}}],
+            "usage": {"prompt_tokens": 123, "completion_tokens": 45,
+                      "total_tokens": 168, "cost": 0.0021,
+                      "cost_details": {"upstream_inference_cost": 0.0018}}
+        }"#;
+        let parsed = parse_chat_completion("openrouter", body).expect("parse");
+        let resp = from_chat_completion(parsed, "qwen/qwen3-235b-a22b-2507".into(), "openrouter", 7)
+            .expect("mappatura");
+        assert_eq!(resp.usage.declared_cost_usd, Some(0.0021));
+        assert_eq!(resp.usage.upstream_cost_usd, Some(0.0018));
+        // I token restano quelli del wire: il costo non tocca i conteggi.
+        assert_eq!(resp.usage.input_tokens, 123);
+        assert_eq!(resp.usage.output_tokens, 45);
+
+        // Un dialetto che NON dichiara (mistral, groq, ...) resta non
+        // dichiarato: `None`, mai uno zero di comodo (regola Q).
+        let body_senza = r#"{
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "ciao"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+        }"#;
+        let parsed = parse_chat_completion("mistral", body_senza).expect("parse");
+        let resp =
+            from_chat_completion(parsed, "m".into(), "mistral", 1).expect("mappatura");
+        assert_eq!(resp.usage.declared_cost_usd, None);
+        assert_eq!(resp.usage.upstream_cost_usd, None);
+    }
+
+    /// Perplexity dichiara `usage.cost` come OGGETTO, non come numero — corpo
+    /// VERBATIM misurato sull'API vera il 16/08/2026 (`sonar`, max_tokens=16):
+    /// `{"input_tokens_cost":0,"output_tokens_cost":0,"request_cost":0.005,
+    /// "total_cost":0.005}`. Il `total_cost` include il costo della SEARCH, che
+    /// il riprezzamento da catalogo non vede: la forma a oggetto si LEGGE, non
+    /// si tollera soltanto.
+    ///
+    /// MISURATO in esercizio prima del fix: col campo `Option<f64>` secco
+    /// l'intera risposta 200 era indecodificabile («invalid type: map, expected
+    /// f64») e il pannello dava perplexity ROSSO — un campo di telemetria
+    /// abbatteva la risposta che lo trasporta.
+    ///
+    /// MUTAZIONE: riportando `cost` a `Option<f64>` il PRIMO expect cade (parse
+    /// fallito), che e' la riproduzione esatta del difetto; togliendo il ramo
+    /// `Oggetto` da `declared_cost`, cade l'assert sul totale.
+    #[test]
+    fn il_costo_a_oggetto_di_perplexity_non_abbatte_la_risposta_e_si_legge() {
+        let body = r#"{
+            "id": "resp-1", "model": "sonar", "object": "chat.completion",
+            "created": 1755350000,
+            "citations": [], "search_results": [],
+            "choices": [{"index": 0, "finish_reason": "length",
+                         "message": {"role": "assistant", "content": "Ok"}}],
+            "usage": {"completion_tokens": 1, "prompt_tokens": 2,
+                      "total_tokens": 3, "search_context_size": "low",
+                      "cost": {"input_tokens_cost": 0, "output_tokens_cost": 0,
+                               "request_cost": 0.005, "total_cost": 0.005}}
+        }"#;
+        let parsed = parse_chat_completion("perplexity", body).expect("parse");
+        let resp = from_chat_completion(parsed, "sonar".into(), "perplexity", 3)
+            .expect("mappatura");
+        assert_eq!(resp.usage.declared_cost_usd, Some(0.005));
+        assert_eq!(resp.usage.upstream_cost_usd, None);
+        assert_eq!(resp.usage.input_tokens, 2);
+
+        // La forma IGNOTA (il fornitore di domani) degrada a None dichiarando
+        // nel log, mai un errore di parse (regola Q).
+        let body_ignoto = r#"{
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "x"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                      "total_tokens": 2, "cost": "gratis"}
+        }"#;
+        let parsed = parse_chat_completion("ignoto", body_ignoto).expect("parse");
+        let resp = from_chat_completion(parsed, "m".into(), "ignoto", 1).expect("mappatura");
+        assert_eq!(resp.usage.declared_cost_usd, None);
+    }
+
+    /// In STREAMING l'usage col costo arriva nell'ultimo chunk (quello con
+    /// `finish_reason`), attraverso il parser SSE reale. E' il percorso su cui
+    /// il campo si perderebbe in silenzio se l'estrazione vivesse solo nel
+    /// non-streaming: per questo entrambe delegano a `WireUsage::declared_cost`.
+    ///
+    /// MUTAZIONE: togliendo `.with_declared_cost(...)` da `chunk_from_sse`
+    /// l'assert cade con `None` mentre il test non-streaming resta verde.
+    #[test]
+    fn il_costo_dichiarato_arriva_anche_dallo_stream() {
+        let mut st = empty_parser();
+        st.parse_line(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\
+             \"usage\":{\"prompt_tokens\":123,\"completion_tokens\":45,\"cost\":0.0021,\
+             \"cost_details\":{\"upstream_inference_cost\":0.0018}}}",
+        );
+        let chunk = st.pending.pop_front().expect("chunk finale con usage");
+        let usage = chunk.usage.expect("l'ultimo chunk porta l'usage");
+        assert_eq!(usage.declared_cost_usd, Some(0.0021));
+        assert_eq!(usage.upstream_cost_usd, Some(0.0018));
+    }
+
+    /// L'opt-in `usage: {"include": true}` parte dal punto unico
+    /// `corpo_della_richiesta`, quindi su ENTRAMBI i percorsi (complete e
+    /// stream); senza il flag del registry la chiave non esiste nel body.
+    ///
+    /// MUTAZIONE: spostando il set fuori dal punto unico (es. solo sul percorso
+    /// complete) l'assert sul corpo streaming rosseggia; facendolo partire
+    /// incondizionato, rosseggia il caso `false`.
+    #[tokio::test]
+    async fn lopt_in_di_usage_accounting_parte_su_entrambi_i_percorsi() {
+        let con_flag = OpenAiCompatClient::new(
+            Client::new(),
+            "https://openrouter.ai/api/v1",
+            "chiave",
+            "openrouter",
+        )
+        .with_usage_accounting(true);
+        for stream in [false, true] {
+            let corpo = serde_json::to_value(
+                con_flag
+                    .corpo_della_richiesta(&sample_request(), stream, &ResolvedReasoning::none())
+                    .await,
+            )
+            .expect("serializza");
+            assert_eq!(
+                corpo["usage"]["include"],
+                serde_json::Value::Bool(true),
+                "stream={stream}: l'opt-in deve partire ({corpo})"
+            );
+        }
+
+        // Default (nessun flag nel registry): il campo non parte — un campo
+        // sconosciuto e' il solo verso che puo' fare danno.
+        let senza_flag =
+            OpenAiCompatClient::new(Client::new(), "https://api.groq.com/openai/v1", "k", "groq");
+        for stream in [false, true] {
+            let corpo = serde_json::to_value(
+                senza_flag
+                    .corpo_della_richiesta(&sample_request(), stream, &ResolvedReasoning::none())
+                    .await,
+            )
+            .expect("serializza");
+            assert!(
+                corpo.get("usage").is_none(),
+                "stream={stream}: senza flag la chiave non deve esistere ({corpo})"
+            );
+        }
+    }
 }

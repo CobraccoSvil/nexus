@@ -156,6 +156,7 @@ pub async fn record_usage_to_ledger(
         &resp.provider_used,
         &resp.model_used,
         &token_usage_from(&resp.usage),
+        costo_dichiarato_da(&resp.usage),
         &req.metadata.request_id,
         &req.metadata.feature,
     )
@@ -269,6 +270,9 @@ pub async fn record_discarded_attempts(
             &s.model,
             s.reason,
             s.usage.map(|u| token_usage_from(&u)).as_ref(),
+            // Uno scarto degenere openrouter porta l'usage del wire col suo
+            // costo dichiarato: la riga `discarded` misura la spesa VERA.
+            s.usage.as_ref().and_then(costo_dichiarato_da),
             &req.metadata.request_id,
             &req.metadata.feature,
         )
@@ -336,6 +340,20 @@ fn token_usage_from(usage: &crate::types::LlmUsage) -> TokenUsage {
         cache_read_tokens: usage.cache_read_tokens.unwrap_or(0) as i64,
         cache_creation_tokens: usage.cache_creation_tokens.unwrap_or(0) as i64,
     }
+}
+
+/// Dal costo dichiarato che l'adapter ha letto sul wire ([`crate::types::LlmUsage`])
+/// al tipo del ledger. Punto unico dei DUE percorsi che lo consegnano (riga
+/// finalized e righe discarded): con due estrazioni separate, gli scarti — che
+/// per i modelli openrouter a listino `unknown` sono le righe dove il
+/// dichiarato e' l'unico costo vero — potrebbero perderlo in silenzio.
+fn costo_dichiarato_da(usage: &crate::types::LlmUsage) -> Option<nexus_ledger::CostoDichiarato> {
+    usage
+        .declared_cost_usd
+        .map(|total| nexus_ledger::CostoDichiarato {
+            total_usd: total,
+            upstream_usd: usage.upstream_cost_usd,
+        })
 }
 
 #[cfg(test)]

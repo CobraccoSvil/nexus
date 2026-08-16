@@ -72,7 +72,7 @@ pub use quote::{
 };
 pub use scrittura::{
     finalize, insert_marker, record_discarded, record_media, record_tokens, release, reserve,
-    settle, DiscardReason,
+    settle, CostoDichiarato, DiscardReason,
 };
 
 /// Chi ha fatto la chiamata. Le due colonne sono NOT NULL e portano una FK:

@@ -257,6 +257,76 @@ pub(crate) async fn listino_degradante(db: &PgPool, provider: &str, model: &str)
     }
 }
 
+/// Costo dichiarato dal FORNITORE sul wire della chiamata (USD). Non e' un
+/// prezzo calcolato: e' un fatto osservato, e il ledger lo registra come tale.
+/// Oggi lo emette il solo OpenRouter (usage accounting, mig 0717), ma la
+/// regola di precedenza non nomina fornitori: vale per chiunque dichiari.
+#[derive(Debug, Clone, Copy)]
+pub struct CostoDichiarato {
+    /// Costo totale della chiamata dichiarato dal fornitore (USD).
+    pub total_usd: f64,
+    /// Costo dell'inference presso il fornitore a valle, quando l'aggregatore
+    /// lo riporta (`cost_details.upstream_inference_cost`). Solo telemetria.
+    pub upstream_usd: Option<f64>,
+}
+
+/// Chiave dei `details` che dichiara la PROVENIENZA del `total_cost` della
+/// riga: `provider_declared` (fattura del fornitore dal wire) o `repriced`
+/// (listino). Identificatore macchina (regola N), scritto in un punto solo.
+const CAMPO_COST_SOURCE: &str = "cost_source";
+
+/// PUNTO UNICO (regola L) della precedenza fra costo dichiarato e riprezzato,
+/// per le due INSERT che chiudono una chiamata (finalized e discarded).
+///
+/// Il dichiarato VINCE sul riprezzato: e' la fattura del fornitore, non una
+/// stima — e per i modelli openrouter entrati dalla discovery
+/// (`pricing_state='unknown'`, listino a 0) e' l'UNICO costo vero disponibile:
+/// prima ogni loro chiamata entrava nel ledger a $0.000.
+///
+/// Si applica SOLO se la currency di piattaforma e' USD: il valore del wire e'
+/// in USD e una conversione qui sarebbe un listino ombra (regola G). Il salto
+/// non e' silenzioso: `details.declared_cost_skipped` lo dichiara.
+///
+/// INVARIANTE per i lettori: con `cost_source = "provider_declared"`,
+/// `total_cost` e' autoritativo e le COMPONENTI (`input_cost`/`output_cost`/
+/// `cache_*`) restano il riprezzato indicativo — la loro somma puo' differire
+/// dal totale. NON si ripartisce il dichiarato sulle componenti: sarebbe
+/// inventare numeri che il fornitore non ha dichiarato. I lettori aggregati
+/// (`usage_for_runs`, `usage_by_model_for_runs`, quote) leggono `total_cost` e
+/// restano coerenti. `price_state` risponde a un'ALTRA domanda («il listino
+/// conosceva il prezzo?») e non si tocca: `cost_source` e' il campo ortogonale.
+fn applica_costo_dichiarato(
+    riprezzato: CostBreakdown,
+    dichiarato: Option<CostoDichiarato>,
+    currency: &str,
+    details: &mut Value,
+) -> CostBreakdown {
+    match dichiarato {
+        Some(d) if currency.eq_ignore_ascii_case("USD") => {
+            details[CAMPO_COST_SOURCE] = json!("provider_declared");
+            // Il riprezzato non si butta: resta leggibile per l'audit del
+            // listino (quanto AVREMMO addebitato senza la dichiarazione).
+            details["repriced_total_cost"] = json!(riprezzato.total_cost);
+            if let Some(up) = d.upstream_usd {
+                details["upstream_inference_cost"] = json!(up);
+            }
+            CostBreakdown {
+                total_cost: d.total_usd,
+                ..riprezzato
+            }
+        }
+        Some(_) => {
+            details[CAMPO_COST_SOURCE] = json!("repriced");
+            details["declared_cost_skipped"] = json!("platform_currency_not_usd");
+            riprezzato
+        }
+        None => {
+            details[CAMPO_COST_SOURCE] = json!("repriced");
+            riprezzato
+        }
+    }
+}
+
 /// Costo non calcolabile: tutte le voci a zero, nessun ripiego da dichiarare.
 fn costo_nullo() -> CostBreakdown {
     CostBreakdown {
@@ -425,24 +495,31 @@ async fn esegui_chiusura(
 /// L'identita' arriva gia' risolta: chi chiama la estrae dai propri tipi e, se
 /// non c'e', non chiama affatto. E' il caso reale delle richieste senza
 /// `tenant_id`/`user_id` (`GwMetadata::default`), dove il gateway non scrive.
+///
+/// `dichiarato` e' il costo che il FORNITORE ha dichiarato sul wire di QUESTA
+/// chiamata (openrouter, usage accounting): quando c'e' vince sul riprezzato
+/// (vedi [`applica_costo_dichiarato`]); `None` = non dichiarato, si riprezza
+/// da catalogo come sempre.
 pub async fn record_tokens(
     db: &PgPool,
     identity: Identity,
     provider: &str,
     model: &str,
     tokens: &TokenUsage,
+    dichiarato: Option<CostoDichiarato>,
     request_id: &str,
     feature: &str,
 ) -> Option<LedgerEntry> {
     let (currency, costo, price_state, price_missing) =
         prezza_chiamata(db, provider, model, tokens).await;
-    let details = details_di_chiamata(
+    let mut details = details_di_chiamata(
         request_id,
         feature,
         price_state,
         price_missing,
         costo.cache_price_state(),
     );
+    let costo = applica_costo_dichiarato(costo, dichiarato, &currency, &mut details);
 
     let res = esegui_chiusura(
         db, SQL_INSERT_FINALIZED, Some(identity), provider, model, tokens,
@@ -554,6 +631,10 @@ const SQL_INSERT_DISCARDED: &str = r#"
 ///
 /// Il costo NON dipende dal titolare: la riga porta comunque provider, modello,
 /// token e importo, che sono cio' che serve a misurare un fornitore.
+/// `dichiarato` come in [`record_tokens`]: uno scarto degenere openrouter porta
+/// lo stesso usage del wire, costo dichiarato compreso, e la riga `discarded`
+/// deve misurare la spesa VERA verso il fornitore — non lo zero del listino
+/// `unknown`.
 pub async fn record_discarded(
     db: &PgPool,
     identity: Option<Identity>,
@@ -561,6 +642,7 @@ pub async fn record_discarded(
     model: &str,
     reason: DiscardReason,
     tokens: Option<&TokenUsage>,
+    dichiarato: Option<CostoDichiarato>,
     request_id: &str,
     feature: &str,
 ) {
@@ -576,13 +658,17 @@ pub async fn record_discarded(
             (cur, costo_nullo(), "no_usage_observed", false, TokenUsage::default())
         }
     };
-    let details = details_di_chiamata(
+    let mut details = details_di_chiamata(
         request_id,
         feature,
         price_state,
         price_missing,
         costo.cache_price_state(),
     );
+    // Senza usage osservato non esiste nemmeno un costo dichiarato: il
+    // chiamante lo estrae dall'usage, quindi qui arriva `None` per costruzione
+    // e l'helper si limita a marcare `cost_source = "repriced"`.
+    let costo = applica_costo_dichiarato(costo, dichiarato, &currency, &mut details);
 
     let res = esegui_chiusura(
         db, SQL_INSERT_DISCARDED, identity, provider, model, &riga_tokens,
@@ -920,6 +1006,50 @@ mod tests {
                 "la UPDATE non assegna {colonna}: resterebbe al valore della prenotazione, cioe' 0"
             );
         }
+    }
+
+    /// Il criterio PURO della precedenza fra dichiarato e riprezzato, sul ramo
+    /// che i test d'integrazione non possono esercitare senza riscrivere
+    /// `billing_base_currency` (territorio di nexus-pricing, guard
+    /// `pricing-single-source`): fuori da USD il dichiarato — che sul wire e'
+    /// in USD — NON si applica, perche' una conversione qui sarebbe un listino
+    /// ombra (regola G). Il salto non e' silenzioso.
+    ///
+    /// MUTAZIONE: togliendo il controllo sulla currency da
+    /// `applica_costo_dichiarato`, l'assert sul totale cade con 0.5 — un
+    /// importo USD sommato in un ledger EUR.
+    #[test]
+    fn fuori_da_usd_il_dichiarato_non_si_applica() {
+        let riprezzato = CostBreakdown {
+            input_cost: 1.0,
+            output_cost: 0.0,
+            cache_read_cost: 0.0,
+            cache_creation_cost: 0.0,
+            total_cost: 1.0,
+            cache_tokens_billed_as_input: 0,
+        };
+        let dichiarato = Some(CostoDichiarato {
+            total_usd: 0.5,
+            upstream_usd: None,
+        });
+
+        let mut details = json!({});
+        let esito = applica_costo_dichiarato(riprezzato, dichiarato, "EUR", &mut details);
+        assert!(
+            (esito.total_cost - 1.0).abs() < 1e-12,
+            "fuori da USD resta il riprezzato: {}",
+            esito.total_cost
+        );
+        assert_eq!(details["cost_source"], "repriced");
+        assert_eq!(details["declared_cost_skipped"], "platform_currency_not_usd");
+
+        // Controprova sulla stessa strada: in USD (case-insensitive) vince il
+        // dichiarato e il riprezzato resta leggibile per l'audit.
+        let mut details = json!({});
+        let esito = applica_costo_dichiarato(riprezzato, dichiarato, "usd", &mut details);
+        assert!((esito.total_cost - 0.5).abs() < 1e-12);
+        assert_eq!(details["cost_source"], "provider_declared");
+        assert_eq!(details["repriced_total_cost"], 1.0);
     }
 
     // Il testo VERO della migrazione che crea status 'discarded' e la colonna

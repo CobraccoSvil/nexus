@@ -107,25 +107,32 @@ struct ProviderDescriptor {
     /// gli adapter dedicati compongono le proprie richieste e non lo leggono.
     /// Oggi lo dichiara openrouter per l'attribuzione (HTTP-Referer/X-Title).
     extra_headers: Option<String>,
+    /// Opt-in di usage accounting (mig 0717), come testo del boolean
+    /// (`to_jsonb` rende 'true'/'false'; NULL = migrazione non applicata =
+    /// false). Consumato dal SOLO provider generico: chiede al fornitore di
+    /// dichiarare `usage.cost` sulla risposta. Oggi solo openrouter.
+    usage_accounting: Option<String>,
 }
 
 /// Carica i descrittori provider dal registry (mig 0565), ordinati. Fallback ai 6
 /// provider noti se la tabella non esiste / e' vuota (fail-safe: se la migrazione
 /// non e' ancora applicata all'avvio, nessuna regressione).
 async fn load_provider_descriptors(db: &PgPool) -> Vec<ProviderDescriptor> {
-    // `models_path` ed `extra_headers` si leggono via `to_jsonb(r) ->> ...` e non
-    // come colonne: su un DB dove la loro migrazione (0705, 0714) non e' ancora
-    // applicata la chiave semplicemente non c'e' e il valore esce NULL, mentre
-    // nominarle direttamente sarebbe un errore SQL — e l'errore qui non degrada al
-    // default del campo, degrada all'INTERO registry (`unwrap_or_default` ->
-    // `fallback_descriptors`, cioe' sei provider al posto di dieci). Il costo di
-    // una colonna nuova non puo' essere la sparizione di quattro fornitori nella
-    // finestra fra il riavvio del gateway e le migrazioni.
+    // `models_path`, `extra_headers` e `usage_accounting` si leggono via
+    // `to_jsonb(r) ->> ...` e non come colonne: su un DB dove la loro migrazione
+    // (0705, 0714, 0717) non e' ancora applicata la chiave semplicemente non c'e'
+    // e il valore esce NULL, mentre nominarle direttamente sarebbe un errore SQL
+    // — e l'errore qui non degrada al default del campo, degrada all'INTERO
+    // registry (`unwrap_or_default` -> `fallback_descriptors`, cioe' sei provider
+    // al posto di dieci). Il costo di una colonna nuova non puo' essere la
+    // sparizione di quattro fornitori nella finestra fra il riavvio del gateway e
+    // le migrazioni.
     let rows = sqlx::query_as::<_, ProviderDescriptor>(
         "SELECT name, api_format, key_setting, enabled_setting, base_url_setting, \
          base_url_default, activation, tiers, max_context_tokens, supports_tools, \
          to_jsonb(r) ->> 'models_path' AS models_path, \
-         to_jsonb(r) ->> 'extra_headers' AS extra_headers \
+         to_jsonb(r) ->> 'extra_headers' AS extra_headers, \
+         to_jsonb(r) ->> 'usage_accounting' AS usage_accounting \
          FROM nexus_provider_registry r WHERE is_active = true ORDER BY sort_order, name",
     )
     .fetch_all(db)
@@ -170,6 +177,8 @@ fn fallback_descriptors() -> Vec<ProviderDescriptor> {
             // Idem per gli header extra: li dichiara il solo openrouter (mig
             // 0714), che non e' fra i sei di ripiego.
             extra_headers: None,
+            // E idem per l'usage accounting (mig 0717): solo openrouter.
+            usage_accounting: None,
         }
     }
     vec![
@@ -389,6 +398,11 @@ fn construct_provider(
                         .map(parse_extra_headers)
                         .unwrap_or_default(),
                 )
+                // Opt-in di usage accounting dal registry (mig 0717): il
+                // fornitore dichiara il costo esatto in `usage.cost`. Il
+                // boolean arriva come testo dal `to_jsonb`; NULL (migrazione
+                // non applicata) vale false, cioe' il comportamento di prima.
+                .with_usage_accounting(d.usage_accounting.as_deref() == Some("true"))
                 // Serve agli instradatori per leggere il fornitore a valle
                 // preferito; gli altri endpoint non lo interrogano mai.
                 .with_db(Some(db.clone())),

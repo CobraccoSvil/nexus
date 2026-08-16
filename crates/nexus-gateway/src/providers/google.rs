@@ -2416,6 +2416,8 @@ fn usage_from_metadata(meta: Option<GoogleUsageMetadata>) -> LlmUsage {
         cache_read_tokens: None,
         cache_creation_tokens: None,
         reasoning_tokens: None,
+        declared_cost_usd: None,
+        upstream_cost_usd: None,
     })
 }
 

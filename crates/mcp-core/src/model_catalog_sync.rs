@@ -1124,16 +1124,19 @@ async fn sync_one_provider_into_stats(
     }
 }
 
-/// Modelli live del provider indicizzati per il sync: la lista dei nomi e la
-/// mappa nome -> finestra di contesto DICHIARATA (solo quando >0).
+/// Modelli live del provider indicizzati per il sync: la lista dei nomi e le
+/// mappe nome -> finestra di contesto / tetto di output DICHIARATI (solo
+/// quando >0).
 struct DiscoveredModels {
     api_models: Vec<String>,
     declared_windows: std::collections::HashMap<String, i64>,
+    declared_outputs: std::collections::HashMap<String, i64>,
 }
 
-/// Fetch dei modelli live dal gateway + indicizzazione (finestre dichiarate).
-/// Estratta da `sync_provider` senza cambi di comportamento: bail su lista vuota
-/// (sospetta, per safety), poi costruisce `declared_windows` e `api_models`.
+/// Fetch dei modelli live dal gateway + indicizzazione (finestre e tetti
+/// dichiarati). Estratta da `sync_provider` senza cambi di comportamento: bail
+/// su lista vuota (sospetta, per safety), poi costruisce le mappe e
+/// `api_models`.
 async fn discover_provider_models(
     orchestrator: Option<&Orchestrator>,
     provider: &str,
@@ -1145,21 +1148,29 @@ async fn discover_provider_models(
     if api_metas.is_empty() {
         anyhow::bail!("gateway ha ritornato lista vuota (sospetto, skip per safety)");
     }
-    // Finestra di contesto DICHIARATA dal provider per modello (quando l'API la
-    // espone, es. Mistral max_context_length). Fonte per scrivere il valore
-    // REALE nel catalog: mai inventarne uno (regola H, incidente 2026-07-06:
-    // il default schema 8192 preso per finestra vera paralizzava i sub-run).
+    // Finestra di contesto e tetto di output DICHIARATI dal provider per
+    // modello (quando l'API li espone: Mistral max_context_length, Google
+    // outputTokenLimit, OpenRouter context_length +
+    // top_provider.max_completion_tokens). Fonte per scrivere il valore REALE
+    // nel catalog: mai inventarne uno (regola H, incidente 2026-07-06: il
+    // default schema 8192 preso per finestra vera paralizzava i sub-run).
     let mut declared_windows: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+    let mut declared_outputs: std::collections::HashMap<String, i64> =
         std::collections::HashMap::new();
     for m in &api_metas {
         if let Some(w) = m.context_window.filter(|w| *w > 0) {
             declared_windows.insert(m.id.clone(), w);
+        }
+        if let Some(o) = m.output_token_limit.filter(|o| *o > 0) {
+            declared_outputs.insert(m.id.clone(), o);
         }
     }
     let api_models: Vec<String> = api_metas.into_iter().map(|m| m.id).collect();
     Ok(DiscoveredModels {
         api_models,
         declared_windows,
+        declared_outputs,
     })
 }
 
@@ -1237,7 +1248,7 @@ async fn process_discovered_model(
     api_model: &str,
     insert_new_disabled: bool,
     catalog_models: &std::collections::HashMap<String, (bool, bool)>,
-    declared_windows: &std::collections::HashMap<String, i64>,
+    discovered: &DiscoveredModels,
 ) -> ModelSyncDelta {
     let mut delta = ModelSyncDelta::default();
 
@@ -1273,7 +1284,8 @@ async fn process_discovered_model(
     }
 
     // Ramo CHAT.
-    let declared_window = declared_windows.get(api_model).copied();
+    let declared_window = discovered.declared_windows.get(api_model).copied();
+    let declared_output = discovered.declared_outputs.get(api_model).copied();
     process_discovered_chat_model(
         db,
         orchestrator,
@@ -1281,6 +1293,7 @@ async fn process_discovered_model(
         api_model,
         insert_new_disabled,
         declared_window,
+        declared_output,
         catalog_models.get(api_model).copied(),
         &mut delta,
     )
@@ -1290,8 +1303,9 @@ async fn process_discovered_model(
 
 /// Ramo CHAT di `process_discovered_model`: se il modello non e' nel catalog lo
 /// inserisce (default sicuro is_enabled=false + probe-on-insert); se e' gia'
-/// presente riallinea tier/vision + finestra di contesto e prova il re-enable.
-/// Aggiorna `delta` in loco. Estratto senza cambi di comportamento.
+/// presente riallinea tier/vision + finestra di contesto + tetto di output
+/// dichiarato e prova il re-enable. Aggiorna `delta` in loco. Estratto senza
+/// cambi di comportamento.
 #[allow(clippy::too_many_arguments)]
 async fn process_discovered_chat_model(
     db: &PgPool,
@@ -1300,6 +1314,7 @@ async fn process_discovered_chat_model(
     api_model: &str,
     insert_new_disabled: bool,
     declared_window: Option<i64>,
+    declared_output: Option<i64>,
     catalog_entry: Option<(bool, bool)>,
     delta: &mut ModelSyncDelta,
 ) {
@@ -1313,22 +1328,44 @@ async fn process_discovered_chat_model(
             // del reconcile e dell'enable — invece di duplicare il filtro.
             if insert_new_disabled
                 && model_passes_selection_policy(db, provider, api_model).await
-                && insert_new_chat_model(db, orchestrator, provider, api_model, declared_window)
-                    .await
+                && insert_new_chat_model(
+                    db,
+                    orchestrator,
+                    provider,
+                    api_model,
+                    declared_window,
+                    declared_output,
+                )
+                .await
             {
                 delta.inserted += 1;
             }
         }
         Some((is_enabled, manual_locked)) => {
             delta.tier_realigned += realign_existing_model(db, provider, api_model).await;
-            // Finestra dichiarata dal provider: riallinea il catalog al
-            // valore REALE (self-healing dei placeholder, regola H).
-            realign_context_window(db, provider, api_model, declared_window).await;
+            // Finestra e tetto di output dichiarati dal provider: riallinea il
+            // catalog al valore REALE (self-healing dei placeholder, regola H).
+            realign_dichiarazioni(db, provider, api_model, declared_window, declared_output).await;
             if reenable_existing_model(db, provider, api_model, is_enabled, manual_locked).await {
                 delta.reenabled += 1;
             }
         }
     }
+}
+
+/// I due riallineamenti alle dichiarazioni del listing (finestra + tetto di
+/// output), insieme: sono lo stesso gesto su due colonne del vocabolario
+/// [`ColonnaDichiarata`].
+async fn realign_dichiarazioni(
+    db: &PgPool,
+    provider: &str,
+    api_model: &str,
+    declared_window: Option<i64>,
+    declared_output: Option<i64>,
+) {
+    use ColonnaDichiarata::{ContextWindow, DeclaredMaxOutput};
+    realign_valore_dichiarato(db, provider, api_model, declared_window, ContextWindow).await;
+    realign_valore_dichiarato(db, provider, api_model, declared_output, DeclaredMaxOutput).await;
 }
 
 async fn sync_provider(
@@ -1338,10 +1375,8 @@ async fn sync_provider(
     insert_new_disabled: bool,
     orchestrator: Option<&Orchestrator>,
 ) -> anyhow::Result<(u32, u32, u32)> {
-    let DiscoveredModels {
-        api_models,
-        declared_windows,
-    } = discover_provider_models(orchestrator, provider).await?;
+    let discovered = discover_provider_models(orchestrator, provider).await?;
+    let api_models = &discovered.api_models;
 
     let catalog_models = load_catalog_models(db, provider).await?;
     let api_set: std::collections::HashSet<&str> = api_models.iter().map(|s| s.as_str()).collect();
@@ -1356,9 +1391,8 @@ async fn sync_provider(
         orchestrator,
         provider,
         insert_new_disabled,
-        &api_models,
+        &discovered,
         &catalog_models,
-        &declared_windows,
     )
     .await;
 
@@ -1369,7 +1403,7 @@ async fn sync_provider(
     // 2. Modelli del catalog enabled non piu' nell'API -> disable.
     if disable_missing {
         disabled +=
-            disable_missing_models(db, provider, &catalog_models, &api_models, &api_set).await;
+            disable_missing_models(db, provider, &catalog_models, api_models, &api_set).await;
     }
 
     if tier_realigned > 0 {
@@ -1386,18 +1420,16 @@ async fn sync_provider(
 /// delta (insert nuovi + riallineo/re-enable esistenti). Estratto senza cambi di
 /// comportamento; `disabled` NON e' qui (i due passi di disable restano nel
 /// chiamante).
-#[allow(clippy::too_many_arguments)]
 async fn accumulate_discovered_models(
     db: &PgPool,
     orchestrator: Option<&Orchestrator>,
     provider: &str,
     insert_new_disabled: bool,
-    api_models: &[String],
+    discovered: &DiscoveredModels,
     catalog_models: &std::collections::HashMap<String, (bool, bool)>,
-    declared_windows: &std::collections::HashMap<String, i64>,
 ) -> ModelSyncDelta {
     let mut total = ModelSyncDelta::default();
-    for api_model in api_models {
+    for api_model in &discovered.api_models {
         let delta = process_discovered_model(
             db,
             orchestrator,
@@ -1405,7 +1437,7 @@ async fn accumulate_discovered_models(
             api_model,
             insert_new_disabled,
             catalog_models,
-            declared_windows,
+            discovered,
         )
         .await;
         total.inserted += delta.inserted;
@@ -1678,19 +1710,27 @@ async fn insert_new_chat_model(
     provider: &str,
     api_model: &str,
     declared_window: Option<i64>,
+    declared_output: Option<i64>,
 ) -> bool {
     let context_window = catalog_window_value(declared_window);
+    // Tetto di output dichiarato: NULL = non dichiarato, MAI 0 — a differenza
+    // di `context_window` qui lo schema ammette NULL (mig 0716) e uno 0
+    // violerebbe il CHECK, oltre a spacciare un'assenza per un limite.
+    let declared_output_col: Option<i32> = declared_output
+        .filter(|o| *o > 0)
+        .and_then(|o| i32::try_from(o).ok());
     let res = sqlx::query(
         "INSERT INTO ai_price_catalog \
          (provider, model, display_name, input_cost_per_million_tokens, \
-          output_cost_per_million_tokens, currency, capabilities, performance_tier, is_enabled, pricing_state, context_window, effective_from) \
-         VALUES ($1, $2, $3, 0, 0, 'USD', '[]'::jsonb, NULL, false, 'unknown', $4, NOW()) \
+          output_cost_per_million_tokens, currency, capabilities, performance_tier, is_enabled, pricing_state, context_window, declared_max_output_tokens, effective_from) \
+         VALUES ($1, $2, $3, 0, 0, 'USD', '[]'::jsonb, NULL, false, 'unknown', $4, $5, NOW()) \
          ON CONFLICT (provider, model) DO NOTHING",
     )
     .bind(provider)
     .bind(api_model)
     .bind(api_model)
     .bind(context_window)
+    .bind(declared_output_col)
     .execute(db)
     .await;
     match res {
@@ -2193,49 +2233,91 @@ pub(crate) async fn tier_prior_bands(
     crate::orchestrator::model_service::relative_bands(db, "catalog.tier_relative").await
 }
 
-/// Riallinea `context_window` di un modello GIA' nel catalog al valore
-/// DICHIARATO dal provider nella discovery (es. Mistral `max_context_length`).
+/// Le colonne del catalogo riallineabili a un valore DICHIARATO dal provider
+/// nel listing di discovery. Enum CHIUSO e non stringhe: il nome della colonna
+/// entra nella SQL per interpolazione, quindi deve venire da questo vocabolario
+/// e mai da un input. Un punto unico per il riallineo (regola L): prima la
+/// finestra e il tetto avevano due funzioni gemelle quasi identiche, cioe' la
+/// forma di duplicazione che diverge in silenzio.
+#[derive(Debug, Clone, Copy)]
+enum ColonnaDichiarata {
+    /// `context_window` (es. Mistral `max_context_length`). Self-healing dei
+    /// placeholder (regola H, incidente sub-agente 2026-07-06: il default
+    /// schema 8192 preso per finestra reale bloccava ogni tool dal predictive
+    /// cap).
+    ContextWindow,
+    /// `declared_max_output_tokens` (mig 0716; google `outputTokenLimit`,
+    /// openrouter `top_provider.max_completion_tokens`).
+    DeclaredMaxOutput,
+}
+
+impl ColonnaDichiarata {
+    fn colonna(self) -> &'static str {
+        match self {
+            Self::ContextWindow => "context_window",
+            Self::DeclaredMaxOutput => "declared_max_output_tokens",
+        }
+    }
+
+    /// Evento di audit (nomi storici: le query gia' scritte li cercano cosi').
+    fn evento(self) -> &'static str {
+        match self {
+            Self::ContextWindow => "context_window_realigned",
+            Self::DeclaredMaxOutput => "declared_output_realigned",
+        }
+    }
+}
+
+/// Riallinea una [`ColonnaDichiarata`] di un modello GIA' nel catalog al valore
+/// DICHIARATO dal provider nella discovery.
 ///
-/// Self-healing dei placeholder (regola H, incidente sub-agente 2026-07-06: il
-/// default schema 8192 preso per finestra reale faceva bloccare OGNI tool dal
-/// predictive cap): la fonte autoritativa della finestra e' il provider stesso;
-/// quando la dichiara, il catalog converge senza patch manuali. `None`/<=0 =
-/// non dichiarata -> nessun tocco (il valore esistente, anche 0 = ignota,
-/// resta). UPDATE mirato (solo se differisce) + audit.
-async fn realign_context_window(
+/// La fonte autoritativa e' il provider stesso: quando dichiara, il catalog
+/// converge senza patch manuali. `None`/<=0 = non dichiarato -> NESSUN tocco:
+/// un listing che smette di dichiarare non e' una dichiarazione di assenza
+/// (il valore esistente — anche 0 = ignota per la finestra, NULL per il tetto —
+/// resta il fatto migliore che abbiamo). UPDATE mirato (solo se differisce) +
+/// audit.
+async fn realign_valore_dichiarato(
     db: &PgPool,
     provider: &str,
     api_model: &str,
-    declared_window: Option<i64>,
+    declared: Option<i64>,
+    col: ColonnaDichiarata,
 ) {
-    let Some(window) = declared_window.filter(|w| *w > 0) else {
+    let Some(valore) = declared
+        .filter(|v| *v > 0)
+        .and_then(|v| i32::try_from(v).ok())
+    else {
         return;
     };
-    let res = sqlx::query(
-        "UPDATE ai_price_catalog SET context_window = $3, updated_at = NOW() \
-         WHERE provider = $1 AND model = $2 AND context_window IS DISTINCT FROM $3",
-    )
-    .bind(provider)
-    .bind(api_model)
-    .bind(window as i32)
-    .execute(db)
-    .await;
+    let colonna = col.colonna();
+    let sql = format!(
+        "UPDATE ai_price_catalog SET {colonna} = $3, updated_at = NOW() \
+         WHERE provider = $1 AND model = $2 AND {colonna} IS DISTINCT FROM $3"
+    );
+    let res = sqlx::query(&sql)
+        .bind(provider)
+        .bind(api_model)
+        .bind(valore)
+        .execute(db)
+        .await;
     let realigned = matches!(res, Ok(r) if r.rows_affected() > 0);
     if !realigned {
         return;
     }
     tracing::info!(
-        "catalog_sync[{}]: context_window riallineato '{}' -> {} (dichiarato dal provider)",
+        "catalog_sync[{}]: {} riallineato '{}' -> {} (dichiarato dal provider)",
         provider,
+        colonna,
         api_model,
-        window
+        valore
     );
     audit_log(
         db,
         provider,
         api_model,
-        "context_window_realigned",
-        json!({"context_window": window, "source": "provider_declared"}),
+        col.evento(),
+        json!({colonna: valore, "source": "provider_declared"}),
     )
     .await;
 }
@@ -3507,12 +3589,16 @@ mod tests {
 
         let mut delta = ModelSyncDelta::default();
         // ramo None (modello nuovo), orchestrator=None -> niente probe.
-        process_discovered_chat_model(&pool, None, "provA", "good-1", true, None, None, &mut delta)
-            .await;
-        process_discovered_chat_model(&pool, None, "provA", "bad-1", true, None, None, &mut delta)
-            .await;
         process_discovered_chat_model(
-            &pool, None, "provB", "qualsiasi-1", true, None, None, &mut delta,
+            &pool, None, "provA", "good-1", true, None, None, None, &mut delta,
+        )
+        .await;
+        process_discovered_chat_model(
+            &pool, None, "provA", "bad-1", true, None, None, None, &mut delta,
+        )
+        .await;
+        process_discovered_chat_model(
+            &pool, None, "provB", "qualsiasi-1", true, None, None, None, &mut delta,
         )
         .await;
 
@@ -3528,6 +3614,79 @@ mod tests {
              dell'insert); provB senza policy inserisce comunque (unwrap_or(true))"
         );
         assert_eq!(delta.inserted, 2, "due soli insert: good-1 e qualsiasi-1");
+    }
+
+    /// Il tetto di output DICHIARATO dal wire arriva in colonna e si riallinea
+    /// (mig 0716), attraverso i produttori reali `insert_new_chat_model` e
+    /// `realign_valore_dichiarato` (regola O: una INSERT ricopiata qui misurerebbe
+    /// la copia).
+    ///
+    /// MUTAZIONI: (1) togliere la colonna dalla INSERT -> il primo assert cade
+    /// (NULL invece di 65536); (2) far si' che `realign_valore_dichiarato` con
+    /// `None` AZZERI la colonna (togliere il filtro in testa) -> il terzo
+    /// assert cade: un listing che smette di dichiarare non e' una
+    /// dichiarazione di assenza.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_tetto_dichiarato_dal_wire_arriva_in_colonna_e_si_riallinea(pool: sqlx::PgPool) {
+        // INSERT col tetto dichiarato (ramo modello nuovo, niente probe).
+        assert!(
+            insert_new_chat_model(&pool, None, "provW", "wire-1", None, Some(65_536)).await,
+            "insert del modello scoperto"
+        );
+        let letto: Option<i32> = sqlx::query_scalar(
+            "SELECT declared_max_output_tokens FROM ai_price_catalog \
+              WHERE provider = 'provW' AND model = 'wire-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("riga inserita");
+        assert_eq!(letto, Some(65_536), "il dichiarato del wire arriva in colonna");
+
+        // Riallineo a un valore diverso: il catalogo segue il fornitore.
+        realign_valore_dichiarato(
+            &pool,
+            "provW",
+            "wire-1",
+            Some(16_384),
+            ColonnaDichiarata::DeclaredMaxOutput,
+        )
+        .await;
+        let riallineato: Option<i32> = sqlx::query_scalar(
+            "SELECT declared_max_output_tokens FROM ai_price_catalog \
+              WHERE provider = 'provW' AND model = 'wire-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("riga riallineata");
+        assert_eq!(riallineato, Some(16_384));
+
+        // `None` NON cancella: l'ultimo valore osservato resta.
+        realign_valore_dichiarato(&pool, "provW", "wire-1", None, ColonnaDichiarata::DeclaredMaxOutput)
+            .await;
+        let conservato: Option<i32> = sqlx::query_scalar(
+            "SELECT declared_max_output_tokens FROM ai_price_catalog \
+              WHERE provider = 'provW' AND model = 'wire-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("riga conservata");
+        assert_eq!(
+            conservato,
+            Some(16_384),
+            "un listing che smette di dichiarare non azzera il fatto osservato"
+        );
+
+        // Un modello senza dichiarazione nasce NULL: mai uno 0 di comodo (il
+        // CHECK della 0716 lo rifiuterebbe comunque).
+        assert!(insert_new_chat_model(&pool, None, "provW", "muto-1", None, None).await);
+        let muto: Option<i32> = sqlx::query_scalar(
+            "SELECT declared_max_output_tokens FROM ai_price_catalog \
+              WHERE provider = 'provW' AND model = 'muto-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("riga muta");
+        assert_eq!(muto, None);
     }
 
     /// I FLAG POST-PROBE DEVONO ARRIVARE NEL CATALOG.

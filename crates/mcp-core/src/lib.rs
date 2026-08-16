@@ -47,7 +47,6 @@ mod claude_agents;
 mod context_settings;
 mod db;
 mod db_settings;
-mod deepseek_balance_sync;
 mod dispatcher_routes;
 mod dlp;
 mod documents;
@@ -111,6 +110,7 @@ mod project_workspace;
 mod projects;
 mod prompt_memories;
 mod prompt_templates;
+mod provider_balance_sync;
 mod provider_cooldown;
 mod provider_error_classifier;
 mod provider_inflight;
@@ -1185,7 +1185,8 @@ fn spawn_infra_watchdogs(state: &AppState) {
 }
 
 /// Avvia i worker catalogo/telemetria/retention: catalog_sync (ai_price_catalog dal
-/// JSON LiteLLM, default 12h), deepseek_balance_sync (/user/balance, 15min),
+/// JSON LiteLLM, default 12h), provider_balance_sync (endpoint di saldo di
+/// deepseek/openrouter/kimi, 15min),
 /// routing_matrix_auto_promoter (ricostruisce la matrix dal catalog ogni 6h,
 /// preserva manual_override), tool-result cache cleanup e db_retention (pota
 /// checkpoint + telemetria). Config DB-driven. Estratto da `spawn_background_workers`.
@@ -1205,7 +1206,7 @@ async fn spawn_catalog_and_retention_workers(state: &AppState) {
         catalog_sync_interval,
     );
 
-    deepseek_balance_sync::spawn_deepseek_balance_sync(state.db.clone(), true, 900);
+    provider_balance_sync::spawn_provider_balance_sync(state.db.clone(), true, 900);
 
     let ap_enabled = setting_flag_enabled(s_ap_enabled.ok().flatten(), true);
     let ap_interval = parse_u64_or(s_ap_interval.ok().flatten(), 21600);

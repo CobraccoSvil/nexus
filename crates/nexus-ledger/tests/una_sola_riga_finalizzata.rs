@@ -120,6 +120,7 @@ async fn una_chiamata_lascia_una_sola_riga_finalizzata(pool: PgPool) {
         "anthropic",
         "claude-x",
         &tokens,
+        None,
         &run.to_string(),
         "chat",
     )
@@ -315,6 +316,7 @@ async fn la_quota_vede_il_consumo_prima_e_dopo_la_chiamata(pool: PgPool) {
         "anthropic",
         "claude-x",
         &tokens,
+        None,
         &run.to_string(),
         "quota",
     )
