@@ -112,6 +112,16 @@ impl GenericOpenAiProvider {
         self
     }
 
+    /// Dichiara l'opt-in di usage accounting del registry
+    /// (`nexus_provider_registry.usage_accounting`, mig 0717): il client
+    /// aggiunge `usage: {"include": true}` al body e il fornitore dichiara il
+    /// costo esatto in `usage.cost`. Oggi solo openrouter; per gli altri il
+    /// flag e' false e il campo non parte.
+    pub fn with_usage_accounting(mut self, attivo: bool) -> Self {
+        self.client = self.client.with_usage_accounting(attivo);
+        self
+    }
+
     /// Garanzia difensiva (regola H): se il provider dichiara `supports_tools=false`
     /// (es. Perplexity sonar, che rifiuta le tool definitions con HTTP 400), rimuove
     /// `tools`/`tool_choice` dalla richiesta PRIMA dell'invio. La garanzia PRIMARIA

@@ -652,6 +652,7 @@ mod tests {
             "m1",
             crate::DiscardReason::DegenerateHollow,
             Some(&tokens),
+            None,
             "",
             "chat",
         )
@@ -663,6 +664,7 @@ mod tests {
             "m1",
             crate::DiscardReason::DegenerateHollow,
             Some(&tokens),
+            None,
             "",
             "rolling_summary",
         )

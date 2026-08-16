@@ -322,6 +322,7 @@ async fn la_spesa_scartata_e_visibile_e_conta_in_quota_solo_se_osservata(pool: P
         "claude-x",
         DiscardReason::DegenerateHollow,
         Some(&usage_degenere),
+        None,
         &run.to_string(),
         "chat",
     )
@@ -334,6 +335,7 @@ async fn la_spesa_scartata_e_visibile_e_conta_in_quota_solo_se_osservata(pool: P
         "anthropic",
         "claude-x",
         DiscardReason::AttemptTimeout,
+        None,
         None,
         &run.to_string(),
         "chat",

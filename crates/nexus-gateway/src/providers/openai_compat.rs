@@ -170,6 +170,12 @@ pub struct OpenAiCompatClient {
     /// Moonshot/Kimi idem (doc `/docs/api/chat`). Il dialetto continua a
     /// governare temperatura, `reasoning_effort` e `extra_body.thinking`.
     tetto_su_completion: bool,
+    /// QUESTO endpoint vuole l'opt-in di usage accounting nel body
+    /// (`usage: {"include": true}`) per dichiarare il costo esatto della
+    /// chiamata in `usage.cost` (registry `usage_accounting`, mig 0717).
+    /// Oggi lo dichiara il solo openrouter; per i fornitori diretti il campo
+    /// non parte — un campo sconosciuto e' il solo verso che puo' fare danno.
+    usage_accounting: bool,
 }
 
 /// TTL della cache delle preferenze di fornitore (come `policy_engine`/`cooldown`).
@@ -257,7 +263,19 @@ impl OpenAiCompatClient {
             // dialetto condiviso — mistral/groq/openrouter/deepseek/perplexity
             // documentano `max_tokens` e basta.
             tetto_su_completion: false,
+            // Il default e' non chiedere nulla: l'usage accounting e' un campo
+            // che solo chi lo documenta (openrouter) accetta nel body.
+            usage_accounting: false,
         }
+    }
+
+    /// Dichiara che questo endpoint vuole `usage: {"include": true}` nel body
+    /// per riportare il costo dichiarato della chiamata (registry
+    /// `usage_accounting`, mig 0717). Lo applica il punto unico
+    /// [`Self::corpo_della_richiesta`], quindi vale per complete E stream.
+    pub fn with_usage_accounting(mut self, attivo: bool) -> Self {
+        self.usage_accounting = attivo;
+        self
     }
 
     /// Dichiara gli header extra che ogni richiesta di questo client deve
@@ -444,6 +462,14 @@ impl OpenAiCompatClient {
         if provider_requires_user_or_tool_last(&self.provider_name) {
             strip_trailing_assistant(&mut body.messages);
         }
+        // Opt-in di usage accounting (mig 0717): messo QUI e non in
+        // `build_request_body` perche' e' una proprieta' del CLIENT (del
+        // fornitore, dal registry), e il punto unico garantisce che complete e
+        // stream lo ereditino insieme — un set su un percorso solo sarebbe un
+        // costo dichiarato che sparisce appena la chiamata va in streaming.
+        body.usage = self
+            .usage_accounting
+            .then_some(UsageAccountingOptIn { include: true });
         body
     }
 
@@ -1236,6 +1262,9 @@ fn build_request_body(
         } else {
             None
         },
+        // L'opt-in di usage accounting e' del CLIENT, non della richiesta: lo
+        // valorizza `corpo_della_richiesta` dal flag del registry.
+        usage: None,
     }
 }
 
@@ -1420,6 +1449,14 @@ fn from_chat_completion(
     // `prompt_tokens`, che e' quindi gia' il LORDO voluto dal sistema. Il punto
     // unico `LlmUsage::normalized` (regola L) non tocca il conteggio; qui si
     // dichiara solo la convenzione del formato.
+    // Costo dichiarato dal wire (openrouter, usage accounting): estratto dal
+    // punto unico `WireUsage::declared_cost` e agganciato all'usage col metodo
+    // esplicito — la normalizzazione dei token non c'entra col costo.
+    let (declared_total, declared_upstream) = resp
+        .usage
+        .as_ref()
+        .map(|u| u.declared_cost())
+        .unwrap_or((None, None));
     let usage = LlmUsage::normalized(
         PromptCacheReporting::CachedIncludedInPrompt,
         resp.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
@@ -1433,7 +1470,8 @@ fn from_chat_completion(
         // un addendo): vale per o1/o3, per il `reasoning_content` DeepSeek e per
         // ogni compatibile. Sommarlo qui raddoppierebbe l'addebito.
         ReasoningTokens::IncludedInOutput,
-    );
+    )
+    .with_declared_cost(declared_total, declared_upstream);
 
     // Citazioni top-level (Perplexity): estratte prima di costruire la risposta.
     let citations = resp.citations.filter(|c| !c.is_empty());
@@ -1474,6 +1512,9 @@ fn chunk_from_sse(
     model_used: &str,
 ) -> Option<LlmStreamChunk> {
     let usage = chunk.usage.map(|u| {
+        // Il costo dichiarato arriva nell'ULTIMO chunk insieme all'usage:
+        // stesso punto unico di estrazione del non-streaming.
+        let (declared_total, declared_upstream) = u.declared_cost();
         LlmUsage::normalized(
             PromptCacheReporting::CachedIncludedInPrompt,
             u.prompt_tokens,
@@ -1483,6 +1524,7 @@ fn chunk_from_sse(
             // Come nel non-streaming: gia' dentro `completion_tokens`.
             ReasoningTokens::IncludedInOutput,
         )
+        .with_declared_cost(declared_total, declared_upstream)
     });
 
     let choice = chunk.choices.into_iter().next();
@@ -1864,6 +1906,12 @@ pub(crate) struct ChatCompletionRequest {
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
+    /// Opt-in di usage accounting (openrouter, mig 0717): chiede al fornitore
+    /// di dichiarare `usage.cost` sulla risposta. Lo setta il solo
+    /// [`OpenAiCompatClient::corpo_della_richiesta`], dal flag del registry;
+    /// omesso per tutti gli altri endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<UsageAccountingOptIn>,
     /// Campi extra appiattiti nel body radice (DeepSeek `thinking`): il client
     /// OpenAI ufficiale fonde `extra_body` nel top-level, quindi facciamo lo
     /// stesso con `serde(flatten)`. `None` => nessun campo aggiunto.
@@ -1874,6 +1922,13 @@ pub(crate) struct ChatCompletionRequest {
 #[derive(Debug, Serialize)]
 struct StreamOptions {
     include_usage: bool,
+}
+
+/// Il corpo dell'opt-in di usage accounting: `{"include": true}`. Tipizzato e
+/// non un `json!` sciolto, cosi' il campo ha un solo produttore possibile.
+#[derive(Debug, Serialize)]
+struct UsageAccountingOptIn {
+    include: bool,
 }
 
 /// Preferenza di fornitore a valle, dialetto degli instradatori (OpenRouter
@@ -2091,6 +2146,21 @@ struct WireUsage {
     /// parte (la firma del `thoughtsTokenCount` di Google).
     #[serde(default)]
     cached_tokens: Option<u32>,
+    /// OpenRouter (usage accounting, mig 0717): costo TOTALE della chiamata in
+    /// USD, dichiarato dal fornitore. Assente su tutti gli altri dialetti.
+    #[serde(default)]
+    cost: Option<f64>,
+    /// OpenRouter: dettaglio del costo, con l'inference del fornitore a valle.
+    #[serde(default)]
+    cost_details: Option<WireCostDetails>,
+}
+
+/// Il dettaglio di costo di un aggregatore (openrouter `cost_details`).
+#[derive(Debug, Deserialize)]
+struct WireCostDetails {
+    /// Costo dell'inference presso il fornitore a valle (USD). Telemetria.
+    #[serde(default)]
+    upstream_inference_cost: Option<f64>,
 }
 
 impl WireUsage {
@@ -2108,6 +2178,20 @@ impl WireUsage {
             .or_else(|| self.prompt_tokens_details.as_ref().and_then(|d| d.cached_tokens))
             .or(self.cached_tokens);
         hit.filter(|&n| n > 0)
+    }
+
+    /// Costo dichiarato dal wire, nella forma `(totale, upstream)` che
+    /// [`LlmUsage::with_declared_cost`] riceve. Punto unico dei DUE percorsi
+    /// che lo consegnano (non-streaming e ultimo chunk SSE): con due estrazioni
+    /// separate, lo streaming — dove openrouter manda l'usage davvero —
+    /// potrebbe perdere il campo con tutti i test del non-streaming verdi.
+    fn declared_cost(&self) -> (Option<f64>, Option<f64>) {
+        (
+            self.cost,
+            self.cost_details
+                .as_ref()
+                .and_then(|d| d.upstream_inference_cost),
+        )
     }
 }
 
@@ -3948,4 +4032,124 @@ mod tests {
     // derivabile, perche' deciderla richiede il catalogo. Questo modulo resta
     // responsabile di cio' che PRODUCE - i candidati e il codice di wire - e i
     // suoi test misurano quello.
+
+    // ── Usage accounting openrouter (mig 0717) ─────────────────
+
+    /// Il costo DICHIARATO dal fornitore attraversa il parser reale fino alla
+    /// `LlmUsage` (regola O: dal produttore `parse_chat_completion` +
+    /// `from_chat_completion`, non da una struct composta a mano).
+    ///
+    /// Body nella forma dell'usage accounting OpenRouter (`usage.cost` +
+    /// `cost_details.upstream_inference_cost`, doc "Usage Accounting"; il
+    /// riscontro sul wire vivo con `usage:{include:true}` resta da annotare al
+    /// primo esercizio).
+    ///
+    /// MUTAZIONE: togliendo `cost` da `WireUsage` (o l'aggancio
+    /// `with_declared_cost` in `from_chat_completion`) il primo assert cade con
+    /// `None` — che e' la forma esatta del difetto: la chiamata entra nel
+    /// ledger a costo 0. Togliendo `cost_details`, cade il secondo.
+    #[test]
+    fn il_costo_dichiarato_dal_wire_arriva_alla_llm_usage() {
+        let body = r#"{
+            "id": "gen-123",
+            "provider": "DeepInfra",
+            "model": "qwen/qwen3-235b-a22b-2507",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "ciao"}}],
+            "usage": {"prompt_tokens": 123, "completion_tokens": 45,
+                      "total_tokens": 168, "cost": 0.0021,
+                      "cost_details": {"upstream_inference_cost": 0.0018}}
+        }"#;
+        let parsed = parse_chat_completion("openrouter", body).expect("parse");
+        let resp = from_chat_completion(parsed, "qwen/qwen3-235b-a22b-2507".into(), "openrouter", 7)
+            .expect("mappatura");
+        assert_eq!(resp.usage.declared_cost_usd, Some(0.0021));
+        assert_eq!(resp.usage.upstream_cost_usd, Some(0.0018));
+        // I token restano quelli del wire: il costo non tocca i conteggi.
+        assert_eq!(resp.usage.input_tokens, 123);
+        assert_eq!(resp.usage.output_tokens, 45);
+
+        // Un dialetto che NON dichiara (mistral, groq, ...) resta non
+        // dichiarato: `None`, mai uno zero di comodo (regola Q).
+        let body_senza = r#"{
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "ciao"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+        }"#;
+        let parsed = parse_chat_completion("mistral", body_senza).expect("parse");
+        let resp =
+            from_chat_completion(parsed, "m".into(), "mistral", 1).expect("mappatura");
+        assert_eq!(resp.usage.declared_cost_usd, None);
+        assert_eq!(resp.usage.upstream_cost_usd, None);
+    }
+
+    /// In STREAMING l'usage col costo arriva nell'ultimo chunk (quello con
+    /// `finish_reason`), attraverso il parser SSE reale. E' il percorso su cui
+    /// il campo si perderebbe in silenzio se l'estrazione vivesse solo nel
+    /// non-streaming: per questo entrambe delegano a `WireUsage::declared_cost`.
+    ///
+    /// MUTAZIONE: togliendo `.with_declared_cost(...)` da `chunk_from_sse`
+    /// l'assert cade con `None` mentre il test non-streaming resta verde.
+    #[test]
+    fn il_costo_dichiarato_arriva_anche_dallo_stream() {
+        let mut st = empty_parser();
+        st.parse_line(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\
+             \"usage\":{\"prompt_tokens\":123,\"completion_tokens\":45,\"cost\":0.0021,\
+             \"cost_details\":{\"upstream_inference_cost\":0.0018}}}",
+        );
+        let chunk = st.pending.pop_front().expect("chunk finale con usage");
+        let usage = chunk.usage.expect("l'ultimo chunk porta l'usage");
+        assert_eq!(usage.declared_cost_usd, Some(0.0021));
+        assert_eq!(usage.upstream_cost_usd, Some(0.0018));
+    }
+
+    /// L'opt-in `usage: {"include": true}` parte dal punto unico
+    /// `corpo_della_richiesta`, quindi su ENTRAMBI i percorsi (complete e
+    /// stream); senza il flag del registry la chiave non esiste nel body.
+    ///
+    /// MUTAZIONE: spostando il set fuori dal punto unico (es. solo sul percorso
+    /// complete) l'assert sul corpo streaming rosseggia; facendolo partire
+    /// incondizionato, rosseggia il caso `false`.
+    #[tokio::test]
+    async fn lopt_in_di_usage_accounting_parte_su_entrambi_i_percorsi() {
+        let con_flag = OpenAiCompatClient::new(
+            Client::new(),
+            "https://openrouter.ai/api/v1",
+            "chiave",
+            "openrouter",
+        )
+        .with_usage_accounting(true);
+        for stream in [false, true] {
+            let corpo = serde_json::to_value(
+                con_flag
+                    .corpo_della_richiesta(&sample_request(), stream, &ResolvedReasoning::none())
+                    .await,
+            )
+            .expect("serializza");
+            assert_eq!(
+                corpo["usage"]["include"],
+                serde_json::Value::Bool(true),
+                "stream={stream}: l'opt-in deve partire ({corpo})"
+            );
+        }
+
+        // Default (nessun flag nel registry): il campo non parte — un campo
+        // sconosciuto e' il solo verso che puo' fare danno.
+        let senza_flag =
+            OpenAiCompatClient::new(Client::new(), "https://api.groq.com/openai/v1", "k", "groq");
+        for stream in [false, true] {
+            let corpo = serde_json::to_value(
+                senza_flag
+                    .corpo_della_richiesta(&sample_request(), stream, &ResolvedReasoning::none())
+                    .await,
+            )
+            .expect("serializza");
+            assert!(
+                corpo.get("usage").is_none(),
+                "stream={stream}: senza flag la chiave non deve esistere ({corpo})"
+            );
+        }
+    }
 }
