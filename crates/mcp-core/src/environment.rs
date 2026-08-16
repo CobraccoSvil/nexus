@@ -1362,7 +1362,19 @@ async fn fetch_saldi_osservati(
     )
     .fetch_all(db)
     .await
-    .unwrap_or_default();
+    // Il guasto di lettura NON deve rompere lo stato provider (il saldo e' una
+    // fonte accessoria), ma nemmeno tacere: un typo di colonna nella vista
+    // renderebbe l'esposizione muta PER SEMPRE con tutti i test verdi — lo
+    // zero-silenzioso che la regola O documenta. Il WARN lo rende visibile al
+    // primo giro.
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            target: "provider_balance_sync",
+            errore = %e,
+            "lettura saldi osservati dalla vista fallita: stato provider senza saldi"
+        );
+        Vec::new()
+    });
     rows.into_iter()
         .map(|(provider, balance_usd, observed_at, source)| {
             (
