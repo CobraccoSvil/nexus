@@ -257,7 +257,13 @@ pub async fn resolve_active_prices_in(
 /// [`resolve_active_price_at`] per la lettura singola. Le finestre del provider
 /// si caricano UNA volta e si applicano modello per modello: una finestra
 /// specifica vince sul jolly solo per il suo modello.
-async fn resolve_active_prices_at(
+///
+/// `pub` per la stessa ragione dichiarata di [`resolve_active_price_at`]
+/// (regola O): i test dei consumatori — il riordino cache-aware di
+/// `Rank::CostFirst` in mcp-core — iniettano l'istante invece di aspettare la
+/// fascia oraria giusta, e devono farlo attraversando QUESTO resolver, non una
+/// copia della query.
+pub async fn resolve_active_prices_at(
     db: &PgPool,
     provider: &str,
     currency: &str,

@@ -576,6 +576,44 @@ async fn diagnose_empty(
     }
 }
 
+/// PUNTO UNICO del fetch dei candidati per i tre percorsi del servizio, col
+/// riordino cache-aware di `Rank::CostFirst` (mig 0721, opt-in). A flag OFF il
+/// fetch resta `limit` e il percorso e' bit-identico allo storico; a flag ON
+/// si chiede un POOL, si riordina sul costo ATTESO (cache + finestre orarie,
+/// vedi `cost_rank`) e si tronca al limite chiesto. Vive qui e non nei tre
+/// call site: tre copie del blocco erano gia' una duplicazione (regola L).
+async fn fetch_ranked(
+    db: &PgPool,
+    req: &ModelRequest<'_>,
+    filter: &EligibilityFilter<'_>,
+    chain: &[&str],
+    limit: i64,
+    min_distinct_providers: usize,
+) -> Result<Vec<(String, String, Option<String>)>, String> {
+    let cache_aware =
+        req.rank == Rank::CostFirst && super::cost_rank::cache_aware_enabled(db).await;
+    let fetch = if cache_aware {
+        limit.max(super::cost_rank::COST_RANK_POOL)
+    } else {
+        limit
+    };
+    let rows = select_models_tierchain(
+        db,
+        filter,
+        chain,
+        &req.rank.to_sql(),
+        fetch,
+        min_distinct_providers,
+    )
+    .await?;
+    if !cache_aware {
+        return Ok(rows);
+    }
+    let mut rows = super::cost_rank::rerank_expected_cost(db, rows).await;
+    rows.truncate(limit.max(0) as usize);
+    Ok(rows)
+}
+
 /// IL PUNTO DI INGRESSO. Sceglie UN modello, o dice PERCHE' non c'e'.
 ///
 /// I2: il gate di qualificazione si legge QUI dal DB, una volta, per tutti. Un
@@ -610,10 +648,12 @@ async fn select_model_governed(
     validate(req)?;
     let chain = chain_for(req);
     let filter = filter_for(req, gate);
-    let rows =
-        select_models_tierchain(db, &filter, &chain, &req.rank.to_sql(), GOVERNED_CANDIDATE_POOL, 1)
-            .await
-            .map_err(NoModelReason::CatalogUnavailable)?;
+    // Con CostFirst cache-aware (mig 0721) il riordino sul costo atteso avviene
+    // PRIMA di `rank_candidates`, che e' stabile: l'ordine base diventa quello
+    // cache-aware e la telemetria retrocede sopra.
+    let rows = fetch_ranked(db, req, &filter, &chain, GOVERNED_CANDIDATE_POOL, 1)
+        .await
+        .map_err(NoModelReason::CatalogUnavailable)?;
     if rows.is_empty() {
         return Err(diagnose_empty(db, req, &chain, gate).await);
     }
@@ -674,16 +714,9 @@ pub async fn select_models(
     validate(req)?;
     let chain = chain_for(req);
     let filter = filter_for(req, gate);
-    let rows = select_models_tierchain(
-        db,
-        &filter,
-        &chain,
-        &req.rank.to_sql(),
-        limit,
-        min_distinct_providers,
-    )
-    .await
-    .map_err(NoModelReason::CatalogUnavailable)?;
+    let rows = fetch_ranked(db, req, &filter, &chain, limit, min_distinct_providers)
+        .await
+        .map_err(NoModelReason::CatalogUnavailable)?;
     if rows.is_empty() {
         return Err(diagnose_empty(db, req, &chain, gate).await);
     }
@@ -710,7 +743,7 @@ async fn select_model_with_gate(
     validate(req)?;
     let chain = chain_for(req);
     let filter = filter_for(req, gate);
-    let rows = select_models_tierchain(db, &filter, &chain, &req.rank.to_sql(), 1, 1)
+    let rows = fetch_ranked(db, req, &filter, &chain, 1, 1)
         .await
         .map_err(NoModelReason::CatalogUnavailable)?;
     let Some((provider, model, effective_tier)) = rows.into_iter().next() else {

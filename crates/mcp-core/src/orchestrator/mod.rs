@@ -34,6 +34,7 @@ pub(crate) const KNOWN_INTENTS: [&str; 6] =
 // ---------------------------------------------------------------------------
 
 mod core;
+mod cost_rank;
 mod intent;
 pub(crate) mod model_routing;
 mod model_selection;

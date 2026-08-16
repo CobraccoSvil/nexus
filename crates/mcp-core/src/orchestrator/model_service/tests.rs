@@ -1007,3 +1007,288 @@ fn la_catena_flexible_non_scende_mai_sotto_il_pavimento() {
         .min_tier("medium");
     assert_eq!(chain_for(&req), vec!["heavy", "high", "medium", "frontier"]);
 }
+
+// ── Rank::CostFirst cache-aware e finestre-aware (mig 0721) ─────────────────
+
+/// Il flag di rollout, scritto e RESO VISIBILE: la cache dei settings (TTL 60s,
+/// per pool) servirebbe altrimenti il valore vecchio per un minuto, e il test
+/// misurerebbe lo stato di prima della flip.
+async fn accendi_cost_rank(pool: &PgPool, acceso: bool) {
+    sqlx::query("UPDATE settings SET value = $1 WHERE key = $2")
+        .bind(if acceso { "true" } else { "false" })
+        .bind(super::super::cost_rank::FLAG_CACHE_AWARE)
+        .execute(pool)
+        .await
+        .expect("flip flag cost_rank");
+    nexus_auth::invalidate_setting_cache(pool, super::super::cost_rank::FLAG_CACHE_AWARE);
+}
+
+/// Un modello del catalog con le colonne che il criterio cache-aware legge:
+/// listino di input, tariffa di cache, tier.
+async fn seed_cost_rank_modello(
+    pool: &PgPool,
+    provider: &str,
+    model: &str,
+    tier: &str,
+    input: f64,
+    cache_read: Option<f64>,
+) {
+    sqlx::query(
+        "INSERT INTO ai_price_catalog \
+           (provider, model, performance_tier, input_cost_per_million_tokens, \
+            output_cost_per_million_tokens, cache_read_cost_per_million_tokens, \
+            currency, is_enabled, supports_tool_use, agentic_thinking_policy, \
+            capabilities, qualified_capabilities, context_window, pricing_state, \
+            qualification_state, qualification_expires_at, last_probe_healthy_at) \
+         VALUES ($1,$2,$3,$4,1.0,$5,'USD',TRUE,TRUE,'none','[\"code\"]'::jsonb, \
+                 '[\"code\"]'::jsonb,200000,'priced','qualified', \
+                 now() + interval '30 days',now())",
+    )
+    .bind(provider)
+    .bind(model)
+    .bind(tier)
+    .bind(input)
+    .bind(cache_read)
+    .execute(pool)
+    .await
+    .expect("seed catalog cost_rank");
+}
+
+/// La dichiarazione `supports_prompt_cache` nella tabella che alimenta la
+/// vista unica `v_model_capabilities` (ADR 0024).
+async fn dichiara_prompt_cache(pool: &PgPool, provider: &str, model: &str, flag: bool) {
+    sqlx::query(
+        "INSERT INTO nexus_provider_capabilities (provider, model, supports_prompt_cache) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind(provider)
+    .bind(model)
+    .bind(flag)
+    .execute(pool)
+    .await
+    .expect("dichiarazione prompt cache");
+}
+
+/// Righe di ledger scritte dal PRODUTTORE reale (`record_tokens`) con le FK
+/// soddisfatte davvero (regola O: il seed a mano del ledger e' esattamente
+/// il precedente "la fixture fissava l'assunto"). Stesso pattern dei test di
+/// escalation_port.
+async fn seed_hit_ledger(
+    pool: &PgPool,
+    provider: &str,
+    model: &str,
+    righe: usize,
+    prompt: i64,
+    cache: i64,
+) {
+    let team = uuid::Uuid::new_v4();
+    let user = uuid::Uuid::new_v4();
+    let project = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO teams (id, name, slug) VALUES ($1,'T',$2)")
+        .bind(team)
+        .bind(team.to_string())
+        .execute(pool)
+        .await
+        .expect("team");
+    sqlx::query("INSERT INTO users (id, email, display_name) VALUES ($1,$2,'U')")
+        .bind(user)
+        .bind(format!("{user}@t.local"))
+        .execute(pool)
+        .await
+        .expect("user");
+    sqlx::query(
+        "INSERT INTO projects (id, team_id, name, slug, owner_user_id) \
+         VALUES ($1,$2,'P',$3,$4)",
+    )
+    .bind(project)
+    .bind(team)
+    .bind(project.to_string())
+    .bind(user)
+    .execute(pool)
+    .await
+    .expect("project");
+
+    let id = nexus_ledger::Identity {
+        user_id: user,
+        project_id: project,
+    };
+    for _ in 0..righe {
+        let usage = nexus_pricing::TokenUsage {
+            prompt_tokens: prompt,
+            completion_tokens: 0,
+            cache_read_tokens: cache,
+            cache_creation_tokens: 0,
+        };
+        nexus_ledger::record_tokens(pool, id, provider, model, &usage, None, "", "test")
+            .await
+            .expect("record_tokens");
+    }
+}
+
+/// Test 1 del design (Fase 3, Lotto 1): CostFirst ordina sul costo ATTESO, non
+/// sul listino nominale. A costa 0.40 senza cache; B costa 0.60 di listino ma
+/// con cache_read 0.06 e hit misurato 70% sul ledger il suo costo atteso e'
+/// 0.60*0.3 + 0.06*0.7 = 0.222 < 0.40: col flag acceso vince B.
+///
+/// MUTAZIONE (eseguita davvero, vedi commit): se il ranking torna al listino
+/// nominale — p.es. `risolvi_hit` che scarta la misura, o l'innesto rimosso —
+/// il test rosseggia mostrando A.
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+async fn costfirst_ordina_sul_costo_atteso_non_sul_listino(pool: PgPool) {
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
+    seed_cost_rank_modello(&pool, "prov-a", "a-listino", "medium", 0.40, None).await;
+    seed_cost_rank_modello(&pool, "prov-b", "b-cache", "medium", 0.60, Some(0.06)).await;
+    dichiara_prompt_cache(&pool, "prov-b", "b-cache", true).await;
+    // 25 righe finalized (>= soglia 20 della mig 0656) con hit 70%.
+    seed_hit_ledger(&pool, "prov-b", "b-cache", 25, 1_000, 700).await;
+
+    let req = ModelRequest::agentic("medium").capability(Some("code"));
+
+    // Flag OFF (default della mig 0721): comanda il listino nominale, vince A.
+    let c = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect("un modello");
+    assert_eq!(c.model, "a-listino", "a flag OFF comanda il listino nominale");
+
+    // Flag ON: comanda il costo atteso, vince B.
+    accendi_cost_rank(&pool, true).await;
+    let c = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect("un modello");
+    assert_eq!(
+        c.model, "b-cache",
+        "costo atteso 0.222 < 0.40: se qui c'e' ancora 'a-listino' il ranking \
+         e' tornato al listino nominale"
+    );
+}
+
+/// Test 3 del design: `supports_prompt_cache` e' il discriminante. Con la
+/// dichiarazione FALSE ma il ledger che misura hit > 0 (deriva della colonna)
+/// vince la MISURA — il fatto piu' recente batte la dichiarazione stantia,
+/// stessa evidenza della mig 0703. Le etichette dei casi senza misura
+/// (Observed(0.0) dichiarata contro Unknown) sono provate a tabella nel test
+/// puro di cost_rank.
+///
+/// MUTAZIONE: se la dichiarazione FALSE azzerasse la misura (precedenza
+/// invertita), il costo atteso di B tornerebbe 0.60 e vincerebbe A.
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+async fn senza_cache_dichiarata_niente_sconto_ma_la_misura_vince(pool: PgPool) {
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
+    seed_cost_rank_modello(&pool, "prov-a", "a-listino", "medium", 0.40, None).await;
+    seed_cost_rank_modello(&pool, "prov-b", "b-smentito", "medium", 0.60, Some(0.06)).await;
+    // La colonna dice FALSE, il ledger misura il contrario.
+    dichiara_prompt_cache(&pool, "prov-b", "b-smentito", false).await;
+    seed_hit_ledger(&pool, "prov-b", "b-smentito", 25, 1_000, 700).await;
+    accendi_cost_rank(&pool, true).await;
+
+    let req = ModelRequest::agentic("medium").capability(Some("code"));
+    let c = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect("un modello");
+    assert_eq!(
+        c.model, "b-smentito",
+        "il ledger misura hit 70%: la misura vince sulla dichiarazione FALSE \
+         (deriva della colonna, con warn)"
+    );
+}
+
+/// Test 4 del design: sotto `min_samples` l'hit e' IGNOTO e il costo atteso
+/// resta il listino pieno — parita' col comportamento di oggi. B ha hit
+/// altissimo ma solo 5 campioni (soglia 20, mig 0656): non conta.
+///
+/// MUTAZIONE: se la soglia sparisse (o l'ignoto degradasse a "scontato"),
+/// B vincerebbe con 5 campioni e il test rosseggerebbe mostrando B.
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+async fn hit_ignoto_resta_listino_pieno(pool: PgPool) {
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
+    seed_cost_rank_modello(&pool, "prov-a", "a-listino", "medium", 0.40, None).await;
+    seed_cost_rank_modello(&pool, "prov-b", "b-pochi-campioni", "medium", 0.60, Some(0.06)).await;
+    dichiara_prompt_cache(&pool, "prov-b", "b-pochi-campioni", true).await;
+    seed_hit_ledger(&pool, "prov-b", "b-pochi-campioni", 5, 1_000, 900).await;
+    accendi_cost_rank(&pool, true).await;
+
+    let req = ModelRequest::agentic("medium").capability(Some("code"));
+    let c = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect("un modello");
+    assert_eq!(
+        c.model, "a-listino",
+        "5 campioni sotto la soglia di 20: hit ignoto, listino pieno, vince il \
+         nominale piu' basso"
+    );
+}
+
+/// Test 5 del design: a ledger VUOTO flag OFF e flag ON scelgono lo stesso
+/// modello — il riordino senza misure e' un'identita' (sort stabile, hit
+/// Unknown per tutti, stesso asse del listino).
+///
+/// MUTAZIONE: se il riordino a hit ignoto alterasse l'ordine (p.es. un sort
+/// instabile, o un default di hit inventato), le due scelte divergerebbero.
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+async fn flag_off_bit_identico(pool: PgPool) {
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
+    seed_cost_rank_modello(&pool, "prov-a", "a-economico", "medium", 0.40, None).await;
+    seed_cost_rank_modello(&pool, "prov-b", "b-caro", "medium", 0.60, Some(0.06)).await;
+    dichiara_prompt_cache(&pool, "prov-b", "b-caro", true).await;
+
+    let req = ModelRequest::agentic("medium").capability(Some("code"));
+    let off = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect("scelta a flag OFF");
+    accendi_cost_rank(&pool, true).await;
+    let on = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect("scelta a flag ON");
+    assert_eq!(
+        (off.provider, off.model),
+        (on.provider, on.model),
+        "a ledger vuoto il riordino non deve cambiare la scelta"
+    );
+}
+
+/// Test 6 del design: nel fan-out multi-tier il riordino cambia l'ordine
+/// DENTRO ogni gruppo di tier, mai fra gruppi. `m1-economico` (medium) e' il
+/// piu' economico in assoluto ma non scavalca i due heavy; fra gli heavy la
+/// cache efficace di `h1-cache` (10.0 nominale, atteso 3.7) batte il nominale
+/// di `h2-nominale` (5.0).
+///
+/// MUTAZIONE: se il reranker ordinasse globalmente sul costo, `m1-economico`
+/// finirebbe primo e il test rosseggerebbe.
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+async fn il_riordino_non_scavalca_il_tier(pool: PgPool) {
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
+    // Due heavy dello stesso provider: il fan-out (min_distinct=2) deve
+    // scendere la catena fino al medium per il secondo provider.
+    seed_cost_rank_modello(&pool, "prov-uno", "h2-nominale", "heavy", 5.0, None).await;
+    seed_cost_rank_modello(&pool, "prov-uno", "h1-cache", "heavy", 10.0, Some(1.0)).await;
+    seed_cost_rank_modello(&pool, "prov-due", "m1-economico", "medium", 0.1, None).await;
+    dichiara_prompt_cache(&pool, "prov-uno", "h1-cache", true).await;
+    // h1: hit 70% -> atteso 10.0*0.3 + 1.0*0.7 = 3.7 < 5.0 di h2.
+    seed_hit_ledger(&pool, "prov-uno", "h1-cache", 25, 1_000, 700).await;
+    accendi_cost_rank(&pool, true).await;
+
+    let req = ModelRequest::agentic("heavy").capability(Some("code"));
+    let scelte = select_models(&pool, &req, 5, 2).await.expect("fan-out");
+    let modelli: Vec<&str> = scelte.iter().map(|c| c.model.as_str()).collect();
+    assert_eq!(
+        modelli,
+        vec!["h1-cache", "h2-nominale", "m1-economico"],
+        "dentro il gruppo heavy comanda il costo atteso (h1 prima di h2); il \
+         medium resta DOPO gli heavy anche se costa 37 volte meno"
+    );
+}
