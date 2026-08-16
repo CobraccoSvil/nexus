@@ -1674,6 +1674,84 @@ mod tests {
         assert!(cieco.richiede_intervento());
     }
 
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn i_codici_groq_flex_e_tool_use_sono_dichiarati(pool: PgPool) {
+        // MUTAZIONE: togliere una delle due righe della mig 0713 fa rosseggiare
+        // il ramo relativo — il DELETE in coda lo dimostra sul catalogo VERO,
+        // riportando il 498 a `DalloStatus` col codice nel debito e il 400 al
+        // debito su `tool_use_failed` (lo stato del registro ignoti 13-14/08).
+        let mappa = catalogo_reale(&pool).await;
+
+        // 498 flex tier: la classe era gia' Transient dallo status; la riga
+        // rende il verdetto DICHIARATO e azzera il debito.
+        let corpo_498 = r#"{"error":{"message":"Flex Tier capacity exceeded, please try again soon","code":"capacity_exceeded"}}"#;
+        let http =
+            crate::providers::ProviderHttpError::from_response("groq", 498, corpo_498.to_string());
+        let v = giudica("groq", 498, &http.candidati, &mappa);
+        assert_eq!(v.classe, ClasseErrore::Transient);
+        assert_eq!(
+            v.fonte,
+            FonteVerdetto::Dichiarata {
+                campo: CampoErrore::ErrorCode,
+                valore: "capacity_exceeded".into(),
+                causa: CausaErrore::Overloaded,
+            }
+        );
+        assert!(
+            !v.richiede_intervento(),
+            "senza la riga della 0713 ogni 498 scriverebbe un ignoto: {:?}",
+            v.non_dichiarati
+        );
+
+        // 400 tool_use_failed: decide il code (rango), il type concorda via
+        // jolly `invalid_request_error`; nessun debito e nessuna discordanza.
+        let corpo_400 = r#"{"error":{"message":"Failed to call a function. Please adjust your prompt.","type":"invalid_request_error","code":"tool_use_failed"}}"#;
+        let http =
+            crate::providers::ProviderHttpError::from_response("groq", 400, corpo_400.to_string());
+        let v = giudica("groq", 400, &http.candidati, &mappa);
+        assert_eq!(v.classe, ClasseErrore::ClientError);
+        assert_eq!(
+            v.fonte,
+            FonteVerdetto::Dichiarata {
+                campo: CampoErrore::ErrorCode,
+                valore: "tool_use_failed".into(),
+                causa: CausaErrore::MalformedRequest,
+            }
+        );
+        assert!(!v.richiede_intervento(), "{:?}", v.non_dichiarati);
+        assert!(
+            crate::history_sanitizer::is_history_related_client_error(v.causa),
+            "una tool-call malformata DEVE innescare la sanificazione della \
+             history: rimuove proprio la generazione malformata"
+        );
+
+        // La mutazione, sul catalogo vero: tolte le righe il debito ricompare.
+        sqlx::query(
+            "DELETE FROM nexus_provider_error_code WHERE provider = 'groq' \
+             AND valore IN ('capacity_exceeded','tool_use_failed')",
+        )
+        .execute(&pool)
+        .await
+        .expect("delete di prova");
+        let senza = catalogo_reale(&pool).await;
+
+        let http =
+            crate::providers::ProviderHttpError::from_response("groq", 498, corpo_498.to_string());
+        let cieco = giudica("groq", 498, &http.candidati, &senza);
+        assert_eq!(cieco.fonte, FonteVerdetto::DalloStatus { status: 498 });
+        assert!(cieco.richiede_intervento());
+
+        let http =
+            crate::providers::ProviderHttpError::from_response("groq", 400, corpo_400.to_string());
+        let cieco = giudica("groq", 400, &http.candidati, &senza);
+        assert_eq!(
+            cieco.non_dichiarati.len(),
+            1,
+            "e' lo stato misurato nel registro ignoti il 13-14/08: il code non \
+             dichiarato, il type retto dal jolly"
+        );
+    }
+
     #[test]
     fn senza_body_decide_lo_status_e_lo_dichiara() {
         let candidati = CandidatiErrore::dal_body("non e' json");
