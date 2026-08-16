@@ -731,6 +731,103 @@ pub(crate) fn azione_dal_probe(
     }
 }
 
+/// IL FRENO SI CONSULTA SEMPRE, e qui: `true` = si puo' fare il probe adesso.
+///
+/// Prima la condizione nel loop era
+/// `is_provider_in_cooldown(p) && !should_reprobe_cooldown(p, 600s)`: il
+/// corto-circuito `&&` fa si' che con il cooldown SCADUTO la seconda meta' non
+/// venga nemmeno chiamata, quindi l'istante dell'ultimo probe non veniva mai
+/// annotato e l'intervallo di 600s non valeva mai. Bastava un esito non
+/// conclusivo — che allora scriveva un cooldown breve di 60s — perche' quello
+/// scadesse al tick seguente e il ciclo ripartisse: cadenza reale MISURATA 120s
+/// per 4h29m, cinque volte piu' frequente del previsto, con una chiamata a
+/// pagamento ogni volta.
+///
+/// Essere o non essere in cooldown non cambia piu' la risposta: la domanda e'
+/// «quanto tempo e' passato dall'ultimo probe di questo loop», e ha una
+/// risposta sola.
+fn freno_consente_il_probe(provider: &str) -> bool {
+    match permesso_di_riprovare(
+        provider,
+        std::time::Duration::from_secs(BILLING_REPROBE_INTERVAL_S),
+    ) {
+        PermessoRiprova::Concesso => true,
+        PermessoRiprova::TroppoPresto { attesa_s } => {
+            tracing::trace!(
+                target: "provider_cooldown",
+                provider = %provider,
+                attesa_s,
+                "probe-then-reenable: freno attivo, non riprovo adesso"
+            );
+            false
+        }
+        PermessoRiprova::RegistroNonInterrogabile => {
+            tracing::warn!(
+                target: "provider_cooldown",
+                provider = %provider,
+                "probe-then-reenable: registro dei re-probe non interrogabile, salto il giro"
+            );
+            false
+        }
+    }
+}
+
+/// Traduce l'[`AzioneRecovery`] decisa dal criterio puro nelle scritture sul
+/// registro — ed e' TUTTO cio' che il loop fa di un esito, cosi' il ramo che
+/// non deve toccare niente resta una decisione dichiarata e non una riga
+/// mancante.
+///
+/// Sul ramo [`AzioneRecovery::LasciaInvariata`]: NON SI TOCCA NIENTE. Qui si
+/// guarda un fornitore che la colonna dichiara escluso per CREDITO, e il probe
+/// non ha saputo dire ne' si' ne' no: un rate limit, un timeout, la rete. Una
+/// non-osservazione non e' una misura, e non puo' riscrivere lo stato (regola
+/// Q). Prima questo ramo chiamava `put_provider_in_short_cooldown`, che scrive
+/// sulla chiave del FORNITORE — la stessa del cooldown di credito — e faceva
+/// quindi DUE danni in una riga: sostituiva la scadenza di sei ore con 60
+/// secondi (mentre `nexus_provider_health.billing_cooldown_until` continuava a
+/// dire sei ore: le due verita' divergevano proprio qui), e declassava la
+/// severita' registrata da `Long` a `Short`. Con la severita' declassata
+/// `is_provider_in_billing_cooldown` diventa falso, quindi il probe periodico
+/// generico — che i billing li salta apposta, incidente Beauty-Book — tornava a
+/// interrogare un fornitore senza credito: MISURATE 583 righe `openai/transient`
+/// in `nexus_provider_health_history` a cadenza ~336s, ognuna una chiamata a
+/// pagamento contro un 429 «You have no credits remaining». E i 60 secondi
+/// scadevano entro il tick successivo, che e' la meta' del difetto del freno:
+/// con il cooldown scaduto il vecchio `&&` non lo consultava nemmeno. Il nuovo
+/// tentativo lo pianifica gia' il freno ([`freno_consente_il_probe`]).
+fn applica_azione_recovery(provider: &str, azione: AzioneRecovery) {
+    match azione {
+        AzioneRecovery::Riabilita => {
+            tracing::info!(
+                target: "provider_cooldown",
+                provider = %provider,
+                "probe-then-reenable: provider sano, esco dal cooldown e riabilito nel DB"
+            );
+            // Esce SUBITO dal cooldown (anche se non ancora scaduto): il
+            // re-probe periodico ha rilevato che il credito e' tornato.
+            // remove_cooldown azzera anche il TTL su nexus_provider_health.
+            remove_cooldown(provider);
+        }
+        AzioneRecovery::RinnovaEsclusione { causa } => {
+            tracing::warn!(
+                target: "provider_cooldown",
+                provider = %provider,
+                kind = %causa,
+                "probe-then-reenable: billing ancora KO, rinnovo cooldown lungo (niente riabilitazione)"
+            );
+            put_provider_in_long_cooldown(provider, &causa);
+        }
+        AzioneRecovery::LasciaInvariata { causa } => {
+            tracing::warn!(
+                target: "provider_cooldown",
+                provider = %provider,
+                kind = %causa,
+                "probe-then-reenable: esito non conclusivo, esclusione invariata"
+            );
+        }
+    }
+}
+
 /// Worker periodico: ogni `interval_secs` controlla i provider che hanno righe
 /// ancora disabilitate dal billing cooldown e, se il cooldown locale e' scaduto,
 /// li riabilita nel DB **solo dopo un probe attivo andato a buon fine**
@@ -799,42 +896,8 @@ pub async fn billing_cooldown_recovery_loop(
                     .as_deref()
                     .unwrap_or("billing_cooldown (allineamento dal DB)"),
             );
-            // IL FRENO SI CONSULTA SEMPRE. Prima la condizione era
-            // `is_provider_in_cooldown(p) && !should_reprobe_cooldown(p, 600s)`:
-            // il corto-circuito `&&` fa si' che con il cooldown SCADUTO la
-            // seconda meta' non venga nemmeno chiamata, quindi l'istante
-            // dell'ultimo probe non veniva mai annotato e l'intervallo di 600s
-            // non valeva mai. Bastava un esito non conclusivo — che allora
-            // scriveva un cooldown breve di 60s — perche' quello scadesse al
-            // tick seguente e il ciclo ripartisse: cadenza reale MISURATA 120s
-            // per 4h29m, cinque volte piu' frequente del previsto, con una
-            // chiamata a pagamento ogni volta.
-            //
-            // Essere o non essere in cooldown non cambia piu' la risposta: la
-            // domanda e' «quanto tempo e' passato dall'ultimo probe di questo
-            // loop», e ha una risposta sola.
-            match permesso_di_riprovare(
-                &provider,
-                std::time::Duration::from_secs(BILLING_REPROBE_INTERVAL_S),
-            ) {
-                PermessoRiprova::Concesso => {}
-                PermessoRiprova::TroppoPresto { attesa_s } => {
-                    tracing::trace!(
-                        target: "provider_cooldown",
-                        provider = %provider,
-                        attesa_s,
-                        "probe-then-reenable: freno attivo, non riprovo adesso"
-                    );
-                    continue;
-                }
-                PermessoRiprova::RegistroNonInterrogabile => {
-                    tracing::warn!(
-                        target: "provider_cooldown",
-                        provider = %provider,
-                        "probe-then-reenable: registro dei re-probe non interrogabile, salto il giro"
-                    );
-                    continue;
-                }
+            if !freno_consente_il_probe(&provider) {
+                continue;
             }
             // Probe-then-reenable: il cooldown e' scaduto (o e' ora di ri-provare)
             // ma prima di riabilitare accertiamo che il provider sia DAVVERO
@@ -846,61 +909,7 @@ pub async fn billing_cooldown_recovery_loop(
                 probe_timeout,
             )
             .await;
-            match azione_dal_probe(esito) {
-                AzioneRecovery::Riabilita => {
-                    tracing::info!(
-                        target: "provider_cooldown",
-                        provider = %provider,
-                        "probe-then-reenable: provider sano, esco dal cooldown e riabilito nel DB"
-                    );
-                    // Esce SUBITO dal cooldown (anche se non ancora scaduto): il
-                    // re-probe periodico ha rilevato che il credito e' tornato.
-                    // remove_cooldown azzera anche il TTL su nexus_provider_health.
-                    remove_cooldown(&provider);
-                }
-                AzioneRecovery::RinnovaEsclusione { causa } => {
-                    tracing::warn!(
-                        target: "provider_cooldown",
-                        provider = %provider,
-                        kind = %causa,
-                        "probe-then-reenable: billing ancora KO, rinnovo cooldown lungo (niente riabilitazione)"
-                    );
-                    put_provider_in_long_cooldown(&provider, &causa);
-                }
-                AzioneRecovery::LasciaInvariata { causa } => {
-                    // NON SI TOCCA NIENTE. Qui si guarda un fornitore che la
-                    // colonna dichiara escluso per CREDITO, e il probe non ha
-                    // saputo dire ne' si' ne' no: un rate limit, un timeout, la
-                    // rete. Una non-osservazione non e' una misura, e non puo'
-                    // riscrivere lo stato (regola Q).
-                    //
-                    // Prima questo ramo chiamava `put_provider_in_short_cooldown`,
-                    // che scrive sulla chiave del FORNITORE — la stessa del
-                    // cooldown di credito — e faceva quindi DUE danni in una
-                    // riga: sostituiva la scadenza di sei ore con 60 secondi
-                    // (mentre `nexus_provider_health.billing_cooldown_until`
-                    // continuava a dire sei ore: le due verita' divergevano
-                    // proprio qui), e declassava la severita' registrata da
-                    // `Long` a `Short`. Con la severita' declassata
-                    // `is_provider_in_billing_cooldown` diventa falso, quindi il
-                    // probe periodico generico — che i billing li salta apposta,
-                    // incidente Beauty-Book — tornava a interrogare un fornitore
-                    // senza credito: MISURATE 583 righe `openai/transient` in
-                    // `nexus_provider_health_history` a cadenza ~336s, ognuna una
-                    // chiamata a pagamento contro un 429 «You have no credits
-                    // remaining». E i 60 secondi scadevano entro il tick
-                    // successivo, che e' la meta' del difetto del freno: con il
-                    // cooldown scaduto il vecchio `&&` non lo consultava nemmeno.
-                    //
-                    // Il nuovo tentativo lo pianifica gia' il freno qui sopra.
-                    tracing::warn!(
-                        target: "provider_cooldown",
-                        provider = %provider,
-                        kind = %causa,
-                        "probe-then-reenable: esito non conclusivo, esclusione invariata e nuovo tentativo al giro consentito"
-                    );
-                }
-            }
+            applica_azione_recovery(&provider, azione_dal_probe(esito));
         }
     }
 }
