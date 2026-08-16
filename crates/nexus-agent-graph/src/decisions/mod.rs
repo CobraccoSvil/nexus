@@ -158,6 +158,7 @@ pub mod g1_accounting;
 pub mod governance;
 pub mod helpers;
 pub mod hitl;
+pub mod latency_budget;
 pub mod step_gate;
 pub mod step_reach;
 pub mod loop_signatures;
