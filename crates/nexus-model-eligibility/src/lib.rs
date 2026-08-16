@@ -131,9 +131,9 @@ pub const CONDITIONS: &[EligibilityCondition] = &[
     // un'intera giornata, con la batteria che girava e sembrava sana.
     //
     // La fonte e' `nexus_provider_health.billing_cooldown_until` (il cooldown
-    // lungo PERSISTENTE, ADR 0020/0030). Il cooldown breve vive in memoria e non
-    // e' interrogabile da SQL: per quello resta il check a valle, che da rete di
-    // sicurezza torna a essere cio' che deve essere — un caso raro, non la norma.
+    // lungo PERSISTENTE, ADR 0020/0030). Il cooldown BREVE non sta qui: vive in
+    // memoria di mcp-core e arriva come BIND del chiamante (condizione
+    // `fuori_cooldown_breve`, sotto).
     EligibilityCondition {
         name: "provider_senza_cooldown",
         sql: "NOT EXISTS (SELECT 1 FROM nexus_provider_health h \
@@ -143,6 +143,26 @@ pub const CONDITIONS: &[EligibilityCondition] = &[
                          (nexus_provider_health.billing_cooldown_until nel futuro): \
                          il giro sarebbe sprecato",
     },
+    // Il cooldown BREVE (registro in-process per-coppia di mcp-core,
+    // `provider_cooldown::ChiaveCooldown`, 13/08/2026). Non e' interrogabile da
+    // SQL: la REGOLA («un fornitore o una coppia dichiarati esclusi non si
+    // misurano») sta qui, i FATTI (chi e' escluso ADESSO) sono bind del
+    // chiamante. Il claim di produzione binda il registro vivo; l'explain —
+    // processo separato, che quella memoria non la vede — binda array vuoti e
+    // DICHIARA la premessa (regola O: un numero senza premessa e' un'opinione).
+    //
+    // `lower()` sul lato catalogo perche' il registro normalizza a lowercase nei
+    // costruttori di `ChiaveCooldown`; la concatenazione `provider || '/' ||
+    // model` e' la convenzione di `ChiaveCooldown::etichetta()` — il ponte fra
+    // le due lo copre un test sqlx in mcp-core.
+    EligibilityCondition {
+        name: "fuori_cooldown_breve",
+        sql: "(NOT (lower(p.provider) = ANY({cooldown_providers})) \
+               AND NOT (lower(p.provider || '/' || p.model) = ANY({cooldown_pairs})))",
+        perche_esclude: "il fornitore (o questa coppia) e' nel registro cooldown \
+            in-process di mcp-core: il giro sarebbe speso contro un \
+            fornitore che rifiutera'",
+    },
 ];
 
 /// L'ordine di PRIORITA' del giro: prima chi non e' mai stato misurato, poi per
@@ -151,33 +171,62 @@ pub const CONDITIONS: &[EligibilityCondition] = &[
 pub const ORDER_BY: &str =
     "(p.qualification_state = 'unqualified') DESC, p.qualification_expires_at ASC NULLS FIRST";
 
-/// I segnaposto delle due condizioni parametriche, resi coi bind del chiamante:
-/// il claim numera `$2`/`$3` (dopo il LIMIT `$1`), l'explain `$1`/`$2`.
-fn render(sql: &str, stale_minutes: &str, suite_version: &str) -> String {
+/// I segnaposto delle condizioni parametriche, resi coi bind del chiamante:
+/// il claim numera da `$2` in poi (dopo il LIMIT `$1`), l'explain da `$1`.
+fn render(
+    sql: &str,
+    stale_minutes: &str,
+    suite_version: &str,
+    cooldown_providers: &str,
+    cooldown_pairs: &str,
+) -> String {
     sql.replace("{stale_minutes}", stale_minutes)
         .replace("{suite_version}", suite_version)
+        .replace("{cooldown_providers}", cooldown_providers)
+        .replace("{cooldown_pairs}", cooldown_pairs)
 }
 
 /// Le [`CONDITIONS`] in AND: la clausola che decide l'eleggibilita'. E' il punto
-/// unico che il claim e l'explain chiamano ENTRAMBI.
-pub fn where_clause(stale_minutes: &str, suite_version: &str) -> String {
+/// unico che il claim e l'explain chiamano ENTRAMBI. `cooldown_providers` e
+/// `cooldown_pairs` sono i bind `text[]` delle esclusioni del registro breve
+/// in-process (lowercase; le coppie nella convenzione `provider/model` di
+/// `ChiaveCooldown::etichetta`): array vuoti = nessuna esclusione.
+pub fn where_clause(
+    stale_minutes: &str,
+    suite_version: &str,
+    cooldown_providers: &str,
+    cooldown_pairs: &str,
+) -> String {
     CONDITIONS
         .iter()
-        .map(|c| render(c.sql, stale_minutes, suite_version))
+        .map(|c| render(c.sql, stale_minutes, suite_version, cooldown_providers, cooldown_pairs))
         .collect::<Vec<_>>()
         .join(" AND ")
 }
 
 /// I bind del claim: `$1` = quanti per giro, `$2` = minuti di lock stantio,
-/// `$3` = versione corrente della suite.
+/// `$3` = versione corrente della suite, `$4`/`$5` = esclusioni del registro
+/// cooldown breve (fornitori interi / coppie `provider/model`).
 pub const CLAIM_LIMIT_PARAM: &str = "$1";
 pub const CLAIM_STALE_PARAM: &str = "$2";
 pub const CLAIM_SUITE_PARAM: &str = "$3";
+pub const CLAIM_COOLDOWN_PROVIDERS_PARAM: &str = "$4";
+pub const CLAIM_COOLDOWN_PAIRS_PARAM: &str = "$5";
 
-/// I bind dell'explain: `$1` = lock stantio, `$2` = suite, `$3` = modello cercato.
+/// I bind dell'explain: `$1` = lock stantio, `$2` = suite, `$3`/`$4` =
+/// esclusioni del registro breve, `$5` = modello cercato (solo
+/// [`sql_explain_model`]).
+///
+/// Il modello e' l'ULTIMO e non il terzo, e non e' estetica: la query degli
+/// eleggibili non lo referenzia, e Postgres rifiuta al PREPARE una statement
+/// coi parametri non contigui («could not determine data type of parameter
+/// $3») — col modello a `$3`, `sql_explain_eligible` referenzierebbe
+/// `$1,$2,$4,$5` con un buco.
 pub const EXPLAIN_STALE_PARAM: &str = "$1";
 pub const EXPLAIN_SUITE_PARAM: &str = "$2";
-pub const EXPLAIN_MODEL_PARAM: &str = "$3";
+pub const EXPLAIN_COOLDOWN_PROVIDERS_PARAM: &str = "$3";
+pub const EXPLAIN_COOLDOWN_PAIRS_PARAM: &str = "$4";
+pub const EXPLAIN_MODEL_PARAM: &str = "$5";
 
 /// Il CLAIM di produzione (CAS). I candidati gia' `qualified` (scaduti o con
 /// suite vecchia) sono ri-provati IN SHADOW: lo state resta `qualified` (il pool
@@ -198,7 +247,12 @@ pub fn sql_claim() -> String {
      ) cand \
      WHERE c.provider = cand.provider AND c.model = cand.model \
      RETURNING c.provider, c.model, c.capabilities",
-        where_ = where_clause(CLAIM_STALE_PARAM, CLAIM_SUITE_PARAM),
+        where_ = where_clause(
+            CLAIM_STALE_PARAM,
+            CLAIM_SUITE_PARAM,
+            CLAIM_COOLDOWN_PROVIDERS_PARAM,
+            CLAIM_COOLDOWN_PAIRS_PARAM,
+        ),
     )
 }
 
@@ -207,7 +261,12 @@ pub fn sql_claim() -> String {
 pub fn sql_explain_eligible() -> String {
     format!(
         "SELECT p.provider, p.model FROM ai_price_catalog p WHERE {where_} ORDER BY {ORDER_BY}",
-        where_ = where_clause(EXPLAIN_STALE_PARAM, EXPLAIN_SUITE_PARAM),
+        where_ = where_clause(
+            EXPLAIN_STALE_PARAM,
+            EXPLAIN_SUITE_PARAM,
+            EXPLAIN_COOLDOWN_PROVIDERS_PARAM,
+            EXPLAIN_COOLDOWN_PAIRS_PARAM,
+        ),
     )
 }
 
@@ -221,7 +280,13 @@ pub fn sql_explain_model() -> String {
         .map(|c| {
             format!(
                 "({}) AS {}",
-                render(c.sql, EXPLAIN_STALE_PARAM, EXPLAIN_SUITE_PARAM),
+                render(
+                    c.sql,
+                    EXPLAIN_STALE_PARAM,
+                    EXPLAIN_SUITE_PARAM,
+                    EXPLAIN_COOLDOWN_PROVIDERS_PARAM,
+                    EXPLAIN_COOLDOWN_PAIRS_PARAM,
+                ),
                 c.name
             )
         })
@@ -275,7 +340,12 @@ mod tests {
         // naturale di chi ha fretta ("aggiungo il filtro dove sto guardando").
         assert_eq!(
             where_effettiva(&sql_claim()),
-            where_clause(CLAIM_STALE_PARAM, CLAIM_SUITE_PARAM),
+            where_clause(
+                CLAIM_STALE_PARAM,
+                CLAIM_SUITE_PARAM,
+                CLAIM_COOLDOWN_PROVIDERS_PARAM,
+                CLAIM_COOLDOWN_PAIRS_PARAM,
+            ),
             "REGRESSIONE: la WHERE del claim non e' piu' la clausola condivisa. \
              L'explain risponderebbe su una regola che la produzione non usa: \
              tornerebbe a MENTIRE con la faccia seria (regola O)."
@@ -284,8 +354,43 @@ mod tests {
         // grave — direbbe 'non eleggibile' di un modello che il giro prendera'.
         assert_eq!(
             where_effettiva(&sql_explain_eligible()),
-            where_clause(EXPLAIN_STALE_PARAM, EXPLAIN_SUITE_PARAM),
+            where_clause(
+                EXPLAIN_STALE_PARAM,
+                EXPLAIN_SUITE_PARAM,
+                EXPLAIN_COOLDOWN_PROVIDERS_PARAM,
+                EXPLAIN_COOLDOWN_PAIRS_PARAM,
+            ),
             "REGRESSIONE: l'explain filtra su una regola sua, diversa dal claim."
+        );
+    }
+
+    /// Il registro cooldown BREVE entra nella clausola CONDIVISA come coppia di
+    /// bind: fornitori interi E coppie, entrambe confrontate lowercase.
+    ///
+    /// MUTAZIONE che lo fa rosseggiare: togliere `fuori_cooldown_breve` da
+    /// `CONDITIONS` (il claim tornerebbe a spendere i posti del giro contro un
+    /// fornitore saturo, e l'unico presidio resterebbe il check a valle che
+    /// conta lo skip come tentativo), oppure rilassare la condizione a
+    /// solo-provider (la coppia — il caso groq/gpt-oss del 13/08 — non sarebbe
+    /// piu' vista), oppure togliere `lower()` dal lato catalogo.
+    #[test]
+    fn la_condizione_cooldown_breve_e_nella_clausola_condivisa() {
+        let claim = sql_claim();
+        assert!(
+            claim.contains(&format!("lower(p.provider) = ANY({CLAIM_COOLDOWN_PROVIDERS_PARAM})")),
+            "il claim non binda piu' i fornitori esclusi del registro breve: {claim}"
+        );
+        assert!(
+            claim.contains(&format!(
+                "lower(p.provider || '/' || p.model) = ANY({CLAIM_COOLDOWN_PAIRS_PARAM})"
+            )),
+            "il claim non binda piu' le coppie escluse del registro breve: {claim}"
+        );
+        // La condizione e' della LISTA, non scritta a mano nel claim: cosi'
+        // l'explain la eredita (test delle colonne) e la where-uguaglianza vale.
+        assert!(
+            CONDITIONS.iter().any(|c| c.name == "fuori_cooldown_breve"),
+            "la condizione deve stare in CONDITIONS, non bolted-on su sql_claim"
         );
     }
 

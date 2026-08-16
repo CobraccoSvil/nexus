@@ -2477,16 +2477,33 @@ async fn claim_candidates(
     max_per_round: i64,
     suite_version: i32,
 ) -> Vec<(String, String, Value)> {
+    // I FATTI del registro cooldown breve (in-process, per-coppia): la REGOLA
+    // sta nel crate (`fuori_cooldown_breve`), i fatti li binda chi la memoria
+    // la vede — cioe' questo processo. L'explain, che non la vede, binda vuoto
+    // e lo dichiara.
     sqlx::query_as(&nexus_model_eligibility::sql_claim())
         .bind(max_per_round)
         .bind(STALE_PROBING_MINUTES as i32)
         .bind(suite_version)
+        .bind(crate::provider_cooldown::fornitori_in_cooldown())
+        .bind(coppie_escluse_etichettate())
         .fetch_all(db)
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(error = %e, "model_qualification: claim candidati fallito");
             Vec::new()
         })
+}
+
+/// Le coppie escluse del registro breve, nella convenzione `provider/model` di
+/// `ChiaveCooldown::etichetta` — la STESSA che la condizione SQL confronta
+/// (`lower(p.provider || '/' || p.model)`). Il ponte fra le due convenzioni lo
+/// copre il test `la_clausola_esclude_fornitori_e_coppie_dichiarate`.
+fn coppie_escluse_etichettate() -> Vec<String> {
+    crate::provider_cooldown::coppie_in_cooldown()
+        .into_iter()
+        .map(|(p, m)| crate::provider_cooldown::ChiaveCooldown::coppia(&p, &m).etichetta())
+        .collect()
 }
 
 /// Il provider e' in cooldown: il giro NON e' un fallimento del modello, e
@@ -3987,6 +4004,142 @@ mod tests {
         // Il provider il cui cooldown e' SCADUTO torna candidabile: il filtro
         // guarda l'orologio, non la presenza della riga.
         assert!(modelli.contains(&"sano"), "mistral (cooldown scaduto) e' candidabile: {modelli:?}");
+    }
+
+    /// La condizione `fuori_cooldown_breve` esclude cio' che i bind dichiarano:
+    /// il fornitore INTERO e la singola COPPIA, entrambi lowercase — e verifica
+    /// il PONTE fra `ChiaveCooldown::etichetta()` (che normalizza) e la
+    /// concatenazione `lower(provider || '/' || model)` della clausola.
+    ///
+    /// La query e' quella di produzione (`sql_claim`, regola O); qui i bind sono
+    /// espliciti perche' il test controlla i FATTI, non il registro globale.
+    ///
+    /// MUTAZIONI che lo fanno rosseggiare: rilassare la condizione a
+    /// solo-provider (m1 verrebbe reclamato al secondo claim), o togliere
+    /// `lower()` dal lato catalogo (la riga 'MiXed' non sarebbe piu' esclusa).
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_clausola_esclude_fornitori_e_coppie_dichiarate(pool: PgPool) {
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, is_enabled, supports_tool_use, qualification_state, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('groq',    'm1', true, true, 'unqualified', 1.0, 1.0, 'USD', now()), \
+             ('groq',    'm2', true, true, 'unqualified', 1.0, 1.0, 'USD', now()), \
+             ('mistral', 'm3', true, true, 'unqualified', 1.0, 1.0, 'USD', now()), \
+             ('MiXed',   'MX', true, true, 'unqualified', 1.0, 1.0, 'USD', now())",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        let claim = |providers: Vec<String>, pairs: Vec<String>| {
+            let pool = pool.clone();
+            async move {
+                let righe: Vec<(String, String, Value)> =
+                    sqlx::query_as(&nexus_model_eligibility::sql_claim())
+                        .bind(10i64)
+                        .bind(STALE_PROBING_MINUTES as i32)
+                        .bind(2i32)
+                        .bind(providers)
+                        .bind(pairs)
+                        .fetch_all(&pool)
+                        .await
+                        .expect("claim");
+                let mut modelli: Vec<String> = righe.into_iter().map(|(_, m, _)| m).collect();
+                modelli.sort();
+                modelli
+            }
+        };
+
+        // Fornitore INTERO escluso: nessun modello groq viene reclamato.
+        let modelli = claim(vec!["groq".into()], Vec::new()).await;
+        assert_eq!(
+            modelli,
+            vec!["MX".to_string(), "m3".to_string()],
+            "con groq escluso il giro prende solo gli altri fornitori"
+        );
+
+        // Il claim ha lockato le righe: si libera il lock per il secondo giro.
+        sqlx::query("UPDATE ai_price_catalog SET qualification_started_at = NULL")
+            .execute(&pool)
+            .await
+            .expect("reset lock");
+
+        // La COPPIA esclusa: input volutamente maiuscolo — la normalizzazione la
+        // fa `ChiaveCooldown` (il ponte), il confronto lato catalogo `lower()`.
+        let escluse = vec![
+            crate::provider_cooldown::ChiaveCooldown::coppia("GROQ", "M1").etichetta(),
+            crate::provider_cooldown::ChiaveCooldown::coppia("mixed", "mx").etichetta(),
+        ];
+        let modelli = claim(Vec::new(), escluse).await;
+        assert_eq!(
+            modelli,
+            vec!["m2".to_string(), "m3".to_string()],
+            "la coppia groq/m1 e' esclusa (m2 dello stesso fornitore resta \
+             candidabile) e la riga 'MiXed/MX' e' esclusa via lower()"
+        );
+    }
+
+    /// IL TEST DELL'INNESTO (regola O): i test della clausola restano verdi se
+    /// `claim_candidates` binda array vuoti — cioe' la forma esatta in cui il
+    /// difetto vivrebbe. Qui il cooldown lo scrive il PRODUTTORE reale e il
+    /// claim e' quello di produzione, registro vivo compreso.
+    ///
+    /// MUTAZIONE: far bindare `vec![]` a `claim_candidates` -> la coppia esclusa
+    /// e il fornitore escluso vengono reclamati -> rosso.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_claim_di_produzione_legge_il_registro_vivo(pool: PgPool) {
+        // Nomi DEDICATI: il registro e' globale di processo e condiviso coi test
+        // paralleli (regola F) — niente nomi di fornitori reali.
+        let coppia_prov = "prov-claim-vivo";
+        let tutto_prov = "prov-claim-tutto";
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, is_enabled, supports_tool_use, qualification_state, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ($1, 'esclusa', true, true, 'unqualified', 1.0, 1.0, 'USD', now()), \
+             ($1, 'sana',    true, true, 'unqualified', 1.0, 1.0, 'USD', now()), \
+             ($2, 'm',       true, true, 'unqualified', 1.0, 1.0, 'USD', now())",
+        )
+        .bind(coppia_prov)
+        .bind(tutto_prov)
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        crate::provider_cooldown::metti_in_cooldown_breve(
+            coppia_prov,
+            Some("esclusa"),
+            "test claim registro vivo",
+            120,
+        );
+        crate::provider_cooldown::put_provider_in_short_cooldown(
+            tutto_prov,
+            "test claim registro vivo",
+            120,
+        );
+
+        let claimed = claim_candidates(&pool, 10, 2).await;
+
+        // Cleanup PRIMA degli assert: lo stato e' globale e un assert che panica
+        // non deve lasciarlo sporco per gli altri test del processo.
+        crate::provider_cooldown::remove_cooldown(coppia_prov);
+        crate::provider_cooldown::remove_cooldown(tutto_prov);
+
+        let coppie: Vec<(&str, &str)> =
+            claimed.iter().map(|(p, m, _)| (p.as_str(), m.as_str())).collect();
+        assert_eq!(
+            coppie,
+            vec![(coppia_prov, "sana")],
+            "il claim di produzione deve saltare la coppia esclusa e il \
+             fornitore escluso del registro VIVO, e reclamare il resto"
+        );
     }
 
     /// FRONTIER: il needle sta a META' della history, mai nel system prompt.

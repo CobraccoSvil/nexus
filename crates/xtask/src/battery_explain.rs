@@ -184,6 +184,11 @@ fn stampa_premessa(p: &Premessa) {
          le STESSE che compongono il claim di produzione",
         elig::CONDITIONS.len()
     );
+    println!(
+        "  cooldown breve  (registro in-process di mcp-core): NON osservabile da \
+         questo processo — fuori_cooldown_breve valutata senza esclusioni; il \
+         claim di produzione la valuta col registro vivo"
+    );
 }
 
 /// Chi e' eleggibile ADESSO. I bind sono gli stessi valori che il worker passa
@@ -193,6 +198,10 @@ async fn stampa_eleggibili(pool: &PgPool, premessa: &Premessa) -> Result<()> {
     let righe: Vec<(String, String)> = sqlx::query_as(&elig::sql_explain_eligible())
         .bind(elig::STALE_PROBING_MINUTES as i32)
         .bind(premessa.suite)
+        // Il registro cooldown breve e' memoria di mcp-core: da qui non e'
+        // osservabile, e si binda VUOTO dichiarandolo nella premessa (regola O).
+        .bind(Vec::<String>::new())
+        .bind(Vec::<String>::new())
         .fetch_all(pool)
         .await
         .context("query degli eleggibili")?;
@@ -226,6 +235,11 @@ async fn stampa_modello(pool: &PgPool, premessa: &Premessa, modello: &str) -> Re
     let righe = sqlx::query(&elig::sql_explain_model())
         .bind(elig::STALE_PROBING_MINUTES as i32)
         .bind(premessa.suite)
+        // Come in `stampa_eleggibili`: il registro breve non e' osservabile da
+        // qui, array vuoti dichiarati in premessa. Il modello e' l'ULTIMO bind
+        // (EXPLAIN_MODEL_PARAM = $5).
+        .bind(Vec::<String>::new())
+        .bind(Vec::<String>::new())
         .bind(modello)
         .fetch_all(pool)
         .await
@@ -328,6 +342,18 @@ mod tests {
     fn i_bind_dell_explain_seguono_i_segnaposto_del_crate() {
         assert_eq!(elig::EXPLAIN_STALE_PARAM, "$1", "1o bind: STALE_PROBING_MINUTES");
         assert_eq!(elig::EXPLAIN_SUITE_PARAM, "$2", "2o bind: suite corrente");
-        assert_eq!(elig::EXPLAIN_MODEL_PARAM, "$3", "3o bind: il modello cercato");
+        assert_eq!(
+            elig::EXPLAIN_COOLDOWN_PROVIDERS_PARAM,
+            "$3",
+            "3o bind: fornitori del registro breve (vuoto dall'explain)"
+        );
+        assert_eq!(
+            elig::EXPLAIN_COOLDOWN_PAIRS_PARAM,
+            "$4",
+            "4o bind: coppie del registro breve (vuoto dall'explain)"
+        );
+        // Il modello e' l'ULTIMO: la query degli eleggibili non lo referenzia, e
+        // Postgres rifiuta al PREPARE i parametri non contigui.
+        assert_eq!(elig::EXPLAIN_MODEL_PARAM, "$5", "5o bind: il modello cercato");
     }
 }
