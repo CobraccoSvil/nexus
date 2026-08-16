@@ -64,6 +64,16 @@ Fase B (brain):
 > autoritativa. Cio' che e' deprecato e' la DECISIONE autonoma del brain, non
 > la sua segnalazione al gate.
 
+> **Aggiornamento 2026-08-13.** La nota sopra vale finche' esiste un brain che
+> osservi qualcosa: col porting zero-Python quel client e' sparito, e la rotta
+> `/api/internal/provider-error` e' stata rimossa con lui. Chi ALIMENTA il gate
+> oggi e' il gateway stesso, che dichiara classe e portata del proprio rifiuto
+> a ogni chiamata (`EsclusioneDichiarata` sul blocco `details.failures`), letto
+> al confine `NexusGatewayClient::complete` e registrato da
+> `provider_cooldown::registra_esclusione_dichiarata`. La sostanza della
+> decisione non cambia — il gate resta la fonte autoritativa e chi osserva gli
+> manda cio' che ha visto — cambia CHI osserva.
+
 > Nota di numerazione: esiste gia' una nota con basename `0019` per il file
 > picking robusto ([[0019-file-picking-robusto-verify-chain]]). Questo ADR copre
 > un tema indipendente (gate di disponibilita' provider) e va riconciliato in

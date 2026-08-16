@@ -106,24 +106,6 @@ impl WikiAiServices for AppStateWikiAi {
             .try_model(&purpose)
         })
     }
-
-    fn notify_provider_llm_failure(
-        &self,
-        provider: &str,
-        error_class: Option<&str>,
-        message: &str,
-    ) -> BoxFuture<'_, ()> {
-        let provider = provider.to_string();
-        let error_class = error_class.map(str::to_string);
-        let message = message.to_string();
-        Box::pin(async move {
-            crate::agent_turn_setup::handle_provider_llm_failure(
-                &provider,
-                error_class.as_deref(),
-                &message,
-            );
-        })
-    }
 }
 
 /// Impl mcp-core del risolutore pool per-progetto per i worker wiki. Delega al

@@ -434,8 +434,10 @@ fn cooldown_exhaustion_note(result: &crate::agent_types::AgentRunResult) -> Opti
 /// True se la classe errore STRUTTURATA del turno indica che il provider coinvolto
 /// e' finito in cooldown (billing o throttle transiente), non un completamento
 /// vuoto o altra causa ortogonale. Segnale macchina (regola M): nessun parsing di
-/// prosa. Le classi sono quelle emesse dal brain
-/// (`agent_turn_setup::classify_provider_error`).
+/// prosa. Le classi sono quelle che il ponte del turno d'errore mette in
+/// `error_class` (`neural_client::valore_derrore_dal_gateway`, che le deriva dal
+/// segnale strutturato del gateway). Qui NON si decide alcun cooldown: si decide
+/// solo se la nota all'utente sia pertinente al turno.
 fn error_class_indicates_cooldown(error_class: Option<&str>) -> bool {
     matches!(
         error_class,

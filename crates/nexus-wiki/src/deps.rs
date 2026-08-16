@@ -44,16 +44,17 @@ pub trait WikiAiServices: std::fmt::Debug + Send + Sync {
         purpose: &str,
         exclude_providers: &[String],
     ) -> BoxFuture<'_, Result<(String, String), PurposeUnresolved>>;
-
-    /// Notifica un fallimento LLM strutturato per applicare cooldown provider
-    /// (punto unico `agent_turn_setup::handle_provider_llm_failure`).
-    fn notify_provider_llm_failure(
-        &self,
-        provider: &str,
-        error_class: Option<&str>,
-        message: &str,
-    ) -> BoxFuture<'_, ()>;
 }
+
+// Qui viveva `notify_provider_llm_failure`, con cui i worker wiki segnalavano
+// un fallimento LLM perche' qualcuno ne applicasse il cooldown al fornitore.
+// Il registro dei cooldown di mcp-core lo allinea ora il confine da cui la
+// chiamata e' gia' passata (`NexusGatewayClient::complete` ->
+// `registra_esclusione_dichiarata`), con la CLASSE e la PORTATA che il gateway
+// dichiara sul wire: questa notifica arrivava dopo, senza il nome del modello,
+// e la sua classificazione era una seconda opinione dedotta dalla prosa.
+// Il failover fra fornitori resta al chiamante (`exclude_providers`): e' una
+// scelta del suo giro, non un'esclusione di sistema.
 
 /// Risolutore del pool DB per-progetto. Iniettato da mcp-core, che possiede il
 /// registry globale (`project_data_pool_from`): nexus-wiki non vede quel
