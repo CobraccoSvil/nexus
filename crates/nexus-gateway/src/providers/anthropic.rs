@@ -48,11 +48,6 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// solo quando il thinking e' attivo per la richiesta.
 const THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 
-/// Beta header richiesto dal TTL cache esteso a 1h (parita' col Python
-/// `_system_cache_control`, commento ~124). Inviato via `anthropic-beta` solo
-/// quando il caching e' attivo con TTL 1h.
-const EXTENDED_CACHE_BETA: &str = "extended-cache-ttl-2025-04-11";
-
 /// Chiave settings (regola G/L) del TTL della prompt cache di sistema Anthropic.
 /// Unica fonte di verita' condivisa col brain Python (mig 0125): valori `5m`,
 /// `1h` (default) o `off` per disattivare il caching. Il gateway Rust segue la
@@ -262,7 +257,7 @@ impl LlmProvider for AnthropicProvider {
             .post(self.endpoint())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION);
-        if let Some(beta) = beta_header(thinking_budget.is_some(), cache_ttl) {
+        if let Some(beta) = beta_header(thinking_budget.is_some()) {
             builder = builder.header("anthropic-beta", beta);
         }
         let resp = builder.json(&body).send().await?;
@@ -293,7 +288,7 @@ impl LlmProvider for AnthropicProvider {
             .post(self.endpoint())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION);
-        if let Some(beta) = beta_header(thinking_budget.is_some(), cache_ttl) {
+        if let Some(beta) = beta_header(thinking_budget.is_some()) {
             builder = builder.header("anthropic-beta", beta);
         }
         let resp = builder.json(&body).send().await?;
@@ -411,22 +406,16 @@ fn resolve_thinking_budget(req: &LlmRequest, configured_budget: u32) -> Option<u
     Some(budget)
 }
 
-/// Valore dell'header `anthropic-beta` da inviare: cumula i beta necessari
-/// separati da virgola. `None` se non serve alcun beta. Il thinking richiede
-/// `interleaved-thinking`; il caching con TTL 1h richiede `extended-cache-ttl`.
-fn beta_header(thinking_active: bool, cache_ttl: CacheTtl) -> Option<String> {
-    let mut betas: Vec<&str> = Vec::new();
-    if thinking_active {
-        betas.push(THINKING_BETA);
-    }
-    if cache_ttl == CacheTtl::OneHour {
-        betas.push(EXTENDED_CACHE_BETA);
-    }
-    if betas.is_empty() {
-        None
-    } else {
-        Some(betas.join(","))
-    }
+/// Valore dell'header `anthropic-beta` da inviare: `interleaved-thinking`
+/// quando il thinking e' attivo, altrimenti nessun beta.
+///
+/// La cache con TTL 1h NON richiede piu' un beta: `extended-cache-ttl-2025-04-11`
+/// e' GA (doc platform.claude.com) e il TTL viaggia nel body
+/// (`cache_control.ttl: "1h"`). La firma non ammette piu' il TTL come input:
+/// reintrodurre l'header richiederebbe di riaprire questo contratto, non di
+/// dimenticare un ramo.
+fn beta_header(thinking_active: bool) -> Option<String> {
+    thinking_active.then(|| THINKING_BETA.to_string())
 }
 
 /// Costruisce il corpo JSON della request Messages a partire dal contratto LLM.
@@ -2269,24 +2258,27 @@ mod tests {
     }
 
     #[test]
-    fn beta_header_cumula_thinking_e_cache_estesa() {
-        // Solo cache 1h.
+    fn cache_1h_non_richiede_beta_header_e_il_ttl_viaggia_nel_body() {
+        // MUTAZIONE: reintrodurre in `beta_header` un ramo che emetta
+        // `extended-cache-ttl-2025-04-11` fa rosseggiare il primo assert
+        // (l'header e' GA e non deve piu' partire); togliere il ttl da
+        // `system_cache_control` fa rosseggiare l'ultimo (il TTL deve
+        // continuare a viaggiare nel body).
         assert_eq!(
-            beta_header(false, CacheTtl::OneHour).as_deref(),
-            Some(EXTENDED_CACHE_BETA)
+            beta_header(false),
+            None,
+            "senza thinking nessun beta, qualunque sia il TTL di cache: la \
+             cache 1h e' GA e non richiede piu' l'header"
         );
-        // Solo thinking.
-        assert_eq!(
-            beta_header(true, CacheTtl::FiveMinutes).as_deref(),
-            Some(THINKING_BETA)
-        );
-        // Entrambi: cumulati con virgola.
-        let both = beta_header(true, CacheTtl::OneHour).unwrap();
-        assert!(both.contains(THINKING_BETA));
-        assert!(both.contains(EXTENDED_CACHE_BETA));
-        // Niente beta: cache 5m senza thinking.
-        assert!(beta_header(false, CacheTtl::FiveMinutes).is_none());
-        assert!(beta_header(false, CacheTtl::Off).is_none());
+        assert_eq!(beta_header(true).as_deref(), Some(THINKING_BETA));
+
+        // Il TTL resta dichiarato nel body: cache_control.ttl = "1h".
+        let req = req_msgs(vec![msg("system", "istruzioni"), msg("user", "ciao")]);
+        let json =
+            serde_json::to_value(build_request_body(&req, false, None, CacheTtl::OneHour))
+                .unwrap();
+        assert_eq!(json["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(json["system"][0]["cache_control"]["ttl"], "1h");
     }
 
     #[test]
