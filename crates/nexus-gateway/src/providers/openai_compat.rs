@@ -497,6 +497,12 @@ impl OpenAiCompatClient {
             .send()
             .await?;
 
+        // Sensore degli header di rate limit (mig 0718): si legge PRIMA del
+        // ramo d'errore, perche' un 429 porta gli header piu' informativi.
+        if let Some(oss) = crate::rate_limit_headers::osserva(resp.headers(), chrono::Utc::now()) {
+            crate::rate_limit_headers::registra(&self.provider_name, &req.model, oss);
+        }
+
         let status = resp.status();
         if !status.is_success() {
             // Regola F: il body d'errore puo' contenere dettagli del provider
@@ -545,6 +551,12 @@ impl OpenAiCompatClient {
             .json(&body)
             .send()
             .await?;
+
+        // Come nel non-streaming: gli header arrivano con la risposta
+        // iniziale, prima del body, e si leggono anche sui non-2xx.
+        if let Some(oss) = crate::rate_limit_headers::osserva(resp.headers(), chrono::Utc::now()) {
+            crate::rate_limit_headers::registra(&self.provider_name, &req.model, oss);
+        }
 
         let status = resp.status();
         if !status.is_success() {

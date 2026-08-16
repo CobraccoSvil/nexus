@@ -40,6 +40,7 @@ pub mod model_alias_resolver;
 pub mod policy_engine;
 pub mod provider;
 pub mod providers;
+pub mod rate_limit_headers;
 pub mod rate_limiter;
 pub mod redaction;
 pub mod server;
