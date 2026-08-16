@@ -2158,13 +2158,39 @@ struct WireUsage {
     /// parte (la firma del `thoughtsTokenCount` di Google).
     #[serde(default)]
     cached_tokens: Option<u32>,
-    /// OpenRouter (usage accounting, mig 0717): costo TOTALE della chiamata in
-    /// USD, dichiarato dal fornitore. Assente su tutti gli altri dialetti.
-    #[serde(default)]
-    cost: Option<f64>,
+    /// Costo dichiarato dal fornitore (usage accounting, mig 0717). Il wire ha
+    /// DUE forme REALI e il campo le accetta entrambe: numero secco in USD
+    /// (openrouter) e oggetto con `total_cost` (perplexity, che vi include il
+    /// `request_cost` della search — un costo che il riprezzamento da catalogo
+    /// non vede). MISURATO il 16/08/2026: col tipo `Option<f64>` secco la
+    /// risposta 200 di perplexity diventava INDECODIFICABILE per intero
+    /// («invalid type: map, expected f64») e il provider risultava rosso nel
+    /// pannello — un campo di telemetria non deve poter abbattere la risposta
+    /// che lo trasporta.
+    #[serde(default, deserialize_with = "opzionale_tollerante")]
+    cost: Option<WireCost>,
     /// OpenRouter: dettaglio del costo, con l'inference del fornitore a valle.
-    #[serde(default)]
+    /// Stessa tolleranza di forma di `cost`, per la stessa ragione.
+    #[serde(default, deserialize_with = "opzionale_tollerante")]
     cost_details: Option<WireCostDetails>,
+}
+
+/// Le forme reali di `usage.cost` sul wire. `Altro` e' il fornitore di domani:
+/// non rompe la risposta e si dichiara nel log ([`WireUsage::declared_cost`]),
+/// mai in silenzio (regola Q: l'ignoto e' una variante, non un crash).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WireCost {
+    /// openrouter: costo totale in USD, numero secco.
+    Numero(f64),
+    /// perplexity: oggetto `{input_tokens_cost, output_tokens_cost,
+    /// request_cost, total_cost}` — si legge il solo totale.
+    Oggetto {
+        #[serde(default)]
+        total_cost: Option<f64>,
+    },
+    /// Forma non riconosciuta: conservata per il log, mai un errore.
+    Altro(serde_json::Value),
 }
 
 /// Il dettaglio di costo di un aggregatore (openrouter `cost_details`).
@@ -2173,6 +2199,23 @@ struct WireCostDetails {
     /// Costo dell'inference presso il fornitore a valle (USD). Telemetria.
     #[serde(default)]
     upstream_inference_cost: Option<f64>,
+}
+
+/// Deserializza `Option<T>` DEGRADANDO a `None` la forma inattesa invece di
+/// abbattere l'intera risposta: i campi di telemetria del wire (costo
+/// dichiarato, dettaglio costi) non possono essere il punto in cui una
+/// risposta 200 valida diventa un errore di provider. La forma scartata non e'
+/// muta: chi consuma il campo la dichiara nel log.
+fn opzionale_tollerante<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_value::<T>(value).ok())
 }
 
 impl WireUsage {
@@ -2198,8 +2241,21 @@ impl WireUsage {
     /// separate, lo streaming — dove openrouter manda l'usage davvero —
     /// potrebbe perdere il campo con tutti i test del non-streaming verdi.
     fn declared_cost(&self) -> (Option<f64>, Option<f64>) {
+        let totale = match &self.cost {
+            Some(WireCost::Numero(n)) => Some(*n),
+            Some(WireCost::Oggetto { total_cost }) => *total_cost,
+            Some(WireCost::Altro(forma)) => {
+                tracing::warn!(
+                    target: "usage_accounting",
+                    forma = %forma,
+                    "usage.cost in forma non riconosciuta: costo dichiarato ignorato"
+                );
+                None
+            }
+            None => None,
+        };
         (
-            self.cost,
+            totale,
             self.cost_details
                 .as_ref()
                 .and_then(|d| d.upstream_inference_cost),
@@ -4094,6 +4150,54 @@ mod tests {
             from_chat_completion(parsed, "m".into(), "mistral", 1).expect("mappatura");
         assert_eq!(resp.usage.declared_cost_usd, None);
         assert_eq!(resp.usage.upstream_cost_usd, None);
+    }
+
+    /// Perplexity dichiara `usage.cost` come OGGETTO, non come numero — corpo
+    /// VERBATIM misurato sull'API vera il 16/08/2026 (`sonar`, max_tokens=16):
+    /// `{"input_tokens_cost":0,"output_tokens_cost":0,"request_cost":0.005,
+    /// "total_cost":0.005}`. Il `total_cost` include il costo della SEARCH, che
+    /// il riprezzamento da catalogo non vede: la forma a oggetto si LEGGE, non
+    /// si tollera soltanto.
+    ///
+    /// MISURATO in esercizio prima del fix: col campo `Option<f64>` secco
+    /// l'intera risposta 200 era indecodificabile («invalid type: map, expected
+    /// f64») e il pannello dava perplexity ROSSO — un campo di telemetria
+    /// abbatteva la risposta che lo trasporta.
+    ///
+    /// MUTAZIONE: riportando `cost` a `Option<f64>` il PRIMO expect cade (parse
+    /// fallito), che e' la riproduzione esatta del difetto; togliendo il ramo
+    /// `Oggetto` da `declared_cost`, cade l'assert sul totale.
+    #[test]
+    fn il_costo_a_oggetto_di_perplexity_non_abbatte_la_risposta_e_si_legge() {
+        let body = r#"{
+            "id": "resp-1", "model": "sonar", "object": "chat.completion",
+            "created": 1755350000,
+            "citations": [], "search_results": [],
+            "choices": [{"index": 0, "finish_reason": "length",
+                         "message": {"role": "assistant", "content": "Ok"}}],
+            "usage": {"completion_tokens": 1, "prompt_tokens": 2,
+                      "total_tokens": 3, "search_context_size": "low",
+                      "cost": {"input_tokens_cost": 0, "output_tokens_cost": 0,
+                               "request_cost": 0.005, "total_cost": 0.005}}
+        }"#;
+        let parsed = parse_chat_completion("perplexity", body).expect("parse");
+        let resp = from_chat_completion(parsed, "sonar".into(), "perplexity", 3)
+            .expect("mappatura");
+        assert_eq!(resp.usage.declared_cost_usd, Some(0.005));
+        assert_eq!(resp.usage.upstream_cost_usd, None);
+        assert_eq!(resp.usage.input_tokens, 2);
+
+        // La forma IGNOTA (il fornitore di domani) degrada a None dichiarando
+        // nel log, mai un errore di parse (regola Q).
+        let body_ignoto = r#"{
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "x"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                      "total_tokens": 2, "cost": "gratis"}
+        }"#;
+        let parsed = parse_chat_completion("ignoto", body_ignoto).expect("parse");
+        let resp = from_chat_completion(parsed, "m".into(), "ignoto", 1).expect("mappatura");
+        assert_eq!(resp.usage.declared_cost_usd, None);
     }
 
     /// In STREAMING l'usage col costo arriva nell'ultimo chunk (quello con
