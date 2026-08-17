@@ -930,6 +930,39 @@ async fn classify_probe_response(
     }
 }
 
+/// PUNTO UNICO (regola L) di scrittura di `ai_model_health_history`: ogni riga
+/// dello storico di salute nasce qui — chat-probe, tool-probe, esiti dei run.
+/// Fire-and-forget: lo storico e' diagnostica, un INSERT fallito non deve
+/// fermare chi misura. `checked_at` resta al default della colonna (NOW()):
+/// l'istante della misura e' il momento in cui la si scrive.
+///
+/// Regola O: i test che SEMINANO lo storico passano da questa funzione, mai da
+/// un INSERT ricopiato — un seed a mano fissa la forma della riga che il test
+/// dovrebbe misurare (e' il precedente «la fixture fissava l'assunto»).
+pub(crate) async fn record_model_health(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    healthy: bool,
+    latency_ms: Option<i32>,
+    error_kind: Option<&str>,
+    error_message: Option<&str>,
+) {
+    let _ = sqlx::query(
+        r#"INSERT INTO ai_model_health_history
+           (provider, model, healthy, latency_ms, error_kind, error_message)
+           VALUES ($1, $2, $3, $4, $5, $6)"#,
+    )
+    .bind(provider)
+    .bind(model)
+    .bind(healthy)
+    .bind(latency_ms)
+    .bind(error_kind)
+    .bind(error_message)
+    .execute(db)
+    .await;
+}
+
 /// Persiste l'esito del chat-probe in `ai_model_health_history` (fire-and-forget,
 /// nessun impatto se fallisce). Il Transient viene tracciato come unhealthy SOLO
 /// per diagnostica (storico append-only): non tocca contatori ne' is_enabled.
@@ -951,18 +984,15 @@ async fn persist_probe_history(
             (false, Some(format!("transient:{kind}")), msg.clone())
         }
     };
-    let _ = sqlx::query(
-        r#"INSERT INTO ai_model_health_history
-           (provider, model, healthy, latency_ms, error_kind, error_message)
-           VALUES ($1, $2, $3, $4, $5, $6)"#,
+    record_model_health(
+        db,
+        provider,
+        model,
+        healthy,
+        Some(latency_ms),
+        error_kind.as_deref(),
+        error_message.as_deref().map(|s| truncate(s, 500)).as_deref(),
     )
-    .bind(provider)
-    .bind(model)
-    .bind(healthy)
-    .bind(latency_ms)
-    .bind(error_kind.as_deref())
-    .bind(error_message.as_deref().map(|s| truncate(s, 500)))
-    .execute(db)
     .await;
 }
 
@@ -1041,17 +1071,9 @@ pub async fn record_run_outcome_health(
     } else {
         Some(error_kind)
     };
-    let _ = sqlx::query(
-        r#"INSERT INTO ai_model_health_history
-           (provider, model, healthy, latency_ms, error_kind, error_message)
-           VALUES ($1, $2, $3, NULL, $4, NULL)"#,
-    )
-    .bind(provider)
-    .bind(model)
-    .bind(healthy)
-    .bind(ek)
-    .execute(db)
-    .await;
+    // latency_ms NULL: l'esito di un run non e' una misura di latenza del
+    // modello (il tempo del run include tool, attese e coda).
+    record_model_health(db, provider, model, healthy, None, ek, None).await;
 }
 
 /// Applica la logica counter / auto-disable / auto-reenable in base alla
@@ -1415,18 +1437,17 @@ async fn persist_tool_probe_history(
         ToolProbeVerdict::ProviderWide(k) => (false, Some(format!("tool_probe_provider:{k}"))),
         ToolProbeVerdict::Transient(k) => (false, Some(format!("tool_probe_transient:{k}"))),
     };
-    let _ = sqlx::query(
-        r#"INSERT INTO ai_model_health_history
-           (provider, model, healthy, latency_ms, error_kind, error_message)
-           VALUES ($1, $2, $3, $4, $5, $6)"#,
+    // error_message = error_kind: il tool-probe non ha un messaggio separato
+    // dal kind (comportamento storico, preservato nell'estrazione del writer).
+    record_model_health(
+        db,
+        provider,
+        model,
+        healthy,
+        Some(latency_ms),
+        error_kind.as_deref(),
+        error_kind.as_deref(),
     )
-    .bind(provider)
-    .bind(model)
-    .bind(healthy)
-    .bind(latency_ms)
-    .bind(error_kind.as_deref())
-    .bind(error_kind.as_deref())
-    .execute(db)
     .await;
 }
 

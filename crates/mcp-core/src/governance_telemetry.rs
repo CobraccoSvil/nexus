@@ -242,50 +242,51 @@ pub async fn load_model_telemetry(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Schema minimale usato da `load_model_telemetry`: catalog (contatori) +
-    /// storico health (esiti recenti) + settings (finestra, assente -> default).
-    async fn create_schema(pool: &PgPool) {
-        crate::test_support::create_settings_table(pool).await;
-        sqlx::query(
-            "CREATE TABLE ai_price_catalog ( \
-                 provider TEXT NOT NULL, model TEXT NOT NULL, \
-                 consecutive_failures INT NOT NULL DEFAULT 0, \
-                 consecutive_tool_failures INT NOT NULL DEFAULT 0 )",
-        )
-        .execute(pool)
-        .await
-        .expect("create ai_price_catalog");
-        sqlx::query(
-            "CREATE TABLE ai_model_health_history ( \
-                 provider TEXT NOT NULL, model TEXT NOT NULL, healthy BOOLEAN NOT NULL, \
-                 latency_ms INT, error_kind TEXT, checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW() )",
-        )
-        .execute(pool)
-        .await
-        .expect("create ai_model_health_history");
-    }
+    use crate::model_health_probe::record_model_health;
 
     /// La query aggrega gli ultimi N check per modello (recent_checks/failures/
     /// avg_latency), l'ultimo error_kind fallito, e i contatori del catalog; i
     /// candidati SENZA storico ne' catalog NON compaiono (telemetria neutra a valle).
-    #[sqlx::test]
+    ///
+    /// Schema REALE (META_MIGRATOR) e storico seminato dal WRITER di
+    /// produzione (`record_model_health`, regola O): l'INSERT ricopiato a mano
+    /// — su una tabella ricreata a mano — fissava la forma della riga che il
+    /// test dovrebbe misurare, ed e' rimasto verde per mesi su colonne che il
+    /// produttore non scrive cosi'.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn load_model_telemetry_aggrega_health_e_catalog(pool: PgPool) {
-        create_schema(&pool).await;
         // pa/ma: 3 check (1 ok + 2 falliti), latenze 100/200/NULL, ultimo fallito
         // = rate_limit; catalog consecutive_failures=1.
+        record_model_health(&pool, "pa", "ma", true, Some(100), None, None).await;
+        record_model_health(&pool, "pa", "ma", false, Some(200), Some("model_not_found"), None)
+            .await;
+        record_model_health(&pool, "pa", "ma", false, None, Some("rate_limit"), None).await;
+        // Il writer scrive l'istante col default della colonna (NOW()): il
+        // test RETRODATA le tre misure a istanti distinti, perche' la query
+        // ordina per checked_at. E' l'iniezione dell'istante (regola O: la
+        // FORMA della riga resta quella del produttore; il QUANDO e' il dato
+        // che il test governa, come l'`at` di rerank_expected_cost_at).
+        for (filtro, minuti) in [
+            ("healthy", 3),
+            ("error_kind = 'model_not_found'", 2),
+            ("error_kind = 'rate_limit'", 1),
+        ] {
+            sqlx::query(&format!(
+                "UPDATE ai_model_health_history \
+                 SET checked_at = NOW() - make_interval(mins => {minuti}) \
+                 WHERE provider = 'pa' AND {filtro}"
+            ))
+            .execute(&pool)
+            .await
+            .expect("retrodatazione");
+        }
         sqlx::query(
-            "INSERT INTO ai_model_health_history (provider, model, healthy, latency_ms, error_kind, checked_at) VALUES \
-             ('pa','ma', true,  100, NULL,             NOW() - INTERVAL '3 minutes'), \
-             ('pa','ma', false, 200, 'model_not_found', NOW() - INTERVAL '2 minutes'), \
-             ('pa','ma', false, NULL,'rate_limit',      NOW() - INTERVAL '1 minutes')",
-        )
-        .execute(&pool)
-        .await
-        .expect("insert health pa");
-        sqlx::query(
-            "INSERT INTO ai_price_catalog (provider, model, consecutive_failures, consecutive_tool_failures) VALUES \
-             ('pa','ma', 1, 0), ('pb','mb', 5, 2)",
+            "INSERT INTO ai_price_catalog (provider, model, is_enabled, supports_tool_use, \
+              agentic_thinking_policy, performance_tier, capabilities, \
+              input_cost_per_million_tokens, output_cost_per_million_tokens, currency, \
+              consecutive_failures, consecutive_tool_failures) VALUES \
+             ('pa','ma', true, true, 'none', 'medium', '[]'::jsonb, 1.0, 1.0, 'USD', 1, 0), \
+             ('pb','mb', true, true, 'none', 'medium', '[]'::jsonb, 1.0, 1.0, 'USD', 5, 2)",
         )
         .execute(&pool)
         .await
@@ -323,16 +324,20 @@ mod tests {
     }
 
     /// Lista candidati vuota -> nessuna query, vettore vuoto (fail-fast).
+    /// Nessuno schema: la lista vuota esce PRIMA di toccare il pool, e se un
+    /// giorno l'uscita anticipata sparisse il test rosseggerebbe qui.
     #[sqlx::test]
     async fn load_model_telemetry_candidati_vuoti(pool: PgPool) {
-        create_schema(&pool).await;
         assert!(load_model_telemetry(&pool, &[]).await.is_empty());
     }
 
-    /// `governance_enabled` default OFF: setting assente -> false (opt-in, regola G).
+    /// `governance_enabled` default OFF: setting ASSENTE -> false (opt-in,
+    /// regola G). Schema `settings` vuoto di proposito, NON il META migrato:
+    /// li' la mig 0526 accende il flag, e questo test misura proprio il
+    /// comportamento a chiave assente.
     #[sqlx::test]
     async fn governance_enabled_default_off(pool: PgPool) {
-        create_schema(&pool).await;
+        crate::test_support::create_settings_table(&pool).await;
         assert!(!governance_enabled(&pool).await);
     }
 }
