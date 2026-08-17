@@ -115,7 +115,18 @@ impl ModelUpscalePort for CatalogModelUpscalePort {
                 why: crate::orchestrator::model_service::ExactReason::ScaleTarget,
             })
             .rank(crate::orchestrator::model_service::Rank::WidestWindow)
-            .min_context_window(required_tokens);
+            .min_context_window(required_tokens)
+            // LO STESSO numero, un secondo lettore. `required_tokens` nasce
+            // nell'executor da `estimate_history_tokens(hist) +
+            // stima_overhead_turno(system, schemi)` inflazionato dal rapporto
+            // di margine (`upscale_required_tokens`): e' la stima del turno,
+            // non una seconda stima coniata qui (regola L). La finestra la
+            // legge come «quanto contesto deve entrarci», la capienza TPM come
+            // «quanti token muovo contro il bucket al minuto» — e per un
+            // bucket TPM, che conta prompt PIU' completamento, il numero col
+            // margine e' la lettura giusta, non un'approssimazione per
+            // eccesso.
+            .richiesta_token_stimati(required_tokens);
         // VINCOLO DEL RUN: restringe la ricerca al fornitore scelto, riusando il
         // pin che il servizio di selezione ha gia' (regola L) invece di
         // aggiungere qui una seconda nozione di "solo questo provider". Se
@@ -185,6 +196,21 @@ impl ModelUpscalePort for CatalogModelUpscalePort {
             })
             .capability(capability)
             .min_context_window(min_context_window)
+            // Come in `select_upscale_model`: l'UNICO produttore di questo
+            // parametro e' il consumo della `ScaleMove` nell'executor, che lo
+            // calcola come `scale_ctx.est_tokens * window_overhead_ratio` —
+            // cioe' la stima del turno col margine, di nuovo. Il downscale e'
+            // il caso in cui serve di piu': si scende di tier e i tier bassi
+            // sono popolati proprio dai fornitori col tetto TPM piu' stretto
+            // (groq dichiara 8000 su TUTTI i suoi modelli, MISURATO).
+            .richiesta_token_stimati(min_context_window)
+            // Come in `select_upscale_model`: l'UNICO produttore di questo
+            // parametro e' il consumo della `ScaleMove` nell'executor, che lo
+            // calcola come `scale_ctx.est_tokens * window_overhead_ratio` —
+            // cioe' la stima del turno col margine, di nuovo. Il downscale e'
+            // il caso in cui serve di piu': si scende di tier e i tier bassi
+            // sono popolati proprio dai fornitori col tetto TPM piu' stretto
+            // (groq dichiara 8000 su TUTTI i suoi modelli, MISURATO).
             .exclude(exclude_providers);
         // Come sopra: anche il cambio di tier bidirezionale resta dentro il
         // vincolo. Su fail-open il chiamante annulla il cambio-tier e tiene il
@@ -389,5 +415,129 @@ mod tests {
             "openai ha la finestra piu' grande e vincerebbe: a escluderlo e' solo il vincolo"
         );
         assert_eq!(pick.model, "claude-ampio");
+    }
+
+    // ---- capienza TPM: la porta DICHIARA la dimensione della richiesta ----
+
+    /// Osservazione di rate limit dalla catena di PRODUZIONE (regola O): gli
+    /// header reali -> il parser del gateway -> l'UPSERT unico. Nessuna riga
+    /// ricopiata a mano.
+    async fn seed_header_tpm(pool: &PgPool, provider: &str, model: &str, limite: i64) {
+        use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+        let mut h = HeaderMap::new();
+        for (nome, valore) in [
+            ("x-ratelimit-limit-tokens", limite.to_string()),
+            // Bucket praticamente pieno: cio' che decide qui e' il TETTO, non
+            // il residuo — altrimenti il test proverebbe l'altro ramo.
+            ("x-ratelimit-remaining-tokens", limite.to_string()),
+            ("x-ratelimit-reset-tokens", "59s".to_string()),
+        ] {
+            h.insert(
+                HeaderName::from_static(nome),
+                HeaderValue::from_str(&valore).expect("valore header"),
+            );
+        }
+        let oss = nexus_gateway::rate_limit_headers::osserva(&h, chrono::Utc::now())
+            .expect("header di rate limit riconosciuti dal parser di produzione");
+        assert!(
+            nexus_gateway::rate_limit_headers::persisti_osservazione(pool, provider, model, &oss)
+                .await
+        );
+    }
+
+    /// Scena: due modelli del tier target abbastanza capienti di FINESTRA, ma
+    /// uno dei due dichiara un tetto TPM che la richiesta sfonda. E' il caso
+    /// del 17/08 nella sua forma piu' insidiosa: la finestra basta (131k >=
+    /// 120k) e a scartarlo puo' essere SOLO il tetto al minuto.
+    async fn scena_tetto_tpm(pool: &PgPool) {
+        create_schema(pool).await;
+        set_setting(pool, "agent.upscale.target_tier", "heavy").await;
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, \
+              context_window, qualification_state, qualification_expires_at, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('groq', 'oss-largo', true, 'none', 'heavy', 400000, 'qualified', now() + interval '30 days', 1.0, 1.0, 'USD', now()), \
+             ('mistral', 'medium-largo', true, 'none', 'heavy', 300000, 'qualified', now() + interval '30 days', 1.0, 1.0, 'USD', now())",
+        )
+        .execute(pool)
+        .await
+        .expect("insert");
+        // I numeri veri: groq 8000 TPM su tutti i suoi modelli, mistral 2M.
+        seed_header_tpm(pool, "groq", "oss-largo", 8_000).await;
+        seed_header_tpm(pool, "mistral", "medium-largo", 2_000_000).await;
+    }
+
+    /// PREMESSA del test seguente: senza osservazioni l'upscale prende la
+    /// finestra piu' grande, cioe' groq. Senza questa riga il test sotto
+    /// potrebbe passare perche' groq non era candidabile per altri motivi.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn senza_osservazioni_l_upscale_prende_la_finestra_piu_grande(pool: PgPool) {
+        create_schema(&pool).await;
+        set_setting(&pool, "agent.upscale.target_tier", "heavy").await;
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, \
+              context_window, qualification_state, qualification_expires_at, input_cost_per_million_tokens, output_cost_per_million_tokens, currency, last_probe_healthy_at) VALUES \
+             ('groq', 'oss-largo', true, 'none', 'heavy', 400000, 'qualified', now() + interval '30 days', 1.0, 1.0, 'USD', now()), \
+             ('mistral', 'medium-largo', true, 'none', 'heavy', 300000, 'qualified', now() + interval '30 days', 1.0, 1.0, 'USD', now())",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert");
+        let port = CatalogModelUpscalePort::new(pool.clone());
+        let pick = port
+            .select_upscale_model("corrente", 120_000)
+            .await
+            .expect("ok")
+            .expect("un heavy capiente esiste");
+        assert_eq!(pick.provider, "groq", "senza fatti comanda la finestra");
+    }
+
+    /// La porta DICHIARA la dimensione della richiesta, e il criterio scarta
+    /// chi non la regge: `required_tokens` e' la stima del turno che
+    /// l'executor ha gia' calcolato (history + system + schemi, col margine),
+    /// non una seconda stima coniata qui.
+    ///
+    /// MUTAZIONE ESEGUITA (vedi commit): togliere `.richiesta_token_stimati()`
+    /// da `select_upscale_model` — il criterio resta perfetto e non viene mai
+    /// interrogato, groq torna a vincere e il test rosseggia. E' l'unico test
+    /// che copre quel confine: quelli sul criterio e quelli sulla selezione
+    /// restano tutti verdi (regola O).
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn l_upscale_non_promuove_chi_dichiara_un_tetto_tpm_sotto_la_richiesta(pool: PgPool) {
+        scena_tetto_tpm(&pool).await;
+        let port = CatalogModelUpscalePort::new(pool.clone());
+        let pick = port
+            .select_upscale_model("corrente", 120_000)
+            .await
+            .expect("ok")
+            .expect("un heavy capiente esiste");
+        assert_eq!(
+            pick.provider, "mistral",
+            "groq ha la finestra piu' grande e vincerebbe: a escluderlo e' il \
+             tetto di 8000 token al minuto contro i 120.000 della richiesta"
+        );
+        assert_eq!(pick.model, "medium-largo");
+    }
+
+    /// Lo stesso vale per il cambio di tier dello scale-controller, che e'
+    /// l'altro consumatore della stima: nel DOWNSCALE si scende proprio verso
+    /// i tier popolati dai fornitori col tetto piu' stretto.
+    ///
+    /// MUTAZIONE: togliere `.richiesta_token_stimati()` da
+    /// `select_model_for_tier` -> torna groq e il test rosseggia.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_cambio_di_tier_non_scende_su_chi_non_regge_la_richiesta(pool: PgPool) {
+        scena_tetto_tpm(&pool).await;
+        let port = CatalogModelUpscalePort::new(pool.clone());
+        let picked = port
+            .select_model_for_tier("heavy", 120_000, None, &[])
+            .await
+            .expect("ok")
+            .expect("un heavy capiente esiste");
+        assert_eq!(
+            picked.0, "mistral",
+            "il tetto TPM vale anche sul cambio di tier: {picked:?}"
+        );
     }
 }
