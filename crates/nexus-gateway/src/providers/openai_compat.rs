@@ -502,6 +502,43 @@ impl OpenAiCompatClient {
         if body.service_tier.is_none() {
             body.service_tier = self.service_tier.clone();
         }
+        // Perche' qui NON si applicano breakpoint di cache espliciti — le part
+        // del system marcate `cache_control`, come fa il dialetto anthropic.
+        //
+        // MISURATO il 17/08/2026 contro l'API OpenRouter su
+        // `qwen/qwen3-235b-a22b-2507`, tre bracci da tre chiamate a prefisso
+        // identico di ~22K token, con `session_id`, `prompt_cache_key` e
+        // `provider.order=[Google]` esattamente come li manda questo client:
+        //   - system a STRINGA (cio' che parte oggi): `cached_tokens` 19 al
+        //     primo colpo, 22.094 su 22.112 (99,9%) dal secondo;
+        //   - system a due PART senza `cache_control`: identico, 22.096 su
+        //     22.114 dal secondo colpo — la forma multipart da sola non sposta
+        //     niente, ed e' il braccio di controllo che lo dimostra;
+        //   - le stesse due part CON `cache_control` sulla part stabile:
+        //     `cached_tokens` 0, su tre chiamate su tre.
+        // Ripetuto con `allow_fallbacks:false`, che inchioda il fornitore a
+        // valle e toglie di mezzo lo spostamento di rotta: col breakpoint 0 su
+        // 2 colpi da Google, senza breakpoint 22.096 su 22.114 dal secondo.
+        //
+        // Il breakpoint quindi non aggiunge cache: la TOGLIE. Su questa rotta il
+        // prefisso lo copre gia' la cache implicita del fornitore a valle, e la
+        // presenza del campo manda la richiesta su una trasformazione diversa —
+        // si vede anche nel conteggio, 19.948 token contro 22.114 per lo stesso
+        // identico testo — dove quella cache non si aggancia. Costo per
+        // chiamata: $0,004867 senza contro $0,004988 con.
+        //
+        // Nota di onesta' sul beneficio che si sta difendendo: su questa rotta
+        // la cache rende in LATENZA e non in prezzo — OpenRouter fattura uguale
+        // il colpo che la crea e quello che la legge (stesso `cost` a
+        // `cached_tokens` 19 e a 22.096), mentre il tempo scende da ~2,3s a
+        // ~0,9s.
+        //
+        // PORTATA della misura: la rotta e' quella per cui il breakpoint era
+        // stato proposto, cioe' un fornitore a valle la cui cache e' IMPLICITA.
+        // Un passthrough verso un fornitore la cui cache esiste solo se
+        // dichiarata (anthropic) e' una domanda diversa e vuole la sua misura:
+        // li' l'assenza del campo non lascia la cache implicita al suo posto,
+        // perche' non ce n'e' nessuna.
         body
     }
 
@@ -2841,6 +2878,13 @@ mod tests {
         // spegnerli costerebbe la resilienza senza comprare nulla: con `false`,
         // un fornitore giu' fa fallire la richiesta invece di costare il solo
         // riuso del prefisso.
+        //
+        // La preferenza cede pero' quando il corpo porta una capacita' che il
+        // preferito non dichiara: il 17/08/2026, con `cache_control` sulle part
+        // del system e ripieghi attivi, tre chiamate su tre sono finite su
+        // Alibaba invece che su Google — la stessa deriva che questo campo
+        // esiste per chiudere, riaperta dal corpo della richiesta. La misura
+        // completa sta accanto a `corpo_della_richiesta`.
         assert_eq!(
             p.get("allow_fallbacks").and_then(|v| v.as_bool()),
             Some(true),
