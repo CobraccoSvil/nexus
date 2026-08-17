@@ -707,9 +707,15 @@ pub(crate) async fn await_target_service_ready(
     let port = base_url.and_then(port_from_localhost_url)?;
     let unit = target_service_unit(db, project_id, port).await?;
     let readiness = playwright_readiness_window(db).await;
+    // La stabilita' e' quella PIENA della remediation: qui la domanda e' "il
+    // bersaglio e' CALDO?", ed e' la ragione per cui questo gate esiste (un
+    // servizio che risponde a t+0 ma sta ancora scaldando fabbrica rossi flaky).
+    // L'avvio di un servizio pone un'altra domanda e passa un'altra stabilita':
+    // stesso criterio, parametro diverso (regola L).
     let ready = crate::project_workspace::service_recovery::await_port_ready(
         u16::try_from(port).ok()?,
         readiness,
+        crate::project_workspace::service_recovery::stabilita_di_remediation(),
     )
     .await;
     if ready.ready() {
@@ -2919,7 +2925,10 @@ mod target_readiness_tests {
         let port = porta_muta().await;
         let ready = PortReadiness {
             answer: probe_port(port).await,
-            stable: crate::project_workspace::service_recovery::stable_enough(None),
+            stable: crate::project_workspace::service_recovery::stable_enough(
+                None,
+                crate::project_workspace::service_recovery::stabilita_di_remediation(),
+            ),
         };
         assert!(!ready.ready(), "porta muta: il gate non puo' dirla pronta");
 
