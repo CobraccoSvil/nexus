@@ -285,10 +285,18 @@ impl RegistroRateLimit {
     }
 }
 
-/// L'UPSERT di UNA osservazione. Best-effort: un sensore che non riesce a
+/// L'UPSERT di UNA osservazione: SCRITTORE UNICO di
+/// `nexus_rate_limit_observations`. Best-effort: un sensore che non riesce a
 /// persistere non interrompe nulla, ma lo dice — la voce resta sporca e il
 /// prossimo giro ritenta. Ritorna `true` se la riga e' stata scritta.
-async fn persisti_osservazione(
+///
+/// `pub` e non privato per il LETTORE, non per un secondo scrittore: il
+/// consumatore di quelle righe vive in mcp-core (`tpm_telemetry`) e i suoi
+/// test devono seminare passando DA QUI (regola O). Ricopiare l'INSERT nel
+/// test del lettore fisserebbe la forma della riga che il test misura invece
+/// di misurare quella che la produzione scrive — e' la classe di difetto per
+/// cui le fixture `CREATE TABLE` a mano sono state rimosse dal repo.
+pub async fn persisti_osservazione(
     db: &PgPool,
     provider: &str,
     model: &str,
