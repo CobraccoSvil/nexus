@@ -146,6 +146,7 @@ pub mod advisory_panel;
 pub mod advisory_requirements;
 pub mod avanzamento_figura;
 pub mod browser_dialogue;
+pub mod capienza_tpm;
 pub mod clarify_signature;
 pub mod context_reduction;
 pub mod correction_progress;
