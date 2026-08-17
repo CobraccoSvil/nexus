@@ -1573,6 +1573,25 @@ assert_single "resa-statica" 'fn classifica_resa' \
 assert_single "natura-app-dai-fatti" 'fn classifica_natura' \
   'crates/nexus-agent-graph/src/decisions/static_render.rs' crates
 
+# «Il codice che questo run ha PRODOTTO si carica?» (2026-08-17, mig 0734)
+#
+# Il caso BASE della famiglia, ed e' quello che mancava: la resa, il dialogo, la
+# suite e lo stile coprono l'app col server, la pagina statica e l'interfaccia —
+# nessuno chiedeva se un file di codice parta. MISURATO il 17/08/2026: task «una
+# calcolatrice e i suoi test», `calcolatrice.test.js` con sintassi Jest in un
+# progetto senza Jest (`ReferenceError: describe is not defined`), final gate
+# «passato» due volte e run chiuso «completed».
+#
+# Il criterio e il PIANO DI PROVA vivono in un punto solo. Il secondo conta
+# quanto il primo: «come si prova questo file» incrocia estensione, vocabolario
+# e marcatore di test, ed e' la forma in cui una decisione si sparpaglia — un
+# call site che riconoscesse i file di test a modo suo eseguirebbe il livello di
+# caricamento su un modulo qualunque, cioe' il codice utente.
+assert_single "codice-eseguibile" 'fn classifica_esecuzione' \
+  'crates/nexus-agent-graph/src/decisions/codice_eseguibile.rs' crates
+assert_single "piano-di-prova" 'fn pianifica_prova' \
+  'crates/nexus-agent-graph/src/decisions/codice_eseguibile.rs' crates
+
 # «Quale pagina di QUESTO run va misurata?» (2026-08-11, mig 0699)
 #
 # Domanda NUOVA e distinta da quella del rilevatore qui sotto. Nasce da due
