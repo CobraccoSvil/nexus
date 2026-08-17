@@ -1072,7 +1072,7 @@ async fn seed_hit_ledger(
             cache_read_tokens: cache,
             cache_creation_tokens: 0,
         };
-        nexus_ledger::record_tokens(pool, id, provider, model, &usage, None, "", "test")
+        nexus_ledger::record_tokens(pool, id, provider, model, &usage, None, "", "test", None)
             .await
             .expect("record_tokens");
     }

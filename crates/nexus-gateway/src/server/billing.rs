@@ -159,6 +159,11 @@ pub async fn record_usage_to_ledger(
         costo_dichiarato_da(&resp.usage),
         &req.metadata.request_id,
         &req.metadata.feature,
+        // La durata misurata attorno alla POST verso il fornitore (mig 0727):
+        // il gateway e' l'unico che la conosce, e la riga di ledger e' l'unico
+        // posto dove il traffico REALE la persiste (i probe sintetici hanno la
+        // loro tabella, ai_model_health_history).
+        Some(resp.latency_ms as i64),
     )
     .await
     {
@@ -691,7 +696,7 @@ mod tests {
         let riga = sqlx::query(
             "SELECT id, user_id, project_id, provider, model, status, currency, details, \
                     prompt_tokens, completion_tokens, total_tokens, \
-                    cache_read_tokens, cache_creation_tokens, \
+                    cache_read_tokens, cache_creation_tokens, duration_ms, \
                     input_cost::float8          AS input_cost, \
                     output_cost::float8         AS output_cost, \
                     cache_read_cost::float8     AS cache_read_cost, \
@@ -723,6 +728,15 @@ mod tests {
         assert_eq!(riga.get::<i64, _>("cache_read_tokens"), 2_000_000);
         assert_eq!(riga.get::<i64, _>("cache_creation_tokens"), 500_000);
         assert_eq!(riga.get::<i32, _>("total_tokens"), 3_900_000);
+
+        // E la durata misurata dal gateway (mig 0727): il valore e' quello di
+        // `resp_anthropic_con_cache().latency_ms`, la strada e' la stessa della
+        // produzione. `Some` e non un numero nudo: NULL = non misurato e' meta'
+        // del contratto (regola Q).
+        //
+        // MUTAZIONE ESEGUITA: passare `None` in `record_usage_to_ledger` al
+        // posto della latenza -> questa assert cade con `None`.
+        assert_eq!(riga.get::<Option<i64>, _>("duration_ms"), Some(7));
 
         // I cinque IMPORTI, alle quattro tariffe distinte del listino:
         // 1M x 3.0, 0.4M x 15.0, 2M x 0.3, 0.5M x 3.75. Il messaggio riporta il

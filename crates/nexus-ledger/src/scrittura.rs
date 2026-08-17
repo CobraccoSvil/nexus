@@ -220,9 +220,9 @@ const SQL_INSERT_FINALIZED: &str = r#"
             prompt_tokens, completion_tokens, total_tokens,
             cache_read_tokens, cache_creation_tokens,
             input_cost, output_cost, cache_read_cost, cache_creation_cost, total_cost,
-            currency, status, details
+            currency, duration_ms, status, details
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'finalized', $17
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'finalized', $18
         )
         RETURNING id
         "#;
@@ -446,9 +446,22 @@ fn bind_chiusura<'q>(
         .bind(currency.to_string())
 }
 
+/// Come si chiude la riga (regola Q): ogni variante porta il SOLO campo che il
+/// proprio percorso misura, cosi' un campo di una delle due INSERT non ha modo
+/// di finire nell'altra. `Finalizzata` porta la durata osservata dal gateway
+/// (`None` = percorso che non la misura: MAI 0, uno zero sarebbe una misura
+/// falsa); `Scartata` porta la causa dello scarto. Prima il discriminante era
+/// la presenza di `discard_reason`, e la durata — che vale per la sola
+/// finalized — non avrebbe avuto un posto senza valere per entrambe.
+enum Chiusura<'a> {
+    Finalizzata { duration_ms: Option<i64> },
+    Scartata { reason: &'a str },
+}
+
 /// Esegue una delle due INSERT di chiusura, dai campi ai bind, in un punto
-/// solo: la SQL la sceglie il chiamante, `discard_reason` presente = $17 della
-/// discarded, assente = la finalized chiude con i soli details ($17).
+/// solo: la SQL la sceglie il chiamante e la [`Chiusura`] lega il $17 di
+/// ciascuna (finalized: `duration_ms`; discarded: `discard_reason`), poi i
+/// details chiudono la lista.
 ///
 /// `run_uuid` si deriva qui dal `request_id` (= run_id nei metadata, M71):
 /// NULL se il chiamante non lo passa o non e' un UUID valido.
@@ -462,7 +475,7 @@ async fn esegui_chiusura(
     tokens: &TokenUsage,
     costo: &CostBreakdown,
     currency: &str,
-    discard_reason: Option<&str>,
+    chiusura: Chiusura<'_>,
     request_id: &str,
     details: Value,
 ) -> Result<Uuid, sqlx::Error> {
@@ -477,9 +490,10 @@ async fn esegui_chiusura(
         costo,
         currency,
     );
-    if let Some(reason) = discard_reason {
-        q = q.bind(reason.to_string());
-    }
+    q = match chiusura {
+        Chiusura::Finalizzata { duration_ms } => q.bind(duration_ms),
+        Chiusura::Scartata { reason } => q.bind(reason.to_string()),
+    };
     q.bind(details).fetch_one(db).await
 }
 
@@ -500,6 +514,12 @@ async fn esegui_chiusura(
 /// chiamata (openrouter, usage accounting): quando c'e' vince sul riprezzato
 /// (vedi [`applica_costo_dichiarato`]); `None` = non dichiarato, si riprezza
 /// da catalogo come sempre.
+///
+/// `duration_ms` e' la durata della chiamata al fornitore misurata da chi l'ha
+/// eseguita (`LlmResponse.latency_ms` del gateway, mig 0727). `None` = il
+/// percorso non la misura, e la colonna resta NULL: mai 0, uno zero sarebbe
+/// una misura falsa (regola Q).
+#[allow(clippy::too_many_arguments)]
 pub async fn record_tokens(
     db: &PgPool,
     identity: Identity,
@@ -509,6 +529,7 @@ pub async fn record_tokens(
     dichiarato: Option<CostoDichiarato>,
     request_id: &str,
     feature: &str,
+    duration_ms: Option<i64>,
 ) -> Option<LedgerEntry> {
     let (currency, costo, price_state, price_missing) =
         prezza_chiamata(db, provider, model, tokens).await;
@@ -523,7 +544,7 @@ pub async fn record_tokens(
 
     let res = esegui_chiusura(
         db, SQL_INSERT_FINALIZED, Some(identity), provider, model, tokens,
-        &costo, &currency, None, request_id, details,
+        &costo, &currency, Chiusura::Finalizzata { duration_ms }, request_id, details,
     )
     .await;
 
@@ -672,7 +693,7 @@ pub async fn record_discarded(
 
     let res = esegui_chiusura(
         db, SQL_INSERT_DISCARDED, identity, provider, model, &riga_tokens,
-        &costo, &currency, Some(reason.as_str()), request_id, details,
+        &costo, &currency, Chiusura::Scartata { reason: reason.as_str() }, request_id, details,
     )
     .await;
 
@@ -1090,7 +1111,8 @@ mod tests {
     fn i_segnaposto_coprono_i_bind() {
         for (sql, n, nome) in [
             (SQL_INSERT_STIMA, 15, "INSERT stima"),
-            (SQL_INSERT_FINALIZED, 17, "INSERT finalized"),
+            // $17 = duration_ms (mig 0727), $18 = details.
+            (SQL_INSERT_FINALIZED, 18, "INSERT finalized"),
             (SQL_INSERT_DISCARDED, 18, "INSERT discarded"),
             (SQL_UPDATE_FINALIZE, 13, "UPDATE finalize"),
             (SQL_INSERT_MEDIA, 12, "INSERT media"),

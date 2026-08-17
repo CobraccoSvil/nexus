@@ -226,7 +226,7 @@ mod tests {
                 cache_read_tokens: cache_read,
                 cache_creation_tokens: 0,
             };
-            crate::record_tokens(pool, id, provider, model, &usage, None, "", "test")
+            crate::record_tokens(pool, id, provider, model, &usage, None, "", "test", None)
                 .await
                 .expect("record_tokens deve scrivere la riga");
         }

@@ -102,6 +102,7 @@ async fn il_dichiarato_vince_sul_riprezzato(pool: PgPool) {
         }),
         &run_dichiarato.to_string(),
         "chat",
+        None,
     )
     .await
     .expect("riga scritta");
@@ -136,6 +137,7 @@ async fn il_dichiarato_vince_sul_riprezzato(pool: PgPool) {
         None,
         &run_riprezzato.to_string(),
         "chat",
+        None,
     )
     .await
     .expect("riga scritta");
@@ -173,6 +175,7 @@ async fn su_listino_ignoto_il_dichiarato_e_lunico_costo_vero(pool: PgPool) {
         }),
         &run.to_string(),
         "chat",
+        None,
     )
     .await
     .expect("riga scritta");
