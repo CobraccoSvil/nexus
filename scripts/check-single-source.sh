@@ -4137,6 +4137,40 @@ else
   echo "OK freno-reprobe: il freno del recovery loop non e' condizionato al cooldown"
 fi
 
+# ── vita-del-servizio-appena-avviato (2026-08-17) ───────────────────────────
+# «Il servizio e' salito?» ha UN criterio: quello della remediation
+# (`service_recovery::await_port_ready` = probe_port + stable_enough + il ciclo
+# dei due orologi), che `agent_tools::avvio_servizio` consuma passando la
+# propria durata di stabilita' — un PARAMETRO, non una seconda funzione.
+# Il difetto chiuso: accanto a quel contratto viveva un SECONDO criterio in
+# `service.rs` (`attende_ascolto`, finestra hardcoded e `port_listening` al
+# posto del probe), montato nel posto piu' esposto e cieco sul fatto che decide
+# tutto: se il processo sia ancora VIVO. Misurato il 17/08/2026 (app libri):
+# `agent_processes` con `status=failed, exit_code=1` e `Cannot find module
+# 'express'` nello stderr, mentre l'agente proseguiva.
+assert_single "vita-del-servizio-appena-avviato" 'pub\(crate\) async fn await_port_ready' \
+  'crates/mcp-core/src/project_workspace/service_recovery.rs' crates
+
+assert_single "vita-del-servizio-appena-avviato" 'pub\(crate\) fn classifica_avvio' \
+  'crates/mcp-core/src/agent_tools/avvio_servizio.rs' crates
+
+# Il tool non torna ad attendere l'ascolto per conto proprio. Le righe di
+# commento sono escluse: la documentazione CITA il difetto per spiegarlo, e un
+# guard che confonde la spiegazione con la regressione costringerebbe a non
+# documentarla.
+if grep -nE 'fn attende_ascolto|port_recovery::port_listening|ATTESA_ASCOLTO_MS' \
+     crates/mcp-core/src/agent_tools/service.rs \
+   | grep -vE '^[0-9]+: *(//|/\*|\*)' >/dev/null 2>&1; then
+  echo "!! vita-del-servizio-appena-avviato: service.rs torna ad attendere la vita" >&2
+  echo "   per conto proprio. E' il secondo criterio rimosso il 17/08/2026:" >&2
+  echo "   finestra hardcoded, port_listening al posto di probe_port, e nessuna" >&2
+  echo "   osservazione del processo. La domanda va posta ad" >&2
+  echo "   avvio_servizio::attendi_avvio, che delega a service_recovery." >&2
+  fail=1
+else
+  echo "OK vita-del-servizio-appena-avviato: il tool delega il criterio della vita"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

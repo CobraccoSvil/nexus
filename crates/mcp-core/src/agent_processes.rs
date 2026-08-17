@@ -734,6 +734,7 @@ pub async fn read_process_output(
 
 use sqlx::Row;
 
+#[derive(Debug, Clone)]
 pub struct ProcessOutput {
     pub command: String,
     pub pid: Option<i32>,
