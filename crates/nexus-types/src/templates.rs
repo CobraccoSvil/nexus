@@ -54,7 +54,7 @@ impl Default for TemplateCache {
 }
 
 /// Chiave del setting che seleziona la variante INGLESE dei template
-/// (A/B lingua, fase 5b, mig 0725): CSV di chiavi di `nexus_prompt_templates`
+/// (A/B lingua, fase 5b, mig 0726): CSV di chiavi di `nexus_prompt_templates`
 /// da servire nella variante `<chiave>.en`. Vuoto = tutti i template in
 /// italiano. Regola G: il flip e' un UPDATE del setting, il rollback e'
 /// svuotare il CSV, niente redeploy.
@@ -92,7 +92,7 @@ async fn variante_inglese_selezionata(db: &PgPool, key: &str) -> bool {
 /// 1. Cache in-memory (TTL 60s)
 /// 2. Variante INGLESE `<chiave>.en`, SOLO se la chiave e' elencata nel CSV
 ///    del setting `prompt.english_variants` E la riga `.en` e' attiva
-///    (A/B lingua fase 5b, mig 0725). Riga `.en` assente o illeggibile =
+///    (A/B lingua fase 5b, mig 0726). Riga `.en` assente o illeggibile =
 ///    degrado DICHIARATO con WARN e si serve la riga italiana: il flip di un
 ///    template non migrato non puo' produrre un prompt vuoto.
 /// 3. DB PostgreSQL (`nexus_prompt_templates` WHERE is_active=TRUE)
@@ -153,7 +153,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// Le 4 chiavi dell'A/B lingua (fase 5b, mig 0725).
+    /// Le 4 chiavi dell'A/B lingua (fase 5b, mig 0726).
     const CHIAVI_AB: [&str; 4] = [
         "automation.supervisor_monitoring",
         "subagent.step_gatekeeper.base",
@@ -177,7 +177,7 @@ mod tests {
         fetch_active_content(db, key).await.expect("lettura template")
     }
 
-    /// MUTAZIONE: togliere un placeholder (o una riga .en) dalla mig 0725 fa
+    /// MUTAZIONE: togliere un placeholder (o una riga .en) dalla mig 0726 fa
     /// rosseggiare questo test — un placeholder perso e' un template che smette
     /// di riempirsi in silenzio.
     #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]

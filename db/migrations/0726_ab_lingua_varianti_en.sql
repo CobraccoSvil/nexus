@@ -1,5 +1,5 @@
 -- ─────────────────────────────────────────────────────────────────────────────
--- 0725 — A/B lingua (fase 5b): varianti INGLESI dei 4 template machine-only
+-- 0726 — A/B lingua (fase 5b): varianti INGLESI dei 4 template machine-only
 --
 -- CAUSA. I template interni (system prompt di worker e giudici, mai letti da
 -- un umano) sono in italiano, e i tokenizer dei fornitori penalizzano
@@ -32,7 +32,7 @@
 -- di scrivere quei campi in italiano.
 --
 -- NOTA NUMERAZIONE: il cantiere fase 3 occupa i numeri fino a 0724 nel suo
--- worktree; al merge riverificare che 0725 sia ancora il primo numero libero
+-- worktree; al merge riverificare che il numero resti libero (rinumerata 0725->0726 al merge per la collisione con latency_budget_selection)
 -- (due file con lo stesso numero: sqlx ne applica UNO SOLO, in silenzio).
 -- ─────────────────────────────────────────────────────────────────────────────
 
@@ -88,7 +88,7 @@ Analyze the situation and respond in JSON format with ONE of these actions:
   → the task is impossible or the agent cannot proceed
 
 Respond with the JSON ONLY, no other text.$tpl$,
-     TRUE, 1, 'migration_0725')
+     TRUE, 1, 'migration_0726')
 ON CONFLICT (key) DO NOTHING;
 
 INSERT INTO nexus_prompt_templates
@@ -114,7 +114,7 @@ The stato_gia_prodotto tag carries the steps the run has ALREADY executed agains
 <output_format>
 Respond EXCLUSIVELY by calling the step_verdict tool. No free text: the verdict counts only in the fields. reasons is mandatory for reject and needs_human, with severity from the vocabulary alta|media|bassa. Write the human-readable reason and evidence fields in Italian.
 </output_format>$tpl$,
-     TRUE, 1, 'migration_0725')
+     TRUE, 1, 'migration_0726')
 ON CONFLICT (key) DO NOTHING;
 
 INSERT INTO nexus_prompt_templates
@@ -140,7 +140,7 @@ The stato_gia_prodotto tag carries the steps the run has ALREADY executed agains
 <output_format>
 Respond EXCLUSIVELY by calling the step_verdict tool. No free text. reasons is mandatory for reject and needs_human, with severity from the vocabulary alta|media|bassa. Write the human-readable reason and evidence fields in Italian.
 </output_format>$tpl$,
-     TRUE, 1, 'migration_0725')
+     TRUE, 1, 'migration_0726')
 ON CONFLICT (key) DO NOTHING;
 
 INSERT INTO nexus_prompt_templates
@@ -167,7 +167,7 @@ ASSISTANT'S REPLY:
 <<<
 {{assistant_text}}
 >>>$tpl$,
-     TRUE, 1, 'migration_0725')
+     TRUE, 1, 'migration_0726')
 ON CONFLICT (key) DO NOTHING;
 
 -- (2) Il selettore dell'A/B (regola G: la configurazione sta nel DB, un solo
@@ -177,5 +177,5 @@ ON CONFLICT (key) DO NOTHING;
 --     entro ~2 minuti senza redeploy.
 INSERT INTO settings (key, value, category, description) VALUES
   ('prompt.english_variants', '', 'system',
-   'A/B lingua (fase 5b): CSV delle chiavi di nexus_prompt_templates da servire nella variante inglese <chiave>.en (righe della mig 0725). Vuoto = tutti i template in italiano. Flip per blocchi con cutover secco, mai per-chiamata (la randomizzazione per-chiamata terrebbe fredda la prompt cache in entrambi i bracci). Rollback = svuotare il CSV.')
+   'A/B lingua (fase 5b): CSV delle chiavi di nexus_prompt_templates da servire nella variante inglese <chiave>.en (righe della mig 0726). Vuoto = tutti i template in italiano. Flip per blocchi con cutover secco, mai per-chiamata (la randomizzazione per-chiamata terrebbe fredda la prompt cache in entrambi i bracci). Rollback = svuotare il CSV.')
 ON CONFLICT (key) DO NOTHING;
