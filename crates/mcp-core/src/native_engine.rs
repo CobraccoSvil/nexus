@@ -1415,6 +1415,11 @@ async fn load_final_gate_config(db: &PgPool, project_id: Option<Uuid>) -> FinalG
         // dall'entry rilevata sul filesystem, che qui non ci sono — stesso
         // motivo per cui `verify_steps` resta al Default in questo loader.
         static_render_criterion: d.static_render_criterion.clone(),
+        // Il codice prodotto si carica? (mig 0734). Qui, come per lo stile e a
+        // differenza della resa: non serve nulla del filesystem — QUALI file
+        // provare lo dira' il registro delle scritture al momento della
+        // verifica, e a t=0 quel registro non ha ancora niente da dire.
+        codice_eseguibile_criterion: criterio_codice_eseguibile(db).await,
         // Escalation su non-convergenza del gate (mig 0577): al cap di max_cycles con
         // criteri oggettivi ancora falliti, cede il turno all'executor per promuovere
         // un modello piu' capace invece di chiudere secco. `max_escalations` RIUSA la
@@ -1479,6 +1484,61 @@ fn criterio_stile(
         expected: serde_json::json!({}),
         timeout_s: Some(timeout_s),
     })
+}
+
+/// Il criterio «il codice che il run ha PRODOTTO si carica?», quando la chiave
+/// lo accende (mig 0734).
+///
+/// TUTTA la configurazione si risolve QUI (regola G) e viaggia nella spec, come
+/// per [`criterio_resa_statica`]: il runner non legge il DB, e la misura resta
+/// leggibile in cio' che ha dichiarato di aver usato per misurare.
+///
+/// Il vocabolario ASSENTE non impedisce al criterio di nascere, ed e'
+/// deliberato: un criterio che sparisse quando la sua configurazione manca
+/// sarebbe un gate silenziosamente inerte — cioe' il punto di partenza di questo
+/// lavoro. Nasce senza la chiave, e chi verifica dichiara di non aver misurato.
+///
+/// QUALI file si provino NON si decide qui: a t=0 il run non ha scritto niente,
+/// e i file da provare sono esattamente quelli che nasceranno dopo. Li chiede al
+/// registro delle scritture chi verifica.
+///
+/// `pub(crate)` per una ragione di MISURA e non di riuso, la stessa di
+/// [`criterio_resa_statica`]: la configurazione con cui il criterio gira la
+/// scrive il DB, e un test che la fabbricasse a mano fisserebbe proprio
+/// l'assunto da verificare (regola O). Il test end-to-end in
+/// `agent_graph_adapter::criteria_runner` parte da qui e attraversa la stessa
+/// strada della produzione: migrazione -> spec -> rilettura della spec ->
+/// comandi veri -> conseguenza.
+pub(crate) async fn criterio_codice_eseguibile(
+    db: &PgPool,
+) -> Option<nexus_agent_graph::runtime::ports::CriterionSpec> {
+    use nexus_agent_graph::decisions::codice_eseguibile::{
+        criterio_esecuzione, ParametriEsecuzione, VocabolarioRuntime,
+    };
+    let abilitato = setting_bool(db, "agent.final_gate.codice_eseguibile_enabled", false).await;
+    if !abilitato {
+        return None;
+    }
+    let voc = nexus_auth::get_setting(db, "agent.final_gate.runtime_per_estensione")
+        .await
+        .as_deref()
+        .and_then(VocabolarioRuntime::parse);
+    if voc.is_none() {
+        tracing::warn!(
+            target: "mcp_core::native_engine",
+            "codice_eseguibile acceso senza vocabolario leggibile \
+             (`agent.final_gate.runtime_per_estensione`): il criterio nascera' e \
+             dichiarera' di non aver potuto misurare"
+        );
+    }
+    criterio_esecuzione(
+        voc.as_ref(),
+        &ParametriEsecuzione {
+            abilitato,
+            timeout_s: setting_f64(db, "agent.final_gate.codice_eseguibile_timeout_s", 30.0).await,
+            max_file: setting_usize(db, "agent.final_gate.codice_eseguibile_max_file", 50).await,
+        },
+    )
 }
 
 /// Il criterio della resa di un'app SENZA server.

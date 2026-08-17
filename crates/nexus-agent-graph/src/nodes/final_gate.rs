@@ -255,6 +255,23 @@ pub struct FinalGateConfig {
     /// DB, che questo crate non legge. Il nodo vi aggiunge la sola parte che
     /// conosce lui — il contenitore DICHIARATO dall'agente.
     pub static_render_criterion: Option<crate::runtime::ports::CriterionSpec>,
+    /// Criterio «i file di codice che questo run ha PRODOTTO si caricano nel
+    /// loro runtime?», gia' costruito dal motore. `None` = criterio spento.
+    ///
+    /// E' il caso BASE della famiglia, e mancava. Gli altri quattro chiedono a
+    /// un servizio, a un browser, a una suite o ai sorgenti dell'interfaccia:
+    /// nessuno chiedeva se un file di codice PARTA. MISURATO il 17/08/2026 su un
+    /// progetto vuoto — `calcolatrice.test.js` con sintassi Jest senza Jest
+    /// (`ReferenceError: describe is not defined`), nessuna porta registrata,
+    /// quindi nessuno degli altri criteri applicabile, e il gate ha chiuso
+    /// «passato» due volte col beneficio del dubbio.
+    ///
+    /// Arriva PRONTO per la stessa ragione degli altri due qui sopra: il
+    /// vocabolario dei runtime e i parametri della misura stanno nel DB, che
+    /// questo crate non legge. Il nodo non vi aggiunge nulla — QUALI file
+    /// provare non e' una domanda che si possa porre a t=0, e la pone chi
+    /// verifica al registro delle scritture.
+    pub codice_eseguibile_criterion: Option<crate::runtime::ports::CriterionSpec>,
     /// ADR 0036: catena di verifica PER-AMBIENTE risolta a monte (profilo
     /// inferito da LLM in `project_verify_profiles`, step marcati gate=true).
     /// Un criterio `run_command` per step, nell'ordine del profilo (es.
@@ -340,6 +357,7 @@ impl Default for FinalGateConfig {
             // chiave e' accesa e il progetto ha una radice.
             ui_styling_criterion: None,
             static_render_criterion: None,
+            codice_eseguibile_criterion: None,
             verify_steps: Vec::new(),
             verify_profile_missing: false,
             origine_frontend: None,
@@ -771,6 +789,21 @@ impl FinalGateNode {
         criteria.extend(self.cfg.static_render_criterion.clone().map(|c| {
             crate::decisions::static_render::con_contenitore(c, state.declared_outcome.as_ref())
         }));
+
+        // (5f) IL CASO BASE: il codice che questo run ha PRODOTTO si carica?
+        //      I quattro criteri qui sopra chiedono a un servizio, a un browser,
+        //      a una suite o ai sorgenti dell'interfaccia. Nessuno chiedeva se un
+        //      file di codice PARTA — e su un progetto senza porte, senza pagina
+        //      e senza suite non ne nasce nemmeno uno. MISURATO il 17/08/2026:
+        //      task «una calcolatrice e i suoi test», `calcolatrice.test.js` con
+        //      sintassi Jest in un progetto senza Jest, gate «passato» due volte
+        //      (cycle=2 inconclusive=2, poi cycle=1 inconclusive=2) e run chiuso
+        //      «completed». Il Consiglio aveva emesso il rischio esatto prima che
+        //      il lavoro cominciasse; mancava chi lo riscontrasse alla fine.
+        //      NIENTE si innesta qui, a differenza della resa: quali file provare
+        //      e' una domanda che a t=0 non ha risposta e che al momento della
+        //      verifica si pone al registro delle scritture, non allo stato.
+        criteria.extend(self.cfg.codice_eseguibile_criterion.clone());
 
         // (6) design_verify (P5): per i task figma l'agente non puo' chiudere con
         //     una resa visiva sotto soglia che HA GIA' misurato con nexus_visual_compare.

@@ -49,6 +49,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use nexus_agent_graph::decisions::browser_dialogue;
+use nexus_agent_graph::decisions::codice_eseguibile;
 use nexus_agent_graph::decisions::pagina_del_run;
 use nexus_agent_graph::decisions::risorse_pagina::{PoliticaRisorse, VerdettoRisorse};
 use nexus_agent_graph::decisions::static_render;
@@ -626,6 +627,13 @@ impl FinalGateCriteriaRunnerAdapter {
             t if t == static_render::CRITERION_TYPE => {
                 self.attesa_bersaglio_http(&c.spec).await;
                 self.check_static_render(&c.spec, timeout_s).await
+            }
+            // Il codice PRODOTTO si carica? Nessuna attesa di readiness, come
+            // per lo stile: la risposta sta nei file e nel loro runtime, non in
+            // un servizio — questo criterio e' vero o falso a servizi spenti,
+            // ed e' precisamente il caso in cui gli altri non nascono.
+            t if t == codice_eseguibile::CRITERION_TYPE => {
+                self.check_codice_eseguibile(&c.spec, timeout_s).await
             }
             "file_exists" => {
                 self.check_file_exists(&c.spec, &c.expected, timeout_s)
@@ -1360,6 +1368,71 @@ task_complete (outcome + summary)"
         (esito, ui_styling::evidenza_criterio(&verdetto, &ev))
     }
 
+    /// I file di codice che questo run ha PRODOTTO si caricano nel loro
+    /// runtime? Il criterio e' il punto unico
+    /// [`codice_eseguibile::classifica_esecuzione`]: qui SOLO l'I/O (registro
+    /// delle scritture, esecuzione dei comandi di prova) e la traduzione
+    /// dell'esito.
+    ///
+    /// I tre esiti hanno tre conseguenze DIVERSE, e appiattirne due sarebbe il
+    /// difetto che il criterio chiude:
+    ///  - un file RIFIUTATO dal proprio runtime boccia — e' l'unico difetto;
+    ///  - «non c'era codice da provare» PASSA: un run che scrive documentazione
+    ///    o configurazione non deve chiudere non-verificato per un criterio che
+    ///    non lo riguarda;
+    ///  - «c'era e non ho potuto guardarlo» (runtime assente dal PATH, registro
+    ///    illeggibile, vocabolario mancante) e' `Inconclusive`: il run chiude
+    ///    `completed_unverified`, mai `passed`. E' la distinzione che il gate
+    ///    del 17/08/2026 non aveva — aveva chiuso «passato» senza aver misurato
+    ///    niente.
+    async fn check_codice_eseguibile(
+        &self,
+        spec: &Value,
+        timeout_s: f64,
+    ) -> (CriterionOutcome, Value) {
+        let Some((voc, max_file)) = Self::parametri_codice(spec) else {
+            return non_misurato(CODICE_SENZA_VOCABOLARIO);
+        };
+        // La radice e' l'albero su cui questo run LAVORA, e il progetto e' il
+        // perimetro del registro: senza uno dei due non c'e' niente da chiedere
+        // e nulla da guardare, e lo si DICHIARA invece di assolvere.
+        let (Some((meta_db, project_id)), Some((session_id, _)), Some(radice)) =
+            (self.progetto.clone(), self.run, self.run_root.clone())
+        else {
+            return non_misurato(CODICE_SENZA_PERIMETRO);
+        };
+        let fatti = match crate::agent_graph_adapter::codice_eseguibile::fatti_codice(
+            &meta_db, project_id, session_id, &radice, &voc, max_file, timeout_s,
+        )
+        .await
+        {
+            Ok(f) => f,
+            // Registro illeggibile: NIENTE ripiego sull'albero. Provare «tutti i
+            // file del progetto» misurerebbe un'altra domanda — il criterio e'
+            // sul codice che QUESTO run ha prodotto — e boccerebbe un run per un
+            // difetto preesistente che non ha introdotto.
+            Err(e) => return non_misurato(&e),
+        };
+        esito_codice(&fatti)
+    }
+
+    /// Legge dalla spec la configurazione del criterio `codice_eseguibile`.
+    ///
+    /// `None` = vocabolario assente o illeggibile. Nessun ripiego su un elenco
+    /// cablato: sarebbe la seconda verita' che la regola G vieta, e per giunta
+    /// silenziosa — chi chiama DICHIARA di non aver potuto misurare.
+    fn parametri_codice(
+        spec: &Value,
+    ) -> Option<(codice_eseguibile::VocabolarioRuntime, usize)> {
+        let voc = serde_json::from_value(spec.get(codice_eseguibile::CHIAVE_VOCABOLARIO)?.clone())
+            .ok()?;
+        let max_file = spec
+            .get(codice_eseguibile::CHIAVE_MAX_FILE)
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        Some((voc, max_file))
+    }
+
     /// ASSENTE, il criterio falliva, il gate bocciava e apriva un ciclo di
     /// correzione su un lavoro gia' fatto.
     ///
@@ -1711,6 +1784,57 @@ impl ParametriResa {
 /// [`esito_dialogo`]: stessa forma di evidenza, perche' chi legge un rilievo
 /// del gate non deve imparare due vocabolari per due criteri fratelli.
 ///
+/// I motivi con cui il criterio `codice_eseguibile` dichiara di NON aver
+/// misurato. Costanti e non letterali in linea: sono cio' che un operatore legge
+/// per sapere quale delle due configurazioni manca, e vanno lette insieme.
+const CODICE_SENZA_VOCABOLARIO: &str =
+    "vocabolario dei runtime assente o illeggibile \
+     (`agent.final_gate.runtime_per_estensione`): nessun file provabile";
+const CODICE_SENZA_PERIMETRO: &str =
+    "manca il progetto, la sessione o la radice del lavoro: \
+     i file prodotti non sono interrogabili";
+
+/// «Non ho potuto misurare», col motivo. Distinto da un `Passed`: il run chiude
+/// `completed_unverified`, che e' il canale giusto per un non-verdetto.
+fn non_misurato(motivo: &str) -> (CriterionOutcome, Value) {
+    (
+        CriterionOutcome::Inconclusive,
+        json!({ "skipped_reason": motivo }),
+    )
+}
+
+/// Traduce i fatti del criterio `codice_eseguibile` in esito ed evidenza.
+///
+/// I tre esiti sono TRE e non due, e appiattirne due sarebbe il difetto che il
+/// criterio chiude: `Failed` solo per un file che il suo runtime RIFIUTA;
+/// `Passed` quando si e' misurato (anche se non c'era codice da provare: un run
+/// che scrive documentazione non deve chiudere non-verificato); `Inconclusive`
+/// quando c'era da guardare e non si e' potuto — un `node` assente dal PATH non
+/// e' un via libera, e il gate del 17/08/2026 aveva chiuso «passato» proprio
+/// senza aver misurato niente.
+fn esito_codice(
+    fatti: &[nexus_agent_graph::decisions::codice_eseguibile::FattoFile],
+) -> (CriterionOutcome, Value) {
+    use codice_eseguibile::VerdettoEsecuzione;
+    let verdetto = codice_eseguibile::classifica_esecuzione(fatti);
+    let esito = if verdetto.e_bloccante() {
+        CriterionOutcome::Failed
+    } else if verdetto.ha_misurato() {
+        CriterionOutcome::Passed
+    } else {
+        CriterionOutcome::Inconclusive
+    };
+    if let VerdettoEsecuzione::CodiceRotto { rotti } = &verdetto {
+        tracing::info!(
+            target: "mcp_core::criteria_runner",
+            rotti = rotti.len(),
+            considerati = fatti.len(),
+            "codice_eseguibile: file prodotti che non si caricano nel loro runtime"
+        );
+    }
+    (esito, codice_eseguibile::evidenza_criterio(&verdetto, fatti))
+}
+
 /// Gli errori di CONSOLE entrano nell'evidenza anche quando il verdetto e'
 /// negativo per altro: non bocciano (lo dichiara il punto unico), ma sono la
 /// prima cosa utile a chi deve capire perche' la pagina e' vuota.
@@ -2437,6 +2561,102 @@ mod caso_reale_resa_tests {
         assert!(
             cause.len() >= 2,
             "eccezione non gestita + contenitore vuoto: {cause:?}"
+        );
+    }
+
+    /// IL CASO MISURATO IL 17/08/2026, dall'inizio alla fine e con la
+    /// configurazione REALE.
+    ///
+    /// Progetto vuoto, task «crea `calcolatrice.js` con quattro funzioni e
+    /// `calcolatrice.test.js` con cinque test». La sorgente funziona, il file di
+    /// test non parte (`ReferenceError: describe is not defined`: sintassi Jest
+    /// senza Jest). Nessuna porta registrata, quindi nessuno degli altri criteri
+    /// del gate nasce: il run ha chiuso «completed» col final gate «passato».
+    ///
+    /// La catena e' quella della produzione, senza scorciatoie:
+    ///   migrazioni (flag, vocabolario e tetto li scrive il DB, non il test)
+    ///     -> `native_engine::criterio_codice_eseguibile` costruisce la spec
+    ///     -> `record_mutation` registra le scritture del run
+    ///     -> `parametri_codice` rilegge la spec come fa il runner
+    ///     -> `fatti_codice` esegue i comandi VERI del vocabolario
+    ///     -> `esito_codice` traduce il verdetto in conseguenza.
+    ///
+    /// MUTAZIONE (il valore reale del difetto): spegnere il flag nella
+    /// migrazione — `agent.final_gate.codice_eseguibile_enabled = 'false'` — e
+    /// il criterio non nasce: la prima `expect` cade, ed e' il gate cieco del
+    /// 17/08. Seconda mutazione, piu' insidiosa: togliere `carica_test` dalla
+    /// riga `js` del vocabolario lascia nascere il criterio, fa passare
+    /// `node --check` su quel file e l'ultima asserzione cade con `Passed` —
+    /// tutto il resto della catena funzionerebbe, e nessuno fermerebbe il run.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_test_che_non_parte_boccia_con_la_configurazione_reale(pool: PgPool) {
+        let (user_id, project_id) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let session_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let albero = tempfile::tempdir().expect("tempdir");
+        let root = albero.path();
+
+        // 1. La CONFIGURAZIONE, dalle migrazioni applicate a questo DB.
+        let criterio = crate::native_engine::criterio_codice_eseguibile(&pool)
+            .await
+            .expect("il criterio nasce: la configurazione lo accende");
+        assert_eq!(criterio.criterion_type, codice_eseguibile::CRITERION_TYPE);
+        let (voc, max_file) =
+            FinalGateCriteriaRunnerAdapter::parametri_codice(&criterio.spec)
+                .expect("la spec porta il vocabolario, come il runner lo rilegge");
+        let timeout_s = criterio.timeout_s.expect("il criterio ha un timeout");
+
+        // 2. Il LAVORO del run, col produttore reale del registro.
+        for (rel, contenuto) in [
+            (
+                "calcolatrice.js",
+                "function somma(a, b) { return a + b; }\nmodule.exports = { somma };\n",
+            ),
+            (
+                "calcolatrice.test.js",
+                "const { somma } = require('./calcolatrice.js');\n\
+                 describe('somma', () => { it('va', () => { expect(somma(2,3)).toBe(5); }); });\n",
+            ),
+        ] {
+            std::fs::write(root.join(rel), contenuto).expect("write");
+            record_mutation(
+                &pool,
+                project_id,
+                Some(session_id),
+                Some(run_id),
+                Some(user_id),
+                rel,
+                "write_file",
+                None,
+                Some(contenuto),
+                ScopeAudit::none(),
+            )
+            .await
+            .expect("mutazione registrata");
+        }
+
+        // 3. I FATTI, coi comandi VERI del vocabolario.
+        let fatti = crate::agent_graph_adapter::codice_eseguibile::fatti_codice(
+            &pool, project_id, session_id, root, &voc, max_file, timeout_s,
+        )
+        .await
+        .expect("fatti");
+
+        // 4. La CONSEGUENZA.
+        let (esito, evidenza) = esito_codice(&fatti);
+        assert_eq!(
+            esito,
+            CriterionOutcome::Failed,
+            "un file di test che non si carica deve fermare il run: evidenza {evidenza}"
+        );
+        assert_eq!(evidenza["verdict"], "code_broken");
+        assert_eq!(evidenza["rotti"][0]["path"], "calcolatrice.test.js");
+        assert_eq!(evidenza["rotti"][0]["livello"], "load");
+        assert!(
+            evidenza["verdict_text"]
+                .as_str()
+                .is_some_and(|t| t.contains("describe is not defined")),
+            "il rimando porta il messaggio del RUNTIME: {evidenza}"
         );
     }
 }
