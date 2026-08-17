@@ -101,6 +101,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/models/:provider", get(routes::models_for_provider))
         .route("/v1/complete", post(routes::complete))
         .route("/v1/stream", post(routes::stream))
+        // Conteggio token: stesso contratto d'ingresso di /v1/complete, nessuna
+        // scrittura di ledger (l'endpoint del fornitore e' gratuito).
+        .route("/v1/count_tokens", post(routes::count_tokens))
         .route("/v1/images/generations", post(routes::generate_image))
         .route("/v1/videos", post(routes::generate_video))
         .route("/v1/audio/transcriptions", post(routes::transcribe_audio))

@@ -728,6 +728,7 @@ mod registry_tests {
             user: None,
             parallel_tool_calls: None,
             deferrable: false,
+            effort: None,
         }
     }
 

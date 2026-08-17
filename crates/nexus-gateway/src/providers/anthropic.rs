@@ -30,8 +30,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::provider::{ChunkStream, LlmProvider};
 use crate::providers::openai_compat::parse_models_response;
 use crate::types::{
-    LlmRequest, LlmResponse, LlmStreamChunk, LlmToolCall, LlmUsage, MessageContent,
-    PromptCacheReporting, ReasoningTokens, SensitivityTier, ToolFunctionCall,
+    CountTokensResponse, LlmRequest, LlmResponse, LlmStreamChunk, LlmToolCall, LlmUsage,
+    MessageContent, PromptCacheReporting, ReasoningTokens, SensitivityTier, ToolFunctionCall,
 };
 
 /// Tier ammessi: pubblico/interno/confidenziale (mai tier 3, riservato a onprem).
@@ -52,7 +52,18 @@ const THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 /// Unica fonte di verita' condivisa col brain Python (mig 0125): valori `5m`,
 /// `1h` (default) o `off` per disattivare il caching. Il gateway Rust segue la
 /// regola G stretta: nessun override env, solo DB.
+/// Il nome con cui questo fornitore si presenta ovunque: e' la chiave con cui
+/// il catalogo, il registry, il ledger e i log lo nominano, quindi una sola
+/// definizione (stessa disciplina di `KimiProvider` e `OpenAiProvider`).
+const PROVIDER_NAME: &str = "anthropic";
+
 const CACHE_TTL_SETTING: &str = "anthropic_system_cache_ttl";
+
+/// Chiave settings (regola G) del breakpoint di cache sulle DEFINIZIONI DEI
+/// TOOL. Seed `'true'` (mig 0730): e' un breakpoint in piu' su un prefisso che
+/// il modello riceve comunque, quindi il rollback e' il caso raro, non il
+/// default. Assente o non riconoscibile -> spento, come ogni altro flag.
+const CACHE_TOOLS_SETTING: &str = "providers.anthropic.cache_tools";
 
 /// TTL cache usato SOLO se il DB e' irraggiungibile (fallback graceful
 /// documentato, regola G). Allineato al default `1h` della mig 0125: il system
@@ -93,6 +104,9 @@ pub struct AnthropicProvider {
     db: Option<PgPool>,
     thinking_budget: TtlCache<(), u32>,
     cache_ttl: TtlCache<(), CacheTtl>,
+    /// Il breakpoint di cache sulle definizioni dei tool (chiave `()`: e' una
+    /// decisione dell'installazione, non del modello).
+    cache_tools: TtlCache<(), bool>,
 }
 
 /// Stato della prompt cache di sistema, risolto dal setting
@@ -150,6 +164,53 @@ impl CacheTtl {
     }
 }
 
+/// DOVE il breakpoint di cache va messo in questa richiesta.
+///
+/// E' un tipo e non due parametri sciolti (regola Q): `build_request_body`
+/// riceve gia' un `stream: bool`, e affiancargli un secondo booleano renderebbe
+/// `(.., true, false)` e `(.., false, true)` due chiamate ugualmente
+/// compilabili e opposte nel significato.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoliticaCache {
+    /// La durata del breakpoint, dal setting `anthropic_system_cache_ttl`.
+    /// `Off` spegne TUTTI i breakpoint, tool compresi.
+    pub ttl: CacheTtl,
+    /// Il breakpoint sull'ULTIMO tool e' acceso
+    /// (`providers.anthropic.cache_tools`, mig 0730).
+    pub sui_tool: bool,
+}
+
+impl PoliticaCache {
+    /// La politica di prima che i tool entrassero nel discorso: breakpoint su
+    /// system e history, nessuno sui tool. E' cio' che un test di
+    /// non-regressione deve poter esprimere senza nominare un flag.
+    pub fn senza_tool(ttl: CacheTtl) -> Self {
+        Self {
+            ttl,
+            sui_tool: false,
+        }
+    }
+
+    /// Il `cache_control` da mettere sull'ULTIMO tool, se ce n'e' uno da
+    /// mettere.
+    ///
+    /// Riusa `history_cache_control` (ephemeral 5m) e non
+    /// `system_cache_control` (che a `1h` aggiunge il TTL esteso): le
+    /// definizioni dei tool cambiano quando cambia il set di tool del run, non
+    /// quando cambia il prompt, e un TTL di un'ora su un prefisso che si
+    /// riscrive prima costa la scrittura (1,25x) senza comprare riletture.
+    ///
+    /// `None` quando la cache e' spenta OPPURE quando il breakpoint sui tool
+    /// non e' acceso: sono due ragioni diverse per la stessa assenza, e la
+    /// prima sovrasta la seconda — spegnere la cache spegne tutto.
+    fn tool_cache_control(self) -> Option<serde_json::Value> {
+        if !self.sui_tool {
+            return None;
+        }
+        self.ttl.history_cache_control()
+    }
+}
+
 impl AnthropicProvider {
     /// Costruisce il provider senza accesso DB (test di mappatura). Il budget
     /// thinking non sara' leggibile dai settings: il thinking resta disattivo a
@@ -176,6 +237,7 @@ impl AnthropicProvider {
             db,
             thinking_budget: TtlCache::new(SETTINGS_TTL),
             cache_ttl: TtlCache::new(SETTINGS_TTL),
+            cache_tools: TtlCache::new(SETTINGS_TTL),
         }
     }
 
@@ -221,12 +283,45 @@ impl AnthropicProvider {
         self.cache_ttl.insert((), ttl);
         ttl
     }
+
+    /// La politica di cache di QUESTA installazione: durata piu' breakpoint sui
+    /// tool, letti insieme perche' insieme viaggiano fino al corpo.
+    ///
+    /// Il flag sui tool ricade su `false` senza DB e su chiave assente: e' un
+    /// breakpoint in piu', e aggiungerne uno che nessuno ha chiesto e' una
+    /// scrittura di cache in piu' (1,25x l'input) a fronte di riletture che
+    /// nessuno ha misurato.
+    async fn politica_cache(&self) -> PoliticaCache {
+        PoliticaCache {
+            ttl: self.configured_cache_ttl().await,
+            sui_tool: self.cache_sui_tool().await,
+        }
+    }
+
+    /// Il breakpoint sulle definizioni dei tool e' acceso? (cache TTL 60s)
+    async fn cache_sui_tool(&self) -> bool {
+        if let Some(v) = self.cache_tools.get(&()) {
+            return v;
+        }
+        let Some(db) = self.db.as_ref() else {
+            return false;
+        };
+        let acceso = nexus_auth::get_setting(db, CACHE_TOOLS_SETTING)
+            .await
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
+        self.cache_tools.insert((), acceso);
+        acceso
+    }
+
+    fn endpoint_count_tokens(&self) -> String {
+        format!("{}/messages/count_tokens", self.base_url)
+    }
 }
 
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
     fn name(&self) -> &str {
-        "anthropic"
+        PROVIDER_NAME
     }
 
     fn supports_tools(&self) -> bool {
@@ -248,8 +343,8 @@ impl LlmProvider for AnthropicProvider {
     async fn complete(&self, req: &LlmRequest) -> anyhow::Result<LlmResponse> {
         let configured = self.configured_thinking_budget().await;
         let thinking_budget = resolve_thinking_budget(req, configured);
-        let cache_ttl = self.configured_cache_ttl().await;
-        let body = build_request_body(req, false, thinking_budget, cache_ttl);
+        let cache = self.politica_cache().await;
+        let body = build_request_body(req, false, thinking_budget, cache);
         let start = Instant::now();
 
         let mut builder = self
@@ -283,11 +378,63 @@ impl LlmProvider for AnthropicProvider {
         Ok(from_anthropic_message(parsed, req.model.clone(), latency_ms))
     }
 
+    fn supports_count_tokens(&self) -> bool {
+        true
+    }
+
+    /// `POST /messages/count_tokens`: quanti token d'ingresso vale questa
+    /// richiesta secondo il tokenizzatore del FORNITORE.
+    ///
+    /// Il corpo si PROIETTA da [`build_request_body`] e non si compone a mano
+    /// (regola O): il conteggio deve valere per la richiesta che partirebbe
+    /// davvero, e un secondo costruttore divergerebbe al primo campo nuovo —
+    /// misurando qualcosa che nessuno manda. Restano fuori i campi che
+    /// l'endpoint non ammette (`max_tokens`, `stream`) e quelli che non
+    /// contribuiscono all'ingresso (`temperature`).
+    ///
+    /// La CACHE resta SPENTA per questa chiamata: `cache_control` marcherebbe un
+    /// breakpoint su una richiesta che non produce output, e il conteggio
+    /// domandato e' quello dell'ingresso NUDO — quanto di esso venga poi riletto
+    /// dalla cache e' un'altra domanda, e la risponde il ledger.
+    ///
+    /// L'endpoint e' GRATUITO: nessuna riga di ledger, nessun `record_and_declare`
+    /// (una riga a costo zero sarebbe indistinguibile da una chiamata non
+    /// fatturata per errore).
+    async fn count_tokens(&self, req: &LlmRequest) -> anyhow::Result<CountTokensResponse> {
+        let completo =
+            build_request_body(req, false, None, PoliticaCache::senza_tool(CacheTtl::Off));
+        let corpo = AnthropicCountTokensRequest {
+            model: completo.model,
+            system: completo.system,
+            messages: completo.messages,
+            tools: completo.tools,
+        };
+        let resp = self
+            .http
+            .post(self.endpoint_count_tokens())
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .json(&corpo)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anthropic_http_error(status.as_u16(), text).into());
+        }
+        let contato: AnthropicCountTokensResponse = resp.json().await?;
+        Ok(CountTokensResponse {
+            input_tokens: contato.input_tokens,
+            provider_used: PROVIDER_NAME.to_string(),
+            model_used: req.model.clone(),
+        })
+    }
+
     async fn stream(&self, req: &LlmRequest) -> anyhow::Result<ChunkStream> {
         let configured = self.configured_thinking_budget().await;
         let thinking_budget = resolve_thinking_budget(req, configured);
-        let cache_ttl = self.configured_cache_ttl().await;
-        let body = build_request_body(req, true, thinking_budget, cache_ttl);
+        let cache = self.politica_cache().await;
+        let body = build_request_body(req, true, thinking_budget, cache);
 
         let mut builder = self
             .http
@@ -440,8 +587,9 @@ fn build_request_body(
     req: &LlmRequest,
     stream: bool,
     thinking_budget: Option<u32>,
-    cache_ttl: CacheTtl,
+    cache: PoliticaCache,
 ) -> AnthropicRequest {
+    let cache_ttl = cache.ttl;
     let (system_text, mut messages) = to_anthropic_messages(req);
 
     // Breakpoint cache su SYSTEM: blocco text strutturato con cache_control
@@ -456,16 +604,7 @@ fn build_request_body(
         apply_history_cache_breakpoint(&mut messages, cache_ttl);
     }
 
-    let tools: Option<Vec<AnthropicTool>> = req.tools.as_ref().map(|tools| {
-        tools
-            .iter()
-            .map(|t| AnthropicTool {
-                name: t.function.name.clone(),
-                description: t.function.description.clone().unwrap_or_default(),
-                input_schema: t.function.parameters.clone(),
-            })
-            .collect()
-    });
+    let tools = build_tools(req, cache);
 
     // tool_choice mappato al dialetto Anthropic (`{type:any|tool|auto}`) via il
     // punto unico (regola L). Inviato solo con tool presenti e vincolo
@@ -489,6 +628,81 @@ fn build_request_body(
             kind: "enabled".to_string(),
             budget_tokens,
         }),
+        output_config: effort_ammesso(req.effort.as_deref(), &req.model)
+            .map(|effort| AnthropicOutputConfig {
+                effort: effort.to_string(),
+            }),
+    }
+}
+
+/// Le definizioni dei tool nel dialetto Anthropic, col breakpoint di cache
+/// sull'ULTIMO quando la politica lo prevede.
+///
+/// PERCHE' UN BREAKPOINT SUI TOOL. La gerarchia di Anthropic e' tools -> system
+/// -> messages, quindi il breakpoint sul system copre gia' il prefisso dei tool
+/// che gli sta davanti: cio' che questo aggiunge sono i due casi che quello non
+/// copre — le richieste SENZA system (dove nessun breakpoint alto esiste) e i
+/// deploy di prompt, dove la parte stabile del system cambia e senza un
+/// breakpoint proprio i tool si riscrivono insieme a lei.
+///
+/// PERCHE' SULL'ULTIMO. `cache_control` marca «memorizza fin qui»: sul primo
+/// memorizzerebbe un solo schema e lascerebbe fuori tutti gli altri, che sono
+/// la parte grossa.
+///
+/// Tetto dei breakpoint: system 1 + history 1 + tools 1 = 3, sotto il limite di
+/// 4 dell'API.
+fn build_tools(req: &LlmRequest, cache: PoliticaCache) -> Option<Vec<AnthropicTool>> {
+    let mut tools: Vec<AnthropicTool> = req
+        .tools
+        .as_ref()?
+        .iter()
+        .map(|t| AnthropicTool {
+            name: t.function.name.clone(),
+            description: t.function.description.clone().unwrap_or_default(),
+            input_schema: t.function.parameters.clone(),
+            cache_control: None,
+        })
+        .collect();
+    if let (Some(cc), Some(ultimo)) = (cache.tool_cache_control(), tools.last_mut()) {
+        ultimo.cache_control = Some(cc);
+    }
+    Some(tools)
+}
+
+/// Il vocabolario CHIUSO dell'effort di anthropic (regola N). Un elenco e non un
+/// passthrough: quel campo lo VALIDA il fornitore, e un valore che non riconosce
+/// e' un rifiuto su OGNI chiamata che lo porta.
+const EFFORT_AMMESSI: &[&str] = &["low", "medium", "high"];
+
+/// L'effort dichiarato dal chiamante, se e' uno di quelli che il fornitore
+/// accetta.
+///
+/// Fuori vocabolario NON si inoltra, e si DICE: inoltrarlo trasformerebbe un
+/// refuso del chiamante in un 400 sistematico su quel percorso, e scartarlo in
+/// silenzio renderebbe «l'ho chiesto e non e' successo niente» indistinguibile
+/// da «non l'ho chiesto». Il WARN nomina il valore rifiutato — e' una stringa di
+/// configurazione del chiamante, non un payload (regola F).
+///
+/// Il confronto e' esatto sul valore normalizzato, mai una sottostringa: `"low"`
+/// e `"very-low"` sono due cose diverse e la seconda non e' nel vocabolario.
+fn effort_ammesso(dichiarato: Option<&str>, model: &str) -> Option<&'static str> {
+    let raw = dichiarato?.trim().to_ascii_lowercase();
+    if raw.is_empty() {
+        return None;
+    }
+    match EFFORT_AMMESSI.iter().find(|a| **a == raw) {
+        Some(a) => Some(a),
+        None => {
+            tracing::warn!(
+                provider = PROVIDER_NAME,
+                model = %model,
+                effort_rifiutato = %raw,
+                ammessi = ?EFFORT_AMMESSI,
+                "anthropic: effort fuori vocabolario -> non inoltrato (il fornitore \
+                 lo rifiuterebbe su ogni chiamata); si usa il default del modello"
+            );
+            None
+        }
     }
 }
 
@@ -854,7 +1068,7 @@ fn from_anthropic_message(
             ReasoningTokens::IncludedInOutput,
         ),
         model_used,
-        provider_used: "anthropic".to_string(),
+        provider_used: PROVIDER_NAME.to_string(),
         latency_ms,
         finish_reason: map_stop_reason(resp.stop_reason.as_deref()),
         privacy_rerouted: None,
@@ -900,7 +1114,7 @@ pub fn is_anthropic_billing_error(msg: &str) -> bool {
 /// (`classify_provider_error`) resta DETERMINISTICO su status+codice (regola H):
 /// il match testuale e' confinato al provider, non sparso nel punto di decisione.
 fn anthropic_http_error(status: u16, body: String) -> super::ProviderHttpError {
-    let mut e = super::ProviderHttpError::from_response("anthropic", status, body);
+    let mut e = super::ProviderHttpError::from_response(PROVIDER_NAME, status, body);
     if e.code.is_none() && is_anthropic_billing_error(&e.message) {
         e.code = Some("billing".to_string());
     }
@@ -1009,7 +1223,7 @@ impl AnthropicSseParser {
                                         tool_call_delta: None,
                                         finish_reason: None,
                                         usage: None,
-                                        provider_used: Some("anthropic".to_string()),
+                                        provider_used: Some(PROVIDER_NAME.to_string()),
                                         model_used: Some(self.model_used.clone()),
                                         reasoning_delta: None,
                                     });
@@ -1026,7 +1240,7 @@ impl AnthropicSseParser {
                                         tool_call_delta: None,
                                         finish_reason: None,
                                         usage: None,
-                                        provider_used: Some("anthropic".to_string()),
+                                        provider_used: Some(PROVIDER_NAME.to_string()),
                                         model_used: Some(self.model_used.clone()),
                                         reasoning_delta: Some(thinking),
                                     });
@@ -1069,7 +1283,7 @@ impl AnthropicSseParser {
                         self.cache_creation_tokens,
                         ReasoningTokens::IncludedInOutput, // come sopra: gia' dentro
                     )),
-                    provider_used: Some("anthropic".to_string()),
+                    provider_used: Some(PROVIDER_NAME.to_string()),
                     model_used: Some(self.model_used.clone()),
                     reasoning_delta: None,
                 });
@@ -1105,6 +1319,42 @@ struct AnthropicRequest {
     /// solo quando il thinking e' attivo per la richiesta.
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<AnthropicThinking>,
+    /// Manopola di sforzo del modello (`{effort:"low|medium|high"}`), dal campo
+    /// di contratto `LlmRequest.effort`. Assente quando il chiamante non lo
+    /// dichiara o quando dichiara un valore fuori vocabolario.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<AnthropicOutputConfig>,
+}
+
+/// Il blocco `output_config` del dialetto anthropic. Oggi porta il solo
+/// `effort`: gli altri campi che l'API vi ammette non hanno un produttore, e un
+/// campo senza produttore sarebbe codice morto (regola O).
+#[derive(Debug, Serialize)]
+struct AnthropicOutputConfig {
+    effort: String,
+}
+
+/// Corpo di `POST /messages/count_tokens`: la PROIEZIONE di
+/// [`AnthropicRequest`] sui soli campi che contribuiscono all'ingresso.
+///
+/// I campi sono presi verbatim da quella struct, non ricostruiti: e' la stessa
+/// disciplina per cui il conteggio si chiede sulla richiesta che partirebbe
+/// davvero. `max_tokens` e `stream` sono esclusi perche' l'endpoint non li
+/// ammette (descrivono l'USCITA, che qui non c'e').
+#[derive(Debug, Serialize)]
+struct AnthropicCountTokensRequest {
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<AnthropicSystem>,
+    messages: Vec<AnthropicMessageParam>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<AnthropicTool>>,
+}
+
+/// Risposta di `POST /messages/count_tokens`: il solo numero.
+#[derive(Debug, Deserialize)]
+struct AnthropicCountTokensResponse {
+    input_tokens: u64,
 }
 
 /// Configurazione thinking nel body Anthropic.
@@ -1218,6 +1468,10 @@ struct AnthropicTool {
     name: String,
     description: String,
     input_schema: serde_json::Value,
+    /// Breakpoint di prompt cache sulle definizioni dei tool. Lo porta il SOLO
+    /// ultimo tool, e solo col flag acceso: vedi [`PoliticaCache`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1471,8 +1725,9 @@ mod tests {
             user: None,
             parallel_tool_calls: None,
             deferrable: false,
+            effort: None,
         };
-        let body = build_request_body(&req, false, None, CacheTtl::Off);
+        let body = build_request_body(&req, false, None, PoliticaCache::senza_tool(CacheTtl::Off));
         let json = serde_json::to_value(&body).unwrap();
 
         // system NON e' tra i messages, ma campo a se'.
@@ -1509,8 +1764,9 @@ mod tests {
             user: None,
             parallel_tool_calls: None,
             deferrable: false,
+            effort: None,
         };
-        let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, false, None, PoliticaCache::senza_tool(CacheTtl::Off))).unwrap();
 
         let m = &json["messages"][0];
         assert_eq!(m["role"], "user");
@@ -1545,9 +1801,10 @@ mod tests {
             user: None,
             parallel_tool_calls: None,
             deferrable: false,
+            effort: None,
         };
         let json =
-            serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
+            serde_json::to_value(build_request_body(&req, false, None, PoliticaCache::senza_tool(CacheTtl::Off))).unwrap();
         json["messages"][0]["content"][0].clone()
     }
 
@@ -1628,8 +1885,9 @@ mod tests {
             user: None,
             parallel_tool_calls: None,
             deferrable: false,
+            effort: None,
         };
-        let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, false, None, PoliticaCache::senza_tool(CacheTtl::Off))).unwrap();
 
         let m = &json["messages"][0];
         assert_eq!(m["role"], "assistant");
@@ -1669,13 +1927,438 @@ mod tests {
             user: None,
             parallel_tool_calls: None,
             deferrable: false,
+            effort: None,
         };
-        let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, false, None, PoliticaCache::senza_tool(CacheTtl::Off))).unwrap();
 
         let t = &json["tools"][0];
         assert_eq!(t["name"], "search");
         assert_eq!(t["description"], "cerca");
         assert_eq!(t["input_schema"]["type"], "object");
+    }
+
+    // ── Breakpoint di cache sui tool (mig 0730) ─────────────────────────────
+
+    fn tool_chiamato(nome: &str) -> LlmToolDefinition {
+        LlmToolDefinition {
+            kind: "function".to_string(),
+            function: ToolFunctionDef {
+                name: nome.to_string(),
+                description: Some(format!("descrizione di {nome}")),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: None,
+            },
+        }
+    }
+
+    fn req_con_tre_tool() -> LlmRequest {
+        let mut r = req_msgs(vec![msg("system", "istruzioni"), msg("user", "ciao")]);
+        r.tools = Some(vec![
+            tool_chiamato("leggi"),
+            tool_chiamato("scrivi"),
+            tool_chiamato("cerca"),
+        ]);
+        r
+    }
+
+    /// I `cache_control` presenti sui tool del corpo, come coppie (nome, c'e').
+    fn breakpoint_sui_tool(json: &serde_json::Value) -> Vec<(String, bool)> {
+        json["tools"]
+            .as_array()
+            .expect("tools nel corpo")
+            .iter()
+            .map(|t| {
+                (
+                    t["name"].as_str().unwrap_or_default().to_string(),
+                    t.get("cache_control").is_some(),
+                )
+            })
+            .collect()
+    }
+
+    /// IL breakpoint sta sull'ULTIMO tool e su nessun altro. Sul primo
+    /// memorizzerebbe un solo schema lasciando fuori la parte grossa: e'
+    /// «memorizza fin qui», non «memorizza questo».
+    ///
+    /// MUTAZIONE: `t.first_mut()` al posto di `t.last_mut()` in
+    /// `build_request_body` -> rosso.
+    #[test]
+    fn il_breakpoint_dei_tool_sta_sull_ultimo() {
+        let politica = PoliticaCache {
+            ttl: CacheTtl::OneHour,
+            sui_tool: true,
+        };
+        let json =
+            serde_json::to_value(build_request_body(&req_con_tre_tool(), false, None, politica))
+                .unwrap();
+        assert_eq!(
+            breakpoint_sui_tool(&json),
+            vec![
+                ("leggi".to_string(), false),
+                ("scrivi".to_string(), false),
+                ("cerca".to_string(), true),
+            ]
+        );
+        // Ephemeral 5m anche col system a 1h: gli schemi dei tool cambiano con
+        // il set di tool del run, non col prompt.
+        let ultimo = &json["tools"][2]["cache_control"];
+        assert_eq!(ultimo["type"], "ephemeral");
+        assert!(
+            ultimo.get("ttl").is_none(),
+            "il TTL esteso e' del system, non dei tool: {ultimo}"
+        );
+    }
+
+    /// Il flag SPENTO lascia il corpo com'era: nessun tool porta il campo.
+    ///
+    /// MUTAZIONE: togliere il gate `if !self.sui_tool` da `tool_cache_control`
+    /// -> rosso.
+    #[test]
+    fn col_flag_spento_i_tool_restano_come_ieri() {
+        let json = serde_json::to_value(build_request_body(
+            &req_con_tre_tool(),
+            false,
+            None,
+            PoliticaCache::senza_tool(CacheTtl::OneHour),
+        ))
+        .unwrap();
+        assert!(breakpoint_sui_tool(&json).iter().all(|(_, c)| !*c));
+        // E il breakpoint sul SYSTEM resta dov'era: il flag governa i soli tool.
+        assert!(json["system"][0]["cache_control"].is_object());
+    }
+
+    /// Spegnere la CACHE spegne anche i tool, flag acceso o no: sono due ragioni
+    /// diverse per la stessa assenza, e la prima sovrasta la seconda. Un
+    /// `cache_control` con la cache spenta e' un breakpoint che nessuno ha
+    /// chiesto (e su blocco vuoto, un HTTP 400).
+    ///
+    /// MUTAZIONE: far ritornare a `tool_cache_control` un ephemeral fisso invece
+    /// di delegare a `ttl.history_cache_control()` -> rosso.
+    #[test]
+    fn la_cache_spenta_spegne_anche_i_tool() {
+        let politica = PoliticaCache {
+            ttl: CacheTtl::Off,
+            sui_tool: true,
+        };
+        let json =
+            serde_json::to_value(build_request_body(&req_con_tre_tool(), false, None, politica))
+                .unwrap();
+        assert!(breakpoint_sui_tool(&json).iter().all(|(_, c)| !*c));
+    }
+
+    /// Senza tool non c'e' niente da marcare, e il campo `tools` resta assente:
+    /// un array vuoto col breakpoint sarebbe un corpo che nessuno ha chiesto.
+    #[test]
+    fn senza_tool_il_breakpoint_non_nasce() {
+        let politica = PoliticaCache {
+            ttl: CacheTtl::OneHour,
+            sui_tool: true,
+        };
+        let req = req_msgs(vec![msg("user", "ciao")]);
+        let json = serde_json::to_value(build_request_body(&req, false, None, politica)).unwrap();
+        assert!(json.get("tools").is_none());
+    }
+
+    /// Il tetto dei breakpoint dell'API e' 4: qui se ne contano al piu' 3
+    /// (system, history, tools). Il conteggio si fa sul corpo SERIALIZZATO, non
+    /// sulle intenzioni: e' quello che l'API rifiuterebbe.
+    #[test]
+    fn i_breakpoint_stanno_sotto_il_tetto_dell_api() {
+        let politica = PoliticaCache {
+            ttl: CacheTtl::OneHour,
+            sui_tool: true,
+        };
+        // History abbastanza lunga da meritare il proprio breakpoint.
+        let mut req = req_con_tre_tool();
+        req.messages = vec![
+            msg("system", "istruzioni"),
+            msg("user", "uno"),
+            msg("assistant", "ok"),
+            msg("user", "due"),
+            msg("assistant", "ok"),
+            msg("user", "tre"),
+            msg("assistant", "ok"),
+            msg("user", "quattro"),
+        ];
+        let json = serde_json::to_value(build_request_body(&req, false, None, politica)).unwrap();
+        let quanti = conta_cache_control(&json);
+        assert!(
+            (1..=4).contains(&quanti),
+            "breakpoint contati: {quanti} (il limite dell'API e' 4)"
+        );
+    }
+
+    /// Conta ricorsivamente le chiavi `cache_control` nel corpo serializzato.
+    fn conta_cache_control(v: &serde_json::Value) -> usize {
+        match v {
+            serde_json::Value::Object(m) => {
+                m.iter()
+                    .map(|(k, val)| {
+                        usize::from(k == "cache_control" && !val.is_null())
+                            + conta_cache_control(val)
+                    })
+                    .sum()
+            }
+            serde_json::Value::Array(a) => a.iter().map(conta_cache_control).sum(),
+            _ => 0,
+        }
+    }
+
+    // ── output_config.effort ────────────────────────────────────────────────
+
+    fn corpo_con_effort(effort: Option<&str>) -> serde_json::Value {
+        let mut req = req_msgs(vec![msg("user", "ciao")]);
+        req.effort = effort.map(|s| s.to_string());
+        serde_json::to_value(build_request_body(
+            &req,
+            false,
+            None,
+            PoliticaCache::senza_tool(CacheTtl::Off),
+        ))
+        .unwrap()
+    }
+
+    /// Il vocabolario e' CHIUSO: i tre valori ammessi passano, tutto il resto
+    /// NON viene inoltrato. Inoltrare un valore che il fornitore non riconosce
+    /// e' un 400 su ogni chiamata che lo porta (regola N + regola H).
+    ///
+    /// MUTAZIONE: sostituire il controllo di appartenenza con un passthrough
+    /// (`Some(raw)`) -> rossi i casi fuori vocabolario.
+    #[test]
+    fn l_effort_fuori_vocabolario_non_parte() {
+        for ammesso in ["low", "medium", "high"] {
+            assert_eq!(
+                corpo_con_effort(Some(ammesso))["output_config"]["effort"], ammesso,
+                "{ammesso} e' nel vocabolario e deve arrivare"
+            );
+        }
+        // Maiuscole e spazi sono lo stesso valore: si normalizza, non si rifiuta.
+        assert_eq!(corpo_con_effort(Some("  HIGH "))["output_config"]["effort"], "high");
+        // Fuori vocabolario: niente campo, e il modello usa il proprio default.
+        // L'elenco copre ENTRAMBE le direzioni in cui un `contains` sbaglierebbe
+        // — un valore che CONTIENE un ammesso (`very-low`, `lowest`) e un valore
+        // CONTENUTO in un ammesso (`lo`, `hig`) — perche' il confronto e' per
+        // uguaglianza e non per sottostringa.
+        for rifiutato in ["very-low", "lowest", "lo", "hig", "massimo", "1", ""] {
+            assert!(
+                corpo_con_effort(Some(rifiutato)).get("output_config").is_none(),
+                "\"{rifiutato}\" non e' del vocabolario e non deve partire"
+            );
+        }
+        // Non dichiarato: il corpo e' quello di sempre.
+        assert!(corpo_con_effort(None).get("output_config").is_none());
+    }
+
+    /// `effort` NON e' `thinking`: dichiarare l'uno non tocca l'altro. Sono due
+    /// campi diversi del corpo e due domande diverse (quanto sforzo contro se
+    /// ragionare e con che budget).
+    #[test]
+    fn l_effort_non_tocca_il_blocco_thinking() {
+        let mut req = req_msgs(vec![msg("user", "ciao")]);
+        req.effort = Some("low".to_string());
+        let json = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            Some(2048),
+            PoliticaCache::senza_tool(CacheTtl::Off),
+        ))
+        .unwrap();
+        assert_eq!(json["output_config"]["effort"], "low");
+        assert_eq!(json["thinking"]["type"], "enabled");
+        assert_eq!(json["thinking"]["budget_tokens"], 2048);
+    }
+
+    // ── Il flag e il conteggio token passano dal driver reale ───────────────
+
+    /// Il seed della mig 0730 e' `'true'`, e il driver lo LEGGE: senza questo
+    /// test il flag potrebbe restare scollegato e tutti i test del corpo
+    /// resterebbero verdi, perche' passano la politica a mano (regola O).
+    ///
+    /// MUTAZIONE: far ritornare `false` a `cache_sui_tool` -> rosso.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_flag_dei_tool_arriva_dal_db_al_corpo(pool: PgPool) {
+        let p = AnthropicProvider::with_db(Client::new(), "chiave", None, Some(pool.clone()));
+        assert!(
+            p.cache_sui_tool().await,
+            "la mig 0730 lo semina acceso: il rollback e' l'evento raro"
+        );
+
+        // La cache deve essere accesa perche' il breakpoint nasca: e' il setting
+        // che gia' esiste, e lo si accende come farebbe un operatore.
+        sqlx::query("UPDATE settings SET value = '1h' WHERE key = $1")
+            .bind(CACHE_TTL_SETTING)
+            .execute(&pool)
+            .await
+            .expect("il setting della durata esiste");
+        let p = AnthropicProvider::with_db(Client::new(), "chiave", None, Some(pool.clone()));
+        let politica = p.politica_cache().await;
+        assert_eq!(politica.ttl, CacheTtl::OneHour);
+        assert!(politica.sui_tool);
+
+        let json =
+            serde_json::to_value(build_request_body(&req_con_tre_tool(), false, None, politica))
+                .unwrap();
+        assert_eq!(
+            breakpoint_sui_tool(&json).last().map(|(_, c)| *c),
+            Some(true),
+            "la politica letta dal DB deve arrivare fino al corpo"
+        );
+
+        // Spegnere il flag dal DB e' il rollback dichiarato. Servono DUE cose,
+        // e la seconda e' la meno ovvia: un provider nuovo (la sua TtlCache e'
+        // per istanza) E l'invalidazione della cache di processo dei settings,
+        // che vive in `nexus_auth` ed e' condivisa da chiunque legga quella
+        // chiave su questo pool. In esercizio la seconda si scioglie da se'
+        // entro il TTL; qui la si forza col punto unico previsto apposta, non
+        // dormendo.
+        sqlx::query("UPDATE settings SET value = 'false' WHERE key = $1")
+            .bind(CACHE_TOOLS_SETTING)
+            .execute(&pool)
+            .await
+            .expect("aggiornabile");
+        nexus_auth::invalidate_setting_cache(&pool, CACHE_TOOLS_SETTING);
+        let p = AnthropicProvider::with_db(Client::new(), "chiave", None, Some(pool));
+        assert!(!p.cache_sui_tool().await);
+    }
+
+    /// Server finto che risponde a `POST /messages/count_tokens` col corpo che
+    /// l'API vera restituisce, e registra la richiesta ricevuta: e' la sola
+    /// prova di QUALE percorso sia stato interrogato e con quale corpo.
+    async fn finge_conteggio(
+        input_tokens: u64,
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("porta effimera");
+        let porta = listener.local_addr().expect("indirizzo").port();
+        let visti = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registro = visti.clone();
+
+        tokio::spawn(async move {
+            // Terminatore di riga del PROTOCOLLO: costante, cosi' un
+            // normalizzatore di fine-riga sull'albero non lo puo' toccare.
+            const CRLF: &str = "\r\n";
+            let corpo = format!("{{\"input_tokens\":{input_tokens}}}");
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut grezzo = Vec::new();
+                let mut buf = [0u8; 4096];
+                let inizio_corpo = loop {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break 0usize,
+                        Ok(n) => grezzo.extend_from_slice(&buf[..n]),
+                    }
+                    let testo = String::from_utf8_lossy(&grezzo);
+                    let Some(fine_testa) = testo.find("\r\n\r\n") else {
+                        continue;
+                    };
+                    let len: usize = testo
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse().ok())
+                        })
+                        .unwrap_or(0);
+                    if grezzo.len() >= fine_testa + 4 + len {
+                        break fine_testa + 4;
+                    }
+                };
+                let intero = String::from_utf8_lossy(&grezzo).to_string();
+                let prima_riga = intero.lines().next().unwrap_or_default().to_string();
+                let ricevuto = intero.get(inizio_corpo..).unwrap_or_default().to_string();
+                registro
+                    .lock()
+                    .expect("registro")
+                    .push(format!("{prima_riga}\n{ricevuto}"));
+
+                let stato = if prima_riga.starts_with("POST /messages/count_tokens") {
+                    "200 OK"
+                } else {
+                    "404 Not Found"
+                };
+                let testa = [
+                    &format!("HTTP/1.1 {stato}"),
+                    "Content-Type: application/json",
+                    &format!("Content-Length: {}", corpo.len()),
+                    "Connection: close",
+                    "",
+                    "",
+                ]
+                .join(CRLF);
+                let _ = socket.write_all(testa.as_bytes()).await;
+                let _ = socket.write_all(corpo.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+
+        (porta, visti)
+    }
+
+    /// Il conteggio arriva dal FORNITORE, sul percorso giusto, con un corpo che
+    /// e' la PROIEZIONE di quello che partirebbe davvero.
+    ///
+    /// I campi esclusi non sono un dettaglio: `max_tokens` e `stream`
+    /// descrivono l'uscita e l'endpoint li rifiuta, quindi un corpo che li
+    /// portasse fallirebbe in produzione mentre qui passerebbe.
+    ///
+    /// MUTAZIONE: comporre il corpo a mano invece di proiettare
+    /// `build_request_body` -> il primo campo nuovo del corpo vero non
+    /// comparirebbe qui, e l'asserzione sui tool rosseggia.
+    #[tokio::test]
+    async fn il_conteggio_token_passa_dal_fornitore() {
+        let (porta, visti) = finge_conteggio(2095).await;
+        let p = AnthropicProvider::new(
+            Client::new(),
+            "chiave",
+            Some(format!("http://127.0.0.1:{porta}")),
+        );
+        assert!(p.supports_count_tokens());
+
+        let esito = p
+            .count_tokens(&req_con_tre_tool())
+            .await
+            .expect("il server finto risponde 200");
+        assert_eq!(esito.input_tokens, 2095, "il numero e' del fornitore");
+        assert_eq!(esito.provider_used, PROVIDER_NAME);
+        assert_eq!(esito.model_used, "claude-x");
+
+        let richieste = visti.lock().expect("registro").clone();
+        assert_eq!(richieste.len(), 1, "una sola chiamata");
+        let (riga, corpo) = richieste[0].split_once('\n').expect("riga e corpo");
+        assert!(
+            riga.starts_with("POST /messages/count_tokens"),
+            "percorso interrogato: {riga}"
+        );
+        let inviato: serde_json::Value = serde_json::from_str(corpo).expect("corpo JSON");
+        assert_eq!(inviato["model"], "claude-x");
+        assert!(inviato["messages"].is_array());
+        assert_eq!(
+            inviato["tools"].as_array().map(|a| a.len()),
+            Some(3),
+            "i tool contano nell'ingresso e devono esserci"
+        );
+        assert!(
+            inviato.get("max_tokens").is_none() && inviato.get("stream").is_none(),
+            "l'endpoint non ammette i campi dell'USCITA: {inviato}"
+        );
+        // La cache resta spenta: un breakpoint su una richiesta che non produce
+        // output marcherebbe qualcosa che nessuno rileggera'.
+        assert_eq!(conta_cache_control(&inviato), 0);
+    }
+
+    /// Chi non lo espone lo DICE, e fallisce visibilmente invece di ritornare
+    /// zero: «non lo so» e «zero token» sono due cose diverse (regola Q).
+    #[tokio::test]
+    async fn chi_non_conta_i_token_lo_dichiara_e_fallisce() {
+        let p = crate::providers::mistral::MistralProvider::new(Client::new(), "k", None);
+        assert!(!p.supports_count_tokens());
+        let err = p
+            .count_tokens(&req_msgs(vec![msg("user", "ciao")]))
+            .await
+            .expect_err("nessun numero inventato");
+        assert!(err.to_string().contains("conteggio token non supportato"));
     }
 
     fn search_tool() -> LlmToolDefinition {
@@ -1714,6 +2397,7 @@ mod tests {
             user: None,
             parallel_tool_calls: None,
             deferrable: false,
+            effort: None,
         }
     }
 
@@ -1723,7 +2407,7 @@ mod tests {
         // che OBBLIGA il modello a chiamare un tool (fix del bug tool_choice
         // droppato dal gateway).
         let req = req_tool_choice(serde_json::json!("required"), true);
-        let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, false, None, PoliticaCache::senza_tool(CacheTtl::Off))).unwrap();
         assert_eq!(json["tool_choice"]["type"], "any");
 
         // Oggetto funzione -> {"type":"tool","name":X}.
@@ -1732,14 +2416,14 @@ mod tests {
             true,
         );
         let json2 =
-            serde_json::to_value(build_request_body(&req2, false, None, CacheTtl::Off)).unwrap();
+            serde_json::to_value(build_request_body(&req2, false, None, PoliticaCache::senza_tool(CacheTtl::Off))).unwrap();
         assert_eq!(json2["tool_choice"]["type"], "tool");
         assert_eq!(json2["tool_choice"]["name"], "search");
 
         // "auto" -> {"type":"auto"}.
         let req3 = req_tool_choice(serde_json::json!("auto"), true);
         let json3 =
-            serde_json::to_value(build_request_body(&req3, false, None, CacheTtl::Off)).unwrap();
+            serde_json::to_value(build_request_body(&req3, false, None, PoliticaCache::senza_tool(CacheTtl::Off))).unwrap();
         assert_eq!(json3["tool_choice"]["type"], "auto");
     }
 
@@ -1747,13 +2431,13 @@ mod tests {
     fn tool_choice_none_e_senza_tools_omettono_il_campo() {
         // "none" non esiste lato Anthropic: campo omesso.
         let req = req_tool_choice(serde_json::json!("none"), true);
-        let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, false, None, PoliticaCache::senza_tool(CacheTtl::Off))).unwrap();
         assert!(json.get("tool_choice").is_none());
 
         // tool_choice senza tools: campo omesso.
         let req2 = req_tool_choice(serde_json::json!("required"), false);
         let json2 =
-            serde_json::to_value(build_request_body(&req2, false, None, CacheTtl::Off)).unwrap();
+            serde_json::to_value(build_request_body(&req2, false, None, PoliticaCache::senza_tool(CacheTtl::Off))).unwrap();
         assert!(json2.get("tool_choice").is_none());
     }
 
@@ -1908,6 +2592,7 @@ mod tests {
             user: None,
             parallel_tool_calls: None,
             deferrable: false,
+            effort: None,
         }
     }
 
@@ -1917,7 +2602,7 @@ mod tests {
         let req = req_thinking(true, Some(1024), Some(8000));
         let budget = resolve_thinking_budget(&req, 2048);
         assert_eq!(budget, Some(1024));
-        let json = serde_json::to_value(build_request_body(&req, false, budget, CacheTtl::Off)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, false, budget, PoliticaCache::senza_tool(CacheTtl::Off))).unwrap();
         assert_eq!(json["thinking"]["type"], "enabled");
         assert_eq!(json["thinking"]["budget_tokens"], 1024);
     }
@@ -1927,7 +2612,7 @@ mod tests {
         let req = req_thinking(false, Some(1024), Some(8000));
         let budget = resolve_thinking_budget(&req, 2048);
         assert_eq!(budget, None);
-        let json = serde_json::to_value(build_request_body(&req, false, budget, CacheTtl::Off)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, false, budget, PoliticaCache::senza_tool(CacheTtl::Off))).unwrap();
         assert!(json.get("thinking").is_none());
     }
 
@@ -2085,8 +2770,9 @@ mod tests {
             user: None,
             parallel_tool_calls: None,
             deferrable: false,
+            effort: None,
         };
-        let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, false, None, PoliticaCache::senza_tool(CacheTtl::Off))).unwrap();
 
         let m = &json["messages"][0];
         assert_eq!(m["role"], "assistant");
@@ -2131,8 +2817,9 @@ mod tests {
             user: None,
             parallel_tool_calls: None,
             deferrable: false,
+            effort: None,
         };
-        let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, false, None, PoliticaCache::senza_tool(CacheTtl::Off))).unwrap();
         let m = &json["messages"][0];
         // Primo block e' il testo (non un thinking).
         assert_eq!(m["content"][0]["type"], "text");
@@ -2189,6 +2876,7 @@ mod tests {
             user: None,
             parallel_tool_calls: None,
             deferrable: false,
+            effort: None,
         }
     }
 
@@ -2196,7 +2884,7 @@ mod tests {
     fn vision_data_uri_diventa_source_base64() {
         let req = req_msgs(vec![user_image("data:image/png;base64,QUJD")]);
         let json =
-            serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
+            serde_json::to_value(build_request_body(&req, false, None, PoliticaCache::senza_tool(CacheTtl::Off))).unwrap();
         let blocks = json["messages"][0]["content"].as_array().unwrap();
         assert_eq!(blocks[0]["type"], "text");
         assert_eq!(blocks[0]["text"], "descrivi");
@@ -2210,7 +2898,7 @@ mod tests {
     fn vision_url_http_diventa_source_url() {
         let req = req_msgs(vec![user_image("https://example.com/x.webp")]);
         let json =
-            serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
+            serde_json::to_value(build_request_body(&req, false, None, PoliticaCache::senza_tool(CacheTtl::Off))).unwrap();
         let blocks = json["messages"][0]["content"].as_array().unwrap();
         assert_eq!(blocks[1]["type"], "image");
         assert_eq!(blocks[1]["source"]["type"], "url");
@@ -2232,7 +2920,7 @@ mod tests {
     fn cache_off_nessun_cache_control_sul_system() {
         let req = req_msgs(vec![msg("system", "istruzioni di sistema"), msg("user", "ciao")]);
         let json =
-            serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
+            serde_json::to_value(build_request_body(&req, false, None, PoliticaCache::senza_tool(CacheTtl::Off))).unwrap();
         // Caching spento: system resta una stringa semplice, niente cache_control.
         assert_eq!(json["system"], "istruzioni di sistema");
     }
@@ -2244,7 +2932,7 @@ mod tests {
             &req,
             false,
             None,
-            CacheTtl::FiveMinutes,
+            PoliticaCache::senza_tool(CacheTtl::FiveMinutes),
         ))
         .unwrap();
         // System promosso a array di blocchi text con cache_control ephemeral.
@@ -2260,7 +2948,7 @@ mod tests {
     fn cache_1h_system_aggiunge_ttl() {
         let req = req_msgs(vec![msg("system", "istruzioni"), msg("user", "ciao")]);
         let json =
-            serde_json::to_value(build_request_body(&req, false, None, CacheTtl::OneHour)).unwrap();
+            serde_json::to_value(build_request_body(&req, false, None, PoliticaCache::senza_tool(CacheTtl::OneHour))).unwrap();
         let sys = json["system"].as_array().unwrap();
         assert_eq!(sys[0]["cache_control"]["type"], "ephemeral");
         assert_eq!(sys[0]["cache_control"]["ttl"], "1h");
@@ -2274,7 +2962,7 @@ mod tests {
             &req,
             false,
             None,
-            CacheTtl::FiveMinutes,
+            PoliticaCache::senza_tool(CacheTtl::FiveMinutes),
         ))
         .unwrap();
         // System vuoto: resta stringa, nessun blocco con cache_control.
@@ -2299,7 +2987,7 @@ mod tests {
             &req,
             false,
             None,
-            CacheTtl::FiveMinutes,
+            PoliticaCache::senza_tool(CacheTtl::FiveMinutes),
         ))
         .unwrap();
         let messages = json["messages"].as_array().unwrap();
@@ -2322,7 +3010,7 @@ mod tests {
             &req,
             false,
             None,
-            CacheTtl::FiveMinutes,
+            PoliticaCache::senza_tool(CacheTtl::FiveMinutes),
         ))
         .unwrap();
         // Pochi messaggi: l'user resta una stringa semplice.
@@ -2347,7 +3035,7 @@ mod tests {
         // Il TTL resta dichiarato nel body: cache_control.ttl = "1h".
         let req = req_msgs(vec![msg("system", "istruzioni"), msg("user", "ciao")]);
         let json =
-            serde_json::to_value(build_request_body(&req, false, None, CacheTtl::OneHour))
+            serde_json::to_value(build_request_body(&req, false, None, PoliticaCache::senza_tool(CacheTtl::OneHour)))
                 .unwrap();
         assert_eq!(json["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(json["system"][0]["cache_control"]["ttl"], "1h");

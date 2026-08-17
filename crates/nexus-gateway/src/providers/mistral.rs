@@ -164,6 +164,7 @@ mod tests {
             user: None,
             parallel_tool_calls: None,
             deferrable: false,
+            effort: None,
         };
         let corpo = serde_json::to_value(
             p.client

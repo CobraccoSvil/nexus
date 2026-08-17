@@ -266,7 +266,38 @@ pub struct LlmRequest {
     /// campo) = comportamento storico.
     #[serde(default)]
     pub deferrable: bool,
+    /// Quanto lavoro il modello deve METTERCI, quando il fornitore lo espone
+    /// come manopola invece che come budget di token.
+    ///
+    /// Vocabolario CHIUSO `low|medium|high` (regola N), validato al confine dal
+    /// driver che lo emette: un valore fuori vocabolario NON viene inoltrato —
+    /// sarebbe un rifiuto su ogni chiamata, e la stessa richiesta che oggi
+    /// funziona smetterebbe di funzionare per un refuso.
+    ///
+    /// Distinto da [`Self::thinking`], che dichiara SE ragionare e con quale
+    /// budget di token: qui la quantita' non e' un numero nostro, e' una
+    /// preferenza che il fornitore traduce come crede. Emesso oggi dal solo
+    /// dialetto anthropic (`output_config.effort`); chi non lo documenta lo
+    /// ignora.
+    ///
+    /// `None` = assente: il default lo decide il modello.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     pub metadata: RequestMetadata,
+}
+
+/// Quanti token d'ingresso costerebbe QUESTA richiesta, secondo il fornitore.
+///
+/// Risposta di `POST /v1/count_tokens`. Non e' una stima nostra: e' il conteggio
+/// che fara' il tokenizzatore del fornitore, chiesto al fornitore stesso — su
+/// anthropic l'endpoint e' gratuito e non scrive ledger. `provider_used` e
+/// `model_used` viaggiano insieme al numero perche' senza di loro il numero non
+/// significa niente: due modelli tokenizzano lo stesso testo in modo diverso.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CountTokensResponse {
+    pub input_tokens: u64,
+    pub provider_used: String,
+    pub model_used: String,
 }
 
 impl LlmRequest {
@@ -302,6 +333,7 @@ impl LlmRequest {
             user: None,
             parallel_tool_calls: None,
             deferrable: false,
+            effort: None,
             metadata,
         }
     }
@@ -363,6 +395,7 @@ mod test_wire_run_timeout {
             user: None,
             parallel_tool_calls: None,
             deferrable: false,
+            effort: None,
             metadata: RequestMetadata {
                 tenant_id: "t".into(),
                 user_id: "u".into(),
@@ -453,6 +486,7 @@ mod test_wire_campi_nativi_openai {
             user: None,
             parallel_tool_calls: None,
             deferrable: false,
+            effort: None,
             metadata: RequestMetadata {
                 tenant_id: "t".into(),
                 user_id: "u".into(),

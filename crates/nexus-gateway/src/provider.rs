@@ -10,9 +10,9 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 
 use crate::types::{
-    ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, LlmStreamChunk, SensitivityTier,
-    TranscribeRequest, TranscribeResponse, TtsRequest, TtsResponse, VideoGenRequest,
-    VideoGenResponse,
+    CountTokensResponse, ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse,
+    LlmStreamChunk, SensitivityTier, TranscribeRequest, TranscribeResponse, TtsRequest,
+    TtsResponse, VideoGenRequest, VideoGenResponse,
 };
 
 /// Stream di chunk prodotto da un provider in modalita' streaming. Ogni
@@ -120,6 +120,29 @@ pub trait LlmProvider: Send + Sync {
     /// fallisce visibilmente invece di restituire un risultato vuoto.
     async fn generate_image(&self, _req: &ImageGenRequest) -> anyhow::Result<ImageGenResponse> {
         anyhow::bail!("{}: image-generation non supportata", self.name())
+    }
+
+    /// Se il provider sa dire QUANTI token d'ingresso costerebbe una richiesta,
+    /// prima di mandarla.
+    ///
+    /// Default impl: `false`. Lo implementa chi espone un endpoint di conteggio
+    /// (anthropic: `POST /messages/count_tokens`, gratuito). Non e' una stima
+    /// nostra e non la sostituisce: e' il conteggio del tokenizzatore del
+    /// FORNITORE, l'unico che corrisponde a cio' che verra' fatturato. Gemello
+    /// di [`Self::supports_image_gen`].
+    fn supports_count_tokens(&self) -> bool {
+        false
+    }
+
+    /// Chiede al fornitore quanti token d'ingresso vale questa richiesta.
+    ///
+    /// Default impl: errore esplicito (regola H, come [`Self::generate_image`]):
+    /// un provider che non dichiara `supports_count_tokens()` non deve mai
+    /// essere chiamato, e se accade deve fallire visibilmente. MAI uno zero:
+    /// «non lo so» e «zero token» sono due cose diverse, e la seconda e' una
+    /// misura falsa (regola Q).
+    async fn count_tokens(&self, _req: &LlmRequest) -> anyhow::Result<CountTokensResponse> {
+        anyhow::bail!("{}: conteggio token non supportato", self.name())
     }
 
     /// Se il provider supporta la trascrizione audio (speech-to-text).

@@ -45,8 +45,9 @@ use crate::tassonomia_errori::{CausaErrore, VerdettoErrore, VocabolarioErrori};
 use crate::redaction::pipeline::{RedactionOptions, RedactionPipeline};
 use crate::redaction::sensitivity_classifier::SensitivityClassifier;
 use crate::types::{
-    ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, RequestMetadata, TranscribeRequest,
-    TranscribeResponse, TtsRequest, TtsResponse, VideoGenRequest, VideoGenResponse,
+    CountTokensResponse, ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse,
+    RequestMetadata, TranscribeRequest, TranscribeResponse, TtsRequest, TtsResponse,
+    VideoGenRequest, VideoGenResponse,
 };
 
 use super::billing::{
@@ -2099,15 +2100,29 @@ async fn run_generate_image(
     Ok(resp)
 }
 
-/// Seleziona il provider per l'image-gen (punto unico, regola L). Con `pin`:
-/// ESATTAMENTE quel provider, che DEVE essere configurato e image-capable
-/// (regola H: errore esplicito, niente delega a chi non genera immagini, niente
-/// ripiego silenzioso). Senza pin: il PRIMO provider image-capable non in
-/// cooldown. Nessun fallback cross-provider in questo PR.
-fn select_image_provider(
+/// PUNTO UNICO (regola L) di «quale provider serve QUESTA capability».
+///
+/// Le cinque domande — immagini, video, trascrizione, sintesi vocale, conteggio
+/// token — hanno la stessa risposta e differiscono in due cose sole: il
+/// predicato che dichiara la capability e il NOME con cui la si nomina
+/// all'utente. Vivevano in cinque funzioni identiche, e la quinta (il conteggio
+/// token) e' cio' che ha reso la duplicazione un problema invece di un fatto:
+/// una regola che vale per tutte — per esempio «un provider in cooldown di
+/// credito non conta nemmeno come pinnato» — andrebbe scritta cinque volte, e
+/// basterebbe dimenticarne una perche' due percorsi vicini si comportino in
+/// modo diverso senza che nulla fallisca.
+///
+/// La disciplina e' quella che le cinque copie gia' avevano, e non cambia: col
+/// `pin` ESATTAMENTE quel provider, che deve essere configurato E capace
+/// (regola H: errore esplicito, niente delega a chi non sa fare la cosa, niente
+/// ripiego silenzioso); senza pin, il PRIMO capace non in cooldown. Nessun
+/// fallback cross-provider.
+fn seleziona_provider_capace(
     providers: &[Arc<dyn LlmProvider>],
     pin: Option<&str>,
     cooldown: &CooldownManager,
+    capacita: &str,
+    capace: impl Fn(&dyn LlmProvider) -> bool,
 ) -> Result<Arc<dyn LlmProvider>, PipelineError> {
     if let Some(pin) = pin {
         let Some(p) = providers.iter().find(|p| p.name() == pin) else {
@@ -2115,20 +2130,36 @@ fn select_image_provider(
                 "provider pinnato \"{pin}\" non configurato/abilitato nel gateway"
             )));
         };
-        if !p.supports_image_gen() {
+        if !capace(p.as_ref()) {
             return Err(PipelineError::provider(format!(
-                "provider \"{pin}\" non supporta la generazione di immagini"
+                "provider \"{pin}\" non supporta {capacita}"
             )));
         }
         return Ok(p.clone());
     }
     providers
         .iter()
-        .find(|p| p.supports_image_gen() && !cooldown.is_in_cooldown(p.name()))
+        .find(|p| capace(p.as_ref()) && !cooldown.is_in_cooldown(p.name()))
         .cloned()
         .ok_or_else(|| {
-            PipelineError::provider("nessun provider sano supporta la generazione di immagini")
+            PipelineError::provider(format!("nessun provider sano supporta {capacita}"))
         })
+}
+
+/// Seleziona il provider per l'image-gen: delega al punto unico
+/// [`seleziona_provider_capace`].
+fn select_image_provider(
+    providers: &[Arc<dyn LlmProvider>],
+    pin: Option<&str>,
+    cooldown: &CooldownManager,
+) -> Result<Arc<dyn LlmProvider>, PipelineError> {
+    seleziona_provider_capace(
+        providers,
+        pin,
+        cooldown,
+        "la generazione di immagini",
+        |p| p.supports_image_gen(),
+    )
 }
 
 /// PUNTO UNICO (regola L) della [`LlmRequest`] sintetica dei quattro handler
@@ -2276,36 +2307,16 @@ async fn run_generate_video(
     Ok(resp)
 }
 
-/// Seleziona il provider per il video-gen (punto unico, regola L). Gemello di
-/// [`select_image_provider`]: con `pin` ESATTAMENTE quel provider, che DEVE
-/// essere configurato e video-capable (regola H: errore esplicito, niente delega
-/// a chi non genera video, niente ripiego silenzioso). Senza pin: il PRIMO
-/// provider video-capable non in cooldown. Nessun fallback cross-provider qui.
+/// Seleziona il provider per il video-gen: delega al punto unico
+/// [`seleziona_provider_capace`].
 fn select_video_provider(
     providers: &[Arc<dyn LlmProvider>],
     pin: Option<&str>,
     cooldown: &CooldownManager,
 ) -> Result<Arc<dyn LlmProvider>, PipelineError> {
-    if let Some(pin) = pin {
-        let Some(p) = providers.iter().find(|p| p.name() == pin) else {
-            return Err(PipelineError::provider(format!(
-                "provider pinnato \"{pin}\" non configurato/abilitato nel gateway"
-            )));
-        };
-        if !p.supports_video_gen() {
-            return Err(PipelineError::provider(format!(
-                "provider \"{pin}\" non supporta la generazione di video"
-            )));
-        }
-        return Ok(p.clone());
-    }
-    providers
-        .iter()
-        .find(|p| p.supports_video_gen() && !cooldown.is_in_cooldown(p.name()))
-        .cloned()
-        .ok_or_else(|| {
-            PipelineError::provider("nessun provider sano supporta la generazione di video")
-        })
+    seleziona_provider_capace(providers, pin, cooldown, "la generazione di video", |p| {
+        p.supports_video_gen()
+    })
 }
 
 /// Costruisce una [`LlmRequest`] di sola STIMA per `enforce_quota` da una
@@ -2420,36 +2431,75 @@ async fn run_transcribe_audio(
     Ok(resp)
 }
 
-/// Seleziona il provider per la trascrizione audio (punto unico, regola L).
-/// Gemello di [`select_image_provider`]: con `pin` ESATTAMENTE quel provider, che
-/// DEVE essere configurato e audio-capable (regola H: errore esplicito, niente
-/// delega a chi non trascrive, niente ripiego silenzioso). Senza pin: il PRIMO
-/// provider audio-capable non in cooldown. Nessun fallback cross-provider qui.
+/// Seleziona il provider per la trascrizione audio: delega al punto unico
+/// [`seleziona_provider_capace`].
 fn select_audio_in_provider(
     providers: &[Arc<dyn LlmProvider>],
     pin: Option<&str>,
     cooldown: &CooldownManager,
 ) -> Result<Arc<dyn LlmProvider>, PipelineError> {
-    if let Some(pin) = pin {
-        let Some(p) = providers.iter().find(|p| p.name() == pin) else {
-            return Err(PipelineError::provider(format!(
-                "provider pinnato \"{pin}\" non configurato/abilitato nel gateway"
-            )));
-        };
-        if !p.supports_audio_in() {
-            return Err(PipelineError::provider(format!(
-                "provider \"{pin}\" non supporta la trascrizione audio"
-            )));
-        }
-        return Ok(p.clone());
+    seleziona_provider_capace(providers, pin, cooldown, "la trascrizione audio", |p| {
+        p.supports_audio_in()
+    })
+}
+
+// ── Conteggio token (gratuito) ───────────────────────────────────────────────
+
+/// `POST /v1/count_tokens`: quanti token d'ingresso vale questa richiesta,
+/// secondo il tokenizzatore del FORNITORE.
+///
+/// Non e' una stima nostra e non la sostituisce: le stime pre-invio restano
+/// quelle che sono (BPE locale nel motore, char/4 nel gateway). Questo e' il
+/// numero che il fornitore usera' davvero, ed e' l'unico con cui misurare la
+/// deriva delle altre.
+///
+/// NESSUNA scrittura di ledger e nessun `enforce_quota`: su anthropic
+/// l'endpoint e' gratuito, e una riga a costo zero sarebbe indistinguibile da
+/// una chiamata fatturata che non abbiamo registrato. Auth invariata: passa dal
+/// solito middleware, come ogni altra rotta `/v1`.
+pub async fn count_tokens(State(state): State<AppState>, Json(body): Json<LlmRequest>) -> Response {
+    if body.messages.is_empty() {
+        return PipelineError::invalid_request("messages required").into_response();
     }
-    providers
-        .iter()
-        .find(|p| p.supports_audio_in() && !cooldown.is_in_cooldown(p.name()))
-        .cloned()
-        .ok_or_else(|| {
-            PipelineError::provider("nessun provider sano supporta la trascrizione audio")
-        })
+    match run_count_tokens(&state, &body).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn run_count_tokens(
+    state: &AppState,
+    body: &LlmRequest,
+) -> Result<CountTokensResponse, PipelineError> {
+    validate_logical_model(&body.model)?;
+    let providers = state.runtime_snapshot().await.providers;
+    let provider =
+        select_count_tokens_provider(&providers, body.pin_provider.as_deref(), &state.cooldown)?;
+    // Il prefisso si toglie solo se e' il provider: per groq/openrouter la
+    // slash e' parte del nome del modello (regola L: unica funzione).
+    let mut req = body.clone();
+    req.model = strip_provider_prefix(&body.model, provider.name());
+    provider
+        .count_tokens(&req)
+        .await
+        .map_err(|e| PipelineError::provider(format!("conteggio token fallito: {e}")))
+}
+
+/// Seleziona il provider che sa contare i token: delega al punto unico
+/// [`seleziona_provider_capace`].
+///
+/// Il ripiego cross-provider, che quel punto unico gia' esclude, qui sarebbe
+/// peggio che altrove: un conteggio fatto col tokenizzatore di un fornitore
+/// diverso da quello che servira' la richiesta e' un numero SBAGLIATO che sembra
+/// giusto.
+fn select_count_tokens_provider(
+    providers: &[Arc<dyn LlmProvider>],
+    pin: Option<&str>,
+    cooldown: &CooldownManager,
+) -> Result<Arc<dyn LlmProvider>, PipelineError> {
+    seleziona_provider_capace(providers, pin, cooldown, "il conteggio dei token", |p| {
+        p.supports_count_tokens()
+    })
 }
 
 /// Costruisce una [`LlmRequest`] di sola STIMA per `enforce_quota` da una
@@ -2562,36 +2612,16 @@ async fn run_text_to_speech(
     Ok(resp)
 }
 
-/// Seleziona il provider per la sintesi vocale (punto unico, regola L). Gemello di
-/// [`select_audio_in_provider`]: con `pin` ESATTAMENTE quel provider, che DEVE
-/// essere configurato e audio-out-capable (regola H: errore esplicito, niente
-/// delega a chi non sintetizza, niente ripiego silenzioso). Senza pin: il PRIMO
-/// provider audio-out-capable non in cooldown. Nessun fallback cross-provider qui.
+/// Seleziona il provider per la sintesi vocale: delega al punto unico
+/// [`seleziona_provider_capace`].
 fn select_audio_out_provider(
     providers: &[Arc<dyn LlmProvider>],
     pin: Option<&str>,
     cooldown: &CooldownManager,
 ) -> Result<Arc<dyn LlmProvider>, PipelineError> {
-    if let Some(pin) = pin {
-        let Some(p) = providers.iter().find(|p| p.name() == pin) else {
-            return Err(PipelineError::provider(format!(
-                "provider pinnato \"{pin}\" non configurato/abilitato nel gateway"
-            )));
-        };
-        if !p.supports_audio_out() {
-            return Err(PipelineError::provider(format!(
-                "provider \"{pin}\" non supporta la sintesi vocale"
-            )));
-        }
-        return Ok(p.clone());
-    }
-    providers
-        .iter()
-        .find(|p| p.supports_audio_out() && !cooldown.is_in_cooldown(p.name()))
-        .cloned()
-        .ok_or_else(|| {
-            PipelineError::provider("nessun provider sano supporta la sintesi vocale")
-        })
+    seleziona_provider_capace(providers, pin, cooldown, "la sintesi vocale", |p| {
+        p.supports_audio_out()
+    })
 }
 
 /// Costruisce una [`LlmRequest`] di sola STIMA per `enforce_quota` da una
@@ -3500,6 +3530,7 @@ mod tests {
             user: None,
             parallel_tool_calls: None,
             deferrable: false,
+            effort: None,
         }
     }
 

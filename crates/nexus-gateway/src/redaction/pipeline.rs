@@ -472,6 +472,7 @@ mod tests {
             user: None,
             parallel_tool_calls: None,
             deferrable: false,
+            effort: None,
         }
     }
 

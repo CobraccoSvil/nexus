@@ -571,6 +571,7 @@ mod tests {
             user: None,
             parallel_tool_calls: None,
             deferrable: false,
+            effort: None,
         }
     }
 
@@ -705,6 +706,11 @@ mod tests {
             .execute(pool)
             .await
             .expect("l'interruttore esiste: lo semina la mig 0729");
+        // La cache dei settings vive in `nexus_auth` ed e' di PROCESSO: senza
+        // invalidarla, una lettura precedente della stessa chiave su questo pool
+        // renderebbe l'accensione invisibile, e il test misurerebbe il valore di
+        // prima credendo di misurare il nuovo.
+        nexus_auth::invalidate_setting_cache(pool, FLEX_ENABLED_SETTING);
     }
 
     fn provider_con_catalogo(pool: PgPool) -> OpenAiProvider {
