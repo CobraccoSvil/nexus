@@ -55,6 +55,9 @@ mod domain;
 mod environment;
 mod fanin_worker;
 mod file_mutations;
+/// Punto unico di «questa coppia (fornitore, modello) sa fare IL GIUDICE su
+/// questo schema?»: memoria di processo delle astensioni STRUTTURALI del gate.
+mod giudici_inadatti;
 mod github;
 mod http_metrics;
 mod intent_classifier;

@@ -4137,6 +4137,66 @@ else
   echo "OK freno-reprobe: il freno del recovery loop non e' condizionato al cooldown"
 fi
 
+# ── giudice-inadatto (2026-08-17) ───────────────────────────────────────────
+# «Riconvocare LO STESSO giudice cambierebbe qualcosa?» ha UN punto unico, e
+# «questa coppia sa fare il giudice su questo schema?» ne ha un altro. Il
+# difetto che hanno chiuso, MISURATO il 17/08/2026 su app-completa-17-08:
+# gatekeeper mistral che approva, challenger kimi/kimi-k2.6 che si astiene per
+# `schema_mismatch`, quorum mancante, rimando; al tentativo successivo la
+# selezione ripropone LA STESSA COPPIA, stesso esito, `retries_exhausted` e run
+# chiuso — con un `node -e` di sola lettura mai eseguito e 400 secondi bruciati.
+assert_single "giudice-inadatto" 'pub fn natura_astensione' \
+  'crates/nexus-agent-graph/src/decisions/step_gate.rs' crates
+
+assert_single "giudice-inadatto" 'pub enum NaturaAstensione' \
+  'crates/nexus-agent-graph/src/decisions/step_gate.rs' crates
+
+assert_single "giudice-inadatto" 'pub fn segna_inadatto' \
+  'crates/mcp-core/src/giudici_inadatti.rs' crates
+
+assert_single "giudice-inadatto" 'pub fn giudizio_sulla_coppia' \
+  'crates/mcp-core/src/giudici_inadatti.rs' crates
+
+# L'identita' del giudice e' UNA (`judge_key_di`): chi MARCA una coppia e chi la
+# FILTRA devono normalizzare allo stesso modo, o la marcatura non escluderebbe
+# nulla senza che niente fallisca.
+assert_single "giudice-inadatto" 'pub fn judge_key_di' \
+  'crates/mcp-core/src/internal_routing.rs' crates
+
+# Il gate NON torna a riconoscere la causa strutturale con un confronto scritto
+# in casa propria: la domanda e' del criterio, e un secondo elenco di cause
+# divergerebbe al primo valore nuovo. Si guarda il CODICE (le righe che non
+# cominciano con un marcatore di commento): la doc del modulo NOMINA la causa
+# per spiegare l'incidente, e un guard che confondesse la spiegazione con la
+# regressione costringerebbe a non documentarla.
+sostituzione_lessicale="$(grep -nE '(==|contains|eq_ignore_ascii_case).*"schema_mismatch"' \
+  crates/mcp-core/src/agent_graph_adapter/step_validation.rs 2>/dev/null \
+  | grep -vE '^[0-9]+:[[:space:]]*(///|//!|//|/\*|\*)' || true)"
+if [[ -n "${sostituzione_lessicale// /}" ]]; then
+  echo "!! giudice-inadatto: il gate riconosce la causa strutturale con un" >&2
+  echo "   confronto scritto in casa propria:" >&2
+  printf '%s\n' "$sostituzione_lessicale" >&2
+  echo "   La domanda «riconvocare lo stesso giudice cambierebbe qualcosa?» e'" >&2
+  echo "   di decisions::step_gate::natura_astensione: un secondo elenco di" >&2
+  echo "   cause diverge al primo valore nuovo, e diverge in silenzio." >&2
+  fail=1
+else
+  echo "OK giudice-inadatto: la natura dell'astensione la decide il punto unico"
+fi
+
+# Il registro NON diventa un cooldown: `esclusioni_selezione` e' la lista di chi
+# il ROUTING non puo' usare, e mettercelo toglierebbe un modello sano al lavoro
+# ordinario per un difetto che riguarda un solo schema.
+if grep -rn 'giudici_inadatti' --include='*.rs' \
+     crates/mcp-core/src/orchestrator/ 2>/dev/null | grep -q .; then
+  echo "!! giudice-inadatto: il registro dei giudici inadatti e' entrato nella" >&2
+  echo "   selezione generale dei modelli. Non e' un cooldown: quel modello fa" >&2
+  echo "   benissimo il proprio lavoro, non sa fare IL GIUDICE su QUESTO schema." >&2
+  fail=1
+else
+  echo "OK giudice-inadatto: il registro resta fuori dalla selezione generale"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

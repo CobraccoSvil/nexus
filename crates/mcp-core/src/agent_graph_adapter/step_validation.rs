@@ -25,13 +25,37 @@
 //! convocati, astensioni comprese — incidente `consiglio-quorum-onesto`). La
 //! decisione (`Approved`/`Rejected`/`NeedsHuman`/`UnavailableDeclared`) e'
 //! SOLO di `decisions::step_gate::decide_step_gate` (regola L).
+//!
+//! ## Il posto che si riassegna, e perche' non e' un buco nel denominatore
+//!
+//! Dal 17/08/2026 un giudice che si astiene per causa STRUTTURALE
+//! ([`nexus_agent_graph::decisions::step_gate::NaturaAstensione`]) non resta un
+//! convocato silenzioso: il suo POSTO viene riassegnato UNA VOLTA a un candidato
+//! non ancora usato, e la sua astensione esce dai verdetti per finire in
+//! [`StepValidationReport::sostituiti`] — dove resta visibile, col suo costo.
+//!
+//! La differenza col quorum onesto e' reale e non un cavillo: li' il difetto era
+//! contare 1 approve su 2 convocati come unanimita', cioe' far sparire dal
+//! DENOMINATORE un giudice che era stato interpellato e non aveva risposto. Qui
+//! quel giudice non ha mai preso il posto — non ha prodotto un giudizio nella
+//! forma che il gate pretende, e riproporglielo dara' lo stesso esito — quindi
+//! il posto viene assegnato a un altro e il denominatore resta di due giudici
+//! che hanno DAVVERO giudicato. Se un sostituto non c'e', l'astensione resta
+//! dov'era e il gate dichiara di non aver potuto giudicare, come prima: nessuna
+//! approvazione per stanchezza.
+//!
+//! Il fatto osservato viene registrato in [`crate::giudici_inadatti`] SEMPRE —
+//! anche quando la sostituzione e' spenta o non ha sostituti — perche' e' quella
+//! memoria a impedire che la selezione riproponga la stessa coppia al tentativo
+//! successivo. Era esattamente cio' che mancava: due astensioni
+//! `schema_mismatch` identiche, a distanza di un rimando, dallo stesso modello.
 
 use nexus_agent_graph::decisions::tetto_output::TettoOutput;
 use std::sync::Arc;
 use std::time::Duration;
 
 use nexus_agent_graph::decisions::helpers::provider_style_supports_forcing;
-use nexus_agent_graph::decisions::step_gate::{StepGateMode, StepVerdict};
+use nexus_agent_graph::decisions::step_gate::{natura_astensione, StepGateMode, StepVerdict};
 use nexus_agent_graph::runtime::ports::{
     LlmGateway, LlmMessage, LlmRequest, StepValidationPort, StepValidationReport,
     StepValidationRequest, ValidatorVerdict,
@@ -69,6 +93,14 @@ const CHIAVE_MODE: &str = "orchestrator.critical_step_gate_mode";
 const CHIAVE_TIMEOUT: &str = "orchestrator.critical_step_gate_timeout_s";
 const CHIAVE_COST_CAP: &str = "orchestrator.critical_step_cost_cap_usd";
 
+/// Interruttore della riassegnazione del posto (mig 0736): si spegne senza
+/// deploy, e spento il gate torna a comportarsi come prima del 17/08 —
+/// l'astensione strutturale resta fra i verdetti. La MEMORIA di
+/// [`crate::giudici_inadatti`] non dipende da questo flag: il suo interruttore
+/// e' il TTL a zero, perche' sono due meccanismi distinti e si spengono
+/// separatamente.
+const CHIAVE_SOSTITUTO: &str = "orchestrator.step_gate_sostituto_enabled";
+
 /// Prompt system dei due mandati asimmetrici (righe `nexus_prompt_templates`).
 const PROMPT_GATEKEEPER: &str = "subagent.step_gatekeeper.base";
 const PROMPT_CHALLENGER: &str = "subagent.step_challenger.base";
@@ -86,13 +118,18 @@ const RUOLO_CHALLENGER: &str = "challenger";
 /// lettura: un solo letterale).
 const CAMPO_VERDICT: &str = "verdict";
 
-/// Vocabolario canonico delle cause d'astensione (campo
-/// `ValidatorVerdict::abstain_cause`, regola N).
-const CAUSA_TIMEOUT: &str = "timeout";
-const CAUSA_JOIN: &str = "join_error";
-const CAUSA_CALL: &str = "call_error";
-const CAUSA_SCHEMA: &str = "schema_mismatch";
-const CAUSA_EXECUTOR: &str = "executor_fallback";
+// Il vocabolario canonico delle cause d'astensione (campo
+// `ValidatorVerdict::abstain_cause`, regola N) NON vive piu' qui: sta accanto
+// al criterio che lo legge (`decisions::step_gate`), perche' «quale causa
+// significa che riconvocare lo stesso giudice e' inutile» e' una domanda sul
+// vocabolario, e finche' i valori erano cinque `const` di questo file non era
+// ponibile da nessun'altra parte (regola L). Qui restano gli alias locali: il
+// produttore usa gli stessi nomi brevi di prima, ma la definizione e' una sola.
+use nexus_agent_graph::decisions::step_gate::{
+    CAUSA_ASTENSIONE_CALL as CAUSA_CALL, CAUSA_ASTENSIONE_EXECUTOR as CAUSA_EXECUTOR,
+    CAUSA_ASTENSIONE_JOIN as CAUSA_JOIN, CAUSA_ASTENSIONE_SCHEMA as CAUSA_SCHEMA,
+    CAUSA_ASTENSIONE_TIMEOUT as CAUSA_TIMEOUT,
+};
 
 /// Configurazione ARMATA del gate: esiste solo se il mode non e' `off` e i due
 /// prompt sono nel DB. Costruita una volta per run (`build_step_gate`);
@@ -104,6 +141,11 @@ pub struct StepGateSetup {
     cost_cap_usd: f64,
     gatekeeper_system: String,
     challenger_system: String,
+    /// Il posto di un giudice inadatto si riassegna? (mig 0736)
+    sostituto_enabled: bool,
+    /// Per quanto vale un'osservazione di inadeguatezza. Zero = registro spento
+    /// (vedi [`crate::giudici_inadatti`]).
+    inadatto_ttl: Duration,
 }
 
 /// Legge la configurazione e ARMA il gate. `None` = gate spento: per scelta
@@ -134,6 +176,15 @@ pub async fn build_step_gate(
     };
     let timeout_s = setting_u64(db, CHIAVE_TIMEOUT, 90).await;
     let cost_cap_usd = setting_f64(db, CHIAVE_COST_CAP, 1.0).await;
+    let sostituto_enabled = nexus_auth::get_bool_setting_or(db, CHIAVE_SOSTITUTO, true).await;
+    let inadatto_ttl = Duration::from_secs(
+        setting_u64(
+            db,
+            crate::giudici_inadatti::KEY_TTL_S,
+            crate::giudici_inadatti::DEFAULT_TTL_S,
+        )
+        .await,
+    );
     Some(Arc::new(StepGateSetup {
         gateway,
         db: db.clone(),
@@ -141,6 +192,8 @@ pub async fn build_step_gate(
         cost_cap_usd,
         gatekeeper_system,
         challenger_system,
+        sostituto_enabled,
+        inadatto_ttl,
     }))
 }
 
@@ -218,43 +271,59 @@ impl StepValidationPort for StepGateAdapter {
             Ok(c) => c,
             Err(report) => return Ok(report),
         };
-        let (convocati, degraded) = seleziona_convocati(candidati, &executor);
-        let verdicts = self.convoca_fanout(convocati, &executor, &req).await;
+        let (convocati, degraded) = seleziona_convocati(candidati.clone(), &executor);
+        let posti = posti_del_panel(convocati);
+        let verdicts = self.convoca(posti.clone(), &executor, &req).await;
+        // Un posto che nessuno ha preso si riassegna UNA VOLTA (vedi la nota in
+        // testa al modulo): qui il report puo' cambiare forma, mai la matrice.
+        let (verdicts, sostituiti) = self
+            .riassegna_posti_inadatti(verdicts, &posti, &candidati, &executor, &req)
+            .await;
+        self.dichiara_se_oltre_il_cap(&verdicts, &sostituiti);
 
-        // Cap di spesa: telemetrico e DICHIARATO (le chiamate sono gia' state
-        // pagate quando il totale e' noto; il cap governa la taratura, non
-        // interrompe una convocazione a meta').
-        let speso: f64 = verdicts.iter().filter_map(|v| v.cost_usd).sum();
-        if speso > self.setup.cost_cap_usd {
-            tracing::warn!(
-                speso_usd = speso,
-                cap_usd = self.setup.cost_cap_usd,
-                "convocazione del gate duale oltre il cost cap configurato"
-            );
-        }
-
-        Ok(StepValidationReport { verdicts, degraded })
+        Ok(StepValidationReport {
+            verdicts,
+            degraded,
+            sostituiti,
+        })
     }
 }
 
+/// UN posto del panel: il RUOLO (col suo mandato asimmetrico) e chi lo occupa.
+/// Il ruolo appartiene al posto, non al candidato: e' cio' che permette a un
+/// sostituto di ereditare il mandato del giudice che rimpiazza.
+type PostoDelPanel = (&'static str, PurposeProviderCandidate);
+
+/// I posti del panel dai convocati: il primo e' il gatekeeper (mandato neutro),
+/// gli altri challenger (mandato refutativo). L'assegnazione stava dentro il
+/// fan-out come `if idx == 0`, e li' era invisibile a chi riassegna un posto.
+fn posti_del_panel(convocati: Vec<PurposeProviderCandidate>) -> Vec<PostoDelPanel> {
+    convocati
+        .into_iter()
+        .enumerate()
+        .map(|(idx, cand)| {
+            let role = if idx == 0 { RUOLO_GATEKEEPER } else { RUOLO_CHALLENGER };
+            (role, cand)
+        })
+        .collect()
+}
+
 impl StepGateAdapter {
-    /// Fan-out: un task per validatore, ciascuno col SUO timeout (timer
+    /// Fan-out: un task per posto, ciascuno col SUO timeout (timer
     /// indipendenti). Il timeout/JoinError diventa astensione STRUTTURATA nel
     /// report, mai sparizione dal denominatore (GAP-2).
-    async fn convoca_fanout(
+    ///
+    /// L'ordine dei verdetti e' quello dei posti: la riassegnazione vi si
+    /// appoggia per rimettere il sostituto dove sedeva il sostituito.
+    async fn convoca(
         &self,
-        convocati: Vec<PurposeProviderCandidate>,
+        posti: Vec<PostoDelPanel>,
         executor: &str,
         req: &StepValidationRequest,
     ) -> Vec<ValidatorVerdict> {
         let mut attese = Vec::new();
-        for (idx, cand) in convocati.into_iter().enumerate() {
-            let role = if idx == 0 { RUOLO_GATEKEEPER } else { RUOLO_CHALLENGER };
-            let system = if idx == 0 {
-                self.setup.gatekeeper_system.clone()
-            } else {
-                self.setup.challenger_system.clone()
-            };
+        for (role, cand) in posti {
+            let system = self.system_del_ruolo(role);
             let blob = blob_del_batch(req);
             let setup = self.setup.clone();
             let project_id = self.project_id.clone();
@@ -276,6 +345,238 @@ impl StepGateAdapter {
         }
         verdicts
     }
+
+    /// Cap di spesa: telemetrico e DICHIARATO (le chiamate sono gia' state
+    /// pagate quando il totale e' noto; il cap governa la taratura, non
+    /// interrompe una convocazione a meta').
+    ///
+    /// I tentativi SOSTITUITI entrano nella somma: un'astensione
+    /// `schema_mismatch` e' una risposta arrivata e pagata, e tenerla fuori
+    /// renderebbe il cap cieco proprio sulle convocazioni che costano di piu'
+    /// (due chiamate per un posto solo).
+    fn dichiara_se_oltre_il_cap(&self, verdicts: &[ValidatorVerdict], sostituiti: &[ValidatorVerdict]) {
+        let speso: f64 = verdicts
+            .iter()
+            .chain(sostituiti.iter())
+            .filter_map(|v| v.cost_usd)
+            .sum();
+        if speso > self.setup.cost_cap_usd {
+            tracing::warn!(
+                speso_usd = speso,
+                cap_usd = self.setup.cost_cap_usd,
+                sostituzioni = sostituiti.len(),
+                "convocazione del gate duale oltre il cost cap configurato"
+            );
+        }
+    }
+
+    /// Il mandato del RUOLO. Un solo punto: il sostituto deve ricevere lo stesso
+    /// system del posto che prende, o il panel cambierebbe natura a seconda di
+    /// chi si e' astenuto.
+    fn system_del_ruolo(&self, role: &str) -> String {
+        if role == RUOLO_GATEKEEPER {
+            self.setup.gatekeeper_system.clone()
+        } else {
+            self.setup.challenger_system.clone()
+        }
+    }
+
+    /// (A) Il posto di chi si e' astenuto per causa STRUTTURALE si riassegna
+    /// UNA VOLTA. Ritorna `(verdetti finali, tentativi sostituiti)`.
+    ///
+    /// L'ordine delle cose non e' di comodo:
+    ///
+    /// 1. la MEMORIA si scrive sempre, anche a sostituzione spenta o senza
+    ///    sostituti: senza, la selezione ripropone la stessa coppia al tentativo
+    ///    successivo — che e' il difetto misurato, due volte di fila;
+    /// 2. la sostituzione si tenta solo dopo, e una volta sola. Se il sostituto
+    ///    a sua volta si astiene per causa strutturale, la sua astensione RESTA
+    ///    fra i verdetti (l'osservazione viene comunque registrata): un secondo
+    ///    giro trasformerebbe un gate in una lotteria a pagamento.
+    async fn riassegna_posti_inadatti(
+        &self,
+        verdicts: Vec<ValidatorVerdict>,
+        posti: &[PostoDelPanel],
+        candidati: &[PurposeProviderCandidate],
+        executor: &str,
+        req: &StepValidationRequest,
+    ) -> (Vec<ValidatorVerdict>, Vec<ValidatorVerdict>) {
+        let vacanti = posti_vacanti(&verdicts, posti);
+        if vacanti.is_empty() {
+            return (verdicts, Vec::new());
+        }
+        for (i, _) in &vacanti {
+            self.registra_inadatto(&verdicts[*i]);
+        }
+        if !self.setup.sostituto_enabled {
+            return (verdicts, Vec::new());
+        }
+        let da_convocare = pianifica_riassegnazioni(&vacanti, &verdicts, posti, candidati, executor);
+        if da_convocare.is_empty() {
+            return (verdicts, Vec::new());
+        }
+
+        let posti_sostituti: Vec<PostoDelPanel> =
+            da_convocare.iter().map(|(_, p)| p.clone()).collect();
+        let nuovi = self.convoca(posti_sostituti, executor, req).await;
+
+        let mut verdicts = verdicts;
+        let mut sostituiti = Vec::new();
+        for ((i, _), nuovo) in da_convocare.into_iter().zip(nuovi) {
+            // Il sostituto che a sua volta non regge lo schema e' un'altra
+            // osservazione, e va ricordata come la prima: non si sostituisce di
+            // nuovo, ma la selezione del prossimo tentativo deve saperlo.
+            if posto_vacante(&nuovo) {
+                self.registra_inadatto(&nuovo);
+            }
+            sostituiti.push(std::mem::replace(&mut verdicts[i], nuovo));
+        }
+        (verdicts, sostituiti)
+    }
+
+    /// Il fatto osservato entra nella memoria di processo. La coppia e' quella
+    /// EFFETTIVA del verdetto (chi ha risposto), mai il candidato scelto.
+    fn registra_inadatto(&self, v: &ValidatorVerdict) {
+        // La causa c'e' per costruzione — un posto e' vacante solo se la sua
+        // natura e' STRUTTURALE, e una causa non dichiarata non lo e' mai. Se
+        // mancasse non la si inventa: registrare «schema_mismatch» su un
+        // silenzio marchierebbe un modello per un fatto mai osservato.
+        let Some(causa) = v.abstain_cause.as_deref() else {
+            return;
+        };
+        match crate::giudici_inadatti::segna_inadatto(
+            &v.provider,
+            &v.model,
+            causa,
+            self.setup.inadatto_ttl,
+        ) {
+            crate::giudici_inadatti::Marcatura::Registrata { residuo } => tracing::warn!(
+                provider = %v.provider,
+                modello = %v.model,
+                causa,
+                residuo_s = residuo.as_secs(),
+                "gate duale: coppia annotata come inadatta a giudicare su questo schema \
+                 (resta usabile per il lavoro ordinario)"
+            ),
+            crate::giudici_inadatti::Marcatura::RegistroSpento => tracing::debug!(
+                chiave = crate::giudici_inadatti::KEY_TTL_S,
+                "registro dei giudici inadatti spento (TTL a zero): nessuna annotazione"
+            ),
+            crate::giudici_inadatti::Marcatura::NonInterrogabile => tracing::warn!(
+                "registro dei giudici inadatti non interrogabile: la coppia potra' \
+                 essere riproposta al prossimo tentativo"
+            ),
+        }
+    }
+}
+
+/// Quali posti sono rimasti VACANTI, e con quale RUOLO ciascuno.
+///
+/// Il ruolo viene dai `posti`, in parallelo ai verdetti che `convoca` ha
+/// prodotto nello stesso ordine: si accoppiano con uno `zip`, non con un indice
+/// piu' un ripiego — un ruolo di ripiego darebbe al sostituto un mandato che
+/// nessuno gli ha assegnato.
+fn posti_vacanti(
+    verdicts: &[ValidatorVerdict],
+    posti: &[PostoDelPanel],
+) -> Vec<(usize, &'static str)> {
+    verdicts
+        .iter()
+        .zip(posti)
+        .enumerate()
+        .filter(|(_, (v, _))| posto_vacante(v))
+        .map(|(i, (_, (role, _)))| (i, *role))
+        .collect()
+}
+
+/// A quali posti vacanti si trova un sostituto, e chi. Ogni assegnazione e' un
+/// WARN nominato: chi legge i log deve poter dire quale giudice e' uscito, per
+/// quale causa e chi e' entrato al suo posto — e, quando il sostituto non c'e',
+/// che il posto resta scoperto (che e' l'informazione piu' utile delle due).
+fn pianifica_riassegnazioni(
+    vacanti: &[(usize, &'static str)],
+    verdicts: &[ValidatorVerdict],
+    posti: &[PostoDelPanel],
+    candidati: &[PurposeProviderCandidate],
+    executor: &str,
+) -> Vec<(usize, PostoDelPanel)> {
+    let mut liberi = sostituti_disponibili(candidati, executor, posti, verdicts);
+    let mut da_convocare: Vec<(usize, PostoDelPanel)> = Vec::new();
+    for (i, role) in vacanti {
+        let (i, role) = (*i, *role);
+        let Some(sostituto) = liberi.pop() else {
+            tracing::warn!(
+                role,
+                provider = %verdicts[i].provider,
+                modello = %verdicts[i].model,
+                "gate duale: nessun sostituto per il giudice inadatto, il posto \
+                 resta scoperto e il gate dichiarera' di non aver giudicato"
+            );
+            continue;
+        };
+        tracing::warn!(
+            role,
+            inadatto = %format!("{}/{}", verdicts[i].provider, verdicts[i].model),
+            causa = verdicts[i].abstain_cause.as_deref().unwrap_or_default(),
+            sostituto = %format!("{}/{}", sostituto.provider, sostituto.model),
+            "gate duale: il giudice non produce il verdetto nella forma richiesta, \
+             il suo posto viene riassegnato"
+        );
+        da_convocare.push((i, (role, sostituto)));
+    }
+    da_convocare
+}
+
+/// Questo posto e' rimasto VACANTE? Vero solo per un'astensione la cui natura
+/// dice che riconvocare lo stesso giudice non cambierebbe nulla — criterio del
+/// punto unico [`nexus_agent_graph::decisions::step_gate::natura_astensione`],
+/// mai un elenco di cause ricopiato qui.
+fn posto_vacante(v: &ValidatorVerdict) -> bool {
+    v.verdict == StepVerdict::Abstained
+        && natura_astensione(v.abstain_cause.as_deref()).richiede_un_altro_giudice()
+}
+
+/// I candidati che possono prendere un posto rimasto vacante.
+///
+/// Tre filtri, e nessuno e' ridondante:
+///
+/// - MAI l'esecutore (il veto «giudice != worker», che la selezione applica gia'
+///   in eleggibilita': qui resta come garanzia del panel — chi compone un panel
+///   non assume che a monte sia stato escluso cio' che a lui non serve);
+/// - MAI un FORNITORE gia' presente in questo giudizio, nemmeno con un altro
+///   modello: il requisito e' «due entita' distinte», e un secondo parere dallo
+///   stesso fornitore non e' indipendente dal primo. Si guardano sia i candidati
+///   convocati sia i fornitori EFFETTIVI dei verdetti, che dopo un failover del
+///   gateway possono essere altri;
+/// - MAI una coppia gia' nota come inadatta: la marcatura di questo giro l'ha
+///   appena scritta, quindi il filtro esclude da se' il giudice che stiamo
+///   sostituendo, e con lui quelli caduti nei run precedenti.
+///
+/// L'ordine di preferenza in ingresso e' quello della selezione (il piu'
+/// preferito per primo): si consuma dal fondo con `pop`, quindi si inverte —
+/// e non e' un dettaglio da lasciare implicito.
+fn sostituti_disponibili(
+    candidati: &[PurposeProviderCandidate],
+    executor: &str,
+    posti: &[PostoDelPanel],
+    verdicts: &[ValidatorVerdict],
+) -> Vec<PurposeProviderCandidate> {
+    let mut usati: Vec<String> = posti
+        .iter()
+        .map(|(_, c)| c.provider.trim().to_lowercase())
+        .collect();
+    usati.extend(verdicts.iter().map(|v| v.provider.trim().to_lowercase()));
+    let mut fuori: Vec<PurposeProviderCandidate> = candidati
+        .iter()
+        .filter(|c| !c.provider.trim().eq_ignore_ascii_case(executor.trim()))
+        .filter(|c| !usati.contains(&c.provider.trim().to_lowercase()))
+        .filter(|c| {
+            !crate::giudici_inadatti::giudizio_sulla_coppia(&c.provider, &c.model).esclude()
+        })
+        .cloned()
+        .collect();
+    fuori.reverse();
+    fuori
 }
 
 /// L'esito di UN task del fan-out: verdetto espresso, oppure astensione con
@@ -321,6 +622,20 @@ async fn attendi_verdetto(
 /// il contrario (alzare il timeout per inseguire il lento e' la toppa che la
 /// regola H vieta). L'ignoto non esclude e il pool svuotato ricade sul pool
 /// intero: la convocazione non diventa mai impossibile per colpa del budget.
+/// Il registro dei giudici inadatti si consulta QUI, dove il veto vive gia'
+/// (design del 17/08: stesso punto, un filtro in piu'). Il filtro e' della
+/// COPPIA e non del fornitore, e non entra in
+/// [`crate::orchestrator::model_selection::esclusioni_selezione`]: quella e' la
+/// lista di chi il ROUTING non puo' usare, e un modello che non regge lo schema
+/// del verdetto continua a fare benissimo il proprio lavoro ordinario.
+///
+/// Con la diversita' `PerProvider` la selezione porta un modello per fornitore:
+/// escludere una coppia significa percio' perdere QUEL fornitore per questa
+/// convocazione, e non ripiegare su un altro suo modello. E' il compromesso
+/// dichiarato — la scelta per coppia vive dentro `model_selection`, e un secondo
+/// elenco di esclusioni li' sarebbe una seconda verita' sulle esclusioni globali
+/// (queste non lo sono). Con `CANDIDATI_RICHIESTI` a 6 contro una soglia di 2,
+/// perdere un fornitore lascia il panel formabile.
 async fn risolvi_candidati(
     db: &PgPool,
     executor_provider: &str,
@@ -330,7 +645,7 @@ async fn risolvi_candidati(
         "" => Vec::new(),
         p => vec![p.to_string()],
     };
-    resolve_purpose_provider_candidates_db_by(
+    let tutti = resolve_purpose_provider_candidates_db_by(
         db,
         PURPOSE,
         CANDIDATI_RICHIESTI,
@@ -340,10 +655,65 @@ async fn risolvi_candidati(
         latency_budget_ms,
     )
     .await
-    .map_err(|risoluzione| StepValidationReport {
+    .map_err(|risoluzione| report_senza_convocati(format!(
+        "purpose {PURPOSE} non risolvibile: {risoluzione:?}"
+    )))?;
+
+    let (eleggibili, inadatti) = separa_inadatti(tutti);
+    if !inadatti.is_empty() {
+        tracing::info!(
+            esclusi = %inadatti.join(", "),
+            restano = eleggibili.len(),
+            "gate duale: coppie escluse dalla selezione perche' gia' osservate \
+             incapaci di produrre il verdetto su questo schema"
+        );
+    }
+    if eleggibili.is_empty() && !inadatti.is_empty() {
+        // Il degrado dice la causa VERA. Lasciare che il panel dichiari
+        // «nessun provider distinto dall'esecutore» sarebbe falso: i fornitori
+        // c'erano, e a toglierli e' stato il registro.
+        return Err(report_senza_convocati(format!(
+            "tutti i candidati del purpose {PURPOSE} sono coppie gia' osservate \
+             incapaci di produrre il verdetto: {}",
+            inadatti.join(", ")
+        )));
+    }
+    Ok(eleggibili)
+}
+
+/// Un report senza convocati col degrado DICHIARATO: unico punto in cui questo
+/// adapter compone la convocazione impossibile.
+fn report_senza_convocati(motivo: String) -> StepValidationReport {
+    StepValidationReport {
         verdicts: Vec::new(),
-        degraded: Some(format!("purpose {PURPOSE} non risolvibile: {risoluzione:?}")),
-    })
+        degraded: Some(motivo),
+        sostituiti: Vec::new(),
+    }
+}
+
+/// Separa i candidati eleggibili dalle coppie gia' osservate inadatte
+/// (etichettate per il log: chi legge deve poter dire QUALI e da quanto).
+fn separa_inadatti(
+    candidati: Vec<PurposeProviderCandidate>,
+) -> (Vec<PurposeProviderCandidate>, Vec<String>) {
+    let mut eleggibili = Vec::new();
+    let mut inadatti = Vec::new();
+    for c in candidati {
+        match crate::giudici_inadatti::giudizio_sulla_coppia(&c.provider, &c.model) {
+            crate::giudici_inadatti::GiudizioSullaCoppia::Inadatta { causa, residuo } => {
+                inadatti.push(format!(
+                    "{}/{} ({causa}, {}s)",
+                    c.provider,
+                    c.model,
+                    residuo.as_secs()
+                ));
+            }
+            // Registro muto o non interrogabile: non si esclude nessuno. Un
+            // mutex avvelenato non e' un buon motivo per svuotare un panel.
+            _ => eleggibili.push(c),
+        }
+    }
+    (eleggibili, inadatti)
 }
 
 /// Il budget che il gate dichiara: il proprio timeout per validatore, in
@@ -1339,5 +1709,527 @@ mod tests {
                 indisponibili.join("\n")
             }
         );
+    }
+}
+
+/// IL DIFETTO DEL 17/08/2026: il gate resta ostaggio di un giudice che non sa
+/// parlare la sua lingua. Prove sulla catena VERA (regola O): un gateway finto
+/// che risponde come quello vero, la selezione reale dei candidati, e
+/// `StepValidationPort::validate` — cioe' esattamente la funzione che il nodo
+/// chiama. Un test che fabbricasse i `ValidatorVerdict` proverebbe la propria
+/// imitazione, ed e' proprio la giunzione (astensione -> sostituzione) a essere
+/// l'oggetto della misura.
+#[cfg(test)]
+mod tests_giudice_inadatto {
+    use super::*;
+    use nexus_agent_graph::decisions::stato_presupposto::StatoPresupposto;
+    use nexus_agent_graph::decisions::step_gate::{
+        classify_block, decide_step_gate, GateBlock, StepCriticality, StepGateDecision,
+    };
+    use nexus_agent_graph::runtime::ports::PendingStepInfo;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+    /// Il nome di un fornitore di prova. Porta il prefisso del modulo E lo
+    /// SCOPE del singolo test: il DB e' per-test (`sqlx::test`), ma il registro
+    /// dei giudici inadatti e' stato GLOBALE di processo e i test girano in
+    /// parallelo — due test che marcassero `..._kimi` si sposterebbero il
+    /// terreno sotto i piedi a vicenda, e il rosso arriverebbe a caso.
+    fn forn(scope: &str, nome: &str) -> String {
+        format!("gsv1708_{scope}_{nome}")
+    }
+
+    /// Il modello che NON regge lo schema del verdetto: e' quello misurato.
+    const MODELLO_INADATTO: &str = "kimi-k2.6";
+
+    /// Il parco dell'incidente: l'esecutore del turno (che il veto deve tenere
+    /// fuori a ogni costo, anche come sostituto), il giudice inadatto — il piu'
+    /// economico, quindi il primo scelto — e i fornitori che possono giudicare.
+    /// Il costo decide l'ordine di preferenza (`Rank::CostFirst`).
+    const PARCO: &[(&str, &str, f64)] = &[
+        ("google", "gemini-2.5-pro", 0.05),
+        ("kimi", MODELLO_INADATTO, 0.10),
+        ("mistral", "magistral-small-latest", 0.50),
+        ("openrouter", "z-ai/glm-4.7-flash", 0.70),
+        ("deepseek", "deepseek-v4-pro", 0.90),
+    ];
+
+    async fn semina(pool: &PgPool, scope: &str, parco: &[(&str, &str, f64)]) {
+        for tabella in ["ai_price_catalog", "nexus_purpose_model"] {
+            sqlx::query(&format!("DELETE FROM {tabella}"))
+                .execute(pool)
+                .await
+                .expect("pulizia");
+        }
+        sqlx::query(
+            "INSERT INTO nexus_purpose_model \
+               (purpose, tier, required_capability, requires_tool_use) \
+             VALUES ($1, 'medium', 'reasoning', true)",
+        )
+        .bind(PURPOSE)
+        .execute(pool)
+        .await
+        .expect("purpose");
+        for (nome, model, costo) in parco {
+            sqlx::query(
+                "INSERT INTO ai_price_catalog \
+                   (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
+                    performance_tier, capabilities, qualified_capabilities, \
+                    input_cost_per_million_tokens, output_cost_per_million_tokens, \
+                    qualification_state, qualification_expires_at, currency, last_probe_healthy_at) \
+                 VALUES ($1, $2, true, true, 'none', 'medium', '[\"reasoning\"]'::jsonb, \
+                         '[\"reasoning\"]'::jsonb, $3, $3, 'qualified', \
+                         now() + interval '30 days', 'USD', now())",
+            )
+            .bind(forn(scope, nome))
+            .bind(model)
+            .bind(costo)
+            .execute(pool)
+            .await
+            .expect("catalog");
+        }
+    }
+
+    /// Il batch dell'incidente: un `run_command` di SOLA LETTURA che la portata
+    /// non puo' collocare, quindi `unconfined` -> `critical`. E' il punto: il
+    /// criterio di portata ha ragione, il gate no.
+    fn richiesta_del_17_08() -> StepValidationRequest {
+        StepValidationRequest {
+            run_id: "run-17-08".into(),
+            executor_provider: String::new(),
+            steps: vec![PendingStepInfo {
+                tool_use_id: "t1".into(),
+                tool_name: "run_command".into(),
+                tool_input: json!({"command": "node -e \"require('./backend/package.json')\""}),
+                matched_category: None,
+                reach: nexus_agent_graph::decisions::step_reach::StepReach::Unconfined,
+            }],
+            level: StepCriticality::Critical,
+            plan_excerpt: Some("verifica le dipendenze del backend".into()),
+            criteri_in_correzione: Vec::new(),
+            stato_presupposto: StatoPresupposto::PrimoPasso,
+            prior_rejections: 1,
+        }
+    }
+
+    /// Il corpo HTTP di UNA richiesta al gateway (headers + body per
+    /// Content-Length): il modello sta nel corpo, ed e' cio' che distingue un
+    /// giudice dall'altro.
+    async fn corpo_richiesta(socket: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 8192];
+        loop {
+            let n = match socket.read(&mut tmp).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(&tmp[..n]);
+            let testo = String::from_utf8_lossy(&buf).to_string();
+            let Some(i) = testo.find("\r\n\r\n") else {
+                continue;
+            };
+            let len: usize = testo[..i]
+                .lines()
+                .find_map(|l| {
+                    let (nome, valore) = l.split_once(':')?;
+                    nome.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| valore.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            if buf.len() >= i + 4 + len {
+                return String::from_utf8_lossy(&buf[i + 4..]).to_string();
+            }
+        }
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
+    /// Il modello che il gateway VEDE, dal corpo della richiesta.
+    ///
+    /// Sul wire viaggia `provider/model` (`build_gw_request`: «il pin server fa
+    /// lo strip del prefisso»), e il gateway vero lo toglie prima di parlare col
+    /// fornitore — quindi il `model_used` che risponde e' il modello NUDO. Se il
+    /// finto echeggiasse la forma del wire, il report porterebbe
+    /// `provider/provider/model` e il registro dei giudici inadatti verrebbe
+    /// chiavato su un modello che nel catalogo non esiste: il test misurerebbe
+    /// un sistema che non e' quello di produzione (regola O).
+    ///
+    /// MISURATO da questo stesso test alla prima esecuzione: il verdetto
+    /// riportava `model: "gsv1708_senza_kimi/kimi-k2.6"`, e la finzione dava un
+    /// verdetto valido al giudice che doveva astenersi.
+    fn modello_del_wire(richiesta: &Value, provider: &str) -> String {
+        let model = richiesta
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        model
+            .strip_prefix(&format!("{provider}/"))
+            .unwrap_or(model)
+            .to_string()
+    }
+
+    /// La risposta del gateway a UNA convocazione. `col_verdetto = false`
+    /// riproduce l'astensione misurata: il modello risponde in prosa e la tool
+    /// call del verdetto non c'e' — `estrai_verdetto` la legge come
+    /// `schema_mismatch`, che e' il fatto da cui tutto discende.
+    fn risposta_gateway(provider: &str, model: &str, col_verdetto: bool) -> String {
+        let mut corpo = json!({
+            "content": if col_verdetto { "" } else {
+                "Non posso valutare questo comando nel formato richiesto."
+            },
+            "usage": {"input_tokens": 800, "output_tokens": 40},
+            "model_used": model,
+            "provider_used": provider,
+            "latency_ms": 12,
+            "finish_reason": if col_verdetto { "tool_calls" } else { "stop" },
+        });
+        if col_verdetto {
+            corpo["tool_calls"] = json!([{
+                "id": "tc-1",
+                "type": "function",
+                "function": {
+                    "name": TOOL_VERDETTO,
+                    "arguments": json!({
+                        "verdict": "approve",
+                        "reasons": [{"severity": "bassa", "description":
+                            "lettura di un file di progetto, nessun effetto"}],
+                    }).to_string(),
+                },
+            }]);
+        }
+        let corpo = corpo.to_string();
+        // Il terminatore di riga di HTTP e' parte del protocollo, non dei
+        // fine-riga del file: costante, cosi' un normalizzatore d'albero non
+        // puo' toccarlo.
+        const CRLF: &str = "\r\n";
+        [
+            "HTTP/1.1 200 OK",
+            "Content-Type: application/json",
+            &format!("Content-Length: {}", corpo.len()),
+            "Connection: close",
+            "",
+            &corpo,
+        ]
+        .join(CRLF)
+    }
+
+    /// Gateway finto: serve una convocazione alla volta e registra QUALI
+    /// modelli sono stati interrogati (il conteggio e' la prova che il
+    /// sostituto e' stato davvero chiamato, non dedotto dal report).
+    async fn gateway_finto(
+        inadatto: &'static str,
+    ) -> (u16, StdArc<StdMutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("porta effimera");
+        let porta = listener.local_addr().expect("indirizzo").port();
+        let interrogati: StdArc<StdMutex<Vec<String>>> = StdArc::new(StdMutex::new(Vec::new()));
+        let registro = interrogati.clone();
+        let handle = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let corpo = corpo_richiesta(&mut socket).await;
+                let richiesta: Value = serde_json::from_str(&corpo).unwrap_or(Value::Null);
+                let provider = richiesta
+                    .get("pin_provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let model = modello_del_wire(&richiesta, &provider);
+                if let Ok(mut r) = registro.lock() {
+                    r.push(model.clone());
+                }
+                let risposta = risposta_gateway(&provider, &model, model != inadatto);
+                let _ = socket.write_all(risposta.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        (porta, interrogati, handle)
+    }
+
+    /// L'interruttore della sostituzione, mosso come lo muove un OPERATORE:
+    /// dal punto unico di scrittura dei settings (regola O), che invalida la
+    /// cache accanto alla scrittura.
+    ///
+    /// Una `UPDATE` diretta non basta e non e' un dettaglio del test: la
+    /// lettura passa da una cache di processo con TTL, quindi il valore nuovo
+    /// arriverebbe entro il TTL e non subito. MISURATO qui alla seconda
+    /// esecuzione — la fase 2 leggeva ancora il `false` della fase 1 e il posto
+    /// non veniva riassegnato, con la sostituzione all'apparenza rotta.
+    async fn interruttore(pool: &PgPool, valore: &str) {
+        nexus_auth::update_setting_value(pool, CHIAVE_SOSTITUTO, valore)
+            .await
+            .expect("la chiave esiste: la semina la mig 0736");
+    }
+
+    async fn arma_il_gate(pool: &PgPool, porta: u16) -> Arc<StepGateSetup> {
+        let gateway = NexusGatewayClient::new(format!("http://127.0.0.1:{porta}"), pool.clone());
+        build_step_gate(pool, gateway)
+            .await
+            .expect("gate armato: mode e prompt vengono dalle migrazioni reali")
+    }
+
+    /// IL CASO MISURATO, nelle sue DUE versioni: prima e dopo il rimedio.
+    ///
+    /// Fase 1 (`step_gate_sostituto_enabled = false`) riproduce l'esercizio del
+    /// 17/08: gatekeeper che approva, challenger `kimi/kimi-k2.6` che si astiene
+    /// per `schema_mismatch`, quorum mancante, e — con un rimando gia' speso —
+    /// `retries_exhausted`, cioe' il run chiuso e il comando di lettura mai
+    /// eseguito.
+    ///
+    /// Fase 2, stesse identiche premesse e sostituzione accesa: il posto del
+    /// giudice inadatto viene riassegnato, il quorum si forma, il batch e'
+    /// GIUDICATO. Il test arriva alla CONSEGUENZA (regola O, punto 2): non
+    /// asserisce che esista un campo `sostituiti`, asserisce che
+    /// `decide_step_gate` dica `Approved` dove prima diceva `NeedsHuman`.
+    ///
+    /// Fra le due fasi c'e' un `dimentica`, e non e' un dettaglio di igiene: e'
+    /// l'altra meta' del rimedio al lavoro. Senza, la fase 2 non convocherebbe
+    /// nemmeno il giudice inadatto — la memoria scritta dalla fase 1 lo avrebbe
+    /// gia' tolto dai candidati, che e' precisamente cio' che deve accadere al
+    /// tentativo successivo di un run vero.
+    ///
+    /// MUTAZIONI che la fanno rosseggiare, tutte col difetto reale:
+    ///   - togliere la chiamata a `riassegna_posti_inadatti` da `validate`;
+    ///   - classificare `schema_mismatch` come astensione TRANSITORIA;
+    ///   - far ereditare al sostituto un ruolo fisso invece di quello del posto.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_posto_del_giudice_inadatto_viene_riassegnato(pool: PgPool) {
+        semina(&pool, "sost", PARCO).await;
+        crate::giudici_inadatti::dimentica(&forn("sost", "kimi"), MODELLO_INADATTO);
+        let (porta, interrogati, server) = gateway_finto(MODELLO_INADATTO).await;
+        let esecutore = forn("sost", "google");
+
+        // ── Fase 1: il comportamento del 17/08 ────────────────────────────
+        interruttore(&pool, "false").await;
+        let porta_gate = adapter(
+            arma_il_gate(&pool, porta).await,
+            String::new(),
+            String::new(),
+            esecutore.clone(),
+        );
+        let prima = porta_gate
+            .validate(richiesta_del_17_08())
+            .await
+            .expect("la convocazione non e' un errore");
+        assert_eq!(prima.verdicts.len(), 2, "due posti: {:?}", prima.verdicts);
+        assert!(
+            prima.sostituiti.is_empty(),
+            "a sostituzione spenta nessun posto si riassegna"
+        );
+        let astenuto = prima
+            .verdicts
+            .iter()
+            .find(|v| v.verdict == StepVerdict::Abstained)
+            .expect("il giudice inadatto si astiene");
+        assert_eq!(astenuto.abstain_cause.as_deref(), Some(CAUSA_SCHEMA));
+        assert_eq!(astenuto.model, MODELLO_INADATTO);
+        let verdetti: Vec<StepVerdict> = prima.verdicts.iter().map(|v| v.verdict).collect();
+        assert_eq!(
+            decide_step_gate(&verdetti, StepCriticality::Critical),
+            StepGateDecision::NeedsHuman,
+            "approve + astensione non e' un quorum"
+        );
+        assert_eq!(
+            classify_block(&verdetti, 1, 2),
+            GateBlock::RetriesExhausted,
+            "col rimando gia' speso il run si chiude: e' l'esito misurato"
+        );
+        // E la memoria e' stata scritta comunque: al tentativo successivo la
+        // selezione non ripropone la stessa coppia.
+        assert!(
+            crate::giudici_inadatti::giudizio_sulla_coppia(&forn("sost", "kimi"), MODELLO_INADATTO)
+                .esclude(),
+            "la coppia osservata va ricordata anche a sostituzione spenta"
+        );
+
+        // ── Fase 2: stesse premesse, rimedio acceso ───────────────────────
+        crate::giudici_inadatti::dimentica(&forn("sost", "kimi"), MODELLO_INADATTO);
+        interruttore(&pool, "true").await;
+        let porta_gate = adapter(
+            arma_il_gate(&pool, porta).await,
+            String::new(),
+            String::new(),
+            esecutore.clone(),
+        );
+        let dopo = porta_gate
+            .validate(richiesta_del_17_08())
+            .await
+            .expect("la convocazione non e' un errore");
+
+        assert_eq!(dopo.verdicts.len(), 2, "i posti restano due: {:?}", dopo.verdicts);
+        let verdetti: Vec<StepVerdict> = dopo.verdicts.iter().map(|v| v.verdict).collect();
+        assert_eq!(
+            decide_step_gate(&verdetti, StepCriticality::Critical),
+            StepGateDecision::Approved,
+            "col posto riassegnato il batch viene GIUDICATO: {:?}",
+            dopo.verdicts
+        );
+        assert_eq!(dopo.sostituiti.len(), 1, "un solo posto era vacante");
+        let fuori = &dopo.sostituiti[0];
+        assert_eq!(fuori.model, MODELLO_INADATTO);
+        assert_eq!(fuori.abstain_cause.as_deref(), Some(CAUSA_SCHEMA));
+        assert!(
+            dopo.verdicts.iter().all(|v| v.model != MODELLO_INADATTO),
+            "il giudice inadatto non siede piu' nel panel"
+        );
+        // Il sostituto eredita il RUOLO del posto, non un ruolo fisso: il
+        // mandato asimmetrico e' del posto, e un panel con due gatekeeper (o
+        // due challenger) non e' il panel che il requisito descrive.
+        let subentrato = dopo
+            .verdicts
+            .iter()
+            .find(|v| v.role == fuori.role)
+            .expect("qualcuno siede sul posto riassegnato");
+        assert_ne!(subentrato.provider, fuori.provider);
+        // Veto «giudice != worker»: vale anche per chi subentra.
+        assert!(
+            dopo.verdicts
+                .iter()
+                .all(|v| !v.provider.eq_ignore_ascii_case(&esecutore)),
+            "l'esecutore non puo' giudicare, nemmeno da sostituto"
+        );
+        // Due fornitori DISTINTI: il quorum e' fatto di entita' indipendenti.
+        assert_ne!(dopo.verdicts[0].provider, dopo.verdicts[1].provider);
+
+        // La chiamata al sostituto e' avvenuta DAVVERO (regola O: il fatto si
+        // legge dal gateway interrogato, non dal report che lo racconta).
+        let modelli = interrogati.lock().expect("registro").clone();
+        assert_eq!(
+            modelli.iter().filter(|m| *m == MODELLO_INADATTO).count(),
+            2,
+            "una convocazione per fase: {modelli:?}"
+        );
+        assert_eq!(modelli.len(), 5, "2 + 2 posti, piu' il sostituto: {modelli:?}");
+
+        crate::giudici_inadatti::dimentica(&forn("sost", "kimi"), MODELLO_INADATTO);
+        server.abort();
+    }
+
+    /// Senza sostituti il gate NON approva per stanchezza: dichiara di non aver
+    /// potuto giudicare, esattamente come prima del rimedio.
+    ///
+    /// Il parco ha tre fornitori: l'esecutore (vietato), il giudice inadatto e
+    /// UN solo altro. Riassegnare il posto e' impossibile — l'unico rimasto
+    /// siede gia' nell'altro — e la sostituzione deve accorgersene invece di
+    /// convocare due volte lo stesso fornitore, che non sarebbe un quorum.
+    ///
+    /// MUTAZIONE: togliere dal filtro dei sostituti i fornitori gia' usati ->
+    /// il panel finisce con due verdetti dallo stesso fornitore, e la seconda
+    /// asserzione cade.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn senza_sostituti_il_gate_dichiara_di_non_aver_giudicato(pool: PgPool) {
+        const RISTRETTO: &[(&str, &str, f64)] = &[
+            ("google", "gemini-2.5-pro", 0.05),
+            ("kimi", MODELLO_INADATTO, 0.10),
+            ("mistral", "magistral-small-latest", 0.50),
+        ];
+        semina(&pool, "senza", RISTRETTO).await;
+        crate::giudici_inadatti::dimentica(&forn("senza", "kimi"), MODELLO_INADATTO);
+        let (porta, _interrogati, server) = gateway_finto(MODELLO_INADATTO).await;
+
+        let porta_gate = adapter(
+            arma_il_gate(&pool, porta).await,
+            String::new(),
+            String::new(),
+            forn("senza", "google"),
+        );
+        let report = porta_gate
+            .validate(richiesta_del_17_08())
+            .await
+            .expect("la convocazione non e' un errore");
+
+        assert!(
+            report.sostituiti.is_empty(),
+            "nessun sostituto disponibile: nessun posto riassegnato"
+        );
+        assert_eq!(report.verdicts.len(), 2);
+        assert_ne!(
+            report.verdicts[0].provider, report.verdicts[1].provider,
+            "mai due pareri dallo stesso fornitore: {:?}",
+            report.verdicts
+        );
+        let verdetti: Vec<StepVerdict> = report.verdicts.iter().map(|v| v.verdict).collect();
+        assert!(
+            verdetti.contains(&StepVerdict::Abstained),
+            "l'astensione resta dov'era: {:?}",
+            report.verdicts
+        );
+        assert_eq!(
+            decide_step_gate(&verdetti, StepCriticality::Critical),
+            StepGateDecision::NeedsHuman,
+            "nessuna approvazione per stanchezza"
+        );
+        assert_eq!(
+            classify_block(&verdetti, 0, 2),
+            GateBlock::NotJudgeable,
+            "un approve accanto a un'astensione e' quorum mancante, non un rifiuto"
+        );
+
+        crate::giudici_inadatti::dimentica(&forn("senza", "kimi"), MODELLO_INADATTO);
+        server.abort();
+    }
+
+    /// (B) La coppia osservata inadatta esce dai CANDIDATI del tentativo
+    /// successivo, e ci rientra allo scadere del TTL.
+    ///
+    /// Passa da `risolvi_candidati`, cioe' dalla stessa funzione che il gate
+    /// invoca (regola O): un test sul solo registro proverebbe la mappa, non la
+    /// selezione — ed e' la selezione a riproporre la stessa coppia due volte di
+    /// fila nel caso misurato.
+    ///
+    /// MUTAZIONE: togliere `separa_inadatti` da `risolvi_candidati` -> la prima
+    /// asserzione cade e la coppia torna eleggibile subito, cioe' il difetto.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_coppia_inadatta_esce_dai_candidati_fino_alla_scadenza(pool: PgPool) {
+        semina(&pool, "filtro", PARCO).await;
+        let kimi = forn("filtro", "kimi");
+        let esecutore = forn("filtro", "google");
+        crate::giudici_inadatti::dimentica(&kimi, MODELLO_INADATTO);
+
+        let presenti = |c: &[PurposeProviderCandidate]| {
+            c.iter().any(|x| x.model == MODELLO_INADATTO)
+        };
+        let candidati = risolvi_candidati(&pool, &esecutore, budget_latenza_ms(90))
+            .await
+            .unwrap_or_else(|r| panic!("purpose non risolvibile: {:?}", r.degraded));
+        assert!(presenti(&candidati), "premessa: la coppia parte eleggibile");
+        assert!(
+            !candidati.iter().any(|c| c.provider == esecutore),
+            "premessa: l'esecutore e' gia' fuori per veto"
+        );
+
+        crate::giudici_inadatti::segna_inadatto(
+            &kimi,
+            MODELLO_INADATTO,
+            CAUSA_SCHEMA,
+            Duration::from_millis(60),
+        );
+        let candidati = risolvi_candidati(&pool, &esecutore, budget_latenza_ms(90))
+            .await
+            .unwrap_or_else(|r| panic!("purpose non risolvibile: {:?}", r.degraded));
+        assert!(
+            !presenti(&candidati),
+            "la coppia osservata non va riproposta: {candidati:?}"
+        );
+        assert!(
+            candidati.len() >= VALIDATORI_RICHIESTI,
+            "e il panel resta formabile con gli altri fornitori: {candidati:?}"
+        );
+
+        // Non e' una condanna: un modello cambia col deploy del fornitore.
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        let candidati = risolvi_candidati(&pool, &esecutore, budget_latenza_ms(90))
+            .await
+            .unwrap_or_else(|r| panic!("purpose non risolvibile: {:?}", r.degraded));
+        assert!(
+            presenti(&candidati),
+            "scaduto il TTL la coppia torna eleggibile: {candidati:?}"
+        );
+
+        crate::giudici_inadatti::dimentica(&kimi, MODELLO_INADATTO);
     }
 }

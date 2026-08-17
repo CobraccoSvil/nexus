@@ -99,8 +99,20 @@ impl PurposeProviderCandidate {
     /// usano sia la selezione dei candidati sia i panel che li convocano, cosi'
     /// che "diversi" voglia dire la stessa cosa ai due capi.
     pub fn judge_key(&self) -> (String, String) {
-        (self.provider.to_lowercase(), self.model.to_lowercase())
+        judge_key_di(&self.provider, &self.model)
     }
+}
+
+/// La stessa identita' a partire dai due NOMI, per chi un candidato non ce l'ha
+/// in mano (il registro dei giudici inadatti, che marca la coppia EFFETTIVA
+/// della risposta). Un secondo `to_lowercase()` scritto altrove darebbe due idee
+/// di «stesso giudice» a chi marca e a chi filtra, e la marcatura non
+/// escluderebbe nulla senza che niente fallisse.
+pub fn judge_key_di(provider: &str, model: &str) -> (String, String) {
+    (
+        provider.trim().to_lowercase(),
+        model.trim().to_lowercase(),
+    )
 }
 
 /// Cosa rende due candidati DIVERSI, per chi li chiede. Sono due domande
