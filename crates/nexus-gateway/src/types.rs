@@ -216,7 +216,73 @@ pub struct LlmRequest {
     /// Puo' solo STRINGERE i budget, mai allungarli oltre il default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_timeout_secs: Option<u64>,
+    /// Tier di servizio del fornitore (dialetto OpenAI: "flex" | "priority" |
+    /// "default"). Passthrough verbatim verso i SOLI endpoint OpenAI-compat:
+    /// gli altri dialetti non lo documentano e non lo vedono mai — un campo
+    /// sconosciuto e' il solo verso che puo' fare danno. Quando presente VINCE
+    /// sull'eventuale default d'endpoint dichiarato dal registry
+    /// (`nexus_provider_registry.service_tier`). `None` = campo assente sul
+    /// wire, comportamento storico.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    /// Seed di campionamento (best-effort determinism, dialetto OpenAI).
+    /// Passthrough verbatim, solo OpenAI-compat. `None` = assente.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+    /// Sequenze di stop, nella forma che l'API accetta (stringa singola oppure
+    /// array di stringhe): si trasporta il `Value` cosi' com'e' invece di
+    /// scegliere una delle due forme al posto del chiamante. Passthrough
+    /// verbatim, solo OpenAI-compat. `None` = assente.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<serde_json::Value>,
+    /// Identificatore opaco dell'utente finale per l'abuse detection del
+    /// fornitore (dialetto OpenAI). Passthrough verbatim, solo OpenAI-compat.
+    /// `None` = assente.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Consenso alle tool call parallele (dialetto OpenAI). `Some(false)` =
+    /// una tool call per turno. Passthrough verbatim, solo OpenAI-compat.
+    /// `None` = assente (il default lo decide il fornitore).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     pub metadata: RequestMetadata,
+}
+
+impl LlmRequest {
+    /// Richiesta col solo obbligatorio (modello, messaggi, metadata): ogni
+    /// campo opzionale del contratto resta assente, che e' il comportamento
+    /// storico di una richiesta che non lo dichiara.
+    ///
+    /// PUNTO UNICO (regola L) dei call site che non valorizzano gli opzionali:
+    /// prima ogni literal nominava tutti i campi a `None`, e l'estensione del
+    /// contratto (i cinque campi nativi OpenAI) ha toccato ~40 posti — alla
+    /// prossima aggiunta sarebbero di nuovo tutti da riscrivere, e i literal
+    /// gemelli contano come duplicazione dal gate qualita.
+    pub fn minimal(
+        model: impl Into<String>,
+        messages: Vec<LlmMessage>,
+        metadata: RequestMetadata,
+    ) -> Self {
+        Self {
+            model: model.into(),
+            messages,
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            response_format: None,
+            stream: None,
+            thinking: None,
+            tool_choice: None,
+            pin_provider: None,
+            run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
+            metadata,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +335,11 @@ mod test_wire_run_timeout {
             tool_choice: None,
             pin_provider: None,
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
             metadata: RequestMetadata {
                 tenant_id: "t".into(),
                 user_id: "u".into(),
@@ -282,6 +353,103 @@ mod test_wire_run_timeout {
             !json.contains("run_timeout_secs"),
             "campo assente non deve finire sul wire: {json}"
         );
+    }
+}
+
+#[cfg(test)]
+mod test_wire_campi_nativi_openai {
+    use super::*;
+
+    /// I cinque campi nativi del dialetto OpenAI (service_tier, seed, stop,
+    /// user, parallel_tool_calls) seguono il trittico di `run_timeout_secs`:
+    /// additivi, opzionali, mai sul wire quando assenti.
+    /// Client VECCHIO -> gateway NUOVO: il corpo storico resta valido.
+    #[test]
+    fn un_corpo_senza_i_campi_resta_valido() {
+        let corpo = r#"{
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "ciao"}],
+            "metadata": {"tenant_id":"t","user_id":"u","request_id":"r","sensitivity_tier":0,"feature":"smoke"}
+        }"#;
+        let req: LlmRequest = serde_json::from_str(corpo).expect("corpo storico valido");
+        assert_eq!(req.service_tier, None);
+        assert_eq!(req.seed, None);
+        assert_eq!(req.stop, None);
+        assert_eq!(req.user, None);
+        assert_eq!(req.parallel_tool_calls, None);
+    }
+
+    /// Client NUOVO -> gateway NUOVO: ogni valore arriva nel proprio campo.
+    #[test]
+    fn i_campi_arrivano_quando_presenti() {
+        let corpo = r#"{
+            "model": "openai/gpt-oss-120b",
+            "messages": [],
+            "service_tier": "flex",
+            "seed": 42,
+            "stop": ["FINE", "STOP"],
+            "user": "utente-opaco-1",
+            "parallel_tool_calls": false,
+            "metadata": {"tenant_id":"t","user_id":"u","request_id":"r","sensitivity_tier":0,"feature":"agent"}
+        }"#;
+        let req: LlmRequest = serde_json::from_str(corpo).expect("corpo nuovo valido");
+        assert_eq!(req.service_tier.as_deref(), Some("flex"));
+        assert_eq!(req.seed, Some(42));
+        assert_eq!(req.stop, Some(serde_json::json!(["FINE", "STOP"])));
+        assert_eq!(req.user.as_deref(), Some("utente-opaco-1"));
+        assert_eq!(req.parallel_tool_calls, Some(false));
+        // `stop` accetta anche la forma a stringa singola: e' il motivo per cui
+        // il campo trasporta un Value e non un Vec.
+        let corpo_stringa = r#"{
+            "model": "m", "messages": [], "stop": "FINE",
+            "metadata": {"tenant_id":"t","user_id":"u","request_id":"r","sensitivity_tier":0,"feature":"f"}
+        }"#;
+        let req: LlmRequest = serde_json::from_str(corpo_stringa).expect("stop a stringa valido");
+        assert_eq!(req.stop, Some(serde_json::json!("FINE")));
+    }
+
+    /// Client NUOVO -> gateway VECCHIO: nessuno dei cinque compare quando e'
+    /// assente, o un deserializzatore rigido a valle vedrebbe `null` inattesi.
+    #[test]
+    fn i_campi_assenti_non_vengono_serializzati() {
+        let req = LlmRequest {
+            model: "m".into(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            response_format: None,
+            stream: None,
+            thinking: None,
+            tool_choice: None,
+            pin_provider: None,
+            run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
+            metadata: RequestMetadata {
+                tenant_id: "t".into(),
+                user_id: "u".into(),
+                request_id: "r".into(),
+                sensitivity_tier: 0,
+                feature: "f".into(),
+            },
+        };
+        let json = serde_json::to_string(&req).expect("serializza");
+        for campo in [
+            "service_tier",
+            "\"seed\"",
+            "\"stop\"",
+            "\"user\"",
+            "parallel_tool_calls",
+        ] {
+            assert!(
+                !json.contains(campo),
+                "campo assente non deve finire sul wire ({campo}): {json}"
+            );
+        }
     }
 }
 

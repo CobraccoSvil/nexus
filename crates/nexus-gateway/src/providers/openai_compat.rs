@@ -1277,6 +1277,15 @@ fn build_request_body(
         // L'opt-in di usage accounting e' del CLIENT, non della richiesta: lo
         // valorizza `corpo_della_richiesta` dal flag del registry.
         usage: None,
+        // Passthrough dei campi nativi del dialetto OpenAI: il chiamante li
+        // valorizza, il body li porta verbatim; `None` = campo assente sul
+        // wire (un endpoint compat rigido rifiuterebbe un campo inatteso,
+        // quindi l'assenza e' parte del contratto quanto la presenza).
+        service_tier: req.service_tier.clone(),
+        seed: req.seed,
+        stop: req.stop.clone(),
+        user: req.user.clone(),
+        parallel_tool_calls: req.parallel_tool_calls,
     }
 }
 
@@ -1924,6 +1933,25 @@ pub(crate) struct ChatCompletionRequest {
     /// omesso per tutti gli altri endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<UsageAccountingOptIn>,
+    /// Tier di servizio del fornitore ("flex" | "priority" | ...): passthrough
+    /// del campo di contratto, con eventuale default d'endpoint dal registry
+    /// applicato in [`OpenAiCompatClient::corpo_della_richiesta`] (la richiesta
+    /// che lo dichiara VINCE sul default). Omesso quando nessuno dei due lo
+    /// valorizza: il comportamento storico resta byte-identico.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<String>,
+    /// Seed di campionamento (passthrough verbatim dal contratto).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<i64>,
+    /// Sequenze di stop, stringa o array come l'API (passthrough verbatim).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop: Option<serde_json::Value>,
+    /// Identificatore opaco dell'utente finale (passthrough verbatim).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
+    /// Consenso alle tool call parallele (passthrough verbatim).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
     /// Campi extra appiattiti nel body radice (DeepSeek `thinking`): il client
     /// OpenAI ufficiale fonde `extra_body` nel top-level, quindi facciamo lo
     /// stesso con `serde(flatten)`. `None` => nessun campo aggiunto.
@@ -2351,6 +2379,68 @@ mod tests {
                 feature: "f".to_string(),
             },
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
+        }
+    }
+
+    /// I cinque campi nativi del dialetto OpenAI attraversano il PRODUTTORE
+    /// reale ([`OpenAiCompatClient::corpo_della_richiesta`], regola O): quando
+    /// il chiamante li valorizza il body li porta verbatim; quando restano
+    /// `None` il body e' byte-identico a prima — nessuna chiave presente,
+    /// perche' un endpoint compat rigido rifiuterebbe un campo inatteso.
+    ///
+    /// MUTAZIONE ESEGUITA: rimuovere il passthrough in `build_request_body`
+    /// (`service_tier: None` al posto di `req.service_tier.clone()`) -> rosso
+    /// il ramo "presente"; emettere il campo anche con `None` (togliere lo
+    /// `skip_serializing_if`) -> rosso il ramo "assente".
+    #[tokio::test]
+    async fn i_campi_nativi_del_dialetto_passano_dal_punto_unico() {
+        let client = OpenAiCompatClient::new(Client::new(), "http://127.0.0.1:1", "k", "test");
+
+        // Con i campi a `None` nessuna chiave compare: l'assenza e' contratto.
+        let assente = serde_json::to_string(
+            &client
+                .corpo_della_richiesta(&sample_request(), false, &ResolvedReasoning::none())
+                .await,
+        )
+        .expect("serializza");
+        for campo in [
+            "\"service_tier\":",
+            "\"seed\":",
+            "\"stop\":",
+            "\"user\":",
+            "\"parallel_tool_calls\":",
+        ] {
+            assert!(
+                !assente.contains(campo),
+                "campo {campo} non deve comparire senza produttore: {assente}"
+            );
+        }
+
+        // Valorizzati, arrivano ognuno nel proprio campo, su ENTRAMBI i
+        // percorsi (complete e stream condividono il punto unico).
+        let mut req = sample_request();
+        req.service_tier = Some("flex".to_string());
+        req.seed = Some(42);
+        req.stop = Some(serde_json::json!(["FINE"]));
+        req.user = Some("utente-opaco-1".to_string());
+        req.parallel_tool_calls = Some(false);
+        for stream in [false, true] {
+            let corpo = serde_json::to_value(
+                &client
+                    .corpo_della_richiesta(&req, stream, &ResolvedReasoning::none())
+                    .await,
+            )
+            .expect("serializza");
+            assert_eq!(corpo["service_tier"], "flex", "stream={stream}");
+            assert_eq!(corpo["seed"], 42, "stream={stream}");
+            assert_eq!(corpo["stop"], serde_json::json!(["FINE"]), "stream={stream}");
+            assert_eq!(corpo["user"], "utente-opaco-1", "stream={stream}");
+            assert_eq!(corpo["parallel_tool_calls"], false, "stream={stream}");
         }
     }
 

@@ -191,6 +191,11 @@ fn richiesta_turno1(modello: &str) -> LlmRequest {
         pin_provider: None,
         metadata: metadata(),
         run_timeout_secs: None,
+        service_tier: None,
+        seed: None,
+        stop: None,
+        user: None,
+        parallel_tool_calls: None,
     }
 }
 
@@ -255,6 +260,11 @@ fn richiesta_turno2(modello: &str, risposta1: &LlmResponse) -> LlmRequest {
         pin_provider: None,
         metadata: metadata(),
         run_timeout_secs: None,
+        service_tier: None,
+        seed: None,
+        stop: None,
+        user: None,
+        parallel_tool_calls: None,
     }
 }
 

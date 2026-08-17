@@ -2005,17 +2005,24 @@ fn select_image_provider(
         })
 }
 
-/// Costruisce una [`LlmRequest`] di sola STIMA per `enforce_quota` a partire da
-/// una [`ImageGenRequest`]: il prompt diventa l'unico messaggio user (cosi' la
-/// stima char/4 di `estimate_prompt_tokens` resta coerente col punto unico
-/// billing). Nessun `max_tokens` (le immagini non hanno completion in token).
-fn image_gen_to_llm_request(body: &ImageGenRequest, model: &str) -> LlmRequest {
+/// PUNTO UNICO (regola L) della [`LlmRequest`] sintetica dei quattro handler
+/// media (image/video/transcribe/tts): il testo diventa l'unico messaggio user
+/// (cosi' la stima char/4 di `estimate_prompt_tokens` resta coerente col punto
+/// unico billing), pin e metadata passano verbatim, ogni altro campo del
+/// contratto resta assente. Prima erano quattro literal gemelli, e ogni
+/// estensione del contratto li faceva riscrivere tutti.
+fn media_to_llm_request(
+    model: &str,
+    testo: String,
+    pin_provider: Option<String>,
+    metadata: RequestMetadata,
+) -> LlmRequest {
     use crate::types::{LlmMessage, MessageContent};
-    LlmRequest {
-        model: model.to_string(),
-        messages: vec![LlmMessage {
+    let mut r = LlmRequest::minimal(
+        model,
+        vec![LlmMessage {
             role: "user".to_string(),
-            content: MessageContent::Text(body.prompt.clone()),
+            content: MessageContent::Text(testo),
             tool_call_id: None,
             tool_calls: None,
             name: None,
@@ -2023,23 +2030,22 @@ fn image_gen_to_llm_request(body: &ImageGenRequest, model: &str) -> LlmRequest {
             reasoning: None,
             is_error: None,
         }],
-        temperature: None,
-        max_tokens: None,
-        tools: None,
-        response_format: None,
-        stream: None,
-        thinking: None,
-        tool_choice: None,
-        pin_provider: body.pin_provider.clone(),
-        metadata: RequestMetadata {
-            tenant_id: body.metadata.tenant_id.clone(),
-            user_id: body.metadata.user_id.clone(),
-            request_id: body.metadata.request_id.clone(),
-            sensitivity_tier: body.metadata.sensitivity_tier,
-            feature: body.metadata.feature.clone(),
-        },
-        run_timeout_secs: None,
-    }
+        metadata,
+    );
+    r.pin_provider = pin_provider;
+    r
+}
+
+/// Costruisce una [`LlmRequest`] di sola STIMA per `enforce_quota` a partire da
+/// una [`ImageGenRequest`]: il prompt diventa l'unico messaggio user. Nessun
+/// `max_tokens` (le immagini non hanno completion in token).
+fn image_gen_to_llm_request(body: &ImageGenRequest, model: &str) -> LlmRequest {
+    media_to_llm_request(
+        model,
+        body.prompt.clone(),
+        body.pin_provider.clone(),
+        body.metadata.clone(),
+    )
 }
 
 // ── Video generation ─────────────────────────────────────────────────────────
@@ -2181,36 +2187,12 @@ fn select_video_provider(
 /// del punto unico billing). Gemella di [`image_gen_to_llm_request`]: niente
 /// costo inventato (regola G/H), il ledger non viene scritto a valle.
 fn video_gen_to_llm_request(body: &VideoGenRequest, model: &str) -> LlmRequest {
-    use crate::types::{LlmMessage, MessageContent};
-    LlmRequest {
-        model: model.to_string(),
-        messages: vec![LlmMessage {
-            role: "user".to_string(),
-            content: MessageContent::Text(body.prompt.clone()),
-            tool_call_id: None,
-            tool_calls: None,
-            name: None,
-            thinking_signature: None,
-            reasoning: None,
-            is_error: None,
-        }],
-        temperature: None,
-        max_tokens: None,
-        tools: None,
-        response_format: None,
-        stream: None,
-        thinking: None,
-        tool_choice: None,
-        pin_provider: body.pin_provider.clone(),
-        metadata: RequestMetadata {
-            tenant_id: body.metadata.tenant_id.clone(),
-            user_id: body.metadata.user_id.clone(),
-            request_id: body.metadata.request_id.clone(),
-            sensitivity_tier: body.metadata.sensitivity_tier,
-            feature: body.metadata.feature.clone(),
-        },
-        run_timeout_secs: None,
-    }
+    media_to_llm_request(
+        model,
+        body.prompt.clone(),
+        body.pin_provider.clone(),
+        body.metadata.clone(),
+    )
 }
 
 // ── Audio transcription ──────────────────────────────────────────────────────
@@ -2349,36 +2331,12 @@ fn select_audio_in_provider(
 /// testuale tokenizzabile e il testo risultante non e' noto a priori). Gemella di
 /// [`image_gen_to_llm_request`]: stima minima, niente costo inventato (regola G/H).
 fn transcribe_to_llm_request(body: &TranscribeRequest, model: &str) -> LlmRequest {
-    use crate::types::{LlmMessage, MessageContent};
-    LlmRequest {
-        model: model.to_string(),
-        messages: vec![LlmMessage {
-            role: "user".to_string(),
-            content: MessageContent::Text(String::new()),
-            tool_call_id: None,
-            tool_calls: None,
-            name: None,
-            thinking_signature: None,
-            reasoning: None,
-            is_error: None,
-        }],
-        temperature: None,
-        max_tokens: None,
-        tools: None,
-        response_format: None,
-        stream: None,
-        thinking: None,
-        tool_choice: None,
-        pin_provider: body.pin_provider.clone(),
-        metadata: RequestMetadata {
-            tenant_id: body.metadata.tenant_id.clone(),
-            user_id: body.metadata.user_id.clone(),
-            request_id: body.metadata.request_id.clone(),
-            sensitivity_tier: body.metadata.sensitivity_tier,
-            feature: body.metadata.feature.clone(),
-        },
-        run_timeout_secs: None,
-    }
+    media_to_llm_request(
+        model,
+        String::new(),
+        body.pin_provider.clone(),
+        body.metadata.clone(),
+    )
 }
 
 // ── Text-to-speech ───────────────────────────────────────────────────────────
@@ -2516,36 +2474,12 @@ fn select_audio_out_provider(
 /// Gemella di [`image_gen_to_llm_request`]/[`transcribe_to_llm_request`]: niente
 /// costo inventato (regola G/H), il ledger non viene scritto a valle.
 fn tts_to_llm_request(body: &TtsRequest, model: &str) -> LlmRequest {
-    use crate::types::{LlmMessage, MessageContent};
-    LlmRequest {
-        model: model.to_string(),
-        messages: vec![LlmMessage {
-            role: "user".to_string(),
-            content: MessageContent::Text(body.input.clone()),
-            tool_call_id: None,
-            tool_calls: None,
-            name: None,
-            thinking_signature: None,
-            reasoning: None,
-            is_error: None,
-        }],
-        temperature: None,
-        max_tokens: None,
-        tools: None,
-        response_format: None,
-        stream: None,
-        thinking: None,
-        tool_choice: None,
-        pin_provider: body.pin_provider.clone(),
-        metadata: RequestMetadata {
-            tenant_id: body.metadata.tenant_id.clone(),
-            user_id: body.metadata.user_id.clone(),
-            request_id: body.metadata.request_id.clone(),
-            sensitivity_tier: body.metadata.sensitivity_tier,
-            feature: body.metadata.feature.clone(),
-        },
-        run_timeout_secs: None,
-    }
+    media_to_llm_request(
+        model,
+        body.input.clone(),
+        body.pin_provider.clone(),
+        body.metadata.clone(),
+    )
 }
 
 // ── Batch API ────────────────────────────────────────────────────────────────
@@ -3429,6 +3363,11 @@ mod tests {
                 feature: "chat".into(),
             },
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         }
     }
 

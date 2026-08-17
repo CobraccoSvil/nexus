@@ -3439,6 +3439,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
 
@@ -3491,6 +3496,11 @@ mod tests {
                 pin_provider: None,
                 metadata: metadata(),
                 run_timeout_secs: None,
+                service_tier: None,
+                seed: None,
+                stop: None,
+                user: None,
+                parallel_tool_calls: None,
             };
             serde_json::to_value(build_request_body(&req, GoogleThinking::Absent))
                 .expect("serializza")
@@ -3529,6 +3539,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(
@@ -3561,6 +3576,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(
@@ -3603,6 +3623,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         }
     }
 
@@ -3656,6 +3681,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(json["contents"][0]["role"], "model");
@@ -3787,6 +3817,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         }
     }
 
@@ -3918,6 +3953,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(json["contents"][0]["role"], "model");
@@ -3946,6 +3986,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert!(json["contents"][0]["parts"][0]
@@ -4132,6 +4177,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         }
     }
 
@@ -4275,6 +4325,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         }
     }
 
@@ -5215,6 +5270,11 @@ mod tests {
                 feature: "chat".into(),
             },
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         };
 
         crate::server::billing::record_and_declare(&pool, &req, &mut resp).await;

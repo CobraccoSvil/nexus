@@ -466,6 +466,11 @@ mod tests {
             pin_provider: None,
             metadata: meta(request_id),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         }
     }
 

@@ -1290,6 +1290,11 @@ mod confine_wire_tests {
                 feature: "chat".into(),
             },
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         }
     }
 

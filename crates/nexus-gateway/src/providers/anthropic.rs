@@ -1465,6 +1465,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         };
         let body = build_request_body(&req, false, None, CacheTtl::Off);
         let json = serde_json::to_value(&body).unwrap();
@@ -1497,6 +1502,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         };
         let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
 
@@ -1527,6 +1537,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         };
         let json =
             serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
@@ -1604,6 +1619,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         };
         let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
 
@@ -1639,6 +1659,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         };
         let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
 
@@ -1678,6 +1703,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         }
     }
 
@@ -1866,6 +1896,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         }
     }
 
@@ -2037,6 +2072,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         };
         let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
 
@@ -2077,6 +2117,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         };
         let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
         let m = &json["messages"][0];
@@ -2129,6 +2174,11 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         }
     }
 

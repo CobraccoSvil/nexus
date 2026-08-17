@@ -158,6 +158,11 @@ mod tests {
                 feature: "f".to_string(),
             },
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         };
         let corpo = serde_json::to_value(
             p.client

@@ -710,6 +710,11 @@ mod registry_tests {
                 feature: "f".to_string(),
             },
             run_timeout_secs: None,
+            service_tier: None,
+            seed: None,
+            stop: None,
+            user: None,
+            parallel_tool_calls: None,
         }
     }
 
