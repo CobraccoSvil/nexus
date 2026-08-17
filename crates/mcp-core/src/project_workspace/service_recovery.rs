@@ -88,13 +88,29 @@ use crate::AppState;
 const DEFAULT_READINESS_SECONDS: i64 = 45;
 /// Intervallo fra due osservazioni durante l'attesa.
 const OBSERVE_INTERVAL_MS: u64 = 2_000;
-/// Per quanto la conformita' deve DURARE, ininterrotta, prima di valere.
+/// Per quanto la conformita' deve DURARE, ininterrotta, prima di valere PER LA
+/// REMEDIATION.
 ///
 /// E' il cuore della differenza fra questo contratto e il segnale che
 /// sostituisce: "e' partito" si misura in un istante, "funziona" no. Vale per
 /// tutti — un servizio web che risponde al secondo 2 e muore al secondo 8 non e'
 /// riparato piu' di un worker che fa lo stesso.
-const STABILITY_SECONDS: u64 = 15;
+///
+/// NON e' piu' una costante del ciclo: e' il valore che questo consumatore
+/// sceglie. La durata e' diventata un PARAMETRO ([`stable_enough`],
+/// [`await_port_ready`]) perche' i consumatori del criterio pongono la stessa
+/// domanda con esigenze diverse, e la variante corretta e' un parametro, non un
+/// secondo criterio (regola L). Chi rimedia e chi lancia una suite pretendono un
+/// servizio CALDO; `run_service` chiede "e' salito?" subito dopo lo spawn, e
+/// pretendere quindici secondi li' costerebbe quel tempo a ogni avvio sano per
+/// rispondere a una domanda che nessuno ha posto.
+pub(crate) const STABILITY_SECONDS: u64 = 15;
+
+/// La durata di stabilita' del contratto di remediation, per i consumatori che
+/// vogliono ESATTAMENTE quella e non un numero ricopiato.
+pub(crate) fn stabilita_di_remediation() -> Duration {
+    Duration::from_secs(STABILITY_SECONDS)
+}
 /// Timeout della prova HTTP: piu' lungo del TCP perche' comprende la risposta.
 const PROBE_HTTP_TIMEOUT_MS: u64 = 2_000;
 /// Caratteri di log conservati nell'evidenza.
@@ -236,8 +252,14 @@ impl ServiceHealth {
 /// comunque dal produttore del fatto invece di scriverselo (regola O).
 ///
 /// `None` = la conformita' non e' mai iniziata, o si e' interrotta.
-pub(crate) fn stable_enough(conforming_for: Option<Duration>) -> bool {
-    conforming_for.is_some_and(|d| d >= Duration::from_secs(STABILITY_SECONDS))
+///
+/// `stability` e' quanto deve durare per QUESTO consumatore: la remediation e il
+/// gate della suite passano [`stabilita_di_remediation`], l'avvio di un servizio
+/// passa zero perche' li' la domanda e' "risponde?" e non "e' caldo?". Zero non
+/// degrada il criterio a un `bool`: il ciclo osserva comunque due volte, quindi
+/// resta il fatto "ha risposto, e un istante dopo rispondeva ancora".
+pub(crate) fn stable_enough(conforming_for: Option<Duration>, stability: Duration) -> bool {
+    conforming_for.is_some_and(|d| d >= stability)
 }
 
 /// Una fase del contratto: un riavvio seguito da un'osservazione.
@@ -634,7 +656,7 @@ async fn observe_health(
     ServiceHealth {
         state: entry.map(|e| e.state).unwrap_or(ServiceState::Unknown),
         ports,
-        stable: stable_enough(conforming_for),
+        stable: stable_enough(conforming_for, stabilita_di_remediation()),
     }
 }
 
@@ -784,7 +806,7 @@ async fn await_contract(
     target: &ServiceRef,
     readiness: Duration,
 ) -> ServiceHealth {
-    await_observed(readiness, |conforming_for| {
+    await_observed(readiness, stabilita_di_remediation(), |conforming_for| {
         Box::pin(observe_health(state, target, conforming_for))
     })
     .await
@@ -832,13 +854,12 @@ impl ObservedContract for ServiceHealth {
 /// (`BoxFuture`, un'allocazione ogni [`OBSERVE_INTERVAL_MS`]: irrilevante) e
 /// NON per comodita': con `AsyncFnMut` il `Send` dei future resi non e'
 /// esprimibile, e ogni `tokio::spawn` a valle della catena smette di compilare.
-async fn await_observed<'a, T, F>(readiness: Duration, mut observe: F) -> T
+async fn await_observed<'a, T, F>(readiness: Duration, stability: Duration, mut observe: F) -> T
 where
     T: ObservedContract,
     F: FnMut(Option<Duration>) -> futures::future::BoxFuture<'a, T>,
 {
     let start = Instant::now();
-    let stability = Duration::from_secs(STABILITY_SECONDS);
     let mut conforming_since: Option<Instant> = None;
     loop {
         let conforming_for = conforming_since.map(|t| t.elapsed());
@@ -891,12 +912,22 @@ impl ObservedContract for PortReadiness {
 /// che risponde ma sta ancora scaldando (Vite che ritrasforma le dipendenze), e
 /// produce rossi flaky su codice sano. Criterio e durata sono i punti unici gia'
 /// esistenti ([`probe_port`], [`stable_enough`]); l'attesa e' [`await_observed`].
-pub(crate) async fn await_port_ready(port: u16, readiness: Duration) -> PortReadiness {
-    await_observed(readiness, move |conforming_for| {
+///
+/// `stability` e' l'unica cosa che cambia fra i consumatori, ed e' percio' un
+/// parametro: il gate della suite pretende [`stabilita_di_remediation`], l'avvio
+/// di un servizio passa zero (vedi [`stable_enough`]). Un secondo ciclo di
+/// attesa con un'altra soglia sarebbe un secondo criterio della vita, cioe' il
+/// difetto che questo punto unico esiste per togliere (regola L).
+pub(crate) async fn await_port_ready(
+    port: u16,
+    readiness: Duration,
+    stability: Duration,
+) -> PortReadiness {
+    await_observed(readiness, stability, move |conforming_for| {
         Box::pin(async move {
             PortReadiness {
                 answer: probe_port(port).await,
-                stable: stable_enough(conforming_for),
+                stable: stable_enough(conforming_for, stability),
             }
         })
     })
@@ -2196,7 +2227,7 @@ mod tests {
         ServiceHealth {
             state,
             ports,
-            stable: stable_enough(conforme_da),
+            stable: stable_enough(conforme_da, stabilita_di_remediation()),
         }
     }
 
@@ -2255,7 +2286,7 @@ mod tests {
                 };
                 PortReadiness {
                     answer,
-                    stable: stable_enough(conforming_for),
+                    stable: stable_enough(conforming_for, stabilita_di_remediation()),
                 }
             })
         }
@@ -2275,6 +2306,7 @@ mod tests {
         let giri = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let esito = await_observed(
             Duration::from_secs(60),
+            stabilita_di_remediation(),
             osservazione_a_scatti(0, giri.clone()),
         )
         .await;
@@ -2298,6 +2330,7 @@ mod tests {
         let muta_per = 5usize;
         let esito = await_observed(
             Duration::from_secs(60),
+            stabilita_di_remediation(),
             osservazione_a_scatti(muta_per, giri.clone()),
         )
         .await;
@@ -2322,6 +2355,7 @@ mod tests {
         let giri = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let esito = await_observed(
             Duration::from_secs(30),
+            stabilita_di_remediation(),
             osservazione_a_scatti(usize::MAX, giri.clone()),
         )
         .await;
@@ -2353,11 +2387,16 @@ mod tests {
                 };
                 PortReadiness {
                     answer,
-                    stable: stable_enough(conforming_for),
+                    stable: stable_enough(conforming_for, stabilita_di_remediation()),
                 }
             })
         };
-        let esito = await_observed(Duration::from_secs(60), osservazione).await;
+        let esito = await_observed(
+            Duration::from_secs(60),
+            stabilita_di_remediation(),
+            osservazione,
+        )
+        .await;
         assert!(esito.ready(), "dopo la ricaduta la finestra rimatura");
         let osservazioni = giri.load(std::sync::atomic::Ordering::SeqCst);
         // 4 giri bruciati (3 conformi + la caduta) + una finestra INTERA dopo.
@@ -2375,7 +2414,12 @@ mod tests {
     /// attese, niente timer in gara con l'I/O.
     #[tokio::test]
     async fn await_port_ready_su_porta_muta_ritorna_subito_non_pronta() {
-        let esito = await_port_ready(porta_muta().await, Duration::ZERO).await;
+        let esito = await_port_ready(
+            porta_muta().await,
+            Duration::ZERO,
+            stabilita_di_remediation(),
+        )
+        .await;
         assert!(!esito.ready(), "nessuno in ascolto: non e' pronta");
         assert_eq!(esito.answer, PortAnswer::Silence);
     }

@@ -28,6 +28,9 @@ pub use nexus_agent_tools::*;
 // «Questa riga di shell avvia un server?» (punto unico, regola L): la domanda
 // posta sulla riga SCOMPOSTA, non sul testo grezzo.
 pub(crate) mod avvio_server;
+// «Il servizio appena lanciato e' VIVO?»: l'esito tipizzato dell'avvio, che
+// delega il criterio della vita ai due punti unici che gia' rispondono.
+pub(crate) mod avvio_servizio;
 pub(crate) mod natura_comando;
 pub(crate) mod command;
 pub(crate) mod context;

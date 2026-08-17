@@ -191,8 +191,9 @@ pub(super) async fn tool_run_service(
         Err(risposta) => return risposta,
     };
     // Porta su cui il servizio DEVE mettersi in ascolto. E' il segnale che
-    // distingue "il processo esiste" da "il servizio serve": senza, un avvio
-    // fallito viene riportato come riuscito (vedi `attende_ascolto`).
+    // distingue "il processo esiste" da "il servizio serve"; la sua ASSENZA non
+    // e' un difetto (un worker non ascolta), ed e' per questo che
+    // `EsitoPorta::NessunaAttesa` e' una variante e non un `None`.
     let porta_attesa = env_overrides
         .as_ref()
         .and_then(|e| e.get("PORT"))
@@ -204,19 +205,22 @@ pub(super) async fn tool_run_service(
             Err(risposta) => return risposta,
         };
 
-    // Servizio web: si attende l'ASCOLTO, non un tempo fisso. Uno sano risponde
-    // spesso in meno di un secondo e il tool ritorna subito; uno morto consuma
-    // l'intera finestra e viene riportato come fallito.
-    // Servizio non web (nessuna porta): resta l'attesa a tempo per raccogliere
-    // l'output iniziale, unico segnale disponibile.
-    let ascolto = match porta_attesa {
-        Some(port) => Some((port, attende_ascolto(port).await)),
-        None => {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            None
-        }
-    };
-    report_started_service(ctx, &label, &kind, process_id, ascolto).await
+    // Si attende la VITA, non la nascita: il processo esiste sempre (su Windows
+    // la shell nasce anche quando il comando dentro muore un istante dopo), e
+    // fino al 17/08/2026 quello era l'unico fatto che il tool guardava. Le due
+    // domande — «la porta risponde?» e «il capostipite e' uscito?» — hanno
+    // ciascuna un punto unico, e `attendi_avvio` le pone entrambe delegando
+    // (regola L). L'esito e' tipizzato perche' i tre casi hanno rimedi diversi.
+    let esito = super::avvio_servizio::attendi_avvio(
+        &ctx.db,
+        ctx.project_id,
+        process_id,
+        porta_attesa,
+        super::avvio_servizio::finestra_readiness(&ctx.db).await,
+        super::avvio_servizio::finestra_morte_precoce(&ctx.db).await,
+    )
+    .await;
+    report_started_service(ctx, &label, &kind, process_id, esito).await
 }
 
 /// Gate pre-avvio di `tool_run_service`: dedup+cleanup porte, poi refuse per
@@ -264,35 +268,14 @@ async fn gate_pre_avvio(
     None
 }
 
-/// Finestra entro cui un servizio web deve mettersi in ascolto sulla sua porta.
-const ATTESA_ASCOLTO_MS: u64 = 20_000;
-/// Pausa fra due sondaggi mentre si aspetta l'ascolto.
-const INTERVALLO_PROBE_MS: u64 = 400;
-
-/// True se `port` entra in ascolto entro [`ATTESA_ASCOLTO_MS`].
-///
-/// Esiste perche' la vita del processo NON dimostra che il servizio funzioni:
-/// `nodemon` sopravvive al crash dell'applicazione ("app crashed - waiting for
-/// file changes") e resta `running` con la porta chiusa. Riportare "avviato" in
-/// quel caso da' all'agente un esito falso, su cui costruisce i passi
-/// successivi invece di correggere l'errore che gli sta gia' nello stderr.
-/// L'ascolto e' il segnale strutturato del fatto (regola M).
-///
-/// Ritorna al PRIMO sondaggio riuscito, cosi' la finestra larga non costa nulla
-/// ai servizi sani: la paga solo chi non parte, dove l'attesa e' il prezzo di
-/// una diagnosi corretta invece di una conferma sbagliata.
-async fn attende_ascolto(port: u16) -> bool {
-    let scaduto_dopo = tokio::time::Instant::now() + std::time::Duration::from_millis(ATTESA_ASCOLTO_MS);
-    loop {
-        if crate::project_workspace::port_recovery::port_listening(port).await {
-            return true;
-        }
-        if tokio::time::Instant::now() >= scaduto_dopo {
-            return false;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(INTERVALLO_PROBE_MS)).await;
-    }
-}
+// L'attesa dell'ascolto viveva QUI, come secondo criterio della vita di un
+// servizio: `attende_ascolto` con la sua finestra hardcoded e il suo
+// `port_listening`, accanto al contratto della remediation che gia' rispondeva
+// alla stessa domanda con `probe_port` + `stable_enough` + il ciclo dei due
+// orologi. Due criteri per un fatto solo, e il piu' povero dei due montato nel
+// posto piu' esposto. Ora la domanda si pone al punto unico
+// (`agent_tools::avvio_servizio`, che delega a `service_recovery`), e la
+// finestra viene dal DB invece che da una costante (regola G).
 
 /// Dove il servizio stia ascoltando DAVVERO, quando la porta attesa resta muta.
 ///
@@ -878,51 +861,53 @@ async fn spawn_service_process(
     .map_err(|e| RispostaTool::fallito_di_sistema(format!("[Errore avvio servizio '{label}': {e}]")))
 }
 
-/// Legge l'output iniziale di un servizio appena avviato, registra la porta
-/// rilevata, emette gli eventi di pannello e compone il messaggio di ritorno.
+/// Registra la porta rilevata, emette gli eventi di pannello e compone il
+/// messaggio di ritorno a partire dall'esito GIA' accertato dell'avvio.
 ///
-/// Se la RILETTURA dell'output fallisce l'esito resta RIUSCITO: il servizio e'
-/// partito, e cio' che non e' riuscito e' guardarlo. Dichiararlo fallito
-/// attribuirebbe al lancio un esito che il lancio non ha avuto, e manderebbe
-/// l'agente a riavviare un processo vivo.
+/// Non attende piu' nulla e non giudica piu' nulla: il verdetto arriva da
+/// [`super::avvio_servizio::attendi_avvio`], e qui si traducono le sue tre
+/// varianti in cio' che il pannello vede e in cio' che l'agente legge.
+///
+/// Se la RILETTURA della riga e' fallita l'esito resta quello dichiarato
+/// dall'avvio: non aver potuto guardare non e' un fatto sul servizio, e
+/// trasformarlo in un fallimento manderebbe l'agente a riavviare un processo
+/// vivo (l'errore opposto, con lo stesso costo).
 async fn report_started_service(
     ctx: &AgentToolContext,
     label: &str,
     kind: &str,
     process_id: Uuid,
-    ascolto: Option<(u16, bool)>,
+    esito: super::avvio_servizio::EsitoAvvio,
 ) -> RispostaTool {
-    let info = match crate::agent_processes::read_process_output(
-        &ctx.db,
-        ctx.project_id,
-        process_id,
-        4000,
-    )
-    .await
-    {
+    use super::avvio_servizio::AvvioServizio;
+
+    let intestazione = format!("Servizio '{label}' (process_id: {process_id})");
+    let info = match esito.info {
         Ok(info) => info,
         Err(e) => {
-            return RispostaTool::riuscito(format!(
-                "Servizio '{label}' avviato (process_id: {process_id}), \
-                 ma errore lettura output: {e}"
-            ))
+            return esito
+                .avvio
+                .risposta(&format!("{intestazione}, output non leggibile: {e}"), None)
         }
     };
 
     let detected_port = registra_o_audita_porta_rilevata(ctx, label, kind, &info).await;
-    // Dispatcher: notifica avvio servizio → pannello Servizi aggiorna LED.
-    // Se la porta attesa non e' mai entrata in ascolto il servizio NON e' su:
-    // emettere l'avvio accenderebbe un LED verde su un servizio morto, cioe'
-    // ripeterebbe nel pannello la stessa bugia detta all'agente.
-    // La diagnosi "dove ascolta davvero" si interroga SOLO nel ramo fallito, e
-    // solo qui: e' l'unico punto in cui si conosce sia la porta attesa sia il
-    // pid del processo avviato.
-    let altrove = match ascolto {
-        Some((port, false)) => accerta_ascolto_altrove(ctx.project_id, port, info.pid).await,
+    // La diagnosi "dove ascolta davvero" si interroga SOLO quando la porta
+    // promessa e' rimasta muta e il processo e' ancora vivo: e' li' che «non
+    // li'» lascia l'agente senza nulla da correggere. Su un processo MORTO non
+    // ha senso cercare un suo listener altrove.
+    let altrove = match &esito.avvio {
+        AvvioServizio::VivoMaSilenzioso {
+            porta_attesa: Some(port),
+            ..
+        } => accerta_ascolto_altrove(ctx.project_id, *port, info.pid).await,
         _ => AscoltoAltrove::NonAccertato,
     };
-    let in_ascolto = !matches!(ascolto, Some((_, false)));
-    if in_ascolto {
+
+    // Dispatcher: notifica avvio servizio -> il pannello Servizi accende il LED.
+    // Solo su `Vivo`: accenderlo su un servizio morto o muto ripeterebbe nel
+    // pannello la stessa bugia appena tolta all'agente.
+    if matches!(esito.avvio, AvvioServizio::Vivo { .. }) {
         nexus_events::dispatcher::emit(
             &ctx.project_channels,
             ctx.project_id,
@@ -933,7 +918,10 @@ async fn report_started_service(
             },
         );
     }
-    format_started_message(label, process_id, &info, ascolto, &altrove)
+
+    let nota = nota_ascolto_altrove(&altrove);
+    let nota = (!nota.is_empty()).then_some(nota);
+    esito.avvio.risposta(&intestazione, nota.as_deref())
 }
 
 /// Che fare della porta che il servizio ha dichiarato nel proprio output: qui,
@@ -1177,97 +1165,13 @@ async fn registra_porta_rilevata(
     claim
 }
 
-/// Compone il messaggio testuale di avvio servizio (header + STDOUT/STDERR).
-/// Messaggio per un servizio che non e' mai entrato in ascolto. Mette lo STDERR
-/// per primo: e' li' che sta la causa, ed e' cio' che l'agente deve leggere per
-/// correggere invece di proseguire.
-///
-/// Il messaggio e' composto con `tool_failure`: senza il marker in testa il
-/// tool_result non DICHIARA il fallimento, e l'anti-loop legge una ripetizione
-/// che "riesce" — cioe' uno stallo da abortire invece di una causa radice da
-/// diagnosticare (regola M). E' la classe di fallimento piu' frequente dei run
-/// agentici: 144 step in 54 run distinti, tutti riportati come esito riuscito.
-fn format_ascolto_mancante(
-    label: &str,
-    process_id: Uuid,
-    info: &crate::agent_processes::ProcessOutput,
-    port: u16,
-    altrove: &AscoltoAltrove,
-) -> RispostaTool {
-    let pid = info
-        .pid
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "?".into());
-    let mut msg = format!(
-        "Servizio '{label}' NON avviato: nessun ascolto sulla porta {port} entro {} secondi \
-         (process_id: {process_id}, pid: {pid}, status processo: {}).\n\
-         Il processo puo' essere ancora vivo senza che il servizio funzioni: alcuni runner \
-         (nodemon, watcher) sopravvivono al crash dell'applicazione. La causa e' nell'output \
-         qui sotto; correggila e riavvia, invece di proseguire come se il servizio rispondesse.\n",
-        ATTESA_ASCOLTO_MS / 1000,
-        info.status,
-    );
-    // Prima dell'output: cambia la diagnosi. Un servizio in ascolto altrove non
-    // ha un errore da correggere nello stderr, ha una porta da riconciliare.
-    msg.push_str(&nota_ascolto_altrove(altrove));
-    if !info.stderr.is_empty() {
-        msg.push_str(&format!("\nSTDERR:\n{}", info.stderr));
-    }
-    if !info.stdout.is_empty() {
-        msg.push_str(&format!("\nSTDOUT:\n{}", info.stdout));
-    }
-    if info.stdout.is_empty() && info.stderr.is_empty() {
-        msg.push_str(
-            "\n(Nessun output: il processo non ha scritto nulla prima di smettere di rispondere.)",
-        );
-    }
-    // TRANSITORIO, e non e' il ripiego comodo: e' il precedente gia' deciso in
-    // main per questa identica firma («servizio non in ascolto entro 20s =
-    // Transitorio»), e regge perche' la causa piu' frequente e' un avvio lento.
-    // Il testo dice all'agente di correggere PRIMA di riavviare, quindi la
-    // direttiva «ritentare e' legittimo» non lo manda a ripetere alla cieca:
-    // gli dice che riprovare, dopo la correzione, e' la strada — che e' cio' che
-    // deve fare.
-    RispostaTool::fallito_transitorio(msg)
-}
-
-fn format_started_message(
-    label: &str,
-    process_id: Uuid,
-    info: &crate::agent_processes::ProcessOutput,
-    ascolto: Option<(u16, bool)>,
-    altrove: &AscoltoAltrove,
-) -> RispostaTool {
-    // Un servizio che non e' entrato in ascolto NON e' avviato, per quanto il
-    // suo processo sia ancora vivo. Dirlo apertamente e' l'intero scopo del
-    // controllo: l'agente deve leggere il fallimento e lo stderr che lo spiega,
-    // non una conferma su cui costruire i passi successivi.
-    if let Some((port, false)) = ascolto {
-        return format_ascolto_mancante(label, process_id, info, port, altrove);
-    }
-    let mut msg = format!(
-        "Servizio '{}' avviato (process_id: {}, pid: {}, status: {})\n",
-        label,
-        process_id,
-        info.pid
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "?".into()),
-        info.status,
-    );
-    if let Some((port, true)) = ascolto {
-        msg.push_str(&format!("In ascolto sulla porta {port} (verificato).\n"));
-    }
-    if !info.stdout.is_empty() {
-        msg.push_str(&format!("\nSTDOUT:\n{}", info.stdout));
-    }
-    if !info.stderr.is_empty() {
-        msg.push_str(&format!("\nSTDERR:\n{}", info.stderr));
-    }
-    if info.stdout.is_empty() && info.stderr.is_empty() {
-        msg.push_str("\n(Nessun output ancora. Usa read_service_output per controllare dopo qualche secondo.)");
-    }
-    RispostaTool::riuscito(msg)
-}
+// Qui vivevano `format_ascolto_mancante` e `format_started_message`: la
+// composizione del messaggio a partire da `Option<(u16, bool)>`, cioe' da un
+// booleano che diceva soltanto se la porta avesse risposto. In quel tipo la
+// morte del processo non era rappresentabile, e infatti non veniva mai
+// dichiarata. Ora il messaggio si compone DAI CAMPI dell'esito tipizzato
+// (`AvvioServizio::risposta`, regola Q), e le tre varianti portano ciascuna la
+// propria conseguenza.
 
 /// Deriva lo scopo del servizio (frontend/backend) dal comando, dalla label o
 /// dalla working directory. Punto unico della classificazione (regola L).
@@ -2194,7 +2098,7 @@ pub(super) async fn tool_list_active_services(
 mod tests {
     use super::{
         classifica_ascolto_altrove, declassa_se_non_e_un_servizio, derive_kind_hint,
-        detect_port_from_output, existing_service_action, format_started_message,
+        detect_port_from_output, existing_service_action, nota_ascolto_altrove,
         looks_like_web_service, registra_le_proprie_porte, resolve_service_label,
         resolve_service_work_dir, scope_dir, tool_run_service, AscoltoAltrove,
         ExistingServiceAction, PortaRilevata, Uuid, LABEL_NON_SERVIZIO,
@@ -2740,6 +2644,40 @@ mod tests {
         }
     }
 
+    /// Il messaggio come lo compone la PRODUZIONE: fatti -> criterio -> testo,
+    /// passando da `classifica_avvio` e `AvvioServizio::risposta` invece di
+    /// fabbricare la variante desiderata (regola O). Prima questi test
+    /// chiamavano `format_started_message` con un `Option<(u16, bool)>`, un
+    /// tipo in cui la morte del processo non era nemmeno esprimibile.
+    fn messaggio_di_avvio(
+        label: &str,
+        info: &crate::agent_processes::ProcessOutput,
+        porta: super::super::avvio_servizio::EsitoPorta,
+        altrove: &AscoltoAltrove,
+    ) -> nexus_types::tool_outcome::RispostaTool {
+        use super::super::avvio_servizio::{classifica_avvio, FattiAvvio, UscitaCapostipite};
+        let uscita = if info.exit_code.is_some() || matches!(info.status.as_str(), "stopped" | "failed") {
+            UscitaCapostipite::Uscito {
+                exit_code: info.exit_code,
+            }
+        } else {
+            UscitaCapostipite::NonUscito
+        };
+        let mut output = info.stdout.trim().to_string();
+        if !info.stderr.trim().is_empty() {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(info.stderr.trim());
+        }
+        let nota = nota_ascolto_altrove(altrove);
+        let nota = (!nota.is_empty()).then_some(nota);
+        classifica_avvio(&FattiAvvio { uscita, porta }, 20_000, output).risposta(
+            &format!("Servizio '{label}' (process_id: {})", uuid::Uuid::nil()),
+            nota.as_deref(),
+        )
+    }
+
     /// REGRESSIONE (2026-07-26): il tool riportava "Servizio avviato" guardando
     /// solo se il PROCESSO esisteva. `nodemon` sopravvive al crash
     /// dell'applicazione ("app crashed - waiting for file changes"), quindi lo
@@ -2753,11 +2691,10 @@ mod tests {
             "[nodemon] app crashed - waiting for file changes",
             "Error: Cannot find module 'D:\\progetto\\backend\\src\\index.js'",
         );
-        let msg = format_started_message(
+        let msg = messaggio_di_avvio(
             "backend",
-            uuid::Uuid::nil(),
             &info,
-            Some((32976, false)),
+            super::super::avvio_servizio::EsitoPorta::Muta { porta: 32976 },
             &AscoltoAltrove::NonAccertato,
         );
         // Il fallimento va DICHIARATO alla macchina, non solo raccontato:
@@ -2781,7 +2718,7 @@ mod tests {
             "{msg:?}"
         );
         assert!(
-            msg.testo.contains("NON avviato"),
+            msg.testo.contains("NESSUN ASCOLTO"),
             "un servizio che non ascolta non va annunciato come avviato: {msg:?}"
         );
         assert!(msg.testo.contains("32976"), "il messaggio deve nominare la porta attesa: {msg:?}");
@@ -2799,20 +2736,18 @@ mod tests {
     #[test]
     fn con_ascolto_verificato_il_messaggio_lo_dichiara() {
         let info = uscita_processo("running", "server listening", "");
-        let msg = format_started_message(
+        let msg = messaggio_di_avvio(
             "backend",
-            uuid::Uuid::nil(),
             &info,
-            Some((32976, true)),
+            super::super::avvio_servizio::EsitoPorta::Risponde { porta: 32976 },
             &AscoltoAltrove::NonAccertato,
         );
-        assert!(msg.testo.contains("avviato"), "{msg:?}");
         assert!(
             !msg.esito.e_fallito(),
             "un servizio che ascolta non e' un fallimento: {msg:?}"
         );
         assert!(
-            msg.testo.contains("In ascolto sulla porta 32976 (verificato)"),
+            msg.testo.contains("VIVO: in ascolto sulla porta 32976"),
             "l'ascolto verificato va dichiarato, cosi' l'agente distingue una \
              conferma provata da una presunta: {msg:?}"
         );
@@ -2954,16 +2889,14 @@ mod tests {
     #[test]
     fn senza_porta_attesa_il_messaggio_resta_invariato() {
         let info = uscita_processo("running", "job avviato", "");
-        let msg = format_started_message(
+        let msg = messaggio_di_avvio(
             "worker",
-            uuid::Uuid::nil(),
             &info,
-            None,
+            super::super::avvio_servizio::EsitoPorta::NessunaAttesa,
             &AscoltoAltrove::NonAccertato,
         );
-        assert!(msg.testo.contains("avviato"), "{msg:?}");
-        assert!(!msg.testo.contains("NON avviato"), "{msg:?}");
-        assert!(!msg.testo.contains("In ascolto"), "{msg:?}");
+        assert!(msg.testo.contains("VIVO"), "{msg:?}");
+        assert!(!msg.testo.contains("NESSUN ASCOLTO"), "{msg:?}");
         assert!(!msg.esito.e_fallito(), "{msg:?}");
     }
 
@@ -2993,11 +2926,10 @@ mod tests {
         );
 
         let info = uscita_processo("running", "VITE ready", "");
-        let msg = format_started_message(
+        let msg = messaggio_di_avvio(
             "frontend",
-            uuid::Uuid::nil(),
             &info,
-            Some((attesa, false)),
+            super::super::avvio_servizio::EsitoPorta::Muta { porta: attesa },
             &altrove,
         );
         assert!(
@@ -3029,11 +2961,10 @@ mod tests {
             "{altrove:?}"
         );
         let info = uscita_processo("running", "", "");
-        let msg = format_started_message(
+        let msg = messaggio_di_avvio(
             "frontend",
-            uuid::Uuid::nil(),
             &info,
-            Some((attesa, false)),
+            super::super::avvio_servizio::EsitoPorta::Muta { porta: attesa },
             &altrove,
         );
         assert!(msg.testo.contains(&fuori.to_string()), "{msg:?}");
