@@ -41,7 +41,7 @@ use crate::history_sanitizer::{self, SanitizeMode};
 use crate::model_alias_resolver::{strip_provider_prefix, ModelAliasResolver};
 use crate::provider::LlmProvider;
 use crate::providers::{ProviderErrorKind, ProviderHttpError};
-use crate::tassonomia_errori::{VerdettoErrore, VocabolarioErrori};
+use crate::tassonomia_errori::{CausaErrore, VerdettoErrore, VocabolarioErrori};
 use crate::redaction::pipeline::{RedactionOptions, RedactionPipeline};
 use crate::redaction::sensitivity_classifier::SensitivityClassifier;
 use crate::types::{
@@ -375,13 +375,38 @@ const BUDGET_RESPONSE_MARGIN: std::time::Duration = std::time::Duration::from_se
 /// lunghissimo — il tetto di trasporto e' comunque congelato nel client HTTP
 /// all'avvio (`client_http_timeout`), e sforarlo trasformerebbe un
 /// `attempt_timeout` strutturato in un errore di trasporto opaco (regola M).
-fn request_timeouts(base: &LlmTimeouts, run_timeout_secs: Option<u64>) -> LlmTimeouts {
+///
+/// L'UNICA eccezione allo stringere e' la richiesta DIFFERIBILE, e non e' un
+/// allentamento del vincolo: e' l'altro ramo dello stesso criterio. I budget
+/// ordinari nascono dalla domanda «quanti turni deve poter completare il run
+/// che contiene questa chiamata», e una richiesta differibile non appartiene a
+/// nessun run — un titolo di conversazione, un riassunto, una nota. I suoi
+/// numeri sono propri (`gateway.flex.*`, mig 0729) e li risolve il punto unico
+/// `LlmTimeouts::with_flex`, che li ha gia' limitati al tetto di trasporto.
+///
+/// Il RUN vince dove e' dichiarato: chi manda `run_timeout_secs` sta dicendo
+/// che quella chiamata sta dentro un run vivo, e il differibile non puo'
+/// allungargliela — sarebbe la scorciatoia con cui un chiamante ottiene budget
+/// piu' larghi mettendo un flag.
+fn request_timeouts(
+    base: &LlmTimeouts,
+    run_timeout_secs: Option<u64>,
+    deferrable: bool,
+) -> LlmTimeouts {
     let per_run = base.for_run(run_timeout_secs);
-    LlmTimeouts {
+    let stretto = LlmTimeouts {
         request_budget: per_run.request_budget.min(base.request_budget),
         per_attempt: per_run.per_attempt.min(base.per_attempt),
         ..per_run
+    };
+    // `run_secs_utile` e' lo stesso criterio con cui `for_run` decide se
+    // ri-derivare (regola L): «un run e' dichiarato» non puo' avere due
+    // definizioni, o esisterebbe un valore — lo zero, che nel DB significa
+    // "non impostato" — per cui una funzione ri-deriva e l'altra no.
+    if deferrable && nexus_auth::llm_timeouts::run_secs_utile(run_timeout_secs).is_none() {
+        return stretto.per_flex();
     }
+    stretto
 }
 
 #[cfg(test)]
@@ -393,11 +418,17 @@ mod test_request_timeouts {
         LlmTimeouts::derive(300, 120, 300, 4)
     }
 
+    /// Come li chiedeva ogni chiamante prima che esistesse la corsia
+    /// differibile: e' l'argomento che il default del contratto produce.
+    fn ordinaria(base: &LlmTimeouts, run: Option<u64>) -> LlmTimeouts {
+        request_timeouts(base, run, false)
+    }
+
     /// Il caso che ha motivato il lavoro: la figura `review` vive 240s, non 300.
     /// I suoi turni valgono 60s, non 75.
     #[test]
     fn un_run_piu_corto_stringe_il_budget() {
-        let t = request_timeouts(&base(), Some(240));
+        let t = ordinaria(&base(), Some(240));
         assert_eq!(t.request_budget, std::time::Duration::from_secs(60));
         assert!(
             t.request_budget.as_secs() * t.min_guaranteed_turns <= 240,
@@ -415,7 +446,7 @@ mod test_request_timeouts {
     fn nessun_run_dichiarato_puo_allungare_i_budget() {
         let b = base();
         for run in [600_u64, 3_600, 86_400, u64::MAX] {
-            let t = request_timeouts(&b, Some(run));
+            let t = ordinaria(&b, Some(run));
             assert!(
                 t.request_budget <= b.request_budget,
                 "run {run}: il budget e' cresciuto ({:?} > {:?})",
@@ -430,8 +461,61 @@ mod test_request_timeouts {
     #[test]
     fn senza_dichiarazione_i_budget_sono_quelli_di_sempre() {
         let b = base();
-        assert_eq!(request_timeouts(&b, None).request_budget, b.request_budget);
-        assert_eq!(request_timeouts(&b, Some(0)).request_budget, b.request_budget);
+        assert_eq!(ordinaria(&b, None).request_budget, b.request_budget);
+        assert_eq!(ordinaria(&b, Some(0)).request_budget, b.request_budget);
+    }
+
+    /// Il meccanismo resta SPENTO finche' i budget differibili non sono
+    /// dichiarati: `deferrable: true` su timeout senza `with_flex` non cambia
+    /// un numero.
+    /// E' lo stato in cui il gateway parte se le chiavi `gateway.flex.*` non
+    /// esistono (regola G: nessun default nascosto nel codice del gateway).
+    #[test]
+    fn senza_budget_dichiarati_il_differibile_non_cambia_niente() {
+        let b = base();
+        assert_eq!(request_timeouts(&b, None, true), ordinaria(&b, None));
+    }
+
+    /// Il caso del lotto: nessun run dichiarato + `deferrable` -> i budget sono
+    /// quelli differibili, non quelli ordinari. Il `per_attempt` resta tagliato
+    /// al tetto di trasporto (300s coi valori LIVE): e' il punto unico
+    /// `with_flex` a deciderlo, non questa funzione.
+    ///
+    /// MUTAZIONE: togliere il ramo `per_flex()` -> il budget torna 75s, rosso.
+    #[test]
+    fn una_richiesta_differibile_ottiene_i_propri_budget() {
+        let b = base().with_flex(900, 900);
+        let t = request_timeouts(&b, None, true);
+        assert_eq!(t.request_budget, std::time::Duration::from_secs(900));
+        assert_eq!(t.per_attempt, b.client_http_timeout());
+        // La stessa base senza il flag resta quella di ieri: il differibile non
+        // e' un innalzamento globale.
+        assert_eq!(ordinaria(&b, None).request_budget, b.request_budget);
+    }
+
+    /// IL vincolo che impedisce la scorciatoia: chi dichiara un run sta dentro
+    /// un run vivo, e un flag non puo' allungarglielo. Senza, `deferrable: true`
+    /// sarebbe il modo di ottenere 900s ovunque.
+    ///
+    /// MUTAZIONE: togliere la condizione `run_secs_utile(...).is_none()` -> il
+    /// budget di un run da 240s diventa 900, rosso.
+    #[test]
+    fn il_run_dichiarato_vince_sul_differibile() {
+        let b = base().with_flex(900, 900);
+        for run in [60_u64, 240, 300, 600] {
+            let t = request_timeouts(&b, Some(run), true);
+            assert_eq!(
+                t.request_budget,
+                ordinaria(&b, Some(run)).request_budget,
+                "run {run}: il differibile ha scavalcato il run dichiarato"
+            );
+        }
+        // Zero nel DB significa "non impostato": e' un run NON dichiarato, e li'
+        // il differibile vale. Stessa lettura di `for_run` (punto unico).
+        assert_eq!(
+            request_timeouts(&b, Some(0), true).request_budget,
+            std::time::Duration::from_secs(900)
+        );
     }
 }
 
@@ -1279,6 +1363,11 @@ async fn complete_with_retry(
                 let retry_after = http.and_then(|h| h.retry_after_seconds);
                 let failure = CallFailure::from_error(kind, &err);
                 let msg = failure.message.clone();
+                // GUARDIA sulla CAUSA, prima della classe: vedi
+                // `corsia_differibile_esaurita` per il perche'.
+                if corsia_differibile_esaurita(name, verdetto.causa, &failure) {
+                    return Err(failure);
+                }
                 match kind {
                     ProviderErrorKind::Billing => {
                         cooldown.mark_billing(name, Some(msg));
@@ -1400,6 +1489,43 @@ async fn complete_with_retry(
             }
         }
     }
+}
+
+/// La chiamata si ferma qui perche' la corsia DIFFERIBILE non ha capacita'?
+///
+/// Guarda la CAUSA e non la classe (regole M+Q). Il tier differibile senza
+/// capacita' arriva come 429 — la classe di un tetto di frequenza — e i due
+/// rimedi si escludono: attendere e ritentare spende il tempo che il
+/// differibile aveva (il fornitore chiede 300s, misurato), e un cooldown
+/// toglierebbe dalla selezione un fornitore SANO, che al tier standard avrebbe
+/// servito subito. Il rimedio, lo scrive il fornitore stesso nel messaggio, e'
+/// cambiare corsia.
+///
+/// Nel caso normale non si arriva qui: il driver openai consuma quel rifiuto da
+/// se', rimandando la richiesta senza il campo. Questa e' la difesa per cio'
+/// che il driver non governa — un `service_tier` PINNATO dal chiamante, che non
+/// scavalca di proposito, e un endpoint compat che lo emetta per conto suo.
+///
+/// Vale la causa e non la classe perche' il vocabolario di wire e' grossolano
+/// (`transient`) e questa distinzione la usa il solo gateway: allargare
+/// `ClasseErrore` per un caso che mcp-core non consuma sarebbe attrito senza
+/// consumatori.
+fn corsia_differibile_esaurita(
+    provider: &str,
+    causa: Option<CausaErrore>,
+    failure: &CallFailure,
+) -> bool {
+    if causa != Some(CausaErrore::FlexCapacity) {
+        return false;
+    }
+    tracing::warn!(
+        provider,
+        status = failure.status,
+        class = failure.class,
+        "gateway: la corsia differibile non ha capacita' -> niente retry/cooldown, \
+         il motore fara' failover cross-provider"
+    );
+    true
 }
 
 /// Registra il cooldown di un fallimento transitorio i cui retry sono esauriti,
@@ -1615,7 +1741,7 @@ pub async fn complete(
     // UNA volta e passati a `run_complete`: wrapper esterno e deadline interna
     // devono venire dallo stesso numero, o il primo scade prima della seconda.
     let base = state.runtime_snapshot().await.timeouts;
-    let timeouts = request_timeouts(&base, body.run_timeout_secs);
+    let timeouts = request_timeouts(&base, body.run_timeout_secs, body.deferrable);
     let budget = timeouts.request_budget;
     match tokio::time::timeout(budget, run_complete(&state, &body, timeouts)).await {
         Ok(Ok(resp)) => Json(resp).into_response(),
@@ -2811,11 +2937,16 @@ mod tests {
     ///
     /// I test di questo modulo misurano il FLUSSO (retry, cooldown, corpo
     /// d'errore); il catalogo ha i suoi test in `tassonomia_errori`.
-    const RIGHE_DI_PROVA: [(&str, &str, Option<i16>, Option<&str>); 5] = [
+    const RIGHE_DI_PROVA: [(&str, &str, Option<i16>, Option<&str>); 6] = [
         ("*", "insufficient_quota", None, Some("credit_exhausted")),
         ("*", "rate_limit_exceeded", None, Some("rate_limit")),
         ("*", "invalid_request_error", None, Some("malformed_request")),
         ("groq", "tokens", None, None),
+        // La corsia differibile piena (mig 0729): senza,
+        // `la_corsia_differibile_piena_non_apre_cooldown` misurerebbe un
+        // catalogo che in produzione non esiste, e il 429 cadrebbe su Transient
+        // proprio come nel difetto che la guardia evita.
+        ("openai", "flex_unavailable", Some(429), Some("flex_capacity")),
         // Il valore sintetico del quirk openrouter (mig 0709): senza,
         // `un_402_di_ammissione_non_mette_il_fornitore_in_cooldown` misurerebbe
         // un catalogo che in produzione non esiste.
@@ -3368,6 +3499,7 @@ mod tests {
             stop: None,
             user: None,
             parallel_tool_calls: None,
+            deferrable: false,
         }
     }
 
@@ -4280,6 +4412,73 @@ mod tests {
             EsclusioneDichiarata::Nessuna,
             "nulla da propagare al registro di mcp-core: il fornitore e' sano"
         );
+    }
+
+    /// Body VERBATIM misurato il 17/08/2026 (gpt-5.2-pro, service_tier=flex).
+    /// Arriva con `Retry-After: 300`, che e' precisamente cio' che il ramo
+    /// Transient onorerebbe: il cooldown durerebbe cinque minuti.
+    const BODY_429_CORSIA_PIENA: &str = r#"{"error":{"message":"Flex tier does not have sufficient resources available to fulfill your request. You can try again later in case more resources are available, or change service_tier=default.","type":"resource_unavailable","param":null,"code":"flex_unavailable"}}"#;
+
+    /// LA GUARDIA sulla causa: un 429 della corsia differibile non ritenta e non
+    /// mette in cooldown, perche' il fornitore e' sano e al tier standard
+    /// avrebbe risposto subito.
+    ///
+    /// Il caso normale non arriva qui — il driver openai ripiega da se' — ma un
+    /// `service_tier` PINNATO dal chiamante ci arriva di proposito, e senza
+    /// questa guardia toglierebbe dalla selezione un modello che sta servendo.
+    ///
+    /// Attraversa `run_fallback` e il corpo REALE, e guarda la CONSEGUENZA (il
+    /// registro dei cooldown, il numero di chiamate, il wire), non il nome della
+    /// classe: la classe di wire resta `transient` di proposito.
+    ///
+    /// MUTAZIONE: togliere la guardia `verdetto.causa == FlexCapacity` da
+    /// `complete_with_retry` -> il ramo Transient ritenta e marca cooldown,
+    /// rossi il primo e il secondo assert col difetto reale.
+    #[tokio::test]
+    async fn la_corsia_differibile_piena_non_apre_cooldown() {
+        let p = RealBodyProvider::new("openai", 429, BODY_429_CORSIA_PIENA);
+        let contatore = p.clone();
+        let resolved = vec![ResolvedProvider {
+            provider: p,
+            model: "gpt-5.2-pro".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+
+        let err = run_fallback(
+            &resolved,
+            &cooldown,
+            &vocabolario_di_prova(),
+            &req(),
+            // `strict = true`: coi retry ABILITATI, cioe' nella condizione in
+            // cui il ramo Transient ritenterebbe davvero. Con `false` il test
+            // resterebbe verde anche senza la guardia.
+            true,
+            TEST_PER_ATTEMPT,
+            far_deadline(),
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("il fornitore ha rifiutato la corsia");
+
+        assert!(
+            !cooldown.is_in_cooldown("openai"),
+            "il fornitore serve al tier standard: escluderlo toglierebbe dalla \
+             selezione anche le richieste ordinarie"
+        );
+        assert!(
+            !cooldown.is_model_in_cooldown("openai", "gpt-5.2-pro"),
+            "e nemmeno la coppia: la corsia e' piena, il modello no"
+        );
+        assert_eq!(
+            contatore.calls.load(Ordering::SeqCst),
+            1,
+            "nessun retry: ripresentarsi nella stessa corsia prende lo stesso \
+             rifiuto, e il Retry-After di 300s mangerebbe il budget"
+        );
+
+        let details = err.details.expect("details presenti");
+        assert_eq!(details["failures"][0]["status"], 429);
     }
 
     /// Il fornitore SANO che fallisce per una causa deterministica non produce

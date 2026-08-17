@@ -389,6 +389,42 @@ pub enum CausaErrore {
     /// messaggi distinti tutti nella forma «can only afford N» con N fra 432 e
     /// 64811 token, cioe' mai zero. Vedi mig 0709.
     RequestExceedsCredit,
+    /// Il tier DIFFERIBILE non ha capacita' adesso: il fornitore e' sano e
+    /// serve, e' la corsia scontata a essere piena.
+    ///
+    /// MISURATA sull'API reale il 17/08/2026 (`gpt-5.2-pro`, `service_tier:
+    /// "flex"`), due volte di fila con lo stesso esito:
+    ///
+    /// ```text
+    /// HTTP 429  Retry-After: 300
+    /// {"error":{"message":"Flex tier does not have sufficient resources
+    ///  available to fulfill your request. You can try again later ... or
+    ///  change service_tier=default",
+    ///  "type":"resource_unavailable","code":"flex_unavailable"}}
+    /// ```
+    ///
+    /// NON e' un tetto di frequenza, benche' condivida lo status E porti un
+    /// `Retry-After`: un rate limit riguarda QUANTO chiediamo e passa
+    /// aspettando, questo riguarda in QUALE corsia lo chiediamo e passa
+    /// cambiando corsia — immediatamente, con la stessa richiesta e lo stesso
+    /// modello. Il rimedio, lo scrive il fornitore stesso nel messaggio, e'
+    /// `service_tier=default`, non l'attesa.
+    ///
+    /// Quei 300 secondi sono la ragione per cui la guardia non e' teorica:
+    /// senza, la classe `Transient` onorerebbe il `Retry-After` e metterebbe la
+    /// coppia in cooldown per cinque minuti — cioe' toglierebbe dalla selezione
+    /// un modello che al tier standard avrebbe risposto subito.
+    ///
+    /// Percio' i due rimedi si escludono: attendere e poi ritentare in flex
+    /// spende il tempo che il differibile aveva, e mettere in cooldown il
+    /// fornitore lo toglie anche alle richieste ordinarie, che il tier standard
+    /// avrebbe servito subito. Nel caso normale il driver openai la CONSUMA da
+    /// se' (ripiego in-driver al tier standard) e questa causa non arriva
+    /// nemmeno alla chain; la riga di catalogo e la guardia in
+    /// `complete_with_retry` sono la difesa per il caso in cui vi arrivi
+    /// comunque — un `service_tier` pinnato dal chiamante, o un endpoint
+    /// compat che lo emetta per conto proprio.
+    FlexCapacity,
 }
 
 impl CausaErrore {
@@ -405,6 +441,7 @@ impl CausaErrore {
             "auth_denied" => Some(Self::AuthDenied),
             "request_too_large" => Some(Self::RequestTooLarge),
             "request_exceeds_credit" => Some(Self::RequestExceedsCredit),
+            CAUSA_FLEX_CAPACITY => Some(Self::FlexCapacity),
             _ => None,
         }
     }
@@ -420,6 +457,7 @@ impl CausaErrore {
             Self::AuthDenied => "auth_denied",
             Self::RequestTooLarge => "request_too_large",
             Self::RequestExceedsCredit => "request_exceeds_credit",
+            Self::FlexCapacity => CAUSA_FLEX_CAPACITY,
         }
     }
 
@@ -439,8 +477,74 @@ impl CausaErrore {
             // (`EsclusioneDichiarata::Credito`). Qui il fornitore serve, e la
             // conseguenza giusta e' nessun cooldown piu' failover cross-provider.
             Self::RequestExceedsCredit => ClasseErrore::RequestExceedsCredit,
+            // Transitorio E' cio' che questa causa descrive del FORNITORE: la
+            // capacita' opportunistica tornera' da se'. La classe non e' pero'
+            // cio' che decide la conseguenza nel gateway — lo fa la CAUSA, in
+            // `complete_with_retry`, che su di essa non ritenta e non marca
+            // cooldown: il vocabolario di wire e' grossolano, questo e' fine, e
+            // la coppia e' esattamente il taglio delle regole M e Q.
+            //
+            // Sul WIRE `transient` senza `retry_after_seconds` produce
+            // `EsclusioneDichiarata::Nessuna` in mcp-core (verificato: la
+            // funzione e' `provider_failure::dal_fallimento`, e il residuo lo
+            // scrive `run_fallback` LEGGENDOLO dal registro cooldown, che qui
+            // resta intonso). Non serve percio' una `ClasseErrore` nuova, che
+            // sarebbe un allargamento del vocabolario condiviso per una
+            // distinzione che il solo gateway usa.
+            Self::FlexCapacity => ClasseErrore::Transient,
         }
     }
+}
+
+/// Il valore che il catalogo (mig 0729) associa a [`CausaErrore::FlexCapacity`].
+/// Costante e non letterale sparso: la stessa stringa e' la `causa` di quella
+/// riga, e `dal_db`/`come_stringa` sono l'andata e il ritorno dello stesso ponte.
+pub const CAUSA_FLEX_CAPACITY: &str = "flex_capacity";
+
+/// I valori con cui openai DICHIARA il rifiuto per capacita' della corsia
+/// differibile. Sono DUE perche' il fornitore ne emette due nello STESSO body —
+/// `code: "flex_unavailable"` e `type: "resource_unavailable"` (misurato il
+/// 17/08/2026) — e nessuno dei due basta da solo:
+///
+/// - il `code` e' il piu' specifico, ma un fornitore che lo rinominasse
+///   lascerebbe il `type` a dire la stessa cosa;
+/// - il `type` e' piu' generico e potrebbe un giorno accompagnare altro, ma su
+///   429 e con la corsia differibile chiesta e' quello.
+///
+/// Il criterio e' l'uguaglianza ESATTA su un candidato qualunque, mai un
+/// `contains`: e' la stessa disciplina del catalogo, dove le varianti sono
+/// RIGHE e non pattern.
+pub const CODICI_CAPACITA_FLEX: &[&str] = &["flex_unavailable", "resource_unavailable"];
+
+/// Lo status con cui lo dichiara. E' 429 come un tetto di frequenza, e non lo
+/// e': la coppia (status, codice) e' cio' che li distingue, non lo status da
+/// solo — e' la ragione per cui la chiave del catalogo ha entrambi.
+pub const STATUS_CAPACITA_FLEX: u16 = 429;
+
+/// Questo errore e' il rifiuto per capacita' della corsia DIFFERIBILE?
+///
+/// PUNTO UNICO (regola L) del riconoscimento in Rust: lo interroga il driver
+/// che ha appena mandato una richiesta flex, per decidere se ripiegare al tier
+/// standard. Il catalogo DB dichiara le stesse coppie per l'altro percorso
+/// (`giudica`, quando l'errore arriva fino alla chain): due encoding dello
+/// stesso fatto divergerebbero al primo ritocco, e a tenerli insieme e' il test
+/// `i_codici_del_driver_sono_quelli_seminati_nel_catalogo`, che legge le righe
+/// dalla migrazione vera (regola O).
+///
+/// Guarda TUTTI i candidati e non il solo `code` esportato: e' l'aver collassato
+/// sei campi in uno che ha reso invisibile il credito esaurito di openai per 14
+/// giorni. Non filtra sul fornitore di proposito — risponde a «e' questo
+/// rifiuto?», e chi la chiama e' gia' il driver che la corsia l'ha chiesta.
+pub fn e_capacita_flex(err: &anyhow::Error) -> bool {
+    err.chain()
+        .find_map(|c| c.downcast_ref::<ProviderHttpError>())
+        .is_some_and(|http| {
+            http.status == STATUS_CAPACITA_FLEX
+                && http
+                    .candidati
+                    .iter()
+                    .any(|c| CODICI_CAPACITA_FLEX.contains(&c.valore.as_str()))
+        })
 }
 
 /// Che cosa il catalogo dice di un valore. Tre stati, e sono distinti perche' i
@@ -1570,6 +1674,139 @@ mod tests {
              Ogni voce qui e' una riga di `nexus_provider_error_code_unknown` che \
              nascerebbe al primo minuto di esercizio"
         );
+    }
+
+    // ── Corsia differibile: il 429 che non e' un tetto di frequenza ──────────
+
+    /// Il corpo VERBATIM misurato il 17/08/2026 su `gpt-5.2-pro` con
+    /// `service_tier: "flex"`, due volte di fila con lo stesso esito.
+    const CORPO_CAPACITA_FLEX: &str = r#"{"error":{"message":"Flex tier does not have sufficient resources available to fulfill your request. You can try again later in case more resources are available, or change service_tier=default. Visit the docs at https://platform.openai.com/docs/guides/flex-processing to learn more.","type":"resource_unavailable","param":null,"code":"flex_unavailable"}}"#;
+
+    /// Col catalogo VERO, quel 429 e' `flex_capacity` e non un tetto di
+    /// frequenza. La differenza non e' accademica: la classe di wire e'
+    /// `Transient` in entrambi i casi, ma e' la CAUSA a governare la
+    /// conseguenza, e senza la riga il verdetto sarebbe `DalloStatus` — cioe'
+    /// «deciso perche' non sappiamo», la casella in cui openai e' rimasto 14
+    /// giorni.
+    ///
+    /// MUTAZIONE: togliere dalla mig 0729 la riga sul `code` -> il verdetto
+    /// resta `flex_capacity` grazie al `type` (ed e' il punto per cui le righe
+    /// sono due); toglierle ENTRAMBE -> `DalloStatus`, rosso.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_corsia_differibile_piena_e_dichiarata(pool: PgPool) {
+        let mappa = catalogo_reale(&pool).await;
+        let voce = VoceCorpus {
+            provider: "openai",
+            status: 429,
+            body: CORPO_CAPACITA_FLEX,
+            classe_oggi: ClasseErrore::Transient,
+            differenza_dichiarata: None,
+            troncato_in_persistenza: false,
+        };
+        let v = verdetto_del_corpo(&mappa, &voce);
+        assert_eq!(v.causa, Some(CausaErrore::FlexCapacity));
+        assert_eq!(
+            v.fonte,
+            FonteVerdetto::Dichiarata {
+                campo: CampoErrore::ErrorCode,
+                valore: "flex_unavailable".into(),
+                causa: CausaErrore::FlexCapacity,
+            },
+            "decide il codice piu' specifico, che ha il rango maggiore"
+        );
+        // La classe di WIRE non cambia (`transient`): la capacita' opportunistica
+        // torna da se', ed e' cio' che la classe descrive del fornitore. A non
+        // ritentare e a non marcare cooldown e' la guardia sulla CAUSA in
+        // `complete_with_retry`.
+        assert_eq!(v.classe, ClasseErrore::Transient);
+        assert!(
+            v.non_dichiarati.is_empty(),
+            "entrambi i valori del body sono a catalogo: {:?}",
+            v.non_dichiarati
+        );
+        assert!(v.discordanti.is_empty(), "{:?}", v.discordanti);
+    }
+
+    /// PONTE fra i due riconoscimenti dello stesso fatto (regola L): il driver
+    /// openai decide il ripiego in-driver con [`e_capacita_flex`], che confronta
+    /// i valori in Rust; il catalogo li dichiara per l'altro percorso, quando
+    /// l'errore arriva fino alla chain. Due encoding divergerebbero al primo
+    /// ritocco, e senza questo test la divergenza sarebbe silenziosa — il
+    /// driver smetterebbe di ripiegare e nulla diventerebbe rosso.
+    ///
+    /// MUTAZIONE: togliere `"resource_unavailable"` da [`CODICI_CAPACITA_FLEX`]
+    /// -> rosso qui, perche' la riga di catalogo non ha piu' un gemello.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn i_codici_del_driver_sono_quelli_seminati_nel_catalogo(pool: PgPool) {
+        let dal_db: Vec<String> = sqlx::query_scalar(
+            "SELECT valore FROM nexus_provider_error_code \
+             WHERE causa = $1 AND provider = 'openai' ORDER BY valore",
+        )
+        .bind(CAUSA_FLEX_CAPACITY)
+        .fetch_all(&pool)
+        .await
+        .expect("catalogo leggibile");
+        let mut nel_codice: Vec<String> =
+            CODICI_CAPACITA_FLEX.iter().map(|s| s.to_string()).collect();
+        nel_codice.sort();
+        assert_eq!(
+            dal_db, nel_codice,
+            "i valori che il driver riconosce e quelli che il catalogo dichiara \
+             devono essere gli stessi: se divergono, uno dei due percorsi smette \
+             di vedere il rifiuto senza che niente fallisca"
+        );
+        // E lo status e' quello della chiave: la coppia (status, valore) e' cio'
+        // che distingue questo 429 da un tetto di frequenza.
+        let status: Vec<i16> = sqlx::query_scalar(
+            "SELECT http_status FROM nexus_provider_error_code WHERE causa = $1",
+        )
+        .bind(CAUSA_FLEX_CAPACITY)
+        .fetch_all(&pool)
+        .await
+        .expect("catalogo leggibile");
+        assert!(
+            status.iter().all(|s| *s as u16 == STATUS_CAPACITA_FLEX),
+            "status del catalogo: {status:?}"
+        );
+    }
+
+    /// Il predicato del driver attraversa il PRODUTTORE reale
+    /// (`ProviderHttpError::from_response`, che e' quello che il client
+    /// costruisce sul non-2xx), non un `ProviderHttpError` composto a mano coi
+    /// candidati gia' scelti: sarebbe fissare qui l'assunto da verificare.
+    #[test]
+    fn il_driver_riconosce_il_rifiuto_dal_corpo_vero() {
+        let err: anyhow::Error = crate::providers::ProviderHttpError::from_response(
+            "openai",
+            429,
+            CORPO_CAPACITA_FLEX.to_string(),
+        )
+        .into();
+        assert!(e_capacita_flex(&err));
+
+        // Il credito esaurito e' 429 anch'esso, e NON deve far ripiegare: li'
+        // cambiare corsia non serve a niente.
+        let credito: anyhow::Error = crate::providers::ProviderHttpError::from_response(
+            "openai",
+            429,
+            r#"{"error":{"message":"You have no credits remaining.","type":"insufficient_quota","code":"credit_balance_exhausted"}}"#.to_string(),
+        )
+        .into();
+        assert!(!e_capacita_flex(&credito));
+
+        // Stesso codice su uno status diverso non e' questo rifiuto: la coppia
+        // e' la chiave.
+        let altro_status: anyhow::Error = crate::providers::ProviderHttpError::from_response(
+            "openai",
+            503,
+            CORPO_CAPACITA_FLEX.to_string(),
+        )
+        .into();
+        assert!(!e_capacita_flex(&altro_status));
+
+        // Un errore che non e' HTTP affatto (trasporto) non e' nemmeno un
+        // candidato: nessun downcast, nessun ripiego.
+        assert!(!e_capacita_flex(&anyhow::anyhow!("connessione caduta")));
     }
 
     #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]

@@ -396,6 +396,7 @@ mod tests {
             stop: None,
             user: None,
             parallel_tool_calls: None,
+            deferrable: false,
         }
     }
 

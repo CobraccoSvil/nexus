@@ -245,6 +245,27 @@ pub struct LlmRequest {
     /// `None` = assente (il default lo decide il fornitore).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
+    /// Questa richiesta puo' ATTENDERE: nessuno la sta guardando, e qualche
+    /// minuto in piu' non costa niente a nessuno.
+    ///
+    /// E' una proprieta' del CHIAMANTE e non del fornitore: solo chi ha chiesto
+    /// il lavoro sa se l'esito serve adesso (un turno di chat) o quando arriva
+    /// (un titolo di conversazione, una nota di documentazione, un riassunto).
+    /// Percio' viaggia nel contratto e non in un setting: un setting direbbe
+    /// «tutte le richieste di questo fornitore sono differibili», che e' falso
+    /// per costruzione — lo stesso modello serve entrambi i casi.
+    ///
+    /// Non e' un tier: e' cio' da cui un tier si DEDUCE. Il driver la traduce
+    /// nel dialetto del proprio fornitore (openai: `service_tier: "flex"`,
+    /// meta' prezzo e nessuna garanzia di latenza) e chi non ha un modo di
+    /// dirlo la ignora — un campo sconosciuto e' il solo verso che puo' fare
+    /// danno. Un [`Self::service_tier`] esplicito VINCE: chi pinna un tier ha
+    /// deciso, e questa e' una dichiarazione di intento, non una decisione.
+    ///
+    /// `false` (il default, e cio' che manda un client che non conosce il
+    /// campo) = comportamento storico.
+    #[serde(default)]
+    pub deferrable: bool,
     pub metadata: RequestMetadata,
 }
 
@@ -280,6 +301,7 @@ impl LlmRequest {
             stop: None,
             user: None,
             parallel_tool_calls: None,
+            deferrable: false,
             metadata,
         }
     }
@@ -340,6 +362,7 @@ mod test_wire_run_timeout {
             stop: None,
             user: None,
             parallel_tool_calls: None,
+            deferrable: false,
             metadata: RequestMetadata {
                 tenant_id: "t".into(),
                 user_id: "u".into(),
@@ -429,6 +452,7 @@ mod test_wire_campi_nativi_openai {
             stop: None,
             user: None,
             parallel_tool_calls: None,
+            deferrable: false,
             metadata: RequestMetadata {
                 tenant_id: "t".into(),
                 user_id: "u".into(),

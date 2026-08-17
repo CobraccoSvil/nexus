@@ -67,6 +67,15 @@ pub const DEFAULT_RUN_TIMEOUT_SECS: u64 = 300;
 pub const CLIENT_BUDGET_MARGIN_SECS: u64 = 15;
 /// Sotto i 2 turni garantiti il concetto stesso di run multi-turno non esiste.
 const MIN_TURNS_FLOOR: u64 = 2;
+/// Budget end-to-end di una richiesta DIFFERIBILE. Seed: mig **0729**.
+pub const DEFAULT_FLEX_REQUEST_BUDGET_SECS: u64 = 900;
+/// Cap per-tentativo di una richiesta DIFFERIBILE. Seed: mig **0729**.
+pub const DEFAULT_FLEX_PER_ATTEMPT_SECS: u64 = 900;
+
+/// Chiave DB: budget end-to-end delle richieste differibili.
+pub const KEY_FLEX_REQUEST_BUDGET: &str = "gateway.flex.request_budget_seconds";
+/// Chiave DB: cap per-tentativo delle richieste differibili.
+pub const KEY_FLEX_PER_ATTEMPT: &str = "gateway.flex.per_attempt_seconds";
 
 /// Chiave DB: turni minimi garantiti per un run.
 pub const KEY_MIN_GUARANTEED_TURNS: &str = "agent.llm.min_guaranteed_turns";
@@ -102,6 +111,41 @@ pub struct LlmTimeouts {
     /// beneficio buttata via per i run lunghi. Conservando il grezzo, la
     /// ri-derivazione da' lo stesso risultato di una lettura fresca dal DB.
     pub complete_cap: Duration,
+    /// Budget dedicato alle richieste DIFFERIBILI, quando qualcuno lo dichiara.
+    ///
+    /// `None` = NESSUNA dichiarazione, e non «una dichiarazione uguale
+    /// all'ordinario»: sono stati diversi e li distingue il tipo (regola Q).
+    /// Coincidevano in una prima stesura, e il difetto non era teorico —
+    /// [`Self::for_run`] ri-applicava come dichiarazione i budget ordinari del
+    /// run PRECEDENTE, cosi' che ri-derivare su un run piu' corto lasciasse in
+    /// piedi i numeri di quello lungo. Lo ha trovato
+    /// `ri_derivare_senza_db_equivale_a_rileggere_dal_db`, che esisteva gia'.
+    pub flex: Option<BudgetFlex>,
+}
+
+/// I budget delle richieste DIFFERIBILI (`LlmRequest.deferrable`).
+///
+/// PERCHE' SONO NUMERI PROPRI. I budget ordinari nascono dalla domanda «quanti
+/// turni deve poter completare il run che contiene questa chiamata»; una
+/// richiesta differibile non appartiene a nessun run con turni da garantire —
+/// e' un titolo di conversazione, un riassunto, una nota — quindi quella
+/// domanda per lei non si pone. Il tier differibile dei fornitori (openai
+/// `flex`) costa la meta' e in cambio non promette latenza: dimensionarlo su un
+/// run lo farebbe scadere prima di servire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetFlex {
+    /// Deadline end-to-end (chain e retry inclusi) di una richiesta differibile.
+    pub request_budget: Duration,
+    /// Cap su un singolo tentativo, GIA' limitato al tetto di trasporto.
+    pub per_attempt: Duration,
+    /// Il cap per-tentativo CHIESTO, prima del taglio al tetto di trasporto.
+    ///
+    /// E' un campo e non una variabile locale di [`LlmTimeouts::with_flex`] per
+    /// un solo motivo: rendere DERIVABILE il fatto che il taglio ci sia stato
+    /// ([`LlmTimeouts::flex_limitato_dal_trasporto`]). Senza, «il budget
+    /// differibile e' 900» e «e' 900 ma ne valgono 300» sarebbero lo stesso
+    /// stato, e il secondo si scoprirebbe solo cronometrando le chiamate.
+    pub per_attempt_chiesto: Duration,
 }
 
 impl LlmTimeouts {
@@ -130,6 +174,86 @@ impl LlmTimeouts {
             stream_timeout: Duration::from_secs(stream_secs.max(1)),
             min_guaranteed_turns: turns,
             complete_cap: Duration::from_secs(complete_secs.max(1)),
+            // Nessun budget differibile DICHIARATO: una richiesta differibile
+            // vale quanto le altre. Lo dichiara [`Self::with_flex`], che i soli
+            // `resolve` chiamano dopo aver letto il DB.
+            flex: None,
+        }
+    }
+
+    /// Dichiara i budget delle richieste DIFFERIBILI, dai settings (regola G).
+    ///
+    /// DUE VINCOLI, e il secondo e' quello che conta:
+    ///
+    /// 1. i budget differibili non possono ACCORCIARE quelli ordinari: un tier
+    ///    che serve a dare piu' tempo non puo' toglierne;
+    /// 2. il cap per-tentativo non puo' superare il TETTO DI TRASPORTO
+    ///    ([`Self::client_http_timeout`]), che e' congelato nel client reqwest
+    ///    all'avvio. Una deadline logica piu' lunga del trasporto non allunga
+    ///    la chiamata: la fa morire al tetto con un errore di TRASPORTO opaco
+    ///    al posto dell'`attempt_timeout` strutturato su cui il motore fa
+    ///    failover (regola M) — e' lo stesso vincolo che `request_timeouts`
+    ///    dichiara gia' per il verso opposto. Non si alza il tetto per farci
+    ///    stare il differibile: quel numero governa anche lo STREAMING, che non
+    ///    ha una deadline logica propria, e allungarlo li' sarebbe un effetto
+    ///    collaterale che il tier differibile non ha alcun titolo a produrre.
+    ///
+    /// Il taglio non e' silenzioso: [`Self::flex_limitato_dal_trasporto`] lo
+    /// dichiara da un campo, e `resolve` lo mette a WARN all'avvio. Per un
+    /// budget differibile davvero piu' lungo si alza `gateway.stream_timeout_seconds`,
+    /// che e' il numero da cui il tetto di trasporto discende.
+    ///
+    /// Il budget END-TO-END invece NON si taglia: comprende la chain e i retry,
+    /// cioe' piu' chiamate da al piu' un tetto ciascuna, e limitarlo al tetto
+    /// di una sola chiamata negherebbe al differibile proprio il secondo
+    /// tentativo per cui il budget esiste.
+    pub fn with_flex(mut self, request_budget_secs: u64, per_attempt_secs: u64) -> Self {
+        let tetto_trasporto = self.client_http_timeout();
+        let request_budget =
+            Duration::from_secs(request_budget_secs.max(1)).max(self.request_budget);
+        let per_attempt_chiesto =
+            Duration::from_secs(per_attempt_secs.max(1)).max(self.per_attempt);
+        self.flex = Some(BudgetFlex {
+            request_budget,
+            per_attempt: per_attempt_chiesto.min(tetto_trasporto).min(request_budget),
+            per_attempt_chiesto,
+        });
+        self
+    }
+
+    /// Il cap per-tentativo differibile e' stato accorciato dal tetto di
+    /// trasporto? Predicato DERIVATO dai campi, non una stringa nei log: chi
+    /// deve allarmarsi (o solo capire perche' una chiamata differibile e'
+    /// scaduta prima del previsto) legge questo, non la prosa di un WARN.
+    /// Falso quando nessun budget e' dichiarato: li' non c'e' niente da tagliare.
+    pub fn flex_limitato_dal_trasporto(&self) -> bool {
+        self.flex
+            .is_some_and(|f| f.per_attempt_chiesto > f.per_attempt)
+    }
+
+    /// Gli stessi timeout, nella forma che vale per una richiesta DIFFERIBILE.
+    ///
+    /// Proiezione e non derivazione: i budget differibili sono gia' risolti in
+    /// [`Self::with_flex`], qui si limitano a prendere il posto di quelli
+    /// ordinari. Senza dichiarazione ritorna se stesso: una richiesta
+    /// differibile vale quanto le altre, che e' il comportamento di sempre.
+    ///
+    /// NON rispetta `request_budget * min_turns <= run_timeout`, ed e'
+    /// deliberato: quell'invariante protegge un run multi-turno, e una
+    /// richiesta differibile non ne ha uno (il chiamante infatti non dichiara
+    /// `run_timeout_secs` — e dove lo dichiara, e' il run a vincere: vedi
+    /// `request_timeouts` nel gateway).
+    pub fn per_flex(&self) -> Self {
+        let Some(f) = self.flex else {
+            return *self;
+        };
+        Self {
+            request_budget: f.request_budget,
+            per_attempt: f.per_attempt,
+            client_budget: f
+                .request_budget
+                .saturating_add(Duration::from_secs(CLIENT_BUDGET_MARGIN_SECS)),
+            ..*self
         }
     }
 
@@ -144,14 +268,34 @@ impl LlmTimeouts {
     /// invariati. Punto unico della scelta: la stessa `run_secs_utile` che usa
     /// `resolve_for_run`.
     pub fn for_run(&self, run_timeout_secs: Option<u64>) -> Self {
-        match run_secs_utile(run_timeout_secs) {
-            Some(run) => Self::derive(
-                run,
-                self.complete_cap.as_secs(),
-                self.stream_timeout.as_secs(),
-                self.min_guaranteed_turns,
-            ),
-            None => *self,
+        let Some(run) = run_secs_utile(run_timeout_secs) else {
+            return *self;
+        };
+        Self::derive(
+            run,
+            self.complete_cap.as_secs(),
+            self.stream_timeout.as_secs(),
+            self.min_guaranteed_turns,
+        )
+        .con_la_dichiarazione_differibile_di(self)
+    }
+
+    /// Ri-applica la dichiarazione differibile di `altro`, che la ri-derivazione
+    /// sul run avrebbe perso.
+    ///
+    /// I budget differibili NON discendono dal run, quindi non si ricalcolano:
+    /// si ri-applicano dai valori CHIESTI, gli stessi che `resolve` ha letto dal
+    /// DB. Passare i CONCESSI renderebbe la ri-derivazione lossy, come lo
+    /// sarebbe passare `per_attempt` al posto di `complete_cap` a
+    /// [`Self::derive`]. E un'ASSENZA resta un'assenza: e' l'unico modo perche'
+    /// un run piu' corto ottenga i propri budget invece di quelli, ormai
+    /// sganciati, del run precedente.
+    fn con_la_dichiarazione_differibile_di(self, altro: &Self) -> Self {
+        match altro.flex {
+            Some(f) => {
+                self.with_flex(f.request_budget.as_secs(), f.per_attempt_chiesto.as_secs())
+            }
+            None => self,
         }
     }
 
@@ -211,7 +355,23 @@ impl LlmTimeouts {
         let complete = setting_u64(db, KEY_COMPLETE_TIMEOUT, DEFAULT_COMPLETE_TIMEOUT_SECS).await;
         let stream = setting_u64(db, KEY_STREAM_TIMEOUT, DEFAULT_STREAM_TIMEOUT_SECS).await;
         let turns = setting_u64(db, KEY_MIN_GUARANTEED_TURNS, DEFAULT_MIN_GUARANTEED_TURNS).await;
-        Self::derive(run, complete, stream, turns)
+        let flex_budget =
+            setting_u64(db, KEY_FLEX_REQUEST_BUDGET, DEFAULT_FLEX_REQUEST_BUDGET_SECS).await;
+        let flex_attempt =
+            setting_u64(db, KEY_FLEX_PER_ATTEMPT, DEFAULT_FLEX_PER_ATTEMPT_SECS).await;
+        let t = Self::derive(run, complete, stream, turns).with_flex(flex_budget, flex_attempt);
+        if let (true, Some(f)) = (t.flex_limitato_dal_trasporto(), t.flex) {
+            tracing::warn!(
+                chiesto_s = f.per_attempt_chiesto.as_secs(),
+                concesso_s = f.per_attempt.as_secs(),
+                tetto_trasporto_s = t.client_http_timeout().as_secs(),
+                chiave = KEY_FLEX_PER_ATTEMPT,
+                "timeout: il cap per-tentativo differibile e' piu' lungo del tetto di \
+                 trasporto e vale quest'ultimo. Per allungarlo davvero si alza \
+                 gateway.stream_timeout_seconds, da cui il tetto discende"
+            );
+        }
+        t
     }
 
     /// Come [`resolve`], ma per un run di durata NOTA.
@@ -439,6 +599,84 @@ mod tests {
     fn un_run_piu_lungo_del_default_ottiene_il_suo_budget() {
         let t = LlmTimeouts::derive(600, 1000, 300, DEFAULT_MIN_GUARANTEED_TURNS);
         assert_eq!(t.request_budget, Duration::from_secs(150));
+    }
+
+    /// Senza dichiarazione, una richiesta differibile vale quanto le altre: il
+    /// meccanismo resta SPENTO finche' il DB non lo dichiara (regola G).
+    #[test]
+    fn senza_dichiarazione_il_differibile_non_esiste() {
+        let t = LlmTimeouts::derive(300, 120, 300, 4);
+        assert_eq!(t.flex, None, "l'assenza e' uno stato, non un valore che coincide");
+        assert_eq!(t.per_flex(), t, "nessun budget dichiarato = nessun budget diverso");
+        assert!(!t.flex_limitato_dal_trasporto());
+    }
+
+    /// IL vincolo del lotto: il cap per-tentativo differibile non puo' superare
+    /// il TETTO DI TRASPORTO, congelato nel client reqwest all'avvio. Una
+    /// deadline logica oltre il tetto non allunga la chiamata, la fa morire con
+    /// un errore di trasporto opaco al posto dell'`attempt_timeout` strutturato
+    /// (regola M).
+    ///
+    /// Coi valori LIVE il taglio C'E': tetto 300s contro i 900s che la doc del
+    /// tier differibile suggerisce. Il meccanismo funziona, ma non per il tempo
+    /// che si crede, e il predicato lo DICHIARA invece di lasciarlo scoprire
+    /// cronometrando (regola Q).
+    ///
+    /// MUTAZIONE: togliere `.min(tetto_trasporto)` da `with_flex` -> rosso qui.
+    #[test]
+    fn il_cap_differibile_non_supera_il_tetto_di_trasporto() {
+        let t = LlmTimeouts::derive(300, 120, 300, 4).with_flex(900, 900);
+        assert_eq!(t.client_http_timeout(), Duration::from_secs(300), "premessa");
+        let f = t.flex.expect("dichiarato");
+        assert_eq!(f.per_attempt, Duration::from_secs(300), "tagliato al tetto");
+        assert_eq!(f.per_attempt_chiesto, Duration::from_secs(900));
+        assert!(
+            t.flex_limitato_dal_trasporto(),
+            "il taglio dev'essere leggibile da un campo, non solo dai log"
+        );
+        // Il budget END-TO-END non si taglia: comprende chain e retry, cioe'
+        // piu' chiamate da al piu' un tetto ciascuna.
+        assert_eq!(f.request_budget, Duration::from_secs(900));
+        assert_eq!(t.per_flex().request_budget, Duration::from_secs(900));
+        assert_eq!(t.per_flex().per_attempt, Duration::from_secs(300));
+    }
+
+    /// Alzare lo streaming alza il tetto, e con lui il cap concesso: e' la
+    /// strada che il WARN indica all'operatore, e deve funzionare davvero.
+    #[test]
+    fn alzando_il_tetto_il_differibile_ottiene_cio_che_chiede() {
+        let t = LlmTimeouts::derive(300, 120, 900, 4).with_flex(900, 900);
+        assert_eq!(t.flex.expect("dichiarato").per_attempt, Duration::from_secs(900));
+        assert!(!t.flex_limitato_dal_trasporto());
+    }
+
+    /// Il tier differibile serve a dare piu' tempo: non puo' toglierne. Un
+    /// setting piu' stretto degli ordinari non li accorcia.
+    #[test]
+    fn il_differibile_non_puo_accorciare_gli_ordinari() {
+        let t = LlmTimeouts::derive(300, 120, 300, 4).with_flex(10, 10);
+        let f = t.flex.expect("dichiarato");
+        assert_eq!(f.request_budget, t.request_budget);
+        assert_eq!(f.per_attempt, t.per_attempt);
+        assert_eq!(t.per_flex(), t, "dichiarare meno non cambia niente");
+    }
+
+    /// La dichiarazione differibile non discende dal run e non deve sparire
+    /// ri-derivando su un run noto.
+    ///
+    /// MUTAZIONE: togliere il `.with_flex(...)` da `for_run` -> rosso.
+    #[test]
+    fn ri_derivare_su_un_run_noto_conserva_il_differibile() {
+        let t = LlmTimeouts::derive(300, 120, 300, 4).with_flex(900, 900);
+        for run in [60_u64, 240, 600, 900] {
+            let f = t.for_run(Some(run)).flex.expect("la dichiarazione sopravvive");
+            assert_eq!(
+                f.request_budget,
+                Duration::from_secs(900),
+                "run {run}: il budget differibile e' un numero proprio"
+            );
+            assert_eq!(f.per_attempt_chiesto, Duration::from_secs(900));
+        }
     }
 
     #[test]

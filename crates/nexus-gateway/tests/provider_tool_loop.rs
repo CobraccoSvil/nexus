@@ -196,6 +196,7 @@ fn richiesta_turno1(modello: &str) -> LlmRequest {
         stop: None,
         user: None,
         parallel_tool_calls: None,
+        deferrable: false,
     }
 }
 
@@ -265,6 +266,7 @@ fn richiesta_turno2(modello: &str, risposta1: &LlmResponse) -> LlmRequest {
         stop: None,
         user: None,
         parallel_tool_calls: None,
+        deferrable: false,
     }
 }
 

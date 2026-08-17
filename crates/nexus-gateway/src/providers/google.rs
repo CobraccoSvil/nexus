@@ -3444,6 +3444,7 @@ mod tests {
             stop: None,
             user: None,
             parallel_tool_calls: None,
+            deferrable: false,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
 
@@ -3501,6 +3502,7 @@ mod tests {
                 stop: None,
                 user: None,
                 parallel_tool_calls: None,
+                deferrable: false,
             };
             serde_json::to_value(build_request_body(&req, GoogleThinking::Absent))
                 .expect("serializza")
@@ -3544,6 +3546,7 @@ mod tests {
             stop: None,
             user: None,
             parallel_tool_calls: None,
+            deferrable: false,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(
@@ -3581,6 +3584,7 @@ mod tests {
             stop: None,
             user: None,
             parallel_tool_calls: None,
+            deferrable: false,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(
@@ -3628,6 +3632,7 @@ mod tests {
             stop: None,
             user: None,
             parallel_tool_calls: None,
+            deferrable: false,
         }
     }
 
@@ -3686,6 +3691,7 @@ mod tests {
             stop: None,
             user: None,
             parallel_tool_calls: None,
+            deferrable: false,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(json["contents"][0]["role"], "model");
@@ -3822,6 +3828,7 @@ mod tests {
             stop: None,
             user: None,
             parallel_tool_calls: None,
+            deferrable: false,
         }
     }
 
@@ -3958,6 +3965,7 @@ mod tests {
             stop: None,
             user: None,
             parallel_tool_calls: None,
+            deferrable: false,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(json["contents"][0]["role"], "model");
@@ -3991,6 +3999,7 @@ mod tests {
             stop: None,
             user: None,
             parallel_tool_calls: None,
+            deferrable: false,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert!(json["contents"][0]["parts"][0]
@@ -4182,6 +4191,7 @@ mod tests {
             stop: None,
             user: None,
             parallel_tool_calls: None,
+            deferrable: false,
         }
     }
 
@@ -4330,6 +4340,7 @@ mod tests {
             stop: None,
             user: None,
             parallel_tool_calls: None,
+            deferrable: false,
         }
     }
 
@@ -5275,6 +5286,7 @@ mod tests {
             stop: None,
             user: None,
             parallel_tool_calls: None,
+            deferrable: false,
         };
 
         crate::server::billing::record_and_declare(&pool, &req, &mut resp).await;
