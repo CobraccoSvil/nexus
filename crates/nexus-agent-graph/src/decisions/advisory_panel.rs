@@ -170,6 +170,15 @@ pub struct AdvisorySynthesis {
     pub risks: Vec<Value>,
     /// Raccomandazioni unite, deduplicate mantenendo l'ordine.
     pub recommendations: Vec<String>,
+    /// PROVE ESEGUIBILI unite da tutti i pareri validi, nella forma GREZZA in
+    /// cui le figure le hanno dichiarate.
+    ///
+    /// Grezze e non tipizzate, ed e' il confine (regola L): qui si AGGREGA, e
+    /// la dedup e' quella generica sul valore. Chi le interpreta — vocabolario
+    /// delle attese, attribuzione dell'origine, dedup per (comando, attesa) — e'
+    /// il punto unico [`super::piano_di_verifica`], che sola sa da QUALE
+    /// apparato arriva questa sintesi: il panel non lo sa e non deve inventarlo.
+    pub prove: Vec<Value>,
     /// Decisione architetturale CONTESA, se una figura ne ha dichiarata una:
     /// `{topic, options[]}`. Vince la PRIMA dichiarazione valida nell'ordine
     /// degli `outcomes` (deterministico e replay-stabile; le successive sono
@@ -200,6 +209,7 @@ impl AdvisorySynthesis {
             "requirements": self.requirements.iter().map(Requirement::to_value).collect::<Vec<_>>(),
             "risks": self.risks,
             "recommendations": self.recommendations,
+            super::piano_di_verifica::CAMPO_PROVE: self.prove,
             "contested_decision": self.contested_decision,
         })
     }
@@ -212,6 +222,9 @@ struct Advice {
     requirements: Vec<Requirement>,
     risks: Vec<Value>,
     recommendations: Vec<String>,
+    /// Prove eseguibili dichiarate da questa figura, grezze (vedi
+    /// [`AdvisorySynthesis::prove`]).
+    prove: Vec<Value>,
     /// Decisione architetturale CONTESA dichiarata da questa figura (innesca il
     /// dibattito a tesi contrapposte). Gia' normalizzata alla frontiera.
     contested_decision: Option<Value>,
@@ -350,6 +363,14 @@ fn extract_advice(outcome: &Value) -> Option<Advice> {
         requirements: requirement_list(advisory, "requirements"),
         risks,
         recommendations: string_list(advisory, "recommendations"),
+        // Grezze: la validazione la fa chi le interpreta, che e' l'unico a
+        // conoscere il vocabolario delle attese (regola L). Una voce
+        // malformata verra' scartata li', non attribuita qui.
+        prove: advisory
+            .get(super::piano_di_verifica::CAMPO_PROVE)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
         // Ri-validata QUI e non data per buona: l'outcome puo' arrivare da un
         // sub-run vecchio o da un percorso che non e' passato dal normalizzatore
         // del tool (regola M: si valida al confine che si attraversa).
@@ -412,6 +433,7 @@ pub fn compose_advisory_synthesis(
     let mut requirements: Vec<Requirement> = Vec::new();
     let mut recommendations: Vec<String> = Vec::new();
     let mut risks: Vec<Value> = Vec::new();
+    let mut prove: Vec<Value> = Vec::new();
     let mut contested_decision: Option<Value> = None;
     for a in &advices {
         match a.verdict {
@@ -426,6 +448,7 @@ pub fn compose_advisory_synthesis(
         }
         extend_dedup(&mut requirements, a.requirements.clone());
         extend_dedup(&mut recommendations, a.recommendations.clone());
+        extend_dedup(&mut prove, a.prove.clone());
         risks.extend(a.risks.iter().cloned());
         // Prima dichiarazione valida nell'ordine degli outcomes: un dibattito ha
         // UN oggetto conteso, non uno per figura (le successive sono ignorate).
@@ -481,6 +504,7 @@ pub fn compose_advisory_synthesis(
         requirements,
         risks,
         recommendations,
+        prove,
         contested_decision,
     })
 }

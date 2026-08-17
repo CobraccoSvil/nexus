@@ -272,6 +272,22 @@ pub struct FinalGateConfig {
     /// provare non e' una domanda che si possa porre a t=0, e la pone chi
     /// verifica al registro delle scritture.
     pub codice_eseguibile_criterion: Option<crate::runtime::ports::CriterionSpec>,
+    /// Criterio «le PROVE che questo run ha dichiarato sono superate?»
+    /// (mig 0737), gia' costruito dal motore. `None` = criterio spento.
+    ///
+    /// E' l'unico criterio il cui contenuto non e' cablato: gli altri sette
+    /// portano una domanda decisa a monte, questo porta le prove che il
+    /// Consiglio e l'agente hanno EMESSO per QUESTO task. Il catalogo delle
+    /// domande cablate e' incompleto per costruzione — MISURATO il 17/08/2026,
+    /// dove su un progetto senza porte il gate non aveva niente da chiedere e
+    /// ha chiuso «passato» due volte su un test non eseguibile.
+    ///
+    /// Arriva PRONTO per la stessa ragione degli altri tre qui sopra: la
+    /// politica di ammissione e i parametri della misura stanno nel DB, che
+    /// questo crate non legge. Il nodo vi aggiunge la sola parte che conosce —
+    /// il PIANO, che a t=0 non esiste ancora: i panel non hanno deliberato e
+    /// l'agente non ha dichiarato niente.
+    pub piano_verifica_criterion: Option<crate::runtime::ports::CriterionSpec>,
     /// ADR 0036: catena di verifica PER-AMBIENTE risolta a monte (profilo
     /// inferito da LLM in `project_verify_profiles`, step marcati gate=true).
     /// Un criterio `run_command` per step, nell'ordine del profilo (es.
@@ -358,6 +374,7 @@ impl Default for FinalGateConfig {
             ui_styling_criterion: None,
             static_render_criterion: None,
             codice_eseguibile_criterion: None,
+            piano_verifica_criterion: None,
             verify_steps: Vec::new(),
             verify_profile_missing: false,
             origine_frontend: None,
@@ -805,6 +822,28 @@ impl FinalGateNode {
         //      verifica si pone al registro delle scritture, non allo stato.
         criteria.extend(self.cfg.codice_eseguibile_criterion.clone());
 
+        // (5g) LE PROVE CHE QUESTO RUN HA DICHIARATO. I sei criteri qui sopra
+        //      sono un CATALOGO, e un catalogo di domande cablate e' incompleto
+        //      per costruzione: nessuna lista conterra' mai «crea un libro via
+        //      POST, rileggilo via GET, controlla che sia nella tabella e
+        //      cancellalo». Quella prova la sa scrivere solo chi conosce il
+        //      task — e il sistema la sa gia' scrivere: per il caso del
+        //      17/08/2026 il Consiglio aveva emesso 17 requisiti, ma in PROSA, e
+        //      il riscontro ha potuto dire soltanto «applicati=0,
+        //      non_applicati=2, non_verificabili=15».
+        //      Il PIANO si compone QUI perche' e' l'unico punto in cui lo stato
+        //      del run e' visibile: le prove dei panel advisory viaggiano
+        //      nell'`extra` (la stessa chiave con due scrittori dei requisiti) e
+        //      quelle dell'agente nella sua dichiarazione di chiusura. L'ordine
+        //      e' load-bearing e incarna «giudice != worker»: chi non ha scritto
+        //      il codice viene prima, e l'esecutore puo' solo AGGIUNGERE.
+        criteria.extend(
+            self.cfg
+                .piano_verifica_criterion
+                .clone()
+                .map(|c| Self::criterio_col_piano(c, state)),
+        );
+
         // (6) design_verify (P5): per i task figma l'agente non puo' chiudere con
         //     una resa visiva sotto soglia che HA GIA' misurato con nexus_visual_compare.
         //     Deterministico: prende l'ultimo similarity_score dalla history (niente
@@ -914,6 +953,25 @@ impl FinalGateNode {
         }
 
         criteria
+    }
+
+    /// Il criterio del piano con dentro le PROVE di questo run (mig 0737).
+    ///
+    /// L'ORDINE delle due fonti e' load-bearing e incarna «giudice != worker»:
+    /// gli apparati advisory, che non hanno scritto il codice, vengono PRIMA;
+    /// l'agente esecutore in coda. La dedup conserva la prima provenienza,
+    /// quindi l'esecutore puo' AGGIUNGERE prove ma non intestarsi ne'
+    /// sostituire quelle di chi lo giudica.
+    fn criterio_col_piano(
+        criterio: CriterionSpec,
+        state: &AgentState,
+    ) -> CriterionSpec {
+        use crate::decisions::piano_di_verifica::{con_piano, PianoDiVerifica, PIANO_VERIFICA_KEY};
+        let piano = PianoDiVerifica::unione(&[
+            PianoDiVerifica::from_value(state.extra.get(PIANO_VERIFICA_KEY)),
+            PianoDiVerifica::da_dichiarazione(state.declared_outcome.as_ref()),
+        ]);
+        con_piano(criterio, &piano)
     }
 
     /// Il criterio docs (mig 0676): estratto per tenere piatto `build_criteria`
@@ -2147,6 +2205,128 @@ mod tests {
     }
 
     // ── build_criteria deterministico ────────────────────────────────────────────
+
+    /// IL NODO E' L'UNICO PUNTO CHE VEDE LO STATO, ed e' li' che il piano entra
+    /// nella spec (mig 0737). Senza questo test la catena resterebbe verde con
+    /// un criterio che nasce SEMPRE VUOTO: le prove del Consiglio viaggiano
+    /// nell'`extra`, quelle dell'agente nella dichiarazione di chiusura, e chi
+    /// non le raccoglie qui non le raccoglie mai piu' (regola O).
+    ///
+    /// Copre anche la precedenza «giudice != worker»: il Consiglio viene PRIMA,
+    /// e l'agente che ridichiara la stessa prova non se ne intesta la
+    /// provenienza.
+    ///
+    /// MUTAZIONE ESEGUITA: togliere `PianoDiVerifica::da_dichiarazione` dalla
+    /// composizione in `build_criteria` lascia una sola prova nella spec e il
+    /// test rosseggia — l'agente perderebbe il proprio canale, e con lui il
+    /// caso in cui NESSUN apparato advisory ha deliberato.
+    #[test]
+    fn build_criteria_raccoglie_il_piano_dallo_stato_e_dalla_dichiarazione() {
+        use crate::decisions::piano_di_verifica::{
+            criterio_piano, OriginePiano, ParametriPiano, PianoDiVerifica, CHIAVE_PROVE,
+            CRITERION_TYPE,
+        };
+        let prova_consiglio = serde_json::json!({
+            "descrizione": "il file di test parte col runner del progetto",
+            "comando": "node --test calcolatrice.test.js",
+            "attesa": {"tipo": "exit_code", "codice": 0},
+            "origine": "council",
+        });
+        let cfg = FinalGateConfig {
+            structural_criteria_enabled: false,
+            piano_verifica_criterion: criterio_piano(
+                None,
+                &ParametriPiano {
+                    abilitato: true,
+                    timeout_s: 60.0,
+                    max_prove: 20,
+                },
+            ),
+            ..Default::default()
+        };
+        let node = node_with(cfg, Arc::new(StubCriteriaRunner::with_results(vec![])));
+        let mut st = software_state();
+        st.extra.insert(
+            crate::decisions::PIANO_VERIFICA_KEY.to_string(),
+            Value::Array(vec![prova_consiglio.clone()]),
+        );
+        st.declared_outcome = Some(serde_json::json!({
+            "outcome": "done",
+            "summary": "fatto",
+            "prove": [
+                prova_consiglio,
+                {
+                    "descrizione": "la sorgente si carica",
+                    "comando": "node --check calcolatrice.js",
+                    "attesa": {"tipo": "exit_code", "codice": 0},
+                },
+            ],
+        }));
+
+        let crits = node.build_criteria(&st);
+        let criterio = crits
+            .iter()
+            .find(|c| c.criterion_type == CRITERION_TYPE)
+            .expect("il criterio del piano e' fra quelli costruiti");
+        let piano = PianoDiVerifica::from_value(criterio.spec.get(CHIAVE_PROVE));
+        assert_eq!(piano.len(), 2, "la prova ripetuta non si conta due volte");
+        assert_eq!(piano.prove[0].origine, OriginePiano::Consiglio);
+        assert_eq!(piano.prove[1].origine, OriginePiano::Agente);
+        assert_eq!(piano.prove[1].comando, "node --check calcolatrice.js");
+    }
+
+    /// PIANO ASSENTE: il criterio nasce lo stesso, con un piano VUOTO scritto
+    /// nella spec, e il resto del gate e' bit-identico a prima.
+    ///
+    /// E' il requisito «il criterio nasce anche a configurazione mancante»: un
+    /// criterio che sparisse quando nessuno ha dichiarato prove renderebbe il
+    /// silenzio indistinguibile da una verifica, che e' il difetto del 17/08.
+    #[test]
+    fn senza_prove_il_criterio_nasce_col_piano_vuoto_e_il_resto_non_cambia() {
+        use crate::decisions::piano_di_verifica::{
+            criterio_piano, ParametriPiano, CHIAVE_PROVE, CRITERION_TYPE,
+        };
+        let parametri = ParametriPiano {
+            abilitato: true,
+            timeout_s: 60.0,
+            max_prove: 20,
+        };
+        let st = software_state();
+        let spento = node_with(
+            FinalGateConfig {
+                structural_criteria_enabled: false,
+                ..Default::default()
+            },
+            Arc::new(StubCriteriaRunner::with_results(vec![])),
+        );
+        let acceso = node_with(
+            FinalGateConfig {
+                structural_criteria_enabled: false,
+                piano_verifica_criterion: criterio_piano(None, &parametri),
+                ..Default::default()
+            },
+            Arc::new(StubCriteriaRunner::with_results(vec![])),
+        );
+        let prima: Vec<String> = spento
+            .build_criteria(&st)
+            .iter()
+            .map(|c| c.criterion_type.clone())
+            .collect();
+        let dopo = acceso.build_criteria(&st);
+        let tipi: Vec<String> = dopo.iter().map(|c| c.criterion_type.clone()).collect();
+        assert_eq!(
+            tipi,
+            [prima, vec![CRITERION_TYPE.to_string()]].concat(),
+            "il criterio si accoda e non riordina nulla"
+        );
+        let criterio = dopo.last().expect("il criterio del piano");
+        assert_eq!(
+            criterio.spec[CHIAVE_PROVE],
+            serde_json::json!([]),
+            "il piano vuoto si scrive lo stesso: «nessuno ha dichiarato prove» \
+             non e' «non ho letto il piano»"
+        );
+    }
 
     #[test]
     fn build_criteria_ordine_e_opzionali() {

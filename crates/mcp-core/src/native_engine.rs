@@ -407,6 +407,11 @@ pub struct NativeRunInput {
     /// stato, due scrittori. Distinti da `pre_run_advisory_synthesis`, che porta
     /// il solo panel scelto per l'enforcement.
     pub pre_run_advisory_requirements: nexus_agent_graph::decisions::EmittedRequirements,
+    /// Le PROVE ESEGUIBILI emesse dagli apparati advisory (mig 0737), per il
+    /// ramo CLASSICO. Stessa disciplina dei requisiti: in overlap resta vuoto
+    /// qui e le prove arrivano dalla release della barriera — una chiave, due
+    /// scrittori (`decisions::PIANO_VERIFICA_KEY`).
+    pub pre_run_advisory_piano: nexus_agent_graph::decisions::PianoDiVerifica,
     /// Barriera di scrittura advisory (overlap consiglio ∥ run, mig 0606).
     /// `Some(rx)` = il run parte SUBITO mentre i panel deliberano: la prima
     /// modifica attendera' il loro verdetto (gate nel ToolDispatchNode). `None`
@@ -1420,6 +1425,11 @@ async fn load_final_gate_config(db: &PgPool, project_id: Option<Uuid>) -> FinalG
         // provare lo dira' il registro delle scritture al momento della
         // verifica, e a t=0 quel registro non ha ancora niente da dire.
         codice_eseguibile_criterion: criterio_codice_eseguibile(db).await,
+        // Le prove che il run ha DICHIARATO (mig 0737). Come lo stile e il
+        // codice eseguibile: nulla del filesystem serve qui. Il PIANO non entra
+        // a t=0 — i panel non hanno deliberato e l'agente non ha dichiarato
+        // niente — e lo inietta il nodo, che e' l'unico a vedere lo stato.
+        piano_verifica_criterion: criterio_piano_verifica(db).await,
         // Escalation su non-convergenza del gate (mig 0577): al cap di max_cycles con
         // criteri oggettivi ancora falliti, cede il turno all'executor per promuovere
         // un modello piu' capace invece di chiudere secco. `max_escalations` RIUSA la
@@ -1537,6 +1547,77 @@ pub(crate) async fn criterio_codice_eseguibile(
             abilitato,
             timeout_s: setting_f64(db, "agent.final_gate.codice_eseguibile_timeout_s", 30.0).await,
             max_file: setting_usize(db, "agent.final_gate.codice_eseguibile_max_file", 50).await,
+        },
+    )
+}
+
+/// Il criterio «le PROVE dichiarate per questo run sono superate?» (mig 0737),
+/// quando la chiave lo accende.
+///
+/// TUTTA la configurazione si risolve QUI (regola G) e viaggia nella spec, come
+/// per [`criterio_codice_eseguibile`]: il runner non legge il DB, e la misura
+/// resta leggibile in cio' che ha dichiarato di aver usato.
+///
+/// La POLITICA di ammissione non e' un elenco nuovo: e' il vocabolario del gate
+/// duale, letto dalle STESSE chiavi (regola L). Una prova e' un `run_command` a
+/// tutti gli effetti e viene classificata come tale — il piano di verifica non
+/// e' un canale privilegiato per eseguire comandi.
+///
+/// Politica ASSENTE (una chiave illeggibile, la soglia fuori vocabolario) non
+/// impedisce al criterio di nascere: nasce, non esegue nulla, e DICHIARA di non
+/// aver potuto misurare. Un criterio che sparisse quando la configurazione manca
+/// sarebbe un gate silenziosamente inerte — cioe' il punto di partenza.
+///
+/// `pub(crate)` per una ragione di MISURA e non di riuso, la stessa degli altri
+/// due costruttori: la configurazione la scrive il DB, e un test che la
+/// fabbricasse a mano fisserebbe proprio l'assunto da verificare (regola O).
+pub(crate) async fn criterio_piano_verifica(
+    db: &PgPool,
+) -> Option<nexus_agent_graph::runtime::ports::CriterionSpec> {
+    use nexus_agent_graph::decisions::piano_di_verifica::{
+        criterio_piano, ParametriPiano, PoliticaEsecuzione,
+    };
+    let abilitato = setting_bool(db, "agent.final_gate.piano_verifica_enabled", false).await;
+    if !abilitato {
+        return None;
+    }
+    let soglia = nexus_auth::get_setting(db, "agent.final_gate.piano_prova_criticita_max")
+        .await
+        .and_then(|v| serde_json::from_value(serde_json::Value::String(v.trim().to_string())).ok());
+    let politica = soglia.map(|soglia| {
+        let gate = load_step_gate_dispatch(db, 0);
+        (soglia, gate)
+    });
+    let politica = match politica {
+        Some((soglia, gate)) => {
+            let gate = gate.await;
+            Some(PoliticaEsecuzione {
+                soglia,
+                // Lo stesso vocabolario dei mutatori del gate HITL e del gate
+                // duale: un secondo elenco divergerebbe al primo tool aggiunto.
+                mutatori: nexus_auth::get_csv_setting(db, "agent.tools.result_cache_mutators")
+                    .await,
+                regole: gate.rules,
+                rigenerabili: gate.rebuildable_artifacts,
+                osservazione: gate.observation_commands,
+            })
+        }
+        None => {
+            tracing::warn!(
+                target: "mcp_core::native_engine",
+                "piano_di_verifica acceso senza una soglia di criticita' leggibile \
+                 (`agent.final_gate.piano_prova_criticita_max`): il criterio nascera' e \
+                 dichiarera' di non aver potuto eseguire alcuna prova"
+            );
+            None
+        }
+    };
+    criterio_piano(
+        politica.as_ref(),
+        &ParametriPiano {
+            abilitato,
+            timeout_s: setting_f64(db, "agent.final_gate.prova_timeout_s", 60.0).await,
+            max_prove: setting_usize(db, "agent.final_gate.piano_max_prove", 20).await,
         },
     )
 }
@@ -3807,6 +3888,38 @@ fn history_entry_to_message(v: &serde_json::Value) -> Option<Message> {
 /// ASSENTI resta INTATTO (None -> il `RouterNode` decide come oggi), comportamento
 /// INVARIATO. Il primario PYTHON (`run_via_brain`) NON passa di qui: ri-classifica
 /// internamente nel router_node.
+/// I DUE prodotti degli apparati advisory nello stato iniziale: i requisiti in
+/// prosa, che chi rivede usa come metro, e le PROVE eseguibili, che il final
+/// gate esegue (mig 0737).
+///
+/// Nel ramo CLASSICO entrano qui; in overlap arrivano dalla release della
+/// barriera — una chiave, due scrittori, per entrambi. La chiave NON si scrive
+/// se non c'e' nulla: in overlap il vuoto significa «non ancora», e scriverlo
+/// qui lo renderebbe indistinguibile da «i panel non hanno posto vincoli» /
+/// «nessun apparato ha emesso prove», che e' l'informazione opposta — ed e'
+/// quella su cui il criterio del piano decide se ha misurato qualcosa.
+///
+/// Insieme e non in due blocchi in linea: la disciplina e' la stessa per
+/// entrambi, e vederla in un punto solo e' cio' che impedisce di applicarla a
+/// meta' quando domani si aggiungera' un terzo prodotto.
+fn scrivi_prodotti_advisory(
+    extra: &mut serde_json::Map<String, serde_json::Value>,
+    input: &NativeRunInput,
+) {
+    if !input.pre_run_advisory_requirements.is_empty() {
+        extra.insert(
+            nexus_agent_graph::decisions::ADVISORY_REQUIREMENTS_KEY.to_string(),
+            input.pre_run_advisory_requirements.to_value(),
+        );
+    }
+    if !input.pre_run_advisory_piano.is_empty() {
+        extra.insert(
+            nexus_agent_graph::decisions::PIANO_VERIFICA_KEY.to_string(),
+            input.pre_run_advisory_piano.to_value(),
+        );
+    }
+}
+
 fn build_initial_state(input: &NativeRunInput) -> AgentState {
     use nexus_agent_graph::state::MessageContent;
 
@@ -3932,18 +4045,7 @@ fn build_initial_state(input: &NativeRunInput) -> AgentState {
                 .to_string(),
         ),
     );
-    // Requisiti degli apparati advisory: entrano nello stato QUI nel ramo
-    // classico, e dalla release della barriera in overlap (unica chiave, due
-    // scrittori — vedi `decisions::advisory_requirements`). Non si scrive la
-    // chiave se non c'e' nulla: in overlap il vuoto significa «non ancora», e
-    // scriverlo qui la renderebbe indistinguibile da «i panel non hanno posto
-    // vincoli», che e' l'informazione opposta.
-    if !input.pre_run_advisory_requirements.is_empty() {
-        extra.insert(
-            nexus_agent_graph::decisions::ADVISORY_REQUIREMENTS_KEY.to_string(),
-            input.pre_run_advisory_requirements.to_value(),
-        );
-    }
+    scrivi_prodotti_advisory(&mut extra, input);
     let mut declared_outcome = None;
     let mut stop_reason = None;
     let mut result = None;
@@ -4816,6 +4918,7 @@ mod tests {
             pre_run_advisory_synthesis: None,
             pre_run_advisory_source: None,
             pre_run_advisory_requirements: Default::default(),
+            pre_run_advisory_piano: Default::default(),
             // Nessun overlap nei test di costruzione dello stato: la barriera e'
             // esercitata dai test del ToolDispatchNode.
             advisory_gate: None,

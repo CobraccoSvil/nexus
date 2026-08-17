@@ -1592,6 +1592,45 @@ assert_single "codice-eseguibile" 'fn classifica_esecuzione' \
 assert_single "piano-di-prova" 'fn pianifica_prova' \
   'crates/nexus-agent-graph/src/decisions/codice_eseguibile.rs' crates
 
+# «Quali PROVE ESEGUIBILI ha dichiarato questo run?» (2026-08-18, mig 0737)
+#
+# Il gemello del 0734 su un altro asse: quello ha aggiunto l'OTTAVA domanda
+# cablata, questo toglie al catalogo il ruolo di limite. Il catalogo e'
+# incompleto per costruzione — nessuna lista conterra' mai la prova che solo chi
+# conosce il task sa scrivere — e il sistema le prove le sa gia' emettere: per il
+# caso del 17/08 il Consiglio ne aveva scritte 17, ma in PROSA, e il riscontro ha
+# potuto dire soltanto `non_verificabili=15`.
+#
+# Tre definizioni protette, ognuna per un difetto diverso:
+#  - `classifica_piano`: il verdetto sul run. Una seconda copia deciderebbe da
+#    se' se una prova fallita boccia;
+#  - `giudica_prova`: il giudizio su UNA prova. E' il confine fra «il modello
+#    propone» e «la macchina emette il verdetto»: una seconda copia e' il posto
+#    in cui rientra un giudizio del modello;
+#  - `PoliticaEsecuzione`: cosa e' ammesso eseguire. Il piano NON e' un canale
+#    privilegiato, e un secondo elenco di comandi pericolosi qui divergerebbe da
+#    quello del gate duale — che e' l'unico vocabolario legittimo.
+assert_single "piano-di-verifica" 'fn classifica_piano' \
+  'crates/nexus-agent-graph/src/decisions/piano_di_verifica.rs' crates
+assert_single "giudizio-della-prova" 'fn giudica_prova' \
+  'crates/nexus-agent-graph/src/decisions/piano_di_verifica.rs' crates
+assert_single "ammissione-della-prova" 'struct PoliticaEsecuzione' \
+  'crates/nexus-agent-graph/src/decisions/piano_di_verifica.rs' crates
+
+# Il CONSUMATORE, non la sola definizione (regola O): senza l'ammissione
+# invocata nel runner, la politica resterebbe perfetta e mai interrogata — e il
+# piano diventerebbe la scorciatoia con cui un comando arbitrario aggira i
+# presidi del resto del sistema, con tutti i test del criterio verdi.
+if grep -q 'politica.ammissione(prova)' \
+     crates/mcp-core/src/agent_graph_adapter/criteria_runner.rs; then
+  echo "OK prova-non-privilegiata: il runner classifica ogni prova prima di eseguirla"
+else
+  echo "!! prova-non-privilegiata: il runner non chiama piu' 'politica.ammissione'." >&2
+  echo "   Una prova e' un run_command proposto da un MODELLO: senza quella" >&2
+  echo "   chiamata il piano di verifica esegue qualunque riga di shell." >&2
+  fail=1
+fi
+
 # «Quale pagina di QUESTO run va misurata?» (2026-08-11, mig 0699)
 #
 # Domanda NUOVA e distinta da quella del rilevatore qui sotto. Nasce da due

@@ -51,6 +51,7 @@ use uuid::Uuid;
 use nexus_agent_graph::decisions::browser_dialogue;
 use nexus_agent_graph::decisions::codice_eseguibile;
 use nexus_agent_graph::decisions::pagina_del_run;
+use nexus_agent_graph::decisions::piano_di_verifica;
 use nexus_agent_graph::decisions::risorse_pagina::{PoliticaRisorse, VerdettoRisorse};
 use nexus_agent_graph::decisions::static_render;
 use nexus_agent_graph::runtime::ports::{
@@ -74,6 +75,19 @@ pub(crate) const DOCS_NOT_NEEDED: &str = "not_needed";
 /// Chiave del fatto "delega completata" nelle spec dei criteri strutturali
 /// (docs e completion_confirmed la leggono entrambe).
 pub(crate) const CHIAVE_SUBAGENT_COMPLETED: &str = "subagent_completed";
+
+/// Chiavi dell'evidence condivise da piu' criteri, con UN solo punto di
+/// scrittura come le tre qui sopra. Non sono cosmesi: `render_failed_block` e
+/// `failed_criteria_meta` le rileggono per NOME dal `Value` opaco, quindi un
+/// refuso in una delle occorrenze sparse non rompe la compilazione — rende muto
+/// il rimando che l'agente riceve per correggere.
+const CHIAVE_EXIT_CODE: &str = "exit_code";
+const CHIAVE_OUTPUT_EXCERPT: &str = "output_excerpt";
+const CHIAVE_REQUESTS_OBSERVED: &str = "requests_observed";
+const CHIAVE_METHOD: &str = "method";
+/// «Non c'e' nulla da misurare» (N/A), che resta un pass — distinto da
+/// [`non_misurato`], che dichiara di non aver potuto guardare.
+const CHIAVE_SKIPPED: &str = "skipped";
 
 /// Timeout di default per i criteri (parita' col Python: `30.0s`). I criteri con
 /// `timeout_s` valorizzato (solo il build) lo sovrascrivono.
@@ -275,7 +289,7 @@ impl FinalGateCriteriaRunnerAdapter {
             CriterionOutcome::measured(passed),
             json!({
                 "command": cmd,
-                "exit_code": v.exit_code,
+                CHIAVE_EXIT_CODE: v.exit_code,
                 "suite_outcome": v.outcome.as_str(),
                 "suite_origine": match &v.origine {
                     crate::suite_verification::OrigineEsito::Eseguita => "eseguita",
@@ -284,7 +298,7 @@ impl FinalGateCriteriaRunnerAdapter {
                 "flaky_tests": v.test_instabili,
                 "passed_tests": v.stats.passed,
                 "failed_tests": v.stats.failed,
-                "output_excerpt": excerpt,
+                CHIAVE_OUTPUT_EXCERPT: excerpt,
                 "output_total_chars": v.testo.chars().count(),
                 "output_truncated": v.testo.chars().count() > MAX_OUTPUT_SUITE,
                 "baseline_exit_code": baseline_exit,
@@ -635,6 +649,13 @@ impl FinalGateCriteriaRunnerAdapter {
             t if t == codice_eseguibile::CRITERION_TYPE => {
                 self.check_codice_eseguibile(&c.spec, timeout_s).await
             }
+            // Le PROVE che questo run ha DICHIARATO. Nessuna attesa di
+            // readiness: le prove sono comandi, e chi ne dichiara una che
+            // interroga un servizio la scrive col proprio tempo di attesa —
+            // qui non si indovina quale bersaglio avesse in mente.
+            t if t == piano_di_verifica::CRITERION_TYPE => {
+                self.check_piano_verifica(&c.spec, timeout_s).await
+            }
             "file_exists" => {
                 self.check_file_exists(&c.spec, &c.expected, timeout_s)
                     .await
@@ -848,7 +869,7 @@ task_complete (outcome + summary)"
         let actual_exit = outcome.exit_code;
         let raw = outcome_text(&outcome);
         let expected_exit = expected
-            .get("exit_code")
+            .get(CHIAVE_EXIT_CODE)
             .and_then(Value::as_i64)
             .unwrap_or(0);
         // `Option::==` faceva di un exit code ASSENTE lo stesso `false` di uno
@@ -949,9 +970,9 @@ task_complete (outcome + summary)"
         let total_chars = raw.chars().count();
         let mut ev = json!({
             "command": cmd,
-            "exit_code": actual_exit,
+            CHIAVE_EXIT_CODE: actual_exit,
             "expected_exit": expected_exit,
-            "output_excerpt": excerpt,
+            CHIAVE_OUTPUT_EXCERPT: excerpt,
             "output_truncated": total_chars > max_chars,
             "output_total_chars": total_chars,
             "build_errors": build_errors,
@@ -1021,7 +1042,7 @@ task_complete (outcome + summary)"
             // nulla alla verifica. Resta un pass, come da sempre.
             return (
                 CriterionOutcome::Passed,
-                json!({ "skipped": "service_logs_clean: command/patterns mancanti (N/A)" }),
+                json!({ CHIAVE_SKIPPED: "service_logs_clean: command/patterns mancanti (N/A)" }),
             );
         }
         let raw = match self
@@ -1057,7 +1078,7 @@ task_complete (outcome + summary)"
         });
         if !passed {
             evidence["verdict"] = json!("errori runtime nei log dei servizi");
-            evidence["output_excerpt"] = json!(format!(
+            evidence[CHIAVE_OUTPUT_EXCERPT] = json!(format!(
                 "ERRORI RUNTIME nei log dei servizi: il codice e' stato scritto ma il flusso reale FALLISCE.\n{}\nAGISCI: trova e correggi la causa (es. applica le migrazioni / crea le tabelle mancanti, sistema la rotta), poi RIESERCITA il flusso reale e verifica che gli errori siano spariti.",
                 hits.join("\n")
             ));
@@ -1078,7 +1099,7 @@ task_complete (outcome + summary)"
             return (false, json!({ "error": "spec.url obbligatorio" }));
         }
         let method = spec
-            .get("method")
+            .get(CHIAVE_METHOD)
             .and_then(Value::as_str)
             .unwrap_or("GET")
             .to_uppercase();
@@ -1416,6 +1437,132 @@ task_complete (outcome + summary)"
         esito_codice(&fatti)
     }
 
+    /// Le PROVE che questo run ha dichiarato sono superate? Il criterio e' il
+    /// punto unico [`piano_di_verifica`]: qui SOLO l'I/O (ammissione,
+    /// esecuzione del comando, raccolta dell'osservazione) e la traduzione
+    /// dell'esito.
+    ///
+    /// Ogni prova attraversa TRE cancelli, in quest'ordine, e l'ordine e'
+    /// load-bearing:
+    ///
+    ///  1. **ammissione**: la prova e' un `run_command`, e viene classificata
+    ///     come tale dal punto unico del gate duale. Cio' che sta oltre la
+    ///     soglia dichiarata non si esegue — il piano di verifica non e' un
+    ///     canale privilegiato per eseguire comandi;
+    ///  2. **budget**: oltre il tetto la prova resta DICHIARATA, non una prova
+    ///     in piu' e nemmeno un silenzio. Il tetto conta le prove AMMESSE, non
+    ///     quelle dichiarate: dieci prove rifiutate non devono consumare il
+    ///     budget di quella che conta;
+    ///  3. **esecuzione e giudizio**: il comando gira dal punto unico
+    ///     [`ToolExecutor`], e il verdetto lo emette [`piano_di_verifica::giudica_prova`]
+    ///     sui campi STRUTTURATI dell'esito (regola M), mai sul testo.
+    async fn check_piano_verifica(
+        &self,
+        spec: &Value,
+        timeout_s: f64,
+    ) -> (CriterionOutcome, Value) {
+        let piano = piano_di_verifica::PianoDiVerifica::from_value(
+            spec.get(piano_di_verifica::CHIAVE_PROVE),
+        );
+        let max_prove = spec
+            .get(piano_di_verifica::CHIAVE_MAX_PROVE)
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        // Politica assente: NON si esegue niente e lo si dichiara. Eseguire
+        // senza sapere cosa sia ammesso e' esattamente il canale privilegiato
+        // che la politica esiste per negare, e assolvere in silenzio
+        // rimetterebbe in piedi il gate che chiude col beneficio del dubbio.
+        let politica = piano_di_verifica::PoliticaEsecuzione::from_value(
+            spec.get(piano_di_verifica::CHIAVE_POLITICA),
+        );
+        let mut esiti: Vec<piano_di_verifica::EsitoProva> = Vec::with_capacity(piano.len());
+        let mut budget = max_prove;
+        for prova in piano.prove {
+            let esito = self
+                .esito_della_prova(&prova, politica.as_ref(), &mut budget, timeout_s)
+                .await;
+            esiti.push(piano_di_verifica::EsitoProva { prova, esito });
+        }
+        esito_piano(&esiti)
+    }
+
+    /// Cosa si accerta di UNA prova: ammissione, tetto, esecuzione, giudizio.
+    async fn esito_della_prova(
+        &self,
+        prova: &piano_di_verifica::Prova,
+        politica: Option<&piano_di_verifica::PoliticaEsecuzione>,
+        budget: &mut usize,
+        timeout_s: f64,
+    ) -> piano_di_verifica::EsitoSingolo {
+        use piano_di_verifica::{Ammissione, EsitoSingolo};
+        let Some(politica) = politica else {
+            return EsitoSingolo::NonEseguibile {
+                motivo: PIANO_SENZA_POLITICA.to_string(),
+            };
+        };
+        if let Ammissione::Rifiutata { motivo } = politica.ammissione(prova) {
+            return EsitoSingolo::NonEseguibile { motivo };
+        }
+        if *budget == 0 {
+            return EsitoSingolo::NonEseguibile {
+                motivo: PIANO_OLTRE_IL_TETTO.to_string(),
+            };
+        }
+        *budget -= 1;
+        match self.osserva_la_prova(prova, timeout_s).await {
+            Ok(oss) => piano_di_verifica::giudica_prova(&prova.attesa, &oss),
+            Err(motivo) => EsitoSingolo::NonEseguibile { motivo },
+        }
+    }
+
+    /// Esegue il comando della prova e raccoglie cio' che si e' OSSERVATO.
+    /// `Err` = non si e' potuto osservare, col motivo gia' in chiaro.
+    ///
+    /// Il tool e' lo STESSO con cui la prova e' stata classificata: classificare
+    /// una cosa ed eseguirne un'altra giudicherebbe cio' che non gira.
+    ///
+    /// L'attesa e' BOUND lato gate e la sua portata e' dichiarata: limita quanto
+    /// il GATE aspetta, non quanto il processo vive — `run_command` non ha un
+    /// campo di timeout nel proprio contratto d'ingresso e il cap del processo
+    /// lo applica il tool runner. Senza questo bound una prova che non torna
+    /// terrebbe fermo il gate quanto quel cap, per ognuna.
+    async fn osserva_la_prova(
+        &self,
+        prova: &piano_di_verifica::Prova,
+        timeout_s: f64,
+    ) -> Result<piano_di_verifica::Osservazione, String> {
+        let mut input = json!({ "command": prova.comando });
+        if let Some(wd) = &prova.working_dir {
+            input["working_dir"] = json!(wd);
+        }
+        let attesa = Duration::from_secs_f64(timeout_s.max(1.0));
+        let esecuzione = tokio::time::timeout(
+            attesa,
+            self.run_tool(piano_di_verifica::TOOL_DELLA_PROVA, input),
+        )
+        .await;
+        let outcome = match esecuzione {
+            Ok(Ok(o)) => o,
+            // Il tool non e' partito: e' un guasto dell'ESECUZIONE, non una
+            // misura del codice. Bocciare qui rimanderebbe in correzione un
+            // lavoro che nessuno ha mai provato.
+            Ok(Err(e)) => return Err(format!("il comando della prova non e' partito: {e}")),
+            Err(_) => {
+                return Err(format!(
+                    "la prova non ha risposto entro {}s: il gate ha smesso di \
+                     attendere (il processo lo governa il tool runner)",
+                    attesa.as_secs()
+                ))
+            }
+        };
+        Ok(piano_di_verifica::Osservazione {
+            // Campo STRUTTURATO dell'esito (regola M): arriva gia' cosi' dal
+            // confine del dispatch e non si ri-estrae dal testo.
+            exit_code: outcome.exit_code.map(|c| c as i32),
+            output: outcome_text(&outcome),
+        })
+    }
+
     /// Legge dalla spec la configurazione del criterio `codice_eseguibile`.
     ///
     /// `None` = vocabolario assente o illeggibile. Nessun ripiego su un elenco
@@ -1451,7 +1598,7 @@ task_complete (outcome + summary)"
             // "non misurabile": non c'e' nessun file di cui rispondere.
             return (
                 CriterionOutcome::Passed,
-                json!({ "skipped": "file_exists senza path: criterio non applicabile (N/A)" }),
+                json!({ CHIAVE_SKIPPED: "file_exists senza path: criterio non applicabile (N/A)" }),
             );
         }
         let expected_exists = expected
@@ -1469,7 +1616,7 @@ task_complete (outcome + summary)"
                 json!({
                     "path": path,
                     "expected_exists": expected_exists,
-                    "method": "filesystem",
+                    CHIAVE_METHOD: "filesystem",
                     "skipped_reason": motivo,
                 }),
             ),
@@ -1481,7 +1628,7 @@ task_complete (outcome + summary)"
                         "path": path,
                         "exists": exists,
                         "expected_exists": expected_exists,
-                        "method": "filesystem",
+                        CHIAVE_METHOD: "filesystem",
                     }),
                 )
             }
@@ -1503,7 +1650,7 @@ task_complete (outcome + summary)"
         if run_id.is_empty() {
             return Ok((
                 CriterionOutcome::Passed,
-                json!({ "skipped": "outputs_exist senza run_id: N/A" }),
+                json!({ CHIAVE_SKIPPED: "outputs_exist senza run_id: N/A" }),
             ));
         }
         let run_uuid = match Uuid::parse_str(run_id) {
@@ -1511,7 +1658,7 @@ task_complete (outcome + summary)"
             Err(_) => {
                 return Ok((
                     CriterionOutcome::Passed,
-                    json!({ "skipped": "outputs_exist run_id non-UUID: N/A" }),
+                    json!({ CHIAVE_SKIPPED: "outputs_exist run_id non-UUID: N/A" }),
                 ))
             }
         };
@@ -1549,7 +1696,7 @@ task_complete (outcome + summary)"
         if paths.is_empty() {
             return Ok((
                 CriterionOutcome::Passed,
-                json!({ "skipped": "nessuno step mutativo file nel run: N/A" }),
+                json!({ CHIAVE_SKIPPED: "nessuno step mutativo file nel run: N/A" }),
             ));
         }
         let mut missing: Vec<String> = Vec::new();
@@ -1648,11 +1795,11 @@ fn esito_dialogo(
             richieste_osservate,
         } => (
             CriterionOutcome::Passed,
-            json!({ "url": url, "requests_observed": osservate, "ok_requests": richieste_osservate }),
+            json!({ "url": url, CHIAVE_REQUESTS_OBSERVED: osservate, "ok_requests": richieste_osservate }),
         ),
         VerdettoDialogo::NonConcludente { motivo } => (
             CriterionOutcome::Inconclusive,
-            json!({ "url": url, "requests_observed": osservate, "skipped_reason": motivo }),
+            json!({ "url": url, CHIAVE_REQUESTS_OBSERVED: osservate, "skipped_reason": motivo }),
         ),
         VerdettoDialogo::Rotto { cause } => {
             let descrizioni: Vec<String> = cause.iter().take(5).map(|c| c.descrizione()).collect();
@@ -1660,7 +1807,7 @@ fn esito_dialogo(
                 CriterionOutcome::Failed,
                 json!({
                     "url": url,
-                    "requests_observed": osservate,
+                    CHIAVE_REQUESTS_OBSERVED: osservate,
                     "error": format!(
                         "il frontend non ottiene i propri dati: {}",
                         descrizioni.join("; ")
@@ -1794,6 +1941,63 @@ const CODICE_SENZA_PERIMETRO: &str =
     "manca il progetto, la sessione o la radice del lavoro: \
      i file prodotti non sono interrogabili";
 
+/// I motivi con cui una PROVA del piano dichiara di non essere stata eseguita.
+/// Costanti e non letterali in linea: sono cio' che un operatore legge per
+/// sapere se rimediare alla configurazione o al tetto.
+const PIANO_SENZA_POLITICA: &str =
+    "politica di ammissione assente o illeggibile \
+     (`agent.final_gate.piano_prova_criticita_max`): nessuna prova eseguita, \
+     perche' senza politica non si sa cosa sia ammesso eseguire";
+const PIANO_OLTRE_IL_TETTO: &str =
+    "oltre il tetto di prove eseguibili in un giro di gate \
+     (`agent.final_gate.piano_max_prove`)";
+
+/// Traduce gli esiti delle prove in esito ed evidenza del criterio.
+///
+/// I tre esiti sono TRE e non due: `Failed` solo per una prova OSSERVATA e non
+/// conforme; `Passed` quando almeno una prova e' stata eseguita e nessuna e'
+/// caduta; `Inconclusive` quando nessuna prova e' stata eseguita — nessuna
+/// dichiarata, oppure dichiarate e tutte rifiutate. Il piano VUOTO non e' un
+/// via libera, ed e' la differenza rispetto a `codice_eseguibile`: li' il
+/// criterio ha guardato i file e ha constatato che nessuno era codice, qui
+/// nessuno ha dichiarato niente. Contarlo come misura positiva farebbe salire il
+/// conteggio dei criteri misurati proprio nei run che non hanno dichiarato nulla.
+fn esito_piano(
+    esiti: &[piano_di_verifica::EsitoProva],
+) -> (CriterionOutcome, Value) {
+    use piano_di_verifica::VerdettoPiano;
+    let verdetto = piano_di_verifica::classifica_piano(esiti);
+    let esito = esito_da_verdetto(verdetto.e_bloccante(), verdetto.ha_misurato());
+    if let VerdettoPiano::ProvaFallita { fallite } = &verdetto {
+        tracing::info!(
+            target: "mcp_core::criteria_runner",
+            fallite = fallite.len(),
+            dichiarate = esiti.len(),
+            "piano_di_verifica: prove dichiarate da questo run che non sono superate"
+        );
+    }
+    (esito, piano_di_verifica::evidenza_piano(&verdetto, esiti))
+}
+
+/// La proiezione di un verdetto a tre stati sull'esito del criterio, in un
+/// posto solo.
+///
+/// I criteri che portano un verdetto PROPRIO — il codice eseguibile (0734), il
+/// piano di verifica (0737) — dichiarano due fatti indipendenti: se bocciano e
+/// se hanno misurato. La traduzione in [`CriterionOutcome`] e' la STESSA per
+/// entrambi, e due copie divergerebbero al primo ritocco proprio sul ramo che
+/// distingue «va bene» da «non ho guardato» (regola L).
+///
+/// L'ordine e' load-bearing: bocciare precede l'aver misurato, perche' un
+/// verdetto bloccante e' per costruzione una misura.
+fn esito_da_verdetto(bloccante: bool, misurato: bool) -> CriterionOutcome {
+    match (bloccante, misurato) {
+        (true, _) => CriterionOutcome::Failed,
+        (false, true) => CriterionOutcome::Passed,
+        (false, false) => CriterionOutcome::Inconclusive,
+    }
+}
+
 /// «Non ho potuto misurare», col motivo. Distinto da un `Passed`: il run chiude
 /// `completed_unverified`, che e' il canale giusto per un non-verdetto.
 fn non_misurato(motivo: &str) -> (CriterionOutcome, Value) {
@@ -1817,13 +2021,7 @@ fn esito_codice(
 ) -> (CriterionOutcome, Value) {
     use codice_eseguibile::VerdettoEsecuzione;
     let verdetto = codice_eseguibile::classifica_esecuzione(fatti);
-    let esito = if verdetto.e_bloccante() {
-        CriterionOutcome::Failed
-    } else if verdetto.ha_misurato() {
-        CriterionOutcome::Passed
-    } else {
-        CriterionOutcome::Inconclusive
-    };
+    let esito = esito_da_verdetto(verdetto.e_bloccante(), verdetto.ha_misurato());
     if let VerdettoEsecuzione::CodiceRotto { rotti } = &verdetto {
         tracing::info!(
             target: "mcp_core::criteria_runner",
@@ -2072,7 +2270,7 @@ fn esito_http(
         passed,
         json!({
             "url": url,
-            "method": method,
+            CHIAVE_METHOD: method,
             "status": actual,
             "expected_status": expected_statuses,
             "content_type": content_type,
@@ -3075,6 +3273,232 @@ mod tests {
             provenance: CriterionProvenance::Authored,
             ..spec(criterion_type, spec_v, expected)
         }
+    }
+
+    // ── piano_di_verifica (mig 0737) ─────────────────────────────────────────
+
+    /// Il PIANO come lo produce la catena reale (regola O): parere di una figura
+    /// -> `compose_advisory_synthesis` -> `PianoDiVerifica::dai_pareri`, piu' la
+    /// dichiarazione di chiusura dell'agente. Comporre il `Vec<Prova>` a mano
+    /// proverebbe solo che il criterio sa leggere cio' che il test sa scrivere, e
+    /// il campo `prove` potrebbe smettere di attraversare la sintesi senza che
+    /// nessun test se ne accorga.
+    ///
+    /// Le tre prove sono i tre casi del design: una FALLITA (il file di test del
+    /// 17/08), una SUPERATA, una NON ESEGUIBILE perche' distruttiva.
+    fn piano_del_caso_reale() -> nexus_agent_graph::decisions::PianoDiVerifica {
+        use nexus_agent_graph::decisions::{
+            compose_advisory_synthesis, AdvisoryPolicy, AdvisoryRoster, AdvisorySource,
+            PianoDiVerifica,
+        };
+        let parere = json!({
+            "success": true,
+            "advisory": {
+                "verdict": "proceed_with_changes",
+                "risks": [],
+                "requirements": [
+                    "Senza un framework di test dichiarato il file di test puo' non essere \
+                     eseguibile col runner predefinito"
+                ],
+                "recommendations": [],
+                "prove": [{
+                    "descrizione": "il file di test parte col runner del progetto",
+                    "comando": "node --test calcolatrice.test.js",
+                    "attesa": {"tipo": "exit_code", "codice": 0},
+                }],
+            }
+        });
+        let sintesi = compose_advisory_synthesis(
+            &[parere],
+            &AdvisoryPolicy::default(),
+            AdvisoryRoster::Convened(1),
+        )
+        .expect("sintesi composta")
+        .to_value();
+        PianoDiVerifica::unione(&[
+            PianoDiVerifica::dai_pareri(&[(AdvisorySource::Council, sintesi)]),
+            PianoDiVerifica::da_dichiarazione(Some(&json!({
+                "outcome": "done",
+                "summary": "calcolatrice e test",
+                "prove": [
+                    {
+                        "descrizione": "la sorgente si carica",
+                        "comando": "node --check calcolatrice.js",
+                        "attesa": {"tipo": "exit_code", "codice": 0},
+                    },
+                    {
+                        "descrizione": "pulizia dell'albero di lavoro",
+                        "comando": "rm -rf /var/dati",
+                        "attesa": {"tipo": "exit_code", "codice": 0},
+                    },
+                ],
+            }))),
+        ])
+    }
+
+    /// IL SALTO DEL 0737, dall'inizio alla fine e con la configurazione REALE.
+    ///
+    /// Il 17/08/2026 il gate non aveva niente da chiedere e ha chiuso «passato»
+    /// due volte su un file di test non eseguibile. Il Consiglio aveva emesso il
+    /// rischio ESATTO, ma in prosa: `non_verificabili=15`. Qui lo stesso rischio
+    /// e' una PROVA, e la catena e' quella della produzione:
+    ///   migrazione 0737 (flag, soglia e tetto li scrive il DB, non il test)
+    ///     -> `native_engine::criterio_piano_verifica` costruisce la spec
+    ///     -> parere della figura -> `compose_advisory_synthesis` -> `dai_pareri`
+    ///     -> `con_piano` inietta il piano come fa il nodo
+    ///     -> `runner.run` attraversa il DISPATCH per tipo
+    ///     -> `check_piano_verifica` esegue, giudica e traduce.
+    ///
+    /// MUTAZIONE ESEGUITA: spegnere il flag nella migrazione
+    /// (`agent.final_gate.piano_verifica_enabled = 'false'`) e il criterio non
+    /// nasce — la prima `expect` cade, ed e' il gate cieco di prima.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn una_prova_fallita_del_consiglio_boccia_con_la_configurazione_reale(pool: PgPool) {
+        use nexus_agent_graph::decisions::piano_di_verifica;
+
+        // 1. La CONFIGURAZIONE, dalle migrazioni applicate a questo DB.
+        let criterio = crate::native_engine::criterio_piano_verifica(&pool)
+            .await
+            .expect("il criterio nasce: la migrazione 0737 lo accende");
+        assert_eq!(criterio.criterion_type, piano_di_verifica::CRITERION_TYPE);
+        assert!(
+            criterio.spec.get(piano_di_verifica::CHIAVE_POLITICA).is_some(),
+            "la politica di ammissione viaggia nella spec: {}",
+            criterio.spec
+        );
+
+        // 2. Il PIANO, dal produttore reale, iniettato come fa il nodo.
+        let piano = piano_del_caso_reale();
+        assert_eq!(piano.len(), 3);
+        let criterio = piano_di_verifica::con_piano(criterio, &piano);
+
+        // 3. L'ESECUZIONE, attraverso il dispatch per tipo. Il fake risponde
+        //    nell'ordine delle chiamate: la prima prova ammessa e' quella del
+        //    Consiglio (exit 1), la seconda quella dell'agente (exit 0). La
+        //    terza non arriva mai al tool.
+        let exec = FakeToolExecutor::with(&[(
+            "run_command",
+            &[
+                "ReferenceError: describe is not defined\nEXIT CODE: 1",
+                "EXIT CODE: 0",
+            ],
+        )]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec.clone(), pool, None);
+        let res = runner.run(vec![criterio]).await.expect("nessun PortError");
+        assert_eq!(res.len(), 1);
+
+        // 4. La CONSEGUENZA.
+        let ev = &res[0].evidence;
+        assert_eq!(
+            res[0].outcome,
+            CriterionOutcome::Failed,
+            "una prova dichiarata e non superata deve fermare il run: {ev}"
+        );
+        assert_eq!(ev["verdict"], "proof_failed");
+        assert_eq!(ev["prove"]["dichiarate"], 3);
+        assert_eq!(ev["prove"]["superate"], 1);
+        assert_eq!(ev["prove"]["fallite"], 1);
+        assert_eq!(ev["prove"]["non_eseguibili"], 1);
+        assert!(
+            ev["verdict_text"]
+                .as_str()
+                .is_some_and(|t| t.contains("Consiglio delle Competenze")
+                    && t.contains("node --test calcolatrice.test.js")),
+            "il rimando nomina la prova e chi l'ha chiesta: {ev}"
+        );
+
+        // IL PIANO NON E' UN CANALE PRIVILEGIATO: la prova distruttiva non e'
+        // mai arrivata al tool, e il rifiuto nomina la regola del gate duale
+        // (`destructive_fs`, mig 0677) invece di un secondo elenco locale.
+        assert_eq!(
+            exec.calls.lock().unwrap().len(),
+            2,
+            "solo le due prove ammesse sono state eseguite"
+        );
+        let distruttiva = ev["dettaglio"]
+            .as_array()
+            .expect("dettaglio")
+            .iter()
+            .find(|d| d["comando"] == "rm -rf /var/dati")
+            .expect("la prova distruttiva e' dichiarata nel referto");
+        assert_eq!(distruttiva["esito"], "not_runnable");
+        assert!(
+            distruttiva["motivo"]
+                .as_str()
+                .is_some_and(|m| m.contains("irreversible") && m.contains("destructive_fs")),
+            "il motivo viene dal punto unico del gate duale: {distruttiva}"
+        );
+    }
+
+    /// IL MANDATO DELLE FIGURE chiede davvero le prove (mig 0737).
+    ///
+    /// Il campo `prove` nello schema del tool descrive COME si dichiara; il
+    /// template e' cio' che la figura legge PRIMA di analizzare, ed e' li' che
+    /// si decide se emettera' una frase o un comando. Il 17/08 le figure hanno
+    /// emesso 17 requisiti e nessuna prova, obbedendo a un mandato che le prove
+    /// non le nominava.
+    ///
+    /// MISURA e non affermazione (regola O): la migrazione fa un REPLACE
+    /// mirato, e un REPLACE che non matcha nulla e' silenzioso. Qui si conta
+    /// quante righe lo portano davvero sullo schema che il migrator produce —
+    /// se l'ancora cambiasse, la migrazione diventerebbe inerte e questo test
+    /// rosseggia invece di lasciar credere che le figure siano state istruite.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_mandato_delle_figure_chiede_le_prove(pool: PgPool) {
+        let con_prove: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM nexus_prompt_templates \
+              WHERE key LIKE 'subagent.%' AND is_active \
+                AND content LIKE '%(4-bis) PROVE%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("conteggio dei mandati aggiornati");
+        assert!(
+            con_prove > 0,
+            "la migrazione 0737 non ha toccato alcun mandato: l'ancora del \
+             REPLACE non esiste piu' e le figure continuerebbero a emettere prosa"
+        );
+        // E il testo dice cosa vale la pena dichiarare, non solo che esiste un
+        // campo: senza il vocabolario delle attese la figura non sa cosa puo'
+        // chiedere alla macchina di accertare.
+        let esempio: String = sqlx::query_scalar(
+            "SELECT content FROM nexus_prompt_templates \
+              WHERE key LIKE 'subagent.%' AND is_active \
+                AND content LIKE '%(4-bis) PROVE%' \
+              ORDER BY key LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("un mandato aggiornato");
+        for atteso in ["comando", "attesa", "codice d'uscita", "testo presente"] {
+            assert!(esempio.contains(atteso), "manca '{atteso}' nel mandato");
+        }
+    }
+
+    /// PIANO VUOTO: il criterio non boccia e NON dichiara di aver verificato.
+    ///
+    /// E' il caso normale finche' le figure non imparano a emettere prove, ed e'
+    /// la ragione per cui il pavimento resta: se un piano vuoto valesse come
+    /// misura positiva, ogni run senza prove salirebbe nel conteggio dei criteri
+    /// misurati del gate — cioe' il silenzio tornerebbe a leggersi «verificato».
+    ///
+    /// MUTAZIONE ESEGUITA: far ritornare `true` a `VerdettoPiano::ha_misurato`
+    /// per `PianoVuoto` porta l'esito a `Passed` e questo test rosseggia.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn un_piano_vuoto_non_boccia_e_non_verifica(pool: PgPool) {
+        use nexus_agent_graph::decisions::{piano_di_verifica, PianoDiVerifica};
+        let criterio = piano_di_verifica::con_piano(
+            crate::native_engine::criterio_piano_verifica(&pool)
+                .await
+                .expect("il criterio nasce"),
+            &PianoDiVerifica::default(),
+        );
+        let exec = FakeToolExecutor::with(&[]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec.clone(), pool, None);
+        let res = runner.run(vec![criterio]).await.expect("nessun PortError");
+        assert_eq!(res[0].outcome, CriterionOutcome::Inconclusive);
+        assert_eq!(res[0].evidence["verdict"], "no_plan");
+        assert!(exec.calls.lock().unwrap().is_empty(), "niente da eseguire");
     }
 
     /// ALLINEAMENTO vocabolario<->dispatch (regola L, rilievo A5 della review):

@@ -3181,6 +3181,10 @@ struct UpstreamAdvisory {
     /// barriera — stessa chiave, due scrittori (vedi
     /// `decisions::ADVISORY_REQUIREMENTS_KEY`).
     requirements: nexus_agent_graph::decisions::EmittedRequirements,
+    /// Le PROVE ESEGUIBILI degli stessi apparati (mig 0737), per il ramo
+    /// CLASSICO. Stessa disciplina dei requisiti: vuoto in overlap significa
+    /// «non ancora», e le prove arrivano dalla barriera.
+    piano: nexus_agent_graph::decisions::PianoDiVerifica,
 }
 
 /// OVERLAP (mig 0606): il run parte SUBITO e i panel deliberano in parallelo,
@@ -3217,6 +3221,7 @@ async fn resolve_upstream_advisory(
             // «non ancora», e chi scrive lo stato non deve confonderlo con
             // «nessun requisito».
             requirements: Default::default(),
+            piano: Default::default(),
         };
     }
     let panels = run_upstream_panels(&upstream_inputs).await;
@@ -3234,6 +3239,7 @@ async fn resolve_upstream_advisory(
         source: panels.source,
         gate: None,
         requirements: panels.requirements,
+        piano: panels.piano,
     }
 }
 
@@ -5180,6 +5186,7 @@ pub(crate) async fn spawn_agent_run(
     let pre_run_advisory_synthesis = advisory.synthesis;
     let pre_run_advisory_source = advisory.source;
     let pre_run_advisory_requirements = advisory.requirements;
+    let pre_run_advisory_piano = advisory.piano;
     let advisory_gate = advisory.gate;
 
     // Nota operativa del last-wins (supersede): vedi `apply_supersede_note`.
@@ -5254,6 +5261,7 @@ pub(crate) async fn spawn_agent_run(
     let pre_run_advisory_synthesis_clone = pre_run_advisory_synthesis.clone();
     let pre_run_advisory_source_clone = pre_run_advisory_source;
     let pre_run_advisory_requirements_clone = pre_run_advisory_requirements.clone();
+    let pre_run_advisory_piano_clone = pre_run_advisory_piano.clone();
     // Barriera advisory (overlap, mig 0606): il receiver entra nel ctx del grafo
     // e arma il gate del ToolDispatchNode. `None` nel ramo classico.
     let advisory_gate_for_run = advisory_gate;
@@ -5371,6 +5379,7 @@ pub(crate) async fn spawn_agent_run(
                     pre_run_advisory_synthesis: pre_run_advisory_synthesis_clone.clone(),
                     pre_run_advisory_source: pre_run_advisory_source_clone,
                     pre_run_advisory_requirements: pre_run_advisory_requirements_clone.clone(),
+                    pre_run_advisory_piano: pre_run_advisory_piano_clone.clone(),
                     advisory_gate: advisory_gate_for_run.clone(),
                 };
                 execute_native_run(
@@ -5689,6 +5698,7 @@ pub(crate) async fn confirm_native_run(
         pre_run_advisory_synthesis: None,
         pre_run_advisory_source: None,
         pre_run_advisory_requirements: Default::default(),
+        pre_run_advisory_piano: Default::default(),
         // RESUME da checkpoint: i panel a monte hanno gia' deliberato nel primo
         // tratto del run e il loro esito e' nello stato checkpointato (chiave
         // `advisory_gate`); ri-armare la barriera farebbe attendere un verdetto
@@ -6100,6 +6110,7 @@ pub(crate) async fn resume_fanin(
         pre_run_advisory_synthesis: None,
         pre_run_advisory_source: None,
         pre_run_advisory_requirements: Default::default(),
+        pre_run_advisory_piano: Default::default(),
         // RESUME da checkpoint: i panel a monte hanno gia' deliberato nel primo
         // tratto del run e il loro esito e' nello stato checkpointato (chiave
         // `advisory_gate`); ri-armare la barriera farebbe attendere un verdetto
@@ -6404,6 +6415,11 @@ struct UpstreamPanels {
     /// verdetto governa l'enforcement» e portarsi via i requisiti dell'altro
     /// apparato ne scartava 8 su 8 a rango pari (misurato il 10/08/2026).
     requirements: nexus_agent_graph::decisions::EmittedRequirements,
+    /// Le PROVE ESEGUIBILI di TUTTI gli apparati (punto unico
+    /// `decisions::piano_di_verifica`), composte dalle STESSE sintesi dei
+    /// requisiti e per la stessa ragione: un apparato che perde la selezione
+    /// dell'enforcement ha emesso le sue prove lo stesso.
+    piano: nexus_agent_graph::decisions::PianoDiVerifica,
 }
 
 /// Dibattito, se il consiglio ha dichiarato una decisione contesa: consuma il
@@ -6493,25 +6509,30 @@ async fn run_upstream_panels(inp: &UpstreamInputs) -> UpstreamPanels {
     // stesso. La selezione qui sotto risponde a un'altra domanda — quale
     // verdetto governa l'enforcement, dove il messaggio da emettere e' uno solo
     // — e prima si portava via anche i requisiti dell'apparato non scelto.
-    let requirements = nexus_agent_graph::decisions::EmittedRequirements::from_panels(
-        &[
-            (
-                nexus_agent_graph::decisions::AdvisorySource::Council,
-                council_synthesis.clone(),
-            ),
-            (
-                nexus_agent_graph::decisions::AdvisorySource::MultiProvider,
-                multi_provider_synthesis.clone(),
-            ),
-        ]
-        .into_iter()
-        .filter_map(|(source, synthesis)| synthesis.map(|s| (source, s)))
-        .collect::<Vec<_>>(),
-    );
+    //
+    // Le PROVE (mig 0737) nascono dagli STESSI pareri e nello stesso punto: sono
+    // l'altro prodotto delle stesse sintesi, con un consumatore diverso (il
+    // final gate le ESEGUE), e comporle altrove darebbe due elenchi da tenere
+    // allineati a mano.
+    let pareri: Vec<(nexus_agent_graph::decisions::AdvisorySource, serde_json::Value)> = [
+        (
+            nexus_agent_graph::decisions::AdvisorySource::Council,
+            council_synthesis.clone(),
+        ),
+        (
+            nexus_agent_graph::decisions::AdvisorySource::MultiProvider,
+            multi_provider_synthesis.clone(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(source, synthesis)| synthesis.map(|s| (source, s)))
+    .collect();
+    let requirements = nexus_agent_graph::decisions::EmittedRequirements::from_panels(&pareri);
 
     let (synthesis, source) = select_pre_run_advisory(council_synthesis, multi_provider_synthesis);
     UpstreamPanels {
         council_present: council_block.is_some(),
+        piano: nexus_agent_graph::decisions::PianoDiVerifica::dai_pareri(&pareri),
         requirements,
         blocks: [
             council_block,
@@ -6583,6 +6604,7 @@ fn gate_state_from_panels(
                 AdvisoryGateState::Released {
                     enforcement: Some(enforcement),
                     requirements: panels.requirements.clone(),
+                    piano: panels.piano.clone(),
                 }
             }
         }
@@ -6593,6 +6615,7 @@ fn gate_state_from_panels(
         None => AdvisoryGateState::Released {
             enforcement: None,
             requirements: panels.requirements.clone(),
+            piano: panels.piano.clone(),
         },
     }
 }
