@@ -177,6 +177,7 @@ async fn nessuna_modalita_sceglie_un_modello_non_eleggibile(pool: PgPool) {
                 rank,
                 governed: false,
                 latency_budget_ms: None,
+                richiesta_token_stimati: None,
             };
             let out = select_model_with_gate(&pool, &req, gate(gate_acceso)).await;
             match out {
@@ -1445,4 +1446,212 @@ async fn senza_budget_bit_identico(pool: PgPool) {
         "senza budget dichiarato la latenza osservata non entra nella scelta"
     );
     assert_eq!(c.rationale, "tier=medium:auto", "nessun segnale di latenza appeso");
+}
+
+// ── La capienza TPM dichiarata (mig 0735) ───────────────────────────────────
+
+/// Osservazione di rate limit seminata dalla catena di PRODUZIONE (regola O):
+/// gli header reali del fornitore -> il parser del gateway (`osserva`) ->
+/// l'UPSERT unico (`persisti_osservazione`). Ne' la riga ne' l'osservazione
+/// sono costruite a mano: se domani cambia il nome di un header o di una
+/// colonna, a rosseggiare e' il test del consumatore, che e' il punto.
+async fn seed_header_tpm(pool: &PgPool, provider: &str, model: &str, limite: i64, residuo: i64) {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+    let mut h = HeaderMap::new();
+    for (nome, valore) in [
+        ("x-ratelimit-limit-tokens", limite.to_string()),
+        ("x-ratelimit-remaining-tokens", residuo.to_string()),
+        // Forma reale di groq: durata stile Go.
+        ("x-ratelimit-reset-tokens", "59s".to_string()),
+    ] {
+        h.insert(
+            HeaderName::from_static(nome),
+            HeaderValue::from_str(&valore).expect("valore header"),
+        );
+    }
+    let oss = nexus_gateway::rate_limit_headers::osserva(&h, chrono::Utc::now())
+        .expect("gli header di rate limit sono riconosciuti dal parser di produzione");
+    assert!(
+        nexus_gateway::rate_limit_headers::persisti_osservazione(pool, provider, model, &oss).await,
+        "l'UPSERT unico del gateway deve scrivere la riga"
+    );
+}
+
+/// Test 3 del design: IL CASO MISURATO del 17/08, sul percorso INTERO. Due
+/// candidati nello stesso tier; il piu' economico e' quello che dichiara 8000
+/// TPM, e la richiesta ne porta 180.000. Non deve uscire, anche se costa meno.
+///
+/// MUTAZIONE ESEGUITA (vedi commit): far degradare `OltreIlLimite` a `Ignota`
+/// nel criterio puro -> il candidato torna primo e il test rosseggia col nome
+/// del fornitore che avrebbe preso 429.
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+async fn il_tetto_tpm_esclude_chi_non_regge_la_richiesta(pool: PgPool) {
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
+    seed_cost_rank_modello(&pool, "groq", "openai/gpt-oss-20b", "medium", 0.10, None).await;
+    seed_cost_rank_modello(&pool, "mistral", "mistral-small-latest", "medium", 0.60, None).await;
+    // I numeri veri del 17/08 su groq, e quelli veri di mistral (2M TPM).
+    seed_header_tpm(&pool, "groq", "openai/gpt-oss-20b", 8_000, 120).await;
+    seed_header_tpm(&pool, "mistral", "mistral-small-latest", 2_000_000, 1_996_407).await;
+
+    let req = ModelRequest::agentic("medium")
+        .capability(Some("code"))
+        .richiesta_token_stimati(180_000);
+    let c = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect("un candidato capiente resta");
+    assert_eq!(
+        c.model, "mistral-small-latest",
+        "groq dichiara 8000 TPM contro 180.000 token: se qui c'e' gpt-oss-20b \
+         la selezione sta rimandando la richiesta dove il 429 e' certo"
+    );
+    assert!(
+        c.rationale
+            .contains(nexus_agent_graph::decisions::capienza_tpm::SEGNALE_OLTRE_LIMITE),
+        "l'esclusione si DICHIARA nel rationale (regola Q): {}",
+        c.rationale
+    );
+}
+
+/// L'asimmetria: il RESIDUO scarso retrocede, non esclude. Stesso parco, ma
+/// entrambi reggono la richiesta a bucket pieno e il piu' economico ha il
+/// residuo insufficiente ADESSO: vince l'altro, e il primo resta nel pool.
+///
+/// MUTAZIONE: se `ResiduoInsufficiente` escludesse invece di retrocedere, la
+/// scelta sarebbe la stessa (il test non se ne accorgerebbe) MA il segnale nel
+/// rationale sarebbe quello dell'esclusione — l'ultima asserzione rosseggia.
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+async fn il_residuo_scarso_retrocede_e_non_esclude(pool: PgPool) {
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
+    seed_cost_rank_modello(&pool, "groq", "openai/gpt-oss-20b", "medium", 0.10, None).await;
+    seed_cost_rank_modello(&pool, "mistral", "mistral-small-latest", "medium", 0.60, None).await;
+    // Il tetto regge la richiesta (5000 <= 8000), il residuo di adesso no.
+    seed_header_tpm(&pool, "groq", "openai/gpt-oss-20b", 8_000, 120).await;
+    seed_header_tpm(&pool, "mistral", "mistral-small-latest", 2_000_000, 1_996_407).await;
+
+    let req = ModelRequest::agentic("medium")
+        .capability(Some("code"))
+        .richiesta_token_stimati(5_000);
+    let c = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect("un candidato resta");
+    assert_eq!(
+        c.model, "mistral-small-latest",
+        "col residuo a 120 groq va in coda: comanda chi ha capienza adesso"
+    );
+    assert!(
+        c.rationale
+            .contains(nexus_agent_graph::decisions::capienza_tpm::SEGNALE_RESIDUO_SCARSO),
+        "la retrocessione si DICHIARA: {}",
+        c.rationale
+    );
+    assert!(
+        !c.rationale
+            .contains(nexus_agent_graph::decisions::capienza_tpm::SEGNALE_OLTRE_LIMITE),
+        "il residuo scarso non e' un'esclusione, e i due segnali non si \
+         confondono: {}",
+        c.rationale
+    );
+}
+
+/// Test 4 del design: osservazione ASSENTE -> scelta invariata. Il parco del
+/// test 3 senza nessuna riga di rate limit rimette in testa il piu' economico,
+/// e nessun segnale compare.
+///
+/// MUTAZIONE: se l'ignoto escludesse (o retrocedesse), vincerebbe mistral e la
+/// prima asserzione rosseggia.
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+async fn senza_osservazione_la_scelta_non_cambia(pool: PgPool) {
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
+    seed_cost_rank_modello(&pool, "groq", "openai/gpt-oss-20b", "medium", 0.10, None).await;
+    seed_cost_rank_modello(&pool, "mistral", "mistral-small-latest", "medium", 0.60, None).await;
+
+    let req = ModelRequest::agentic("medium")
+        .capability(Some("code"))
+        .richiesta_token_stimati(180_000);
+    let c = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect("un modello");
+    assert_eq!(
+        c.model, "openai/gpt-oss-20b",
+        "dove non sappiamo nulla comanda il costo, come prima (regola Q)"
+    );
+    assert_eq!(
+        c.rationale, "tier=medium:auto",
+        "nessun segnale di capienza appeso"
+    );
+}
+
+/// SENZA dichiarazione della dimensione il percorso e' bit-identico allo
+/// storico: lo stesso parco del test 3, con le stesse osservazioni che
+/// escluderebbero groq, sceglie groq.
+///
+/// MUTAZIONE: se il criterio si applicasse anche a `None` (o con una
+/// dimensione stimata di nascosto dentro la selezione), vincerebbe mistral e
+/// il test rosseggia.
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+async fn senza_dimensione_dichiarata_bit_identico(pool: PgPool) {
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
+    seed_cost_rank_modello(&pool, "groq", "openai/gpt-oss-20b", "medium", 0.10, None).await;
+    seed_cost_rank_modello(&pool, "mistral", "mistral-small-latest", "medium", 0.60, None).await;
+    seed_header_tpm(&pool, "groq", "openai/gpt-oss-20b", 8_000, 120).await;
+    seed_header_tpm(&pool, "mistral", "mistral-small-latest", 2_000_000, 1_996_407).await;
+
+    let req = ModelRequest::agentic("medium").capability(Some("code"));
+    let c = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect("un modello");
+    assert_eq!(
+        c.model, "openai/gpt-oss-20b",
+        "senza dimensione dichiarata la capienza non entra nella scelta"
+    );
+    assert_eq!(c.rationale, "tier=medium:auto", "nessun segnale appeso");
+}
+
+/// Tutti oltre il tetto: si serve il pool INTERO col segnale della ricaduta,
+/// mai «nessun modello». Un 429 e' un fallimento veloce gia' gestito dal
+/// failover; una selezione vuota ferma il run.
+///
+/// MUTAZIONE: fail-closed nella ricaduta -> `select` fallisce e l'`expect`
+/// rosseggia.
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+async fn tutti_oltre_il_tetto_ricade_dichiarando(pool: PgPool) {
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
+    seed_cost_rank_modello(&pool, "groq", "openai/gpt-oss-20b", "medium", 0.10, None).await;
+    seed_cost_rank_modello(&pool, "groq", "openai/gpt-oss-120b", "medium", 0.60, None).await;
+    seed_header_tpm(&pool, "groq", "openai/gpt-oss-20b", 8_000, 7_800).await;
+    seed_header_tpm(&pool, "groq", "openai/gpt-oss-120b", 8_000, 7_834).await;
+
+    let req = ModelRequest::agentic("medium")
+        .capability(Some("code"))
+        .richiesta_token_stimati(180_000);
+    let c = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect("la ricaduta serve il pool intero, mai nessun modello");
+    assert_eq!(
+        c.model, "openai/gpt-oss-20b",
+        "sul pool intero comanda di nuovo il costo: stessa scelta di una \
+         dimensione non dichiarata"
+    );
+    assert!(
+        c.rationale
+            .contains(nexus_agent_graph::decisions::capienza_tpm::SEGNALE_RICADUTA),
+        "la ricaduta si DICHIARA nel rationale, non si deduce dal \
+         comportamento: {}",
+        c.rationale
+    );
 }

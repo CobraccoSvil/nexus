@@ -300,6 +300,11 @@ async fn resolve_purpose_core(
         // La risoluzione singola non dichiara un budget: i chiamanti one-shot
         // che ne hanno uno passano dal fan-out (`..._candidates_db_by`).
         latency_budget_ms: None,
+        // Un purpose interno non conosce la dimensione del prompt che il
+        // chiamante comporra': non la dichiara e il criterio di capienza non
+        // nasce (mai una stima inventata qui, vedi
+        // ModelRequest::richiesta_token_stimati).
+        richiesta_token_stimati: None,
     };
     if let Some(p) = only_provider {
         req.pin = Some(p);
@@ -505,6 +510,9 @@ pub async fn resolve_purpose_provider_candidates_db_by(
         // turno primario: niente riordino telemetria (vedi ModelRequest::governed).
         governed: false,
         latency_budget_ms,
+        // Come sopra: il fan-out di un purpose non conosce la dimensione della
+        // richiesta che ogni convocato ricevera'.
+        richiesta_token_stimati: None,
     };
     // Pool piu' ampio del limite per deduplicare per provider senza una query
     // dedicata fuori dal servizio.

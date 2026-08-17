@@ -167,6 +167,10 @@ async fn select_for_slot_requirement(
         // budget e' di RUN): niente budget di latenza, prima tranche ai soli
         // one-shot (gate duale). Vedi ModelRequest::latency_budget_ms.
         latency_budget_ms: None,
+        // Il canale SLOT sceglie il modello PRIMA che la history del turno sia
+        // composta: la dimensione della richiesta qui non e' nota, e non si
+        // stima (vedi ModelRequest::richiesta_token_stimati).
+        richiesta_token_stimati: None,
     };
     model_service::select_model(db, &request).await
 }

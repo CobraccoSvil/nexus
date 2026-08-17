@@ -63,6 +63,7 @@ mod internal_routing;
 pub(crate) use nexus_types::llm_json;
 mod governance_telemetry;
 mod latency_telemetry;
+mod tpm_telemetry;
 mod long_running;
 mod mcp_client;
 mod mcp_connectors;
