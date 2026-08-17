@@ -641,7 +641,15 @@ async fn fetch_ranked(
     if cache_aware {
         rows = super::cost_rank::rerank_expected_cost(db, rows).await;
     }
-    if pool_esteso {
+    // La troncatura al limite richiesto vale per la SCELTA SINGOLA. Col fan-out
+    // (min_distinct_providers >= 2) NON si tronca: la condizione d'uscita della
+    // tier-chain (provider distinti) e' valutata sul pool PRE-troncatura, e un
+    // taglio cieco a `limit` puo' consegnare UN solo fornitore dove il chiamante
+    // ne esige due — il gate duale resterebbe senza secondo giudice proprio nei
+    // giorni in cui un solo fornitore domina il tier (misurato il 13/08). I
+    // chiamanti del fan-out deduplicano e cappano gia' da soli, come facevano
+    // sul percorso storico (review avversaria fase 3, bloccante 1).
+    if pool_esteso && min_distinct_providers < 2 {
         rows.truncate(limit.max(0) as usize);
     }
     Ok((rows, esito_latenza))

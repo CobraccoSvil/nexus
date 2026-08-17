@@ -1246,6 +1246,48 @@ async fn il_riordino_non_scavalca_il_tier(pool: PgPool) {
     );
 }
 
+/// Il FAN-OUT non perde il secondo fornitore per la troncatura del pool esteso
+/// (review avversaria fase 3, bloccante 1): la tier-chain esce quando vede due
+/// provider distinti nel POOL, ma il taglio a `limit` avveniva DOPO — con un
+/// primo fornitore ricco di modelli economici, il secondo finiva oltre il
+/// taglio e il chiamante (il gate duale, che dichiara SEMPRE il budget e
+/// quindi estende sempre il pool) riceveva un solo fornitore dove ne esige
+/// due. Qui prov-uno ha 3 modelli medium piu' economici e prov-due uno solo,
+/// piu' caro: con limit=2 e min_distinct=2 il risultato DEVE contenere
+/// entrambi i fornitori.
+///
+/// MUTAZIONE: ripristinare la troncatura incondizionata
+/// (`if pool_esteso { rows.truncate(limit) }` in `fetch_ranked`) fa sparire
+/// prov-due e l'assert sui provider distinti rosseggia — la forma esatta del
+/// bloccante.
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+async fn il_fan_out_non_perde_il_secondo_fornitore_nella_troncatura(pool: PgPool) {
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
+    seed_cost_rank_modello(&pool, "prov-uno", "u1", "medium", 0.10, None).await;
+    seed_cost_rank_modello(&pool, "prov-uno", "u2", "medium", 0.20, None).await;
+    seed_cost_rank_modello(&pool, "prov-uno", "u3", "medium", 0.30, None).await;
+    seed_cost_rank_modello(&pool, "prov-due", "d1", "medium", 0.90, None).await;
+    accendi_cost_rank(&pool, true).await;
+
+    let req = ModelRequest::agentic("medium").capability(Some("code"));
+    let scelte = select_models(&pool, &req, 2, 2).await.expect("fan-out");
+    let providers: std::collections::BTreeSet<&str> =
+        scelte.iter().map(|c| c.provider.as_str()).collect();
+    assert!(
+        providers.contains("prov-due"),
+        "il secondo fornitore deve sopravvivere alla troncatura del pool \
+         esteso: scelte = {:?}",
+        scelte
+            .iter()
+            .map(|c| format!("{}/{}", c.provider, c.model))
+            .collect::<Vec<_>>()
+    );
+    assert!(providers.len() >= 2, "min_distinct_providers=2 va onorato");
+}
+
 // ── Il budget di latenza dichiarato (mig 0725) ──────────────────────────────
 
 /// Probe SANI seminati dal WRITER di produzione (regola O: mai un INSERT

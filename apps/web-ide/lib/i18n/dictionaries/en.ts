@@ -592,6 +592,7 @@ export const en = {
     "settings.salvaQuestoPurposeModel": "Save this purpose model",
     "settings.testaLaRisoluzioneRuntime": "Test runtime resolution of the loop fallback",
     "settings.purposeModels": "Purpose models",
+    "settings.nessunModelloRisolvibileOra": "No model resolvable right now: catalog, qualification gate, or provider in cooldown",
     "settings.caricamento2": "Loading…",
     "settings.salvato2": "Saved ✓",
     "settings.policyDlp": "DLP policy",

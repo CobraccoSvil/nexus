@@ -583,6 +583,7 @@ export const es: PartialDictionary = {
     "settings.salvaQuestoPurposeModel": "Guardar este purpose model",
     "settings.testaLaRisoluzioneRuntime": "Prueba la resolucion en runtime del respaldo por bucle",
     "settings.purposeModels": "Purpose models",
+    "settings.nessunModelloRisolvibileOra": "Ningun modelo resolvible ahora: catalogo, gate de calificacion o proveedor en cooldown",
     "settings.caricamento2": "Cargando…",
     "settings.salvato2": "Guardado ✓",
     "settings.policyDlp": "Politica DLP",

@@ -141,7 +141,7 @@ export function PurposeModelsSection({
                     {"→"} {pm.resolved.provider}/{pm.resolved.model}
                   </span>
                 ) : currentTier !== "" ? (
-                  <span style={{ color: tc.error }} title="Nessun modello risolvibile ora: catalog, gate di qualificazione o provider in cooldown">
+                  <span style={{ color: tc.error }} title={t("settings.nessunModelloRisolvibileOra")}>
                     {"→"} non risolvibile ora
                   </span>
                 ) : (

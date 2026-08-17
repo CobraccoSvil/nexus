@@ -585,6 +585,7 @@ export const it: PartialDictionary = {
     "settings.salvaQuestoPurposeModel": "Salva questo purpose model",
     "settings.testaLaRisoluzioneRuntime": "Testa la risoluzione runtime del fallback su loop",
     "settings.purposeModels": "Purpose models",
+    "settings.nessunModelloRisolvibileOra": "Nessun modello risolvibile ora: catalog, gate di qualificazione o provider in cooldown",
     "settings.caricamento2": "Caricamento…",
     "settings.salvato2": "Salvato ✓",
     "settings.policyDlp": "Policy DLP",
