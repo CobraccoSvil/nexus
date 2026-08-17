@@ -491,6 +491,213 @@ mod tests {
         );
     }
 
+    /// I DUE FILE VERI del run del 17/08/2026, byte per byte.
+    ///
+    /// Le fixture di sopra sono riduzioni scritte a mano: dicono che il criterio
+    /// riconosce *un* file con la sintassi Jest. Queste sono l'ARTEFATTO — i 320
+    /// e 625 byte che il run ha davvero prodotto sul progetto
+    /// `audit-verifica-17-08`, righe 6519 e 6520 di `file_mutations` nel DB META.
+    ///
+    /// Non si possono leggere dall'albero del progetto, e la ragione e' essa
+    /// stessa una misura: alle 15:12:15 UTC — 32 minuti dopo la creazione — la
+    /// riga 6521 ha RISCRITTO `calcolatrice.test.js` con `node:test`. Sul disco
+    /// oggi c'e' quella versione, che si carica e supera tutti e cinque i casi
+    /// (verificato: `node --test` esce 0, 5 pass). Il file rotto sopravvive solo
+    /// nel registro delle scritture, ed e' da li' che queste due costanti
+    /// vengono.
+    const CALCOLATRICE_REALE: &str = r#"function somma(a, b) {
+  return a + b;
+}
+
+function sottrai(a, b) {
+  return a - b;
+}
+
+function moltiplica(a, b) {
+  return a * b;
+}
+
+function dividi(a, b) {
+  if (b === 0) {
+    throw new Error("Divisione per zero non consentita");
+  }
+  return a / b;
+}
+
+module.exports = {
+  somma,
+  sottrai,
+  moltiplica,
+  dividi
+};
+"#;
+
+    const TEST_JEST_REALE: &str = r#"const { somma, sottrai, moltiplica, dividi } = require('./calcolatrice');
+
+describe('Calcolatrice', () => {
+  test('somma due numeri', () => {
+    expect(somma(2, 3)).toBe(5);
+  });
+
+  test('sottrae due numeri', () => {
+    expect(somma ? sottrai(5, 2) : 0).toBe(3);
+    expect(sottrai(5, 2)).toBe(3);
+  });
+
+  test('moltiplica due numeri', () => {
+    expect(moltiplica(4, 3)).toBe(12);
+  });
+
+  test('divide due numeri', () => {
+    expect(dividi(10, 2)).toBe(5);
+  });
+
+  test('lancia un errore in caso di divisione per zero', () => {
+    expect(() => dividi(5, 0)).toThrow("Divisione per zero non consentita");
+  });
+});
+"#;
+
+    /// Le impronte che il registro porta per quelle due righe. Servono a
+    /// DIMOSTRARE che le fixture sono l'artefatto invece di affermarlo: chi le
+    /// ritoccasse «per renderle piu' leggibili» starebbe misurando un altro
+    /// caso, e il test glielo dice. Si ricalcolano con la funzione che ha
+    /// scritto `after_sha256` sul registro, non con una seconda copia (regola O).
+    const SHA_SORGENTE_REALE: &str =
+        "678814cb71077fc307ed949769e67b87dda36d4bd7b775d487dc65fc81513f98";
+    const SHA_TEST_REALE: &str =
+        "eaaca1ae1c98b26faa8cc04fba8bc1adaa159fc7f649850e58b87496f6d20bdd";
+
+    /// IL CASO CHE HA MOTIVATO IL CRITERIO, contro i file veri e la raccolta
+    /// vera: `fatti_codice` -> vocabolario della migrazione -> `node` eseguito
+    /// davvero -> verdetto.
+    ///
+    /// Il 17/08/2026 il final gate ha dichiarato «passato» DUE volte su questi
+    /// esatti due file. Qui il primo esce `Caricato` e il secondo `NonCaricato`
+    /// con dentro la parola del runtime, e il verdetto e' bloccante.
+    ///
+    /// DUE DETTAGLI LOAD-BEARING, entrambi misurati sui file veri:
+    ///
+    ///  - la sorgente va scritta INSIEME al test. Il `require('./calcolatrice')`
+    ///    sta alla riga 1 e si risolve PRIMA che `describe` venga chiamato alla
+    ///    riga 3: senza la sorgente il file fallirebbe lo stesso, ma con
+    ///    `MODULE_NOT_FOUND` — cioe' il test sarebbe rosso per la causa
+    ///    SBAGLIATA, e non proverebbe piu' niente sul difetto. L'asserzione
+    ///    sulla causa e' cio' che tiene distinti i due casi;
+    ///  - il messaggio del runtime arriva su STDOUT e non su stderr (misurato:
+    ///    stderr 0 byte, stdout 1099). E' `messaggio_del_processo` a coprirlo,
+    ///    e questo test e' l'unico posto in cui quella scelta viene esercitata
+    ///    dal file vero.
+    ///
+    /// MUTAZIONE ESEGUITA: degradato `NonCaricato` a `NonProvato` in
+    /// `prova_file`. Il test rosseggia sull'esito del file — «dev'essere
+    /// NonCaricato, ottenuto NonProvato { RuntimeNonDisponibile }» col
+    /// `ReferenceError` finito dentro il dettaglio — e non arriva al verdetto,
+    /// che a quel punto sarebbe `CodiceCaricabile { provati: 1 }`: nessun file
+    /// rotto, la sola sorgente contata fra i provati, quindi un PASSED. E' il
+    /// gate del 17/08 che riapprova il file rotto.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn i_due_file_veri_del_run_del_17_agosto(pool: PgPool) {
+        assert_eq!(
+            crate::file_mutations::sha256_hex(CALCOLATRICE_REALE.as_bytes()),
+            SHA_SORGENTE_REALE,
+            "la fixture della sorgente non e' piu' il file che il run ha prodotto"
+        );
+        assert_eq!(
+            crate::file_mutations::sha256_hex(TEST_JEST_REALE.as_bytes()),
+            SHA_TEST_REALE,
+            "la fixture del test non e' piu' il file che il run ha prodotto"
+        );
+
+        let (user_id, project_id) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let session_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let albero = tempfile::tempdir().expect("tempdir");
+        let root = albero.path();
+
+        for (rel, contenuto) in [
+            ("calcolatrice.js", CALCOLATRICE_REALE),
+            ("calcolatrice.test.js", TEST_JEST_REALE),
+        ] {
+            scrivi(
+                &pool,
+                project_id,
+                session_id,
+                user_id,
+                Some(run_id),
+                root,
+                rel,
+                contenuto,
+            )
+            .await;
+        }
+
+        let fatti = fatti_codice(
+            &pool,
+            project_id,
+            session_id,
+            root,
+            &vocabolario_dalla_migrazione(),
+            50,
+            30.0,
+        )
+        .await
+        .expect("fatti");
+        assert_eq!(fatti.len(), 2, "due file prodotti, due fatti: {fatti:?}");
+
+        let sorgente = fatti
+            .iter()
+            .find(|f| f.path == "calcolatrice.js")
+            .expect("la sorgente e' fra i fatti");
+        assert_eq!(
+            sorgente.esito,
+            EsitoFile::Caricato {
+                livello: LivelloProva::Sintassi
+            },
+            "la sorgente si carica: e' il file che l'audit ha verificato a mano"
+        );
+
+        let prova = fatti
+            .iter()
+            .find(|f| f.path == "calcolatrice.test.js")
+            .expect("il file di test e' fra i fatti");
+        let EsitoFile::NonCaricato {
+            livello,
+            exit_code,
+            causa,
+        } = &prova.esito
+        else {
+            panic!(
+                "il file che il 17/08 ha chiuso il run come «completato» \
+                 dev'essere NonCaricato, ottenuto {:?}",
+                prova.esito
+            );
+        };
+        assert_eq!(
+            *livello,
+            LivelloProva::Caricamento,
+            "`node --check` questo file lo PASSA (misurato: exit 0): e' il \
+             secondo livello a vederlo"
+        );
+        assert_eq!(*exit_code, Some(1));
+        assert!(
+            causa.contains("describe is not defined"),
+            "la causa e' la parola del RUNTIME, e distingue il difetto vero da \
+             un MODULE_NOT_FOUND: {causa}"
+        );
+
+        let verdetto = classifica_esecuzione(&fatti);
+        let VerdettoEsecuzione::CodiceRotto { rotti } = &verdetto else {
+            panic!("atteso CodiceRotto, ottenuto {verdetto:?}");
+        };
+        assert_eq!(rotti.len(), 1, "un solo file rotto dei due");
+        assert_eq!(rotti[0].path, "calcolatrice.test.js");
+        assert!(
+            verdetto.e_bloccante(),
+            "il gate del 17/08 aveva chiuso «passato»: qui non deve"
+        );
+    }
+
     /// LO STESSO FILE riscritto con `node:test` si carica — e il suo test
     /// FALLISCE apposta.
     ///

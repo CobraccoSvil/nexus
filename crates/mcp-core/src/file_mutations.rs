@@ -140,7 +140,13 @@ fn solo_fine_riga(before: Option<&[u8]>, after: Option<&[u8]>) -> Option<bool> {
 }
 
 /// Calcola lo SHA-256 in hex di un blocco di byte.
-fn sha256_hex(data: &[u8]) -> String {
+///
+/// Visibile al crate perche' e' la funzione che produce `after_sha256` sulle
+/// righe del registro: chi vuole accertare che una fixture sia byte-identica a
+/// un file davvero prodotto da un run deve ricalcolarne l'impronta con QUESTA,
+/// non con una seconda implementazione che potrebbe divergerne restando verde
+/// (regola O).
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(data);
     format!("{:x}", h.finalize())
