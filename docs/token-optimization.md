@@ -187,3 +187,11 @@ Storia degli aggiornamenti:
   lettore; `supports_prompt_cache` allineata ai fatti del ledger) + wiring di
   `dedup_tool_results_enabled` e `drop_unused_base64_age` (vince il DB: 3, non
   il cablato 8).
+- 16/08/2026 — Fase 5b (A/B lingua) infrastruttura pronta: varianti EN dei 4
+  template machine-only come righe `<chiave>.en` + selettore CSV
+  `prompt.english_variants` nel punto unico di lettura (mig 0725). Il flip per
+  blocchi e' un UPDATE del setting con cutover secco (mai per-chiamata: cache
+  fredda in entrambi i bracci), rollback = svuotare il CSV. Misure attese dal
+  ledger a esercizio ripreso: `prompt_tokens` per purpose prima/dopo il flip
+  (delta live misurato -13/-20% sui template tradotti, atteso ~5-10%
+  dell'input di piattaforma).
