@@ -718,16 +718,23 @@ fn astensione_su(role: &str, provider: String, model: String, causa: &str) -> Va
 }
 
 async fn template(db: &PgPool, chiave: &str) -> Option<String> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT content FROM nexus_prompt_templates WHERE key = $1 AND is_active = true",
+    // Delega al punto unico di lettura (regola L): la SELECT locale che stava
+    // qui non passava dalla selezione della variante EN (A/B lingua, mig 0725)
+    // e il flip del setting sarebbe stato muto proprio sui due giudici del
+    // gate. La cache fresca per chiamata replica il costo precedente (una
+    // lettura DB per convocazione, ammortizzata dalla cache dei settings).
+    let contenuto = crate::prompt_templates::get_template_or_default(
+        db,
+        &crate::prompt_templates::TemplateCache::new(),
+        chiave,
     )
-    .bind(chiave)
-    .fetch_optional(db)
-    .await
-    .ok()
-    .flatten()
-    .map(|t| t.trim().to_string())
-    .filter(|t| !t.is_empty())
+    .await;
+    let contenuto = contenuto.trim();
+    if contenuto.is_empty() {
+        None
+    } else {
+        Some(contenuto.to_string())
+    }
 }
 
 async fn setting_u64(db: &PgPool, chiave: &str, default: u64) -> u64 {

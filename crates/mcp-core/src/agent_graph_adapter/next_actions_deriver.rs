@@ -327,16 +327,19 @@ impl NextActionsDeriverAdapter {
     /// presente (placeholder `{{assistant_text}}`), altrimenti fallback hardcoded
     /// (graceful degradation, parita' py:333-373).
     async fn build_extractor_prompt(&self, assistant_text: &str) -> String {
-        let tpl = sqlx::query_scalar::<_, String>(
-            "SELECT content FROM nexus_prompt_templates \
-             WHERE key = 'system.choices_extractor' AND is_active = TRUE LIMIT 1",
+        // Delega al punto unico di lettura (regola L): la SELECT locale che
+        // stava qui non passava dalla selezione della variante EN (A/B lingua,
+        // mig 0725) e il flip del setting sarebbe stato muto sull'estrattore.
+        // Errore DB o chiave assente escono come stringa vuota (gia' loggati
+        // dal punto unico) e cadono sul fallback, come prima.
+        let tpl = crate::prompt_templates::get_template_or_default(
+            &self.db,
+            &crate::prompt_templates::TemplateCache::new(),
+            "system.choices_extractor",
         )
-        .fetch_optional(&self.db)
-        .await
-        .ok()
-        .flatten();
+        .await;
 
-        if let Some(tpl) = tpl.filter(|t| !t.trim().is_empty()) {
+        if !tpl.trim().is_empty() {
             return tpl.replace("{{assistant_text}}", assistant_text);
         }
 
