@@ -1533,8 +1533,9 @@ fn from_chat_completion(
     )
     .with_declared_cost(declared_total, declared_upstream);
 
-    // Citazioni top-level (Perplexity): estratte prima di costruire la risposta.
-    let citations = resp.citations.filter(|c| !c.is_empty());
+    // Fonti consultate (Perplexity): estratte prima di costruire la risposta, da
+    // qualunque delle due forme il fornitore usi.
+    let citations = citazioni_dal_wire(resp.search_results, resp.citations);
 
     let finish_reason = normalize_finish_reason(choice.finish_reason.as_deref());
 
@@ -2131,8 +2132,99 @@ struct ChatCompletion {
     usage: Option<WireUsage>,
     /// Perplexity espone le fonti come array top-level `citations` (non standard
     /// OpenAI): mappato una sola volta qui, vale per ogni provider OpenAI-compat.
+    /// FORMA STORICA — vedi [`ChatCompletion::search_results`].
     #[serde(default)]
     citations: Option<Vec<String>>,
+    /// Forma NUOVA delle stesse fonti: oggetti con url piu' titolo e data, che
+    /// l'API Router di Perplexity emette al posto di `citations`. Si leggono
+    /// ENTRAMBE perche' la migrazione dell'endpoint e' un fatto del fornitore e
+    /// non nostro: un parser che ne conoscesse una sola smetterebbe di riempire
+    /// il pannello «Fonti consultate» nel giorno in cui il fornitore cambia
+    /// forma, e lo farebbe in silenzio — le fonti mancanti non sono un errore
+    /// per nessuno.
+    #[serde(default)]
+    search_results: Option<Vec<WireSearchResult>>,
+}
+
+/// Una fonte nella forma NUOVA del Router Perplexity.
+///
+/// UN SOLO CAMPO, e non e' pigrizia: il fornitore manda anche `title` e `date`,
+/// ma il contratto a valle ([`LlmResponse::citations`]) e' una lista di URL, e un
+/// campo che nessuno legge e' una dichiarazione senza lettore — la stessa cosa
+/// che si rimprovera alle colonne di capability mai interrogate. Il giorno in cui
+/// il contratto sapra' portare titolo e data, quel giorno si aggiungono qui
+/// insieme al loro consumatore. Serde ignora da se' i campi non dichiarati.
+///
+/// `url` e' `Option` perche' la forma la decide il fornitore, non noi: una voce
+/// che non ce l'ha non e' una citazione, e non lo diventa inventandone una dal
+/// titolo.
+#[derive(Debug, Deserialize)]
+struct WireSearchResult {
+    #[serde(default)]
+    url: Option<String>,
+}
+
+/// Le fonti consultate, da qualunque delle due forme il fornitore usi.
+///
+/// PUNTO UNICO (regola L) della domanda «quali fonti ha citato questa risposta?»:
+/// il contratto verso mcp-core e verso il pannello «Fonti consultate» resta una
+/// lista di URL e non cambia, quindi la scelta fra le due forme si fa qui una
+/// volta sola invece che dove le si legge.
+///
+/// PRECEDENZA alla forma nuova quando porta almeno un url: e' la piu' ricca, e
+/// dove il fornitore emette entrambe sono la stessa cosa detta due volte. Il
+/// ripiego sulla forma storica non e' un residuo da togliere un giorno — e' cio'
+/// che rende il flip dell'endpoint una migrazione di soli DATI, reversibile con
+/// l'UPDATE inverso e senza revert di codice.
+///
+/// IL FLIP NON E' STATO FATTO, e la ragione e' misurata: il 17/08/2026 l'account
+/// Perplexity e' senza credito e risponde `401 insufficient_quota` a TUTTO —
+/// `GET /router/v1/models`, `GET /v1/models`, e le completion su entrambe le
+/// radici. La conformita' del Router non e' quindi accertabile e il flip resta
+/// bloccato: e' esattamente l'incidente che la mig 0708 ha chiuso (discovery e
+/// healthcheck condividono quella GET, quindi una radice sbagliata spegne il
+/// fornitore, non lo degrada). Cio' che si e' potuto accertare e' che il
+/// sottoalbero `/router/v1` ESISTE: un percorso inventato sotto di esso risponde
+/// 401 (l'autenticazione precede l'instradamento) mentre lo stesso percorso alla
+/// radice risponde 404. Non e' un 200, e non basta.
+///
+/// Quando il credito tornera' e i probe daranno 200, il flip e' un UPDATE solo,
+/// senza codice — la parte di codice e' questa funzione, che c'e' gia':
+/// ```sql
+/// UPDATE nexus_provider_registry
+///    SET base_url_default = 'https://api.perplexity.ai/router/v1',
+///        models_path      = '/models',   -- relativo alla NUOVA base (mig 0708)
+///        supports_tools   = TRUE,        -- solo se il probe CON tool da' 200
+///        updated_at       = now()
+///  WHERE name = 'perplexity';
+/// ```
+/// Verificato sul DB di esercizio: il setting `perplexity_base_url` NON esiste
+/// (la mig 0568 non lo semina), quindi `resolve_base_url` cade sul default del
+/// registry e l'UPDATE e' efficace da solo. Se un giorno quel setting comparira'
+/// valorizzato con la vecchia radice, il flip sara' inerte finche' non lo si
+/// azzera: e' la nota operativa da non perdere.
+///
+/// Lo STREAMING non e' toccato: se il Router emettesse le fonti sull'ultimo
+/// chunk SSE andrebbe letto anche li', e senza un probe non lo si sa. Il
+/// percorso che conta oggi (`ricerca_web`) e' quello non-streaming.
+///
+/// Una lista vuota vale come assente in entrambe le forme: «nessuna fonte» e
+/// «campo presente ma vuoto» sono la stessa cosa per chi legge, e un `Some(vec![])`
+/// farebbe comparire un pannello vuoto al posto di nessun pannello.
+fn citazioni_dal_wire(
+    search_results: Option<Vec<WireSearchResult>>,
+    citations: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    let dai_risultati: Vec<String> = search_results
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| r.url)
+        .filter(|u| !u.trim().is_empty())
+        .collect();
+    if !dai_risultati.is_empty() {
+        return Some(dai_risultati);
+    }
+    citations.filter(|c| !c.is_empty())
 }
 
 #[derive(Debug, Deserialize)]
@@ -4329,6 +4421,90 @@ mod tests {
         let parsed = parse_chat_completion("ignoto", body_ignoto).expect("parse");
         let resp = from_chat_completion(parsed, "m".into(), "ignoto", 1).expect("mappatura");
         assert_eq!(resp.usage.declared_cost_usd, None);
+    }
+
+    /// Le fonti si leggono in ENTRAMBE le forme, e la nuova vince.
+    ///
+    /// Perplexity sta migrando le completion sotto `/router/v1`, dove le fonti
+    /// arrivano come `search_results` (oggetti con url, titolo e data) invece che
+    /// come `citations` (array di stringhe). Le due forme convivono nella stessa
+    /// finestra di migrazione, e un parser che ne conoscesse una sola smetterebbe
+    /// di riempire il pannello «Fonti consultate» in SILENZIO: le fonti che non
+    /// arrivano non sono un errore per nessuno.
+    ///
+    /// I corpi passano dal parser REALE (`parse_chat_completion` +
+    /// `from_chat_completion`), non da `citazioni_dal_wire` chiamata a mano: cosi'
+    /// il test copre anche il campo `search_results` sulla struct del wire, che e'
+    /// il punto in cui un rinominamento romperebbe tutto restando verde.
+    ///
+    /// MUTAZIONE: invertire la precedenza -> il caso «entrambe» rosseggia con gli
+    /// url legacy; togliere il ripiego -> rosseggia il caso legacy, cioe' l'API
+    /// che oggi e' ancora in produzione.
+    #[test]
+    fn le_fonti_si_leggono_dalla_forma_nuova_e_da_quella_storica() {
+        let corpo = |fonti: &str| {
+            format!(
+                r#"{{"choices": [{{"index": 0, "finish_reason": "stop",
+                     "message": {{"role": "assistant", "content": "ok"}}}}],
+                   "usage": {{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+                   {fonti}}}"#
+            )
+        };
+        let cita = |body: String| {
+            let parsed = parse_chat_completion("perplexity", &body).expect("parse");
+            from_chat_completion(parsed, "sonar".into(), "perplexity", 1)
+                .expect("mappatura")
+                .citations
+        };
+
+        // Forma NUOVA (Router): gli url escono dagli oggetti, titolo e data non
+        // entrano nel contratto a valle, che e' una lista di url.
+        assert_eq!(
+            cita(corpo(
+                r#", "search_results": [
+                     {"title": "Uno", "url": "https://a.example/1", "date": "2026-08-01"},
+                     {"title": "Due", "url": "https://b.example/2"}]"#
+            )),
+            Some(vec![
+                "https://a.example/1".to_string(),
+                "https://b.example/2".to_string()
+            ])
+        );
+
+        // Forma STORICA: identica a prima del lotto. E' l'API in produzione oggi.
+        assert_eq!(
+            cita(corpo(r#", "citations": ["https://c.example/3"]"#)),
+            Some(vec!["https://c.example/3".to_string()])
+        );
+
+        // ENTRAMBE: vince la nuova, che e' la piu' ricca. Gli url sono diversi
+        // apposta — se vincesse l'altra il test non se ne accorgerebbe.
+        assert_eq!(
+            cita(corpo(
+                r#", "citations": ["https://vecchia.example/x"],
+                    "search_results": [{"url": "https://nuova.example/y"}]"#
+            )),
+            Some(vec!["https://nuova.example/y".to_string()])
+        );
+
+        // Una voce SENZA url non e' una citazione e non la si inventa dal titolo;
+        // se resta il nulla, si ripiega sulla forma storica invece di dichiarare
+        // zero fonti.
+        assert_eq!(
+            cita(corpo(
+                r#", "citations": ["https://c.example/3"],
+                    "search_results": [{"title": "Senza indirizzo"}]"#
+            )),
+            Some(vec!["https://c.example/3".to_string()])
+        );
+
+        // Nessuna delle due forme, e le forme VUOTE: `None`, mai una lista vuota
+        // che farebbe comparire un pannello «Fonti consultate» senza fonti.
+        assert_eq!(cita(corpo("")), None);
+        assert_eq!(
+            cita(corpo(r#", "citations": [], "search_results": []"#)),
+            None
+        );
     }
 
     /// In STREAMING l'usage col costo arriva nell'ultimo chunk (quello con
