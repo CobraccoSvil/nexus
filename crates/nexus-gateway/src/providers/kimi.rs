@@ -20,7 +20,7 @@
 //! `max_completion_tokens` al posto del deprecato `max_tokens`, il round-trip
 //! del `reasoning_content` preteso dal Preserved Thinking, e lo spegnimento del
 //! pensiero — che questo modulo decide, perche' e' l'unico a sapere se il
-//! modello lo consenta (vedi [`PensieroSpegnibile`]).
+//! modello lo consenta (vedi [`FattiDelModello`]).
 //!
 //! CACHE: il fornitore cachea il prefisso da solo ("Context Caching is
 //! automatically enabled for all model requests"), ma documenta anche il campo
@@ -53,6 +53,58 @@ const PROVIDER_NAME: &str = "kimi";
 /// configurazione del gateway (`policy_engine`, `cooldown`, affinita' upstream).
 const CATALOG_TTL: Duration = Duration::from_secs(60);
 
+/// Chiave settings (regola G) dello sforzo di ragionamento da chiedere a questo
+/// fornitore. Gemella di `providers.openai.reasoning_effort`: stessa forma, altro
+/// vocabolario, e per questo due chiavi e non una.
+const EFFORT_SETTING: &str = "providers.kimi.reasoning_effort";
+
+/// Vocabolario CHIUSO documentato da Moonshot per `reasoning_effort`.
+///
+/// E' anche il solo posto da cui puo' nascere il valore che finisce sul wire:
+/// [`effort_ammesso`] ritorna un `&'static str` preso da qui (regola Q).
+///
+/// SERVE PIU' DI QUANTO SEMBRI, perche' l'API non fa da rete: MISURATO il
+/// 17/08/2026, `reasoning_effort: "assurdo"` su kimi-k3 risponde 200 con 117 char
+/// di pensiero. Un valore inventato non torna indietro come errore, torna come un
+/// comportamento che nessuno ha dichiarato.
+///
+/// `minimal` e' stato OSSERVATO funzionare su k3 (200, 10 char di pensiero, meno
+/// ancora di `low`) e NON e' qui: la doc dichiara low|high|max, e su un valore non
+/// documentato non si spedisce.
+const EFFORT_VOCABOLARIO: [&str; 3] = ["low", "high", "max"];
+
+/// Lo sforzo dichiarato dal DB, ridotto al vocabolario chiuso. Stringa vuota,
+/// chiave assente o valore fuori vocabolario -> `None`, cioe' non si emette.
+fn effort_ammesso(valore: &str) -> Option<&'static str> {
+    let valore = valore.trim();
+    EFFORT_VOCABOLARIO.iter().copied().find(|v| *v == valore)
+}
+
+/// Lo sforzo da emettere dato cio' che il setting contiene, con l'avviso quando
+/// quel contenuto non e' spedibile.
+///
+/// Funzione PURA e separata dalla lettura: e' la parte che DECIDE, e tenerla
+/// fuori dal metodo che fa I/O la rende provabile senza DB — oltre a togliere
+/// due livelli di annidamento a chi legge.
+///
+/// Il ripiego NON esiste di proposito. Un valore fuori vocabolario non ricade su
+/// uno "ragionevole": qui il ripiego non sarebbe conservativo, sarebbe
+/// l'attivazione di un meccanismo che nessuno ha chiesto.
+fn effort_dal_setting(letto: Option<&str>) -> Option<&'static str> {
+    let valore = letto?;
+    let ammesso = effort_ammesso(valore);
+    if ammesso.is_none() {
+        // Regola F: solo identificatori di configurazione, mai il valore.
+        tracing::warn!(
+            provider = PROVIDER_NAME,
+            setting = EFFORT_SETTING,
+            "sforzo di ragionamento fuori vocabolario (low|high|max): non lo \
+             dichiaro. L'API lo accetterebbe in silenzio"
+        );
+    }
+    ammesso
+}
+
 /// Endpoint internazionale di default (override via costruttore/registry).
 ///
 /// L'host API resta `api.moonshot.ai`: sono i domini di DOCUMENTAZIONE e console
@@ -67,31 +119,34 @@ const DEFAULT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 /// e non si duplica qui.
 const MAX_CONTEXT_TOKENS: u32 = 1_048_576;
 
-/// Il fornitore accetta di SPEGNERE il ragionamento su questo modello?
+/// Cio' che il catalogo DICHIARA su un fatto booleano di un modello.
 ///
 /// Tre varianti e non un `bool` (regola Q): l'ignoto ha una conseguenza propria e
-/// non deve degradare ne' a «si'» ne' a «no» per comodita' di chi legge. I due
-/// errori non si equivalgono affatto — spegnere dove il fornitore non lo consente
-/// e' un HTTP 400 su OGNI chiamata a quel modello (l'immagine speculare del
-/// difetto della temperatura che questo driver gia' evita), mentre non spegnere
-/// dove si potrebbe costa il tetto di output. Percio' solo [`Self::Si`] autorizza,
-/// e [`Self::NonDichiarato`] si comporta come il codice si comportava prima che
-/// il dato esistesse.
+/// non deve degradare ne' a «si'» ne' a «no» per comodita' di chi legge. Solo
+/// [`Self::Si`] autorizza, e [`Self::NonDichiarato`] si comporta come il codice si
+/// comportava prima che il dato esistesse.
+///
+/// UN vocabolario per DUE fatti (mig 0705 e 0732), e non due copie: la domanda e'
+/// la stessa — «cosa dice il catalogo di questa colonna nullable?» — e prima
+/// erano due enum con lo stesso corpo, cioe' due posti in cui rispondere. QUALE
+/// fatto sia lo dice il campo che lo porta ([`FattiDelModello`]), che e' anche
+/// dove sta scritto cosa si e' misurato: le due asimmetrie non si somigliano
+/// affatto, e vanno lette li' prima di cambiare una direzione.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PensieroSpegnibile {
-    /// MISURATO: l'API accetta `thinking: {"type":"disabled"}`.
+pub enum FattoDichiarato {
+    /// Il catalogo lo afferma.
     Si,
-    /// MISURATO: l'API risponde 400 «only type=enabled is allowed».
+    /// Il catalogo lo nega.
     No,
     /// Il catalogo non lo dice — riga assente, colonna `NULL`, o DB che non ha
-    /// parlato. Non e' una misura, e non si spegne.
+    /// parlato. Non e' una misura.
     NonDichiarato,
 }
 
-impl PensieroSpegnibile {
-    /// Dalla colonna `ai_price_catalog.thinking_can_be_disabled` (mig 0705), dove
-    /// il `NULL` della colonna e la riga assente collassano legittimamente nella
-    /// stessa risposta: in entrambi i casi nessuno ha dichiarato nulla.
+impl FattoDichiarato {
+    /// Da una colonna booleana nullable, dove il `NULL` e la riga assente
+    /// collassano legittimamente nella stessa risposta: in entrambi i casi
+    /// nessuno ha dichiarato nulla.
     fn dal_catalogo(letto: Option<bool>) -> Self {
         match letto {
             Some(true) => Self::Si,
@@ -100,8 +155,8 @@ impl PensieroSpegnibile {
         }
     }
 
-    /// L'unico punto in cui questo fatto diventa un permesso.
-    fn consente_lo_spegnimento(self) -> bool {
+    /// L'unico punto in cui un fatto dichiarato diventa un permesso.
+    fn autorizza(self) -> bool {
         matches!(self, Self::Si)
     }
 }
@@ -109,7 +164,7 @@ impl PensieroSpegnibile {
 /// Questa richiesta vuole una RISPOSTA o un RAGIONAMENTO?
 ///
 /// Funzione pura: e' la VOLONTA' del chiamante, distinta dal fatto del fornitore
-/// (`PensieroSpegnibile`) con cui viene incrociata. Due segnali, in quest'ordine:
+/// (`FattiDelModello::spegnibile`) con cui viene incrociata. Due segnali, in ordine:
 ///
 /// 1. la preferenza ESPLICITA, quando c'e': chi si e' preso la briga di dirlo
 ///    comanda, in entrambi i versi (e' il canale che usa la batteria di
@@ -144,7 +199,49 @@ pub struct KimiProvider {
     /// fornitore: e' l'intero punto di questo meccanismo. Vi entra solo cio' che
     /// si e' letto — un errore non e' una misura, e scriverlo qui
     /// cristallizzerebbe per 60s un'ignoranza momentanea.
-    spegnibile: TtlCache<String, PensieroSpegnibile>,
+    fatti: TtlCache<String, FattiDelModello>,
+    /// Lo sforzo configurato: uno per FORNITORE, non per modello, e ridotto al
+    /// vocabolario chiuso gia' qui — cio' che si memorizza e' gia' spedibile.
+    effort_configurato: TtlCache<(), Option<&'static str>>,
+}
+
+/// Cio' che il catalogo dichiara su un modello kimi.
+///
+/// Stanno insieme perche' sono la stessa riga di `ai_price_catalog` e si leggono
+/// in una volta sola. Il vocabolario e' lo stesso ([`FattoDichiarato`]) perche' la
+/// domanda posta al catalogo e' la stessa; cio' che NON e' lo stesso e' la
+/// conseguenza di sbagliare, ed e' scritto qui perche' e' qui che si distingue
+/// quale fatto si sta leggendo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FattiDelModello {
+    /// Il fornitore consente di SPEGNERE il ragionamento (mig 0705)?
+    ///
+    /// MISURATO il 13/08/2026: `thinking: {"type":"disabled"}` accettato su
+    /// `kimi-k2.6` e `kimi-k3`, HTTP 400 «only type=enabled is allowed» su
+    /// `kimi-k2.7-code` e `-highspeed`. L'errore e' RUMOROSO in un verso solo:
+    /// spegnere dove non si puo' e' un 400 su OGNI chiamata a quel modello,
+    /// mentre non spegnere dove si potrebbe costa soltanto il tetto di output.
+    spegnibile: FattoDichiarato,
+    /// Il modello interpreta `reasoning_effort` (mig 0732)?
+    ///
+    /// MISURATO il 17/08/2026: accettato da tutti e quattro i modelli a catalogo
+    /// (l'idea che fosse del solo k3 era una supposizione), e su k3 `low` porta
+    /// il completion da 80 a 24 token. L'asimmetria e' OPPOSTA a quella qui
+    /// sopra e per questo piu' insidiosa: l'API risponde 200 anche a un valore
+    /// insensato, quindi sbagliare non produce un errore visibile ma un effetto
+    /// che nessuno ha dichiarato.
+    effort: FattoDichiarato,
+}
+
+impl FattiDelModello {
+    /// Cio' che si sa di un modello di cui non si e' letto nulla: niente. Non e'
+    /// un default comodo, e' l'unico stato onesto quando il DB non ha parlato.
+    fn ignoti() -> Self {
+        Self {
+            spegnibile: FattoDichiarato::NonDichiarato,
+            effort: FattoDichiarato::NonDichiarato,
+        }
+    }
 }
 
 impl KimiProvider {
@@ -174,32 +271,38 @@ impl KimiProvider {
                 .with_prompt_cache_keying(PromptCacheKeying::RequiresKey)
                 .with_tetto_su_completion(),
             db,
-            spegnibile: TtlCache::new(CATALOG_TTL),
+            fatti: TtlCache::new(CATALOG_TTL),
+            effort_configurato: TtlCache::new(CATALOG_TTL),
         }
     }
 
-    /// Se il fornitore consenta di spegnere il pensiero su questo modello, dal
-    /// catalogo (mig 0705).
+    /// Cio' che il catalogo dichiara su questo modello (mig 0705 + 0732), in una
+    /// lettura sola.
     ///
-    /// Ogni via di fuga porta a [`PensieroSpegnibile::NonDichiarato`], e sempre
-    /// nella stessa direzione: non spegnere. Nessun DB agganciato, riga assente,
-    /// colonna `NULL`, query fallita — in nessuno di questi casi qualcuno ha
-    /// misurato alcunche', e il costo dell'errore non e' simmetrico. Un guasto
-    /// del DB piu' lungo della TTL riporta al comportamento di ieri, che e'
-    /// sicuro; la direzione opposta manderebbe un `disabled` a un modello che
-    /// risponde 400.
-    async fn pensiero_spegnibile(&self, model: &str) -> PensieroSpegnibile {
-        if let Some(v) = self.spegnibile.get(model) {
+    /// UNA query e UNA cache per DUE fatti, e non e' un'ottimizzazione: sono la
+    /// STESSA RIGA. Due letture separate erano due copie dello stesso giro
+    /// (cache, guardia sul DB, `Option<Option<bool>>`, WARN) e avrebbero potuto
+    /// divergere su cio' che conta davvero — la DIREZIONE in cui si sbaglia
+    /// quando il DB non risponde. Cosi' la direzione e' scritta una volta.
+    ///
+    /// Ogni via di fuga porta ai `NonDichiarato`, e sempre dalla parte del non
+    /// fare: nessun DB agganciato, riga assente, colonne `NULL`, query fallita —
+    /// in nessuno di questi casi qualcuno ha misurato alcunche'. Un guasto del DB
+    /// piu' lungo della TTL riporta al comportamento di ieri, che e' sicuro; la
+    /// direzione opposta manderebbe un `disabled` a un modello che risponde 400,
+    /// o un `reasoning_effort` a un modello che nessuno ha provato.
+    async fn fatti_del_modello(&self, model: &str) -> FattiDelModello {
+        if let Some(v) = self.fatti.get(model) {
             return v;
         }
         let Some(db) = self.db.as_ref() else {
-            return PensieroSpegnibile::NonDichiarato;
+            return FattiDelModello::ignoti();
         };
-        // `Option<Option<bool>>`: il primo livello e' la riga, il secondo la
-        // colonna nullable. Entrambi gli assenti dicono la stessa cosa.
-        let letto: Result<Option<(Option<bool>,)>, sqlx::Error> = sqlx::query_as(
-            "SELECT thinking_can_be_disabled FROM ai_price_catalog \
-             WHERE provider = $1 AND model = $2",
+        // `Option<(..)>` e' la riga; gli `Option<bool>` dentro sono le colonne
+        // nullable. Riga assente e colonna nulla dicono la stessa cosa.
+        let letto: Result<Option<(Option<bool>, Option<bool>)>, sqlx::Error> = sqlx::query_as(
+            "SELECT thinking_can_be_disabled, accepts_reasoning_effort \
+             FROM ai_price_catalog WHERE provider = $1 AND model = $2",
         )
         .bind(PROVIDER_NAME)
         .bind(model)
@@ -207,8 +310,12 @@ impl KimiProvider {
         .await;
         match letto {
             Ok(row) => {
-                let esito = PensieroSpegnibile::dal_catalogo(row.and_then(|(v,)| v));
-                self.spegnibile.insert(model.to_string(), esito);
+                let (spegnibile, effort) = row.unwrap_or((None, None));
+                let esito = FattiDelModello {
+                    spegnibile: FattoDichiarato::dal_catalogo(spegnibile),
+                    effort: FattoDichiarato::dal_catalogo(effort),
+                };
+                self.fatti.insert(model.to_string(), esito);
                 esito
             }
             Err(e) => {
@@ -218,12 +325,44 @@ impl KimiProvider {
                     provider = PROVIDER_NAME,
                     model = %model,
                     error = %e,
-                    "disattivabilita' del pensiero non leggibile dal catalogo: \
-                     il ragionamento resta acceso e puo' consumare il tetto di output"
+                    "fatti del modello non leggibili dal catalogo: il ragionamento \
+                     resta acceso col proprio default e non si dichiara nulla"
                 );
-                PensieroSpegnibile::NonDichiarato
+                FattiDelModello::ignoti()
             }
         }
+    }
+
+    /// Se il fornitore consenta di spegnere il pensiero su questo modello
+    /// (mig 0705).
+    async fn pensiero_spegnibile(&self, model: &str) -> FattoDichiarato {
+        self.fatti_del_modello(model).await.spegnibile
+    }
+
+    /// Se il modello interpreti `reasoning_effort` (mig 0732).
+    async fn effort_ammesso(&self, model: &str) -> FattoDichiarato {
+        self.fatti_del_modello(model).await.effort
+    }
+
+    /// Lo sforzo configurato per questo fornitore (settings, TTL 60s), gia'
+    /// ridotto al vocabolario chiuso.
+    ///
+    /// `None` non e' un ripiego ed e' il SEED: la mig 0732 nasce con la chiave
+    /// vuota, cioe' il meccanismo spento. Un valore fuori vocabolario finisce
+    /// nello stesso `None` con un WARN, e non ricade su un valore "ragionevole":
+    /// qui il ripiego non sarebbe conservativo, sarebbe l'attivazione di un
+    /// meccanismo che nessuno ha chiesto.
+    async fn effort_configurato(&self) -> Option<&'static str> {
+        if let Some(v) = self.effort_configurato.get(&()) {
+            return v;
+        }
+        let db = self.db.as_ref()?;
+        // `get_setting` scarta gia' trim e valori vuoti: al criterio arriva solo
+        // qualcosa che qualcuno ha scritto davvero.
+        let letto = nexus_auth::get_setting(db, EFFORT_SETTING).await;
+        let effort = effort_dal_setting(letto.as_deref());
+        self.effort_configurato.insert((), effort);
+        effort
     }
 
     /// Il dialetto e' SEMPRE `Kimi`, senza condizioni sul modello o sulla
@@ -238,18 +377,36 @@ impl KimiProvider {
     /// se entrambe lo dicono; in ogni altro caso resta il default del fornitore,
     /// che e' acceso.
     ///
-    /// `effort` resta neutro: e' accettato dal solo `kimi-k3`, nessun chiamante lo
-    /// esprime oggi, e un ramo senza produttore sarebbe codice morto (regola O).
+    /// `effort` (mig 0732) e' la CONGIUNZIONE di tre cose, e nessuna delle tre e'
+    /// sostituibile dalle altre:
+    ///
+    ///   1. il MODELLO lo interpreta ([`Self::effort_ammesso`], dal catalogo);
+    ///   2. qualcuno lo ha CONFIGURATO ([`Self::effort_configurato`]) — al seed
+    ///      la chiave e' vuota, quindi il meccanismo nasce spento;
+    ///   3. il pensiero NON viene spento su questa stessa richiesta.
+    ///
+    /// La terza non e' una cautela di stile: chiedere uno sforzo di ragionamento
+    /// e insieme dichiarare `thinking: {"type":"disabled"}` sono due istruzioni
+    /// contraddittorie nello stesso corpo, e quale delle due vinca lo deciderebbe
+    /// il fornitore al posto nostro. Fra le due comanda lo spegnimento, che e'
+    /// l'istruzione MISURATA (mig 0705).
     async fn resolve_reasoning(&self, req: &LlmRequest) -> ResolvedReasoning {
         let spegnere = vuole_risposta_e_non_ragionamento(req)
             && self
                 .pensiero_spegnibile(&req.model)
                 .await
-                .consente_lo_spegnimento();
+                .autorizza();
+        let effort = if spegnere {
+            None
+        } else if self.effort_ammesso(&req.model).await.autorizza() {
+            self.effort_configurato().await
+        } else {
+            None
+        };
         ResolvedReasoning {
             dialect: ReasoningDialect::Kimi,
             enabled: !spegnere,
-            effort: None,
+            effort: effort.map(str::to_string),
         }
     }
 }
@@ -530,7 +687,7 @@ mod tests {
         let p = provider();
         assert_eq!(
             p.pensiero_spegnibile("kimi-k2.6").await,
-            PensieroSpegnibile::NonDichiarato
+            FattoDichiarato::NonDichiarato
         );
         let corpo = corpo_di(&p, &richiesta_agentica("kimi-k2.6")).await;
         assert!(
@@ -555,7 +712,7 @@ mod tests {
         for consentito in ["kimi-k2.6", "kimi-k3"] {
             assert_eq!(
                 p.pensiero_spegnibile(consentito).await,
-                PensieroSpegnibile::Si,
+                FattoDichiarato::Si,
                 "{consentito}: la 0705 lo dichiara disattivabile"
             );
             let corpo = corpo_di(&p, &richiesta_agentica(consentito)).await;
@@ -571,7 +728,7 @@ mod tests {
         for vietato in ["kimi-k2.7-code", "kimi-k2.7-code-highspeed"] {
             assert_eq!(
                 p.pensiero_spegnibile(vietato).await,
-                PensieroSpegnibile::No,
+                FattoDichiarato::No,
                 "{vietato}: la 0705 lo dichiara NON disattivabile"
             );
             let corpo = corpo_di(&p, &richiesta_agentica(vietato)).await;
@@ -585,7 +742,7 @@ mod tests {
         // non degrada a permesso.
         assert_eq!(
             p.pensiero_spegnibile("kimi-k9-mai-vista").await,
-            PensieroSpegnibile::NonDichiarato
+            FattoDichiarato::NonDichiarato
         );
         let corpo = corpo_di(&p, &richiesta_agentica("kimi-k9-mai-vista")).await;
         assert!(corpo.get("thinking").is_none());
@@ -606,6 +763,145 @@ mod tests {
             corpo.get("thinking").is_none(),
             "nessuno ha chiesto una risposta secca: vale il default del fornitore"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // reasoning_effort (mig 0732). Il corpo passa sempre da `corpo_di`, cioe'
+    // dalla `resolve_reasoning` reale: un `ResolvedReasoning` scritto a mano
+    // fisserebbe qui l'assunto da verificare (regola O).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Scrive lo sforzo configurato come farebbe un amministratore, e invalida la
+    /// cache di processo di nexus-auth: la scrittura non passa da
+    /// `update_setting_value`, quindi quella cache non se ne accorgerebbe: e' il
+    /// contratto dichiarato di quella cache, e il test lo rispetta invece di
+    /// aggirarlo.
+    async fn configura_effort(pool: &PgPool, valore: &str) {
+        sqlx::query("UPDATE settings SET value = $1 WHERE key = $2")
+            .bind(valore)
+            .bind(EFFORT_SETTING)
+            .execute(pool)
+            .await
+            .expect("scrittura setting");
+        nexus_auth::invalidate_setting_cache(pool, EFFORT_SETTING);
+    }
+
+    /// IL test del lotto: lo sforzo parte solo dove i TRE segnali concordano, e
+    /// il permesso viene dal CATALOGO.
+    ///
+    /// I valori seminati vengono dalla mig 0732, che a sua volta li ha dai probe
+    /// del 17/08/2026 sull'API reale: su kimi-k3 `low` porta il completion da 80
+    /// a 24 token. Se qualcuno cambia quella migrazione, questo test se ne accorge
+    /// (regola O).
+    ///
+    /// MUTAZIONE: emettere senza guardare il catalogo -> rosso sul modello ignoto;
+    /// hardcodare un valore -> rosso col setting vuoto.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn lo_sforzo_parte_solo_se_catalogo_e_setting_concordano(pool: PgPool) {
+        // SEED della 0732: il meccanismo nasce SPENTO. E' la prima cosa da
+        // provare, perche' e' lo stato in cui il deploy mette il sistema.
+        let p = provider_con_catalogo(pool.clone());
+        assert_eq!(p.effort_ammesso("kimi-k3").await, FattoDichiarato::Si);
+        assert!(
+            corpo_di(&p, &richiesta())
+                .await
+                .get("reasoning_effort")
+                .is_none(),
+            "col setting al seed (vuoto) non parte nulla, nemmeno dove il \
+             modello lo accetta"
+        );
+
+        // Configurato: parte, e parte su tutti i modelli che la 0732 dichiara.
+        configura_effort(&pool, "low").await;
+        for model in [
+            "kimi-k3",
+            "kimi-k2.6",
+            "kimi-k2.7-code",
+            "kimi-k2.7-code-highspeed",
+        ] {
+            let p = provider_con_catalogo(pool.clone());
+            let mut req = richiesta();
+            req.model = model.to_string();
+            assert_eq!(
+                corpo_di(&p, &req).await["reasoning_effort"],
+                "low",
+                "{model}: la 0732 lo dichiara, il setting lo configura"
+            );
+        }
+
+        // Modello che il catalogo non conosce: l'ignoto non autorizza. Conta piu'
+        // che altrove — l'API non risponde 400 a cio' che non capisce, quindi uno
+        // sbaglio qui non si vedrebbe in nessun log.
+        let p = provider_con_catalogo(pool.clone());
+        let mut ignoto = richiesta();
+        ignoto.model = "kimi-k9-mai-vista".to_string();
+        assert_eq!(
+            p.effort_ammesso("kimi-k9-mai-vista").await,
+            FattoDichiarato::NonDichiarato
+        );
+        assert!(
+            corpo_di(&p, &ignoto).await.get("reasoning_effort").is_none(),
+            "nessuno ha misurato questo modello: non gli si dichiara nulla"
+        );
+    }
+
+    /// Il vocabolario e' chiuso, e cio' che ne sta fuori NON parte.
+    ///
+    /// Non e' zelo: MISURATO il 17/08/2026, `reasoning_effort: "assurdo"` su
+    /// kimi-k3 risponde 200 con 117 char di pensiero. L'API non fa da rete, quindi
+    /// la rete e' questa.
+    ///
+    /// MUTAZIONE: inoltrare la stringa grezza del setting -> rosso sul caso
+    /// 'assurdo'.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn fuori_vocabolario_non_parte(pool: PgPool) {
+        for (scritto, atteso) in [
+            ("high", Some("high")),
+            ("max", Some("max")),
+            // Osservato funzionare sull'API, ma non documentato: non si spedisce.
+            ("minimal", None),
+            ("assurdo", None),
+            ("", None),
+        ] {
+            configura_effort(&pool, scritto).await;
+            // Provider NUOVO a ogni giro: la cache dello sforzo ha TTL 60s.
+            let p = provider_con_catalogo(pool.clone());
+            let corpo = corpo_di(&p, &richiesta()).await;
+            match atteso {
+                Some(v) => assert_eq!(corpo["reasoning_effort"], v, "setting '{scritto}'"),
+                None => assert!(
+                    corpo.get("reasoning_effort").is_none(),
+                    "setting '{scritto}': l'API lo accetterebbe in silenzio"
+                ),
+            }
+        }
+    }
+
+    /// Spegnere il pensiero e chiedere uno sforzo di ragionamento sono due
+    /// istruzioni contraddittorie nello stesso corpo: fra le due comanda lo
+    /// spegnimento, che e' quella MISURATA (mig 0705).
+    ///
+    /// MUTAZIONE: calcolare lo sforzo prima dello spegnimento (o in parallelo) ->
+    /// il corpo porta insieme `thinking: disabled` e `reasoning_effort`, rosso.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn lo_spegnimento_del_pensiero_esclude_lo_sforzo(pool: PgPool) {
+        configura_effort(&pool, "low").await;
+        let p = provider_con_catalogo(pool.clone());
+
+        // Turno agentico su un modello che la 0705 dichiara spegnibile.
+        let corpo = corpo_di(&p, &richiesta_agentica("kimi-k3")).await;
+        assert_eq!(corpo["thinking"]["type"], "disabled");
+        assert!(
+            corpo.get("reasoning_effort").is_none(),
+            "chiedere uno sforzo a un pensiero appena spento lascerebbe al \
+             fornitore la scelta di quale delle due istruzioni onorare"
+        );
+
+        // Controprova sullo stesso setting: dove il pensiero NON si spegne (la
+        // 0705 lo vieta su k2.7-code) lo sforzo parte.
+        let corpo = corpo_di(&p, &richiesta_agentica("kimi-k2.7-code")).await;
+        assert!(corpo.get("thinking").is_none());
+        assert_eq!(corpo["reasoning_effort"], "low");
     }
 
     #[test]

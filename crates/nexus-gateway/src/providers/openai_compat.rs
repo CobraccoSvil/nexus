@@ -90,10 +90,13 @@ pub enum ReasoningDialect {
     ///   tempo (214,8s a 8192). Chi decide e' [`super::kimi::KimiProvider`], che
     ///   legge il fatto dal catalogo; qui si applica soltanto.
     ///
-    /// `reasoning_effort` non si emette: e' accettato dal solo `kimi-k3` e nessun
-    /// chiamante lo esprime oggi. Un ramo senza produttore sarebbe codice morto
-    /// (regola O), e la distinzione fra k3 e i k2.x va fatta con un dato (regola
-    /// G), non con un riconoscimento sul nome scritto qui prima che serva.
+    /// `reasoning_effort` si emette dalla mig 0732, che gli ha dato il produttore
+    /// e il dato che mancavano. Il permesso e' per MODELLO
+    /// (`ai_price_catalog.accepts_reasoning_effort`, regola G) e non un
+    /// riconoscimento sul nome scritto qui: MISURATO il 17/08/2026, tutti e
+    /// quattro i modelli a catalogo lo accettano, e l'idea che fosse del solo k3
+    /// era una supposizione. Chi decide e' [`super::kimi::KimiProvider`]; qui si
+    /// applica soltanto.
     Kimi,
 }
 
@@ -1203,10 +1206,17 @@ fn build_request_body(
     } else {
         req.temperature
     };
-    // `reasoning_effort` resta del solo dialetto o-series: su Kimi e' accettato
-    // dal solo `kimi-k3` e nessun chiamante lo esprime oggi (vedi il commento
-    // della variante), quindi qui non avrebbe un produttore.
-    let reasoning_effort = if reasoning.dialect == ReasoningDialect::OpenAiReasoning {
+    // `reasoning_effort` vale per i DUE dialetti che lo documentano. Il gate resta
+    // sul dialetto e non sulla sola presenza del campo: il campo, da solo, non
+    // dice a chi si sta parlando, e un dialetto che non lo documenta non deve
+    // poterlo emettere nemmeno per errore di un chiamante. Chi lo valorizza lo fa
+    // a monte e con le proprie condizioni — o-series in [`super::openai`], kimi in
+    // [`super::kimi`], dove la mig 0732 aggiunge il permesso per modello — quindi
+    // qui basta non buttarlo via.
+    let reasoning_effort = if matches!(
+        reasoning.dialect,
+        ReasoningDialect::OpenAiReasoning | ReasoningDialect::Kimi
+    ) {
         reasoning.effort.clone()
     } else {
         None
