@@ -176,6 +176,15 @@ pub struct OpenAiCompatClient {
     /// Oggi lo dichiara il solo openrouter; per i fornitori diretti il campo
     /// non parte — un campo sconosciuto e' il solo verso che puo' fare danno.
     usage_accounting: bool,
+    /// Tier di servizio che QUESTO endpoint vuole su ogni richiesta
+    /// (`nexus_provider_registry.service_tier`, mig 0728). Groq 'flex':
+    /// stesso prezzo, ~10x rate limit, fail-fast 498 `capacity_exceeded`
+    /// (tassonomia mig 0713). L'eventuale `service_tier` della RICHIESTA
+    /// vince su questo default: il chiamante che pinna un tier sa qualcosa
+    /// che il registry non sa. `None` = il campo non parte, il default di
+    /// tutti i fornitori — un tier non richiesto e' un HTTP 400 sui piani
+    /// che non lo includono (misurato su groq il 17/08/2026).
+    service_tier: Option<String>,
 }
 
 /// TTL della cache delle preferenze di fornitore (come `policy_engine`/`cooldown`).
@@ -266,6 +275,9 @@ impl OpenAiCompatClient {
             // Il default e' non chiedere nulla: l'usage accounting e' un campo
             // che solo chi lo documenta (openrouter) accetta nel body.
             usage_accounting: false,
+            // E il default e' nessun tier: lo dichiara il registry per i soli
+            // endpoint che lo vogliono (mig 0728).
+            service_tier: None,
         }
     }
 
@@ -275,6 +287,15 @@ impl OpenAiCompatClient {
     /// [`Self::corpo_della_richiesta`], quindi vale per complete E stream.
     pub fn with_usage_accounting(mut self, attivo: bool) -> Self {
         self.usage_accounting = attivo;
+        self
+    }
+
+    /// Dichiara il tier di servizio che questo endpoint vuole su ogni
+    /// richiesta (registry `service_tier`, mig 0728). Lo applica il punto
+    /// unico [`Self::corpo_della_richiesta`], quindi vale per complete E
+    /// stream; la richiesta che ne dichiara uno proprio VINCE.
+    pub fn with_service_tier(mut self, tier: Option<String>) -> Self {
+        self.service_tier = tier;
         self
     }
 
@@ -470,6 +491,14 @@ impl OpenAiCompatClient {
         body.usage = self
             .usage_accounting
             .then_some(UsageAccountingOptIn { include: true });
+        // Tier di servizio d'endpoint (mig 0728): proprieta' del CLIENT come
+        // l'usage accounting, quindi sta QUI e non in `build_request_body` —
+        // il punto unico garantisce che complete e stream lo ereditino
+        // insieme. La richiesta che dichiara un tier proprio VINCE: il campo
+        // del contratto e' gia' nel body (passthrough) e non si sovrascrive.
+        if body.service_tier.is_none() {
+            body.service_tier = self.service_tier.clone();
+        }
         body
     }
 

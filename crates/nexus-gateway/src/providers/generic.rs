@@ -122,6 +122,17 @@ impl GenericOpenAiProvider {
         self
     }
 
+    /// Dichiara il tier di servizio che il registry impone a ogni richiesta di
+    /// questo endpoint (`nexus_provider_registry.service_tier`, mig 0728).
+    /// Groq 'flex': stesso prezzo, ~10x rate limit, fail-fast 498 (mig 0713).
+    /// `None` (il default di tutti) = nessun campo sul wire, il comportamento
+    /// di ieri. L'applicazione sta nel punto unico del client, cosi' complete
+    /// e stream lo ereditano insieme.
+    pub fn with_service_tier(mut self, tier: Option<String>) -> Self {
+        self.client = self.client.with_service_tier(tier);
+        self
+    }
+
     /// Garanzia difensiva (regola H): se il provider dichiara `supports_tools=false`
     /// (es. Perplexity sonar, che rifiuta le tool definitions con HTTP 400), rimuove
     /// `tools`/`tool_choice` dalla richiesta PRIMA dell'invio. La garanzia PRIMARIA
@@ -296,6 +307,70 @@ mod tests {
         assert!(corpo.get("prompt_cache_key").is_none());
         assert!(corpo.get("session_id").is_none());
         assert!(corpo.get("provider").is_none());
+    }
+
+    /// Dal service_tier del registry (mig 0728) al campo sul wire: l'endpoint
+    /// che lo dichiara lo emette su OGNI richiesta — complete E stream, perche'
+    /// l'applicazione sta nel punto unico `corpo_della_richiesta` — chi non lo
+    /// dichiara resta senza campo (un tier non richiesto e' un 400 sui piani
+    /// che non lo includono, misurato su groq), e la richiesta che ne pinna
+    /// uno proprio (campo del contratto) VINCE sul default d'endpoint.
+    ///
+    /// MUTAZIONE ESEGUITA: applicare il default in `complete_with_reasoning`
+    /// invece che nel punto unico -> il ramo stream=true perde il campo e
+    /// rosseggia.
+    #[tokio::test]
+    async fn il_service_tier_del_registry_arriva_sul_wire() {
+        let flex = GenericOpenAiProvider::new(
+            Client::new(),
+            "https://api.groq.com/openai/v1",
+            "chiave",
+            "groq",
+            vec![0, 1],
+            131_072,
+            true,
+        )
+        .with_service_tier(Some("flex".to_string()));
+
+        for stream in [false, true] {
+            let corpo = serde_json::to_value(
+                flex.client
+                    .corpo_della_richiesta(&richiesta(), stream, &ResolvedReasoning::none())
+                    .await,
+            )
+            .expect("serializza");
+            assert_eq!(corpo["service_tier"], "flex", "stream={stream}");
+        }
+
+        // Chi non dichiara nulla nel registry non manda il campo.
+        let senza = GenericOpenAiProvider::new(
+            Client::new(),
+            "https://api.groq.com/openai/v1",
+            "chiave",
+            "groq",
+            vec![0, 1],
+            131_072,
+            true,
+        );
+        let corpo = serde_json::to_value(
+            senza
+                .client
+                .corpo_della_richiesta(&richiesta(), false, &ResolvedReasoning::none())
+                .await,
+        )
+        .expect("serializza");
+        assert!(corpo.get("service_tier").is_none());
+
+        // La richiesta che dichiara un tier proprio vince sul default.
+        let mut req = richiesta();
+        req.service_tier = Some("priority".to_string());
+        let corpo = serde_json::to_value(
+            flex.client
+                .corpo_della_richiesta(&req, false, &ResolvedReasoning::none())
+                .await,
+        )
+        .expect("serializza");
+        assert_eq!(corpo["service_tier"], "priority");
     }
 
     #[test]

@@ -112,6 +112,11 @@ struct ProviderDescriptor {
     /// false). Consumato dal SOLO provider generico: chiede al fornitore di
     /// dichiarare `usage.cost` sulla risposta. Oggi solo openrouter.
     usage_accounting: Option<String>,
+    /// Tier di servizio imposto dal registry su OGNI richiesta dell'endpoint
+    /// (mig 0728). NULL = non emettere, il default di tutti: un tier non
+    /// richiesto e' un HTTP 400 sui piani che non lo includono (misurato su
+    /// groq 'flex' il 17/08/2026). Consumato dal SOLO provider generico.
+    service_tier: Option<String>,
 }
 
 /// Carica i descrittori provider dal registry (mig 0565), ordinati. Fallback ai 6
@@ -132,7 +137,8 @@ async fn load_provider_descriptors(db: &PgPool) -> Vec<ProviderDescriptor> {
          base_url_default, activation, tiers, max_context_tokens, supports_tools, \
          to_jsonb(r) ->> 'models_path' AS models_path, \
          to_jsonb(r) ->> 'extra_headers' AS extra_headers, \
-         to_jsonb(r) ->> 'usage_accounting' AS usage_accounting \
+         to_jsonb(r) ->> 'usage_accounting' AS usage_accounting, \
+         to_jsonb(r) ->> 'service_tier' AS service_tier \
          FROM nexus_provider_registry r WHERE is_active = true ORDER BY sort_order, name",
     )
     .fetch_all(db)
@@ -179,6 +185,9 @@ fn fallback_descriptors() -> Vec<ProviderDescriptor> {
             extra_headers: None,
             // E idem per l'usage accounting (mig 0717): solo openrouter.
             usage_accounting: None,
+            // E idem per il tier di servizio (mig 0728): nessuno dei sei di
+            // ripiego ne dichiara uno.
+            service_tier: None,
         }
     }
     vec![
@@ -403,6 +412,9 @@ fn construct_provider(
                 // boolean arriva come testo dal `to_jsonb`; NULL (migrazione
                 // non applicata) vale false, cioe' il comportamento di prima.
                 .with_usage_accounting(d.usage_accounting.as_deref() == Some("true"))
+                // Tier di servizio dal registry (mig 0728): groq 'flex' quando
+                // il piano dell'org lo include. NULL = nessun campo sul wire.
+                .with_service_tier(d.service_tier.clone())
                 // Serve agli instradatori per leggere il fornitore a valle
                 // preferito; gli altri endpoint non lo interrogano mai.
                 .with_db(Some(db.clone())),
@@ -847,6 +859,140 @@ mod registry_tests {
                  attribuzione: {testa}"
             );
         }
+    }
+
+    /// Server finto che accetta la POST delle completion, registra il CORPO
+    /// ricevuto (testa + Content-Length, poi il body per intero) e risponde
+    /// 404: come nel test degli header di attribuzione, l'esito della
+    /// chiamata non conta — conta cio' che il client ha DAVVERO spedito.
+    async fn finge_endpoint_che_registra_i_corpi(
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("porta effimera");
+        let porta = listener.local_addr().expect("indirizzo").port();
+        let corpi = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registro = corpi.clone();
+
+        tokio::spawn(async move {
+            const CRLF: &str = "\r\n";
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut grezzo = Vec::new();
+                let mut buf = [0u8; 4096];
+                let corpo = loop {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break None,
+                        Ok(n) => grezzo.extend_from_slice(&buf[..n]),
+                    }
+                    if let Some(pos) = grezzo.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let testa = String::from_utf8_lossy(&grezzo[..pos]).to_string();
+                        let atteso: usize = testa
+                            .lines()
+                            .filter_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse().ok())
+                            })
+                            .next()
+                            .unwrap_or(0);
+                        if grezzo.len() >= pos + 4 + atteso {
+                            break Some(
+                                String::from_utf8_lossy(&grezzo[pos + 4..pos + 4 + atteso])
+                                    .to_string(),
+                            );
+                        }
+                    }
+                };
+                if let Some(c) = corpo {
+                    if !c.is_empty() {
+                        registro.lock().expect("registro").push(c);
+                    }
+                }
+                let risposta = [
+                    "HTTP/1.1 404 Not Found",
+                    "Content-Length: 0",
+                    "Connection: close",
+                    "",
+                    "",
+                ]
+                .join(CRLF);
+                let _ = socket.write_all(risposta.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+
+        (porta, corpi)
+    }
+
+    /// Registry -> factory -> client -> WIRE: il service_tier dichiarato dalla
+    /// colonna (mig 0728) parte su ogni richiesta dell'endpoint. Attraversa la
+    /// catena intera (regola O) perche' il tratto scoperto e' proprio la
+    /// factory (`construct_provider` -> `with_service_tier`), che nessuno dei
+    /// due test parziali — descrittore da un lato, builder->wire dall'altro —
+    /// misura.
+    ///
+    /// Il valore lo semina il test e non la mig del flip: il flip di groq e'
+    /// una migrazione DATI futura (oggi il piano dell'org non include flex,
+    /// misurato: 400 su ogni tier esplicito), e questo test resta vero con o
+    /// senza di essa.
+    ///
+    /// MUTAZIONE ESEGUITA: togliere `.with_service_tier(...)` dalla factory ->
+    /// il descrittore porta 'flex', il corpo spedito non lo porta, rosso.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_service_tier_del_registry_parte_su_ogni_richiesta(db: PgPool) {
+        let (porta, corpi) = finge_endpoint_che_registra_i_corpi().await;
+
+        sqlx::query("UPDATE nexus_provider_registry SET service_tier = 'flex' WHERE name = 'groq'")
+            .execute(&db)
+            .await
+            .expect("la colonna esiste dalla mig 0728");
+        for (chiave, valore) in [
+            ("groq_api_key", "chiave-di-prova".to_string()),
+            ("groq_enabled", "true".to_string()),
+            ("groq_base_url", format!("http://127.0.0.1:{porta}")),
+        ] {
+            sqlx::query(
+                "INSERT INTO settings (key, value, category) VALUES ($1, $2, 'providers') \
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            )
+            .bind(chiave)
+            .bind(&valore)
+            .execute(&db)
+            .await
+            .expect("settings di prova");
+        }
+
+        let descrittori = load_provider_descriptors(&db).await;
+        let groq = descrittori
+            .iter()
+            .find(|d| d.name == "groq")
+            .expect("il registry conosce groq dalla mig 0566");
+        assert_eq!(
+            groq.service_tier.as_deref(),
+            Some("flex"),
+            "senza la colonna (mig 0728) il valore non arriva fin qui"
+        );
+
+        let providers = build_providers(&db, &Client::new(), &descrittori).await;
+        let provider = providers
+            .iter()
+            .find(|p| p.name() == "groq")
+            .expect("chiave presente ed enabled: il provider e' attivo");
+
+        // Il POST prende 404 dal server finto e l'esito non conta: conta il
+        // corpo della richiesta, che parte comunque.
+        let _ = provider.complete(&richiesta_chat()).await;
+
+        let registrati = corpi.lock().expect("registro").clone();
+        assert!(!registrati.is_empty(), "il server deve aver visto il POST");
+        let corpo: serde_json::Value =
+            serde_json::from_str(&registrati[0]).expect("il body spedito e' JSON");
+        assert_eq!(
+            corpo["service_tier"], "flex",
+            "il tier del registry deve partire sul wire: {corpo}"
+        );
     }
 
     /// I casi di bordo del parse, che la catena sopra non esercita: valori non
