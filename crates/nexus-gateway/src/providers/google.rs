@@ -71,6 +71,85 @@ const THINKING_BUDGET_FLOOR: u32 = 128;
 /// (es. pro -> 128) si interviene qui, non sparso nei call site (regola L).
 const THINKING_DISABLE_BUDGET: u32 = 0;
 
+/// Chiave settings (regola G) del livello di pensiero emesso ai modelli a
+/// dialetto `level` (famiglia 3.x). Distinta da [`THINKING_BUDGET_SETTING`]
+/// perche' i due dialetti non parlano la stessa unita': l'uno e' un numero di
+/// token, l'altro un livello di un vocabolario chiuso (mig 0731).
+const THINKING_LEVEL_SETTING: &str = "providers.google.thinking_level";
+
+/// Vocabolario CHIUSO dei livelli di pensiero (doc Google, `thinkingLevel`).
+/// E' anche il solo posto da cui puo' nascere il valore che finisce sul wire:
+/// [`livello_ammesso`] ritorna un `&'static str` preso da qui, cosi' un livello
+/// che il fornitore rifiuterebbe non e' rappresentabile piu' a valle (regola Q).
+const THINKING_LEVELS: [&str; 4] = ["minimal", "low", "medium", "high"];
+
+/// Livello usato quando il setting manca, e' vuoto, e' fuori vocabolario o il DB
+/// non risponde. Allineato al seed 'low' della mig 0731: su un turno agentico si
+/// vuole l'azione, non il ragionamento, e su questo dialetto non si puo' spegnere.
+const THINKING_LEVEL_DB_DOWN_FALLBACK: &str = "low";
+
+/// Il minimo del vocabolario: e' cio' che si emette quando il chiamante ha
+/// chiesto ESPLICITAMENTE di non far ragionare il modello. Non e' uno
+/// spegnimento — questo dialetto non ne ha uno — ma e' la cosa piu' vicina che
+/// offra: MISURATO il 17/08/2026 su gemini-3-flash-preview, `minimal` e `low`
+/// non producono alcun token di pensiero, `high` ne produce 72.
+const THINKING_LEVEL_MINIMO: &str = "minimal";
+
+/// Il livello letto dal DB, ridotto al vocabolario chiuso.
+///
+/// Ritorna un `&'static str` e non una `String` di proposito: da qui in poi il
+/// valore non puo' piu' essere un livello che il fornitore rifiuterebbe, e
+/// [`GoogleThinking`] resta `Copy` senza che nessun call site debba cambiare.
+fn livello_ammesso(valore: &str) -> Option<&'static str> {
+    let valore = valore.trim();
+    THINKING_LEVELS.iter().copied().find(|l| *l == valore)
+}
+
+/// Con quale dialetto questo modello dichiara il proprio pensiero (colonna
+/// `ai_price_catalog.thinking_dialect`, mig 0731).
+///
+/// Tre varianti e non un `bool` (regola Q): l'ignoto ha una conseguenza propria e
+/// non deve degradare per comodita' di chi legge.
+///
+/// I DUE ERRORI NON SI EQUIVALGONO, e la misura del 17/08/2026 (Vertex, location
+/// `global`) dice in quale verso: `thinkingLevel` a un gemini-2.5-flash e' un
+/// HTTP 400 «thinking_level is not supported by this model», mentre
+/// `thinkingBudget: 0` a un 3.x oggi risponde 200 su tutti e quattro i modelli
+/// provati — il 400 che la mig 0578 dichiarava non e' piu' riproducibile.
+/// Percio' solo [`Self::Level`] cambia il dialetto, e [`Self::NonDichiarato`] si
+/// comporta come il codice si comportava prima che il dato esistesse: e' la
+/// direzione che nessuna delle due API rifiuta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingDialect {
+    /// `thinkingBudget` in token (famiglia 2.5). Lo zero SPEGNE il pensiero.
+    Budget,
+    /// `thinkingLevel` da vocabolario chiuso (famiglia 3.x). Nessuno spegnimento.
+    Level,
+    /// Il catalogo non lo dice — riga assente, colonna `NULL`, o DB che non ha
+    /// parlato. Non e' una misura: vale il dialetto storico.
+    NonDichiarato,
+}
+
+impl ThinkingDialect {
+    /// Dalla colonna `thinking_dialect`, dove il `NULL` e la riga assente
+    /// collassano legittimamente nella stessa risposta: in entrambi i casi
+    /// nessuno ha dichiarato nulla. Un valore fuori vocabolario non e'
+    /// rappresentabile a schema (CHECK della 0731); se ci arrivasse comunque,
+    /// vale come non dichiarato.
+    fn dal_catalogo(letto: Option<String>) -> Self {
+        match letto.as_deref().map(str::trim) {
+            Some("level") => Self::Level,
+            Some("budget") => Self::Budget,
+            _ => Self::NonDichiarato,
+        }
+    }
+
+    /// L'unico punto in cui questo fatto cambia il dialetto emesso.
+    fn e_a_livelli(self) -> bool {
+        matches!(self, Self::Level)
+    }
+}
+
 /// Marker (case-insensitive) presente nel body d'errore HTTP 400 INVALID_ARGUMENT
 /// quando Gemini RIFIUTA `thinkingConfig.thinkingBudget=0`. Quirk per-modello: i
 /// modelli con thinking OBBLIGATORIO (es. gemini-2.5-pro, minimo documentato > 0)
@@ -141,6 +220,14 @@ pub struct GoogleProvider {
     api_key: String,
     db: Option<PgPool>,
     thinking_budget: TtlCache<(), u32>,
+    /// Livello di pensiero dei modelli a dialetto `level` (setting, TTL 60s).
+    thinking_level: TtlCache<(), &'static str>,
+    /// Per MODELLO, perche' la risposta cambia per modello dentro lo stesso
+    /// fornitore: 2.5 e 3.x parlano due dialetti diversi ed e' l'intero punto di
+    /// questo meccanismo. Vi entra solo cio' che si e' letto — un errore non e'
+    /// una misura, e scriverlo qui cristallizzerebbe per 60s un'ignoranza
+    /// momentanea.
+    thinking_dialect: TtlCache<String, ThinkingDialect>,
     /// Backend risolto dai settings (cache TTL 60s). La cache memorizza un
     /// `Arc<GoogleBackend>` cosi' il `VertexAuth` (e la sua cache token) e'
     /// condiviso tra le richieste invece di ricreare l'auth ad ogni chiamata.
@@ -176,6 +263,8 @@ impl GoogleProvider {
             api_key: api_key.into(),
             db,
             thinking_budget: TtlCache::new(SETTINGS_TTL),
+            thinking_level: TtlCache::new(SETTINGS_TTL),
+            thinking_dialect: TtlCache::new(SETTINGS_TTL),
             backend: TtlCache::new(SETTINGS_TTL),
             vertex_model_region: TtlCache::new(VERTEX_REGION_CACHE_TTL),
         }
@@ -198,6 +287,101 @@ impl GoogleProvider {
         let budget = parsed.unwrap_or(THINKING_BUDGET_DB_DOWN_FALLBACK);
         self.thinking_budget.insert((), budget);
         budget
+    }
+
+    /// Livello di pensiero dei modelli a dialetto `level` (settings, TTL 60s).
+    ///
+    /// Il valore letto passa da [`livello_ammesso`]: cio' che esce di qui e'
+    /// sempre una voce del vocabolario chiuso, mai la stringa grezza del DB. Un
+    /// valore fuori vocabolario NON si inoltra — sarebbe un HTTP 400 su ogni
+    /// chiamata a quel modello — e si dichiara con un WARN, perche' un ripiego
+    /// silenzioso su un valore che nessuno ha scritto e' indistinguibile da una
+    /// configurazione applicata.
+    async fn configured_thinking_level(&self) -> &'static str {
+        if let Some(l) = self.thinking_level.get(&()) {
+            return l;
+        }
+        let Some(db) = self.db.as_ref() else {
+            return THINKING_LEVEL_DB_DOWN_FALLBACK;
+        };
+        let letto = nexus_auth::get_setting(db, THINKING_LEVEL_SETTING).await;
+        let livello = match letto.as_deref() {
+            Some(v) => livello_ammesso(v).unwrap_or_else(|| {
+                // Regola F: il valore di configurazione non e' un segreto, ma si
+                // dichiara il RIPIEGO, non lo si applica in silenzio.
+                tracing::warn!(
+                    setting = THINKING_LEVEL_SETTING,
+                    fallback = THINKING_LEVEL_DB_DOWN_FALLBACK,
+                    "livello di pensiero fuori vocabolario (minimal|low|medium|high): \
+                     uso il ripiego"
+                );
+                THINKING_LEVEL_DB_DOWN_FALLBACK
+            }),
+            None => THINKING_LEVEL_DB_DOWN_FALLBACK,
+        };
+        self.thinking_level.insert((), livello);
+        livello
+    }
+
+    /// Con quale dialetto questo modello dichiara il pensiero, dal catalogo
+    /// (mig 0731).
+    ///
+    /// Ogni via di fuga porta a [`ThinkingDialect::NonDichiarato`], e sempre nella
+    /// stessa direzione: il dialetto storico. Nessun DB agganciato, riga assente,
+    /// colonna `NULL`, query fallita — in nessuno di questi casi qualcuno ha
+    /// dichiarato alcunche', e un guasto del DB piu' lungo della TTL riporta al
+    /// comportamento di ieri, che e' quello che il gateway ha sempre avuto.
+    async fn thinking_dialect(&self, model: &str) -> ThinkingDialect {
+        if let Some(d) = self.thinking_dialect.get(model) {
+            return d;
+        }
+        let Some(db) = self.db.as_ref() else {
+            return ThinkingDialect::NonDichiarato;
+        };
+        // `Option<Option<String>>`: il primo livello e' la riga, il secondo la
+        // colonna nullable. Entrambi gli assenti dicono la stessa cosa.
+        let letto: Result<Option<(Option<String>,)>, sqlx::Error> = sqlx::query_as(
+            "SELECT thinking_dialect FROM ai_price_catalog \
+             WHERE provider = 'google' AND model = $1",
+        )
+        .bind(model)
+        .fetch_optional(db)
+        .await;
+        match letto {
+            Ok(row) => {
+                let esito = ThinkingDialect::dal_catalogo(row.and_then(|(v,)| v));
+                self.thinking_dialect.insert(model.to_string(), esito);
+                esito
+            }
+            Err(e) => {
+                tracing::warn!(
+                    model = %model,
+                    error = %e,
+                    "dialetto del pensiero non leggibile dal catalogo: \
+                     uso il dialetto storico (budget)"
+                );
+                ThinkingDialect::NonDichiarato
+            }
+        }
+    }
+
+    /// Il pensiero di QUESTA richiesta: l'unico punto in cui i tre fatti che lo
+    /// governano — budget configurato, dialetto del modello, livello configurato
+    /// — si incontrano (regola L).
+    ///
+    /// Sta qui e non nei due call site perche' `complete` e `stream` devono
+    /// mandare lo stesso `thinkingConfig`: due letture separate potrebbero
+    /// divergere al primo fatto aggiunto, e la divergenza non fallirebbe nulla —
+    /// produrrebbe due comportamenti diversi sullo stesso modello a seconda che
+    /// la risposta sia in streaming.
+    async fn thinking_per(&self, req: &LlmRequest) -> GoogleThinking {
+        let dialect = self.thinking_dialect(&req.model).await;
+        resolve_thinking(
+            req,
+            self.configured_thinking_budget().await,
+            dialect,
+            self.configured_thinking_level().await,
+        )
     }
 
     /// Timeout del poll-loop video-gen dai settings (regola G), in secondi. Se il
@@ -968,8 +1152,7 @@ impl LlmProvider for GoogleProvider {
 
     async fn complete(&self, req: &LlmRequest) -> anyhow::Result<LlmResponse> {
         let backend = self.resolved_backend().await?;
-        let configured = self.configured_thinking_budget().await;
-        let thinking = resolve_thinking(req, configured);
+        let thinking = self.thinking_per(req).await;
         let start = Instant::now();
 
         // Invio con fallback di region per Vertex (mig 0476) e retry-su-400 per il
@@ -996,8 +1179,7 @@ impl LlmProvider for GoogleProvider {
 
     async fn stream(&self, req: &LlmRequest) -> anyhow::Result<ChunkStream> {
         let backend = self.resolved_backend().await?;
-        let configured = self.configured_thinking_budget().await;
-        let thinking = resolve_thinking(req, configured);
+        let thinking = self.thinking_per(req).await;
 
         // Fallback di region risolto sullo STATUS HTTP iniziale (mig 0476): il 404
         // arriva prima di qualunque byte di stream, quindi scegliamo la region
@@ -1585,6 +1767,14 @@ enum GoogleThinking {
     DisabledForTools,
     /// Thinking attivo con `budget` token riservati al reasoning.
     Enabled(u32),
+    /// Dialetto a LIVELLI (famiglia 3.x, mig 0731): `thinkingConfig
+    /// { includeThoughts: true, thinkingLevel: <livello> }`. Il livello e' un
+    /// `&'static str` preso da [`THINKING_LEVELS`] e non una stringa qualunque:
+    /// il tipo stesso esclude che un valore fuori vocabolario arrivi sul wire.
+    /// Non esiste una variante di spegnimento perche' il dialetto non ne ha una:
+    /// il minimo e' [`THINKING_LEVEL_MINIMO`], che sul turno con tool ottiene
+    /// comunque zero token di pensiero (misurato 17/08/2026).
+    Level(&'static str),
 }
 
 /// Riconosce, dal body d'errore HTTP 400, il quirk Gemini "il modello non
@@ -1597,7 +1787,37 @@ fn is_thinking_budget_error(body: &str) -> bool {
         .contains(THINKING_BUDGET_ERROR_MARKER)
 }
 
+/// Il pensiero di questa richiesta, nel dialetto che il modello dichiara.
+///
+/// E' un DISPATCHER e nient'altro: l'unico punto in cui il dialetto sceglie, e
+/// una funzione per ciascuno dei due — non condividono nessuna decisione, e
+/// tenerli in un `if` dentro lo stesso corpo li faceva sembrare due rami della
+/// stessa politica quando sono due contratti diversi.
+///
+/// L'ORDINE E' PORTANTE: il dialetto decide PRIMA di tutto, in particolare prima
+/// del ramo `mandatory` del dialetto a budget. Quel flag e' il rimedio che la
+/// mig 0578 aveva dovuto inventare dal lato mcp-core proprio perche' il dialetto
+/// non esisteva ancora; lasciarlo vincere qui rimetterebbe un BUDGET su un
+/// modello il cui contratto parla di LIVELLI. Il flag resta accettato — l'adapter
+/// continua a mandarlo e i modelli a dialetto budget lo usano — e il suo ritiro
+/// e' un cleanup di mcp-core, non di questa funzione.
+fn resolve_thinking(
+    req: &LlmRequest,
+    configured_budget: u32,
+    dialect: ThinkingDialect,
+    configured_level: &'static str,
+) -> GoogleThinking {
+    if dialect.e_a_livelli() {
+        resolve_thinking_level(req, configured_level)
+    } else {
+        resolve_thinking_budget(req, configured_budget)
+    }
+}
+
 /// Budget thinking effettivo per la richiesta (parita' col Python ~470-503).
+///
+/// E' il dialetto STORICO, quello della famiglia 2.5 e di ogni modello che il
+/// catalogo non dichiara (mig 0731).
 ///
 /// GATE THINKING+TOOL (fix definitivo, regola H — incidente "google 0 enabled nel
 /// catalog"): i modelli Gemini 2.5/3.x girano in thinking ON di DEFAULT. Nei run
@@ -1630,14 +1850,9 @@ fn is_thinking_budget_error(body: &str) -> bool {
 ///   - se `max_tokens` < soglia minima (256), thinking disattivato (troppo poco
 ///     spazio anche solo per la risposta);
 ///   - clamp del budget a `max(128, min(budget, max_tokens))`.
-fn resolve_thinking(req: &LlmRequest, configured_budget: u32) -> GoogleThinking {
+fn resolve_thinking_budget(req: &LlmRequest, configured_budget: u32) -> GoogleThinking {
     // GATE TOOL: prima di tutto. Stessa rilevazione di deepseek.rs::resolve_reasoning.
-    let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
-    let has_tool_choice_constraint = req
-        .tool_choice
-        .as_ref()
-        .and_then(super::tool_choice::ToolChoice::from_openai)
-        .is_some();
+    let vincolo_tool = richiesta_con_tool(req);
     // THINKING OBBLIGATORIO (regola M/G, fix gemini-3 empty-completion): un modello a
     // thinking mandatory (segnalato dall'adapter mcp-core via `thinking.mandatory`,
     // policy DB `agentic_thinking_policy='native'`) RIFIUTA `thinkingBudget=0` (HTTP
@@ -1661,7 +1876,7 @@ fn resolve_thinking(req: &LlmRequest, configured_budget: u32) -> GoogleThinking 
             .min(max_tokens.max(THINKING_BUDGET_FLOOR));
         return GoogleThinking::Enabled(budget);
     }
-    if has_tools || has_tool_choice_constraint {
+    if vincolo_tool {
         return GoogleThinking::DisabledForTools;
     }
 
@@ -1688,6 +1903,71 @@ fn resolve_thinking(req: &LlmRequest, configured_budget: u32) -> GoogleThinking 
     }
     let budget = base.min(max_tokens).max(THINKING_BUDGET_FLOOR);
     GoogleThinking::Enabled(budget)
+}
+
+/// Il pensiero dei modelli a dialetto `level` (famiglia 3.x, mig 0731).
+///
+/// Funzione PURA, separata da [`resolve_thinking`] e non un ramo dentro di essa
+/// perche' le due non condividono nessuna delle proprie decisioni: qui non c'e'
+/// un budget da dimensionare, non c'e' un tetto di output da rispettare, e
+/// soprattutto non c'e' uno SPEGNIMENTO.
+///
+/// TRE COSE CHE QUI NON POSSONO ACCADERE, e sono le tre che il dialetto budget fa
+/// ogni giorno:
+///
+///   1. Mai [`GoogleThinking::DisabledForTools`]. Non perche' quello zero sia
+///      oggi un errore — MISURATO il 17/08/2026, i 3.x lo accettano con 200, e il
+///      400 dichiarato dalla mig 0578 non e' piu' riproducibile — ma perche' e'
+///      un campo di UN ALTRO dialetto: dice «zero token di pensiero» dove il
+///      contratto del modello parla di livelli, e sul turno con tool il livello
+///      minimo ottiene lo stesso silenzio (misurato) restando nel vocabolario
+///      che il modello dichiara.
+///   2. Mai un budget in token, e con esso mai l'alzata di `maxOutputTokens` che
+///      il dialetto budget deve fare per non lasciare la risposta senza spazio.
+///   3. Mai il livello grezzo del DB: il tipo ammette solo il vocabolario.
+///
+/// La preferenza ESPLICITA del chiamante di non far ragionare il modello
+/// (`req.thinking.enabled == false`) si traduce nel MINIMO del vocabolario, che
+/// e' la cosa piu' vicina a uno spegnimento che questo dialetto offra: e' la
+/// stessa traduzione al confine che [`super::kimi`] fa quando il fornitore non
+/// consente di spegnere, e vale piu' del silenzio — senza `thinkingConfig` il
+/// modello userebbe il proprio default, che non e' il minimo.
+///
+/// Senza alcun segnale — niente tool, niente preferenza, niente `mandatory` —
+/// resta [`GoogleThinking::Absent`]: e' il comportamento di oggi su quel
+/// percorso, e non c'e' motivo di dichiarare un livello a chi non ha chiesto
+/// nulla.
+fn resolve_thinking_level(req: &LlmRequest, configured_level: &'static str) -> GoogleThinking {
+    if let Some(t) = req.thinking.as_ref() {
+        if !t.enabled {
+            return GoogleThinking::Level(THINKING_LEVEL_MINIMO);
+        }
+        return GoogleThinking::Level(configured_level);
+    }
+    if richiesta_con_tool(req) {
+        return GoogleThinking::Level(configured_level);
+    }
+    GoogleThinking::Absent
+}
+
+/// Questa richiesta porta un vincolo di tool?
+///
+/// Punto unico (regola L) dei DUE dialetti: entrambi devono riconoscere il turno
+/// agentico, e prima erano due copie dello stesso blocco — un ritocco alla
+/// rilevazione fatto in un posto solo avrebbe dato ai 2.5 e ai 3.x due idee
+/// diverse di «ci sono tool», in silenzio.
+///
+/// Regola G: scatta sulla PRESENZA di tool o di un `tool_choice` riconosciuto,
+/// mai su una stringa modello; il riconoscimento del vincolo delega al punto
+/// unico di mapping ([`super::tool_choice::ToolChoice::from_openai`]). Una lista
+/// di tool VUOTA non e' «ci sono tool»: senza tool veri il turno e' testuale.
+fn richiesta_con_tool(req: &LlmRequest) -> bool {
+    req.tools.as_ref().is_some_and(|t| !t.is_empty())
+        || req
+            .tool_choice
+            .as_ref()
+            .and_then(super::tool_choice::ToolChoice::from_openai)
+            .is_some()
 }
 
 /// Rimuove ricorsivamente le chiavi JSON-Schema non supportate da Gemini
@@ -1944,23 +2224,7 @@ fn build_generation_config(req: &LlmRequest, thinking: GoogleThinking) -> Option
         (mt, _) => mt,
     };
 
-    // Mapping enum -> wire `thinkingConfig` (punto unico, regola L):
-    //   - Absent          -> nessun thinkingConfig (Gemini usa il suo default ON).
-    //   - DisabledForTools -> thinkingConfig ESPLICITO budget 0 / includeThoughts
-    //     false: spegne il thinking ON di default, necessario col function-calling
-    //     (lasciarlo assente NON basterebbe, vedi resolve_thinking).
-    //   - Enabled(budget) -> thinkingConfig con budget e thoughts visibili.
-    let thinking_config = match thinking {
-        GoogleThinking::Absent => None,
-        GoogleThinking::DisabledForTools => Some(ThinkingConfigWire {
-            include_thoughts: false,
-            thinking_budget: THINKING_DISABLE_BUDGET,
-        }),
-        GoogleThinking::Enabled(budget) => Some(ThinkingConfigWire {
-            include_thoughts: true,
-            thinking_budget: budget,
-        }),
-    };
+    let thinking_config = thinking_config_wire(thinking);
     let response_format = google_response_format(req.response_format.as_ref());
 
     if req.temperature.is_some()
@@ -1979,6 +2243,42 @@ fn build_generation_config(req: &LlmRequest, thinking: GoogleThinking) -> Option
         })
     } else {
         None
+    }
+}
+
+/// Mapping enum -> wire `thinkingConfig` (punto unico, regola L). Estratto da
+/// [`build_generation_config`] (regola A) quando il dialetto a livelli ne ha
+/// fatto un secondo concern: li' si decide il TETTO di output, qui la forma del
+/// blocco, e sono due domande diverse.
+///
+///   - `Absent`           -> nessun `thinkingConfig` (Gemini usa il suo default).
+///   - `DisabledForTools` -> blocco ESPLICITO con budget 0 / `includeThoughts`
+///     false: spegne il thinking ON di default, necessario col function-calling
+///     (lasciarlo assente NON basterebbe, vedi [`resolve_thinking`]).
+///   - `Enabled(budget)`  -> budget in token e thoughts visibili.
+///   - `Level(livello)`   -> dialetto a LIVELLI (famiglia 3.x, mig 0731):
+///     nessun `thinkingBudget` sul wire. Il tetto NON viene alzato per lui, e
+///     non e' una dimenticanza: l'alzata serve al dialetto budget, dove i token
+///     di reasoning li prenotiamo noi e andrebbero a togliere spazio alla
+///     risposta.
+fn thinking_config_wire(thinking: GoogleThinking) -> Option<ThinkingConfigWire> {
+    match thinking {
+        GoogleThinking::Absent => None,
+        GoogleThinking::DisabledForTools => Some(ThinkingConfigWire {
+            include_thoughts: Some(false),
+            thinking_budget: Some(THINKING_DISABLE_BUDGET),
+            thinking_level: None,
+        }),
+        GoogleThinking::Enabled(budget) => Some(ThinkingConfigWire {
+            include_thoughts: Some(true),
+            thinking_budget: Some(budget),
+            thinking_level: None,
+        }),
+        GoogleThinking::Level(livello) => Some(ThinkingConfigWire {
+            include_thoughts: Some(true),
+            thinking_budget: None,
+            thinking_level: Some(livello.to_string()),
+        }),
     }
 }
 
@@ -2869,12 +3169,22 @@ struct GenerationConfig {
 
 /// `thinkingConfig` del body Gemini. `includeThoughts=true` espone i thoughts
 /// nella risposta cosi' il reasoning e' visibile (parita' col Python ~491-493).
+///
+/// I campi sono `Option` con `skip_serializing_if` perche' il blocco ha DUE
+/// dialetti che non si mescolano (mig 0731): `thinkingBudget` per la famiglia
+/// 2.5, `thinkingLevel` per la 3.x. L'ordine di dichiarazione e' quello storico
+/// e non e' decorativo: con `Some` su entrambi i campi di prima e `None` sul
+/// terzo, il JSON emesso per i 2.5 resta BIT-IDENTICO a quello di ieri.
 #[derive(Debug, Serialize)]
 struct ThinkingConfigWire {
-    #[serde(rename = "includeThoughts")]
-    include_thoughts: bool,
-    #[serde(rename = "thinkingBudget")]
-    thinking_budget: u32,
+    #[serde(rename = "includeThoughts", skip_serializing_if = "Option::is_none")]
+    include_thoughts: Option<bool>,
+    #[serde(rename = "thinkingBudget", skip_serializing_if = "Option::is_none")]
+    thinking_budget: Option<u32>,
+    /// Dialetto a livelli (famiglia 3.x). Mutualmente esclusivo con
+    /// `thinkingBudget`: chi lo riceve rifiuta l'altro.
+    #[serde(rename = "thinkingLevel", skip_serializing_if = "Option::is_none")]
+    thinking_level: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3057,6 +3367,24 @@ struct LongRunningError {
 mod tests {
     use super::*;
     use crate::types::{LlmMessage, RequestMetadata};
+
+    /// La risoluzione del pensiero come il gateway l'ha sempre fatta: dialetto
+    /// NON dichiarato, cioe' il ramo storico a budget.
+    ///
+    /// I test che non parlano del dialetto passano da qui, e non e' una scorciatoia
+    /// per non aggiornarli: `ThinkingDialect::NonDichiarato` e' il valore che il
+    /// catalogo produce per ogni modello privo di dichiarazione, cioe' la
+    /// stragrande maggioranza. Ognuno di questi test e' percio' un test di
+    /// NON-REGRESSIONE del dialetto storico, ed e' quello il loro mestiere: il
+    /// dialetto a livelli ha i suoi, che passano dal provider reale col DB.
+    fn thinking_storico(req: &LlmRequest, configured_budget: u32) -> GoogleThinking {
+        resolve_thinking(
+            req,
+            configured_budget,
+            ThinkingDialect::NonDichiarato,
+            THINKING_LEVEL_DB_DOWN_FALLBACK,
+        )
+    }
 
     fn metadata() -> RequestMetadata {
         RequestMetadata {
@@ -3843,7 +4171,7 @@ mod tests {
     fn thinking_attivo_aggiunge_config_e_alza_output() {
         // budget esplicito 2048, max_tokens 8000 -> thinking attivo, output alzato.
         let req = req_thinking(true, Some(2048), Some(8000), vec![msg("user", "ciao")]);
-        let thinking = resolve_thinking(&req, 8192);
+        let thinking = thinking_storico(&req, 8192);
         assert_eq!(thinking, GoogleThinking::Enabled(2048));
         let json = serde_json::to_value(build_request_body(&req, thinking)).unwrap();
         assert_eq!(json["generationConfig"]["thinkingConfig"]["includeThoughts"], true);
@@ -3855,7 +4183,7 @@ mod tests {
     #[test]
     fn thinking_disattivo_non_aggiunge_config() {
         let req = req_thinking(false, Some(2048), Some(8000), vec![msg("user", "ciao")]);
-        let thinking = resolve_thinking(&req, 8192);
+        let thinking = thinking_storico(&req, 8192);
         assert_eq!(thinking, GoogleThinking::Absent);
         let json = serde_json::to_value(build_request_body(&req, thinking)).unwrap();
         assert!(json["generationConfig"].get("thinkingConfig").is_none());
@@ -3867,13 +4195,13 @@ mod tests {
     fn thinking_budget_usa_configurato_e_clampa() {
         // Budget configurato 50000 > max_tokens 4000 -> clamp a max_tokens.
         let req = req_thinking(true, None, Some(4000), vec![msg("user", "x")]);
-        assert_eq!(resolve_thinking(&req, 50_000), GoogleThinking::Enabled(4000));
+        assert_eq!(thinking_storico(&req, 50_000), GoogleThinking::Enabled(4000));
         // max_tokens sotto soglia minima -> thinking disattivato.
         let req2 = req_thinking(true, Some(1024), Some(100), vec![msg("user", "x")]);
-        assert_eq!(resolve_thinking(&req2, 8192), GoogleThinking::Absent);
+        assert_eq!(thinking_storico(&req2, 8192), GoogleThinking::Absent);
         // Nessun max_tokens -> non dimensionabile -> disattivato.
         let req3 = req_thinking(true, Some(1024), None, vec![msg("user", "x")]);
-        assert_eq!(resolve_thinking(&req3, 8192), GoogleThinking::Absent);
+        assert_eq!(thinking_storico(&req3, 8192), GoogleThinking::Absent);
     }
 
     #[test]
@@ -3888,7 +4216,7 @@ mod tests {
         // Sanity: nessuna preferenza esplicita di thinking nel contratto.
         assert!(req.thinking.is_none());
         assert!(req.tool_choice.is_none());
-        let thinking = resolve_thinking(&req, 8192);
+        let thinking = thinking_storico(&req, 8192);
         assert_eq!(thinking, GoogleThinking::DisabledForTools);
 
         let json = serde_json::to_value(build_request_body(&req, thinking)).unwrap();
@@ -3914,13 +4242,224 @@ mod tests {
             mandatory: false,
         });
         req.max_tokens = Some(8000);
-        let thinking = resolve_thinking(&req, 8192);
+        let thinking = thinking_storico(&req, 8192);
         assert_eq!(thinking, GoogleThinking::DisabledForTools);
         let json = serde_json::to_value(build_request_body(&req, thinking)).unwrap();
         assert_eq!(json["generationConfig"]["thinkingConfig"]["thinkingBudget"], 0);
         assert_eq!(json["generationConfig"]["thinkingConfig"]["includeThoughts"], false);
         // Il tetto NON e' alzato del budget richiesto: thinking spento.
         assert_eq!(json["generationConfig"]["maxOutputTokens"], 8000);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Dialetto del pensiero (mig 0731): thinkingBudget (2.5) vs thinkingLevel
+    // (3.x). I test passano dal PROVIDER reale con DB e dal corpo che parte
+    // davvero — un `ThinkingDialect` scritto a mano nel test fisserebbe qui
+    // l'assunto da verificare (regola O).
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn provider_con_catalogo(pool: sqlx::PgPool) -> GoogleProvider {
+        GoogleProvider::with_db(reqwest::Client::new(), "chiave", None, Some(pool))
+    }
+
+    /// Turno agentico su un modello preciso: e' la forma in cui il difetto vive
+    /// — tool presenti, e il dialetto che decide se lo zero sia uno spegnimento
+    /// o un HTTP 400.
+    fn richiesta_agentica(model: &str) -> LlmRequest {
+        let mut req = req_with_tools(vec![msg("user", "leggi x")], true);
+        req.model = model.to_string();
+        req
+    }
+
+    /// Il corpo che parte davvero, costruito dalla stessa strada di `complete`:
+    /// `thinking_per` reale (catalogo + settings) e `build_request_body` reale.
+    async fn corpo_di(p: &GoogleProvider, req: &LlmRequest) -> serde_json::Value {
+        serde_json::to_value(build_request_body(req, p.thinking_per(req).await))
+            .expect("il corpo serializza")
+    }
+
+    /// I modelli della famiglia 3.x arrivano dal DISCOVERY a runtime, non da una
+    /// migrazione: sul META appena migrato non esiste alcuna riga `gemini-3%`,
+    /// quindi il seed della 0731 non ha nulla da marcare. Il test riproduce lo
+    /// stato del catalogo VIVO, dove quella riga esiste (misurato: sette modelli
+    /// `gemini-3.x` abilitati) e dopo la 0731 porta `thinking_dialect='level'`.
+    ///
+    /// La colonna si scrive con lo stesso valore che il CHECK della migrazione
+    /// ammette: un refuso qui non passerebbe il vincolo.
+    async fn semina_modello_a_livelli(pool: &sqlx::PgPool, model: &str) {
+        sqlx::query(
+            "INSERT INTO ai_price_catalog (provider, model, thinking_dialect, \
+                 input_cost_per_million_tokens, output_cost_per_million_tokens, currency) \
+             VALUES ('google', $1, 'level', 1.0, 10.0, 'USD') \
+             ON CONFLICT (provider, model) DO UPDATE SET thinking_dialect = 'level'",
+        )
+        .bind(model)
+        .execute(pool)
+        .await
+        .expect("seed modello a livelli");
+    }
+
+    /// IL test del lotto: sul dialetto a livelli un turno con tool riceve
+    /// `thinkingLevel` e NON un `thinkingBudget`.
+    ///
+    /// MISURATO il 17/08/2026 su Vertex: `gemini-3-flash-preview` con una tool
+    /// definition e `thinkingLevel:"low"` risponde 200 con `functionCall` e
+    /// `thoughtSignature` presenti — cioe' il round-trip della firma, che questo
+    /// lotto non tocca, continua a valere sul dialetto nuovo.
+    ///
+    /// MUTAZIONE 1: spostare il controllo del dialetto DOPO il ramo `mandatory`
+    /// in `resolve_thinking` -> il caso `mandatory` qui sotto torna `Enabled` e
+    /// il corpo porta un `thinkingBudget`: rosso.
+    /// MUTAZIONE 2: far tornare `DisabledForTools` sul dialetto a livelli ->
+    /// rosso su `thinkingBudget` assente.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn sul_dialetto_a_livelli_i_tool_non_spengono_il_pensiero(pool: sqlx::PgPool) {
+        semina_modello_a_livelli(&pool, "gemini-3-flash-preview").await;
+        let p = provider_con_catalogo(pool);
+
+        assert_eq!(
+            p.thinking_dialect("gemini-3-flash-preview").await,
+            ThinkingDialect::Level
+        );
+
+        let req = richiesta_agentica("gemini-3-flash-preview");
+        let corpo = corpo_di(&p, &req).await;
+        let tc = &corpo["generationConfig"]["thinkingConfig"];
+        assert_eq!(
+            tc["thinkingLevel"], "low",
+            "il dialetto a livelli emette il livello configurato (seed 0731)"
+        );
+        assert!(
+            tc.get("thinkingBudget").is_none(),
+            "il budget non esiste in questo dialetto: lo zero qui e' un HTTP 400"
+        );
+        assert_eq!(tc["includeThoughts"], true);
+        // Il tetto NON e' alzato: l'alzata e' un fatto del dialetto budget, dove
+        // i token di reasoning li prenotiamo noi.
+        assert_eq!(corpo["generationConfig"]["maxOutputTokens"], 1024);
+
+        // Il flag `mandatory` dell'adapter mcp-core (mig 0578) e' il rimedio che
+        // esisteva PRIMA del dialetto: qui non deve piu' produrre un budget.
+        let mut con_mandatory = req.clone();
+        con_mandatory.thinking = Some(crate::types::ThinkingConfig {
+            enabled: true,
+            budget_tokens: Some(4096),
+            mandatory: true,
+        });
+        let corpo = corpo_di(&p, &con_mandatory).await;
+        let tc = &corpo["generationConfig"]["thinkingConfig"];
+        assert_eq!(tc["thinkingLevel"], "low");
+        assert!(
+            tc.get("thinkingBudget").is_none(),
+            "col dialetto a catalogo il flag mandatory non rimette un budget"
+        );
+    }
+
+    /// Lo spegnimento ESPLICITO non diventa uno zero: diventa il minimo del
+    /// vocabolario, che e' la cosa piu' vicina a uno spegnimento che questo
+    /// dialetto offra — e che MISURATO ottiene lo stesso risultato (zero token
+    /// di pensiero) restando nel contratto che il modello dichiara.
+    ///
+    /// MUTAZIONE: tradurre `enabled=false` in `DisabledForTools` (o in un budget
+    /// 0) -> rosso: e' un campo di un altro dialetto.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn spegnere_il_pensiero_di_un_3x_significa_il_livello_minimo(pool: sqlx::PgPool) {
+        semina_modello_a_livelli(&pool, "gemini-3.1-pro-preview").await;
+        let p = provider_con_catalogo(pool);
+
+        let mut req = richiesta_agentica("gemini-3.1-pro-preview");
+        req.thinking = Some(crate::types::ThinkingConfig {
+            enabled: false,
+            budget_tokens: None,
+            mandatory: false,
+        });
+        let corpo = corpo_di(&p, &req).await;
+        let tc = &corpo["generationConfig"]["thinkingConfig"];
+        assert_eq!(tc["thinkingLevel"], "minimal");
+        assert!(tc.get("thinkingBudget").is_none());
+    }
+
+    /// LA NON-REGRESSIONE, ed e' quella che conta: sui 2.5 il corpo deve restare
+    /// BIT-IDENTICO a quello di ieri.
+    ///
+    /// La riga di `gemini-2.5-flash` esiste dalla mig 0032 e la 0731 le scrive
+    /// `thinking_dialect='budget'`: il test legge percio' il SEED REALE della
+    /// migrazione, non un valore che si e' messo da solo.
+    ///
+    /// MUTAZIONE ESEGUITA: marcato `level` anche il ramo 2.5 della 0731 -> questo
+    /// test rosseggia (`left: Level, right: Budget`). E' l'unica difesa contro un
+    /// seed scritto con un `LIKE` troppo largo, e la posta e' alta: MISURATO il
+    /// 17/08/2026, `thinkingLevel` su gemini-2.5-flash e' un HTTP 400 su OGNI
+    /// chiamata.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn sui_25_il_corpo_resta_quello_di_ieri(pool: sqlx::PgPool) {
+        let p = provider_con_catalogo(pool.clone());
+
+        assert_eq!(
+            p.thinking_dialect("gemini-2.5-flash").await,
+            ThinkingDialect::Budget,
+            "la 0731 marca la famiglia 2.5 col dialetto storico"
+        );
+
+        let req = richiesta_agentica("gemini-2.5-flash");
+        let corpo = corpo_di(&p, &req).await;
+        // Confronto sul blocco INTERO, non campo per campo: e' cosi' che si vede
+        // un campo NUOVO comparso per sbaglio (thinkingLevel su un 2.5).
+        assert_eq!(
+            corpo["generationConfig"]["thinkingConfig"],
+            serde_json::json!({ "includeThoughts": false, "thinkingBudget": 0 }),
+            "sui 2.5 lo zero e' lo spegnimento documentato e nient'altro deve partire"
+        );
+    }
+
+    /// Un modello che il catalogo non dichiara non cambia dialetto: l'ignoto non
+    /// degrada verso il dialetto nuovo. E' il caso della stragrande maggioranza
+    /// del parco, e il limite dichiarato della 0731 (un 3.x scoperto domani dal
+    /// discovery nasce NULL).
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_modello_non_dichiarato_resta_al_dialetto_storico(pool: sqlx::PgPool) {
+        let p = provider_con_catalogo(pool);
+        assert_eq!(
+            p.thinking_dialect("gemini-9-mai-vista").await,
+            ThinkingDialect::NonDichiarato
+        );
+        let corpo = corpo_di(&p, &richiesta_agentica("gemini-9-mai-vista")).await;
+        assert_eq!(
+            corpo["generationConfig"]["thinkingConfig"],
+            serde_json::json!({ "includeThoughts": false, "thinkingBudget": 0 })
+        );
+    }
+
+    /// Il livello che parte viene dal DB e non da un letterale, e cio' che il DB
+    /// dice fuori vocabolario NON parte: sarebbe un 400 su ogni chiamata.
+    ///
+    /// MUTAZIONE: inoltrare la stringa grezza del setting -> rosso sul caso
+    /// 'assurdo'. Non e' nemmeno scrivibile senza cambiare il TIPO di
+    /// `GoogleThinking::Level`, ed e' il punto.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_livello_viene_dal_setting_e_solo_dal_vocabolario(pool: sqlx::PgPool) {
+        semina_modello_a_livelli(&pool, "gemini-3.5-flash").await;
+
+        for (scritto, atteso) in [("high", "high"), ("assurdo", "low"), ("", "low")] {
+            sqlx::query("UPDATE settings SET value = $1 WHERE key = $2")
+                .bind(scritto)
+                .bind(THINKING_LEVEL_SETTING)
+                .execute(&pool)
+                .await
+                .expect("scrittura setting");
+            // La scrittura non passa da `update_setting_value`, quindi la cache di
+            // processo di nexus-auth non se ne accorge: e' il contratto dichiarato
+            // di quella cache, e il test lo rispetta invece di aggirarlo.
+            nexus_auth::invalidate_setting_cache(&pool, THINKING_LEVEL_SETTING);
+            // Provider NUOVO a ogni giro: la cache del livello ha TTL 60s e
+            // riuserebbe la lettura precedente.
+            let p = provider_con_catalogo(pool.clone());
+            let corpo = corpo_di(&p, &richiesta_agentica("gemini-3.5-flash")).await;
+            assert_eq!(
+                corpo["generationConfig"]["thinkingConfig"]["thinkingLevel"], atteso,
+                "setting '{scritto}': fuori vocabolario si ripiega, mai si inoltra"
+            );
+        }
     }
 
     #[test]
@@ -3931,7 +4470,7 @@ mod tests {
         let mut req = req_with_tools(vec![msg("user", "x")], false);
         assert!(req.tools.is_none());
         req.tool_choice = Some(serde_json::json!("required"));
-        assert_eq!(resolve_thinking(&req, 8192), GoogleThinking::DisabledForTools);
+        assert_eq!(thinking_storico(&req, 8192), GoogleThinking::DisabledForTools);
     }
 
     #[test]
@@ -3941,7 +4480,7 @@ mod tests {
         let req = req_with_tools(vec![msg("user", "x")], false);
         assert!(req.tools.is_none());
         assert!(req.tool_choice.is_none());
-        assert_eq!(resolve_thinking(&req, 8192), GoogleThinking::Absent);
+        assert_eq!(thinking_storico(&req, 8192), GoogleThinking::Absent);
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         // Nessun thinkingConfig: nel ramo storico Gemini usa il suo default.
         let gc = &json["generationConfig"];
@@ -5036,7 +5575,7 @@ mod tests {
         let req = req_with_tools(vec![msg("user", "leggi x")], true);
 
         // Replica la risoluzione del gate: con tool presenti -> DisabledForTools.
-        let initial = resolve_thinking(&req, 8192);
+        let initial = thinking_storico(&req, 8192);
         assert_eq!(initial, GoogleThinking::DisabledForTools);
         let body_iniziale = serde_json::to_value(build_request_body(&req, initial)).unwrap();
         assert_eq!(
