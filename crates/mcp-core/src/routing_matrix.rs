@@ -261,7 +261,7 @@ impl RoutingMatrix {
 }
 
 /// Carica la matrice dal DB. Ritorna `Err` se DB irraggiungibile o tabelle vuote.
-async fn fetch_from_db(db: &PgPool) -> Result<RoutingMatrix, String> {
+pub(crate) async fn fetch_from_db(db: &PgPool) -> Result<RoutingMatrix, String> {
     // Estesa con le 3 colonne escalation_* (mig 0120). Le colonne sono
     // nullable: usiamo Option per leggerle senza rompere se la migrazione
     // 0120 non e' applicata (graceful fallback: nessuna escalation).

@@ -201,6 +201,100 @@ async fn run_one_round(orchestrator: &Orchestrator, db: &PgPool) {
     }
 }
 
+/// Con quale modello si sonda un fornitore: l'esito e' un TIPO perche' i casi
+/// sono TRE e il terzo non e' un modello (regola Q).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ModelloProbe {
+    /// Il default della matrice e' abilitato a catalogo: si usa quello.
+    Configurato(String),
+    /// Il default configurato NON e' abilitato (deprecato dal fornitore,
+    /// squalificato, fuori policy): si sonda con un modello vivo e lo si
+    /// DICHIARA, invece di far risultare malato il fornitore per colpa di un
+    /// modello morto.
+    Sostituito { usato: String, configurato: String },
+    /// Il fornitore non ha nemmeno un modello abilitato: non c'e' niente da
+    /// interrogare, e non e' un fornitore giu' (lo dice gia'
+    /// `ProviderReadiness::Stalled(NoModels)`).
+    NessunoAbilitato,
+}
+
+impl ModelloProbe {
+    /// Il modello da interrogare, se ce n'e' uno.
+    pub(crate) fn modello(&self) -> Option<&str> {
+        match self {
+            ModelloProbe::Configurato(m) => Some(m.as_str()),
+            ModelloProbe::Sostituito { usato, .. } => Some(usato.as_str()),
+            ModelloProbe::NessunoAbilitato => None,
+        }
+    }
+
+    /// Il modello da interrogare, DICHIARANDO la sostituzione se c'e' stata.
+    ///
+    /// I due chiamanti (il giro periodico e il probe-then-reenable) fanno la
+    /// stessa cosa e la fanno qui: tenere separati log e scelta li obbligava a
+    /// due righe identiche ciascuno, e la prossima chiamata ne dimenticherebbe
+    /// una — il log, cioe' proprio cio' che rende visibile la sostituzione.
+    pub(crate) fn risolvi(&self, provider: &str) -> Option<String> {
+        if let ModelloProbe::Sostituito { usato, configurato } = self {
+            tracing::warn!(
+                target: "provider_health_probe",
+                provider = %provider,
+                configurato = %configurato,
+                usato = %usato,
+                "il default del fornitore non e' abilitato a catalogo: sondo con un modello vivo"
+            );
+        }
+        self.modello().map(str::to_string)
+    }
+}
+
+/// Sceglie il modello del probe: il default della matrice SE il catalogo lo
+/// abilita, altrimenti un modello abilitato dello stesso fornitore.
+///
+/// MISURATO il 17/08/2026: `nexus_provider_default_model` puntava per groq a
+/// `llama-3.1-8b-instant` (disabilitato dal 15/07, `disqualified`, e rimosso
+/// dal fornitore) e per perplexity a `sonar` (disabilitato). Il probe li
+/// interrogava lo stesso, prendeva 404 `model_not_found` e l'intero fornitore
+/// risultava `not_found` nello stato provider — un modello morto che fa
+/// apparire malato un endpoint che risponde 200 (verificato con probe diretto
+/// su `openai/gpt-oss-20b`: HTTP 200 mentre lo stato del fornitore diceva
+/// `not_found`).
+///
+/// La domanda «quale modello uso per sondare» non puo' avere per risposta un
+/// modello che il catalogo ha spento: i fornitori deprecano di continuo, e un
+/// default che punta nel vuoto si ripresenta (due su nove, il giorno della
+/// misura). Fra gli abilitati si preferisce il piu' economico: il probe e' una
+/// chiamata a pagamento che si ripete a ogni giro.
+pub(crate) async fn modello_per_probe(
+    db: &PgPool,
+    matrix: &crate::routing_matrix::RoutingMatrix,
+    provider: &str,
+) -> ModelloProbe {
+    let configurato = default_model_for_provider(matrix, provider);
+    // UNA query per le due domande («il default e' abilitato?» e «qual e' il
+    // piu' economico fra gli abilitati?»): due letture separate darebbero due
+    // fotografie dello stesso catalogo, e su un sync concorrente potrebbero
+    // non essere la stessa.
+    let righe: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT model, is_enabled FROM ai_price_catalog           WHERE provider = $1 AND (model = $2 OR is_enabled = true)           ORDER BY input_cost_per_million_tokens ASC NULLS LAST, model",
+    )
+    .bind(provider)
+    .bind(&configurato)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    if righe
+        .iter()
+        .any(|(model, abilitato)| *abilitato && model == &configurato)
+    {
+        return ModelloProbe::Configurato(configurato);
+    }
+    match righe.into_iter().find(|(_, abilitato)| *abilitato) {
+        Some((usato, _)) => ModelloProbe::Sostituito { usato, configurato },
+        None => ModelloProbe::NessunoAbilitato,
+    }
+}
+
 /// Pinga un singolo provider. Persiste sempre il risultato (anche success).
 async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
     // ── Budget exhausted check ────────────────────────────────────────────
@@ -269,7 +363,17 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
             return;
         }
     };
-    let model = default_model_for_provider(&matrix_arc, provider);
+    let Some(model) = modello_per_probe(db, &matrix_arc, provider)
+        .await
+        .risolvi(provider)
+    else {
+        tracing::warn!(
+            target: "provider_health_probe",
+            provider = %provider,
+            "nessun modello abilitato: niente da sondare, salto il giro"
+        );
+        return;
+    };
     let timings = provider_health_timings();
     let probe_timeout_s = timings.health_probe_timeout_s;
     let started = Instant::now();
@@ -483,6 +587,7 @@ pub enum ProbeOutcome {
 /// detection dell'errore "ingoiato dal brain" (`[Error: ...]`).
 pub async fn probe_provider_once(
     orchestrator: &Orchestrator,
+    db: &PgPool,
     provider: &str,
     timeout_s: u64,
 ) -> ProbeOutcome {
@@ -490,7 +595,14 @@ pub async fn probe_provider_once(
         Ok(m) => m,
         Err(e) => return ProbeOutcome::Transient(format!("routing_matrix non disponibile: {e}")),
     };
-    let model = default_model_for_provider(&matrix_arc, provider);
+    let Some(model) = modello_per_probe(db, &matrix_arc, provider)
+        .await
+        .risolvi(provider)
+    else {
+        return ProbeOutcome::Transient(format!(
+            "nessun modello abilitato per '{provider}': niente da interrogare"
+        ));
+    };
     let result = tokio::time::timeout(
         Duration::from_secs(timeout_s.max(1)),
         orchestrator
@@ -623,6 +735,91 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// IL CASO REALE MISURATO il 17/08/2026: il default del fornitore punta a un
+    /// modello che il catalogo ha DISABILITATO (groq -> `llama-3.1-8b-instant`,
+    /// squalificato dal 15/07 e rimosso dal fornitore; perplexity -> `sonar`).
+    /// Il probe lo interrogava lo stesso, prendeva 404 `model_not_found`, e
+    /// l'intero fornitore risultava `not_found` mentre il suo endpoint
+    /// rispondeva 200 su un modello vivo.
+    ///
+    /// Qui il criterio si misura contro lo schema REALE (META_MIGRATOR) e la
+    /// matrice REALE letta dal DB, non contro una mappa scritta a mano.
+    ///
+    /// MUTAZIONE: far ritornare a `modello_per_probe` il default senza guardare
+    /// `is_enabled` (il comportamento di prima) fa cadere il primo assert con
+    /// `Configurato("modello-morto")`.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_probe_non_interroga_un_modello_che_il_catalogo_ha_spento(pool: PgPool) {
+        sqlx::query("DELETE FROM ai_price_catalog WHERE provider = 'prov-probe'")
+            .execute(&pool)
+            .await
+            .expect("pulizia");
+        for (model, enabled, costo) in [
+            ("modello-morto", false, 0.01_f64),
+            ("modello-vivo-caro", true, 5.0_f64),
+            ("modello-vivo-economico", true, 0.20_f64),
+        ] {
+            sqlx::query(
+                // `last_probe_healthy_at` valorizzato: il trigger
+                // `enforce_probe_before_enable` (mig 0629) respinge a false
+                // ogni riga abilitata senza un probe sano alle spalle.
+                "INSERT INTO ai_price_catalog                  (provider, model, display_name, input_cost_per_million_tokens,                   output_cost_per_million_tokens, currency, is_enabled, pricing_state,                   last_probe_healthy_at)                  VALUES ('prov-probe', $1, $1, $2, $2, 'USD', $3, 'priced', now())",
+            )
+            .bind(model)
+            .bind(costo)
+            .bind(enabled)
+            .execute(&pool)
+            .await
+            .expect("seed catalog");
+        }
+        sqlx::query(
+            "INSERT INTO nexus_provider_default_model (provider, model_id, notes)              VALUES ('prov-probe', 'modello-morto', 'default che punta nel vuoto')              ON CONFLICT (provider) DO UPDATE SET model_id = EXCLUDED.model_id",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed default");
+
+        let matrix = crate::routing_matrix::fetch_from_db(&pool)
+            .await
+            .expect("matrice dal DB reale");
+
+        // Il default e' spento: si sonda con un modello vivo, e la sostituzione
+        // e' DICHIARATA (non un silenzioso ripiego).
+        let scelta = modello_per_probe(&pool, &matrix, "prov-probe").await;
+        assert_eq!(
+            scelta,
+            ModelloProbe::Sostituito {
+                usato: "modello-vivo-economico".to_string(),
+                configurato: "modello-morto".to_string(),
+            },
+            "col default spento si sonda il piu' economico fra gli abilitati"
+        );
+
+        // Riabilitato il default, torna a essere quello configurato.
+        sqlx::query(
+            "UPDATE ai_price_catalog SET is_enabled = true, last_probe_healthy_at = now()               WHERE provider = 'prov-probe' AND model = 'modello-morto'",
+        )
+        .execute(&pool)
+        .await
+        .expect("riabilito");
+        assert_eq!(
+            modello_per_probe(&pool, &matrix, "prov-probe").await,
+            ModelloProbe::Configurato("modello-morto".to_string()),
+            "se il catalogo lo abilita, il default configurato comanda"
+        );
+
+        // Nessun modello abilitato: non c'e' niente da interrogare, e non e'
+        // un fornitore giu' (regola Q: l'ignoto e' una variante dichiarata).
+        sqlx::query("UPDATE ai_price_catalog SET is_enabled = false WHERE provider = 'prov-probe'")
+            .execute(&pool)
+            .await
+            .expect("spengo tutto");
+        assert_eq!(
+            modello_per_probe(&pool, &matrix, "prov-probe").await,
+            ModelloProbe::NessunoAbilitato
+        );
+    }
 
     /// LA CONSEGUENZA, non la stringa (regola O): un 429 di groq per tetto giornaliero
     /// non deve produrre `ProbeOutcome::Billing`, che e' cio' che porta a

@@ -905,6 +905,7 @@ pub async fn billing_cooldown_recovery_loop(
             let probe_timeout = provider_health_timings().recovery_probe_timeout_s;
             let esito = crate::provider_health_probe::probe_provider_once(
                 &orchestrator,
+                &db,
                 &provider,
                 probe_timeout,
             )
