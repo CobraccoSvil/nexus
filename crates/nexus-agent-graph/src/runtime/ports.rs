@@ -879,6 +879,22 @@ pub struct StepValidationReport {
     /// `Some(motivo)` quando la selezione non ha potuto garantire 2 provider
     /// distinti dall'esecutore: il chiamante lo DICHIARA nell'esito.
     pub degraded: Option<String>,
+    /// I tentativi di convocazione il cui POSTO e' stato riassegnato: giudici
+    /// che si sono astenuti per una causa STRUTTURALE
+    /// ([`crate::decisions::step_gate::NaturaAstensione::Strutturale`]) e ai
+    /// quali e' subentrato, in `verdicts`, un altro candidato.
+    ///
+    /// NON sono nel denominatore, e la differenza col quorum onesto e'
+    /// sostanziale: li' spariva un giudice INTERPELLATO che non aveva risposto,
+    /// qui non ha mai preso il posto — non ha prodotto un giudizio nella forma
+    /// che il gate pretende, e riproporglielo darebbe lo stesso esito. Restano
+    /// pero' VISIBILI, col loro costo: senza, «la sostituzione e' scattata e ha
+    /// aiutato?» non sarebbe una domanda che il meta_step sa rispondere, ed e'
+    /// la sola misura con cui tarare il meccanismo.
+    ///
+    /// Vuoto sul percorso ordinario (nessuna astensione strutturale) e quando
+    /// un sostituto non c'era: li' l'astensione resta fra i `verdicts`.
+    pub sostituiti: Vec<ValidatorVerdict>,
 }
 
 /// Porta del gate duale (gemella di [`ReviewPanelPort`]): il concreto in

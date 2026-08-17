@@ -434,6 +434,167 @@ pub enum StepVerdict {
     Abstained,
 }
 
+// ── Vocabolario delle cause d'astensione prodotte dal GATE ──────────────────
+//
+// Le scrive l'adapter che convoca (`mcp-core::agent_graph_adapter::
+// step_validation`) nel campo `ValidatorVerdict::abstain_cause`, e le legge il
+// criterio qui sotto. Stanno insieme al criterio e non presso il produttore
+// (regola L): finche' erano cinque `const` locali dell'adapter, «quale causa
+// significa che riconvocare lo stesso giudice e' inutile» non era una domanda
+// ponibile da nessun'altra parte, e infatti nessuno la poneva.
+//
+// Le ALTRE cause che quel campo puo' portare non sono nostre: le dichiara il
+// fornitore attraverso [`crate::runtime::ports::ProviderFailureCause`], e la
+// loro natura la si chiede a quel vocabolario invece di ricopiarne i valori.
+
+/// Il timer del validatore e' scaduto prima della risposta.
+pub const CAUSA_ASTENSIONE_TIMEOUT: &str = "timeout";
+/// Il task del validatore e' morto (JoinError).
+pub const CAUSA_ASTENSIONE_JOIN: &str = "join_error";
+/// La chiamata e' fallita senza che il gateway dichiarasse una causa propria.
+pub const CAUSA_ASTENSIONE_CALL: &str = "call_error";
+/// Il modello ha risposto, ma non nella forma che il verdetto pretende: tool
+/// assente, verdetto fuori enum, input malformato.
+pub const CAUSA_ASTENSIONE_SCHEMA: &str = "schema_mismatch";
+/// Il gateway ha ripiegato sull'ESECUTORE del turno: il verdetto ci sarebbe
+/// anche, ma non e' indipendente.
+pub const CAUSA_ASTENSIONE_EXECUTOR: &str = "executor_fallback";
+
+/// Perche' un giudice non ha espresso un verdetto — e soprattutto: **cambierebbe
+/// qualcosa riconvocare LO STESSO?**
+///
+/// E' la domanda che il gate non sapeva porre, e il tipo esiste perche' le due
+/// risposte hanno rimedi OPPOSTI (regola Q: la distinzione vive in un tipo, non
+/// in un `if` sparso nel punto di convocazione).
+///
+/// MISURATO il 17/08/2026 in esercizio (progetto `app-completa-17-08`, run dalla
+/// UI): un `run_command` di sola lettura — `node -e "require('./backend/package.json')"`
+/// — classificato `unconfined` e quindi `critical`, gatekeeper `mistral` che
+/// APPROVA scrivendo «non si rilevano rischi di blast radius o di distruzione
+/// irreversibile», challenger `kimi/kimi-k2.6` che si astiene con
+/// `schema_mismatch`. Su un passo critico un solo parere non basta: rimando.
+/// L'agente riprova, la selezione ripropone LA STESSA COPPIA di giudici, stesso
+/// esito, e al secondo giro il tetto dei rimandi chiude il run
+/// (`retries_exhausted`). Il passo non e' mai stato eseguito, e il sub-run ha
+/// speso oltre 400 secondi su una lettura di file.
+///
+/// `kimi-k2.6` e' a catalogo `supports_tool_use = true` e `qualified`, e la
+/// dichiarazione non e' falsa in generale — le tool call quel modello le fa. Non
+/// regge lo schema STRICT del verdetto del gate, che e' un fatto su QUESTO
+/// schema e non sul fornitore: nessuno lo registrava, quindi la selezione lo
+/// riproponeva a ogni tentativo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NaturaAstensione {
+    /// Condizione d'AMBIENTE: credito, cooldown, coda, un turno vuoto sotto
+    /// carico. Riprovare piu' tardi ha senso; sostituire il giudice adesso
+    /// pagherebbe una seconda chiamata per rimediare a qualcosa che non
+    /// riguarda quel modello.
+    Transitoria,
+    /// Fatto su QUELLA COPPIA rispetto a QUESTO schema: riconvocarla dara' lo
+    /// stesso esito finche' il fornitore non cambia il modello. L'unica mossa
+    /// utile e' cambiare giudice.
+    Strutturale,
+    /// Causa assente o fuori dal vocabolario. NON e' «transitoria»: e' «non lo
+    /// so», e va contata a parte — un conteggio che cresce dice che il
+    /// vocabolario delle cause e' rimasto indietro rispetto a chi le produce.
+    /// La conseguenza pratica coincide con `Transitoria` (nessuna
+    /// sostituzione), perche' al buio non si spende una chiamata in piu'.
+    NonDichiarata,
+}
+
+impl NaturaAstensione {
+    /// Identificatore canonico (regola N) per il payload del meta_step.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Transitoria => "transitoria",
+            Self::Strutturale => "strutturale",
+            Self::NonDichiarata => "non_dichiarata",
+        }
+    }
+
+    /// L'unica conseguenza che il gate deriva da qui: questo posto va
+    /// riassegnato a un altro giudice?
+    pub fn richiede_un_altro_giudice(self) -> bool {
+        matches!(self, Self::Strutturale)
+    }
+}
+
+/// La natura di un'astensione dalla sua causa STRUTTURATA (regola M: il campo,
+/// mai la prosa del messaggio).
+///
+/// Perche' la sola `schema_mismatch` e' strutturale, e le sorelle che sembrano
+/// tali non lo sono:
+///
+/// - `client_error` e' un rifiuto del fornitore, e «un altro fornitore lo
+///   accetterebbe?» ha gia' un punto unico che pretende il CODICE d'errore
+///   ([`crate::runtime::ports::ProviderUnavailableInfo::allows_cross_provider_failover`]).
+///   Quel codice non arriva fin qui — l'astensione porta la sola CLASSE — e
+///   decidere dal nome della classe significherebbe rispondere senza il dato
+///   che quel punto unico pretende;
+/// - `empty_completion` e' un comportamento che dipende dal carico e dal tetto
+///   di output, non dallo schema: e' la firma del difetto gia' chiuso col tetto
+///   dal catalogo, e trattarlo come strutturale marchierebbe come inadatto un
+///   modello sano;
+/// - `executor_fallback` dipende da dove il gateway ha potuto instradare in
+///   quell'istante, cioe' dallo stato dei cooldown: ambiente.
+pub fn natura_astensione(causa: Option<&str>) -> NaturaAstensione {
+    let Some(causa) = causa.map(str::trim).filter(|c| !c.is_empty()) else {
+        return NaturaAstensione::NonDichiarata;
+    };
+    match causa {
+        CAUSA_ASTENSIONE_SCHEMA => return NaturaAstensione::Strutturale,
+        CAUSA_ASTENSIONE_TIMEOUT
+        | CAUSA_ASTENSIONE_JOIN
+        | CAUSA_ASTENSIONE_CALL
+        | CAUSA_ASTENSIONE_EXECUTOR => return NaturaAstensione::Transitoria,
+        _ => {}
+    }
+    natura_dal_fornitore(causa).unwrap_or(NaturaAstensione::NonDichiarata)
+}
+
+/// Le cause che il FORNITORE dichiara: la natura si chiede al vocabolario che
+/// le produce, non a un secondo elenco di stringhe scritto qui (regola O — un
+/// elenco ricopiato diverge, e diverge in silenzio).
+fn natura_dal_fornitore(causa: &str) -> Option<NaturaAstensione> {
+    use crate::runtime::ports::ProviderFailureCause as Causa;
+    // L'elenco e' il vocabolario. Una variante nuova che non arrivasse fin qui
+    // cadrebbe in `NonDichiarata`, cioe' nella direzione prudente (nessuna
+    // sostituzione); e il match di [`natura_di_causa_fornitore`] e' ESAUSTIVO,
+    // quindi la variante nuova rompe comunque la compilazione e chiede una
+    // decisione a chi la introduce.
+    [
+        Causa::Cooldown,
+        Causa::Billing,
+        Causa::ClientError,
+        Causa::PolicyTierExcluded,
+        Causa::EmptyCompletion,
+        Causa::ContextTooLong,
+        Causa::RequestExceedsCredit,
+        Causa::Unknown,
+    ]
+    .into_iter()
+    .find(|c| c.as_str() == causa)
+    .map(natura_di_causa_fornitore)
+}
+
+/// La natura di una causa dichiarata dal fornitore. ESAUSTIVA di proposito.
+fn natura_di_causa_fornitore(causa: crate::runtime::ports::ProviderFailureCause) -> NaturaAstensione {
+    use crate::runtime::ports::ProviderFailureCause as Causa;
+    match causa {
+        // Tutte condizioni del FORNITORE o della richiesta in corso: nessuna
+        // dice che quel modello non sappia fare il giudice.
+        Causa::Cooldown
+        | Causa::Billing
+        | Causa::ClientError
+        | Causa::PolicyTierExcluded
+        | Causa::EmptyCompletion
+        | Causa::ContextTooLong
+        | Causa::RequestExceedsCredit => NaturaAstensione::Transitoria,
+        // Il gateway stesso dichiara di non saperlo: non lo sappiamo nemmeno noi.
+        Causa::Unknown => NaturaAstensione::NonDichiarata,
+    }
+}
+
 /// La decisione del gate sul batch, dai verdetti dei CONVOCATI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1032,6 +1193,94 @@ mod tests {
                 "il blocker di {b:?} non e' nel vocabolario ADR 0034"
             );
         }
+    }
+
+    /// IL CRITERIO del 17/08/2026: quale astensione si rimedia cambiando
+    /// GIUDICE, e quale no.
+    ///
+    /// `schema_mismatch` e' l'unica strutturale: quel modello, su QUESTO schema,
+    /// non ce la fa, e riconvocarlo e' il giro a vuoto misurato in esercizio
+    /// (kimi/kimi-k2.6, due tentativi identici, run chiuso `retries_exhausted`).
+    /// Tutte le altre sono condizioni d'ambiente: sostituire il giudice
+    /// pagherebbe una seconda chiamata senza rimediare a nulla.
+    ///
+    /// MUTAZIONE: spostare `CAUSA_ASTENSIONE_SCHEMA` fra le transitorie ->
+    /// `richiede_un_altro_giudice()` torna falso, questo test rosseggia e con
+    /// lui quello della sostituzione in `mcp-core::agent_graph_adapter::
+    /// step_validation` (il gate torna a rimandare all'infinito).
+    #[test]
+    fn solo_lo_schema_si_rimedia_cambiando_giudice() {
+        assert_eq!(
+            natura_astensione(Some(CAUSA_ASTENSIONE_SCHEMA)),
+            NaturaAstensione::Strutturale
+        );
+        assert!(natura_astensione(Some(CAUSA_ASTENSIONE_SCHEMA)).richiede_un_altro_giudice());
+        for causa in [
+            CAUSA_ASTENSIONE_TIMEOUT,
+            CAUSA_ASTENSIONE_JOIN,
+            CAUSA_ASTENSIONE_CALL,
+            CAUSA_ASTENSIONE_EXECUTOR,
+        ] {
+            assert_eq!(
+                natura_astensione(Some(causa)),
+                NaturaAstensione::Transitoria,
+                "{causa} e' una condizione d'ambiente: riprovare piu' tardi ha senso"
+            );
+            assert!(!natura_astensione(Some(causa)).richiede_un_altro_giudice());
+        }
+    }
+
+    /// Le cause del FORNITORE arrivano dal suo vocabolario, non da un elenco di
+    /// stringhe ricopiato qui (regola O): il test le prende da `as_str()`, cioe'
+    /// dal produttore, e non dai letterali che vorrebbe verificare.
+    ///
+    /// MUTAZIONE: classificare `EmptyCompletion` come strutturale -> la prima
+    /// asserzione cade, e col difetto reale: un modello sano che sotto carico
+    /// ha prodotto un turno vuoto verrebbe marchiato inadatto a fare il giudice.
+    #[test]
+    fn le_cause_del_fornitore_non_squalificano_il_giudice() {
+        use super::super::super::runtime::ports::ProviderFailureCause as Causa;
+        for causa in [
+            Causa::Cooldown,
+            Causa::Billing,
+            Causa::ClientError,
+            Causa::PolicyTierExcluded,
+            Causa::EmptyCompletion,
+            Causa::ContextTooLong,
+            Causa::RequestExceedsCredit,
+        ] {
+            assert_eq!(
+                natura_astensione(Some(causa.as_str())),
+                NaturaAstensione::Transitoria,
+                "{}: e' il fornitore, non il giudice",
+                causa.as_str()
+            );
+        }
+        // Il gateway che dichiara di non sapere non produce una supposizione.
+        assert_eq!(
+            natura_astensione(Some(Causa::Unknown.as_str())),
+            NaturaAstensione::NonDichiarata
+        );
+    }
+
+    /// L'ignoto e' una VARIANTE, non un valore comodo (regola Q): «causa non
+    /// dichiarata» e «causa d'ambiente» hanno la stessa conseguenza oggi e
+    /// dicono due cose diverse — la prima, se cresce, dice che il vocabolario e'
+    /// rimasto indietro rispetto a chi le produce.
+    #[test]
+    fn la_causa_assente_non_degrada_a_transitoria() {
+        for causa in [None, Some(""), Some("   "), Some("causa_mai_vista")] {
+            assert_eq!(
+                natura_astensione(causa),
+                NaturaAstensione::NonDichiarata,
+                "{causa:?}"
+            );
+            assert!(!natura_astensione(causa).richiede_un_altro_giudice());
+        }
+        // E le tre nature restano distinguibili da chi legge il payload.
+        assert_eq!(NaturaAstensione::Strutturale.as_str(), "strutturale");
+        assert_eq!(NaturaAstensione::Transitoria.as_str(), "transitoria");
+        assert_eq!(NaturaAstensione::NonDichiarata.as_str(), "non_dichiarata");
     }
 
     /// Il vocabolario sul WIRE (serde, payload del meta_step) e quello del

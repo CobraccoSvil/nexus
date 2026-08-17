@@ -2671,6 +2671,7 @@ fn report_degradato(motivo: &str) -> ports::StepValidationReport {
     ports::StepValidationReport {
         verdicts: Vec::new(),
         degraded: Some(motivo.to_string()),
+        sostituiti: Vec::new(),
     }
 }
 
@@ -2685,27 +2686,20 @@ fn payload_convocazione(
     prior_rejections: u32,
 ) -> Value {
     let blocco = esito.blocco();
-    let validators_slim: Vec<Value> = report
-        .verdicts
-        .iter()
-        .map(|v| {
-            json!({
-                "role": v.role,
-                "provider": v.provider,
-                "model": v.model,
-                "verdict": v.verdict,
-                "abstain_cause": v.abstain_cause,
-                "reasons": v.reasons,
-                "safer_alternative": v.safer_alternative,
-                "cost_usd": v.cost_usd,
-            })
-        })
-        .collect();
+    let validators_slim: Vec<Value> = report.verdicts.iter().map(validatore_slim).collect();
+    // I posti RIASSEGNATI, nella stessa forma dei validatori: chi ha provato a
+    // giudicare, con quale causa si e' astenuto e quanto e' costato. Senza
+    // questo campo «la sostituzione e' scattata, e ha aiutato?» non sarebbe una
+    // domanda che le query di taratura sanno porre — ed e' la sola misura con
+    // cui capire se il vocabolario delle cause strutturali e' tarato bene
+    // (regola Q: il fatto in un campo, mai dentro la prosa del degrado).
+    let sostituiti_slim: Vec<Value> = report.sostituiti.iter().map(validatore_slim).collect();
     json!({
         "decision": esito.decision(),
         "level": level.as_str(),
         "steps": steps_slim,
         "validators": validators_slim,
+        "sostituiti": sostituiti_slim,
         "degraded": report.degraded,
         "prior_rejections": prior_rejections,
         // La NATURA del blocco: `null` quando il batch passa. Le due domande
@@ -2718,6 +2712,23 @@ fn payload_convocazione(
         // taratura gia' scritte lo leggono.
         "cap_reached": blocco.map(crate::decisions::step_gate::GateBlock::ferma_il_run)
             .unwrap_or(false),
+    })
+}
+
+/// La forma slim di UN tentativo di giudizio. Una sola resa per i due elenchi
+/// del payload (chi siede nel panel e chi il posto lo ha lasciato): due mappe
+/// diverse renderebbero i sostituiti meno leggibili proprio dove servono a
+/// confrontarli coi loro sostituti.
+fn validatore_slim(v: &ports::ValidatorVerdict) -> Value {
+    json!({
+        "role": v.role,
+        "provider": v.provider,
+        "model": v.model,
+        "verdict": v.verdict,
+        "abstain_cause": v.abstain_cause,
+        "reasons": v.reasons,
+        "safer_alternative": v.safer_alternative,
+        "cost_usd": v.cost_usd,
     })
 }
 
@@ -4941,6 +4952,7 @@ mod tests {
                 },
             ],
             degraded: None,
+            sostituiti: Vec::new(),
         };
         let motivi = motivi_di_rifiuto(&report);
         assert!(
@@ -4964,6 +4976,7 @@ mod tests {
         let report = ports::StepValidationReport {
             verdicts: vec![verdetto("gatekeeper", StepVerdict::Approve)],
             degraded: Some("nessun provider candidato".into()),
+            sostituiti: Vec::new(),
         };
         assert!(motivi_di_rifiuto(&report).contains("nessun verdetto espresso"));
     }
@@ -5125,6 +5138,7 @@ mod tests {
                     verdetto("challenger", StepVerdict::Reject),
                 ],
                 degraded: None,
+                sostituiti: Vec::new(),
             },
             chiamate: std::sync::Mutex::new(0),
         });
@@ -5168,6 +5182,7 @@ mod tests {
         let report = ports::StepValidationReport {
             verdicts: vec![verdetto("gatekeeper", StepVerdict::Approve), astenuto],
             degraded: None,
+            sostituiti: Vec::new(),
         };
         use crate::decisions::step_gate::GateBlock;
         let fermo = |blocco| EsitoGate::Fermo {
@@ -5239,6 +5254,7 @@ mod tests {
             report: ports::StepValidationReport {
                 verdicts: vec![verdetto("gatekeeper", StepVerdict::Approve), astenuto],
                 degraded: None,
+                sostituiti: Vec::new(),
             },
             chiamate: std::sync::Mutex::new(0),
         });
@@ -5275,6 +5291,7 @@ mod tests {
             report: ports::StepValidationReport {
                 verdicts: vec![verdetto("gatekeeper", StepVerdict::Approve), astenuto],
                 degraded: None,
+                sostituiti: Vec::new(),
             },
             chiamate: std::sync::Mutex::new(0),
         });
@@ -5310,6 +5327,7 @@ mod tests {
                     verdetto("challenger", StepVerdict::Approve),
                 ],
                 degraded: None,
+                sostituiti: Vec::new(),
             },
             chiamate: std::sync::Mutex::new(0),
         });
@@ -5398,6 +5416,7 @@ mod tests {
             report: ports::StepValidationReport {
                 verdicts: vec![gk, ch],
                 degraded: None,
+                sostituiti: Vec::new(),
             },
             chiamate: std::sync::Mutex::new(0),
         });
@@ -5478,6 +5497,7 @@ mod tests {
                     verdetto("challenger", StepVerdict::Reject),
                 ],
                 degraded: None,
+                sostituiti: Vec::new(),
             },
             chiamate: std::sync::Mutex::new(0),
         });
@@ -5560,6 +5580,7 @@ mod tests {
             report: ports::StepValidationReport {
                 verdicts: vec![verdetto("gatekeeper", StepVerdict::Approve), astenuto],
                 degraded: None,
+                sostituiti: Vec::new(),
             },
             chiamate: std::sync::Mutex::new(0),
         });
@@ -5624,6 +5645,7 @@ mod tests {
             report: ports::StepValidationReport {
                 verdicts: vec![verdetto("gatekeeper", StepVerdict::Reject)],
                 degraded: None,
+                sostituiti: Vec::new(),
             },
             chiamate: std::sync::Mutex::new(0),
         });
@@ -5664,6 +5686,7 @@ mod tests {
                     verdetto("challenger", StepVerdict::Approve),
                 ],
                 degraded: None,
+                sostituiti: Vec::new(),
             })
         }
     }
