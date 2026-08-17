@@ -55,6 +55,7 @@
 
 use sqlx::PgPool;
 
+use nexus_agent_graph::decisions::latency_budget::EsitoBudgetLatenza;
 use nexus_agent_graph::decisions::tiers::{tier_chain_up, tier_rank};
 
 use super::model_routing::{agentic_tier_chain, AGENTIC_COST_FIRST_ORDER, AGENTIC_FAILOVER_ORDER};
@@ -213,6 +214,19 @@ pub struct ModelRequest<'a> {
     /// A flag OFF (default) e' bit-identico alla selezione normale: il riordino
     /// e' STABILE, con telemetria uniforme il top-1 resta quello del `rank`.
     pub governed: bool,
+    /// Budget di latenza DICHIARATO dal chiamante (ms): il tetto entro cui la
+    /// risposta deve arrivare perche' il lavoro a valle abbia senso — es. il
+    /// timeout per validatore del gate duale, che senza questo campo convocava
+    /// giudici col p95 osservato sopra il proprio timeout (astensione
+    /// `timeout` per costruzione). I candidati il cui percentile osservato
+    /// ECCEDE il budget escono dal pool; l'IGNOTO non esclude (regola Q) e il
+    /// pool svuotato ricade sul pool INTERO col segnale
+    /// `latency=overbudget_fallback` nel `rationale` (mai fail-closed).
+    /// Criterio puro: `nexus_agent_graph::decisions::latency_budget`; fatti:
+    /// p95 dei probe sani (`ai_model_health_history`), config
+    /// `routing.latency.*` (mig 0725). `None` (o un valore non positivo) =
+    /// nessun budget: percorso bit-identico allo storico.
+    pub latency_budget_ms: Option<i64>,
 }
 
 impl<'a> ModelRequest<'a> {
@@ -229,6 +243,7 @@ impl<'a> ModelRequest<'a> {
             pin: None,
             rank: Rank::CostFirst,
             governed: false,
+            latency_budget_ms: None,
         }
     }
 
@@ -289,6 +304,13 @@ impl<'a> ModelRequest<'a> {
     /// e' per la selezione DINAMICA del turno primario, non per tutti.
     pub fn governed(mut self, on: bool) -> Self {
         self.governed = on;
+        self
+    }
+
+    /// Dichiara il budget di latenza (ms). Vedi
+    /// [`ModelRequest::latency_budget_ms`].
+    pub fn latency_budget_ms(mut self, ms: i64) -> Self {
+        self.latency_budget_ms = Some(ms);
         self
     }
 }
@@ -563,11 +585,17 @@ async fn diagnose_empty(
 }
 
 /// PUNTO UNICO del fetch dei candidati per i tre percorsi del servizio, col
-/// riordino cache-aware di `Rank::CostFirst` (mig 0721, opt-in). A flag OFF il
-/// fetch resta `limit` e il percorso e' bit-identico allo storico; a flag ON
-/// si chiede un POOL, si riordina sul costo ATTESO (cache + finestre orarie,
-/// vedi `cost_rank`) e si tronca al limite chiesto. Vive qui e non nei tre
-/// call site: tre copie del blocco erano gia' una duplicazione (regola L).
+/// riordino cache-aware di `Rank::CostFirst` (mig 0721, opt-in) e col budget
+/// di latenza dichiarato (mig 0725). A flag OFF e senza budget il fetch resta
+/// `limit` e il percorso e' bit-identico allo storico; altrimenti si chiede un
+/// POOL, si applica il budget (PRIMA del riordino di costo: il filtro decide
+/// CHI e' ammissibile, il riordino l'ordine fra gli ammessi), si riordina sul
+/// costo ATTESO e si tronca al limite chiesto. Vive qui e non nei tre call
+/// site: tre copie del blocco erano gia' una duplicazione (regola L).
+///
+/// Il secondo elemento della coppia e' l'esito del budget (`None` = non
+/// dichiarato): i chiamanti lo passano a [`con_segnale_latenza`] perche' la
+/// ricaduta a pool pieno arrivi nel `rationale` della scelta.
 async fn fetch_ranked(
     db: &PgPool,
     req: &ModelRequest<'_>,
@@ -575,10 +603,21 @@ async fn fetch_ranked(
     chain: &[&str],
     limit: i64,
     min_distinct_providers: usize,
-) -> Result<Vec<(String, String, Option<String>)>, String> {
+) -> Result<
+    (
+        Vec<(String, String, Option<String>)>,
+        Option<EsitoBudgetLatenza>,
+    ),
+    String,
+> {
     let cache_aware =
         req.rank == Rank::CostFirst && super::cost_rank::cache_aware_enabled(db).await;
-    let fetch = if cache_aware {
+    // Un budget non positivo non e' un vincolo dichiarabile: si ignora, come
+    // l'assenza (il costruttore non lo produce; questa e' la guardia per chi
+    // costruisce a mano).
+    let budget = req.latency_budget_ms.filter(|b| *b > 0);
+    let pool_esteso = cache_aware || budget.is_some();
+    let fetch = if pool_esteso {
         limit.max(super::cost_rank::COST_RANK_POOL)
     } else {
         limit
@@ -592,12 +631,34 @@ async fn fetch_ranked(
         min_distinct_providers,
     )
     .await?;
-    if !cache_aware {
-        return Ok(rows);
+    let (mut rows, esito_latenza) = match budget {
+        Some(b) => {
+            let (rows, esito) = crate::latency_telemetry::applica_budget_latenza(db, rows, b).await;
+            (rows, Some(esito))
+        }
+        None => (rows, None),
+    };
+    if cache_aware {
+        rows = super::cost_rank::rerank_expected_cost(db, rows).await;
     }
-    let mut rows = super::cost_rank::rerank_expected_cost(db, rows).await;
-    rows.truncate(limit.max(0) as usize);
-    Ok(rows)
+    if pool_esteso {
+        rows.truncate(limit.max(0) as usize);
+    }
+    Ok((rows, esito_latenza))
+}
+
+/// Appende al `rationale` della scelta il segnale della ricaduta di latenza
+/// (`latency=overbudget_fallback`). UN solo punto di composizione (regola Q:
+/// il testo si compone dai campi, e il letterale vive nel criterio puro): i
+/// tre percorsi del servizio delegano qui, mai un `format!` per call site.
+fn con_segnale_latenza(
+    mut choice: ModelChoice,
+    esito: Option<EsitoBudgetLatenza>,
+) -> ModelChoice {
+    if let Some(segnale) = esito.as_ref().and_then(EsitoBudgetLatenza::segnale) {
+        choice.rationale = format!("{} {}", choice.rationale, segnale);
+    }
+    choice
 }
 
 /// IL PUNTO DI INGRESSO. Sceglie UN modello, o dice PERCHE' non c'e'.
@@ -637,7 +698,7 @@ async fn select_model_governed(
     // Con CostFirst cache-aware (mig 0721) il riordino sul costo atteso avviene
     // PRIMA di `rank_candidates`, che e' stabile: l'ordine base diventa quello
     // cache-aware e la telemetria retrocede sopra.
-    let rows = fetch_ranked(db, req, &filter, &chain, GOVERNED_CANDIDATE_POOL, 1)
+    let (rows, esito_latenza) = fetch_ranked(db, req, &filter, &chain, GOVERNED_CANDIDATE_POOL, 1)
         .await
         .map_err(NoModelReason::CatalogUnavailable)?;
     if rows.is_empty() {
@@ -646,7 +707,7 @@ async fn select_model_governed(
     // 0/1 candidati: nulla da riordinare (evita I/O telemetria inutile).
     if rows.len() < 2 {
         let (p, m, t) = rows.into_iter().next().expect("len >= 1");
-        return Ok(choice_from(req, p, m, t));
+        return Ok(con_segnale_latenza(choice_from(req, p, m, t), esito_latenza));
     }
     // Il tier effettivo viaggia con la riga: lo si ritrova dopo il riordino, che
     // lavora su (provider, model). Senza questa mappa `degraded` andrebbe
@@ -675,7 +736,10 @@ async fn select_model_governed(
         .get(&(provider.clone(), model.clone()))
         .cloned()
         .flatten();
-    Ok(choice_from(req, provider, model, effective_tier))
+    Ok(con_segnale_latenza(
+        choice_from(req, provider, model, effective_tier),
+        esito_latenza,
+    ))
 }
 
 /// Come [`select_model`] ma ritorna fino a `limit` candidati.
@@ -700,7 +764,7 @@ pub async fn select_models(
     validate(req)?;
     let chain = chain_for(req);
     let filter = filter_for(req, gate);
-    let rows = fetch_ranked(db, req, &filter, &chain, limit, min_distinct_providers)
+    let (rows, esito_latenza) = fetch_ranked(db, req, &filter, &chain, limit, min_distinct_providers)
         .await
         .map_err(NoModelReason::CatalogUnavailable)?;
     if rows.is_empty() {
@@ -708,7 +772,7 @@ pub async fn select_models(
     }
     Ok(rows
         .into_iter()
-        .map(|(p, m, t)| choice_from(req, p, m, t))
+        .map(|(p, m, t)| con_segnale_latenza(choice_from(req, p, m, t), esito_latenza))
         .collect())
 }
 
@@ -729,13 +793,13 @@ async fn select_model_with_gate(
     validate(req)?;
     let chain = chain_for(req);
     let filter = filter_for(req, gate);
-    let rows = fetch_ranked(db, req, &filter, &chain, 1, 1)
+    let (rows, esito_latenza) = fetch_ranked(db, req, &filter, &chain, 1, 1)
         .await
         .map_err(NoModelReason::CatalogUnavailable)?;
     let Some((provider, model, effective_tier)) = rows.into_iter().next() else {
         return Err(diagnose_empty(db, req, &chain, gate).await);
     };
-    let choice = choice_from(req, provider, model, effective_tier);
+    let choice = con_segnale_latenza(choice_from(req, provider, model, effective_tier), esito_latenza);
     verifica_i3(req, &choice);
     log_shift(&choice);
     Ok(choice)

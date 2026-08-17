@@ -297,6 +297,9 @@ async fn resolve_purpose_core(
         // Il purpose e' una risoluzione interna, non la selezione dinamica del
         // turno primario: niente riordino telemetria (vedi ModelRequest::governed).
         governed: false,
+        // La risoluzione singola non dichiara un budget: i chiamanti one-shot
+        // che ne hanno uno passano dal fan-out (`..._candidates_db_by`).
+        latency_budget_ms: None,
     };
     if let Some(p) = only_provider {
         req.pin = Some(p);
@@ -408,6 +411,7 @@ pub async fn resolve_purpose_provider_candidates_db(
         min_providers,
         CandidateDiversity::PerProvider,
         &[],
+        None,
     )
     .await
 }
@@ -436,6 +440,13 @@ pub async fn resolve_purpose_provider_candidates_db(
 /// mistral. La selezione tornava l'unico rimasto, mistral, il chiamante lo
 /// filtrava e dichiarava `unavailable_declared` — mentre deepseek, google e
 /// openrouter stavano un gradino sopra, sani e mai guardati.
+///
+/// `latency_budget_ms` e' il budget di latenza che il chiamante DICHIARA
+/// (`ModelRequest::latency_budget_ms`, mig 0725): il timeout entro cui la
+/// risposta di UNA convocazione deve arrivare. Lo dichiarano i soli chiamanti
+/// one-shot che quel tetto lo conoscono (il gate duale col suo timeout per
+/// validatore); un budget di RUN non e' un budget di chiamata, e chi non ce
+/// l'ha passa `None` (percorso bit-identico).
 pub async fn resolve_purpose_provider_candidates_db_by(
     db: &PgPool,
     purpose: &str,
@@ -443,6 +454,7 @@ pub async fn resolve_purpose_provider_candidates_db_by(
     min_providers: usize,
     diversity: CandidateDiversity,
     exclude_providers: &[String],
+    latency_budget_ms: Option<i64>,
 ) -> Result<Vec<PurposeProviderCandidate>, PurposeResolution> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -492,6 +504,7 @@ pub async fn resolve_purpose_provider_candidates_db_by(
         // Il purpose e' una risoluzione interna, non la selezione dinamica del
         // turno primario: niente riordino telemetria (vedi ModelRequest::governed).
         governed: false,
+        latency_budget_ms,
     };
     // Pool piu' ampio del limite per deduplicare per provider senza una query
     // dedicata fuori dal servizio.
@@ -1099,6 +1112,7 @@ mod tests {
             1,
             CandidateDiversity::PerProviderAndModel,
             &[],
+            None,
         )
         .await
         .expect("candidati");
@@ -1179,6 +1193,7 @@ mod tests {
             1,
             CandidateDiversity::PerProviderAndModel,
             &[],
+            None,
         )
         .await
         .expect("candidati");

@@ -208,7 +208,13 @@ impl StepValidationPort for StepGateAdapter {
         // Selezione: candidati del purpose, MAI l'esecutore. La convocazione
         // impossibile e' un ESITO del report (il nodo applica la matrice
         // della doppia astensione), mai un errore che spegne il gate.
-        let candidati = match risolvi_candidati(&self.setup.db, &executor).await {
+        let candidati = match risolvi_candidati(
+            &self.setup.db,
+            &executor,
+            budget_latenza_ms(self.setup.timeout_s),
+        )
+        .await
+        {
             Ok(c) => c,
             Err(report) => return Ok(report),
         };
@@ -306,9 +312,19 @@ async fn attendi_verdetto(
 /// Esecutore vuoto = nessun veto (stessa scelta di `veto_del_giudice`):
 /// escludere un nome vuoto non escluderebbe nessuno, o tutti, a seconda del
 /// confronto — e in nessuno dei due casi il motivo si leggerebbe.
+///
+/// `latency_budget_ms` e' il timeout per validatore DICHIARATO alla selezione
+/// (mig 0725): un giudice il cui p95 osservato eccede il timeout brucerebbe
+/// l'astensione `timeout` per costruzione, e la selezione deve saperlo PRIMA
+/// di convocare. Se l'admin stringe il timeout sotto il p95 di un fornitore,
+/// quel fornitore esce dal pool — la selezione segue la configurazione, mai
+/// il contrario (alzare il timeout per inseguire il lento e' la toppa che la
+/// regola H vieta). L'ignoto non esclude e il pool svuotato ricade sul pool
+/// intero: la convocazione non diventa mai impossibile per colpa del budget.
 async fn risolvi_candidati(
     db: &PgPool,
     executor_provider: &str,
+    latency_budget_ms: Option<i64>,
 ) -> Result<Vec<PurposeProviderCandidate>, StepValidationReport> {
     let veto: Vec<String> = match executor_provider.trim() {
         "" => Vec::new(),
@@ -321,12 +337,23 @@ async fn risolvi_candidati(
         VALIDATORI_RICHIESTI,
         CandidateDiversity::PerProvider,
         &veto,
+        latency_budget_ms,
     )
     .await
     .map_err(|risoluzione| StepValidationReport {
         verdicts: Vec::new(),
         degraded: Some(format!("purpose {PURPOSE} non risolvibile: {risoluzione:?}")),
     })
+}
+
+/// Il budget che il gate dichiara: il proprio timeout per validatore, in
+/// millisecondi. UN solo punto di conversione (i secondi del setting non
+/// attraversano mai la selezione come numero nudo).
+fn budget_latenza_ms(timeout_s: u64) -> Option<i64> {
+    i64::try_from(timeout_s)
+        .ok()
+        .map(|s| s.saturating_mul(1000))
+        .filter(|ms| *ms > 0)
 }
 
 /// UNA chiamata one-shot: system del ruolo, batch nel messaggio utente (il
@@ -1125,7 +1152,11 @@ mod tests {
         crate::provider_cooldown::restore_billing_cooldowns_from_db(&pool).await;
 
         let esecutore = forn("mistral");
-        let candidati = risolvi_candidati(&pool, &esecutore)
+        // Il budget dichiarato del gate (timeout di default 90s): qui lo
+        // storico probe e' vuoto, quindi ogni candidato e' Unknown e il
+        // budget non esclude nessuno (regola Q) — e' il percorso vero della
+        // produzione, non una semplificazione del test.
+        let candidati = risolvi_candidati(&pool, &esecutore, budget_latenza_ms(90))
             .await
             .unwrap_or_else(|r| panic!("purpose non risolvibile: {:?}", r.degraded));
         let mut trovati: Vec<String> = candidati.iter().map(|c| c.provider.clone()).collect();
@@ -1194,7 +1225,7 @@ mod tests {
             .expect("gate non armato: mode 'off' o prompt assenti (applicare la mig 0677)");
         // Esecutore vuoto: la prova diagnostica interroga TUTTI i candidati del
         // purpose, non quelli residui di un turno.
-        let candidati = risolvi_candidati(&db, "")
+        let candidati = risolvi_candidati(&db, "", budget_latenza_ms(setup.timeout_s))
             .await
             .unwrap_or_else(|r| panic!("purpose {PURPOSE} non risolvibile: {:?}", r.degraded));
         assert!(

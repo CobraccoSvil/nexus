@@ -163,6 +163,10 @@ async fn select_for_slot_requirement(
         // E' la selezione del turno primario: riordino telemetria-aware
         // (ADR 0030) come per il selettore dinamico del catalog.
         governed: true,
+        // Il turno primario non ha un tetto per chiamata da dichiarare (il suo
+        // budget e' di RUN): niente budget di latenza, prima tranche ai soli
+        // one-shot (gate duale). Vedi ModelRequest::latency_budget_ms.
+        latency_budget_ms: None,
     };
     model_service::select_model(db, &request).await
 }

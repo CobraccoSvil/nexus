@@ -176,6 +176,7 @@ async fn nessuna_modalita_sceglie_un_modello_non_eleggibile(pool: PgPool) {
                 pin: None,
                 rank,
                 governed: false,
+                latency_budget_ms: None,
             };
             let out = select_model_with_gate(&pool, &req, gate(gate_acceso)).await;
             match out {
@@ -1243,4 +1244,163 @@ async fn il_riordino_non_scavalca_il_tier(pool: PgPool) {
         "dentro il gruppo heavy comanda il costo atteso (h1 prima di h2); il \
          medium resta DOPO gli heavy anche se costa 37 volte meno"
     );
+}
+
+// ── Il budget di latenza dichiarato (mig 0725) ──────────────────────────────
+
+/// Probe SANI seminati dal WRITER di produzione (regola O: mai un INSERT
+/// ricopiato — il seed a mano fissa la forma della riga che il test misura).
+async fn seed_probe_latenza(pool: &PgPool, provider: &str, model: &str, n: usize, ms: i32) {
+    for _ in 0..n {
+        crate::model_health_probe::record_model_health(
+            pool,
+            provider,
+            model,
+            true,
+            Some(ms),
+            None,
+            None,
+        )
+        .await;
+    }
+}
+
+/// Test 1 del design (Fase 3, Lotto 3): il budget dichiarato ESCLUDE il lento
+/// osservato. A e' il piu' economico (0.40 < 0.60) ma il suo p95 osservato e'
+/// 30s; col budget di 10s vince B (2s), nonostante costi di piu'.
+///
+/// MUTAZIONE (eseguita davvero, vedi commit): un criterio che ignora il
+/// budget — `latency_fit` che risponde sempre `Fits` — riporta la scelta sul
+/// costo e il test rosseggia mostrando `a-economico`.
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+async fn il_budget_esclude_il_lento_osservato(pool: PgPool) {
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
+    seed_cost_rank_modello(&pool, "prov-lento", "a-economico", "medium", 0.40, None).await;
+    seed_cost_rank_modello(&pool, "prov-svelto", "b-caro", "medium", 0.60, None).await;
+    // 20 probe per coppia (>= min_samples 5 della mig 0725), come il design.
+    seed_probe_latenza(&pool, "prov-lento", "a-economico", 20, 30_000).await;
+    seed_probe_latenza(&pool, "prov-svelto", "b-caro", 20, 2_000).await;
+
+    let req = ModelRequest::agentic("medium")
+        .capability(Some("code"))
+        .latency_budget_ms(10_000);
+    let c = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect("un candidato resta");
+    assert_eq!(
+        c.model, "b-caro",
+        "p95 di A (30s) eccede il budget (10s): se qui c'e' 'a-economico' il \
+         criterio sta ignorando il budget dichiarato"
+    );
+    assert!(
+        !c.rationale.contains(
+            nexus_agent_graph::decisions::latency_budget::SEGNALE_RICADUTA
+        ),
+        "il filtro e' riuscito: nessun segnale di ricaduta nel rationale ({})",
+        c.rationale
+    );
+}
+
+/// Test 2 del design (regola Q, sul percorso INTERO): la latenza ignota non
+/// esclude. Un candidato senza probe, e uno col p95 alto ma con campioni
+/// sotto la soglia (2 < 5), restano eleggibili anche col budget dichiarato.
+///
+/// MUTAZIONE: se l'ignoto escludesse, il pool sarebbe vuoto e la ricaduta
+/// servirebbe comunque i candidati MA col segnale nel rationale — la seconda
+/// asserzione rosseggia.
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+async fn latenza_ignota_non_esclude(pool: PgPool) {
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
+    seed_cost_rank_modello(&pool, "prov-nuovo", "mai-osservato", "medium", 0.40, None).await;
+    seed_cost_rank_modello(&pool, "prov-scarso", "pochi-campioni", "medium", 0.60, None).await;
+    // Sotto la soglia di campioni (2 < 5): non e' una misura.
+    seed_probe_latenza(&pool, "prov-scarso", "pochi-campioni", 2, 30_000).await;
+
+    let req = ModelRequest::agentic("medium")
+        .capability(Some("code"))
+        .latency_budget_ms(10_000);
+    let c = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect("l'ignoto resta eleggibile");
+    assert_eq!(c.model, "mai-osservato", "comanda il costo, non l'assenza di storia");
+    assert!(
+        !c.rationale.contains(
+            nexus_agent_graph::decisions::latency_budget::SEGNALE_RICADUTA
+        ),
+        "nessuna ricaduta: l'ignoto non e' stato escluso ({})",
+        c.rationale
+    );
+}
+
+/// Test 3 del design: tutti i candidati oltre il budget -> si serve la STESSA
+/// scelta di prima (il pool intero, ordine di costo) e il rationale porta il
+/// segnale strutturato della ricaduta.
+///
+/// MUTAZIONE: fail-closed (la ricaduta che ritorna il pool vuoto) -> il
+/// select fallisce e l'`expect` rosseggia; segnale non appeso -> rosseggia
+/// l'ultima asserzione.
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+async fn pool_svuotato_ricade_dichiarando(pool: PgPool) {
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
+    seed_cost_rank_modello(&pool, "prov-lento", "a-economico", "medium", 0.40, None).await;
+    seed_cost_rank_modello(&pool, "prov-svelto", "b-caro", "medium", 0.60, None).await;
+    seed_probe_latenza(&pool, "prov-lento", "a-economico", 20, 30_000).await;
+    seed_probe_latenza(&pool, "prov-svelto", "b-caro", 20, 20_000).await;
+
+    // Budget 5s: ENTRAMBI i p95 (30s, 20s) eccedono.
+    let req = ModelRequest::agentic("medium")
+        .capability(Some("code"))
+        .latency_budget_ms(5_000);
+    let c = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect("la ricaduta serve il pool intero, mai nessun modello");
+    assert_eq!(
+        c.model, "a-economico",
+        "sul pool intero comanda di nuovo il costo: stessa scelta di un budget assente"
+    );
+    assert!(
+        c.rationale.contains(
+            nexus_agent_graph::decisions::latency_budget::SEGNALE_RICADUTA
+        ),
+        "la ricaduta si DICHIARA nel rationale (regola Q), non si deduce dal \
+         comportamento: {}",
+        c.rationale
+    );
+}
+
+/// Test 4 del design: SENZA budget il percorso e' bit-identico allo storico —
+/// lo stesso parco del test 1 (A lento ed economico, B svelto e caro) sceglie
+/// A, e nessun segnale compare nel rationale.
+///
+/// MUTAZIONE: se il budget si applicasse anche a `None` (o un default
+/// nascosto), vincerebbe `b-caro` e il test rosseggerebbe.
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+async fn senza_budget_bit_identico(pool: PgPool) {
+    sqlx::query("DELETE FROM ai_price_catalog")
+        .execute(&pool)
+        .await
+        .expect("pulizia catalog");
+    seed_cost_rank_modello(&pool, "prov-lento", "a-economico", "medium", 0.40, None).await;
+    seed_cost_rank_modello(&pool, "prov-svelto", "b-caro", "medium", 0.60, None).await;
+    seed_probe_latenza(&pool, "prov-lento", "a-economico", 20, 30_000).await;
+    seed_probe_latenza(&pool, "prov-svelto", "b-caro", 20, 2_000).await;
+
+    let req = ModelRequest::agentic("medium").capability(Some("code"));
+    let c = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect("un modello");
+    assert_eq!(
+        c.model, "a-economico",
+        "senza budget dichiarato la latenza osservata non entra nella scelta"
+    );
+    assert_eq!(c.rationale, "tier=medium:auto", "nessun segnale di latenza appeso");
 }

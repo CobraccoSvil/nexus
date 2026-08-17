@@ -2775,6 +2775,10 @@ async fn candidati_revisori(
         // di OGNI revisore (selezione + ripiego). Passarlo anche qui sarebbe
         // una seconda espressione della stessa regola (regola L).
         &[],
+        // Nessun budget di latenza: il timeout di un revisore e' un budget di
+        // RUN (nexus_subagent_definitions.timeout_s), non di chiamata — la
+        // prima tranche della dichiarazione resta ai one-shot (gate duale).
+        None,
     )
     .await
     .unwrap_or_else(|resolution| {
@@ -6268,6 +6272,7 @@ mod tests {
             // Il criterio della PRODUZIONE, non uno scelto qui.
             REVIEW_PANEL_DIVERSITY,
             &[],
+            None,
         )
         .await
         .expect("candidati revisori");
