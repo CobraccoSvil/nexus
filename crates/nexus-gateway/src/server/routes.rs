@@ -42,10 +42,10 @@ use crate::model_alias_resolver::{strip_provider_prefix, ModelAliasResolver};
 use crate::provider::LlmProvider;
 use crate::providers::{ProviderErrorKind, ProviderHttpError};
 use crate::tassonomia_errori::{CausaErrore, VerdettoErrore, VocabolarioErrori};
-use crate::redaction::pipeline::{RedactionOptions, RedactionPipeline};
+use crate::redaction::pipeline::{RedactionOptions, RedactionPipeline, RedactionResult};
 use crate::redaction::sensitivity_classifier::SensitivityClassifier;
 use crate::types::{
-    CountTokensResponse, ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse,
+    CountTokensResponse, ImageGenRequest, ImageGenResponse, LlmMessage, LlmRequest, LlmResponse,
     RequestMetadata, TranscribeRequest, TranscribeResponse, TtsRequest, TtsResponse,
     VideoGenRequest, VideoGenResponse,
 };
@@ -616,31 +616,10 @@ async fn run_complete(
 
     // Redaction pre-flight: strict mode quando il tier e' elevato (>=2) e il
     // provider scelto e' cloud. La mappa serve per la reidratazione post-flight.
-    let strict = effective_tier >= 2;
-    // Policy PII asimmetrica (regola G, opt-in): quando ON, la PII fornita
-    // volontariamente dall'utente nel proprio messaggio (soggetto del task) non
-    // viene oscurata; segreti e PII di terzi restano redatti. Default sicuro
-    // (comportamento storico) se il flag e' assente o il DB non risponde.
-    let skip_pii_in_user_messages = nexus_auth::get_bool_setting(
-        &state.db,
-        "gateway.redaction.skip_pii_in_user_messages",
-    )
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or(false);
-    let pipeline = RedactionPipeline::new(
-        runtime.presidio.clone(),
-        RedactionOptions {
-            strict_mode: strict,
-            skip_pii_in_user_messages,
-            ..Default::default()
-        },
-    );
-    let redaction = pipeline
-        .redact(req)
-        .await
-        .map_err(|e| PipelineError::blocked(e.to_string()))?;
+    // La redazione passa dal punto unico condiviso col conteggio token
+    // (`redigi_richiesta`): le opzioni le decide il tier effettivo, e due copie
+    // divergerebbero al primo ritocco della soglia (regola L).
+    let (pipeline, redaction) = redigi_richiesta(state, &runtime, req, effective_tier).await?;
     if redaction.any_redacted() {
         // Regola M: log dai flag strutturati, non dal placeholder testuale.
         tracing::info!(
@@ -2472,17 +2451,104 @@ async fn run_count_tokens(
     body: &LlmRequest,
 ) -> Result<CountTokensResponse, PipelineError> {
     validate_logical_model(&body.model)?;
-    let providers = state.runtime_snapshot().await.providers;
-    let provider =
-        select_count_tokens_provider(&providers, body.pin_provider.as_deref(), &state.cooldown)?;
+    let runtime = state.runtime_snapshot().await;
+    let provider = select_count_tokens_provider(
+        &runtime.providers,
+        body.pin_provider.as_deref(),
+        &state.cooldown,
+    )?;
+
+    let messaggi_redatti = messaggi_dietro_la_dlp(state, &runtime, body, provider.name()).await?;
+
     // Il prefisso si toglie solo se e' il provider: per groq/openrouter la
     // slash e' parte del nome del modello (regola L: unica funzione).
     let mut req = body.clone();
+    req.messages = messaggi_redatti;
     req.model = strip_provider_prefix(&body.model, provider.name());
     provider
         .count_tokens(&req)
         .await
         .map_err(|e| PipelineError::provider(format!("conteggio token fallito: {e}")))
+}
+
+/// LA PIPELINE DLP VALE ANCHE PER IL CONTEGGIO, e questa funzione e' il punto in
+/// cui lo si vede.
+///
+/// `/v1/count_tokens` manda al fornitore la STESSA `LlmRequest` di
+/// `/v1/complete` — messaggi, system e tool per intero — quindi senza questa
+/// sequenza sarebbe una seconda via d'uscita del contenuto che salta
+/// classificazione, gate di tier e redazione: segreti e PII che la pipeline
+/// toglie dalla completion partirebbero verbatim dal conteggio (review
+/// avversaria fase 4, bloccante). Il numero contato sul testo REDATTO e' anche
+/// quello giusto: e' il testo che verra' davvero spedito.
+///
+/// Ritorna i messaggi da spedire; blocca la richiesta dove la policy blocca.
+///
+/// Il gate di tier sul provider e' l'unica parte non condivisa con la
+/// completion: la' vive dentro il ramo del pin, qui il provider e' gia' scelto
+/// e vale sempre. La redazione invece e' la STESSA (regola L: due copie
+/// divergerebbero, e la copia dimenticata sarebbe quella che lascia passare).
+async fn messaggi_dietro_la_dlp(
+    state: &AppState,
+    runtime: &super::RuntimeState,
+    body: &LlmRequest,
+    provider_name: &str,
+) -> Result<Vec<LlmMessage>, PipelineError> {
+    let classifier = SensitivityClassifier::new(runtime.presidio.clone());
+    let classification = classifier.classify(&body.messages).await;
+    let effective_tier = classification.tier.max(body.metadata.sensitivity_tier);
+    runtime
+        .policy
+        .validate_tier_claim(body.metadata.sensitivity_tier, effective_tier);
+    pin_tier_gate(
+        &runtime.policy,
+        provider_name,
+        effective_tier,
+        &body.metadata.feature,
+    )?;
+    let (_, redaction) = redigi_richiesta(state, runtime, body, effective_tier).await?;
+    Ok(redaction.messages)
+}
+
+/// La redazione con le opzioni che il tier effettivo impone: punto unico dei due
+/// percorsi che spediscono una `LlmRequest` a un fornitore (`/v1/complete` e
+/// `/v1/count_tokens`). Lo `strict_mode` nasce dal tier, la politica PII
+/// asimmetrica dal DB — decise QUI, una volta sola.
+async fn redigi_richiesta(
+    state: &AppState,
+    runtime: &super::RuntimeState,
+    req: &LlmRequest,
+    effective_tier: u8,
+) -> Result<(RedactionPipeline, RedactionResult), PipelineError> {
+    // Policy PII asimmetrica (regola G, opt-in): quando ON, la PII fornita
+    // volontariamente dall'utente nel proprio messaggio (soggetto del task) non
+    // viene oscurata; segreti e PII di terzi restano redatti. Default sicuro
+    // (comportamento storico) se il flag e' assente o il DB non risponde.
+    let skip_pii_in_user_messages = nexus_auth::get_bool_setting(
+        &state.db,
+        "gateway.redaction.skip_pii_in_user_messages",
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false);
+    let pipeline = RedactionPipeline::new(
+        runtime.presidio.clone(),
+        RedactionOptions {
+            strict_mode: effective_tier >= 2,
+            skip_pii_in_user_messages,
+            ..Default::default()
+        },
+    );
+    let redaction = pipeline
+        .redact(req)
+        .await
+        .map_err(|e| PipelineError::blocked(e.to_string()))?;
+    // La pipeline torna al chiamante perche' la completion la riusa per la
+    // re-idratazione della risposta (`rehydrate`): costruirne una seconda con
+    // altre opzioni de-redigerebbe con una mappa diversa da quella che ha
+    // redatto.
+    Ok((pipeline, redaction))
 }
 
 /// Seleziona il provider che sa contare i token: delega al punto unico

@@ -631,6 +631,54 @@ else
   echo "OK batteria-senza-round-a-vuoto: qualify_claimed delega al criterio del cooldown"
 fi
 
+# ── ogni via d'uscita del contenuto passa dalla redazione ────────────────────
+# `/v1/count_tokens` manda al fornitore la STESSA LlmRequest di `/v1/complete`
+# (messaggi, system e tool per intero): senza la pipeline DLP sarebbe una
+# seconda porta da cui segreti e PII escono verbatim, mentre la completion li
+# redige. Un test in-process costerebbe un AppState completo (db + presidio +
+# policy + provider), quindi la maglia la chiude il guard: la rotta deve
+# nominare classificazione e redazione. Il conteggio sul testo REDATTO e' anche
+# il numero giusto — e' il testo che verra' spedito davvero.
+# La catena ha TRE anelli e il guard li segue tutti: la rotta chiama il
+# passaggio, il passaggio classifica e apre il gate di tier, e delega la
+# redazione al punto unico condiviso con la completion. Guardare un anello solo
+# lascerebbe passare la rotta che smette di chiamarlo.
+conteggio_senza_dlp=""
+blocco_conteggio="$(sed -n '/async fn run_count_tokens/,/^}/p' \
+  crates/nexus-gateway/src/server/routes.rs 2>/dev/null || true)"
+blocco_dlp="$(sed -n '/async fn messaggi_dietro_la_dlp/,/^}/p' \
+  crates/nexus-gateway/src/server/routes.rs 2>/dev/null || true)"
+blocco_redigi="$(sed -n '/async fn redigi_richiesta/,/^}/p' \
+  crates/nexus-gateway/src/server/routes.rs 2>/dev/null || true)"
+if [[ -z "$blocco_conteggio" ]]; then
+  conteggio_senza_dlp="  run_count_tokens: funzione non trovata in routes.rs"
+elif ! printf '%s' "$blocco_conteggio" | grep -q 'messaggi_dietro_la_dlp'; then
+  conteggio_senza_dlp="  run_count_tokens: non passa piu' da messaggi_dietro_la_dlp"
+fi
+if [[ -z "$blocco_dlp" ]]; then
+  conteggio_senza_dlp="${conteggio_senza_dlp}  messaggi_dietro_la_dlp: funzione non trovata\n"
+else
+  for atteso in 'SensitivityClassifier' 'pin_tier_gate' 'redigi_richiesta'; do
+    if ! printf '%s' "$blocco_dlp" | grep -q "$atteso"; then
+      conteggio_senza_dlp="${conteggio_senza_dlp}  messaggi_dietro_la_dlp: manca ${atteso}\n"
+    fi
+  done
+fi
+if [[ -z "$blocco_redigi" ]]; then
+  conteggio_senza_dlp="${conteggio_senza_dlp}  redigi_richiesta: funzione non trovata\n"
+elif ! printf '%s' "$blocco_redigi" | grep -q 'RedactionPipeline'; then
+  conteggio_senza_dlp="${conteggio_senza_dlp}  redigi_richiesta: manca RedactionPipeline\n"
+fi
+if [[ -n "$conteggio_senza_dlp" ]]; then
+  echo "!! conteggio-token-dietro-la-dlp: una via d'uscita del contenuto salta la redazione:" >&2
+  printf '%b' "$conteggio_senza_dlp" >&2
+  echo "   La rotta spedisce la stessa LlmRequest di /v1/complete: senza classify," >&2
+  echo "   gate di tier e redact, i segreti partono verbatim." >&2
+  fail=1
+else
+  echo "OK conteggio-token-dietro-la-dlp: il conteggio passa dalla pipeline di redazione"
+fi
+
 # ── sizing dei pool verso il DB per-progetto ─────────────────────────────────
 # Lo stesso DB <slug>_nexus veniva aperto con due tetti decisi in due punti che
 # si ignoravano: 5 sul percorso caldo di mcp-core, 3 in nexus-project-pools. Una
