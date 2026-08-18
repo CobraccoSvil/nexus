@@ -956,7 +956,8 @@ impl ClarifyOrExpandNode {
     /// La richiesta al modello: PURA (nessun I/O), cosi' «cosa chiediamo» resta
     /// leggibile accanto a «chi lo chiede una volta sola».
     ///
-    /// Il provider/model del purpose `clarify_expand` + il system prompt
+    /// TODO (I/O delegato, invariato dal porting e non chiuso qui): il
+    /// provider/model del purpose `clarify_expand` + il system prompt
     /// `agent.clarify.base` sono RISOLTI A MONTE (regola G). Finche' non c'e' la
     /// porta che li fornisce, il chiamante li passa via `LlmRequest`
     /// (provider/model gia' decisi). Il `project_context` (se presente) e'
