@@ -12,6 +12,7 @@
 //! nodi reali arrivano nei PR successivi del porting.
 
 pub mod clarify_or_expand;
+pub mod decisione_chiarimento;
 pub mod executor;
 pub mod final_gate;
 pub mod review_gate;
@@ -30,6 +31,9 @@ pub mod verifier;
 pub use clarify_or_expand::{
     ClarifyConfig, ClarifyMode, ClarifyOrExpandNode, DecisionCategory, GateOutcome, LlmDecision,
     META_KIND_CLARIFY, META_KIND_CLARIFY_ASSUNZIONE,
+};
+pub use decisione_chiarimento::{
+    ChiaveDecisione, EsitoDecisione, MotivoNonPresa, ProvenienzaDecisione,
 };
 pub use executor::{ExecutorConfig, ExecutorNode, ScaleConfig};
 pub use review_gate::{ReviewGateConfig, ReviewGateNode, REVIEW_GATE_ESCALATION_KEY};

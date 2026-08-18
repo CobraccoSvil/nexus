@@ -4496,6 +4496,96 @@ else
   echo "OK interlocutore-del-run: l'esito del clarify attraversa il confine"
 fi
 
+# ── decisione-di-convocazione (2026-08-18) ──────────────────────────────────
+# «La decisione di chiarimento su QUESTO mandato e' gia' stata presa?» ha UN
+# punto unico, e la sua identita' e' la coppia (convocazione, testo). Il difetto
+# chiuso: il nodo clarify la prendeva una volta per FIGLIO — misurato su
+# `app-libri-18-08` (run abdbc7c4), otto figure con UN solo
+# md5(task_description), otto chiamate al modello in tre secondi (7715 token) e
+# otto `list_files`.
+assert_single "decisione-di-convocazione" 'pub struct ChiaveDecisione' \
+  'crates/nexus-agent-graph/src/nodes/decisione_chiarimento.rs' \
+  crates/nexus-agent-graph/src
+
+# Il nodo deve PASSARE dal registro: se `run` torna a chiamare direttamente il
+# proprio I/O per ogni figlio, il criterio resta perfetto e mai interrogato, con
+# tutti i suoi test verdi (regola O).
+if ! grep -q 'una_volta_per_convocazione' \
+  crates/nexus-agent-graph/src/nodes/clarify_or_expand.rs; then
+  echo "!! decisione-di-convocazione: il nodo clarify non passa piu' dal punto" >&2
+  echo "   unico: la decisione torna a pagarsi una volta per figura." >&2
+  fail=1
+else
+  echo "OK decisione-di-convocazione: il nodo clarify passa dal punto unico"
+fi
+
+# I DUE I/O condivisi stanno DENTRO `prendi_decisione`: la `list_files` del
+# contesto progetto fa parte della richiesta su cui il modello decide, quindi
+# condividerne solo meta' darebbe alle figure una decisione presa su un prompt
+# diverso dal loro (e lascerebbe l'altra meta' moltiplicata per figura).
+if ! grep -q 'async fn prendi_decisione' \
+  crates/nexus-agent-graph/src/nodes/clarify_or_expand.rs; then
+  echo "!! decisione-di-convocazione: i due I/O della decisione non sono piu'" >&2
+  echo "   in un punto solo: quello lasciato fuori non viene condiviso." >&2
+  fail=1
+else
+  echo "OK decisione-di-convocazione: i due I/O della decisione sono in un punto"
+fi
+
+# L'IDENTITA' della convocazione e' il DISPATCHER, mai l'ancora della famiglia.
+# `parent_anchor` = `parent_run_id.or(session_id)`: per un sub-run di primo
+# livello e' la SESSIONE, che vive quanto l'intera conversazione — misurato il
+# 18/08/2026, 10 righe di `nexus_subagent_runs` ancorate a una riga di
+# `chat_sessions` su 18m15s e su due turni di chat distinti.
+assert_single "decisione-di-convocazione" 'fn dispatcher_run_id' \
+  'crates/mcp-core/src/agent_tools/subagent_native.rs' \
+  crates/mcp-core/src
+# Il grep esclude le righe di commento: la doc del modulo NOMINA il campo
+# sbagliato per spiegare la mutazione, e un guard che matcha la propria
+# spiegazione e' rosso per costruzione.
+if grep -v '^[[:space:]]*//' \
+  crates/nexus-agent-graph/src/nodes/decisione_chiarimento.rs \
+  | grep -q 'let convocazione = state\.parent_run_id'; then
+  echo "!! decisione-di-convocazione: la chiave e' tornata all'ANCORA della" >&2
+  echo "   famiglia (parent_run_id = la sessione): due turni di chat" >&2
+  echo "   condividerebbero la decisione. Usa state.dispatcher_run_id." >&2
+  fail=1
+else
+  echo "OK decisione-di-convocazione: la chiave e' il dispatcher, non l'ancora"
+fi
+
+# Il CABLAGGIO di produzione: il dispatcher deve dichiarare la convocazione sul
+# NativeRunInput del sub-run. Senza questa riga il campo resterebbe `None`, ogni
+# figura tornerebbe a pagare la propria decisione, e il ponte di test —
+# che l'ancora la chiede ai produttori — resterebbe verde perche' esercita il
+# criterio, non il cablaggio (regola O).
+if ! grep -q 'dispatcher_run_id: dispatcher_run_id(ctx)' \
+  crates/mcp-core/src/agent_tools/subagent_native.rs; then
+  echo "!! decisione-di-convocazione: prepare_subagent_run non dichiara piu'" >&2
+  echo "   la convocazione: le figure tornano a pagare una decisione a testa." >&2
+  fail=1
+elif ! grep -q 'dispatcher_run_id,' crates/mcp-core/src/agent_tools/subagent_native.rs; then
+  echo "!! decisione-di-convocazione: la convocazione non arriva al" >&2
+  echo "   NativeRunInput del sub-run." >&2
+  fail=1
+else
+  echo "OK decisione-di-convocazione: il dispatcher dichiara la convocazione"
+fi
+
+# Il ponte di test CHIEDE l'ancora ai produttori invece di fabbricarla: un ponte
+# che se la inventa si accorge solo che il campo e' VUOTO, mai che contiene
+# un'altra cosa — ed e' cosi' che l'ancora sbagliata e' sopravvissuta al primo
+# giro con tutte le prove verdi.
+if ! grep -q 'dispatcher_run_id(&turno_1)' crates/mcp-core/src/native_engine.rs \
+  || ! grep -q 'parent_anchor(&turno_1)' crates/mcp-core/src/native_engine.rs; then
+  echo "!! decisione-di-convocazione: il ponte di test non chiede piu' l'ancora" >&2
+  echo "   ai produttori (parent_anchor / dispatcher_run_id): se la fabbrica," >&2
+  echo "   quindi non puo' vedere una convocazione dichiarata sbagliata." >&2
+  fail=1
+else
+  echo "OK decisione-di-convocazione: il ponte chiede l'ancora ai produttori"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

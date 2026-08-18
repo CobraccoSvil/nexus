@@ -3684,7 +3684,9 @@ mod tests {
             Ok(nexus_agent_graph::runtime::ports::StepValidationReport {
                 verdicts: vec![voto("gatekeeper", "p1"), voto("challenger", "p2")],
                 degraded: None,
-                sostituiti: Vec::new(),
+                // Percorso ORDINARIO: nessuna astensione strutturale, quindi
+                // nessun posto riassegnato (vedi la doc del campo).
+                sostituiti: vec![],
             })
         }
     }

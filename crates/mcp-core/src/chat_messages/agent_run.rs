@@ -5365,6 +5365,8 @@ pub(crate) async fn spawn_agent_run(
                     // Run PRINCIPALE (non sub-agente): nessun parent/depth. Solo
                     // `dispatch_subagent` (subagent_native) popola questi campi.
                     parent_run_id: None,
+                    // Run principale: nessuna convocazione (vedi `dispatcher_run_id`).
+                    dispatcher_run_id: None,
                     subagent_depth: None,
                     sizing_complexity,
                     sizing_scope_system_wide,
@@ -5686,6 +5688,8 @@ pub(crate) async fn confirm_native_run(
         supervisor_mode: nexus_agent_graph::SupervisorMode::None,
         step_tx: tx.clone(),
         parent_run_id: None,
+        // Run principale: nessuna convocazione (vedi `dispatcher_run_id`).
+        dispatcher_run_id: None,
         subagent_depth: None,
         sizing_complexity: None,
         sizing_scope_system_wide: false,
@@ -6098,6 +6102,8 @@ pub(crate) async fn resume_fanin(
         supervisor_mode: nexus_agent_graph::SupervisorMode::None,
         step_tx: tx.clone(),
         parent_run_id: None,
+        // Run principale: nessuna convocazione (vedi `dispatcher_run_id`).
+        dispatcher_run_id: None,
         subagent_depth: None,
         sizing_complexity: None,
         sizing_scope_system_wide: false,

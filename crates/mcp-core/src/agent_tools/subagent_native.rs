@@ -562,28 +562,59 @@ pub(crate) fn build_tools_json(whitelist: &[String]) -> Value {
 }
 
 /// Ancora del parent per la catena di sub-run: il run genitore se noto, altrimenti
-/// la sessione (usata per depth-chain / cost-cap / ensure_child, valori raggruppati
+/// la SESSIONE (usata per depth-chain / cost-cap / ensure_child, valori raggruppati
 /// per famiglia di sub-run). `Uuid::nil` solo se manca anche la sessione (caso
 /// degenere). NON e' il target del fan-in: quello e' il run CORRENTE (vedi
 /// [`fanin_target_run_id`]).
-fn parent_anchor(ctx: &AgentToolContext) -> Uuid {
+///
+/// **NON e' l'identita' di una CONVOCAZIONE** e non va usata come tale: il ramo
+/// `session_id` non e' un caso raro ma quello ORDINARIO — un sub-run dispatchato
+/// dal run principale ha `ctx.core.parent_run_id = None`, quindi la sua ancora e'
+/// la sessione, che vive quanto l'INTERA conversazione. MISURATO il 18/08/2026 su
+/// `app-libri-18-08`: dieci righe di `nexus_subagent_runs` con
+/// `parent_run_id = 7b734e17…`, che e' una riga di `chat_sessions` («Chat 1»),
+/// distribuite su 18m15s e su DUE run principali distinti (`abdbc7c4` alle
+/// 00:29:44 e `52b3a747` alle 00:49:36). Per chi convoca, l'identita' e'
+/// [`dispatcher_run_id`]. `pub(crate)` perche' il ponte di test possa CONFRONTARE
+/// le due (regola O): senza il confronto, un ritorno all'ancora resterebbe verde.
+pub(crate) fn parent_anchor(ctx: &AgentToolContext) -> Uuid {
     ctx.core
         .parent_run_id
         .or(ctx.core.session_id)
         .unwrap_or_else(Uuid::nil)
 }
 
+/// PUNTO UNICO (regola L): **quale run ha CONVOCATO questa figura**.
+///
+/// E' il run CORRENTE che sta eseguendo `dispatch_subagents` (`ctx.core.run_id`),
+/// lo stesso valore che finisce nella colonna `nexus_subagent_runs.dispatcher_run_id`.
+/// MISURATO il 18/08/2026 sui due DB-progetto con attivita' (`app-libri-18-08`,
+/// `audit-verifica-17-08`): su tre dispatcher distinti, TUTTI e tre sono righe di
+/// `agent_runs` e NESSUNO e' una riga di `chat_sessions` — mentre `parent_run_id`
+/// e' una sessione in 10 righe su 20.
+///
+/// `None` fuori dal grafo Real (server gRPC, dispatch legacy, test che non lo
+/// dichiarano): li' non esiste una convocazione NOMINABILE, e chi ne ha bisogno
+/// per decidere deve trattarlo come «nessuna convocazione» — mai ripiegare
+/// sull'ancora, che e' la sessione. [`fanin_target_run_id`] ci ripiega, ma per
+/// un'altra domanda e con un'altra conseguenza (vedi li').
+pub(crate) fn dispatcher_run_id(ctx: &AgentToolContext) -> Option<Uuid> {
+    ctx.core.run_id
+}
+
 /// PUNTO UNICO (regola L) del run da RIPRENDERE nel fan-in background: il run
-/// CORRENTE che ha invocato `dispatch_subagents` (`ctx.core.run_id`), cioe' l'id
-/// che il motore marca `awaiting_subagents` e che il worker fan-in cerca con il
-/// CAS `agent_runs.id = parent_run_id`. Diverso da [`parent_anchor`] (che e'
+/// CORRENTE che ha invocato `dispatch_subagents` ([`dispatcher_run_id`]), cioe'
+/// l'id che il motore marca `awaiting_subagents` e che il worker fan-in cerca con
+/// il CAS `agent_runs.id = parent_run_id`. Diverso da [`parent_anchor`] (che e'
 /// `parent_run_id.or(session_id)`, usato per la catena depth/cost): accodare
 /// l'anchor romperebbe il CAS (il run sospeso e' il chiamante, non l'anchor).
-/// `None` fuori dal grafo Real (dove il background non e' comunque attivo): in tal
-/// caso ricade su `anchor` per non regredire (best-effort) — ma nel flusso reale
-/// il grafo Real valorizza sempre `run_id`.
+///
+/// Il RIPIEGO sull'anchor quando `run_id` e' assente vale per QUESTA domanda e non
+/// si esporta: qui il ripiego costa al piu' una coda che nessuno consuma (fuori dal
+/// grafo Real il background non e' attivo), mentre come identita' di una
+/// convocazione varrebbe la sessione, cioe' l'intera conversazione.
 fn fanin_target_run_id(ctx: &AgentToolContext, anchor: Uuid) -> Uuid {
-    ctx.core.run_id.unwrap_or(anchor)
+    dispatcher_run_id(ctx).unwrap_or(anchor)
 }
 
 /// Profondita' del nuovo sub-run nella CATENA ANTENATI (anti-ricorsione, punto
@@ -4213,6 +4244,11 @@ async fn prepare_subagent_run(
         // awaiting_subagents), NON l'anchor depth-chain (bug: il CAS del worker
         // cerca agent_runs.id = questo id).
         fanin_parent_run_id: fanin_target_run_id(ctx, anchor),
+        // Chi convoca. Dallo STESSO punto unico da cui esce il valore della
+        // colonna `dispatcher_run_id`, ma senza il ripiego sull'ancora: qui
+        // «non lo so» deve restare «non lo so» (vedi il campo su
+        // `SubagentExecInputs`).
+        dispatcher_run_id: dispatcher_run_id(ctx),
     })
 }
 
@@ -4302,6 +4338,15 @@ struct SubagentExecInputs {
     /// `awaiting_subagents`). PUNTO UNICO [`fanin_target_run_id`]: e' l'id che il
     /// CAS del worker cerca in `agent_runs`, NON l'`anchor` (depth-chain).
     fanin_parent_run_id: Uuid,
+    /// Chi ha CONVOCATO questa figura (PUNTO UNICO [`dispatcher_run_id`]).
+    ///
+    /// Viaggia fino a `AgentState::dispatcher_run_id`, dove e' l'identita' sotto
+    /// cui le figure di una stessa convocazione condividono la decisione di
+    /// chiarimento. Distinto da `fanin_parent_run_id` — stesso valore quando c'e',
+    /// ma qui l'assenza resta ASSENZA invece di ripiegare sull'`anchor`: quel
+    /// ripiego e' la sessione, e una decisione chiavata sulla sessione si
+    /// erediterebbe fra turni di chat diversi.
+    dispatcher_run_id: Option<Uuid>,
 }
 
 /// Parte "execute" di un sub-run (PUNTO UNICO, regola L): narrazione avvio ->
@@ -4337,6 +4382,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         isolated,
         is_background,
         fanin_parent_run_id,
+        dispatcher_run_id,
     } = exec;
 
     // ── NARRAZIONE sul run PADRE (ADR 0037): avvio ────────────────────────────
@@ -4450,6 +4496,13 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         supervisor_mode: nexus_agent_graph::SupervisorMode::None,
         step_tx: sub_tx,
         parent_run_id: Some(anchor),
+        // Chi ha CONVOCATO questa figura, distinto dall'ancora della famiglia:
+        // e' l'identita' sotto cui le figure di una stessa convocazione
+        // condividono la decisione di chiarimento (`decisione_chiarimento`).
+        // L'ancora qui sopra NON puo' servire allo scopo — per un sub-run di
+        // primo livello vale la SESSIONE (misurato: 10 righe su 18 minuti e due
+        // turni di chat) — e l'assenza non ci ripiega.
+        dispatcher_run_id,
         subagent_depth: Some(current_depth),
         // Dal CONTRATTO della figura, deciso in `prepare_subagent_run` dove la
         // whitelist e' in mano: mai dal kind (un kind nuovo domani non sarebbe in
