@@ -2689,7 +2689,10 @@ pub(crate) async fn convene_council(
     // Le figure hanno gia' l'istruzione advisory_verdict nel loro prompt (mig 0548);
     // qui ribadiamo il formato atteso come promemoria operativo.
     let expected = "Concludi la tua analisi chiamando il tool advisory_verdict \
-                    (verdict, requirements, risks[severity+description], recommendations).";
+                    (verdict, requirements, risks[severity+description], recommendations, prove). \
+                    Dove un tuo requisito e' accertabile con un COMANDO, emettilo come PROVA \
+                    invece che come frase: la verifica finale esegue le prove e ne giudica \
+                    l'esito, mentre un requisito in prosa nessuno lo puo' eseguire.";
     // Fan-out sul PUNTO UNICO (regola L): ogni figura nel proprio task tokio,
     // col proprio timer (difetto D3). Il progresso UI viene emesso appena il
     // singolo sub-run rientra, senza attendere gli altri.
@@ -3031,7 +3034,10 @@ pub(crate) async fn convene_multi_provider_panel(
     }
     let expected = "Analizza la richiesta dalla prospettiva del tuo provider/modello \
                     e chiudi chiamando advisory_verdict (verdict, requirements, \
-                    risks[severity+description], recommendations).";
+                    risks[severity+description], recommendations, prove). Dove un tuo \
+                    requisito e' accertabile con un COMANDO, emettilo come PROVA invece \
+                    che come frase: la verifica finale esegue le prove e ne giudica \
+                    l'esito, mentre un requisito in prosa nessuno lo puo' eseguire.";
     // Stesso punto unico di fan-out (regola L, difetto D3): un task per
     // analista. Prima era `join_all` — stessa trappola del FuturesUnordered:
     // tutte le future in UN task, quindi tutti i timer ostaggio del membro
@@ -4482,6 +4488,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         pre_run_advisory_synthesis: None,
         pre_run_advisory_source: None,
         pre_run_advisory_requirements: Default::default(),
+        pre_run_advisory_piano: Default::default(),
         // Un SUB-RUN non ha barriera: i panel a monte sono del coordinatore, non
         // suoi. Un figlio che attendesse il consiglio del padre sarebbe un'attesa
         // circolare (il padre sta aspettando lui).

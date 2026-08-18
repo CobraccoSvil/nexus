@@ -596,7 +596,11 @@ fn natura_di_causa_fornitore(causa: crate::runtime::ports::ProviderFailureCause)
 }
 
 /// La decisione del gate sul batch, dai verdetti dei CONVOCATI.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `Copy`/`Eq` perche' e' un vocabolario chiuso senza dati: dal 0737 viaggia
+/// dentro [`super::piano_di_verifica::CausaNonEseguita`], che e' un campo di
+/// esito confrontato nei test e nel referto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepGateDecision {
     /// Unanimita' dei convocati: si procede (i verdetti restano allegati).

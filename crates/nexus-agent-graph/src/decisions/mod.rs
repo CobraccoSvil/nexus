@@ -171,6 +171,7 @@ pub mod orchestration_sizing;
 pub mod origine_frontend;
 pub mod pagina_del_run;
 pub mod panel_quorum;
+pub mod piano_di_verifica;
 pub mod severity;
 pub mod shell_command;
 pub mod stato_presupposto;
@@ -204,6 +205,9 @@ pub use advisory_panel::{
 };
 pub use advisory_requirements::{
     AdvisorySource, EmittedRequirements, SourcedRequirement, ADVISORY_REQUIREMENTS_KEY,
+};
+pub use piano_di_verifica::{
+    Attesa, OriginePiano, PianoDiVerifica, PoliticaEsecuzione, Prova, PIANO_VERIFICA_KEY,
 };
 pub use clarify_signature::{clarify_signature, normalize_question};
 pub use context_reduction::{

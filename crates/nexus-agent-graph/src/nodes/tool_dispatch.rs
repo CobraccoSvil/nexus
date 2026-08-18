@@ -256,6 +256,16 @@ pub enum AdvisoryGateState {
     Released {
         enforcement: Option<Value>,
         requirements: crate::decisions::EmittedRequirements,
+        /// Le PROVE ESEGUIBILI emesse dagli stessi apparati (mig 0737).
+        ///
+        /// Viaggia accanto ai requisiti e non dentro di loro: sono due
+        /// prodotti diversi degli stessi pareri — la prosa che un revisore
+        /// usa come metro, e il comando che il gate ESEGUE — e chi li
+        /// consuma e' diverso. Fonderli renderebbe un requisito in prosa
+        /// indistinguibile da una prova che nessuno puo' eseguire, che e'
+        /// esattamente il difetto misurato il 17/08/2026 (15 requisiti su 17
+        /// `non_verificabili`).
+        piano: crate::decisions::PianoDiVerifica,
     },
     /// Veto del consiglio: il run va fermato PRIMA della prima modifica.
     /// `enforcement` e' gia' nella forma di `PANEL_ENFORCEMENT_KEY` (terminal),
@@ -683,7 +693,8 @@ impl ToolDispatchNode {
             AdvisoryGateState::Released {
                 enforcement,
                 requirements,
-            } => Self::rilascio(extra, enforcement, requirements),
+                piano,
+            } => Self::rilascio(extra, enforcement, requirements, piano),
             AdvisoryGateState::Unavailable { reason_code } => {
                 tracing::warn!(
                     target: "nexus_agent_graph::tool_dispatch",
@@ -719,6 +730,7 @@ impl ToolDispatchNode {
         mut extra: serde_json::Map<String, Value>,
         enforcement: Option<Value>,
         requirements: crate::decisions::EmittedRequirements,
+        piano: crate::decisions::PianoDiVerifica,
     ) -> AdvisoryBarrier {
         let reminder = enforcement.as_ref().map(render_gate_requirements);
         if let Some(e) = enforcement {
@@ -728,10 +740,18 @@ impl ToolDispatchNode {
             crate::decisions::ADVISORY_REQUIREMENTS_KEY.to_string(),
             requirements.to_value(),
         );
+        // Le PROVE, per il final gate (mig 0737). Stesso trattamento dei
+        // requisiti e per la stessa ragione: in overlap questo e' l'unico punto
+        // in cui il run le incontra, e l'insieme VUOTO si scrive lo stesso.
+        extra.insert(
+            crate::decisions::PIANO_VERIFICA_KEY.to_string(),
+            piano.to_value(),
+        );
         extra.insert(ADVISORY_GATE_KEY.to_string(), json!({ "status": "released" }));
         tracing::info!(
             target: "nexus_agent_graph::tool_dispatch",
             requisiti = requirements.len(),
+            prove = piano.len(),
             "barriera advisory: verdetto arrivato, la scrittura procede"
         );
         AdvisoryBarrier::Proceed { extra, reminder }
@@ -3632,6 +3652,7 @@ mod tests {
                     "terminal": false,
                 })),
                 requirements: requisiti_dei_due_apparati(),
+                piano: piano_dei_due_apparati(),
             });
         });
         let st = state_with_pending(vec![pending_tool(
@@ -3675,17 +3696,36 @@ mod tests {
             crate::decisions::AdvisorySource::MultiProvider,
             "anche l'apparato che perde la selezione per l'enforcement resta"
         );
+
+        // E con loro le PROVE (mig 0737), che sono l'altro prodotto degli stessi
+        // pareri e hanno un altro consumatore: il final gate, che le ESEGUE.
+        // In overlap questo e' l'unico punto in cui il run le incontra — la
+        // stessa ragione per cui i requisiti erano rimasti inerti in 200 run.
+        //
+        // MUTAZIONE: togliere l'insert di PIANO_VERIFICA_KEY in `rilascio` rende
+        // rosso qui, e il gate tornerebbe a non avere prove da eseguire.
+        let piano = crate::decisions::PianoDiVerifica::from_value(
+            out.extra.get(crate::decisions::PIANO_VERIFICA_KEY),
+        );
+        assert_eq!(piano, piano_dei_due_apparati());
+        assert_eq!(piano.prove[0].comando, "node --test calcolatrice.test.js");
+        assert_eq!(
+            piano.prove[0].origine,
+            crate::decisions::OriginePiano::Consiglio,
+            "la provenienza sopravvive al viaggio nello stato"
+        );
     }
 
-    /// I requisiti come li produce il punto unico dai pareri dei DUE apparati
-    /// (regola O: costruirli a mano proverebbe solo che il test sa scrivere il
-    /// JSON che il test sa leggere).
-    fn requisiti_dei_due_apparati() -> crate::decisions::EmittedRequirements {
+    /// Le sintesi dei DUE apparati, come le compone il produttore (regola O:
+    /// costruirle a mano proverebbe solo che il test sa scrivere il JSON che il
+    /// test sa leggere). Una porta un requisito in PROSA, l'altra anche una
+    /// PROVA eseguibile: sono i due prodotti che il rilascio deve consegnare
+    /// entrambi.
+    fn pareri_dei_due_apparati() -> Vec<(crate::decisions::AdvisorySource, Value)> {
         use crate::decisions::{
             compose_advisory_synthesis, AdvisoryPolicy, AdvisoryRoster, AdvisorySource,
-            EmittedRequirements,
         };
-        let sintesi = |testo: &str| {
+        let sintesi = |testo: &str, prove: Value| {
             let parere = json!({
                 "success": true,
                 "advisory": {
@@ -3693,6 +3733,7 @@ mod tests {
                     "risks": [],
                     "requirements": [testo],
                     "recommendations": [],
+                    "prove": prove,
                 }
             });
             compose_advisory_synthesis(
@@ -3703,16 +3744,36 @@ mod tests {
             .expect("sintesi composta")
             .to_value()
         };
-        EmittedRequirements::from_panels(&[
+        vec![
             (
                 AdvisorySource::Council,
-                sintesi("Il contrasto tra testo e sfondo deve essere >= 4.5:1"),
+                sintesi(
+                    "Il contrasto tra testo e sfondo deve essere >= 4.5:1",
+                    json!([{
+                        "descrizione": "il file di test parte col runner del progetto",
+                        "comando": "node --test calcolatrice.test.js",
+                        "attesa": {"tipo": "exit_code", "codice": 0},
+                    }]),
+                ),
             ),
             (
                 AdvisorySource::MultiProvider,
-                sintesi("Sanitizzare i task utente prima di inserirli nel DOM"),
+                sintesi(
+                    "Sanitizzare i task utente prima di inserirli nel DOM",
+                    json!([]),
+                ),
             ),
-        ])
+        ]
+    }
+
+    /// I requisiti come li produce il punto unico dai pareri dei DUE apparati.
+    fn requisiti_dei_due_apparati() -> crate::decisions::EmittedRequirements {
+        crate::decisions::EmittedRequirements::from_panels(&pareri_dei_due_apparati())
+    }
+
+    /// Le prove come le produce il punto unico dagli STESSI pareri.
+    fn piano_dei_due_apparati() -> crate::decisions::PianoDiVerifica {
+        crate::decisions::PianoDiVerifica::dai_pareri(&pareri_dei_due_apparati())
     }
 
     #[tokio::test]
