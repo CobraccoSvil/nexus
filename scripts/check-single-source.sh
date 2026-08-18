@@ -1663,7 +1663,7 @@ fi
 #       nominata: «resterebbe verde con la soglia a un valore che ammette tutto».
 #       Un elenco lessicale ACCUSA, quindi cio' che non nomina passa, e l'ultima
 #       parola dev'essere `RichiedeGiudizio`.
-#       Dal 18/08/2026 (mig 0739) non esiste piu' NESSUNA scorciatoia: la quarta
+#       Dal 18/08/2026 (mig 0740) non esiste piu' NESSUNA scorciatoia: la quarta
 #       variante `Diretta` e' sparita con il vocabolario che l'alimentava, quindi
 #       il guard pretende che dentro `ammissione` compaiano SOLO le due varianti
 #       rimaste — un ramo che ammetta senza giudizio e' la regressione.
@@ -2273,7 +2273,7 @@ else
   echo "OK portata-del-passo: il pavimento di step_gate viene dalla portata"
 fi
 
-# NESSUN ELENCO ASSOLVE una riga di shell (mig 0739, 18/08/2026). Fino a quel
+# NESSUN ELENCO ASSOLVE una riga di shell (mig 0740, 18/08/2026). Fino a quel
 # giorno `orchestrator.step_reach.observation_commands` riportava sotto soglia
 # le righe di sola osservazione. MISURATO: su 26 righe realmente eseguite dai
 # due progetti vivi ne assolveva UNA, e la sua esistenza suggeriva di allungare
@@ -2294,7 +2294,7 @@ if grep -nE 'comandi_di_osservazione|observation_commands|StepReach::Observation
    | grep -vE ':[0-9]+: *(//|///|/\*|\*)' | grep . >/dev/null 2>&1; then
   echo "!! niente-elenco-che-assolve: e' ricomparso un vocabolario che ASSOLVE una" >&2
   echo "   riga di shell per il nome del suo comando. Rimosso il 18/08/2026" >&2
-  echo "   (mig 0739): assolveva 1 riga su 26 misurate, e invitava a inseguire le" >&2
+  echo "   (mig 0740): assolveva 1 riga su 26 misurate, e invitava a inseguire le" >&2
   echo "   varianti (curl -> wget -> psql) invece di dare al giudice i fatti che" >&2
   echo "   gli mancano. Il freno sul costo e' critical_step_max_rejections; il" >&2
   echo "   rollback e' critical_step_gate_mode = enforce_irreversible." >&2

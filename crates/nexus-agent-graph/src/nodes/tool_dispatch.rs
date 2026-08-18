@@ -5051,7 +5051,7 @@ mod tests {
 
     /// La config del gate COME LA DEPLOYA la mig 0688: mode `enforce` e le
     /// regole lessicali che il DB porta gia'. Il vocabolario che ASSOLVEVA le
-    /// righe di osservazione e' stato rimosso il 18/08/2026 (mig 0739).
+    /// righe di osservazione e' stato rimosso il 18/08/2026 (mig 0740).
     fn cfg_gate_0688() -> ToolDispatchConfig {
         ToolDispatchConfig {
             step_gate_mode: crate::decisions::step_gate::StepGateMode::Enforce,
@@ -5129,7 +5129,7 @@ mod tests {
     /// Il test asseriva l'opposto fino al 18/08/2026: un batch di sole
     /// osservazioni (`ls`, `git status`) NON convocava nessuno, perche' un
     /// vocabolario DB le assolveva. Quel vocabolario e' stato rimosso (mig
-    /// 0739, misura in testa a `decisions::step_reach`), quindi ora anche loro
+    /// 0740, misura in testa a `decisions::step_reach`), quindi ora anche loro
     /// arrivano ai giudici — ed e' la conseguenza da vedere QUI, sulla strada
     /// vera del passo 2a, non solo nel criterio puro.
     ///

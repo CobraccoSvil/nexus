@@ -1,4 +1,4 @@
--- 0739 — Il gate duale non ha piu' un elenco che ASSOLVE
+-- 0740 — Il gate duale non ha piu' un elenco che ASSOLVE
 --
 -- Rimuove `orchestrator.step_reach.observation_commands` (seminato dalla mig
 -- 0688). Con la chiave sparisce il MECCANISMO: la variante `StepReach::
@@ -93,5 +93,5 @@ WHERE key = 'orchestrator.step_reach.observation_commands';
 -- descrizione che rimanda a una chiave inesistente e' una seconda verita' su
 -- cosa il gate faccia (regola G). Il valore NON si tocca.
 UPDATE settings
-SET description = 'Gate duale sui passi critici: off | observe (classifica e persiste, zero costo LLM) | enforce_irreversible (convoca solo sugli Irreversible) | enforce (convoca su Critical e Irreversible). Dal 09/08/2026 il livello base viene dalla PORTATA del passo (decisions/step_reach.rs): `unconfined` (esegue una riga di shell/SQL) e `undetermined` (mutatore non collocabile) hanno pavimento Critical, quindi con `enforce` una migrazione di schema arriva ai giudici anche se nessuna regola lessicale la nomina (mig 0688). Dal 18/08/2026 non esiste piu'' alcun elenco che ASSOLVA una riga per il nome del suo comando (mig 0739): ogni riga di shell viene giudicata. Il freno sul costo resta orchestrator.critical_step_max_rejections, e il rollback e'' enforce_irreversible. Vocabolario canonico, parse unico in decisions::step_gate::StepGateMode.'
+SET description = 'Gate duale sui passi critici: off | observe (classifica e persiste, zero costo LLM) | enforce_irreversible (convoca solo sugli Irreversible) | enforce (convoca su Critical e Irreversible). Dal 09/08/2026 il livello base viene dalla PORTATA del passo (decisions/step_reach.rs): `unconfined` (esegue una riga di shell/SQL) e `undetermined` (mutatore non collocabile) hanno pavimento Critical, quindi con `enforce` una migrazione di schema arriva ai giudici anche se nessuna regola lessicale la nomina (mig 0688). Dal 18/08/2026 non esiste piu'' alcun elenco che ASSOLVA una riga per il nome del suo comando (mig 0740): ogni riga di shell viene giudicata. Il freno sul costo resta orchestrator.critical_step_max_rejections, e il rollback e'' enforce_irreversible. Vocabolario canonico, parse unico in decisions::step_gate::StepGateMode.'
 WHERE key = 'orchestrator.critical_step_gate_mode';

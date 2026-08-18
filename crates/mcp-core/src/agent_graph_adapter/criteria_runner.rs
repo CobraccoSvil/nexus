@@ -4021,7 +4021,7 @@ mod tests {
     /// 18/08/2026 visto DA QUI, sulla strada vera del runner: `git status` era
     /// la sola prova che partiva senza convocare nessuno, perche' un
     /// vocabolario DB (`orchestrator.step_reach.observation_commands`) la
-    /// assolveva. Rimosso dalla mig 0739 — misura in testa a
+    /// assolveva. Rimosso dalla mig 0740 — misura in testa a
     /// `decisions::step_reach`: su 26 righe realmente eseguite ne assolveva UNA,
     /// e la sua esistenza invitava ad allungare la lista invece di dare al
     /// giudice i fatti che gli mancano (regola H).
