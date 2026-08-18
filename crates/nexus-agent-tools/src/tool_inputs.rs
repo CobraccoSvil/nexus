@@ -425,6 +425,47 @@ crate::tool_object! {
     }
 }
 
+crate::tool_enum! {
+    ProvaAttesaTipo {
+        ExitCode => "exit_code";
+        OutputContains => "output_contains";
+        OutputNotContains => "output_not_contains";
+    }
+}
+
+crate::tool_object! {
+    ProvaAttesa {
+        obbligatori {
+            tipo: ProvaAttesaTipo, 
+                "exit_code = il comando deve uscire con `codice`; output_contains = l'output deve contenere "
+                "`testo`; output_not_contains = l'output NON deve contenerlo.";
+        }
+        opzionali {
+            codice: i64, "Codice d'uscita atteso con tipo=exit_code. Default 0.";
+            testo: String, 
+                "Il testo cercato con tipo=output_contains o output_not_contains. Obbligatorio per quei due "
+                "tipi.";
+        }
+    }
+}
+
+crate::tool_object! {
+    Prova {
+        obbligatori {
+            descrizione: String, "Cosa si sta accertando, in una frase.";
+            comando: String, 
+                "La riga di comando, eseguita nella root del progetto (o in working_dir). Usa comandi "
+                "disponibili nell'ambiente dichiarato.";
+            attesa: ProvaAttesa, 
+                "Quando la prova e' superata. UNA sola condizione per prova: se ne servono due, dichiara due "
+                "prove, cosi' il referto dice quale delle due e' caduta.";
+        }
+        opzionali {
+            working_dir: String, "Sottocartella in cui eseguire, relativa alla root. Ometti per la root.";
+        }
+    }
+}
+
 crate::tool_input! {
     AdvisoryVerdictInput for "advisory_verdict" {
         obbligatori {
@@ -442,6 +483,13 @@ crate::tool_input! {
                 "Rischi con evidenza. Obbligatorio (non vuoto) con verdict=block: un veto senza evidenza viene "
                 "rifiutato.";
             recommendations: Vec<String>, "Suggerimenti non vincolanti dalla tua prospettiva.";
+            prove: Vec<Prova>, 
+                "PROVE ESEGUIBILI: dove un requisito e' accertabile con un COMANDO, emetti la prova invece della "
+                "frase. La verifica finale le ESEGUE davvero e ne giudica l'esito in modo meccanico (codice "
+                "d'uscita, testo presente, testo assente): tu proponi la prova, la macchina emette il verdetto. "
+                "Un requisito in prosa resta ammesso e resta utile a chi rivede il codice, ma nessuno lo puo' "
+                "eseguire. Ogni prova deve essere eseguibile da sola, ripetibile e NON distruttiva: una prova "
+                "classificata come irreversibile non viene eseguita affatto.";
             contested_decision: AdvisoryVerdictContestedDecision, 
                 "Dichiaralo SOLO se la richiesta nasconde una DECISIONE ARCHITETTURALE aperta: piu' strade "
                 "alternative difendibili, dove la scelta cambia il progetto e nessuna e' ovviamente superiore. "
@@ -664,11 +712,15 @@ crate::tool_input! {
     EditFileInput for "edit_file" {
         obbligatori {
             path: String, "Percorso del file relativo alla root";
-            old_string: String, "Stringa esatta da sostituire (deve esistere esattamente una volta nel file, a meno di replace_all)";
+            old_string: String, 
+                "Stringa esatta da sostituire (deve esistere esattamente una volta nel file, a meno di "
+                "replace_all)";
             new_string: String, "Stringa con cui sostituire old_string";
         }
         opzionali {
-            replace_all: bool, "Se true, sostituisce TUTTE le occorrenze di old_string invece di pretenderne una sola. Default: false";
+            replace_all: bool, 
+                "Se true, sostituisce TUTTE le occorrenze di old_string invece di pretenderne una sola. "
+                "Default: false";
         }
     }
 }
@@ -1633,6 +1685,13 @@ crate::tool_input! {
                 "voce deve essere eseguibile da sola e ripetibile; se una dipende da un'altra (es. DELETE dopo "
                 "POST) elencale in quest'ordine. Una POST di prova crea un dato vero nell'applicazione: usa "
                 "valori di prova riconoscibili.";
+            prove: Vec<Prova>, 
+                "PROVE ESEGUIBILI: dove un requisito e' accertabile con un COMANDO, emetti la prova invece della "
+                "frase. La verifica finale le ESEGUE davvero e ne giudica l'esito in modo meccanico (codice "
+                "d'uscita, testo presente, testo assente): tu proponi la prova, la macchina emette il verdetto. "
+                "Un requisito in prosa resta ammesso e resta utile a chi rivede il codice, ma nessuno lo puo' "
+                "eseguire. Ogni prova deve essere eseguibile da sola, ripetibile e NON distruttiva: una prova "
+                "classificata come irreversibile non viene eseguita affatto.";
             rendered_container: String,
                 "Selettore CSS dell'elemento che il JavaScript della pagina RIEMPIE all'avvio (es. "
                 "'#courses-grid', '.product-list'). Dichiaralo quando il contenuto visibile non sta nell'HTML "
