@@ -4250,6 +4250,56 @@ else
   echo "OK giudice-inadatto: il registro resta fuori dalla selezione generale"
 fi
 
+# ── interlocutore-del-run (2026-08-18) ──────────────────────────────────────
+# «Esiste una superficie di dialogo per QUESTO run?» ha UN punto unico, distinto
+# dalla modalita' di automazione (che dice se valga la pena disturbare un umano
+# che ESISTE). Il difetto chiuso: il nodo clarify emetteva `pending_clarify` in
+# un sub-run — dove il prodotto e' un tool_result letto da un altro agente e
+# nessuno puo' rispondere — e l'edge del grafo lo instradava a End come stato
+# terminale. Misurato su `app-libri-18-08`: `ui_ux_designer` chiuso «completed»
+# con 0 iterazioni, 0 token e riassunto vuoto; il 17/08 un sub-run `review`.
+assert_single "interlocutore-del-run" 'pub fn del_run' \
+  'crates/nexus-agent-graph/src/decisions/interlocutore.rs' \
+  crates/nexus-agent-graph/src/decisions
+
+# Il criterio deve raggiungere il RAMO ASK: se `build_ask_delta` smette di
+# interrogarlo, il campo resta un tipo che nessuno legge e il sub-run torna a
+# morire muto con tutti i test del criterio verdi (regola O).
+if ! grep -q 'puo_porre_una_domanda' \
+  crates/nexus-agent-graph/src/nodes/clarify_or_expand.rs; then
+  echo "!! interlocutore-del-run: il ramo ask del clarify non interroga piu' il" >&2
+  echo "   criterio: senza, 'pending_clarify' torna a chiudere un run che non" >&2
+  echo "   ha nessuno a cui chiedere." >&2
+  fail=1
+else
+  echo "OK interlocutore-del-run: il ramo ask del clarify interroga il criterio"
+fi
+
+# La domanda POSTA e l'assunzione APPLICATA sono due esiti (regola Q) e vogliono
+# due `kind`: l'esistenza di un meta_step 'clarify' e' cio' che il detector
+# cross-run conta come «questo turno ha posto una domanda», e un'assunzione
+# contata li' sarebbe un loop di domande che nessuno ha mai fatto.
+if ! grep -q 'META_KIND_CLARIFY_ASSUNZIONE' \
+  crates/nexus-agent-graph/src/nodes/clarify_or_expand.rs; then
+  echo "!! interlocutore-del-run: il kind dell'assunzione e' sparito: domanda" >&2
+  echo "   posta e assunzione applicata tornerebbero indistinguibili." >&2
+  fail=1
+else
+  echo "OK interlocutore-del-run: domanda e assunzione hanno due kind distinti"
+fi
+
+# L'esito «mi sono fermato per chiedere» deve attraversare il confine grafo ->
+# mcp-core come CAMPO: senza, `classify_status` non puo' che dire Completed, e
+# un turno a zero iterazioni torna a dichiararsi un successo.
+if ! grep -q 'pending_clarify: state.is_pending_clarify()' \
+  crates/mcp-core/src/native_engine.rs; then
+  echo "!! interlocutore-del-run: 'pending_clarify' non risale piu' nell'outcome:" >&2
+  echo "   l'informazione muore al confine e il run torna 'completed'." >&2
+  fail=1
+else
+  echo "OK interlocutore-del-run: l'esito del clarify attraversa il confine"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

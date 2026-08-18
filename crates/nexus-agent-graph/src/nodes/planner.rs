@@ -370,12 +370,15 @@ pub enum ClarifyingBranch {
 }
 
 /// `true` se l'`automation_mode` impone HITL sul ramo clarifying (study/confirm).
+///
+/// DELEGA al punto unico [`crate::decisions::hitl::automation_requires_hitl`]
+/// (regola L): il corpo era una copia IDENTICA, e la stessa domanda aveva cinque
+/// risposte sparse fra questo nodo, `hitl.rs`, `clarify_or_expand::is_auto`,
+/// `AutomationMode::is_autonomous` e `AgentState::is_autonomous_run`. E' la
+/// ragione strutturale per cui questo nodo e il clarify si comportavano in modo
+/// opposto davanti allo stesso problema: la domanda non aveva un padrone.
 fn clarifying_requires_hitl(automation_mode: Option<crate::state::AutomationMode>) -> bool {
-    matches!(
-        automation_mode,
-        None | Some(crate::state::AutomationMode::None)
-            | Some(crate::state::AutomationMode::Confirm)
-    )
+    crate::decisions::hitl::automation_requires_hitl(automation_mode)
 }
 
 /// Branching clarifying PURO (`planner_node.py:144-170`). `questions` sono le

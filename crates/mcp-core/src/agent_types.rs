@@ -169,7 +169,16 @@ pub enum AgentRunStatus {
     FailedDiagnosed,
     /// Il run e' bloccato e richiede input esterno reale (segreto/credenziale mancante,
     /// permesso non disponibile, servizio offline) OPPURE la conferma di un'azione
-    /// irreversibile (governata da automation_mode). MAI per ambiguita' di intent.
+    /// irreversibile (governata da automation_mode) OPPURE la risposta a una
+    /// domanda di chiarimento che il turno ha effettivamente POSTO
+    /// (`pending_clarify`, dal 18/08/2026).
+    ///
+    /// Il MODELLO non lo dichiara mai per ambiguita' di intent: `task_complete`
+    /// con `outcome=needs_input` non e' il modo di scaricare un compito ambiguo
+    /// che va risolto lavorando. Il terzo caso ha un produttore diverso — un
+    /// segnale strutturato del grafo, dopo che il run si e' DAVVERO fermato in
+    /// attesa — e li' l'alternativa era dichiarare «completato con successo» un
+    /// turno a zero iterazioni.
     BlockedNeedsInput,
 }
 

@@ -62,6 +62,9 @@
 //!     history). PUNTO UNICO condiviso da planner ed executor (regola L).
 //!   - [`hitl`]: gate HITL strutturale per modalita' Conferma (sospensione prima
 //!     dei tool mutativi, pending_actions, compatibile con interrupt-resume).
+//!   - [`interlocutore`]: «esiste una superficie di dialogo per QUESTO run?».
+//!     Distinta dalla modalita' (che dice se vale la pena disturbare un umano
+//!     che ESISTE): un sub-run non ha nessuno a cui chiedere, strutturalmente.
 //!   - [`supervisor`]: scheduling e parsing della risposta del supervisore worker.
 //!   - [`end_turn`]: decisioni DETERMINISTICHE post-end_turn dell'executor
 //!     (unfulfilled-report, rimozione blocco `<suggested_actions>`, messaggio
@@ -160,6 +163,7 @@ pub mod g1_accounting;
 pub mod governance;
 pub mod helpers;
 pub mod hitl;
+pub mod interlocutore;
 pub mod latency_budget;
 pub mod step_gate;
 pub mod step_reach;

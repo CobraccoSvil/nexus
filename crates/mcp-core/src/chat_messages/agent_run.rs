@@ -9337,6 +9337,7 @@ mod tests_native_mapping {
         crate::native_engine::NativeRunOutcome {
             completed: true,
             awaiting_subagents: false,
+            pending_clarify: false,
             suspension_origin: None,
             final_answer: Some("fatto".to_string()),
             stop_reason: Some(StopReason::EndTurn),

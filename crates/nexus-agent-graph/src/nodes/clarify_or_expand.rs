@@ -1,13 +1,33 @@
 //! `ClarifyOrExpandNode` — porta la parte PORTABILE/deterministica di
 //! `clarify_or_expand_node` (`brain/agents/clarify_or_expand_node.py:587-898`).
 //!
-//! Il nodo e' condizionale: si attiva SOLO su bassa confidence del classifier
-//! intent (~1% dei casi) e produce due output mutuamente esclusivi:
-//!   - `ask`    -> meta_step `clarify` con la domanda + `pending_clarify=true`
-//!                 (il grafo va a END, il turno si ferma) + `clarify_attempts+1`.
+//! Il nodo e' condizionale e produce tre output mutuamente esclusivi:
+//!   - `ask` CON interlocutore -> meta_step `clarify` con la domanda +
+//!                 `pending_clarify=true` (il grafo va a END, il turno si ferma)
+//!                 + `clarify_attempts+1`.
+//!   - `ask` SENZA interlocutore -> meta_step `clarify_assumption` con
+//!                 l'assunzione dichiarata in `applied_default_assumptions`, e
+//!                 il run PROSEGUE. Vedi sotto.
 //!   - `expand` -> popola `expanded_query` (arricchisce il retrieve RAG; il
 //!                 messaggio utente passa intatto al modello principale).
 //! Negli altri casi e' no-op (delta vuoto), il flusso prosegue invariato.
+//!
+//! ## La domanda posta a nessuno (18/08/2026)
+//!
+//! Il nodo non si attiva «solo sull'1% dei casi»: con
+//! `clarify.confirm_irreversible_in_auto=true` (valore in produzione)
+//! `force_classify` disarma sia il gate di autonomia sia quello di confidence, e
+//! la chiamata LLM parte per OGNI run che arrivi qui senza `intent_hint` — cioe'
+//! per ogni sub-run, che per costruzione non ne ha. Quando la decisione torna
+//! `mode=ask` con `category=product`, il gate residuo non l'assorbe e il nodo
+//! emette `pending_clarify`, che l'edge del grafo instrada a `End` come stato
+//! TERMINALE: il sub-run chiude «completed» a zero iterazioni, per porre una
+//! domanda a un interlocutore che non esiste.
+//!
+//! Misurato su `app-libri-18-08` (`ui_ux_designer`, 0 iterazioni, 0 token,
+//! summary vuoto, 2,6 s) e il giorno prima su un sub-run `review`. Il criterio
+//! che mancava e' [`Interlocutore`] — vedi quel modulo per la catena completa e
+//! per il perche' NON e' la modalita' di automazione.
 //!
 //! ## Cosa porta QUESTO PR (deterministico, testato golden 1:1)
 //!
@@ -70,12 +90,48 @@ use uuid::Uuid;
 use nexus_graph::node::{GraphNode, NodeError, NodeId};
 use nexus_graph::StateDelta as OpaqueDelta;
 
+use crate::decisions::interlocutore::Interlocutore;
+use crate::runtime::ports::MetaStepStore;
 use crate::runtime::AgentNodeCtx;
 use crate::state::{AgentState, Message, MetaStep, StateDelta, ToolUse};
 
 /// Lunghezza minima dell'ultimo messaggio utente sotto la quale il nodo salta
 /// (`clarify_or_expand_node.py:752`: `len(user_msg) < 3`).
 const MIN_USER_MSG_LEN: usize = 3;
+
+/// `kind` del meta_step della DOMANDA posta all'utente.
+///
+/// E' un vocabolario con DUE lati e per questo vive qui, dove il produttore lo
+/// scrive: l'unico consumatore e' `mcp-core::agent_graph_adapter::clarify_history_store`,
+/// che conta le righe `kind='clarify'` come «questo turno ha posto una domanda»
+/// per il detector cross-run di loop. Finche' nessuno persisteva questi
+/// meta_step quel detector leggeva sempre 0: nessuna riga da contare, quindi
+/// nessuna ripetizione rilevabile (misurato il 18/08/2026: zero righe
+/// `kind='clarify'` su 104+ meta_step in due progetti, il canale non esisteva
+/// in DB).
+pub const META_KIND_CLARIFY: &str = "clarify";
+
+/// Nome del campo con cui il modello dichiara il proprio default.
+///
+/// Ha TRE lati che devono nominarlo allo stesso modo — lo schema che lo chiede,
+/// il parser che lo legge, il payload dell'assunzione che lo riporta — e una
+/// costante e' il solo modo di renderli un contratto invece di tre stringhe che
+/// si somigliano.
+const CAMPO_SUGGESTED_DEFAULT: &str = "suggested_default";
+
+/// Descrizione del campo `suggested_default` dichiarata al modello: fuori dalla
+/// `json!` per non produrre una riga oltre il limite di stile (stessa ragione di
+/// `DESCRIZIONE_TIPI_CRITERIO` nel planner).
+const DESCRIZIONE_SUGGESTED_DEFAULT: &str = "Con mode=ask: la risposta che \
+    adotteresti se nessuno rispondesse alla domanda. Obbligatoria di fatto: \
+    dove non c'e' nessuno a cui chiedere (sub-run di una figura convocata) e' \
+    QUESTA che viene applicata come assunzione dichiarata, e il lavoro prosegue.";
+
+/// `kind` del meta_step dell'ASSUNZIONE applicata al posto della domanda, dove
+/// non c'e' nessuno a cui chiederla. Distinto da [`META_KIND_CLARIFY`]: sono due
+/// esiti diversi e vogliono due varianti (regola Q), e confonderli farebbe
+/// contare al detector di loop domande che nessuno ha mai posto.
+pub const META_KIND_CLARIFY_ASSUNZIONE: &str = "clarify_assumption";
 
 /// Marcatori di dominio/codice/design cercati nel listing top-level del progetto.
 /// Replica `_DOMAIN_MARKERS` (`clarify_or_expand_node.py:52-67`): coppie
@@ -204,6 +260,16 @@ pub struct LlmDecision {
     pub category: DecisionCategory,
     /// `true` se la decisione e' facilmente reversibile (default true).
     pub reversible: bool,
+    /// Risposta che il modello adotterebbe se nessuno rispondesse alla domanda.
+    ///
+    /// Campo NUOVO rispetto al Python (che non ne aveva alcuno): senza, un run
+    /// privo di interlocutore non ha nulla su cui ripiegare e il livello 1 del
+    /// fix degraderebbe a «ignora la domanda». E' la stessa forma che il planner
+    /// usa gia' per la propria clarifying pre-flight (`suggested_default` dentro
+    /// `{id, question, suggested_default}`), riusata invece di reinventata
+    /// (regola L). Stringa vuota = il modello non ne ha proposto uno: l'ignoto
+    /// resta dichiarato, non diventa un default inventato da noi (regola Q).
+    pub suggested_default: String,
 }
 
 impl LlmDecision {
@@ -251,6 +317,7 @@ impl LlmDecision {
             rationale: Self::input_str(input, "rationale"),
             category,
             reversible,
+            suggested_default: Self::input_str(input, CAMPO_SUGGESTED_DEFAULT),
         }
     }
 
@@ -286,12 +353,22 @@ impl LlmDecision {
 pub struct ClarifyOrExpandNode {
     /// Config DB-driven (regola G: passata, mai letta dal nodo).
     cfg: ClarifyConfig,
+    /// Persistenza dei meta_step (come planner / executor / final_gate).
+    ///
+    /// Il nodo era l'UNICO produttore di meta_step senza questa porta: il
+    /// MetaStep viaggiava nel `StateDelta`, `AgentState.meta_steps` lo
+    /// accumulava in memoria e mcp-core non lo leggeva mai
+    /// (`grep 'state.meta_steps' crates/mcp-core/` -> zero righe). La domanda
+    /// che il modello aveva formulato veniva costruita, troncata, impacchettata
+    /// e buttata: nemmeno un umano avrebbe potuto rispondere.
+    meta_steps: std::sync::Arc<dyn MetaStepStore>,
 }
 
 impl ClarifyOrExpandNode {
-    /// Costruisce il nodo con la config DB-driven gia' risolta dal chiamante.
-    pub fn new(cfg: ClarifyConfig) -> Self {
-        Self { cfg }
+    /// Costruisce il nodo con la config DB-driven gia' risolta dal chiamante e
+    /// la porta di persistenza dei meta_step.
+    pub fn new(cfg: ClarifyConfig, meta_steps: std::sync::Arc<dyn MetaStepStore>) -> Self {
+        Self { cfg, meta_steps }
     }
 
     /// Ultimo messaggio di ruolo human/user (in reverse), content come stringa,
@@ -311,14 +388,18 @@ impl ClarifyOrExpandNode {
     }
 
     /// `true` se l'`automation_mode` e' uno dei 5 alias "automatico"
-    /// (`clarify_or_expand_node.py:417` / `:692`). Nel runtime Rust
-    /// `automation_mode` e' gia' un enum: `Automatic`/`Continuous` sono auto.
+    /// (`clarify_or_expand_node.py:417` / `:692`).
+    ///
+    /// DELEGA a [`AgentState::is_autonomous_run`] (regola L): la stessa domanda
+    /// aveva cinque risposte scritte in cinque posti — qui, in
+    /// [`crate::decisions::hitl::automation_requires_hitl`], in
+    /// `planner::clarifying_requires_hitl`, in `AutomationMode::is_autonomous` e
+    /// in `AgentState::is_autonomous_run` — ed e' la ragione strutturale per cui
+    /// questo nodo e il planner si comportavano in modo OPPOSTO davanti allo
+    /// stesso problema nello stesso grafo (il planner applica i default e
+    /// prosegue, questo fermava il run).
     pub fn is_auto(state: &AgentState) -> bool {
-        use crate::state::AutomationMode;
-        matches!(
-            state.automation_mode,
-            Some(AutomationMode::Automatic) | Some(AutomationMode::Continuous)
-        )
+        state.is_autonomous_run()
     }
 
     /// Tronca la question a `max_chars` caratteri rimuovendo l'ultima parola
@@ -462,17 +543,35 @@ impl ClarifyOrExpandNode {
     /// Applica la decisione LLM (mode=ask) producendo il delta del ramo `ask`, o
     /// `None` se il gate `force_classify` impone di procedere autonomo
     /// (`clarify_or_expand_node.py:841-885`). Deterministico: decisione + stato +
-    /// config + force_classify + confidence -> delta.
+    /// config + force_classify + confidence + interlocutore -> delta.
     ///
-    /// Ritorna `Some(StateDelta)` con il meta_step clarify + `pending_clarify` +
-    /// `clarify_attempts+1`; `None` quando il gate force_classify procede senza
-    /// domanda, oppure quando la question e' vuota (no-op, `:852-853`).
+    /// ## I due esiti, e perche' sono due (regola Q)
+    ///
+    /// - [`Interlocutore::Umano`]: `pending_clarify=true` + meta_step
+    ///   [`META_KIND_CLARIFY`] + `clarify_attempts+1`. Il turno si ferma, la
+    ///   domanda compare in chat, il messaggio successivo apre un run nuovo.
+    ///   Comportamento invariato.
+    /// - [`Interlocutore::Nessuno`]: MAI `pending_clarify`, qualunque sia la
+    ///   categoria. La domanda diventa un'ASSUNZIONE DICHIARATA nel canale che
+    ///   il planner usa gia' per lo stesso problema
+    ///   (`applied_default_assumptions`, [`crate::nodes::ClarifyingBranch::ApplyDefaults`])
+    ///   e il run PROSEGUE all'understanding. E' la regola D: chi non ha nessuno
+    ///   a cui chiedere procede dichiarando le proprie assunzioni, non tace.
+    ///
+    /// Il gate `force_classify` resta e viene PRIMA, perche' risponde a un'altra
+    /// domanda («vale la pena disturbare un umano che esiste?»): con una
+    /// decisione technical+reversibile in automatico non c'e' ne' domanda ne'
+    /// assunzione da dichiarare, e il ramo esce `None` come sempre.
+    ///
+    /// `None` anche quando la question e' vuota (no-op, `:852-853`): senza
+    /// domanda non c'e' nulla da chiedere ne' da assumere.
     pub fn build_ask_delta(
         cfg: &ClarifyConfig,
         state: &AgentState,
         decision: &LlmDecision,
         force_classify: bool,
         confidence: f64,
+        interlocutore: Interlocutore,
     ) -> Option<StateDelta> {
         // Gate Cluster 4 (:841-848): in auto (force_classify) NON interrompiamo
         // per decisioni tecniche/reversibili; chiediamo conferma SOLO per
@@ -498,29 +597,110 @@ impl ClarifyOrExpandNode {
             0
         };
         let question = Self::truncate_question(question, max_chars);
+        let clarify_attempts = state.clarify_attempts.unwrap_or(0);
 
-        let payload = json!({
-            "question": question,
-            "rationale": decision.rationale,
-            "category": Self::category_label(decision.category),
-            "reversible": decision.reversible,
-            "intent": state.user_intent,
-            "confidence": confidence,
-        });
+        // IL BIVIO, e l'unico posto in cui il criterio ha una conseguenza.
+        Some(if interlocutore.puo_porre_una_domanda() {
+            Self::delta_domanda(state, decision, &question, clarify_attempts, confidence)
+        } else {
+            Self::delta_assunzione(state, decision, &question, clarify_attempts, interlocutore)
+        })
+    }
+
+    /// Il delta del ramo CON interlocutore: la domanda posta, il turno che si
+    /// ferma. Comportamento storico, invariato.
+    fn delta_domanda(
+        state: &AgentState,
+        decision: &LlmDecision,
+        question: &str,
+        clarify_attempts: i64,
+        confidence: f64,
+    ) -> StateDelta {
         let meta = MetaStep {
-            kind: "clarify".to_string(),
+            kind: META_KIND_CLARIFY.to_string(),
             title: "Serve un chiarimento".to_string(),
-            payload,
+            payload: json!({
+                "question": question,
+                "rationale": decision.rationale,
+                "category": Self::category_label(decision.category),
+                "reversible": decision.reversible,
+                "intent": state.user_intent,
+                "confidence": confidence,
+            }),
             correlation_id: None,
             created_at: None,
         };
-        let clarify_attempts = state.clarify_attempts.unwrap_or(0);
-        Some(StateDelta {
+        StateDelta {
             pending_clarify: Some(Some(true)),
             clarify_attempts: Some(Some(clarify_attempts + 1)),
             meta_steps: Some(vec![meta]),
             ..Default::default()
-        })
+        }
+    }
+
+    /// Il delta del ramo SENZA interlocutore: l'assunzione dichiarata al posto
+    /// della domanda, e il run prosegue.
+    ///
+    /// L'entry ha la SHAPE del planner (`{id, question, suggested_default}`)
+    /// perche' e' lo stesso canale e chi lo legge non deve conoscere due forme;
+    /// i campi in piu' (`rationale`, `category`, `source`, `reason`) dicono da
+    /// dove viene e perche' e' stata applicata invece di chiesta.
+    ///
+    /// L'append e' esplicito (`state` + push) e non un reducer: il campo ha
+    /// semantica di sovrascrittura, e assegnarlo secco cancellerebbe quanto gia'
+    /// presente.
+    ///
+    /// `suggested_default` VUOTO resta `null`: un default che il modello non ha
+    /// proposto non lo inventiamo noi (regola G/Q). L'assunzione vale comunque —
+    /// dice «qui c'era un'ambiguita' e ho proceduto lo stesso», che e'
+    /// esattamente l'informazione che oggi va perduta.
+    ///
+    /// PORTATA di cio' che si vede: il canale VISIBILE e' il meta_step, che
+    /// `run` emette live e persiste. Il campo di stato ha oggi i soli lettori
+    /// che ha gia' per il planner (nessuno fuori dallo stato): vi si scrive
+    /// perche' e' lo stesso canale per la stessa cosa (regola L), non perche'
+    /// da solo basti a mostrarla.
+    fn delta_assunzione(
+        state: &AgentState,
+        decision: &LlmDecision,
+        question: &str,
+        clarify_attempts: i64,
+        interlocutore: Interlocutore,
+    ) -> StateDelta {
+        let default = decision.suggested_default.trim();
+        let payload = json!({
+            "id": format!("clarify_{}", clarify_attempts + 1),
+            "question": question,
+            CAMPO_SUGGESTED_DEFAULT: if default.is_empty() { Value::Null } else { json!(default) },
+            "rationale": decision.rationale,
+            "category": Self::category_label(decision.category),
+            "source": META_KIND_CLARIFY_ASSUNZIONE,
+            "reason": interlocutore.motivo_assenza(),
+        });
+        let mut assunzioni = state.applied_default_assumptions.clone().unwrap_or_default();
+        assunzioni.push(payload.clone());
+        let meta = MetaStep {
+            // Kind DIVERSO da `clarify` e non e' un dettaglio: l'ESISTENZA di un
+            // meta_step `clarify` e' la dichiarazione strutturata "questo turno
+            // ha posto una domanda all'utente", ed e' cio' che il detector
+            // cross-run di loop conta (`ClarifyHistoryPort`). Un'assunzione
+            // applicata non e' una domanda posta: contarla li' significherebbe
+            // rilevare un loop di domande che nessuno ha mai fatto.
+            kind: META_KIND_CLARIFY_ASSUNZIONE.to_string(),
+            title: "Assunzione dichiarata (nessuno a cui chiedere)".to_string(),
+            payload,
+            correlation_id: None,
+            created_at: None,
+        };
+        StateDelta {
+            // NIENTE `pending_clarify`: e' l'intero fix. Qui il campo non e'
+            // "false", e' ASSENTE — il ramo non ha nulla da dire su un flag che
+            // governa la terminazione del run.
+            clarify_attempts: Some(Some(clarify_attempts + 1)),
+            applied_default_assumptions: Some(Some(assunzioni)),
+            meta_steps: Some(vec![meta]),
+            ..Default::default()
+        }
     }
 
     /// Applica la decisione LLM (mode=expand) producendo il delta del ramo
@@ -567,7 +747,8 @@ impl ClarifyOrExpandNode {
                         "enum": ["technical", "product", "irreversible"],
                         "description": "Tipo di decisione: technical (scelta implementativa), product (scelta di prodotto/UX/business), irreversible (azione difficile da annullare)."
                     },
-                    "reversible": {"type": "boolean", "description": "True se la decisione e' facilmente reversibile."}
+                    "reversible": {"type": "boolean", "description": "True se la decisione e' facilmente reversibile."},
+                    CAMPO_SUGGESTED_DEFAULT: {"type": "string", "description": DESCRIZIONE_SUGGESTED_DEFAULT}
                 },
                 "required": ["mode"]
             }
@@ -696,26 +877,51 @@ impl GraphNode<AgentState, AgentNodeCtx> for ClarifyOrExpandNode {
         };
 
         let decision = LlmDecision::from_tool_input(&tool_call.input);
+        // Chi puo' rispondere a una domanda posta da QUESTO run: punto unico
+        // (regola L), letto dallo stato. Non e' la modalita' — vedi la doc di
+        // `Interlocutore` per il perche' le due domande restano separate.
+        let interlocutore = Interlocutore::dello_stato(state);
         tracing::info!(
             target: "nexus_agent_graph::clarify_or_expand",
             mode = ?decision.mode,
             category = ?decision.category,
             reversible = decision.reversible,
+            interlocutore = ?interlocutore,
             "decisione clarify"
         );
 
         // ── Applica la decisione (logica deterministica) ──────────────────────
         let delta = match decision.mode {
-            ClarifyMode::Ask => {
-                Self::build_ask_delta(&self.cfg, state, &decision, force_classify, confidence)
-                    .unwrap_or_default()
-            }
+            ClarifyMode::Ask => Self::build_ask_delta(
+                &self.cfg,
+                state,
+                &decision,
+                force_classify,
+                confidence,
+                interlocutore,
+            )
+            .unwrap_or_default(),
             ClarifyMode::Expand => {
                 Self::build_expand_delta(&decision, &user_msg).unwrap_or_default()
             }
             // mode=skip o sconosciuto -> no-op (:897-898).
             ClarifyMode::Skip => StateDelta::default(),
         };
+
+        // I meta_step costruiti qui sopra sono l'unico canale su cui la domanda
+        // (o l'assunzione che la sostituisce) sopravvive al run: si emettono live
+        // e si persistono dal PUNTO UNICO di narrazione (regola L), lo stesso di
+        // planner/executor/final_gate. Best-effort: non fallisce mai il turno.
+        for meta in delta.meta_steps.iter().flatten() {
+            super::emit_phase_meta(
+                ctx.emit.as_ref(),
+                self.meta_steps.as_ref(),
+                &meta.kind,
+                meta.title.clone(),
+                meta.payload.clone(),
+            )
+            .await;
+        }
 
         Ok(delta.into_opaque())
     }
@@ -877,6 +1083,68 @@ mod tests {
             intent_confidence: Some(0.4),
             ..Default::default()
         }
+    }
+
+    /// Lo stato di un SUB-RUN: gli stessi campi che il dispatcher scrive
+    /// all'origine (`parent_run_id: Some(anchor)`, `subagent_depth >= 1`,
+    /// `automation_mode='automatic'`), piu' il mandato al posto del messaggio
+    /// utente. E' il caso che nessun test attraversava (regola O): finche' il
+    /// nodo veniva esercitato solo con lo stato di un run di chat, la morte di
+    /// `ui_ux_designer` non era rappresentabile in nessuna prova.
+    fn stato_sub_run() -> AgentState {
+        AgentState {
+            messages: vec![human(
+                "Sei ui_ux_designer. Analizza il compito e dai un parere \
+                 sull'interfaccia dell'app libri.",
+            )],
+            user_intent: Some("code_write".to_string()),
+            intent_confidence: Some(0.4),
+            automation_mode: Some(AutomationMode::Automatic),
+            parent_run_id: Some("abdbc7c4-66c3-4dcb-8dec-b37bcaf0a916".to_string()),
+            subagent_depth: Some(1),
+            ..Default::default()
+        }
+    }
+
+    /// Nodo di test con uno store di meta_step usa-e-getta (quando la prova non
+    /// guarda cosa e' stato persistito).
+    fn nodo_di_test() -> ClarifyOrExpandNode {
+        nodo_con_store(ClarifyConfig::default()).0
+    }
+
+    /// Nodo + il suo store, per le prove che guardano CHE COSA e' stato
+    /// persistito: quel canale e' l'unico su cui la domanda sopravvive al run.
+    fn nodo_con_store(
+        cfg: ClarifyConfig,
+    ) -> (
+        ClarifyOrExpandNode,
+        Arc<crate::runtime::test_doubles::StubMetaStepStore>,
+    ) {
+        let store = Arc::new(crate::runtime::test_doubles::StubMetaStepStore::default());
+        (ClarifyOrExpandNode::new(cfg, store.clone()), store)
+    }
+
+    /// La config REALE di produzione (misurata sul DB meta il 18/08/2026:
+    /// `clarify.confirm_irreversible_in_auto=true`), non il default del codice —
+    /// che vale `false` e da solo non riproduce nulla.
+    fn cfg_produzione() -> ClarifyConfig {
+        ClarifyConfig {
+            confirm_irreversible_in_auto: true,
+            ..Default::default()
+        }
+    }
+
+    /// La decisione che ha ucciso `ui_ux_designer`, nella forma in cui e' uscita
+    /// dal modello: `mode=ask`, `category=product`, `reversible=true`.
+    fn decisione_product() -> Value {
+        json!({
+            "mode": "ask",
+            "question": "Quale palette e quale famiglia tipografica devo adottare?",
+            "rationale": "scelta di prodotto non specificata dal mandato",
+            "category": "product",
+            "reversible": true,
+            "suggested_default": "palette neutra su fondo chiaro, font di sistema sans-serif"
+        })
     }
 
     // ── Gate pre-LLM (unitari, deterministici) ────────────────────────────────
@@ -1105,7 +1373,7 @@ mod tests {
             }
         }
 
-        let node = ClarifyOrExpandNode::new(ClarifyConfig::default());
+        let node = nodo_di_test();
         let llm = Arc::new(ScriptedLlm::with_decision(
             json!({"mode": "skip"}),
         ));
@@ -1149,9 +1417,18 @@ mod tests {
             "mode": "ask", "question": "quale db?", "category": "technical", "reversible": true
         }));
         // force_classify + technical + reversibile -> None (procede autonomo).
-        assert!(ClarifyOrExpandNode::build_ask_delta(&cfg, &st, &decision, true, 0.4).is_none());
+        assert!(ClarifyOrExpandNode::build_ask_delta(
+            &cfg,
+            &st,
+            &decision,
+            true,
+            0.4,
+            Interlocutore::Umano
+        )
+        .is_none());
     }
 
+    /// Con un interlocutore la domanda si pone: comportamento INVARIATO.
     #[test]
     fn build_ask_delta_force_classify_product_emette() {
         let cfg = ClarifyConfig::default();
@@ -1159,9 +1436,116 @@ mod tests {
         let decision = LlmDecision::from_tool_input(&json!({
             "mode": "ask", "question": "scelta di prodotto?", "category": "product"
         }));
-        let delta =
-            ClarifyOrExpandNode::build_ask_delta(&cfg, &st, &decision, true, 0.4).expect("delta");
+        let delta = ClarifyOrExpandNode::build_ask_delta(
+            &cfg,
+            &st,
+            &decision,
+            true,
+            0.4,
+            Interlocutore::Umano,
+        )
+        .expect("delta");
         assert_eq!(delta.pending_clarify, Some(Some(true)));
+        let meta = delta.meta_steps.expect("meta");
+        assert_eq!(meta[0].kind, META_KIND_CLARIFY);
+    }
+
+    /// SENZA interlocutore la STESSA decisione non ferma il run: diventa
+    /// un'assunzione dichiarata, e il flusso prosegue all'understanding.
+    ///
+    /// MUTAZIONE: togliere il ramo `!interlocutore.puo_porre_una_domanda()` da
+    /// `build_ask_delta` fa rosseggiare la prima asserzione con
+    /// `Some(Some(true))` — cioe' il valore esatto che, passando per l'edge del
+    /// grafo, ha chiuso `ui_ux_designer` a zero iterazioni.
+    #[test]
+    fn build_ask_delta_senza_interlocutore_dichiara_l_assunzione() {
+        let cfg = cfg_produzione();
+        let st = stato_sub_run();
+        let decision = LlmDecision::from_tool_input(&decisione_product());
+        let delta = ClarifyOrExpandNode::build_ask_delta(
+            &cfg,
+            &st,
+            &decision,
+            true,
+            0.4,
+            Interlocutore::Nessuno,
+        )
+        .expect("delta");
+
+        assert_eq!(
+            delta.pending_clarify, None,
+            "nessun pending_clarify: il campo non e' 'false', e' ASSENTE"
+        );
+        let assunzioni = delta
+            .applied_default_assumptions
+            .expect("il campo e' valorizzato")
+            .expect("le assunzioni ci sono");
+        assert_eq!(assunzioni.len(), 1);
+        assert_eq!(
+            assunzioni[0]["suggested_default"],
+            json!("palette neutra su fondo chiaro, font di sistema sans-serif")
+        );
+        assert_eq!(
+            assunzioni[0]["reason"],
+            json!(crate::decisions::interlocutore::MOTIVO_NESSUN_INTERLOCUTORE)
+        );
+        let meta = delta.meta_steps.expect("meta");
+        assert_eq!(
+            meta[0].kind, META_KIND_CLARIFY_ASSUNZIONE,
+            "kind DIVERSO da 'clarify': il detector di loop conta le domande poste"
+        );
+    }
+
+    /// Il default assente resta `null`: non lo inventiamo noi (regola G/Q), ma
+    /// l'ambiguita' resta dichiarata e il run prosegue lo stesso.
+    #[test]
+    fn senza_default_proposto_resta_l_ambiguita_dichiarata() {
+        let cfg = cfg_produzione();
+        let st = stato_sub_run();
+        let decision = LlmDecision::from_tool_input(&json!({
+            "mode": "ask", "question": "quale palette?", "category": "product"
+        }));
+        let delta = ClarifyOrExpandNode::build_ask_delta(
+            &cfg,
+            &st,
+            &decision,
+            true,
+            0.4,
+            Interlocutore::Nessuno,
+        )
+        .expect("delta");
+        assert_eq!(delta.pending_clarify, None);
+        let assunzioni = delta
+            .applied_default_assumptions
+            .expect("campo")
+            .expect("valore");
+        assert_eq!(assunzioni[0]["suggested_default"], Value::Null);
+        assert_eq!(assunzioni[0]["question"], json!("quale palette?"));
+    }
+
+    /// Le assunzioni si APPENDONO: il campo ha reducer di sovrascrittura, e
+    /// assegnarlo secco cancellerebbe quanto un altro nodo ha gia' dichiarato.
+    #[test]
+    fn le_assunzioni_non_cancellano_le_precedenti() {
+        let cfg = cfg_produzione();
+        let mut st = stato_sub_run();
+        st.applied_default_assumptions = Some(vec![json!({"id": "planner_1"})]);
+        let decision = LlmDecision::from_tool_input(&decisione_product());
+        let delta = ClarifyOrExpandNode::build_ask_delta(
+            &cfg,
+            &st,
+            &decision,
+            true,
+            0.4,
+            Interlocutore::Nessuno,
+        )
+        .expect("delta");
+        let assunzioni = delta
+            .applied_default_assumptions
+            .expect("campo")
+            .expect("valore");
+        assert_eq!(assunzioni.len(), 2);
+        assert_eq!(assunzioni[0]["id"], json!("planner_1"));
     }
 
     #[test]
@@ -1169,7 +1553,15 @@ mod tests {
         let cfg = ClarifyConfig::default();
         let st = trigger_state();
         let decision = LlmDecision::from_tool_input(&json!({"mode": "ask", "question": "  "}));
-        assert!(ClarifyOrExpandNode::build_ask_delta(&cfg, &st, &decision, false, 0.4).is_none());
+        assert!(ClarifyOrExpandNode::build_ask_delta(
+            &cfg,
+            &st,
+            &decision,
+            false,
+            0.4,
+            Interlocutore::Umano
+        )
+        .is_none());
     }
 
     #[test]
@@ -1191,10 +1583,13 @@ mod tests {
 
     // ── Nodo end-to-end con i mock dei trait ────────────────────────────────────
 
-    /// ask -> pending_clarify + meta_step + clarify_attempts incrementato.
+    /// ask -> pending_clarify + meta_step + clarify_attempts incrementato, E il
+    /// meta_step PERSISTITO: quel canale e' l'unico su cui la domanda sopravvive
+    /// al run (misurato: zero righe `kind='clarify'` in DB su due progetti,
+    /// quindi nemmeno un umano avrebbe potuto rispondere).
     #[tokio::test]
     async fn nodo_ask_emette_pending_clarify_e_meta_step() {
-        let node = ClarifyOrExpandNode::new(ClarifyConfig::default());
+        let (node, store) = nodo_con_store(ClarifyConfig::default());
         let llm = Arc::new(ScriptedLlm::with_decision(json!({
             "mode": "ask",
             "question": "Vuoi una cache in-memory o Redis?",
@@ -1214,14 +1609,83 @@ mod tests {
             "clarify_attempts incrementato"
         );
         assert_eq!(out.meta_steps.len(), 1);
-        assert_eq!(out.meta_steps[0].kind, "clarify");
+        assert_eq!(out.meta_steps[0].kind, META_KIND_CLARIFY);
         assert_eq!(out.meta_steps[0].title, "Serve un chiarimento");
+
+        let persistiti = store.meta_steps.lock().expect("lock");
+        assert_eq!(
+            persistiti.len(),
+            1,
+            "la domanda deve arrivare in DB, o nessuno potra' rispondere"
+        );
+        assert_eq!(persistiti[0]["kind"], json!(META_KIND_CLARIFY));
+        assert_eq!(
+            persistiti[0]["payload"]["question"],
+            json!("Vuoi una cache in-memory o Redis?")
+        );
+    }
+
+    /// IL CASO MISURATO (18/08/2026, `ui_ux_designer` su `app-libri-18-08`).
+    ///
+    /// Stessa config di produzione, stesso stato di un sub-run, stessa decisione
+    /// che il modello ha davvero emesso — e la CONSEGUENZA che si guarda e'
+    /// quella che l'utente ha visto due volte: una figura che chiude senza dire
+    /// niente.
+    ///
+    /// MUTAZIONE: rimettere `pending_clarify: Some(Some(true))` nel ramo senza
+    /// interlocutore (o togliere il ramo) fa rosseggiare la prima asserzione, e
+    /// con essa il resto: `is_pending_clarify()` torna `true`, l'edge del grafo
+    /// instrada a `End`, e il sub-run chiude «completed» con 0 iterazioni.
+    #[tokio::test]
+    async fn una_figura_senza_interlocutore_non_muore_muta() {
+        let (node, store) = nodo_con_store(cfg_produzione());
+        let llm = Arc::new(ScriptedLlm::with_decision(decisione_product()));
+        let ctx = ctx_with(llm.clone(), Arc::new(FailingTools));
+        let st = stato_sub_run();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
+
+        assert!(
+            !out.is_pending_clarify(),
+            "e' la condizione che l'edge instrada a End: il run non deve morire qui"
+        );
+        let assunzioni = out
+            .applied_default_assumptions
+            .expect("l'assunzione e' dichiarata, non buttata");
+        assert_eq!(assunzioni.len(), 1);
+        assert_eq!(
+            assunzioni[0]["question"],
+            json!("Quale palette e quale famiglia tipografica devo adottare?")
+        );
+
+        let persistiti = store.meta_steps.lock().expect("lock");
+        assert_eq!(persistiti.len(), 1);
+        assert_eq!(
+            persistiti[0]["kind"],
+            json!(META_KIND_CLARIFY_ASSUNZIONE),
+            "un'assunzione applicata non e' una domanda posta"
+        );
+    }
+
+    /// Il run di CHAT in automatico non e' toccato: li' un umano c'e', la
+    /// domanda compare in chat, e `confirm_irreversible_in_auto` continua a fare
+    /// cio' per cui esiste (intercettare product/irreversibile).
+    #[tokio::test]
+    async fn il_run_di_chat_in_automatico_puo_ancora_chiedere() {
+        let (node, _store) = nodo_con_store(cfg_produzione());
+        let llm = Arc::new(ScriptedLlm::with_decision(decisione_product()));
+        let ctx = ctx_with(llm, Arc::new(FailingTools));
+        let mut st = trigger_state();
+        st.automation_mode = Some(AutomationMode::Automatic);
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
+
+        assert!(out.is_pending_clarify());
+        assert_eq!(out.applied_default_assumptions, None);
     }
 
     /// expand -> expanded_query, niente pending_clarify ne' meta_step.
     #[tokio::test]
     async fn nodo_expand_popola_expanded_query() {
-        let node = ClarifyOrExpandNode::new(ClarifyConfig::default());
+        let node = nodo_di_test();
         let llm = Arc::new(ScriptedLlm::with_decision(json!({
             "mode": "expand",
             "expanded_query": "implementazione cache sessioni utente con TTL e invalidazione"
@@ -1241,7 +1705,7 @@ mod tests {
     /// skip dal gate (confidence alta) -> delta vuoto, l'LLM NON viene chiamato.
     #[tokio::test]
     async fn nodo_gate_skip_passthrough() {
-        let node = ClarifyOrExpandNode::new(ClarifyConfig::default());
+        let node = nodo_di_test();
         let llm = Arc::new(ScriptedLlm::with_decision(
             json!({"mode": "ask", "question": "x"}),
         ));
@@ -1257,7 +1721,7 @@ mod tests {
     /// LLM emette solo testo (no tool_use) -> no-op.
     #[tokio::test]
     async fn nodo_no_tool_use_noop() {
-        let node = ClarifyOrExpandNode::new(ClarifyConfig::default());
+        let node = nodo_di_test();
         let ctx = ctx_with(
             Arc::new(ScriptedLlm::no_tool()),
             Arc::new(FailingTools),
@@ -1270,7 +1734,7 @@ mod tests {
     /// LLM fallisce -> no-op (best-effort).
     #[tokio::test]
     async fn nodo_llm_fallito_noop() {
-        let node = ClarifyOrExpandNode::new(ClarifyConfig::default());
+        let node = nodo_di_test();
         let ctx = ctx_with(Arc::new(FailingLlm), Arc::new(FailingTools));
         let st = trigger_state();
         let delta = node.run(&st, &ctx).await.expect("run ok");
