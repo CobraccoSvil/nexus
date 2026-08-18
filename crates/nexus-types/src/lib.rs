@@ -7,7 +7,8 @@ pub use nexus_auth::Claims;
 
 mod templates;
 pub use templates::{
-    get_template_or_default, TemplateCache, ENGLISH_VARIANTS_SETTING_KEY, ENGLISH_VARIANT_SUFFIX,
+    chiave_variante, chiavi_servibili, get_template_or_default, TemplateCache,
+    ENGLISH_VARIANTS_SETTING_KEY, ENGLISH_VARIANT_SUFFIX,
 };
 
 pub mod fs_browse;

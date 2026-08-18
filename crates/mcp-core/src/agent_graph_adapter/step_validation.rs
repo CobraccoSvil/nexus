@@ -2555,7 +2555,8 @@ mod tests_appartenenza_dei_bersagli {
         }
     }
 
-    /// COPERTURA della mig 0739 sui mandati: le due meta' devono COMBACIARE.
+    /// COPERTURA della mig 0739 su TUTTE le righe che il runtime puo' servire
+    /// come mandato: le due meta' devono COMBACIARE su ciascuna.
     ///
     /// Il blocco `<appartenenza_dei_bersagli>` risponde sui SOLI indirizzi di
     /// rete scritti per esteso, quindi il mandato puo' allentarsi solo li'. Per
@@ -2567,79 +2568,170 @@ mod tests_appartenenza_dei_bersagli {
     /// parte. Dove il fatto non arriva la regola stretta della 0677 deve
     /// sopravvivere: allentarla sarebbe un allentamento non compensato.
     ///
-    /// Si conta la COPERTURA — quanti dei due mandati portano ciascuna meta' —
-    /// e non l'esistenza di una riga: la 0739 riscrive i mandati per intero, e
-    /// una `UPDATE ... WHERE key` che non mordesse (chiave rinominata, riga
-    /// disattivata) non fallirebbe, lascerebbe in piedi il testo vecchio in
-    /// silenzio.
+    /// IL PERIMETRO NON E' «I DUE MANDATI». Un mandato e' una CHIAVE, e a una
+    /// chiave corrispondono piu' RIGHE servibili: dalla mig 0726 esiste la
+    /// gemella `<chiave>.en`, e a sceglierle e' `get_template_or_default`
+    /// leggendo il CSV `prompt.english_variants` — un UPDATE senza redeploy,
+    /// che sul META vivo del 18/08/2026 elenca entrambe le chiavi del gate,
+    /// cioe' in produzione i giudici leggono le righe INGLESI. La prima
+    /// stesura di questo guard pretendeva `2` e sarebbe rimasta verde con le
+    /// due righe servite ferme al mandato vecchio. Il perimetro si deriva
+    /// percio' da [`nexus_types::chiavi_servibili`], la stessa funzione da cui
+    /// la selezione compone la chiave della variante (regola O): una variante
+    /// nuova nasce li' e questo guard la segue, mentre un letterale — `2`
+    /// ieri, `4` oggi — e' falso alla variante successiva.
+    ///
+    /// Si conta la COPERTURA e non l'esistenza di una riga: la 0739 riscrive i
+    /// mandati per intero, e una `UPDATE ... WHERE key` che non mordesse
+    /// (chiave rinominata, riga disattivata, gemella dimenticata) non
+    /// fallirebbe, lascerebbe in piedi il testo vecchio in silenzio.
+    ///
+    /// I MARCATORI SONO BILINGUI perche' le righe lo sono, e il confronto e'
+    /// case-insensitive: una regola che apre una frase cambia di maiuscola fra
+    /// le due lingue.
     ///
     /// MUTAZIONI che lo fanno rosseggiare, ciascuna col difetto per cui il
     /// lotto e' stato bocciato:
+    ///   - lasciare indietro UNA riga servibile (per esempio non aggiornare
+    ///     `subagent.step_gatekeeper.base.en`): il rosso la nomina;
     ///   - rimettere in gatekeeper 3 «Se nessuna delle due fonti risponde,
     ///     giudica il RISCHIO del passo» al posto del reject motivato;
     ///   - togliere da challenger 2 il «in dubbio = reject»;
-    ///   - togliere da un mandato la dichiarazione che su pid, container e
-    ///     label il blocco «tace per costruzione».
+    ///   - togliere da una riga la dichiarazione che su pid, container e label
+    ///     il blocco «tace per costruzione».
     #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn la_cautela_resta_dove_il_fatto_non_arriva(pool: PgPool) {
-        let mandati: Vec<(String, String)> = sqlx::query_as(
+        // Il perimetro, DERIVATO dal criterio di selezione: per ciascuna chiave
+        // di mandato, le righe che `get_template_or_default` puo' restituire.
+        let mut atteso: Vec<(&str, String)> = Vec::new();
+        for chiave in [PROMPT_GATEKEEPER, PROMPT_CHALLENGER] {
+            for servibile in nexus_types::chiavi_servibili(chiave) {
+                atteso.push((chiave, servibile));
+            }
+        }
+        let chiavi: Vec<String> = atteso.iter().map(|(_, k)| k.clone()).collect();
+
+        let righe: Vec<(String, String)> = sqlx::query_as(
             "SELECT key, content FROM nexus_prompt_templates \
              WHERE key = ANY($1) AND is_active = true",
         )
-        .bind(vec![
-            PROMPT_GATEKEEPER.to_string(),
-            PROMPT_CHALLENGER.to_string(),
-        ])
+        .bind(&chiavi)
         .fetch_all(&pool)
         .await
-        .expect("i mandati del gate duale sono nel META migrato");
-        assert_eq!(
-            mandati.len(),
-            2,
-            "la 0739 deve trovare DUE mandati attivi da riscrivere, non {}: \
-             una UPDATE che non morde e' silenziosa",
-            mandati.len()
-        );
+        .expect("le righe di mandato sono nel META migrato");
 
-        // Meta' che si ALLENTA: entrambi i mandati nominano il blocco, o il
-        // codice consegnerebbe un contesto che il prompt non dichiara.
-        let col_blocco = mandati
-            .iter()
-            .filter(|(_, c)| c.contains("appartenenza_dei_bersagli"))
-            .count();
-        assert_eq!(
-            col_blocco, 2,
-            "solo {col_blocco} mandati su 2 nominano <appartenenza_dei_bersagli>"
-        );
-
-        // Meta' che RESTA: dove il blocco tace, la cautela non cade. La regola
-        // stretta e' asimmetrica fra i due ruoli e si verifica per ruolo.
-        for (key, content) in &mandati {
+        // Non vacuita', e per RUOLO: se una chiave non avesse alcuna riga
+        // attiva i confronti che seguono girerebbero a vuoto e uscirebbero
+        // verdi. Ogni mandato deve portare tutte le righe che la selezione
+        // dichiara servibili — una gemella disattivata e' un cambiamento di
+        // contratto, non un dettaglio.
+        for (mandato, servibile) in &atteso {
             assert!(
-                content.contains("tace per costruzione"),
-                "il mandato `{key}` non dichiara che su pid, container e label il blocco \
-                 tace: un giudice puo' leggere l'assenza di riga come un'assoluzione"
+                righe.iter().any(|(k, _)| k == servibile),
+                "la riga `{servibile}` del mandato `{mandato}` non e' attiva nel META \
+                 migrato: la selezione puo' servirla, quindi va aggiornata come le altre"
             );
-            let stretta = if key == PROMPT_GATEKEEPER {
-                "appartenenza non dimostrabile dai dati del passo = reject motivato"
-            } else {
-                "in dubbio = reject"
-            };
+        }
+        assert_eq!(
+            righe.len(),
+            atteso.len(),
+            "perimetro incoerente: {} righe attive contro le {} servibili",
+            righe.len(),
+            atteso.len()
+        );
+
+        // E nel DB non esistono righe di mandato che il criterio NON dichiari
+        // servibili. E' il caso inverso e piu' insidioso: una migrazione che
+        // crea una variante nuova (la 0726 lo ha fatto con `.en`) senza che la
+        // selezione la conosca. Li' il guard sopra resterebbe verde — conta
+        // cio' che il criterio elenca — e la riga nuova andrebbe alla deriva
+        // finche' qualcuno non la mettesse nel CSV. Il rosso chiede di
+        // estendere `chiavi_servibili`, non di cancellare la riga.
+        let censite: Vec<String> = sqlx::query_scalar(
+            "SELECT key FROM nexus_prompt_templates \
+             WHERE key LIKE $1 || '%' OR key LIKE $2 || '%' ORDER BY key",
+        )
+        .bind(PROMPT_GATEKEEPER)
+        .bind(PROMPT_CHALLENGER)
+        .fetch_all(&pool)
+        .await
+        .expect("censimento delle righe di mandato");
+        for key in &censite {
             assert!(
-                content.contains(stretta),
-                "il mandato `{key}` ha perso la regola stretta della 0677 (`{stretta}`): il \
-                 blocco non risponde su pid, container e label di servizio, quindi li' la \
-                 cautela non puo' cadere"
+                chiavi.contains(key),
+                "la riga `{key}` porta un mandato del gate ma `chiavi_servibili` non la \
+                 dichiara: o la selezione sa gia' servirla e questo guard e' cieco su di \
+                 lei, o nessuno la servira' mai. Estendi il criterio in nexus-types."
             );
         }
 
-        // E l'allentamento NON e' generale: nessuno dei due manda a giudicare
-        // il solo rischio quando nessuna fonte risponde su un bersaglio che il
-        // passo DISTRUGGE. E' la frase esatta con cui il lotto era stato scritto.
-        for (key, content) in &mandati {
+        let ruolo_di = |key: &str| -> &str {
+            if key.starts_with(PROMPT_GATEKEEPER) {
+                PROMPT_GATEKEEPER
+            } else {
+                PROMPT_CHALLENGER
+            }
+        };
+        // Un marcatore e' presente se lo e' in UNA delle due lingue: le righe
+        // `.en` portano la stessa regola tradotta, non una regola diversa.
+        let porta = |content: &str, forme: &[&str]| -> bool {
+            let basso = content.to_lowercase();
+            forme.iter().any(|f| basso.contains(&f.to_lowercase()))
+        };
+
+        for (key, content) in &righe {
+            // Meta' che si ALLENTA: ogni riga servibile nomina il blocco, o il
+            // codice consegnerebbe a quel giudice un contesto che il suo
+            // prompt non dichiara. Il tag e' un identificatore: non tradotto.
             assert!(
-                !content.contains("Se nessuna delle due fonti risponde, giudica il RISCHIO"),
-                "il mandato `{key}` allenta l'appartenenza anche dove il blocco non porta \
+                porta(content, &["appartenenza_dei_bersagli"]),
+                "la riga `{key}` non nomina <appartenenza_dei_bersagli>: resta al mandato \
+                 che pretende una prova non scrivibile nel testo di un comando"
+            );
+
+            // Meta' che RESTA: dove il blocco tace, la cautela non cade.
+            assert!(
+                porta(content, &["tace per costruzione", "silent by construction"]),
+                "la riga `{key}` non dichiara che su pid, container e label il blocco \
+                 tace: un giudice puo' leggere l'assenza di riga come un'assoluzione"
+            );
+
+            // La regola stretta della 0677 e' asimmetrica fra i due ruoli.
+            let stretta: &[&str] = if ruolo_di(key) == PROMPT_GATEKEEPER {
+                &[
+                    "appartenenza non dimostrabile dai dati del passo = reject motivato",
+                    "ownership not provable from the step's own data = a motivated reject",
+                ]
+            } else {
+                &["in dubbio = reject", "in doubt = reject"]
+            };
+            assert!(
+                porta(content, stretta),
+                "la riga `{key}` ha perso la regola stretta della 0677: il blocco non \
+                 risponde su pid, container e label di servizio, quindi li' la cautela \
+                 non puo' cadere"
+            );
+
+            // Il fatto non e' un lasciapassare.
+            assert!(
+                porta(content, &["resta distruggibile", "remains destructible"]),
+                "la riga `{key}` non dichiara che l'appartenenza risolta lascia intatta \
+                 la soglia sull'irreversibilita'"
+            );
+
+            // E l'allentamento NON e' generale: nessuna riga manda a giudicare
+            // il solo rischio quando nessuna fonte risponde su un bersaglio
+            // che il passo DISTRUGGE. Sono le frasi esatte con cui il lotto era
+            // stato scritto la prima volta, nelle due lingue.
+            assert!(
+                !porta(
+                    content,
+                    &[
+                        "Se nessuna delle due fonti risponde, giudica il RISCHIO",
+                        "If neither source answers, judge the RISK",
+                    ]
+                ),
+                "la riga `{key}` allenta l'appartenenza anche dove il blocco non porta \
                  alcun fatto (pid, container, label): allentamento non compensato"
             );
         }

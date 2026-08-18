@@ -63,6 +63,42 @@ pub const ENGLISH_VARIANTS_SETTING_KEY: &str = "prompt.english_variants";
 /// Suffisso delle righe di variante inglese in `nexus_prompt_templates`.
 pub const ENGLISH_VARIANT_SUFFIX: &str = ".en";
 
+/// La chiave della riga VARIANTE per una chiave richiesta.
+///
+/// Punto unico da cui `get_template_or_default` deriva la riga `.en`: chi
+/// verifica un invariante di contenuto deve poter comporre la stessa chiave
+/// che la selezione compone, senza ricopiarne la forma (regola O).
+pub fn chiave_variante(key: &str) -> String {
+    format!("{key}{ENGLISH_VARIANT_SUFFIX}")
+}
+
+/// Le righe di `nexus_prompt_templates` che il runtime PUO' servire quando gli
+/// si chiede `key`.
+///
+/// NON e' l'elenco di cio' che serve ADESSO: quello lo decide il CSV
+/// `prompt.english_variants`, che e' un UPDATE senza redeploy e puo' cambiare
+/// fra due convocazioni. E' l'elenco di cio' che puo' USCIRE da
+/// `get_template_or_default`, e quindi il perimetro su cui va verificato
+/// qualunque invariante di CONTENUTO di un prompt.
+///
+/// PERCHE' NON BASTA LA RIGA BASE. Misurato il 18/08/2026 sul META vivo: dal
+/// 17/08/2026 02:23 UTC il CSV elenca tutte e quattro le chiavi dell'A/B
+/// (mig 0726), fra cui i due giudici del gate duale — quindi in produzione la
+/// riga servita e' la `.en`, e una migrazione che aggiorni la sola riga
+/// italiana non cambia una virgola di cio' che il giudice legge. La riga base
+/// non e' «quella vera con una traduzione a fianco»: sono due righe che il
+/// runtime serve alternativamente, e un invariante vale su entrambe o su
+/// nessuna.
+///
+/// DERIVATA da [`chiave_variante`], la stessa funzione che la selezione usa:
+/// una variante nuova nasce li' e questo elenco la segue. Un numero scritto a
+/// mano in un guard — «due mandati», «quattro righe» — diventa falso alla
+/// variante successiva, che e' precisamente il modo in cui la 0726 e' passata
+/// inosservata a chi ha scritto la 0739.
+pub fn chiavi_servibili(key: &str) -> Vec<String> {
+    vec![key.to_string(), chiave_variante(key)]
+}
+
 /// La SELECT unica sulla tabella dei template: la variante EN e quella IT
 /// escono dalla stessa query, o le due strade divergerebbero al primo filtro
 /// aggiunto a una sola delle due (regola L).
@@ -109,7 +145,7 @@ pub async fn get_template_or_default(db: &PgPool, cache: &TemplateCache, key: &s
         return cached;
     }
     if variante_inglese_selezionata(db, key).await {
-        let chiave_en = format!("{key}{ENGLISH_VARIANT_SUFFIX}");
+        let chiave_en = chiave_variante(key);
         match fetch_active_content(db, &chiave_en).await {
             Ok(Some(content)) => {
                 cache.set(key.to_string(), content.clone());
