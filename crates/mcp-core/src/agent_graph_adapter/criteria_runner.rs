@@ -2257,16 +2257,22 @@ fn tutte_non_eseguite(
 ///
 /// I tre esiti sono TRE e non due: `Failed` solo per una prova OSSERVATA e non
 /// conforme; `Passed` quando almeno una prova INDIPENDENTE e' stata eseguita e
-/// nessuna e' caduta; `Inconclusive` in tutti gli altri casi — nessuna prova
-/// dichiarata, prove tutte rifiutate, oppure prove superate ma tutte proposte
-/// dall'esecutore stesso. Il piano VUOTO non e' un via libera, ed e' la
-/// differenza rispetto a `codice_eseguibile`: li' il criterio ha guardato i
-/// file e ha constatato che nessuno era codice, qui nessuno ha dichiarato
-/// niente.
+/// nessuna e' caduta, OPPURE quando nessuno ha dichiarato prove; `Inconclusive`
+/// quando le prove c'erano e non sono valse come misura — tutte rifiutate,
+/// oppure superate ma tutte proposte dall'esecutore stesso.
+///
+/// IL PIANO VUOTO PASSA, e non e' un via libera comprato: `Inconclusive`
+/// presuppone che le prove esistano e non si siano potute valutare, e finche' il
+/// campo e' nuovo quella premessa e' falsa per costruzione — un piano vuoto oggi
+/// significa «il sistema non ha ancora imparato a emettere prove», cioe' la
+/// situazione di ieri, e il criterio nasce su OGNI run. Cio' che il criterio NON
+/// ha misurato resta scritto nell'evidenza (`misurato: false`,
+/// `skipped_reason`, `per_origine` a zero): il razionale per esteso sta sulla
+/// variante `VerdettoPiano::PianoVuoto`.
 fn esito_piano(esiti: &[piano_di_verifica::EsitoProva]) -> (CriterionOutcome, Value) {
     use piano_di_verifica::VerdettoPiano;
     let verdetto = piano_di_verifica::classifica_piano(esiti);
-    let esito = esito_da_verdetto(verdetto.e_bloccante(), verdetto.ha_misurato());
+    let esito = esito_da_verdetto(verdetto.e_bloccante(), verdetto.dichiara_un_esito());
     match &verdetto {
         VerdettoPiano::ProvaFallita { fallite } => tracing::info!(
             target: "mcp_core::criteria_runner",
@@ -2300,14 +2306,21 @@ fn esito_piano(esiti: &[piano_di_verifica::EsitoProva]) -> (CriterionOutcome, Va
 ///
 /// I criteri che portano un verdetto PROPRIO — il codice eseguibile (0734), il
 /// piano di verifica (0737) — dichiarano due fatti indipendenti: se bocciano e
-/// se hanno misurato. La traduzione in [`CriterionOutcome`] e' la STESSA per
-/// entrambi, e due copie divergerebbero al primo ritocco proprio sul ramo che
-/// distingue «va bene» da «non ho guardato» (regola L).
+/// se hanno un esito da consegnare. La traduzione in [`CriterionOutcome`] e' la
+/// STESSA per entrambi, e due copie divergerebbero al primo ritocco proprio sul
+/// ramo che distingue «va bene» da «non ho guardato» (regola L).
 ///
-/// L'ordine e' load-bearing: bocciare precede l'aver misurato, perche' un
-/// verdetto bloccante e' per costruzione una misura.
-fn esito_da_verdetto(bloccante: bool, misurato: bool) -> CriterionOutcome {
-    match (bloccante, misurato) {
+/// Il secondo fatto e' «ho un esito da dichiarare», non «ho misurato»: per
+/// `codice_eseguibile` i due coincidono (`ha_misurato` e' gia' vero su
+/// `NienteDaProvare`, che e' una risposta), per `piano_di_verifica` no — li' il
+/// piano vuoto non e' una misura e passa lo stesso, e a dirlo e' un predicato
+/// suo (`dichiara_un_esito`) perche' l'evidenza possa continuare a scrivere che
+/// non si e' misurato niente.
+///
+/// L'ordine e' load-bearing: bocciare precede tutto, perche' un verdetto
+/// bloccante e' per costruzione una misura.
+fn esito_da_verdetto(bloccante: bool, ha_esito: bool) -> CriterionOutcome {
+    match (bloccante, ha_esito) {
         (true, _) => CriterionOutcome::Failed,
         (false, true) => CriterionOutcome::Passed,
         (false, false) => CriterionOutcome::Inconclusive,
@@ -4045,10 +4058,13 @@ mod tests {
 
     /// RILIEVO 6 — UNA PROVA TAUTOLOGICA DELL'AGENTE NON COMPRA IL VERDE.
     ///
-    /// La via piu' economica per rendere verde il gate era `echo ok` con attesa
-    /// «l'output contiene ok»: il criterio passava da `Inconclusive` a `Passed`.
+    /// La via piu' economica per farsi certificare era `echo ok` con attesa
+    /// «l'output contiene ok»: il criterio diventava un `PianoSuperato`, cioe'
+    /// MISURATO e indistinguibile da una prova di chi non ha scritto il codice.
     /// Ora la prova gira davvero (e' innocua) ma NON e' una misura, perche' a
-    /// proporla e' stato chi ha scritto il codice.
+    /// proporla e' stato chi ha scritto il codice — e qui la premessa di
+    /// `Inconclusive` e' vera, a differenza del piano VUOTO: le prove ci sono e
+    /// sono state valutate.
     ///
     /// MUTAZIONE ESEGUITA: togliere il filtro sull'origine dal conteggio degli
     /// `indipendenti` in `classifica_piano` riporta l'esito a `Passed` e questo
@@ -4172,17 +4188,27 @@ mod tests {
         );
     }
 
-    /// PIANO VUOTO: il criterio non boccia e NON dichiara di aver verificato.
+    /// PIANO VUOTO: il criterio non boccia, non declassa, e DICE di non aver
+    /// misurato niente.
     ///
-    /// E' il caso normale finche' le figure non imparano a emettere prove, ed e'
-    /// la ragione per cui il pavimento resta: se un piano vuoto valesse come
-    /// misura positiva, ogni run senza prove salirebbe nel conteggio dei criteri
-    /// misurati del gate — cioe' il silenzio tornerebbe a leggersi «verificato».
+    /// E' il caso normale — oggi il 100% dei run, perche' il campo `prove` e'
+    /// nato con questa migrazione e nessuna figura lo compila ancora — e la
+    /// conseguenza si misura QUI, dove il verdetto diventa l'esito che il gate
+    /// legge: con `Inconclusive` la 0737 chiuderebbe `completed_unverified` OGNI
+    /// run software, contro il precedente che il gate dichiara gia' per se'
+    /// («un inconcludente qui declasserebbe a `completed_unverified` ogni run a
+    /// cui il criterio non si applica», `final_gate.rs`).
     ///
-    /// MUTAZIONE ESEGUITA: far ritornare `true` a `VerdettoPiano::ha_misurato`
-    /// per `PianoVuoto` porta l'esito a `Passed` e questo test rosseggia.
+    /// L'ASSENZA RESTA SCRITTA e non e' un silenzio: `misurato: false`, il
+    /// motivo in chiaro, e il conteggio per origine leggibile a zero — che e'
+    /// esattamente il numero da cui si vedra' quando le figure cominceranno a
+    /// emettere prove.
+    ///
+    /// MUTAZIONE ESEGUITA: togliere `PianoVuoto` da
+    /// `VerdettoPiano::dichiara_un_esito` riporta l'esito a `Inconclusive` e
+    /// questo test rosseggia.
     #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
-    async fn un_piano_vuoto_non_boccia_e_non_verifica(pool: PgPool) {
+    async fn un_piano_vuoto_non_boccia_e_non_declassa_il_run(pool: PgPool) {
         use nexus_agent_graph::decisions::PianoDiVerifica;
         let criterio = criterio_reale(
             &pool,
@@ -4194,8 +4220,21 @@ mod tests {
         let runner = FinalGateCriteriaRunnerAdapter::new(exec.clone(), pool, None)
             .con_giudice(GiudiceFinto::che_approva());
         let res = runner.run(vec![criterio]).await.expect("nessun PortError");
-        assert_eq!(res[0].outcome, CriterionOutcome::Inconclusive);
+        assert_eq!(
+            res[0].outcome,
+            CriterionOutcome::Passed,
+            "parita' con ieri finche' nessuno emette prove: {}",
+            res[0].evidence
+        );
         assert_eq!(res[0].evidence["verdict"], "no_plan");
+        assert_eq!(
+            res[0].evidence["misurato"], false,
+            "passa, ma non afferma di aver verificato"
+        );
+        assert!(res[0].evidence["skipped_reason"]
+            .as_str()
+            .is_some_and(|m| m.contains("nessuna prova")));
+        assert_eq!(res[0].evidence["per_origine"], json!({}));
         assert!(exec.calls.lock().unwrap().is_empty(), "niente da eseguire");
     }
 

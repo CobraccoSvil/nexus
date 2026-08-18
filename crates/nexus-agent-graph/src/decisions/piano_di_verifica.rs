@@ -1079,10 +1079,16 @@ pub enum VerdettoPiano {
     ///
     /// Non e' una misura positiva, ed e' «giudice != worker» applicato al
     /// verdetto invece che alla sola provenienza nel referto. Senza questa
-    /// variante la via piu' economica per rendere verde il gate era una prova
-    /// tautologica: `echo ok` con attesa `output_contains: "ok"` portava il
-    /// criterio da `Inconclusive` a `Passed`, cioe' l'esecutore si fabbricava
-    /// la propria verifica.
+    /// variante la via piu' economica per comprare una verifica era una prova
+    /// tautologica: `echo ok` con attesa `output_contains: "ok"` dava
+    /// [`VerdettoPiano::PianoSuperato`], cioe' un criterio MISURATO e
+    /// indistinguibile da una prova di chi non ha scritto il codice — dodici
+    /// caratteri per farsi certificare da se'.
+    ///
+    /// Qui la premessa di `Inconclusive` e' VERA, ed e' cio' che distingue
+    /// questa assenza da [`VerdettoPiano::PianoVuoto`]: le prove esistono, sono
+    /// state eseguite e valutate, e non valgono come misura per via di CHI le
+    /// ha proposte.
     ///
     /// L'asimmetria e' voluta: l'esecutore puo' INCRIMINARSI ma non
     /// ASSOLVERSI — una sua prova FALLITA resta `ProvaFallita` e blocca il run,
@@ -1095,13 +1101,34 @@ pub enum VerdettoPiano {
     ProvaFallita { fallite: Vec<EsitoProva> },
     /// Nessuna prova dichiarata.
     ///
-    /// NON e' un via libera, ed e' la differenza rispetto al
-    /// `NienteDaProvare` di [`super::codice_eseguibile`]: li' il criterio ha
-    /// GUARDATO i file prodotti e ha constatato che nessuno era codice; qui
-    /// nessuno ha dichiarato niente, che e' un'assenza di dichiarazione e non
-    /// una misura. Contarla come misura positiva farebbe salire il conteggio
-    /// dei criteri misurati del gate proprio nei run che non hanno dichiarato
-    /// nulla — cioe' renderebbe «verificato» il silenzio.
+    /// NON e' una misura — [`Self::ha_misurato`] resta `false` e l'evidenza lo
+    /// scrive — e non e' nemmeno un declassamento: al gate consegna un esito
+    /// POSITIVO ([`Self::dichiara_un_esito`]).
+    ///
+    /// LA RAGIONE E' UNA PREMESSA, non una preferenza. `Inconclusive` significa
+    /// «le prove esistevano e non si sono potute valutare», che e' il caso di
+    /// [`Self::NonEseguito`]. Finche' il campo `prove` e' NUOVO — nessuna figura
+    /// ne emette ancora, i mandati della 0737 le chiedono da oggi — quella
+    /// premessa e' falsa per costruzione: un piano vuoto dice «il sistema non ha
+    /// ancora imparato a emettere prove», cioe' esattamente la situazione di
+    /// ieri. La parita' con ieri e' quindi il comportamento CORRETTO, non un
+    /// indebolimento: il criterio nasce su OGNI run, e con `Inconclusive` la
+    /// 0737 avrebbe chiuso `completed_unverified` OGNI run software — contro il
+    /// precedente che il gate dichiara gia' per se' («un inconcludente qui
+    /// declasserebbe a `completed_unverified` ogni run a cui il criterio non si
+    /// applica», `nodes/final_gate.rs`).
+    ///
+    /// CIO' CHE NON SI PERDE, ed e' il perche' della parita' invece del silenzio:
+    /// l'assenza resta scritta nell'evidenza (`misurato: false`,
+    /// `skipped_reason`, `prove.dichiarate: 0`) e `per_origine` resta leggibile
+    /// a zero. E' quel conteggio a dire QUANDO le figure cominceranno a emettere
+    /// prove, e il giorno in cui lo faranno il verdetto passera' da se' a
+    /// [`Self::PianoSuperato`] o a [`Self::ProvaFallita`] — senza toccare una
+    /// riga di questo criterio.
+    ///
+    /// Distinto da [`Self::SoloProveDellEsecutore`], che resta `Inconclusive`:
+    /// li' le prove ci sono e la premessa e' vera — sono state valutate e non
+    /// valgono come misura, perche' le ha proposte chi ha scritto il codice.
     PianoVuoto,
     /// C'erano prove e nessuna si e' potuta eseguire.
     NonEseguito {
@@ -1135,6 +1162,22 @@ impl VerdettoPiano {
     /// l'esecutore ha scelto di farsi chiedere.
     pub fn ha_misurato(&self) -> bool {
         matches!(self, Self::PianoSuperato { .. } | Self::ProvaFallita { .. })
+    }
+
+    /// Il criterio consegna un ESITO al gate, o si dichiara inconcludente?
+    ///
+    /// NON coincide con [`Self::ha_misurato`], e i due divergono su UNA sola
+    /// variante: [`Self::PianoVuoto`], dove non si e' misurato niente e l'esito
+    /// e' comunque positivo. Sono due fatti diversi e vanno tenuti in due
+    /// predicati, o l'evidenza sarebbe costretta a mentire su uno dei due per
+    /// dire il vero sull'altro (regola Q): «non ho misurato» resta scritto
+    /// (`misurato: false`, `skipped_reason`) e il run non viene declassato.
+    ///
+    /// Perche' il vuoto passi e l'inconcludente no sta sulla variante; qui basta
+    /// la conseguenza: `false` -> `Inconclusive` -> il run chiude
+    /// `completed_unverified`.
+    pub fn dichiara_un_esito(&self) -> bool {
+        self.ha_misurato() || matches!(self, Self::PianoVuoto)
     }
 
     /// Il FATTO da opporre all'agente quando il verdetto boccia. `None` quando
@@ -1289,7 +1332,9 @@ fn motivo_del_non_misurato(verdetto: &VerdettoPiano) -> Option<String> {
         VerdettoPiano::NonEseguito { causa, .. } => Some(causa.descrizione()),
         VerdettoPiano::PianoVuoto => Some(
             "nessuna prova eseguibile dichiarata: ne' gli apparati advisory ne' l'agente ne \
-             hanno emesse, quindi questo criterio non ha misurato nulla"
+             hanno emesse, quindi questo criterio non ha misurato nulla. Il run non e' \
+             declassato per questo — il campo e' nuovo e nessuno lo compila ancora — ma il \
+             conteggio per origine resta a zero, ed e' li' che si vedra' quando cominceranno"
                 .to_string(),
         ),
         // La misura c'e' ma e' AUTODICHIARATA: il criterio non certifica cio'
@@ -2391,11 +2436,10 @@ mod tests {
 
     /// RILIEVO 6 — L'ESECUTORE NON SI FABBRICA LA MISURA.
     ///
-    /// `superate > 0 -> Passed` valeva per qualunque origine, quindi la via piu'
-    /// economica per rendere verde il gate era una prova tautologica: `echo ok`
-    /// con attesa «l'output contiene ok» portava il criterio da `Inconclusive` a
-    /// `Passed`. Con `PianoVuoto -> Inconclusive` dichiarato load-bearing, quella
-    /// riga bastava a comprare la verifica.
+    /// `superate > 0 -> misurato` valeva per qualunque origine, quindi la via
+    /// piu' economica per farsi certificare era una prova tautologica: `echo ok`
+    /// con attesa «l'output contiene ok» dava `PianoSuperato`, cioe' un criterio
+    /// MISURATO e indistinguibile da una prova di chi non ha scritto il codice.
     ///
     /// L'asimmetria e' voluta: l'esecutore puo' INCRIMINARSI (una sua prova
     /// fallita blocca lo stesso) ma non ASSOLVERSI.
@@ -2494,15 +2538,28 @@ mod tests {
         assert!(classifica_piano(&esiti).ha_misurato());
     }
 
-    /// PIANO VUOTO: il criterio non ha misurato NIENTE, e lo dichiara. Non e' un
-    /// via libera — contarlo come misura positiva farebbe salire il conteggio dei
-    /// criteri misurati del gate proprio nei run che non hanno dichiarato nulla.
+    /// PIANO VUOTO: il criterio non ha misurato NIENTE, lo DICHIARA, e non
+    /// declassa il run.
     ///
-    /// MUTAZIONE ESEGUITA: far ritornare `true` a `ha_misurato` per `PianoVuoto`
-    /// rende rosso questo test, e con esso il gate tornerebbe a dire
-    /// «verificato» sul silenzio — il difetto del 17/08 in forma nuova.
+    /// I due fatti stanno in due predicati e questo test li tiene separati: se
+    /// collassassero, l'evidenza dovrebbe mentire su uno per dire il vero
+    /// sull'altro. `ha_misurato` resta falso — nessuno ha eseguito niente — e
+    /// `dichiara_un_esito` e' vero, perche' `Inconclusive` presuppone prove
+    /// esistenti e non valutabili, premessa oggi falsa per costruzione: il campo
+    /// e' nuovo e nessuna figura lo compila ancora, quindi un piano vuoto e'
+    /// esattamente la situazione di ieri e la parita' con ieri e' il
+    /// comportamento corretto.
+    ///
+    /// L'ASSENZA NON DIVENTA SILENZIO: il conteggio per origine resta leggibile
+    /// a zero, ed e' quel numero a dire quando le figure cominceranno a emettere
+    /// prove.
+    ///
+    /// MUTAZIONE ESEGUITA: rimettere `PianoVuoto` fuori da `dichiara_un_esito`
+    /// (cioe' `Inconclusive`) rende rosso questo test, e con esso il criterio
+    /// chiuderebbe `completed_unverified` OGNI run software — il criterio nasce
+    /// su ogni run e oggi nessuno emette prove.
     #[test]
-    fn un_piano_vuoto_non_e_una_verifica() {
+    fn un_piano_vuoto_non_e_una_verifica_e_non_declassa_il_run() {
         let v = classifica_piano(&[]);
         assert_eq!(v, VerdettoPiano::PianoVuoto);
         assert!(
@@ -2510,12 +2567,64 @@ mod tests {
             "nessuno ha dichiarato prove: non e' un difetto"
         );
         assert!(!v.ha_misurato(), "e nemmeno una verifica");
+        assert!(
+            v.dichiara_un_esito(),
+            "ma il run non si declassa perche' il campo prove e' nato ieri"
+        );
         assert_eq!(v.fatto_opponibile(), None);
         let ev = evidenza_piano(&v, &[]);
         assert_eq!(ev["misurato"], json!(false));
         assert!(ev["skipped_reason"]
             .as_str()
             .is_some_and(|m| m.contains("nessuna prova")));
+        assert_eq!(ev["prove"]["dichiarate"], json!(0));
+        assert_eq!(
+            ev["per_origine"],
+            json!({}),
+            "la metrica resta leggibile a zero: e' il numero che dira' quando le figure \
+             cominceranno a emettere prove"
+        );
+    }
+
+    /// IL CONFINE FRA LE DUE ASSENZE, che e' il punto in cui la parita' col
+    /// passato potrebbe diventare un condono.
+    ///
+    /// «Nessuna prova» e «prove tutte dell'esecutore» sono due vuoti diversi con
+    /// due esiti diversi, e la differenza e' la PREMESSA di `Inconclusive`: nel
+    /// secondo caso le prove esistono, sono state valutate, e non valgono come
+    /// misura perche' le ha proposte chi ha scritto il codice. Il rilievo 6
+    /// resta intatto: l'esecutore non compra il verde scrivendosi le domande.
+    ///
+    /// MUTAZIONE ESEGUITA: aggiungere `SoloProveDellEsecutore` a
+    /// `dichiara_un_esito` fa rosseggiare qui, e riaprirebbe la strada da 12
+    /// caratteri (`echo ok`) al gate verde.
+    #[test]
+    fn il_vuoto_che_passa_e_quello_che_non_passa_sono_distinti() {
+        let vuoto = classifica_piano(&[]);
+        let tautologica = classifica_piano(&[esito(
+            prova(
+                "echo ok",
+                Attesa::OutputContiene { testo: "ok".into() },
+                OriginePiano::Agente,
+            ),
+            EsitoSingolo::Superata,
+        )]);
+        assert!(vuoto.dichiara_un_esito(), "nessuna prova emessa: parita'");
+        assert!(
+            !tautologica.dichiara_un_esito(),
+            "prove emesse e valutate, ma dall'esecutore: la premessa di Inconclusive e' vera"
+        );
+        // E nemmeno l'altra assenza passa: li' le prove c'erano e non sono
+        // partite, che e' la definizione stessa di inconcludente.
+        let non_partita = classifica_piano(&[esito(
+            prova(
+                "pytest",
+                Attesa::Uscita { codice: 0 },
+                OriginePiano::Consiglio,
+            ),
+            non_eseguibile(CausaNonEseguita::OltreIlTetto { max: 6 }),
+        )]);
+        assert!(!non_partita.dichiara_un_esito());
     }
 
     /// Prove dichiarate e nessuna eseguita: non e' un piano vuoto, ed e' la
