@@ -1641,7 +1641,6 @@ pub(crate) async fn criterio_piano_verifica(
             mutatori,
             regole: gate.rules,
             rigenerabili: gate.rebuildable_artifacts,
-            osservazione: gate.observation_commands,
         })
     };
     criterio_piano(
@@ -2855,7 +2854,6 @@ async fn load_tool_dispatch_config(
         step_gate_rules: gate.rules,
         step_gate_max_rejections: gate.max_rejections,
         rebuildable_artifacts: gate.rebuildable_artifacts,
-        observation_commands: gate.observation_commands,
     }
 }
 
@@ -2879,16 +2877,14 @@ async fn load_dispatch_limits(
 }
 
 /// I campi del gate duale (migg 0677, 0684, 0688) per la
-/// [`ToolDispatchConfig`]. Struct e non tupla: sono cinque valori di cui due
-/// `Vec<String>` — `rebuildable_artifacts` e `observation_commands` — che a
-/// posizione sono indistinguibili, e scambiarli darebbe un gate che assolve
-/// `dist` e giudica `ls`.
+/// [`ToolDispatchConfig`]. Struct e non tupla: i valori omogenei a posizione
+/// sono indistinguibili, e scambiarli darebbe un gate che classifica un passo
+/// con i vocabolari di un altro.
 struct StepGateDispatch {
     mode: nexus_agent_graph::decisions::step_gate::StepGateMode,
     rules: Vec<nexus_agent_graph::decisions::step_gate::CriticalityRule>,
     max_rejections: u32,
     rebuildable_artifacts: Vec<String>,
-    observation_commands: Vec<String>,
 }
 
 /// Il mode passa dallo stesso parse dell'adapter (`load_mode`, punto unico del
@@ -2915,17 +2911,11 @@ async fn load_step_gate_dispatch(
     // framework, e un elenco nel codice sarebbe da rincorrere a ogni novita'.
     // Vuoto = nessun declassamento, cioe' il comportamento di prima.
     let rebuildable = nexus_auth::get_csv_setting(db, "orchestrator.rebuildable_artifacts").await;
-    // La soglia sul COSTO del gate (mig 0688). Unico elenco che ASSOLVE: cio'
-    // che non nomina viene giudicato, quindi la sua incompletezza costa
-    // convocazioni e mai un buco. Vuoto = nulla e' provatamente innocuo.
-    let osservazione =
-        nexus_auth::get_csv_setting(db, "orchestrator.step_reach.observation_commands").await;
     StepGateDispatch {
         mode,
         rules,
         max_rejections,
         rebuildable_artifacts: rebuildable,
-        observation_commands: osservazione,
     }
 }
 

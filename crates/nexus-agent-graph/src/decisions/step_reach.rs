@@ -59,36 +59,50 @@
 //! [`super::step_gate::TOOL_CON_COMANDO`]: un tool che esegue righe e non fosse
 //! in quell'elenco resterebbe comunque sopra la soglia, invece di passare.
 //!
-//! # La soglia sul costo, e perche' e' un ELENCO CHE ASSOLVE
+//! # La soglia sul costo che non c'era: perche' l'elenco che ASSOLVE e' sparito
 //!
-//! Con la sola inversione qui sopra ogni `run_command` diventa `Unconfined`, e
-//! in `enforce` questo significa due chiamate LLM prima di `ls`, `cat`,
-//! `git status`. Il costo e' il limite vero di questo gate: renderlo
-//! insostenibile e' il modo piu' sicuro di farlo spegnere, cioe' di tornare al
-//! punto di partenza per un'altra strada.
+//! Fino al 18/08/2026 esisteva una sesta variante, `Observation`, e con lei un
+//! vocabolario DB (`orchestrator.step_reach.observation_commands`, mig 0688)
+//! che riportava sotto la soglia le righe fatte di soli comandi di
+//! osservazione: `ls`, `cat`, `git status`, `node --version`. Serviva a non
+//! pagare due chiamate LLM per un `ls`, e l'argomento era che un elenco che
+//! ASSOLVE ha polarita' opposta a uno che accusa — cio' che non nomina viene
+//! giudicato, quindi la sua incompletezza costa denaro e latenza, non un buco.
 //!
-//! La soglia e' [`StepReach::Observation`], ed e' un elenco — ma di POLARITA'
-//! opposta a quello che il difetto ha prodotto, e l'asimmetria e' tutto:
+//! L'argomento reggeva. Quello che non reggeva era la PREMESSA: che l'agente
+//! usi la shell per guardare. MISURATO il 18/08/2026 sui due progetti con
+//! attivita' (`agent_steps`, tool che eseguono una riga):
 //!
-//! - `critical_step_rules` e' un elenco che ACCUSA. Cio' che non nomina passa.
-//!   La sua incompletezza costa SICUREZZA, e non si vede: `dotnet ef database
-//!   update` e' passato cinque volte senza che nulla lo dichiarasse;
-//! - `observation_commands` e' un elenco che ASSOLVE. Cio' che non nomina viene
-//!   GIUDICATO. La sua incompletezza costa DENARO e LATENZA, e si vede subito —
-//!   un giudice convocato su un `tree` che nessuno aveva previsto e' rumore
-//!   misurabile, non un buco.
+//! - app-libri-18-08, 21 righe: `curl` 8, `npm` 5, `go` 1, `netstat` 1,
+//!   `python` 1, `chmod` 1, `sqlite3` 1, `git diff` 1, piu' due righe che
+//!   nominavano un altro tool;
+//! - audit-verifica-17-08, 5 righe: `node --test` 3, `npx jest` 2.
 //!
-//! Un elenco incompleto che fallisce verso il giudizio non e' la stessa cosa di
-//! un elenco incompleto che fallisce verso il passaggio, ed e' il motivo per cui
-//! qui un elenco e' ammesso e li' no. Vocabolario in DB (regola G, chiave
-//! `orchestrator.step_reach.observation_commands`, mig 0688): VUOTO significa
-//! «nulla e' provatamente innocuo», cioe' tutto e' giudicato — nessun ripiego
-//! cablato nel codice, e il ripiego mancante fallisce verso la cautela.
+//! Ventisei righe, e il vocabolario in esercizio — ventotto voci — ne ha
+//! assolta UNA (`git diff backend/db/schema.sql`). Le 33 convocazioni reali del
+//! gate su quei due progetti sono TUTTE su `unconfined`. La ragione e'
+//! strutturale e non congiunturale: per guardare l'agente ha tool DEDICATI
+//! (`read_file`, `list_files`, `search_in_files`), e la shell la usa per
+//! COSTRUIRE ed ESEGUIRE. Il vocabolario era progettato per un uso della shell
+//! che non avviene.
 //!
-//! Il riconoscimento passa dallo scompositore unico
-//! [`super::shell_command::comandi`], mai da un `contains` sulla riga: una voce
-//! del vocabolario e' un PREFISSO DI PAROLE, quindi `git status` assolve
-//! `git status --short` e non ha nulla da dire su `git push`.
+//! LIMITE DELLA MISURA, dichiarato: due soli progetti, entrambi di generazione
+//! di app. Un task di DIAGNOSI userebbe piu' `cat`/`grep`, e li' qualcosa
+//! avrebbe risparmiato. La rimozione e' decisa sapendolo.
+//!
+//! La ragione VERA della rimozione non e' pero' che fosse quasi inerte: e' che
+//! un elenco che assolve SUGGERISCE la soluzione sbagliata al problema
+//! successivo. Il caso del 18/08 sono cinque `curl` respinti dal gate, e la
+//! strada che veniva spontanea era «aggiungi `curl` al vocabolario con qualche
+//! flag vietato» — che avrebbe chiuso l'istanza `curl` e ripresentato lo stesso
+//! problema con `wget`, con un client HTTP in node, con `psql`. E' la stessa
+//! forma di toppa che questo modulo esiste per NON commettere (regola H); il
+//! rimedio giusto e' dare al giudice i fatti che gli mancano, non allungare la
+//! lista di chi non deve essere giudicato.
+//!
+//! Il costo residuo resta un limite reale del gate, e ha gia' i suoi freni
+//! (`critical_step_max_rejections`, e il rollback `critical_step_gate_mode` a
+//! `enforce_irreversible`). Non ha piu' un elenco.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -102,11 +116,6 @@ use super::step_gate::StepCriticality;
 pub enum StepReach {
     /// Il passo non muta nulla: il tool e' fuori dal vocabolario dei mutatori.
     ReadOnly,
-    /// Il tool esegue una riga, e OGNI comando di quella riga e' stato
-    /// riconosciuto come osservazione (vocabolario DB, nessuna redirezione,
-    /// nessun env inline). E' l'unica variante che ASSOLVE, e assolve per
-    /// riconoscimento positivo: cio' che non e' riconosciuto non finisce qui.
-    Observation,
     /// Muta SOLO artefatti che il progetto sa rigenerare (output di build).
     /// Cancellarli e' il gesto piu' ordinario di un ciclo di sviluppo.
     Regenerable,
@@ -130,7 +139,6 @@ impl StepReach {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ReadOnly => "read_only",
-            Self::Observation => "observation",
             Self::Regenerable => "regenerable",
             Self::WorkingTree => "working_tree",
             Self::Unconfined => "unconfined",
@@ -144,9 +152,8 @@ impl StepReach {
     /// «assente dalla lista» smette di significare «innocuo».
     pub fn livello_minimo(self) -> StepCriticality {
         match self {
-            // Riconosciuta come osservazione: non e' «non l'ho vista», e'
-            // «l'ho vista e non tocca nulla». Sotto la soglia del gate.
-            Self::ReadOnly | Self::Observation => StepCriticality::ReadOnly,
+            // Il tool non e' un mutatore: non c'e' niente da disfare.
+            Self::ReadOnly => StepCriticality::ReadOnly,
             // Coperti dallo snapshot di sessione e riletti da review /
             // final_gate: restano fuori dal gate duale, come deciso il 04/08.
             Self::Regenerable | Self::WorkingTree => StepCriticality::Mutating,
@@ -162,9 +169,6 @@ impl StepReach {
     pub fn motivo(self) -> &'static str {
         match self {
             Self::ReadOnly => "non muta nulla",
-            Self::Observation => {
-                "esegue una riga fatta di soli comandi di osservazione riconosciuti"
-            }
             Self::Regenerable => "tocca artefatti che il progetto sa rigenerare",
             Self::WorkingTree => {
                 "scrive nell'albero di lavoro, coperto dallo snapshot di sessione"
@@ -198,34 +202,31 @@ const CAMPI_RIGA_ESEGUITA: &[&str] = &["command", "cmd", "sql"];
 /// I campi dell'input che nominano un PATH scritto.
 const CAMPI_PATH: &[&str] = &["path", "file_path", "target_path", "destination"];
 
-/// Classifica la portata di UN passo. PURA: i tre vocabolari (mutatori,
-/// artefatti rigenerabili, comandi di osservazione) arrivano dal chiamante
-/// (regola G), niente letture qui.
+/// Classifica la portata di UN passo. PURA: i due vocabolari (mutatori,
+/// artefatti rigenerabili) arrivano dal chiamante (regola G), niente letture
+/// qui.
 ///
 /// L'ordine dei criteri non e' arbitrario: si guarda PRIMA se il passo esegue
 /// una riga, poi dove scrive. Un tool che esegue e nomina anche un path (es.
 /// `--output`) resta non confinato — la riga puo' fare molto piu' di quel file.
+///
+/// Chi esegue una riga non ha ECCEZIONI: nessun elenco assolve piu' un comando
+/// per il suo nome. Il perche' — e la misura che lo decide — sta in testa al
+/// modulo.
 pub fn classifica_portata(
     tool_name: &str,
     tool_input: &Value,
     fs_mutator_tools: &[String],
     artefatti_rigenerabili: &[String],
-    comandi_di_osservazione: &[String],
 ) -> StepReach {
     if !super::hitl::is_mutator_tool_name(tool_name, fs_mutator_tools) {
         return StepReach::ReadOnly;
     }
-    if let Some(riga) = CAMPI_RIGA_ESEGUITA
+    if CAMPI_RIGA_ESEGUITA
         .iter()
-        .find_map(|c| tool_input.get(c).and_then(Value::as_str))
+        .any(|c| tool_input.get(c).and_then(Value::as_str).is_some())
     {
-        // L'unica assoluzione, e per riconoscimento POSITIVO: una riga che non
-        // si e' potuta riconoscere resta non confinata.
-        return if riga_e_osservazione(riga, comandi_di_osservazione) {
-            StepReach::Observation
-        } else {
-            StepReach::Unconfined
-        };
+        return StepReach::Unconfined;
     }
     let Some(path) = CAMPI_PATH
         .iter()
@@ -242,60 +243,6 @@ pub fn classifica_portata(
         // sessione, che fotografa la sola radice del progetto.
         CollocazionePath::FuoriAlbero => StepReach::Unconfined,
     }
-}
-
-/// La riga e' fatta di SOLI comandi di osservazione riconosciuti?
-///
-/// Delega la scomposizione al punto unico [`super::shell_command::comandi`]
-/// (regola L): mai un `contains` sulla riga, che non distingue un comando
-/// ESEGUITO da un comando NOMINATO — e' lo stesso principio per cui il matcher
-/// delle regole lessicali guarda i token e non il testo.
-///
-/// Tre condizioni, e devono valere per OGNI comando della catena:
-///
-/// 1. le sue prime parole coincidono con una voce del vocabolario. La voce e'
-///    un prefisso di PAROLE, non una sottostringa: `git status` assolve
-///    `git status --short` e non dice nulla su `git push`;
-/// 2. nessuna redirezione. `cat piano.md > src/main.rs` e' fatto di soli
-///    comandi di osservazione e scrive un file. Il campo `redirezioni` copre
-///    anche `2>&1`, che non scrive nulla di interessante: escluderlo e' il
-///    verso conservativo, e costa una convocazione, non un buco;
-/// 3. nessuna assegnazione env in testa. `FOO=1 ls` e' innocuo, ma il
-///    vocabolario assolve un PROGRAMMA e non l'ambiente in cui gira, e questa
-///    e' la meta' su cui non si vuole ragionare caso per caso.
-///
-/// Vocabolario vuoto -> `false` per costruzione: nessun comando e' provatamente
-/// innocuo finche' qualcuno non lo ha dichiarato tale (regola G, niente
-/// ripiego cablato — e qui il ripiego mancante fallisce verso il giudizio).
-///
-/// Sul campo `sql` la scomposizione shell e' una tokenizzazione grossolana: e'
-/// ammesso perche' nessuna statement SQL puo' coincidere col prefisso di una
-/// voce del vocabolario, quindi l'esito e' `Unconfined`, cioe' il lato cauto.
-fn riga_e_osservazione(riga: &str, vocabolario: &[String]) -> bool {
-    if vocabolario.is_empty() {
-        return false;
-    }
-    let comandi = super::shell_command::comandi(riga);
-    if comandi.is_empty() {
-        return false;
-    }
-    comandi.iter().all(|c| {
-        !c.redirezioni && c.env.is_empty() && vocabolario.iter().any(|v| prefisso_di(v, &c.parole))
-    })
-}
-
-/// La voce `voce` (parole separate da spazi) e' il prefisso di `parole`?
-/// Confronto case-insensitive sul solo nome: i percorsi non sono normalizzati,
-/// quindi `/usr/bin/ls` non e' `ls` — e non lo assolve.
-fn prefisso_di(voce: &str, parole: &[String]) -> bool {
-    let attese: Vec<&str> = voce.split_whitespace().collect();
-    if attese.is_empty() || attese.len() > parole.len() {
-        return false;
-    }
-    attese
-        .iter()
-        .zip(parole)
-        .all(|(a, p)| a.eq_ignore_ascii_case(p))
 }
 
 /// Dove cade un path scritto, rispetto all'albero di lavoro del progetto.
@@ -366,28 +313,8 @@ mod tests {
             .collect()
     }
 
-    /// Il vocabolario che assolve, nella forma seminata dalla mig 0688 MENO
-    /// `tree`: serve un comando innocuo ma NON dichiarato, per provare che
-    /// l'assoluzione e' per riconoscimento e non per innocuita' apparente.
-    fn osservazione() -> Vec<String> {
-        [
-            "ls", "pwd", "cat", "head", "tail", "wc", "echo", "which", "whoami", "date",
-            "printenv", "grep", "rg", "git status", "git diff", "git log", "git show",
-            "node --version", "dotnet --version",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
-    }
-
     fn portata(tool: &str, input: Value) -> StepReach {
-        classifica_portata(
-            tool,
-            &input,
-            &mutatori(),
-            &artefatti(),
-            &osservazione(),
-        )
+        classifica_portata(tool, &input, &mutatori(), &artefatti())
     }
 
     /// IL CASO MISURATO il 09/08/2026 su gestione-corsi, ed e' la ragione per
@@ -504,104 +431,51 @@ mod tests {
         );
     }
 
-    /// LA SOGLIA SUL COSTO. Senza di essa il criterio metterebbe due giudici
-    /// davanti a `ls`, e un gate insostenibile e' un gate che verra' spento —
-    /// cioe' lo stesso punto di partenza per un'altra strada.
+    /// CHI ESEGUE UNA RIGA NON HA ECCEZIONI, ed e' il cambiamento del
+    /// 18/08/2026. Fino a quel giorno un vocabolario DB assolveva le righe di
+    /// sola osservazione (`ls`, `cat`, `git status`): la misura in testa al
+    /// modulo dice che su 26 righe realmente eseguite ne assolveva UNA, e che
+    /// la sua esistenza suggeriva di allungare la lista al primo comando
+    /// rumoroso — la toppa della regola H.
     ///
-    /// L'assoluzione e' per RICONOSCIMENTO POSITIVO: quel che il vocabolario
-    /// non nomina resta giudicato. E' l'asimmetria per cui qui un elenco e'
-    /// ammesso e in `critical_step_rules` no.
+    /// Le prime cinque righe sono quelle che il vocabolario ASSOLVEVA: sono
+    /// qui perche' il cambiamento sia visibile in cio' che il criterio
+    /// risponde, non solo in cio' che il modulo non contiene piu'.
     ///
-    /// MUTAZIONE: far ritornare `true` a `riga_e_osservazione` quando il
-    /// vocabolario non riconosce il comando (cioe' assolvere per default)
-    /// fa cadere ogni asserzione del secondo blocco, `dotnet ef` compreso.
+    /// MUTAZIONE: reintrodurre una qualunque assoluzione per nome di comando
+    /// (elenco DB, costante, default "solo per i comandi ovvi") fa cadere il
+    /// primo blocco, che e' esattamente il meccanismo rimosso.
     #[test]
-    fn solo_l_osservazione_riconosciuta_assolve() {
+    fn ogni_riga_eseguita_e_non_confinata() {
         for riga in [
+            // Cio' che il vocabolario assolveva.
             "ls -la",
             "git status --short",
             "cat package.json",
             "git log --oneline | head -20",
             "pwd && ls src",
+            // Cio' che il vocabolario gia' non assolveva, e non deve iniziare.
+            "dotnet ef database update",
+            "git push origin main",
+            "ls && npm run build",
+            "cat piano.md > src/main.rs",
+            "FOO=1 ls",
+            // Le righe REALI dei due progetti misurati il 18/08/2026.
+            "curl -s http://localhost:36526/api/libri",
+            "npm install",
+            "npx jest --coverage",
+            "node --test calcolatrice.test.js",
+            "chmod +x start_backend.sh",
         ] {
             let p = portata("run_command", json!({ "command": riga }));
-            assert_eq!(p, StepReach::Observation, "'{riga}' e' osservazione pura");
-            assert_eq!(p.livello_minimo(), StepCriticality::ReadOnly);
-        }
-        for riga in [
-            // Il caso che il modulo esiste per prendere.
-            "dotnet ef database update",
-            // Stesso programma, sottocomando diverso: la voce e' un prefisso di
-            // PAROLE, quindi `git status` non ha nulla da dire qui.
-            "git push origin main",
-            "git checkout -- .",
-            // Un comando di osservazione in catena con uno sconosciuto non
-            // assolve la catena: `all`, non `any`.
-            "ls && npm run build",
-            // Innocuo quanto un `ls`, e non dichiarato: viene giudicato lo
-            // stesso. L'assoluzione e' per RICONOSCIMENTO, mai per innocuita'
-            // apparente — costa una convocazione, mai un buco.
-            "tree -L 2",
-        ] {
             assert_eq!(
-                portata("run_command", json!({ "command": riga })),
+                p,
                 StepReach::Unconfined,
-                "'{riga}': cio' che non e' riconosciuto viene giudicato"
+                "'{riga}': chi esegue una riga di shell non e' confinabile"
             );
+            assert_eq!(p.livello_minimo(), StepCriticality::Critical);
         }
-        // E la cura di quel costo e' un DATO, non una patch: dichiarare `tree`
-        // nel vocabolario lo assolve, senza toccare una riga di codice
-        // (regola G). E' l'asimmetria per cui qui un elenco e' ammesso.
-        assert_eq!(
-            classifica_portata(
-                "run_command",
-                &json!({"command": "tree -L 2"}),
-                &mutatori(),
-                &artefatti(),
-                &["tree".to_string()],
-            ),
-            StepReach::Observation
-        );
     }
-
-    /// Le due condizioni che un elenco di soli PROGRAMMI non puo' esprimere:
-    /// un comando di osservazione REDIRETTO scrive, e un vocabolario vuoto non
-    /// assolve nessuno.
-    ///
-    /// MUTAZIONE: togliere il controllo su `redirezioni` fa passare
-    /// `cat piano.md > src/main.rs` come osservazione — una scrittura di file
-    /// sotto la soglia del gate.
-    #[test]
-    fn la_redirezione_e_il_vocabolario_vuoto_non_assolvono() {
-        assert_eq!(
-            portata("run_command", json!({"command": "cat piano.md > src/main.rs"})),
-            StepReach::Unconfined,
-            "una riga di soli comandi di osservazione che REDIRIGE scrive un file"
-        );
-        assert_eq!(
-            portata("run_command", json!({"command": "ls 2>&1"})),
-            StepReach::Unconfined,
-            "verso conservativo: costa una convocazione, non un buco"
-        );
-        assert_eq!(
-            portata("run_command", json!({"command": "FOO=1 ls"})),
-            StepReach::Unconfined,
-            "il vocabolario assolve un programma, non l'ambiente in cui gira"
-        );
-        // Vocabolario assente = nulla e' provatamente innocuo (regola G:
-        // niente ripiego cablato, e il ripiego mancante e' quello cauto).
-        assert_eq!(
-            classifica_portata(
-                "run_command",
-                &json!({"command": "ls -la"}),
-                &mutatori(),
-                &artefatti(),
-                &[],
-            ),
-            StepReach::Unconfined
-        );
-    }
-
     /// La collocazione e' il punto unico anche del declassamento in step_gate:
     /// fuori dall'albero il nome di una cartella non dice piu' di chi sia.
     #[test]

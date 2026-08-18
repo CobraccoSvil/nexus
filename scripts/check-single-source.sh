@@ -1661,21 +1661,23 @@ fi
 #  (b2) IL RAMO DI DEFAULT dell'ammissione e' il GIUDIZIO, non l'esecuzione.
 #       E' la forma che il guard precedente non poteva vedere e che la review ha
 #       nominata: «resterebbe verde con la soglia a un valore che ammette tutto».
-#       Un elenco lessicale ACCUSA, quindi cio' che non nomina passa: l'unica
-#       posizione sicura per `Diretta` e' dentro il ramo dell'osservazione, e
-#       l'ultima parola dev'essere `RichiedeGiudizio`.
+#       Un elenco lessicale ACCUSA, quindi cio' che non nomina passa, e l'ultima
+#       parola dev'essere `RichiedeGiudizio`.
+#       Dal 18/08/2026 (mig 0740) non esiste piu' NESSUNA scorciatoia: la quarta
+#       variante `Diretta` e' sparita con il vocabolario che l'alimentava, quindi
+#       il guard pretende che dentro `ammissione` compaiano SOLO le due varianti
+#       rimaste — un ramo che ammetta senza giudizio e' la regressione.
 CORPO_AMMISSIONE=$(awk '/pub fn ammissione\(&self, prova: &Prova\) -> Ammissione/,/^    }$/' "$PDV")
-DIRETTE=$(printf '%s\n' "$CORPO_AMMISSIONE" | grep -c 'Ammissione::Diretta' || true)
+VARIANTI=$(printf '%s\n' "$CORPO_AMMISSIONE" | grep -oE 'Ammissione::[A-Za-z]+' | sort -u | tr '\n' ' ')
 ULTIMA=$(printf '%s\n' "$CORPO_AMMISSIONE" \
-  | grep -oE 'Ammissione::(Diretta|RichiedeGiudizio|Vietata)' | tail -1)
-if [ "$DIRETTE" = "1" ] \
-   && printf '%s\n' "$CORPO_AMMISSIONE" | grep -q '<= StepCriticality::ReadOnly' \
+  | grep -oE 'Ammissione::(RichiedeGiudizio|Vietata)' | tail -1)
+if [ "$VARIANTI" = "Ammissione::RichiedeGiudizio Ammissione::Vietata " ] \
    && [ "$ULTIMA" = "Ammissione::RichiedeGiudizio" ]; then
   echo "OK prova-default-giudicata: cio' che le regole non nominano viene giudicato"
 else
   echo "!! prova-default-giudicata: 'ammissione' non finisce piu' su RichiedeGiudizio," >&2
-  echo "   oppure 'Diretta' e' uscita dal ramo dell'osservazione (trovate: $DIRETTE," >&2
-  echo "   ultima variante: ${ULTIMA:-nessuna})." >&2
+  echo "   oppure e' ricomparsa una variante che esegue senza giudizio" >&2
+  echo "   (trovate: ${VARIANTI:-nessuna}; ultima: ${ULTIMA:-nessuna})." >&2
   echo "   L'elenco lessicale ACCUSA: cio' che non nomina PASSA, e non nomina" >&2
   echo "   'psql -c \"DROP TABLE users\"' ne' 'curl ... | sh'. Se il default e'" >&2
   echo "   l'esecuzione, il piano torna a essere un canale privilegiato." >&2
@@ -2271,33 +2273,45 @@ else
   echo "OK portata-del-passo: il pavimento di step_gate viene dalla portata"
 fi
 
-# La SOGLIA sul costo e' l'unico elenco che ASSOLVE, e vive nel DB (regola G).
-# Un vocabolario cablato nel codice sarebbe due verita': l'operatore ne
-# modificherebbe una e il gate leggerebbe l'altra. Il criterio non deve nominare
-# nessun comando: li riceve dal chiamante.
-if grep -nE '"(ls|cat|pwd|git status|git diff|git log)"' \
+# NESSUN ELENCO ASSOLVE una riga di shell (mig 0740, 18/08/2026). Fino a quel
+# giorno `orchestrator.step_reach.observation_commands` riportava sotto soglia
+# le righe di sola osservazione. MISURATO: su 26 righe realmente eseguite dai
+# due progetti vivi ne assolveva UNA, e la sua esistenza suggeriva di allungare
+# la lista al primo comando rumoroso (il caso dei cinque `curl` del 18/08) --
+# cioe' la toppa che questo criterio esiste per non commettere (regola H).
+#
+# Il guard e' sul MECCANISMO, non sul contenuto: un vocabolario svuotato
+# lascerebbe in piedi la variante e il ramo che la produce, cioe' codice che il
+# prossimo lettore scambia per una funzionalita'. Filtra le righe di commento:
+# la documentazione dei moduli CITA il meccanismo rimosso per spiegarlo.
+if grep -nE 'comandi_di_osservazione|observation_commands|StepReach::Observation' \
      crates/nexus-agent-graph/src/decisions/step_reach.rs \
-   | grep -vE '^[0-9]+: *(//|/\*|\*)' \
-   | awk -v inizio="$(grep -n '#\[cfg(test)\]' crates/nexus-agent-graph/src/decisions/step_reach.rs | head -1 | cut -d: -f1)" \
-         -F: '$1 < inizio' | grep . >/dev/null 2>&1; then
-  echo "!! vocabolario-osservazione: step_reach nomina un comando concreto fuori" >&2
-  echo "   dai test. La soglia sul costo e' un DATO nel DB" >&2
-  echo "   (orchestrator.step_reach.observation_commands, mig 0688): cablarla nel" >&2
-  echo "   codice creerebbe una seconda verita' che l'operatore non puo' correggere." >&2
+     crates/nexus-agent-graph/src/decisions/step_gate.rs \
+     crates/nexus-agent-graph/src/decisions/piano_di_verifica.rs \
+     crates/nexus-agent-graph/src/nodes/tool_dispatch.rs \
+     crates/mcp-core/src/native_engine.rs \
+     crates/mcp-core/src/agent_graph_adapter/criteria_runner.rs \
+   | grep -vE ':[0-9]+: *(//|///|/\*|\*)' | grep . >/dev/null 2>&1; then
+  echo "!! niente-elenco-che-assolve: e' ricomparso un vocabolario che ASSOLVE una" >&2
+  echo "   riga di shell per il nome del suo comando. Rimosso il 18/08/2026" >&2
+  echo "   (mig 0740): assolveva 1 riga su 26 misurate, e invitava a inseguire le" >&2
+  echo "   varianti (curl -> wget -> psql) invece di dare al giudice i fatti che" >&2
+  echo "   gli mancano. Il freno sul costo e' critical_step_max_rejections; il" >&2
+  echo "   rollback e' critical_step_gate_mode = enforce_irreversible." >&2
   fail=1
 else
-  echo "OK vocabolario-osservazione: il criterio non nomina nessun comando"
+  echo "OK niente-elenco-che-assolve: nessuna riga di shell e' assolta per nome"
 fi
 
-# L'assoluzione e' per RICONOSCIMENTO: un vocabolario vuoto non assolve nessuno.
-# E' il verso che distingue questo elenco da critical_step_rules, e senza la
-# guardia sul vuoto un DB non seminato renderebbe il gate di nuovo inerte —
-# nella direzione opposta, e altrettanto silenziosa.
-if grep -q 'if vocabolario.is_empty() {' crates/nexus-agent-graph/src/decisions/step_reach.rs; then
-  echo "OK vocabolario-osservazione: il vocabolario vuoto non assolve nessuno"
+# La PORTATA si decide su DUE vocabolari (mutatori, rigenerabili) e nessun
+# terzo: una firma che ne accetti un altro e' la porta d'ingresso del
+# meccanismo rimosso, anche sotto un nome diverso.
+if [ "$(grep -c '^    [a-z_]*: &\[String\],$' crates/nexus-agent-graph/src/decisions/step_reach.rs)" = "2" ]; then
+  echo "OK niente-elenco-che-assolve: classifica_portata prende due soli vocabolari"
 else
-  echo "!! vocabolario-osservazione: sparita la guardia sul vocabolario vuoto." >&2
-  echo "   Senza, un DB non seminato deciderebbe da solo chi e' innocuo." >&2
+  echo "!! niente-elenco-che-assolve: classifica_portata ha cambiato numero di" >&2
+  echo "   vocabolari. Sono due (mutatori, rigenerabili): un terzo elenco che" >&2
+  echo "   decida la portata dal TESTO del comando e' il difetto rimosso." >&2
   fail=1
 fi
 

@@ -1607,10 +1607,6 @@ task_complete (outcome + summary)"
                             .await
                     }
                 },
-                Ammissione::Diretta { .. } => {
-                    self.esegui_se_c_e_budget(&prova, &mut budget, timeout_s)
-                        .await
-                }
             };
             esiti.push(EsitoProva { prova, esito });
         }
@@ -4024,11 +4020,24 @@ mod tests {
         }
     }
 
-    /// L'OSSERVAZIONE non paga il giudizio, ed e' la sola scorciatoia: senza,
-    /// un `git status` costerebbe due chiamate LLM e il gate sarebbe
-    /// insostenibile, cioe' verrebbe spento.
+    /// NEMMENO L'OSSERVAZIONE salta il giudizio, ed e' il cambiamento del
+    /// 18/08/2026 visto DA QUI, sulla strada vera del runner: `git status` era
+    /// la sola prova che partiva senza convocare nessuno, perche' un
+    /// vocabolario DB (`orchestrator.step_reach.observation_commands`) la
+    /// assolveva. Rimosso dalla mig 0740 — misura in testa a
+    /// `decisions::step_reach`: su 26 righe realmente eseguite ne assolveva UNA,
+    /// e la sua esistenza invitava ad allungare la lista invece di dare al
+    /// giudice i fatti che gli mancano (regola H).
+    ///
+    /// Il test resta perche' la proprieta' e' cambiata di SEGNO, non sparita, e
+    /// perche' il criterio puro non basta a provarla: se l'adapter smettesse di
+    /// convocare, i test di `piano_di_verifica` resterebbero tutti verdi
+    /// (regola O).
+    ///
+    /// MUTAZIONE: rimettere un ramo che esegua senza giudizio sotto una soglia
+    /// di criticita' svuota `comandi_giudicati` e la seconda asserzione cade.
     #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
-    async fn una_prova_di_sola_osservazione_non_convoca_nessuno(pool: PgPool) {
+    async fn nemmeno_una_prova_di_sola_osservazione_salta_il_giudizio(pool: PgPool) {
         use nexus_agent_graph::decisions::{OriginePiano, PianoDiVerifica};
         // Dal produttore reale, con l'origine imposta dal punto unico.
         let piano = PianoDiVerifica::dai_pareri(&[(
@@ -4047,14 +4056,19 @@ mod tests {
         )
         .await;
         let exec = FakeToolExecutor::with(&[("run_command", &["EXIT CODE: 0"])]);
-        let giudice = GiudiceFinto::che_rifiuta();
+        let giudice = GiudiceFinto::che_approva();
         let runner = FinalGateCriteriaRunnerAdapter::new(exec.clone(), pool, None)
             .con_giudice(giudice.clone());
         let res = runner.run(vec![criterio]).await.expect("nessun PortError");
-        assert_eq!(exec.calls.lock().unwrap().len(), 1, "eseguita");
-        assert!(
-            giudice.richieste.lock().unwrap().is_empty(),
-            "un comando di sola osservazione non convoca due modelli"
+        assert_eq!(
+            giudice.comandi_giudicati(),
+            vec!["git status --short".to_string()],
+            "anche la prova piu' innocua passa dal gate duale"
+        );
+        assert_eq!(
+            exec.calls.lock().unwrap().len(),
+            1,
+            "approvata, quindi eseguita"
         );
         assert_eq!(res[0].outcome, CriterionOutcome::Passed);
         assert_eq!(res[0].evidence["verdict"], "plan_passed");
