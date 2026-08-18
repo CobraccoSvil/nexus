@@ -69,7 +69,7 @@ export function buildTerminalRunSummary(run: AgentRunInfo): string {
       : "Operazione non completata: ho interrotto e diagnosticato il blocco (esito e prossimo passo nel messaggio).";
   }
   if (run.status === "blocked_needs_input") {
-    return "In attesa di input esterno per proseguire (es. credenziale, permesso o servizio mancante).";
+    return "In attesa di input per proseguire: la richiesta e' nel messaggio.";
   }
   return "Operazione conclusa.";
 }
