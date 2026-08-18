@@ -2554,4 +2554,94 @@ mod tests_appartenenza_dei_bersagli {
             );
         }
     }
+
+    /// COPERTURA della mig 0739 sui mandati: le due meta' devono COMBACIARE.
+    ///
+    /// Il blocco `<appartenenza_dei_bersagli>` risponde sui SOLI indirizzi di
+    /// rete scritti per esteso, quindi il mandato puo' allentarsi solo li'. Per
+    /// un pid, un nome di container o una label di servizio il fatto NON
+    /// arriva, e non e' un'omissione rimediabile a costo zero: nel META —
+    /// l'unico pool che il gate possiede — `agent_processes` non esiste piu'
+    /// (la mig 0507 l'ha rinominata al cutover dei DB-progetto, e vive in
+    /// `<slug>_nexus`), e di un nome di container non c'e' registro da nessuna
+    /// parte. Dove il fatto non arriva la regola stretta della 0677 deve
+    /// sopravvivere: allentarla sarebbe un allentamento non compensato.
+    ///
+    /// Si conta la COPERTURA — quanti dei due mandati portano ciascuna meta' —
+    /// e non l'esistenza di una riga: la 0739 riscrive i mandati per intero, e
+    /// una `UPDATE ... WHERE key` che non mordesse (chiave rinominata, riga
+    /// disattivata) non fallirebbe, lascerebbe in piedi il testo vecchio in
+    /// silenzio.
+    ///
+    /// MUTAZIONI che lo fanno rosseggiare, ciascuna col difetto per cui il
+    /// lotto e' stato bocciato:
+    ///   - rimettere in gatekeeper 3 «Se nessuna delle due fonti risponde,
+    ///     giudica il RISCHIO del passo» al posto del reject motivato;
+    ///   - togliere da challenger 2 il «in dubbio = reject»;
+    ///   - togliere da un mandato la dichiarazione che su pid, container e
+    ///     label il blocco «tace per costruzione».
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_cautela_resta_dove_il_fatto_non_arriva(pool: PgPool) {
+        let mandati: Vec<(String, String)> = sqlx::query_as(
+            "SELECT key, content FROM nexus_prompt_templates \
+             WHERE key = ANY($1) AND is_active = true",
+        )
+        .bind(vec![
+            PROMPT_GATEKEEPER.to_string(),
+            PROMPT_CHALLENGER.to_string(),
+        ])
+        .fetch_all(&pool)
+        .await
+        .expect("i mandati del gate duale sono nel META migrato");
+        assert_eq!(
+            mandati.len(),
+            2,
+            "la 0739 deve trovare DUE mandati attivi da riscrivere, non {}: \
+             una UPDATE che non morde e' silenziosa",
+            mandati.len()
+        );
+
+        // Meta' che si ALLENTA: entrambi i mandati nominano il blocco, o il
+        // codice consegnerebbe un contesto che il prompt non dichiara.
+        let col_blocco = mandati
+            .iter()
+            .filter(|(_, c)| c.contains("appartenenza_dei_bersagli"))
+            .count();
+        assert_eq!(
+            col_blocco, 2,
+            "solo {col_blocco} mandati su 2 nominano <appartenenza_dei_bersagli>"
+        );
+
+        // Meta' che RESTA: dove il blocco tace, la cautela non cade. La regola
+        // stretta e' asimmetrica fra i due ruoli e si verifica per ruolo.
+        for (key, content) in &mandati {
+            assert!(
+                content.contains("tace per costruzione"),
+                "il mandato `{key}` non dichiara che su pid, container e label il blocco \
+                 tace: un giudice puo' leggere l'assenza di riga come un'assoluzione"
+            );
+            let stretta = if key == PROMPT_GATEKEEPER {
+                "appartenenza non dimostrabile dai dati del passo = reject motivato"
+            } else {
+                "in dubbio = reject"
+            };
+            assert!(
+                content.contains(stretta),
+                "il mandato `{key}` ha perso la regola stretta della 0677 (`{stretta}`): il \
+                 blocco non risponde su pid, container e label di servizio, quindi li' la \
+                 cautela non puo' cadere"
+            );
+        }
+
+        // E l'allentamento NON e' generale: nessuno dei due manda a giudicare
+        // il solo rischio quando nessuna fonte risponde su un bersaglio che il
+        // passo DISTRUGGE. E' la frase esatta con cui il lotto era stato scritto.
+        for (key, content) in &mandati {
+            assert!(
+                !content.contains("Se nessuna delle due fonti risponde, giudica il RISCHIO"),
+                "il mandato `{key}` allenta l'appartenenza anche dove il blocco non porta \
+                 alcun fatto (pid, container, label): allentamento non compensato"
+            );
+        }
+    }
 }
