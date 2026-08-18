@@ -1733,8 +1733,11 @@ task_complete (outcome + summary)"
             // Chi convoca qui NON ha la cronologia del run (riceve la spec, non
             // lo stato): l'assenza e' DICHIARATA e non travestita da
             // `PrimoPasso`, che alla verifica finale direbbe al giudice
-            // l'opposto del vero.
-            stato_presupposto: StatoPresupposto::NonInterrogabile,
+            // l'opposto del vero. I fatti dei REGISTRI invece arrivano lo
+            // stesso: li costruisce l'adapter del gate, che ha i pool, ed e'
+            // proprio qui che servono di piu' — le prove del piano di verifica
+            // sono in gran parte chiamate HTTP a una porta del progetto.
+            stato_presupposto: StatoPresupposto::non_interrogabile(),
             prior_rejections: 0,
         })
     }

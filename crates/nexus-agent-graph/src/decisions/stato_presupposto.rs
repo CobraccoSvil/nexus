@@ -127,13 +127,83 @@ pub struct FattoPertinente {
     pub risultato: Option<String>,
 }
 
-/// L'estratto consegnato ai due giudici.
+/// Che cosa si SA di cio' che questo batch presuppone.
+///
+/// E' il PUNTO UNICO (regola L) che porta i fatti ai due giudici, e le sue due
+/// meta' rispondono alla stessa domanda da fonti diverse:
+///
+/// - [`Self::dal_run`] — che cosa il RUN ha gia' prodotto (dalla cronologia:
+///   lo sa il nodo, che ha lo stato e non ha DB);
+/// - [`Self::dai_registri`] — che cosa i REGISTRI del progetto dichiarano dei
+///   bersagli che il batch nomina (lo sa l'adapter, che ha i pool e non ha lo
+///   stato).
+///
+/// Stanno insieme perche' il canale verso il giudice deve restare uno solo: un
+/// secondo campo trasportato per conto proprio si sarebbe potuto comporre in un
+/// posto e dimenticare nell'altro, ed e' esattamente la forma in cui questo
+/// contesto e' mancato finora. La composizione del testo e' percio' una sola
+/// ([`Self::blocco`]), e i due TAG restano distinti perche' sono due domande
+/// che il giudice deve porsi separatamente.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatoPresupposto {
+    /// I passi del RUN che toccano i bersagli del batch.
+    pub dal_run: FattiDelRun,
+    /// Cio' che i registri del progetto dichiarano dei bersagli del batch.
+    pub dai_registri: super::appartenenza_bersaglio::AppartenenzaBersagli,
+}
+
+impl StatoPresupposto {
+    /// L'estratto della sola cronologia: i registri non sono stati interrogati.
+    ///
+    /// E' cio' che costruisce il NODO, che DB non ne ha. La variante e'
+    /// dichiarata e non un vuoto: il giudice deve poter distinguere «non e'
+    /// stato chiesto» da «chiesto e non c'era nulla» (regola Q).
+    pub fn dal_run(dal_run: FattiDelRun) -> Self {
+        Self {
+            dal_run,
+            dai_registri: super::appartenenza_bersaglio::AppartenenzaBersagli::NonInterrogati,
+        }
+    }
+
+    /// Chi convoca non ha accesso ne' alla cronologia ne' ai registri.
+    ///
+    /// La usa il final gate per le prove eseguibili del piano di verifica (mig
+    /// 0737), che gira in un adapter senza stato di run.
+    pub fn non_interrogabile() -> Self {
+        Self::dal_run(FattiDelRun::NonInterrogabile)
+    }
+
+    /// Aggiunge cio' che i registri hanno risposto.
+    ///
+    /// Consumante e non `&mut`: l'arricchimento avviene UNA volta, in chi ha i
+    /// pool, e una firma che permettesse di rifarlo permetterebbe anche di
+    /// consegnare due risposte diverse alla stessa domanda.
+    pub fn con_registri(
+        mut self,
+        dai_registri: super::appartenenza_bersaglio::AppartenenzaBersagli,
+    ) -> Self {
+        self.dai_registri = dai_registri;
+        self
+    }
+
+    /// La resa: il testo si compone DAI campi, in un punto solo (regola Q).
+    ///
+    /// Entrambi i blocchi sono incorniciati e dichiarati come DATO: portano
+    /// output di comandi, contenuti di file e label scelte dall'agente, cioe'
+    /// superficie di prompt injection. Il verdetto resta letto dai soli campi
+    /// della tool-call, come per il batch.
+    pub fn blocco(&self) -> String {
+        format!("{}{}", self.dal_run.blocco(), self.dai_registri.blocco())
+    }
+}
+
+/// L'estratto della CRONOLOGIA consegnato ai due giudici.
 ///
 /// Le tre varianti negative non sono lo stesso vuoto: dicono al giudice se il
 /// run non ha ancora fatto nulla, se il batch non offre una domanda ponibile
 /// alla history, o se la domanda e' stata posta e non ha trovato risposta.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StatoPresupposto {
+pub enum FattiDelRun {
     /// Il run non ha ancora eseguito alcun passo: il batch e' la prima azione.
     PrimoPasso,
     /// Il batch non nomina file o percorsi riconoscibili: non c'e' una domanda
@@ -169,13 +239,11 @@ pub enum StatoPresupposto {
     },
 }
 
-impl StatoPresupposto {
-    /// La resa: il testo si compone DAI campi, in un punto solo (regola Q).
-    ///
-    /// Il blocco e' incorniciato e dichiarato come DATO: porta output di comandi
-    /// e contenuti di file, cioe' superficie di prompt injection. Il verdetto
-    /// resta letto dai soli campi della tool-call, come per il batch.
-    pub fn blocco(&self) -> String {
+impl FattiDelRun {
+    /// La meta' «cronologia» del blocco. Privata: la sola resa pubblica e'
+    /// [`StatoPresupposto::blocco`], o il contesto potrebbe raggiungere il
+    /// giudice a meta' senza che nulla lo dichiari.
+    fn blocco(&self) -> String {
         format!(
             "<stato_gia_prodotto>\n{}Questo estratto porta i soli passi che nominano i bersagli \
              del batch: l'assenza di un passo qui NON prova che lo stato non esista.\n\
@@ -187,15 +255,15 @@ impl StatoPresupposto {
     /// Il corpo: una frase per ciascuna assenza, l'elenco per i fatti.
     fn corpo(&self) -> String {
         match self {
-            StatoPresupposto::PrimoPasso => {
+            FattiDelRun::PrimoPasso => {
                 "Il run non ha ancora eseguito alcun passo: questo batch e' la sua prima azione.\n"
                     .to_string()
             }
-            StatoPresupposto::BersagliNonRiconosciuti { passi_eseguiti } => format!(
+            FattiDelRun::BersagliNonRiconosciuti { passi_eseguiti } => format!(
                 "Il batch non nomina file o percorsi riconoscibili, quindi non c'e' stato nulla \
                  da cercare fra i {passi_eseguiti} passi gia' eseguiti in questo run.\n"
             ),
-            StatoPresupposto::NessunFattoPertinente {
+            FattiDelRun::NessunFattoPertinente {
                 passi_eseguiti,
                 bersagli,
             } => format!(
@@ -203,13 +271,13 @@ impl StatoPresupposto {
                  del batch ({}).\n",
                 bersagli.join(", ")
             ),
-            StatoPresupposto::NonInterrogabile =>
+            FattiDelRun::NonInterrogabile =>
                 "Chi ti convoca non ha accesso alla cronologia di questo run: non sapere cosa \
                  sia gia' stato prodotto NON e' una prova che non sia stato prodotto, e non e' \
                  di per se' un motivo di rifiuto. Giudica il RISCHIO di cio' che ti viene \
                  mostrato.\n"
                     .to_string(),
-            StatoPresupposto::Fatti { fatti, omessi } => elenco_dei_fatti(fatti, *omessi),
+            FattiDelRun::Fatti { fatti, omessi } => elenco_dei_fatti(fatti, *omessi),
         }
     }
 }
@@ -249,47 +317,64 @@ fn riga_del_fatto(i: usize, f: &FattoPertinente) -> String {
 
 /// L'estratto per un batch: i passi gia' eseguiti che ne toccano i bersagli.
 ///
-/// `batch` sono i passi da giudicare come `(tool_name, input)` — i dati grezzi,
-/// non `PendingStepInfo`: il criterio vive in `decisions` e non deve conoscere
-/// la forma della porta che lo trasporta.
-pub fn stato_presupposto(messages: &[Message], batch: &[(&str, &Value)]) -> StatoPresupposto {
-    let passi = passi_eseguiti(messages);
+/// `batch` sono i passi da giudicare come `(tool_use_id, tool_name, input)` — i
+/// dati grezzi, non `PendingStepInfo`: il criterio vive in `decisions` e non
+/// deve conoscere la forma della porta che lo trasporta.
+///
+/// ## L'id non e' un ornamento: senza, il batch e' prova contro se' stesso
+///
+/// Il delta che porta il turno del modello (`executor.rs`) appende
+/// `assistant_msg` a `messages` E valorizza `pending_tool_uses` nella stessa
+/// mossa: quando il gate classifica il batch, il suo tool_use E' GIA' nella
+/// cronologia, e nessun `tool_result` gli risponde ancora — per costruzione,
+/// visto che il gate deve decidere se farlo partire. Senza gli id il criterio
+/// non poteva distinguere «adesso» da «prima» e consegnava al giudice, come
+/// FATTO, il passo che gli stava chiedendo di giudicare, con esito
+/// `ESITO NON OSSERVATO`. E il batch condivide i bersagli con se' stesso per
+/// definizione, quindi il fatto-di-se'-stesso era sempre presente e — con
+/// [`MAX_FATTI`] che tiene i piu' recenti — sempre ULTIMO.
+///
+/// MISURATO il 18/08/2026 su `app-libri-18-08`, in 4 rifiuti su 17:
+/// «Il fatto 2 nello stato_gia_prodotto riporta lo stesso identico comando con
+/// ESITO NON OSSERVATO: il passo potrebbe gia' essere stato eseguito»
+/// (challenger, 00:32:19); «lo stato_gia_prodotto riporta un tentativo identico
+/// di curl che restituisce ESITO NON OSSERVATO. Richiedere di eseguire
+/// nuovamente...» (gatekeeper, 00:46:15). I giudici hanno letto correttamente
+/// un fatto che il gate stesso aveva fabbricato.
+pub fn stato_presupposto(
+    messages: &[Message],
+    batch: &[(&str, &str, &Value)],
+) -> StatoPresupposto {
+    StatoPresupposto::dal_run(fatti_del_run(messages, batch))
+}
+
+/// La meta' «cronologia» dell'estratto.
+fn fatti_del_run(messages: &[Message], batch: &[(&str, &str, &Value)]) -> FattiDelRun {
+    let in_giudizio: BTreeSet<&str> = batch.iter().map(|(id, _, _)| *id).collect();
+    let passi: Vec<PassoEseguito> = passi_eseguiti(messages)
+        .into_iter()
+        .filter(|p| !in_giudizio.contains(p.id.as_str()))
+        .collect();
     if passi.is_empty() {
-        return StatoPresupposto::PrimoPasso;
+        return FattiDelRun::PrimoPasso;
     }
     let bersagli_batch: BTreeSet<String> = batch
         .iter()
-        .flat_map(|(_, input)| bersagli_del_passo(input))
+        .flat_map(|(_, _, input)| bersagli_del_passo(input))
         .collect();
     if bersagli_batch.is_empty() {
-        return StatoPresupposto::BersagliNonRiconosciuti {
+        return FattiDelRun::BersagliNonRiconosciuti {
             passi_eseguiti: passi.len(),
         };
     }
 
-    let mut pertinenti: Vec<FattoPertinente> = Vec::new();
-    for p in &passi {
-        let condivisi: Vec<String> = p
-            .bersagli
-            .intersection(&bersagli_batch)
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        if condivisi.is_empty() {
-            continue;
-        }
-        pertinenti.push(FattoPertinente {
-            tool_name: p.tool_name.clone(),
-            bersagli: condivisi,
-            esito: p.esito,
-            input: tronca(&p.input, CAP_INPUT),
-            risultato: p.risultato.as_deref().map(|r| tronca(r, CAP_RISULTATO)),
-        });
-    }
+    let mut pertinenti: Vec<FattoPertinente> = passi
+        .iter()
+        .filter_map(|p| fatto_pertinente(p, &bersagli_batch))
+        .collect();
 
     if pertinenti.is_empty() {
-        return StatoPresupposto::NessunFattoPertinente {
+        return FattiDelRun::NessunFattoPertinente {
             passi_eseguiti: passi.len(),
             bersagli: bersagli_batch.into_iter().collect(),
         };
@@ -298,14 +383,45 @@ pub fn stato_presupposto(messages: &[Message], batch: &[(&str, &Value)]) -> Stat
     if omessi > 0 {
         pertinenti.drain(..omessi);
     }
-    StatoPresupposto::Fatti {
+    FattiDelRun::Fatti {
         fatti: pertinenti,
         omessi,
     }
 }
 
+/// Il fatto reso da UN passo gia' eseguito, se tocca i bersagli del batch.
+///
+/// Riporta i soli bersagli CONDIVISI, non tutti quelli del passo: al giudice
+/// interessa il punto di contatto, e l'elenco integrale di un `write_file` che
+/// ne nomina dieci sposterebbe l'attenzione altrove.
+fn fatto_pertinente(
+    p: &PassoEseguito,
+    bersagli_batch: &BTreeSet<String>,
+) -> Option<FattoPertinente> {
+    let condivisi: Vec<String> = p
+        .bersagli
+        .intersection(bersagli_batch)
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if condivisi.is_empty() {
+        return None;
+    }
+    Some(FattoPertinente {
+        tool_name: p.tool_name.clone(),
+        bersagli: condivisi,
+        esito: p.esito,
+        input: tronca(&p.input, CAP_INPUT),
+        risultato: p.risultato.as_deref().map(|r| tronca(r, CAP_RISULTATO)),
+    })
+}
+
 /// Un passo che il run ha gia' chiesto, con l'esito osservato.
 struct PassoEseguito {
+    /// L'id della richiesta: e' il criterio con cui si distingue un passo
+    /// PRECEDENTE dal batch che si sta giudicando adesso.
+    id: String,
     tool_name: String,
     bersagli: BTreeSet<String>,
     esito: EsitoFatto,
@@ -366,6 +482,7 @@ fn richieste_del_messaggio(m: &Message) -> Vec<(&str, &str, &Value)> {
 fn passo(id: &str, nome: &str, input: &Value, messages: &[Message]) -> PassoEseguito {
     let (esito, risultato) = esito_per_id(messages, id);
     PassoEseguito {
+        id: id.to_string(),
         tool_name: nome.to_string(),
         bersagli: bersagli_del_passo(input),
         esito,
@@ -543,6 +660,19 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// L'id del batch IN GIUDIZIO. Nella history dei test non compare: sono i
+    /// passi PRECEDENTI a doversi trovare, e il caso in cui il batch e' anche
+    /// nella cronologia ha il suo test dedicato.
+    const ID_IN_GIUDIZIO: &str = "toolu_batch_in_giudizio";
+
+    /// La meta' «cronologia» dell'estratto, che e' cio' che questi test
+    /// misurano. Passa dal criterio reale ([`stato_presupposto`]) e ne legge il
+    /// campo: chiamare `fatti_del_run` direttamente scavalcherebbe il
+    /// costruttore che la produzione usa (regola O).
+    fn fatti_del_run_di(messages: &[Message], batch: &[(&str, &str, &Value)]) -> FattiDelRun {
+        stato_presupposto(messages, batch).dal_run
+    }
+
     /// La history COME LA PRODUCE il motore: il tool_use in un `Message::Ai` a
     /// blocchi, il tool_result in un `Message::Human` a blocchi (regola O: e' la
     /// forma che `tool_dispatch` emette, non una fabbricata per il test).
@@ -595,10 +725,10 @@ mod tests {
             false,
         );
         let input = json!({"command": "chmod +x verifica.sh && ./verifica.sh"});
-        let batch = vec![("run_command", &input)];
+        let batch = vec![(ID_IN_GIUDIZIO, "run_command", &input)];
 
-        let estratto = stato_presupposto(&messages, &batch);
-        let StatoPresupposto::Fatti { fatti, omessi } = &estratto else {
+        let estratto = fatti_del_run_di(&messages, &batch);
+        let FattiDelRun::Fatti { fatti, omessi } = &estratto else {
             panic!("il passo che ha creato il file non e' arrivato al giudice: {estratto:?}");
         };
         assert_eq!(*omessi, 0);
@@ -636,8 +766,8 @@ mod tests {
         ));
         let input = json!({"command": "chmod +x verifica.sh && ./verifica.sh"});
 
-        let estratto = stato_presupposto(&messages, &[("run_command", &input)]);
-        let StatoPresupposto::Fatti { fatti, .. } = &estratto else {
+        let estratto = fatti_del_run_di(&messages, &[(ID_IN_GIUDIZIO, "run_command", &input)]);
+        let FattiDelRun::Fatti { fatti, .. } = &estratto else {
             panic!("estratto vuoto: {estratto:?}");
         };
         // Entrambi i passi, nell'ordine in cui sono avvenuti.
@@ -662,8 +792,8 @@ mod tests {
             true,
         );
         let input = json!({"command": "./verifica.sh"});
-        let estratto = stato_presupposto(&messages, &[("run_command", &input)]);
-        let StatoPresupposto::Fatti { fatti, .. } = &estratto else {
+        let estratto = fatti_del_run_di(&messages, &[(ID_IN_GIUDIZIO, "run_command", &input)]);
+        let FattiDelRun::Fatti { fatti, .. } = &estratto else {
             panic!("il fallimento e' sparito dall'estratto: {estratto:?}");
         };
         assert_eq!(fatti[0].esito, EsitoFatto::Fallito);
@@ -697,7 +827,7 @@ mod tests {
             },
         ];
         let input = json!({"command": "rm -rf build.js"});
-        let StatoPresupposto::Fatti { fatti, .. } = stato_presupposto(&messages, &[("run_command", &input)])
+        let FattiDelRun::Fatti { fatti, .. } = fatti_del_run_di(&messages, &[(ID_IN_GIUDIZIO, "run_command", &input)])
         else {
             panic!("nessun fatto");
         };
@@ -719,7 +849,7 @@ mod tests {
             thinking_signature: None,
         }];
         let input = json!({"command": "cat b.txt"});
-        let StatoPresupposto::Fatti { fatti, .. } = stato_presupposto(&messages, &[("run_command", &input)])
+        let FattiDelRun::Fatti { fatti, .. } = fatti_del_run_di(&messages, &[(ID_IN_GIUDIZIO, "run_command", &input)])
         else {
             panic!("nessun fatto");
         };
@@ -733,8 +863,8 @@ mod tests {
         let vuoto: Vec<Message> = Vec::new();
         let cmd = json!({"command": "rm -rf dist/"});
         assert_eq!(
-            stato_presupposto(&vuoto, &[("run_command", &cmd)]),
-            StatoPresupposto::PrimoPasso
+            fatti_del_run_di(&vuoto, &[(ID_IN_GIUDIZIO, "run_command", &cmd)]),
+            FattiDelRun::PrimoPasso
         );
 
         let messages = turno(
@@ -747,23 +877,23 @@ mod tests {
         // Un batch che non nomina percorsi: nessuna domanda ponibile.
         let prune = json!({"command": "docker system prune"});
         assert_eq!(
-            stato_presupposto(&messages, &[("run_command", &prune)]),
-            StatoPresupposto::BersagliNonRiconosciuti { passi_eseguiti: 1 }
+            fatti_del_run_di(&messages, &[(ID_IN_GIUDIZIO, "run_command", &prune)]),
+            FattiDelRun::BersagliNonRiconosciuti { passi_eseguiti: 1 }
         );
 
         // Bersagli riconosciuti, ma il run non li ha mai toccati.
         let altro = json!({"command": "rm -rf vendor/lib.so"});
-        let StatoPresupposto::NessunFattoPertinente {
+        let FattiDelRun::NessunFattoPertinente {
             passi_eseguiti,
             bersagli,
-        } = stato_presupposto(&messages, &[("run_command", &altro)])
+        } = fatti_del_run_di(&messages, &[(ID_IN_GIUDIZIO, "run_command", &altro)])
         else {
             panic!("atteso NessunFattoPertinente");
         };
         assert_eq!(passi_eseguiti, 1);
         assert_eq!(bersagli, vec!["lib.so".to_string()]);
         // La resa dice che si e' guardato: non tace.
-        let b = StatoPresupposto::NessunFattoPertinente {
+        let b = FattiDelRun::NessunFattoPertinente {
             passi_eseguiti,
             bersagli,
         }
@@ -786,8 +916,8 @@ mod tests {
             ));
         }
         let input = json!({"command": "cat a.txt"});
-        let estratto = stato_presupposto(&messages, &[("run_command", &input)]);
-        let StatoPresupposto::Fatti { fatti, omessi } = &estratto else {
+        let estratto = fatti_del_run_di(&messages, &[(ID_IN_GIUDIZIO, "run_command", &input)]);
+        let FattiDelRun::Fatti { fatti, omessi } = &estratto else {
             panic!("nessun fatto");
         };
         assert_eq!(fatti.len(), MAX_FATTI);
@@ -813,8 +943,8 @@ mod tests {
         );
         let input = json!({"command": "rm pagina.html"});
         assert!(matches!(
-            stato_presupposto(&messages, &[("run_command", &input)]),
-            StatoPresupposto::NessunFattoPertinente { .. }
+            fatti_del_run_di(&messages, &[(ID_IN_GIUDIZIO, "run_command", &input)]),
+            FattiDelRun::NessunFattoPertinente { .. }
         ));
     }
 
@@ -843,5 +973,112 @@ mod tests {
         let t = tronca(&s, CAP_INPUT);
         assert!(t.ends_with(TAGLIATO));
         assert_eq!(t.chars().count(), CAP_INPUT + TAGLIATO.chars().count());
+    }
+
+    /// IL CASO MISURATO (18/08/2026, `app-libri-18-08`): il batch in giudizio
+    /// e' GIA' nella cronologia quando il gate lo classifica — il delta di
+    /// `executor.rs` appende `assistant_msg` a `messages` e valorizza
+    /// `pending_tool_uses` nella stessa mossa — e senza risultato, perche' e'
+    /// il gate a doverne decidere la partenza. Consegnarlo come FATTO significa
+    /// dire al giudice «questo identico comando risulta gia' chiesto, con esito
+    /// non osservato»: quattro rifiuti su diciassette sono nati cosi'.
+    ///
+    /// MUTAZIONE: togliere il filtro `!in_giudizio.contains(...)` da
+    /// `fatti_del_run` -> questo test rosseggia con `Fatti`, e il fatto reso e'
+    /// il curl stesso.
+    #[test]
+    fn il_batch_in_giudizio_non_e_un_fatto_contro_se_stesso() {
+        let input = json!({"command": "curl -s http://localhost:36526/api/libri"});
+        // La cronologia COME la trova il gate: il tool_use del batch e' gia'
+        // stato appeso, e nessun tool_result gli risponde.
+        let messages = vec![Message::Ai {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: ID_IN_GIUDIZIO.to_string(),
+                name: "run_command".to_string(),
+                input: input.clone(),
+                thought_signature: None,
+            }]),
+            tool_calls: Vec::new(),
+            reasoning: None,
+            thinking_signature: None,
+        }];
+
+        let estratto = fatti_del_run_di(&messages, &[(ID_IN_GIUDIZIO, "run_command", &input)]);
+        assert_eq!(
+            estratto,
+            FattiDelRun::PrimoPasso,
+            "il gate ha consegnato al giudice il passo che gli stava chiedendo di giudicare: {estratto:?}"
+        );
+        assert!(!estratto
+            .blocco()
+            .contains(EsitoFatto::NonOsservato.etichetta()));
+    }
+
+    /// Un passo PRECEDENTE con lo stesso identico input resta un fatto: il
+    /// filtro discrimina per ID, non per contenuto — due tentativi uguali sono
+    /// informazione vera, e toglierli nasconderebbe una ripetizione reale.
+    #[test]
+    fn un_tentativo_precedente_identico_resta_un_fatto() {
+        let input = json!({"command": "curl -s http://localhost:36526/api/libri"});
+        let messages = turno(
+            "toolu_precedente",
+            "run_command",
+            input.clone(),
+            "curl: (7) Failed to connect",
+            true,
+        );
+
+        let estratto = fatti_del_run_di(&messages, &[(ID_IN_GIUDIZIO, "run_command", &input)]);
+        let FattiDelRun::Fatti { fatti, .. } = &estratto else {
+            panic!("il tentativo precedente e' sparito dall'estratto: {estratto:?}");
+        };
+        assert_eq!(fatti.len(), 1);
+        assert_eq!(fatti[0].esito, EsitoFatto::Fallito);
+    }
+
+    /// Il canale verso il giudice e' UNO: la resa porta entrambe le meta',
+    /// quella della cronologia e quella dei registri.
+    ///
+    /// MUTAZIONE: togliere `self.dai_registri.blocco()` da
+    /// `StatoPresupposto::blocco` -> rosseggia, e il difetto e' quello reale:
+    /// i fatti sull'appartenenza viaggiano fino all'adapter e nessuno li scrive
+    /// nel prompt (regola O).
+    #[test]
+    fn la_resa_porta_entrambe_le_meta() {
+        use super::super::appartenenza_bersaglio::{
+            Appartenenza, AppartenenzaBersagli, BersaglioRete, FattoDiRete, PerimetroEsecuzione,
+        };
+        let b = StatoPresupposto::dal_run(FattiDelRun::PrimoPasso)
+            .con_registri(AppartenenzaBersagli::Interrogati {
+                rete: vec![FattoDiRete {
+                    bersaglio: BersaglioRete::Loopback {
+                        host: "localhost".to_string(),
+                        porta: 36526,
+                    },
+                    appartenenza: Some(Appartenenza::QuestoProgetto {
+                        label: "backend".to_string(),
+                        unit: Some("app-libri-18-08-backend.service".to_string()),
+                        modo: "adopted".to_string(),
+                    }),
+                }],
+                omessi: 0,
+                perimetro: PerimetroEsecuzione::RadiceDelProgetto,
+            })
+            .blocco();
+        assert!(b.contains("<stato_gia_prodotto>"), "{b}");
+        assert!(b.contains("<appartenenza_dei_bersagli>"), "{b}");
+        assert!(b.contains("localhost:36526"), "{b}");
+    }
+
+    /// Chi non ha interrogato i registri lo DICHIARA: il nodo, che DB non ne
+    /// ha, non deve produrre un blocco che sembri una risposta.
+    #[test]
+    fn il_nodo_dichiara_di_non_aver_interrogato_i_registri() {
+        let s = stato_presupposto(&[], &[]);
+        assert_eq!(
+            s.dai_registri,
+            super::super::appartenenza_bersaglio::AppartenenzaBersagli::NonInterrogati
+        );
+        assert!(s.blocco().contains("non ha interrogato i registri"));
     }
 }

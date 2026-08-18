@@ -3968,6 +3968,56 @@ else
   echo "   reject strutturalmente obbligato misurato il 13/08/2026." >&2
   fail=1
 fi
+# ── appartenenza-bersaglio (2026-08-18) ─────────────────────────────────────
+# «I bersagli che questo batch nomina appartengono al progetto del run?» ha UN
+# punto unico: il criterio e' PURO (vocabolario + resa) e l'unico I/O sta
+# nell'adapter del gate, che ha i pool. Il difetto che ha chiuso: i due mandati
+# pretendevano che l'appartenenza fosse dimostrata «dai DATI DEL PASSO», e per
+# un bersaglio di rete quella prova non e' esprimibile nel testo del comando.
+# Misurato il 18/08/2026 su app-libri-18-08 (run abdbc7c4): 5 curl su 8
+# respinti — «Mancanza di evidenza che il servizio target (localhost:36526)
+# APPARTENGA AL PROGETTO CORRENTE» — mentre nexus_port_allocations aveva la riga
+# `36526 | backend | app-libri-18-08-backend.service` per quel progetto.
+assert_single "appartenenza-bersaglio" 'pub fn bersagli_di_rete' \
+  'crates/nexus-agent-graph/src/decisions/appartenenza_bersaglio.rs' crates
+assert_single "appartenenza-bersaglio" 'pub fn perimetro_del_batch' \
+  'crates/nexus-agent-graph/src/decisions/appartenenza_bersaglio.rs' crates
+assert_single "appartenenza-bersaglio" 'pub enum Appartenenza \{' \
+  'crates/nexus-agent-graph/src/decisions/appartenenza_bersaglio.rs' crates
+
+# Il bucket NON si ricalcola qui: la matematica degli estremi ha gia' il suo
+# punto unico in nexus-tool-kit, e una seconda somma darebbe due idee di «e'
+# sua» proprio dove si decide se un servizio e' del progetto.
+if grep -qE 'nexus_tool_kit::ports::(project_bucket_range|port_in_project_bucket)' \
+     crates/mcp-core/src/agent_graph_adapter/step_validation.rs; then
+  echo "OK appartenenza-bersaglio: il bucket lo dichiara il punto unico delle porte"
+else
+  echo "!! appartenenza-bersaglio: l'adapter non delega piu' il bucket a" >&2
+  echo "   nexus_tool_kit::ports. Due somme divergono su una porta di confine." >&2
+  fail=1
+fi
+
+# Il CONSUMATORE: il messaggio ai due giudici deve rendere il blocco. Senza
+# questa riga i fatti dei registri viaggiano fino all'adapter e nessuno li
+# scrive nel prompt — il difetto tornerebbe intatto con tutti i test del
+# criterio verdi, che e' la forma in cui e' vissuto finora (regola O).
+if grep -qE 'con_registri\(' \
+     crates/mcp-core/src/agent_graph_adapter/step_validation.rs; then
+  echo "OK appartenenza-bersaglio: il gate interroga i registri prima di convocare"
+else
+  echo "!! appartenenza-bersaglio: validate non attacca piu' i fatti dei registri." >&2
+  echo "   I due giudici tornano a non sapere di CHI sia la porta che il comando" >&2
+  echo "   raggiunge, e il loro mandato impone di rifiutare: sono i 5 curl" >&2
+  echo "   respinti il 18/08/2026 su app-libri-18-08." >&2
+  fail=1
+fi
+
+# La resa e' UNA: `StatoPresupposto::blocco` compone entrambe le meta'. Un
+# secondo canale verso il giudice si comporrebbe in un posto e si
+# dimenticherebbe nell'altro (regola L).
+assert_single "appartenenza-bersaglio" 'pub struct StatoPresupposto' \
+  'crates/nexus-agent-graph/src/decisions/stato_presupposto.rs' crates
+
 # ── tassonomia-errori (2026-08-13) ──────────────────────────────────────────
 # «Di che cosa parla questo errore fornitore?» ha UN punto unico: il criterio
 # (`giudica`), il catalogo in memoria (`Mappa`) e l'unica lettura della tabella

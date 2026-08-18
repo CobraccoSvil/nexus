@@ -54,6 +54,9 @@ use nexus_agent_graph::decisions::tetto_output::TettoOutput;
 use std::sync::Arc;
 use std::time::Duration;
 
+use nexus_agent_graph::decisions::appartenenza_bersaglio::{
+    self, Appartenenza, AppartenenzaBersagli, FattoDiRete,
+};
 use nexus_agent_graph::decisions::helpers::provider_style_supports_forcing;
 use nexus_agent_graph::decisions::step_gate::{natura_astensione, StepGateMode, StepVerdict};
 use nexus_agent_graph::runtime::ports::{
@@ -62,6 +65,7 @@ use nexus_agent_graph::runtime::ports::{
 };
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use super::llm_gateway::{turn_cost_usd, GatewayLlmAdapter};
 use crate::internal_routing::{
@@ -248,7 +252,7 @@ struct StepGateAdapter {
 impl StepValidationPort for StepGateAdapter {
     async fn validate(
         &self,
-        req: StepValidationRequest,
+        mut req: StepValidationRequest,
     ) -> Result<StepValidationReport, nexus_agent_graph::runtime::ports::PortError> {
         // Il veto vale su chi sta scrivendo ADESSO: il provider sticky del
         // turno (cascade a meta' run) quando la request lo porta, altrimenti
@@ -273,6 +277,17 @@ impl StepValidationPort for StepGateAdapter {
         };
         let (convocati, degraded) = seleziona_convocati(candidati.clone(), &executor);
         let posti = posti_del_panel(convocati);
+        // I fatti dei REGISTRI si attaccano qui e una volta sola: e' l'unico
+        // punto della catena che conosce l'identita' del progetto e ha i pool,
+        // e i due giudici (piu' un eventuale sostituto) devono leggere lo
+        // stesso blob. Costruirli nel nodo lascerebbe scoperto il secondo
+        // chiamante della porta — `criteria_runner::convocazione_delle_prove`,
+        // che non ha ne' nodo ne' stato di run — o imporrebbe un secondo
+        // produttore della stessa cosa (regola L).
+        req.stato_presupposto = req
+            .stato_presupposto
+            .clone()
+            .con_registri(self.fatti_dei_registri(&req).await);
         let verdicts = self.convoca(posti.clone(), &executor, &req).await;
         // Un posto che nessuno ha preso si riassegna UNA VOLTA (vedi la nota in
         // testa al modulo): qui il report puo' cambiare forma, mai la matrice.
@@ -309,6 +324,83 @@ fn posti_del_panel(convocati: Vec<PurposeProviderCandidate>) -> Vec<PostoDelPane
 }
 
 impl StepGateAdapter {
+    /// Che cosa i REGISTRI del progetto dicono dei bersagli di questo batch.
+    ///
+    /// L'unico I/O del criterio puro
+    /// [`nexus_agent_graph::decisions::appartenenza_bersaglio`]: qui si legge
+    /// `nexus_port_allocations` e si delega la matematica del bucket al punto
+    /// unico che gia' esiste (`nexus_tool_kit::ports`), mai ricalcolandola.
+    ///
+    /// Il registro muto NON degrada a «va bene» ne' a «e' altrui»: diventa
+    /// [`Appartenenza::NonInterrogabile`] col motivo, che al giudice dice che
+    /// si e' guardato e non si e' potuto rispondere (regola Q).
+    async fn fatti_dei_registri(&self, req: &StepValidationRequest) -> AppartenenzaBersagli {
+        let batch: Vec<(&str, &Value)> = req
+            .steps
+            .iter()
+            .map(|s| (s.tool_name.as_str(), &s.tool_input))
+            .collect();
+        let perimetro = appartenenza_bersaglio::perimetro_del_batch(&batch);
+        let bersagli = appartenenza_bersaglio::bersagli_di_rete(&batch);
+
+        // L'identita' del progetto e' la premessa di OGNI domanda al registro:
+        // senza, non esiste ne' bucket ne' proprietario da confrontare.
+        let progetto = nexus_types::parse_project_id(&self.project_id).ok();
+        let mut rete = Vec::with_capacity(bersagli.len());
+        for bersaglio in bersagli {
+            let appartenenza = match (bersaglio.porta_interrogabile(), progetto) {
+                (None, _) => None,
+                (Some(_), None) => Some(Appartenenza::NonInterrogabile {
+                    causa: "identita' del progetto non interpretabile".to_string(),
+                }),
+                (Some(porta), Some(progetto)) => {
+                    Some(self.appartenenza_della_porta(&progetto, porta).await)
+                }
+            };
+            rete.push(FattoDiRete {
+                bersaglio,
+                appartenenza,
+            });
+        }
+        let (rete, omessi) = appartenenza_bersaglio::taglia(rete);
+        AppartenenzaBersagli::Interrogati {
+            rete,
+            omessi,
+            perimetro,
+        }
+    }
+
+    /// La riga del registro per UNA porta, tradotta nel vocabolario del criterio.
+    ///
+    /// `nexus_port_allocations.port` e' UNIQUE (mig 0114), quindi la riga e' una
+    /// sola o nessuna: il proprietario non e' ambiguo.
+    async fn appartenenza_della_porta(&self, progetto: &Uuid, porta: u16) -> Appartenenza {
+        let riga = sqlx::query_as::<_, (Uuid, String, String, Option<String>)>(
+            "SELECT project_id, label, allocation_mode, service_unit \
+             FROM nexus_port_allocations WHERE port = $1",
+        )
+        .bind(i32::from(porta))
+        .fetch_optional(&self.setup.db)
+        .await;
+        let bucket = nexus_tool_kit::ports::project_bucket_range(progetto);
+        match riga {
+            Err(e) => Appartenenza::NonInterrogabile {
+                causa: format!("registro delle porte illeggibile: {e}"),
+            },
+            Ok(Some((proprietario, label, modo, unit))) if proprietario == *progetto => {
+                Appartenenza::QuestoProgetto { label, unit, modo }
+            }
+            Ok(Some((proprietario, label, _, _))) => Appartenenza::AltroProgetto {
+                project_id: proprietario.to_string(),
+                label,
+            },
+            Ok(None) if nexus_tool_kit::ports::port_in_project_bucket(progetto, porta) => {
+                Appartenenza::NelBucketSenzaRiga { bucket }
+            }
+            Ok(None) => Appartenenza::FuoriDalBucket { bucket },
+        }
+    }
+
     /// Fan-out: un task per posto, ciascuno col SUO timeout (timer
     /// indipendenti). Il timeout/JoinError diventa astensione STRUTTURATA nel
     /// report, mai sparizione dal denominatore (GAP-2).
@@ -1149,7 +1241,9 @@ async fn setting_f64(db: &PgPool, chiave: &str, default: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexus_agent_graph::decisions::stato_presupposto::{stato_presupposto, StatoPresupposto};
+    use nexus_agent_graph::decisions::stato_presupposto::{
+        stato_presupposto, FattiDelRun, StatoPresupposto,
+    };
     use nexus_agent_graph::decisions::step_gate::StepCriticality;
     use nexus_agent_graph::runtime::ports::PendingStepInfo;
     use nexus_agent_graph::state::message::{ContentBlock, Message, MessageContent};
@@ -1248,7 +1342,7 @@ mod tests {
             level: StepCriticality::Irreversible,
             plan_excerpt: Some("pulizia della cartella build".into()),
             criteri_in_correzione: Vec::new(),
-            stato_presupposto: StatoPresupposto::PrimoPasso,
+            stato_presupposto: StatoPresupposto::dal_run(FattiDelRun::PrimoPasso),
             prior_rejections: 1,
         }
     }
@@ -1304,10 +1398,10 @@ mod tests {
         );
         let mut r = richiesta();
         r.steps[0].tool_input = json!({"command": "chmod +x verifica.sh && ./verifica.sh"});
-        let batch: Vec<(&str, &Value)> = r
+        let batch: Vec<(&str, &str, &Value)> = r
             .steps
             .iter()
-            .map(|s| (s.tool_name.as_str(), &s.tool_input))
+            .map(|s| (s.tool_use_id.as_str(), s.tool_name.as_str(), &s.tool_input))
             .collect();
         r.stato_presupposto = stato_presupposto(&messages, &batch);
 
@@ -1722,7 +1816,7 @@ mod tests {
 #[cfg(test)]
 mod tests_giudice_inadatto {
     use super::*;
-    use nexus_agent_graph::decisions::stato_presupposto::StatoPresupposto;
+    use nexus_agent_graph::decisions::stato_presupposto::{FattiDelRun, StatoPresupposto};
     use nexus_agent_graph::decisions::step_gate::{
         classify_block, decide_step_gate, GateBlock, StepCriticality, StepGateDecision,
     };
@@ -1734,7 +1828,7 @@ mod tests_giudice_inadatto {
     /// dei giudici inadatti e' stato GLOBALE di processo e i test girano in
     /// parallelo — due test che marcassero `..._kimi` si sposterebbero il
     /// terreno sotto i piedi a vicenda, e il rosso arriverebbe a caso.
-    fn forn(scope: &str, nome: &str) -> String {
+    pub(super) fn forn(scope: &str, nome: &str) -> String {
         format!("gsv1708_{scope}_{nome}")
     }
 
@@ -1745,7 +1839,7 @@ mod tests_giudice_inadatto {
     /// fuori a ogni costo, anche come sostituto), il giudice inadatto — il piu'
     /// economico, quindi il primo scelto — e i fornitori che possono giudicare.
     /// Il costo decide l'ordine di preferenza (`Rank::CostFirst`).
-    const PARCO: &[(&str, &str, f64)] = &[
+    pub(super) const PARCO: &[(&str, &str, f64)] = &[
         ("google", "gemini-2.5-pro", 0.05),
         ("kimi", MODELLO_INADATTO, 0.10),
         ("mistral", "magistral-small-latest", 0.50),
@@ -1753,7 +1847,7 @@ mod tests_giudice_inadatto {
         ("deepseek", "deepseek-v4-pro", 0.90),
     ];
 
-    async fn semina(pool: &PgPool, scope: &str, parco: &[(&str, &str, f64)]) {
+    pub(super) async fn semina(pool: &PgPool, scope: &str, parco: &[(&str, &str, f64)]) {
         for tabella in ["ai_price_catalog", "nexus_purpose_model"] {
             sqlx::query(&format!("DELETE FROM {tabella}"))
                 .execute(pool)
@@ -1806,7 +1900,7 @@ mod tests_giudice_inadatto {
             level: StepCriticality::Critical,
             plan_excerpt: Some("verifica le dipendenze del backend".into()),
             criteri_in_correzione: Vec::new(),
-            stato_presupposto: StatoPresupposto::PrimoPasso,
+            stato_presupposto: StatoPresupposto::dal_run(FattiDelRun::PrimoPasso),
             prior_rejections: 1,
         }
     }
@@ -1814,7 +1908,7 @@ mod tests_giudice_inadatto {
     /// Il corpo HTTP di UNA richiesta al gateway (headers + body per
     /// Content-Length): il modello sta nel corpo, ed e' cio' che distingue un
     /// giudice dall'altro.
-    async fn corpo_richiesta(socket: &mut tokio::net::TcpStream) -> String {
+    pub(super) async fn corpo_richiesta(socket: &mut tokio::net::TcpStream) -> String {
         use tokio::io::AsyncReadExt;
         let mut buf: Vec<u8> = Vec::new();
         let mut tmp = [0u8; 8192];
@@ -1857,7 +1951,7 @@ mod tests_giudice_inadatto {
     /// MISURATO da questo stesso test alla prima esecuzione: il verdetto
     /// riportava `model: "gsv1708_senza_kimi/kimi-k2.6"`, e la finzione dava un
     /// verdetto valido al giudice che doveva astenersi.
-    fn modello_del_wire(richiesta: &Value, provider: &str) -> String {
+    pub(super) fn modello_del_wire(richiesta: &Value, provider: &str) -> String {
         let model = richiesta
             .get("model")
             .and_then(Value::as_str)
@@ -1872,7 +1966,7 @@ mod tests_giudice_inadatto {
     /// riproduce l'astensione misurata: il modello risponde in prosa e la tool
     /// call del verdetto non c'e' — `estrai_verdetto` la legge come
     /// `schema_mismatch`, che e' il fatto da cui tutto discende.
-    fn risposta_gateway(provider: &str, model: &str, col_verdetto: bool) -> String {
+    pub(super) fn risposta_gateway(provider: &str, model: &str, col_verdetto: bool) -> String {
         let mut corpo = json!({
             "content": if col_verdetto { "" } else {
                 "Non posso valutare questo comando nel formato richiesto."
@@ -1965,7 +2059,7 @@ mod tests_giudice_inadatto {
             .expect("la chiave esiste: la semina la mig 0736");
     }
 
-    async fn arma_il_gate(pool: &PgPool, porta: u16) -> Arc<StepGateSetup> {
+    pub(super) async fn arma_il_gate(pool: &PgPool, porta: u16) -> Arc<StepGateSetup> {
         let gateway = NexusGatewayClient::new(format!("http://127.0.0.1:{porta}"), pool.clone());
         build_step_gate(pool, gateway)
             .await
@@ -2231,5 +2325,233 @@ mod tests_giudice_inadatto {
         );
 
         crate::giudici_inadatti::dimentica(&kimi, MODELLO_INADATTO);
+    }
+}
+
+/// IL DIFETTO DEL 18/08/2026: il giudice rifiuta un `curl` verso una porta che
+/// il registro del progetto gli attribuisce, perche' quel fatto non gli arriva.
+///
+/// La misura passa dalla catena VERA (regola O): un gateway finto che risponde
+/// come quello vero, la selezione reale dei candidati, `validate` — cioe' la
+/// funzione che il nodo chiama — e il MESSAGGIO che i giudici ricevono davvero,
+/// letto dal corpo della richiesta HTTP. I test del criterio puro
+/// (`decisions::appartenenza_bersaglio`) resterebbero tutti verdi se `validate`
+/// non chiamasse mai `fatti_dei_registri`: e' precisamente la forma in cui
+/// questo contesto e' mancato finora.
+#[cfg(test)]
+mod tests_appartenenza_dei_bersagli {
+    use super::tests_giudice_inadatto::{
+        arma_il_gate, corpo_richiesta, forn, modello_del_wire, risposta_gateway, semina, PARCO,
+    };
+    use super::*;
+    use nexus_agent_graph::decisions::stato_presupposto::{FattiDelRun, StatoPresupposto};
+    use nexus_agent_graph::decisions::step_gate::StepCriticality;
+    use nexus_agent_graph::runtime::ports::PendingStepInfo;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+    /// La porta del reperto: `nexus_port_allocations` la assegnava al progetto
+    /// con label `backend` e unit `app-libri-18-08-backend.service`.
+    const PORTA_DEL_PROGETTO: i32 = 36526;
+
+    /// Un gateway finto che REGISTRA il messaggio utente consegnato a ciascun
+    /// giudice: e' il prompt reale, non una sua ricostruzione.
+    async fn gateway_che_registra_il_prompt() -> (
+        u16,
+        StdArc<StdMutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("porta effimera");
+        let porta = listener.local_addr().expect("indirizzo").port();
+        let prompt: StdArc<StdMutex<Vec<String>>> = StdArc::new(StdMutex::new(Vec::new()));
+        let registro = prompt.clone();
+        let handle = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let corpo = corpo_richiesta(&mut socket).await;
+                let richiesta: Value = serde_json::from_str(&corpo).unwrap_or(Value::Null);
+                let provider = richiesta
+                    .get("pin_provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let model = modello_del_wire(&richiesta, &provider);
+                // L'ultimo messaggio e' quello utente: il blob del batch.
+                let testo = richiesta
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .and_then(|m| m.last())
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Ok(mut r) = registro.lock() {
+                    r.push(testo);
+                }
+                let risposta = risposta_gateway(&provider, &model, true);
+                let _ = socket.write_all(risposta.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        (porta, prompt, handle)
+    }
+
+    /// Progetto reale + la riga di `nexus_port_allocations` del reperto.
+    async fn progetto_con_porta(pool: &PgPool) -> uuid::Uuid {
+        let team = uuid::Uuid::new_v4();
+        let user = uuid::Uuid::new_v4();
+        let project = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO teams (id, name, slug) VALUES ($1,'T',$2)")
+            .bind(team)
+            .bind(team.to_string())
+            .execute(pool)
+            .await
+            .expect("team");
+        sqlx::query("INSERT INTO users (id, email, display_name) VALUES ($1,$2,'U')")
+            .bind(user)
+            .bind(format!("{user}@t.local"))
+            .execute(pool)
+            .await
+            .expect("user");
+        sqlx::query(
+            "INSERT INTO projects (id, team_id, name, slug, owner_user_id) \
+             VALUES ($1,$2,'app-libri-18-08',$3,$4)",
+        )
+        .bind(project)
+        .bind(team)
+        .bind(project.to_string())
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect("project");
+        sqlx::query(
+            "INSERT INTO nexus_port_allocations \
+               (project_id, port, label, allocation_mode, service_unit) \
+             VALUES ($1, $2, 'backend', 'manual', 'app-libri-18-08-backend.service')",
+        )
+        .bind(project)
+        .bind(PORTA_DEL_PROGETTO)
+        .execute(pool)
+        .await
+        .expect("allocazione");
+        project
+    }
+
+    /// Il batch del reperto: il `curl` che il task chiedeva esplicitamente
+    /// («prova le API con curl») e che il gate ha respinto cinque volte.
+    fn richiesta_del_18_08() -> StepValidationRequest {
+        StepValidationRequest {
+            run_id: "run-18-08".into(),
+            executor_provider: String::new(),
+            steps: vec![PendingStepInfo {
+                tool_use_id: "t1".into(),
+                tool_name: "run_command".into(),
+                tool_input: json!({
+                    "command": format!("curl -s http://localhost:{PORTA_DEL_PROGETTO}/api/libri")
+                }),
+                matched_category: None,
+                reach: nexus_agent_graph::decisions::step_reach::StepReach::Unconfined,
+            }],
+            level: StepCriticality::Critical,
+            plan_excerpt: Some("prova le API con curl".into()),
+            criteri_in_correzione: Vec::new(),
+            stato_presupposto: StatoPresupposto::dal_run(FattiDelRun::PrimoPasso),
+            prior_rejections: 0,
+        }
+    }
+
+    /// MUTAZIONE che la fa rosseggiare col difetto reale: togliere da
+    /// `validate` la riga `req.stato_presupposto = ... .con_registri(...)`. Il
+    /// prompt torna quello del 18/08 — nessuna traccia della porta — e il
+    /// giudice non ha altra scelta che contestare l'appartenenza.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn al_giudice_arriva_a_chi_appartiene_la_porta_del_curl(pool: PgPool) {
+        semina(&pool, "appart", PARCO).await;
+        let progetto = progetto_con_porta(&pool).await;
+        let (porta, prompt, handle) = gateway_che_registra_il_prompt().await;
+
+        let porta_gate = adapter(
+            arma_il_gate(&pool, porta).await,
+            progetto.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            forn("appart", "google"),
+        );
+        let report = porta_gate
+            .validate(richiesta_del_18_08())
+            .await
+            .expect("il gate risponde");
+        handle.abort();
+
+        assert!(
+            !report.verdicts.is_empty(),
+            "nessun giudice convocato: il test non misura il prompt di nessuno ({:?})",
+            report.degraded
+        );
+        let visti = prompt.lock().expect("registro").clone();
+        assert!(
+            !visti.is_empty(),
+            "il gateway finto non ha registrato alcun messaggio"
+        );
+        for testo in &visti {
+            assert!(
+                testo.contains("<appartenenza_dei_bersagli>"),
+                "il blocco dei registri non raggiunge il giudice:\n{testo}"
+            );
+            assert!(
+                testo.contains(&format!("localhost:{PORTA_DEL_PROGETTO}")),
+                "il bersaglio del curl non e' stato riconosciuto:\n{testo}"
+            );
+            assert!(
+                testo.contains("ALLOCATA A QUESTO PROGETTO"),
+                "la riga di nexus_port_allocations non e' arrivata al giudice, che il 18/08 \
+                 ha rifiutato cinque curl per «appartenenza non provata»:\n{testo}"
+            );
+            assert!(
+                testo.contains("app-libri-18-08-backend.service"),
+                "manca l'unit che lega la porta al servizio del progetto:\n{testo}"
+            );
+        }
+    }
+
+    /// Il fatto NON e' un lasciapassare: una porta che il registro attribuisce
+    /// a un ALTRO progetto arriva al giudice come elemento a CARICO.
+    ///
+    /// Senza questo caso il rimedio sarebbe indistinguibile da un'assoluzione
+    /// generalizzata dei bersagli locali.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn una_porta_di_un_altro_progetto_arriva_come_elemento_a_carico(pool: PgPool) {
+        semina(&pool, "carico", PARCO).await;
+        let altrui = progetto_con_porta(&pool).await;
+        let (porta, prompt, handle) = gateway_che_registra_il_prompt().await;
+
+        // Il run gira su un progetto DIVERSO da quello che tiene la porta.
+        let porta_gate = adapter(
+            arma_il_gate(&pool, porta).await,
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            forn("carico", "google"),
+        );
+        let _ = porta_gate
+            .validate(richiesta_del_18_08())
+            .await
+            .expect("il gate risponde");
+        handle.abort();
+
+        let visti = prompt.lock().expect("registro").clone();
+        assert!(!visti.is_empty(), "nessun prompt registrato");
+        for testo in &visti {
+            assert!(
+                testo.contains("ALTRO progetto") && testo.contains("elemento a carico"),
+                "la porta di un altro progetto non e' stata dichiarata a carico:\n{testo}"
+            );
+            assert!(
+                !testo.contains("ALLOCATA A QUESTO PROGETTO"),
+                "il blocco attribuisce al run una porta che e' di {altrui}:\n{testo}"
+            );
+        }
     }
 }

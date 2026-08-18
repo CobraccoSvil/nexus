@@ -1648,9 +1648,13 @@ impl ToolDispatchNode {
         // gate ha deciso di convocare, e giudicare su un insieme e cercare
         // prove per un altro sarebbe la stessa doppia lettura che il campo
         // vuole chiudere.
-        let batch: Vec<(&str, &Value)> = critici
+        // L'id viaggia col passo: senza, il criterio non puo' distinguere il
+        // batch che sta per essere giudicato dai passi PRECEDENTI, e il tool_use
+        // del batch e' gia' nella cronologia quando il gate lo classifica (vedi
+        // la nota in `decisions::stato_presupposto::stato_presupposto`).
+        let batch: Vec<(&str, &str, &Value)> = critici
             .iter()
-            .map(|s| (s.tool_name.as_str(), &s.tool_input))
+            .map(|s| (s.tool_use_id.as_str(), s.tool_name.as_str(), &s.tool_input))
             .collect();
         let stato_presupposto =
             crate::decisions::stato_presupposto::stato_presupposto(&state.messages, &batch);
@@ -5768,7 +5772,7 @@ mod tests {
     /// appena scritto, e il suo mandato gli impone di rifiutare.
     #[tokio::test]
     async fn al_giudice_arriva_lo_stato_che_il_batch_presuppone() {
-        use crate::decisions::stato_presupposto::{EsitoFatto, StatoPresupposto};
+        use crate::decisions::stato_presupposto::{EsitoFatto, FattiDelRun};
         let gate = Arc::new(GateCheCattura {
             vista: std::sync::Mutex::new(None),
         });
@@ -5808,7 +5812,7 @@ mod tests {
         let _ = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
 
         let req = gate.vista.lock().unwrap().clone().expect("porta convocata");
-        let StatoPresupposto::Fatti { fatti, .. } = &req.stato_presupposto else {
+        let FattiDelRun::Fatti { fatti, .. } = &req.stato_presupposto.dal_run else {
             panic!(
                 "il giudice non riceve il file che il run ha appena scritto: {:?}",
                 req.stato_presupposto

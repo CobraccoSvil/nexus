@@ -147,6 +147,7 @@
 pub mod adversarial_review;
 pub mod advisory_panel;
 pub mod advisory_requirements;
+pub mod appartenenza_bersaglio;
 pub mod avanzamento_figura;
 pub mod browser_dialogue;
 pub mod capienza_tpm;
