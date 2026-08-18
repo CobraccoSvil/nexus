@@ -91,6 +91,10 @@ use nexus_graph::node::{GraphNode, NodeError, NodeId};
 use nexus_graph::StateDelta as OpaqueDelta;
 
 use crate::decisions::interlocutore::Interlocutore;
+use crate::nodes::decisione_chiarimento::{
+    una_volta_per_convocazione, ChiaveDecisione, EsitoDecisione, MotivoNonPresa,
+    ProvenienzaDecisione,
+};
 use crate::runtime::ports::MetaStepStore;
 use crate::runtime::AgentNodeCtx;
 use crate::state::{AgentState, Message, MetaStep, StateDelta, ToolUse};
@@ -118,6 +122,13 @@ pub const META_KIND_CLARIFY: &str = "clarify";
 /// costante e' il solo modo di renderli un contratto invece di tre stringhe che
 /// si somigliano.
 const CAMPO_SUGGESTED_DEFAULT: &str = "suggested_default";
+
+/// Nome del campo con cui il payload dichiara DA DOVE viene la decisione.
+///
+/// Vale `null` dove l'ha presa questo run: «non c'e' stata alcuna deviazione»
+/// non e' la stessa cosa di «non lo so», e l'assenza del campo significherebbe
+/// un produttore che non parla questa versione del contratto (regola Q).
+const CAMPO_DECISIONE: &str = "decisione";
 
 /// Descrizione del campo `suggested_default` dichiarata al modello: fuori dalla
 /// `json!` per non produrre una riga oltre il limite di stile (stessa ragione di
@@ -565,6 +576,11 @@ impl ClarifyOrExpandNode {
     ///
     /// `None` anche quando la question e' vuota (no-op, `:852-853`): senza
     /// domanda non c'e' nulla da chiedere ne' da assumere.
+    ///
+    /// `provenienza` dichiara nei campi se la decisione l'ha presa questo run o
+    /// se e' quella della convocazione (regola Q): una figura che agisce su una
+    /// decisione presa altrove deve dirlo, non lasciarlo dedurre.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_ask_delta(
         cfg: &ClarifyConfig,
         state: &AgentState,
@@ -572,6 +588,7 @@ impl ClarifyOrExpandNode {
         force_classify: bool,
         confidence: f64,
         interlocutore: Interlocutore,
+        provenienza: &ProvenienzaDecisione,
     ) -> Option<StateDelta> {
         // Gate Cluster 4 (:841-848): in auto (force_classify) NON interrompiamo
         // per decisioni tecniche/reversibili; chiediamo conferma SOLO per
@@ -601,9 +618,23 @@ impl ClarifyOrExpandNode {
 
         // IL BIVIO, e l'unico posto in cui il criterio ha una conseguenza.
         Some(if interlocutore.puo_porre_una_domanda() {
-            Self::delta_domanda(state, decision, &question, clarify_attempts, confidence)
+            Self::delta_domanda(
+                state,
+                decision,
+                &question,
+                clarify_attempts,
+                confidence,
+                provenienza,
+            )
         } else {
-            Self::delta_assunzione(state, decision, &question, clarify_attempts, interlocutore)
+            Self::delta_assunzione(
+                state,
+                decision,
+                &question,
+                clarify_attempts,
+                interlocutore,
+                provenienza,
+            )
         })
     }
 
@@ -615,6 +646,7 @@ impl ClarifyOrExpandNode {
         question: &str,
         clarify_attempts: i64,
         confidence: f64,
+        provenienza: &ProvenienzaDecisione,
     ) -> StateDelta {
         let meta = MetaStep {
             kind: META_KIND_CLARIFY.to_string(),
@@ -626,6 +658,7 @@ impl ClarifyOrExpandNode {
                 "reversible": decision.reversible,
                 "intent": state.user_intent,
                 "confidence": confidence,
+                CAMPO_DECISIONE: provenienza.dichiarazione(),
             }),
             correlation_id: None,
             created_at: None,
@@ -666,6 +699,7 @@ impl ClarifyOrExpandNode {
         question: &str,
         clarify_attempts: i64,
         interlocutore: Interlocutore,
+        provenienza: &ProvenienzaDecisione,
     ) -> StateDelta {
         let default = decision.suggested_default.trim();
         let payload = json!({
@@ -676,6 +710,7 @@ impl ClarifyOrExpandNode {
             "category": Self::category_label(decision.category),
             "source": META_KIND_CLARIFY_ASSUNZIONE,
             "reason": interlocutore.motivo_assenza(),
+            CAMPO_DECISIONE: provenienza.dichiarazione(),
         });
         let mut assunzioni = state.applied_default_assumptions.clone().unwrap_or_default();
         assunzioni.push(payload.clone());
@@ -783,100 +818,38 @@ impl GraphNode<AgentState, AgentNodeCtx> for ClarifyOrExpandNode {
         // sono portati (OFF di default, I/O KB+LLM+DB): vedi doc del modulo. Con i
         // default DB il flusso non li attraversa, quindi nessuna divergenza.
 
-        // ── project_context: UNA list_files top-level (I/O dietro la porta) ───
-        // Best-effort: errore -> blocco vuoto (comportamento storico, :561-563).
-        let project_context = {
-            let call = ToolUse {
-                id: Uuid::new_v4().to_string(),
-                name: "list_files".to_string(),
-                input: json!({ "directory": "." }),
-                thought_signature: None,
-            };
-            match ctx.tools.execute(call).await {
-                Ok(outcome) => {
-                    // L'esito viaggia nel campo: il listing e' testo per i
-                    // marcatori, `is_error` e' cio' su cui si decide.
-                    let raw = Self::outcome_result_json(&outcome.content);
-                    Self::build_project_context(&raw, outcome.is_error)
-                }
-                Err(err) => {
-                    tracing::debug!(
-                        target: "nexus_agent_graph::clarify_or_expand",
-                        error = %err,
-                        "list_files root fallita (best-effort, nessun project_context)"
-                    );
-                    String::new()
-                }
+        // ── La decisione: una volta per CONVOCAZIONE, non una per figlio ──────
+        // Punto unico dell'identita' in `decisione_chiarimento`: se questo run e'
+        // una figura convocata, la decisione appartiene alla convocazione e al
+        // TESTO del mandato, e il primo che arriva la prende per tutte. Dentro
+        // `prendi_decisione` stanno ENTRAMBI gli I/O (la `list_files` del contesto
+        // progetto e la chiamata al modello): condividerne solo uno lascerebbe
+        // l'altro moltiplicato per il numero di figure.
+        let chiave = ChiaveDecisione::della_convocazione(state, &user_msg);
+        let (esito, provenienza) = match chiave.as_ref() {
+            Some(k) => {
+                una_volta_per_convocazione(k, || Self::prendi_decisione(ctx, &user_msg)).await
+            }
+            // Run di chat: nessuna convocazione, la domanda se la pone lui solo.
+            None => (
+                Self::prendi_decisione(ctx, &user_msg).await,
+                ProvenienzaDecisione::FuoriConvocazione,
+            ),
+        };
+        let decision = match esito {
+            EsitoDecisione::Presa(d) => d,
+            EsitoDecisione::NonPresa(motivo) => {
+                // Best-effort come il Python (:816-818, :822-828): nessuna
+                // decisione -> no-op, con la CAUSA nel campo (regola Q).
+                tracing::info!(
+                    target: "nexus_agent_graph::clarify_or_expand",
+                    motivo = motivo.identificatore(),
+                    provenienza = provenienza.identificatore(),
+                    "nessuna decisione clarify, no-op"
+                );
+                return Ok(StateDelta::default().into_opaque());
             }
         };
-
-        // ── Decisione LLM (TODO I/O delegato) ─────────────────────────────────
-        // Il provider/model del purpose `clarify_expand` + il system prompt
-        // `agent.clarify.base` sono RISOLTI A MONTE (regola G). Finche' non c'e'
-        // la porta che li fornisce, il chiamante li passa via `LlmRequest`
-        // (provider/model gia' decisi). Il project_context (se presente) e'
-        // appeso al system prompt dal chiamante: qui lo passiamo come messaggio di
-        // sistema implicito tramite il primo blocco. La forma della richiesta
-        // resta minimale e provider-agnostica (porte ports.rs).
-        let llm_response = {
-            use crate::runtime::ports::{LlmMessage, LlmRequest};
-            // Il system prompt arriva risolto a monte: qui costruiamo SOLO la
-            // parte nota (user msg + eventuale contesto progetto come system).
-            let mut messages: Vec<LlmMessage> = Vec::new();
-            if !project_context.is_empty() {
-                messages.push(LlmMessage {
-                    role: "system".to_string(),
-                    content: Value::String(project_context),
-                    ..Default::default()
-                });
-            }
-            messages.push(LlmMessage {
-                role: "user".to_string(),
-                content: Value::String(user_msg.clone()),
-                ..Default::default()
-            });
-            let req = LlmRequest {
-                // provider/model RISOLTI A MONTE dal chiamante (regola G): qui
-                // restano vuoti finche' la porta purpose-resolver non li fornisce.
-                // mcp-core li popolera' con `resolve_purpose_model("clarify_expand")`.
-                provider: String::new(),
-                model: String::new(),
-                messages,
-                tools: Some(vec![Self::tool_schema()]),
-                // Nodo chiamante = clarify/understanding. Il gateway concreto lo
-                // IGNORA quando il modello e' gia' risolto (regola L).
-                purpose: Some("clarify_expand".into()),
-                ..Default::default()
-            };
-            match ctx.llm.complete(req).await {
-                Ok(resp) => resp,
-                Err(err) => {
-                    // LLM call fallita -> skip (no-op), come il Python (:816-818).
-                    tracing::warn!(
-                        target: "nexus_agent_graph::clarify_or_expand",
-                        error = %err,
-                        "chiamata LLM clarify fallita (best-effort, no-op)"
-                    );
-                    return Ok(StateDelta::default().into_opaque());
-                }
-            }
-        };
-
-        // Estrae il tool_use `clarify_or_expand`; assente -> skip (:822-828).
-        let tool_call = llm_response
-            .tool_calls
-            .iter()
-            .find(|t| t.name == "clarify_or_expand");
-        let Some(tool_call) = tool_call else {
-            tracing::info!(
-                target: "nexus_agent_graph::clarify_or_expand",
-                blocks = llm_response.tool_calls.len(),
-                "tool_use 'clarify_or_expand' non emesso, no-op"
-            );
-            return Ok(StateDelta::default().into_opaque());
-        };
-
-        let decision = LlmDecision::from_tool_input(&tool_call.input);
         // Chi puo' rispondere a una domanda posta da QUESTO run: punto unico
         // (regola L), letto dallo stato. Non e' la modalita' — vedi la doc di
         // `Interlocutore` per il perche' le due domande restano separate.
@@ -887,6 +860,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for ClarifyOrExpandNode {
             category = ?decision.category,
             reversible = decision.reversible,
             interlocutore = ?interlocutore,
+            provenienza = provenienza.identificatore(),
             "decisione clarify"
         );
 
@@ -899,6 +873,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for ClarifyOrExpandNode {
                 force_classify,
                 confidence,
                 interlocutore,
+                &provenienza,
             )
             .unwrap_or_default(),
             ClarifyMode::Expand => {
@@ -928,6 +903,128 @@ impl GraphNode<AgentState, AgentNodeCtx> for ClarifyOrExpandNode {
 }
 
 impl ClarifyOrExpandNode {
+    /// I DUE I/O della decisione, in un punto solo: il contesto di progetto
+    /// (`list_files` sulla radice) e la chiamata al modello che decide.
+    ///
+    /// Estratta da `run` perche' e' cio' che una convocazione paga UNA volta
+    /// (vedi [`super::decisione_chiarimento`]): finche' viveva inline, ogni
+    /// figura ne pagava una copia e non c'era niente da condividere. Entrambi gli
+    /// I/O stanno DENTRO — il blocco `CONTESTO PROGETTO` fa parte della richiesta
+    /// su cui il modello decide, quindi condividerne solo la meta' darebbe alle
+    /// figure una decisione presa su un prompt diverso dal loro.
+    ///
+    /// Best-effort su entrambi i fronti, come il Python: `list_files` fallita ->
+    /// nessun contesto (`:561-563`); chiamata fallita o verdetto non emesso ->
+    /// [`EsitoDecisione::NonPresa`] con la causa nel campo (`:816-818`,
+    /// `:822-828`), mai un `None` che confonde le due.
+    async fn prendi_decisione(ctx: &AgentNodeCtx, user_msg: &str) -> EsitoDecisione {
+        let project_context = Self::contesto_di_progetto(ctx).await;
+
+        let llm_response = match ctx
+            .llm
+            .complete(Self::richiesta_di_decisione(user_msg, project_context))
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                tracing::warn!(
+                    target: "nexus_agent_graph::clarify_or_expand",
+                    error = %err,
+                    "chiamata LLM clarify fallita (best-effort, no-op)"
+                );
+                return EsitoDecisione::NonPresa(MotivoNonPresa::ChiamataFallita);
+            }
+        };
+
+        // Estrae il tool_use `clarify_or_expand`; assente -> skip (:822-828).
+        let Some(tool_call) = llm_response
+            .tool_calls
+            .iter()
+            .find(|t| t.name == "clarify_or_expand")
+        else {
+            tracing::info!(
+                target: "nexus_agent_graph::clarify_or_expand",
+                blocks = llm_response.tool_calls.len(),
+                "tool_use 'clarify_or_expand' non emesso, no-op"
+            );
+            return EsitoDecisione::NonPresa(MotivoNonPresa::VerdettoNonEmesso);
+        };
+
+        EsitoDecisione::Presa(LlmDecision::from_tool_input(&tool_call.input))
+    }
+
+    /// La richiesta al modello: PURA (nessun I/O), cosi' «cosa chiediamo» resta
+    /// leggibile accanto a «chi lo chiede una volta sola».
+    ///
+    /// Il provider/model del purpose `clarify_expand` + il system prompt
+    /// `agent.clarify.base` sono RISOLTI A MONTE (regola G). Finche' non c'e' la
+    /// porta che li fornisce, il chiamante li passa via `LlmRequest`
+    /// (provider/model gia' decisi). Il `project_context` (se presente) e'
+    /// appeso al system prompt dal chiamante: qui lo passiamo come messaggio di
+    /// sistema implicito tramite il primo blocco. La forma resta minimale e
+    /// provider-agnostica (porte `ports.rs`).
+    fn richiesta_di_decisione(
+        user_msg: &str,
+        project_context: String,
+    ) -> crate::runtime::ports::LlmRequest {
+        use crate::runtime::ports::{LlmMessage, LlmRequest};
+        let mut messages: Vec<LlmMessage> = Vec::new();
+        if !project_context.is_empty() {
+            messages.push(LlmMessage {
+                role: "system".to_string(),
+                content: Value::String(project_context),
+                ..Default::default()
+            });
+        }
+        messages.push(LlmMessage {
+            role: "user".to_string(),
+            content: Value::String(user_msg.to_string()),
+            ..Default::default()
+        });
+        LlmRequest {
+            // provider/model RISOLTI A MONTE dal chiamante (regola G): qui
+            // restano vuoti finche' la porta purpose-resolver non li fornisce.
+            // mcp-core li popolera' con `resolve_purpose_model("clarify_expand")`.
+            provider: String::new(),
+            model: String::new(),
+            messages,
+            tools: Some(vec![Self::tool_schema()]),
+            // Nodo chiamante = clarify/understanding. Il gateway concreto lo
+            // IGNORA quando il modello e' gia' risolto (regola L).
+            purpose: Some("clarify_expand".into()),
+            ..Default::default()
+        }
+    }
+
+    /// Il blocco `CONTESTO PROGETTO`: UNA `list_files` sulla radice, dietro la
+    /// porta. Best-effort — errore -> blocco vuoto (comportamento storico,
+    /// `:561-563`) — e chiamata SOLO da [`Self::prendi_decisione`], perche' fa
+    /// parte della richiesta su cui il modello decide e quindi si paga con lei.
+    async fn contesto_di_progetto(ctx: &AgentNodeCtx) -> String {
+        let call = ToolUse {
+            id: Uuid::new_v4().to_string(),
+            name: "list_files".to_string(),
+            input: json!({ "directory": "." }),
+            thought_signature: None,
+        };
+        match ctx.tools.execute(call).await {
+            Ok(outcome) => {
+                // L'esito viaggia nel campo: il listing e' testo per i
+                // marcatori, `is_error` e' cio' su cui si decide.
+                let raw = Self::outcome_result_json(&outcome.content);
+                Self::build_project_context(&raw, outcome.is_error)
+            }
+            Err(err) => {
+                tracing::debug!(
+                    target: "nexus_agent_graph::clarify_or_expand",
+                    error = %err,
+                    "list_files root fallita (best-effort, nessun project_context)"
+                );
+                String::new()
+            }
+        }
+    }
+
     /// Estrae la stringa `result_json` dal contenuto di un `ToolOutcome`.
     /// Allineato a `UnderstandingNode::outcome_result_json`: stringa -> tale e
     /// quale; oggetto con campo `result_json` -> quello; oggetto -> serializzato;
@@ -1001,6 +1098,11 @@ mod tests {
                 seen: std::sync::Mutex::new(vec![]),
             }
         }
+        /// Quante chiamate al modello sono nate: e' LA misura del difetto
+        /// «una decisione per figlio invece che una per convocazione».
+        fn chiamate(&self) -> usize {
+            self.seen.lock().expect("lock").len()
+        }
     }
 
     #[async_trait]
@@ -1031,6 +1133,36 @@ mod tests {
     impl LlmGateway for FailingLlm {
         async fn complete(&self, _req: LlmRequest) -> Result<LlmResponse, PortError> {
             Err(PortError::Llm("simulato".to_string().into()))
+        }
+    }
+
+    /// Tool executor che CONTA le esecuzioni: la `list_files` del contesto
+    /// progetto e' la seconda meta' di cio' che una convocazione pagava per
+    /// figura, e senza contarla il risparmio dichiarato sarebbe meta' misurato e
+    /// meta' assunto.
+    #[derive(Default)]
+    struct ContaTools {
+        chiamate: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ContaTools {
+        fn chiamate(&self) -> usize {
+            self.chiamate.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for ContaTools {
+        async fn execute(&self, _call: ToolCall) -> Result<ToolOutcome, PortError> {
+            self.chiamate
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Un listing reale del progetto misurato: contiene marcatori, quindi
+            // il blocco CONTESTO PROGETTO viene davvero composto.
+            Ok(ToolOutcome {
+                content: Value::String("src\npackage.json\nREADME.md".to_string()),
+                is_error: false,
+                ..Default::default()
+            })
         }
     }
 
@@ -1091,7 +1223,19 @@ mod tests {
     /// utente. E' il caso che nessun test attraversava (regola O): finche' il
     /// nodo veniva esercitato solo con lo stato di un run di chat, la morte di
     /// `ui_ux_designer` non era rappresentabile in nessuna prova.
+    ///
+    /// La CONVOCAZIONE e' nuova a ogni chiamata, e non e' un dettaglio di stile:
+    /// da quando la decisione di chiarimento e' memoizzata per (convocazione,
+    /// testo) — [`super::decisione_chiarimento`] — due prove che condividessero
+    /// il `parent_run_id` del run misurato condividerebbero anche la decisione,
+    /// e la seconda leggerebbe il verdetto scriptato per la prima (regola F).
     fn stato_sub_run() -> AgentState {
+        stato_sub_run_di(&Uuid::new_v4().to_string())
+    }
+
+    /// Come sopra, con la convocazione DICHIARATA: la usano le prove che
+    /// mettono piu' figure sotto lo stesso padre.
+    fn stato_sub_run_di(convocazione: &str) -> AgentState {
         AgentState {
             messages: vec![human(
                 "Sei ui_ux_designer. Analizza il compito e dai un parere \
@@ -1100,7 +1244,7 @@ mod tests {
             user_intent: Some("code_write".to_string()),
             intent_confidence: Some(0.4),
             automation_mode: Some(AutomationMode::Automatic),
-            parent_run_id: Some("abdbc7c4-66c3-4dcb-8dec-b37bcaf0a916".to_string()),
+            parent_run_id: Some(convocazione.to_string()),
             subagent_depth: Some(1),
             ..Default::default()
         }
@@ -1110,6 +1254,11 @@ mod tests {
     /// guarda cosa e' stato persistito).
     fn nodo_di_test() -> ClarifyOrExpandNode {
         nodo_con_store(ClarifyConfig::default()).0
+    }
+
+    /// Nodo con una config dichiarata, store usa-e-getta.
+    fn nodo_di_test_con(cfg: ClarifyConfig) -> ClarifyOrExpandNode {
+        nodo_con_store(cfg).0
     }
 
     /// Nodo + il suo store, per le prove che guardano CHE COSA e' stato
@@ -1423,7 +1572,8 @@ mod tests {
             &decision,
             true,
             0.4,
-            Interlocutore::Umano
+            Interlocutore::Umano,
+            &ProvenienzaDecisione::Presa,
         )
         .is_none());
     }
@@ -1443,6 +1593,7 @@ mod tests {
             true,
             0.4,
             Interlocutore::Umano,
+            &ProvenienzaDecisione::Presa,
         )
         .expect("delta");
         assert_eq!(delta.pending_clarify, Some(Some(true)));
@@ -1469,6 +1620,7 @@ mod tests {
             true,
             0.4,
             Interlocutore::Nessuno,
+            &ProvenienzaDecisione::Presa,
         )
         .expect("delta");
 
@@ -1512,6 +1664,7 @@ mod tests {
             true,
             0.4,
             Interlocutore::Nessuno,
+            &ProvenienzaDecisione::Presa,
         )
         .expect("delta");
         assert_eq!(delta.pending_clarify, None);
@@ -1538,6 +1691,7 @@ mod tests {
             true,
             0.4,
             Interlocutore::Nessuno,
+            &ProvenienzaDecisione::Presa,
         )
         .expect("delta");
         let assunzioni = delta
@@ -1559,7 +1713,8 @@ mod tests {
             &decision,
             false,
             0.4,
-            Interlocutore::Umano
+            Interlocutore::Umano,
+            &ProvenienzaDecisione::Presa,
         )
         .is_none());
     }
@@ -1663,6 +1818,132 @@ mod tests {
             persistiti[0]["kind"],
             json!(META_KIND_CLARIFY_ASSUNZIONE),
             "un'assunzione applicata non e' una domanda posta"
+        );
+    }
+
+    /// LA MISURA CHE CONTA (18/08/2026, run `abdbc7c4` su `app-libri-18-08`).
+    ///
+    /// Otto figure convocate, UN solo `md5(task_description)` (verificato con
+    /// query sul DB del progetto), otto chiamate al modello in tre secondi piu'
+    /// otto `list_files`. Qui il numero che si guarda non e' un delta dello
+    /// stato: e' QUANTE CHIAMATE nascono da una convocazione di otto figure.
+    ///
+    /// Le otto girano CONCORRENTI perche' e' cosi' che `spawn_fanout` le lancia:
+    /// un «guarda se c'e' gia'» senza attesa qui non risparmierebbe nulla —
+    /// nessuna ha ancora risposto quando le altre guardano — e il test lo
+    /// dimostrerebbe restando rosso.
+    ///
+    /// MUTAZIONE: in `run`, sostituire il ramo `Some(k)` con
+    /// `(Self::prendi_decisione(ctx, &user_msg).await, ProvenienzaDecisione::Presa)`
+    /// — cioe' il difetto reale, la decisione presa da ogni figlio — fa
+    /// rosseggiare le prime due asserzioni con 8 invece di 1.
+    #[tokio::test]
+    async fn una_convocazione_di_otto_figure_paga_una_sola_decisione() {
+        let node = Arc::new(nodo_di_test_con(cfg_produzione()));
+        let llm = Arc::new(ScriptedLlm::with_decision(decisione_product()));
+        let tools = Arc::new(ContaTools::default());
+        let ctx = Arc::new(ctx_with(llm.clone(), tools.clone()));
+        // Una convocazione sola, otto figure, mandato BYTE-IDENTICO.
+        let convocazione = Uuid::new_v4().to_string();
+
+        let mut figure = Vec::new();
+        for _ in 0..8 {
+            let node = node.clone();
+            let ctx = ctx.clone();
+            let st = stato_sub_run_di(&convocazione);
+            figure.push(async move {
+                let delta = node.run(&st, &ctx).await.expect("run ok");
+                apply(st, delta)
+            });
+        }
+        let esiti = futures::future::join_all(figure).await;
+
+        assert_eq!(
+            llm.chiamate(),
+            1,
+            "otto figure sullo stesso mandato: UNA decisione, non otto"
+        );
+        assert_eq!(
+            tools.chiamate(),
+            1,
+            "anche il contesto di progetto e' un fatto della convocazione"
+        );
+
+        // E nessuna delle otto perde il proprio prodotto: l'assunzione c'e' per
+        // tutte, con lo stesso contenuto (avevano lo stesso identico mandato).
+        for out in &esiti {
+            let assunzioni = out
+                .applied_default_assumptions
+                .as_ref()
+                .expect("ogni figura dichiara la propria assunzione");
+            assert_eq!(assunzioni.len(), 1);
+            assert_eq!(
+                assunzioni[0]["question"],
+                json!("Quale palette e quale famiglia tipografica devo adottare?")
+            );
+        }
+        // Sette su otto la dichiarano EREDITATA (regola Q): chi agisce su una
+        // decisione presa altrove lo scrive, non lo lascia dedurre.
+        let ereditate = esiti
+            .iter()
+            .filter(|o| {
+                o.applied_default_assumptions.as_ref().expect("assunzioni")[0][CAMPO_DECISIONE]
+                    ["provenienza"]
+                    == json!("inherited")
+            })
+            .count();
+        assert_eq!(ereditate, 7, "una la prende, sette la ereditano");
+    }
+
+    /// DUE mandati diversi nella stessa convocazione sono DUE domande: e' il
+    /// caso misurato delle due `provider_analyst`, che sotto lo stesso padre
+    /// avevano `context_blob` distinti (md5 `00ddb047` e `21949e6b`).
+    ///
+    /// E' la ragione per cui l'identita' della decisione e' il TESTO e non la
+    /// convocazione: una decisione sola per padre darebbe a una figura la
+    /// risposta data sul contesto dell'altra.
+    #[tokio::test]
+    async fn due_mandati_diversi_restano_due_decisioni() {
+        let node = Arc::new(nodo_di_test_con(cfg_produzione()));
+        let llm = Arc::new(ScriptedLlm::with_decision(decisione_product()));
+        let tools = Arc::new(ContaTools::default());
+        let ctx = Arc::new(ctx_with(llm.clone(), tools.clone()));
+        let convocazione = Uuid::new_v4().to_string();
+
+        let mut figure = Vec::new();
+        for contesto in ["openai", "mistral"] {
+            let node = node.clone();
+            let ctx = ctx.clone();
+            let mut st = stato_sub_run_di(&convocazione);
+            st.messages = vec![human(&format!(
+                "Sei provider_analyst. Analizza il fornitore {contesto}."
+            ))];
+            figure.push(async move { node.run(&st, &ctx).await.expect("run ok") });
+        }
+        futures::future::join_all(figure).await;
+
+        assert_eq!(
+            llm.chiamate(),
+            2,
+            "contesti diversi -> prompt diversi -> due decisioni"
+        );
+    }
+
+    /// Il run di CHAT non entra in nessuna convocazione: la decisione se la
+    /// prende lui, e due run di chat con lo stesso testo non se la scambiano.
+    #[tokio::test]
+    async fn due_run_di_chat_non_condividono_la_decisione() {
+        let node = nodo_di_test_con(cfg_produzione());
+        let llm = Arc::new(ScriptedLlm::with_decision(decisione_product()));
+        let tools = Arc::new(ContaTools::default());
+        let ctx = ctx_with(llm.clone(), tools.clone());
+        let st = trigger_state();
+        node.run(&st, &ctx).await.expect("run ok");
+        node.run(&st, &ctx).await.expect("run ok");
+        assert_eq!(
+            llm.chiamate(),
+            2,
+            "senza convocazione non c'e' nessuno con cui condividere"
         );
     }
 

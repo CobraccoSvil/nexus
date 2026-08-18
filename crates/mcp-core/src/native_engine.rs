@@ -7273,4 +7273,183 @@ mod tests {
         assert_eq!(effective_run_cost_budget_usd(10.0, None), 10.0);
         assert_eq!(effective_run_cost_budget_usd(0.0, None), 0.0);
     }
+
+    // ── PONTE col produttore: i campi che il DISPATCHER scrive bastano a far
+    //    pagare UNA sola decisione di chiarimento a una convocazione? ─────────
+    //
+    // Il criterio e il registro vivono in `nexus-agent-graph` e li' sono provati
+    // con stati costruiti a mano. Quella prova resterebbe VERDE anche se questo
+    // lato smettesse di propagare `parent_run_id`, o se il mandato venisse
+    // composto in modo diverso per ogni figura: sarebbe il falso verde della
+    // regola O. Qui l'input nasce dai produttori REALI — `compose_subagent_mandate`
+    // per il messaggio, `build_initial_state` per lo stato — e la misura e'
+    // quella che conta: quante chiamate al modello nascono da otto figure.
+    mod decisione_di_convocazione {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        use async_trait::async_trait;
+        use nexus_agent_graph::nodes::ClarifyOrExpandNode;
+        use nexus_agent_graph::runtime::ports::{
+            EventSink, LlmGateway, LlmRequest, LlmResponse, MetaStepStore, PortError, SseEvent,
+            ToolCall, ToolOutcome, ToolExecutor,
+        };
+        use nexus_agent_graph::runtime::AgentNodeCtx;
+        use nexus_agent_graph::state::ToolUse;
+        use nexus_graph::node::GraphNode;
+        use serde_json::json;
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        use super::super::build_initial_state;
+        use super::sample_input;
+
+        /// Gateway che CONTA le chiamate ed emette la decisione misurata
+        /// (`mode=ask`, `category=product`): la stessa che il 18/08 ha fermato
+        /// `ui_ux_designer`.
+        #[derive(Default)]
+        struct ContaChiamate {
+            n: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl LlmGateway for ContaChiamate {
+            async fn complete(&self, _req: LlmRequest) -> Result<LlmResponse, PortError> {
+                self.n.fetch_add(1, Ordering::SeqCst);
+                Ok(LlmResponse {
+                    tool_calls: vec![ToolUse {
+                        id: "tc-1".to_string(),
+                        name: "clarify_or_expand".to_string(),
+                        input: json!({
+                            "mode": "ask",
+                            "question": "Quale palette devo adottare?",
+                            "category": "product",
+                            "reversible": true,
+                            "suggested_default": "palette neutra"
+                        }),
+                        thought_signature: None,
+                    }],
+                    ..Default::default()
+                })
+            }
+        }
+
+        /// Tool executor che conta le `list_files` del contesto di progetto.
+        #[derive(Default)]
+        struct ContaTool {
+            n: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl ToolExecutor for ContaTool {
+            async fn execute(&self, _call: ToolCall) -> Result<ToolOutcome, PortError> {
+                self.n.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolOutcome {
+                    content: serde_json::Value::String("src\npackage.json".to_string()),
+                    ..Default::default()
+                })
+            }
+        }
+
+        struct Muto;
+        impl EventSink for Muto {
+            fn emit(&self, _ev: SseEvent) {}
+        }
+
+        #[async_trait]
+        impl MetaStepStore for Muto {
+            async fn persist_meta_step(
+                &self,
+                _meta_step: serde_json::Value,
+            ) -> Result<(), PortError> {
+                Ok(())
+            }
+        }
+
+        /// LA MISURA (18/08/2026, run `abdbc7c4` su `app-libri-18-08`): otto
+        /// figure convocate dallo stesso padre con `md5(task_description)` unico
+        /// -> otto chiamate clarify in tre secondi, 7715 token, piu' otto
+        /// `list_files`.
+        ///
+        /// MUTAZIONE: azzerare `input.parent_run_id` prima di
+        /// `build_initial_state` — cioe' il dispatcher che smette di dichiarare
+        /// la convocazione — fa risalire il conteggio a 8. E' la ragione per cui
+        /// questa prova sta QUI e non nel crate del criterio.
+        #[tokio::test]
+        async fn otto_figure_dello_stesso_padre_pagano_una_decisione_sola() {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://nexus@localhost:1/na")
+                .expect("connect_lazy non fa I/O");
+            let llm = Arc::new(ContaChiamate::default());
+            let tools = Arc::new(ContaTool::default());
+            let ctx = Arc::new(AgentNodeCtx {
+                isolation_available: false,
+                db: pool,
+                llm: llm.clone(),
+                tools: tools.clone(),
+                emit: Arc::new(Muto),
+                cfg: Default::default(),
+                cancel: CancellationToken::new(),
+                run_id: Uuid::new_v4(),
+                session_id: Uuid::new_v4(),
+                thread_id: Uuid::new_v4(),
+                advisory_gate: None,
+                step_gate: None,
+            });
+            // La config REALE di produzione: `confirm_irreversible_in_auto=true`
+            // e' cio' che accende `force_classify` e fa partire la chiamata per
+            // ogni sub-run (misurato sul DB meta il 18/08/2026).
+            let node = Arc::new(ClarifyOrExpandNode::new(
+                nexus_agent_graph::nodes::ClarifyConfig {
+                    confirm_irreversible_in_auto: true,
+                    ..Default::default()
+                },
+                Arc::new(Muto),
+            ));
+
+            // La convocazione: un solo padre, otto figure, task IDENTICO — la
+            // forma esatta delle sei del Consiglio (context_blob vuoto,
+            // expected_format condiviso).
+            let anchor = Uuid::new_v4();
+            let mandate = crate::agent_tools::subagent_native::compose_subagent_mandate(
+                "Crea un'app per gestire una libreria personale.",
+                "",
+                "Concludi chiamando advisory_verdict.",
+            );
+
+            let mut figure = Vec::new();
+            for _ in 0..8 {
+                let mut input = sample_input();
+                // Gli STESSI campi che `prepare_subagent_run` scrive all'origine.
+                input.parent_run_id = Some(anchor);
+                input.subagent_depth = Some(1);
+                input.automation_mode = "automatic".to_string();
+                input.intent_hint = None;
+                input.classifier_resolved = false;
+                input.requires_tools = None;
+                input.agentic_score = None;
+                input.conversation_history = Vec::new();
+                input.initial_msg = mandate.initial_msg.clone();
+                input.bare_task = Some(mandate.bare_task.clone());
+                let state = build_initial_state(&input);
+                let node = node.clone();
+                let ctx = ctx.clone();
+                figure.push(async move {
+                    node.run(&state, &ctx).await.expect("run ok");
+                });
+            }
+            futures::future::join_all(figure).await;
+
+            assert_eq!(
+                llm.n.load(Ordering::SeqCst),
+                1,
+                "otto figure, un mandato: UNA chiamata al modello, non otto"
+            );
+            assert_eq!(
+                tools.n.load(Ordering::SeqCst),
+                1,
+                "e una sola list_files: il contesto di progetto e' un fatto della convocazione"
+            );
+        }
+    }
 }

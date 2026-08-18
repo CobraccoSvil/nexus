@@ -4432,6 +4432,42 @@ else
   echo "OK interlocutore-del-run: l'esito del clarify attraversa il confine"
 fi
 
+# ── decisione-di-convocazione (2026-08-18) ──────────────────────────────────
+# «La decisione di chiarimento su QUESTO mandato e' gia' stata presa?» ha UN
+# punto unico, e la sua identita' e' la coppia (convocazione, testo). Il difetto
+# chiuso: il nodo clarify la prendeva una volta per FIGLIO — misurato su
+# `app-libri-18-08` (run abdbc7c4), otto figure con UN solo
+# md5(task_description), otto chiamate al modello in tre secondi (7715 token) e
+# otto `list_files`.
+assert_single "decisione-di-convocazione" 'pub struct ChiaveDecisione' \
+  'crates/nexus-agent-graph/src/nodes/decisione_chiarimento.rs' \
+  crates/nexus-agent-graph/src
+
+# Il nodo deve PASSARE dal registro: se `run` torna a chiamare direttamente il
+# proprio I/O per ogni figlio, il criterio resta perfetto e mai interrogato, con
+# tutti i suoi test verdi (regola O).
+if ! grep -q 'una_volta_per_convocazione' \
+  crates/nexus-agent-graph/src/nodes/clarify_or_expand.rs; then
+  echo "!! decisione-di-convocazione: il nodo clarify non passa piu' dal punto" >&2
+  echo "   unico: la decisione torna a pagarsi una volta per figura." >&2
+  fail=1
+else
+  echo "OK decisione-di-convocazione: il nodo clarify passa dal punto unico"
+fi
+
+# I DUE I/O condivisi stanno DENTRO `prendi_decisione`: la `list_files` del
+# contesto progetto fa parte della richiesta su cui il modello decide, quindi
+# condividerne solo meta' darebbe alle figure una decisione presa su un prompt
+# diverso dal loro (e lascerebbe l'altra meta' moltiplicata per figura).
+if ! grep -q 'async fn prendi_decisione' \
+  crates/nexus-agent-graph/src/nodes/clarify_or_expand.rs; then
+  echo "!! decisione-di-convocazione: i due I/O della decisione non sono piu'" >&2
+  echo "   in un punto solo: quello lasciato fuori non viene condiviso." >&2
+  fail=1
+else
+  echo "OK decisione-di-convocazione: i due I/O della decisione sono in un punto"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1
