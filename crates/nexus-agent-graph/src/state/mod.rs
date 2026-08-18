@@ -709,8 +709,24 @@ pub struct AgentState {
     pub applied_default_assumptions: Option<Vec<Value>>,
 
     // ── Sub-agents ──────────────────────────────────────────────────────────────
-    /// Id del run genitore (se sub-run).
+    /// Id del run genitore (se sub-run). E' l'ANCORA della famiglia
+    /// (`subagent_native::parent_anchor` = `parent_run_id.or(session_id)`): per un
+    /// sub-run di primo livello vale la SESSIONE, non un run. Va bene per la
+    /// domanda che si pone [`crate::decisions::interlocutore`] («esiste un
+    /// padre?»), NON per identificare una convocazione — per quella c'e'
+    /// [`Self::dispatcher_run_id`].
     pub parent_run_id: Option<String>,
+    /// Id del run che ha CONVOCATO questa figura (`ctx.core.run_id` del
+    /// dispatcher, lo stesso valore della colonna
+    /// `nexus_subagent_runs.dispatcher_run_id`). `None` per il run principale e
+    /// dovunque la convocazione non sia nominabile.
+    ///
+    /// Non e' un doppione di [`Self::parent_run_id`]: quello e' l'ancora della
+    /// FAMIGLIA e degenera nella sessione, questo nomina il run che ha fatto il
+    /// fan-out. Lo legge [`crate::nodes::decisione_chiarimento`], dove e'
+    /// l'identita' sotto cui le figure di una convocazione condividono la
+    /// decisione di chiarimento invece di pagarne una a testa.
+    pub dispatcher_run_id: Option<String>,
     /// Profondita' del sub-agente.
     pub subagent_depth: Option<i64>,
     /// Che cosa questo run deve CONSEGNARE: il lavoro, o un parere su di esso.

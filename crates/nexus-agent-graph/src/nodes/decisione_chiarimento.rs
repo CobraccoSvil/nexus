@@ -8,12 +8,12 @@
 //!
 //! Il Consiglio convoca otto figure e il nodo
 //! [`crate::nodes::ClarifyOrExpandNode`] gira per ognuna: otto chiamate al
-//! modello in tre secondi, 7715 token, tutte sullo stesso fornitore, e la nona
-//! riceve il 429 causato dalle otto precedenti. Ogni figura paga anche una
-//! `list_files` propria per il contesto di progetto.
+//! modello, 7715 token, tutte sullo stesso fornitore, e la nona riceve il 429
+//! causato dalle otto precedenti. Ogni figura paga anche una `list_files`
+//! propria per il contesto di progetto.
 //!
 //! Le otto figure non stavano rispondendo a otto domande. Misurato sul DB del
-//! progetto (`nexus_subagent_runs`, `parent_run_id='abdbc7c4-…'`):
+//! progetto (`nexus_subagent_runs`, `dispatcher_run_id='abdbc7c4-…'`):
 //!
 //! | figure | `md5(task_description)` | `md5(context_blob)` | `md5(expected_format)` |
 //! |---|---|---|---|
@@ -23,7 +23,7 @@
 //! Le sei del Consiglio hanno un mandato BYTE-IDENTICO: sei chiamate per una
 //! domanda sola. Le due `provider_analyst` NO — stesso task, contesto diverso —
 //! e sono la ragione per cui l'identita' della decisione e' il TESTO e non la
-//! convocazione (vedi sotto).
+//! sola convocazione (vedi sotto).
 //!
 //! ## Perche' l'identita' e' (CONVOCAZIONE, TESTO) e non una delle due
 //!
@@ -45,13 +45,70 @@
 //! uguale significa richiesta uguale. Una normalizzazione lo renderebbe un
 //! «quasi uguale» deciso da noi.
 //!
+//! ## La convocazione e' il DISPATCHER, mai l'ancora della famiglia
+//!
+//! Il primo giro di questo modulo chiavava su `AgentState::parent_run_id`, ed
+//! era l'identita' SBAGLIATA: quel campo porta
+//! `subagent_native::parent_anchor` = `parent_run_id.or(session_id)`, e il ramo
+//! `session_id` non e' un caso di confine — e' quello ORDINARIO, perche' un
+//! sub-run dispatchato dal run principale ha `ctx.core.parent_run_id = None`.
+//!
+//! MISURATO il 18/08/2026 sui due soli DB-progetto con attivita'
+//! (`app-libri-18-08` 20 righe, `audit-verifica-17-08` 7):
+//!
+//! | chiave | gruppo piu' grande | arco temporale |
+//! |---|---|---|
+//! | `parent_run_id` | 10 righe | **18m15s** — ed e' `7b734e17`, una riga di `chat_sessions` («Chat 1») |
+//! | `dispatcher_run_id` | 18 righe | 18m32s — ma su 3 dispatcher distinti, TUTTI righe di `agent_runs`, NESSUNO una sessione |
+//! | coppia (dispatcher, mandato) | 6 righe | **69 ms** |
+//!
+//! La sessione `7b734e17` contiene DUE run principali (`abdbc7c4` alle 00:29:44
+//! e `52b3a747` alle 00:49:36): con l'ancora, due TURNI DI CHAT diversi
+//! condividevano lo spazio delle chiavi, e con la ritenzione di 1800 s un
+//! mandato identico al secondo turno avrebbe ereditato la decisione — o il
+//! FALLIMENTO — del primo, venti minuti prima.
+//!
+//! **Il dispatcher da solo non e' una convocazione, e va detto**: quelle 18
+//! righe sono due fan-out distinti dello stesso run (le 8 figure del Consiglio
+//! alle 00:29:45, poi 10 `implement` fino alle 00:48:17, con un intervallo
+//! MINIMO fra due dispatch consecutivi di **9,6 s**). E' la COPPIA col mandato a
+//! stringere il gruppo a 69 ms, perche' i 10 `implement` portano dieci
+//! `md5(task_description)` DIVERSI. Resta percio' un residuo — lo stesso
+//! dispatcher che ri-dispatcha un mandato byte-identico — e a governarlo e' la
+//! ritenzione (vedi [`VITA_MASSIMA_VOCE`]), non la chiave.
+//!
+//! ### Profondita' 2: isolata per costruzione, e i dati lo mostrano
+//!
+//! Una figura che ne convoca un'altra passa dal proprio `ctx.core.run_id`,
+//! quindi la convocazione dei nipoti e' il SUB-RUN che li ha chiamati, mai il
+//! run principale: nessuna condivisione fra i due livelli, e nessun buco.
+//! MISURATO: `a7d51f6e` e `462eaa25` (due `review`, depth 2) portano
+//! `dispatcher_run_id = 87426d5e`, che e' il sub-run `implement` che le ha
+//! convocate — non `abdbc7c4`, che aveva convocato lui.
+//!
+//! Sull'ANCORA quella garanzia non c'era, e la ragione e' che la stessa
+//! `parent_anchor` produce valori di natura diversa a seconda del percorso: per
+//! le otto figure del Consiglio vale il run principale (`abdbc7c4`), per i dieci
+//! `implement` dispatchati dallo STESSO run vale la sessione (`7b734e17`). Un
+//! campo che per lo stesso dispatcher vale ora un run e ora una conversazione
+//! non e' un'identita'.
+//!
 //! ## Il contesto di progetto sta dentro la decisione, non accanto
 //!
 //! La richiesta al modello porta anche il blocco `CONTESTO PROGETTO`, prodotto
-//! da una `list_files` sulla radice. E' un fatto del PROGETTO, non della figura:
-//! le figure di una convocazione condividono sessione e radice, quindi il blocco
-//! e' lo stesso per tutte. Sta dentro cio' che si paga una volta sola — le otto
-//! `list_files` diventano una — e non e' un secondo criterio da tenere allineato.
+//! da una `list_files` sulla radice. E' un fatto del PROGETTO, non della figura,
+//! e sta dentro cio' che si paga una volta sola: le otto `list_files` diventano
+//! una, e non e' un secondo criterio da tenere allineato.
+//!
+//! Una precisazione che il primo giro dava per scontata: le figure di una
+//! convocazione condividono la sessione, ma **non sempre la radice**.
+//! `subagent_native::run_batch_isolated` esegue ogni sub-run su un worktree
+//! effimero PROPRIO, quindi la `list_files` condivisa e' quella della radice
+//! della PRIMA figura che decide. I worktree di un batch nascono tutti dallo
+//! stesso `base_commit` risolto una volta (`head_commit` prima delle ondate),
+//! quindi il listing e' lo stesso e l'effetto pratico e' nullo — ma
+//! «condividono la radice» resta un'affermazione che il codice non garantisce,
+//! e vale finche' l'apply dei worktree resta serializzato DOPO le ondate.
 //!
 //! ## Perche' una memoizzazione e non un valore calcolato prima del fan-out
 //!
@@ -83,6 +140,13 @@
 //! ([`MotivoNonPresa`], regola Q): «non ho deciso perche' il modello non ha
 //! risposto» e «non ho deciso perche' non ha emesso il verdetto» hanno rimedi
 //! diversi e non collassano in un `None`.
+//!
+//! L'argomento vale per una FINESTRA, non per sempre, ed e' la seconda ragione
+//! per cui la ritenzione e' quella che e': un 429 ereditato per la durata del
+//! fan-out e' il comportamento giusto (il cooldown del fornitore dura molto di
+//! piu' della finestra, quindi riprovare subito confermerebbe soltanto), mentre
+//! un 429 ereditato mezz'ora dopo sarebbe un guasto conservato oltre la propria
+//! causa.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -145,20 +209,28 @@ pub struct ChiaveDecisione {
 impl ChiaveDecisione {
     /// Il criterio: esiste una convocazione a cui questa decisione appartiene?
     ///
-    /// La convocazione e' il run che ha convocato la figura
-    /// (`AgentState::parent_run_id`, scritto all'origine dal dispatcher). Senza,
-    /// il run e' quello di chat: non c'e' nessuna convocazione, la domanda se la
-    /// pone lui solo, e la decisione non si condivide con nessuno — `None`.
+    /// La convocazione e' il run che ha fatto il FAN-OUT
+    /// (`AgentState::dispatcher_run_id`, scritto all'origine dal punto unico
+    /// `subagent_native::dispatcher_run_id`). Senza, non c'e' nessuna
+    /// convocazione nominabile — il run di chat, e ogni percorso fuori dal grafo
+    /// Real — la domanda se la pone quel run solo, e la decisione non si
+    /// condivide con nessuno: `None`.
     ///
-    /// NON e' [`crate::decisions::interlocutore::Interlocutore`], che risponde a
-    /// «c'e' qualcuno a cui chiedere?» e basta a se stesso con la sola
-    /// profondita': qui serve il NOME della convocazione, perche' e' lui la
-    /// chiave. Un sub-run che dichiarasse la profondita' e non il padre non ha
-    /// una convocazione nominabile e decide per conto proprio — l'errore cade
-    /// dalla parte di pagare una chiamata in piu', mai di ereditare da un
-    /// insieme sbagliato.
+    /// NON e' `AgentState::parent_run_id`, ed e' il difetto che questo modulo ha
+    /// avuto per un giorno: quel campo e' l'ANCORA della famiglia e per un
+    /// sub-run di primo livello vale la SESSIONE (misurato: 10 righe di
+    /// `nexus_subagent_runs` ancorate a una riga di `chat_sessions`, su 18
+    /// minuti e su due turni di chat distinti). Una decisione chiavata li'
+    /// sarebbe una decisione della CONVERSAZIONE.
+    ///
+    /// NON e' nemmeno [`crate::decisions::interlocutore::Interlocutore`], che
+    /// risponde a «c'e' qualcuno a cui chiedere?» e basta a se stesso con la
+    /// sola profondita': qui serve il NOME della convocazione, perche' e' lui la
+    /// chiave. Un sub-run che dichiarasse la profondita' e non il dispatcher
+    /// decide per conto proprio — l'errore cade dalla parte di pagare una
+    /// chiamata in piu', mai di ereditare da un insieme sbagliato.
     pub fn della_convocazione(state: &AgentState, mandato: &str) -> Option<Self> {
-        let convocazione = state.parent_run_id.as_deref().map(str::trim)?;
+        let convocazione = state.dispatcher_run_id.as_deref().map(str::trim)?;
         if convocazione.is_empty() {
             return None;
         }
@@ -237,13 +309,41 @@ impl ProvenienzaDecisione {
     }
 }
 
-/// Vita massima di una voce del registro.
+/// Vita massima di una voce del registro: la FINESTRA DI ADESIONE al fan-out.
 ///
-/// NON e' un TTL di cache — la chiave e' gia' la convocazione, quindi una voce
-/// non puo' in nessun caso rispondere a un'altra: e' igiene di memoria per un
-/// registro di processo, dimensionata sopra la durata di qualunque convocazione
-/// (i tetti dei sub-run stanno nell'ordine dei minuti).
-const VITA_MASSIMA_VOCE: Duration = Duration::from_secs(1800);
+/// Non e' igiene di memoria e non e' un TTL di cache: e' il solo presidio contro
+/// l'unico residuo che la chiave non copre — lo stesso dispatcher che
+/// ri-dispatcha un mandato BYTE-IDENTICO piu' tardi, ereditando una decisione (o
+/// un fallimento) presa su uno stato del progetto che non c'e' piu'.
+///
+/// Governa le sole adesioni NUOVE. Chi ha gia' ottenuto l'`Arc` della cella
+/// resta agganciato anche se la voce viene potata mentre la decisione e' in
+/// volo: potare non fa mai decidere due volte chi sta gia' aspettando.
+///
+/// I 60 s stanno fra due quantita' MISURATE il 18/08/2026 e non sono un numero
+/// di comodo:
+///
+/// - **sopra la finestra da servire.** Le otto figure del fan-out misurato hanno
+///   raggiunto il nodo in **2,586 s** (ledger `ai_usage_ledger`, otto chiamate
+///   `groq/openai/gpt-oss-20b` da 00:29:45.989 a 00:29:48.575); 60 s sono 23
+///   volte tanto, e il margine serve perche' quel tempo dipende da quanto ci
+///   mettono i nodi a monte, non da noi.
+/// - **sotto la vita del dispatcher.** Lo stesso dispatcher ha continuato a
+///   dispatchare per 18m32s: con 1800 s la finestra di ereditarieta' era la sua
+///   INTERA vita, con 60 s e' un minuto.
+///
+/// Il residuo dichiarato: due dispatch consecutivi dello stesso run possono
+/// distare **9,6 s** (minimo osservato), quindi un mandato byte-identico ripetuto
+/// dentro il minuto eredita ancora. Non e' mai accaduto nei dati (i 10 dispatch
+/// successivi al Consiglio portavano dieci mandati diversi), e l'errore cade dal
+/// lato di una decisione vecchia al piu' un minuto, mai di una chiamata in meno
+/// che avrebbe cambiato l'esito.
+///
+/// Un valore piu' stretto (5 s) separerebbe i due casi anche sui minimi
+/// osservati, ma sarebbe solo il doppio della finestra da servire: alla prima
+/// convocazione piu' lenta il risparmio sparirebbe in silenzio, che e' il difetto
+/// per cui questo modulo esiste.
+const VITA_MASSIMA_VOCE: Duration = Duration::from_secs(60);
 
 /// Tetto al numero di voci vive. Superato, si potano le piu' VECCHIE.
 const VOCI_MASSIME: usize = 512;
@@ -344,10 +444,14 @@ mod tests {
         LlmDecision::from_tool_input(&json!({"mode": "expand", "expanded_query": "x"}))
     }
 
-    fn stato_figura(padre: Option<&str>) -> AgentState {
+    /// Lo stato di una figura convocata: il dispatcher e' il campo che conta,
+    /// l'ancora della famiglia e' un campo DIVERSO (qui la sessione, come in
+    /// produzione per un sub-run di primo livello).
+    fn stato_figura(dispatcher: Option<&str>) -> AgentState {
         AgentState {
-            parent_run_id: padre.map(str::to_string),
-            subagent_depth: padre.map(|_| 1),
+            dispatcher_run_id: dispatcher.map(str::to_string),
+            parent_run_id: dispatcher.map(|_| "sessione-condivisa".to_string()),
+            subagent_depth: dispatcher.map(|_| 1),
             ..Default::default()
         }
     }
@@ -362,13 +466,51 @@ mod tests {
             ChiaveDecisione::della_convocazione(&stato_figura(None), "task").is_none(),
             "run di chat: nessuna convocazione, decide per se'"
         );
-        let k = ChiaveDecisione::della_convocazione(&stato_figura(Some("padre-1")), "task")
+        let k = ChiaveDecisione::della_convocazione(&stato_figura(Some("dispatcher-1")), "task")
             .expect("figura convocata");
-        assert_eq!(k.convocazione(), "padre-1");
+        assert_eq!(k.convocazione(), "dispatcher-1");
         assert_eq!(
             ChiaveDecisione::della_convocazione(&stato_figura(Some("  ")), "task"),
             None,
-            "un padre vuoto non e' un padre: e' un campo non popolato sul wire"
+            "un dispatcher vuoto non e' un dispatcher: e' un campo non popolato sul wire"
+        );
+    }
+
+    /// L'ANCORA della famiglia non e' la convocazione, e nel caso ordinario e'
+    /// la SESSIONE: due figure di due TURNI DI CHAT diversi condividono
+    /// l'ancora, e non devono condividere la decisione.
+    ///
+    /// E' la forma esatta del difetto misurato: sessione `7b734e17` con dentro
+    /// i run principali `abdbc7c4` (00:29:44) e `52b3a747` (00:49:36), e dieci
+    /// righe di `nexus_subagent_runs` ancorate alla sessione su 18m15s.
+    ///
+    /// MUTAZIONE: rimettere `state.parent_run_id` in
+    /// [`ChiaveDecisione::della_convocazione`] fa rosseggiare l'`assert_ne`, con
+    /// la conseguenza in chiaro — due convocazioni distinte, una chiave sola.
+    #[test]
+    fn due_turni_della_stessa_sessione_non_sono_la_stessa_convocazione() {
+        let sessione = "7b734e17";
+        let turno_1 = AgentState {
+            dispatcher_run_id: Some("abdbc7c4".to_string()),
+            parent_run_id: Some(sessione.to_string()),
+            subagent_depth: Some(1),
+            ..Default::default()
+        };
+        let turno_2 = AgentState {
+            dispatcher_run_id: Some("52b3a747".to_string()),
+            parent_run_id: Some(sessione.to_string()),
+            subagent_depth: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            turno_1.parent_run_id, turno_2.parent_run_id,
+            "premessa: l'ancora e' la stessa, ed e' la sessione"
+        );
+        let a = ChiaveDecisione::della_convocazione(&turno_1, "stesso mandato").unwrap();
+        let b = ChiaveDecisione::della_convocazione(&turno_2, "stesso mandato").unwrap();
+        assert_ne!(
+            a, b,
+            "stesso mandato in due turni di chat: due decisioni, non una ereditata"
         );
     }
 
@@ -376,7 +518,7 @@ mod tests {
     /// caso misurato delle due `provider_analyst`.
     #[test]
     fn testi_diversi_nella_stessa_convocazione_sono_chiavi_diverse() {
-        let s = stato_figura(Some("padre-1"));
+        let s = stato_figura(Some("dispatcher-1"));
         let a = ChiaveDecisione::della_convocazione(&s, "analizza openai").unwrap();
         let b = ChiaveDecisione::della_convocazione(&s, "analizza mistral").unwrap();
         assert_ne!(a, b);
@@ -388,8 +530,8 @@ mod tests {
     /// ha un proprietario, e non e' il testo.
     #[test]
     fn lo_stesso_testo_in_due_convocazioni_non_e_la_stessa_chiave() {
-        let a = ChiaveDecisione::della_convocazione(&stato_figura(Some("padre-1")), "t").unwrap();
-        let b = ChiaveDecisione::della_convocazione(&stato_figura(Some("padre-2")), "t").unwrap();
+        let a = ChiaveDecisione::della_convocazione(&stato_figura(Some("dispatcher-1")), "t").unwrap();
+        let b = ChiaveDecisione::della_convocazione(&stato_figura(Some("dispatcher-2")), "t").unwrap();
         assert_ne!(a, b);
     }
 
@@ -467,13 +609,13 @@ mod tests {
         assert_eq!(ProvenienzaDecisione::Presa.dichiarazione(), None);
         assert_eq!(ProvenienzaDecisione::FuoriConvocazione.dichiarazione(), None);
         let d = ProvenienzaDecisione::Ereditata {
-            convocazione: "padre-1".to_string(),
+            convocazione: "dispatcher-1".to_string(),
             firma_mandato: "abc123abc123".to_string(),
         }
         .dichiarazione()
         .expect("ereditata dichiara");
         assert_eq!(d["provenienza"], json!("inherited"));
-        assert_eq!(d["convocazione"], json!("padre-1"));
+        assert_eq!(d["convocazione"], json!("dispatcher-1"));
         assert_eq!(d["firma_mandato"], json!("abc123abc123"));
     }
 

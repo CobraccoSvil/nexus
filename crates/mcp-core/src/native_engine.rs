@@ -352,6 +352,15 @@ pub struct NativeRunInput {
     /// il run principale. Propagato nello stato (`AgentState::parent_run_id`) per
     /// far convergere il sub-run col path Python (`run_subagent`).
     pub parent_run_id: Option<Uuid>,
+    /// Run che ha CONVOCATO questa figura, quando questo run e' un SUB-RUN.
+    /// `None` per il run principale e ovunque la convocazione non sia nominabile.
+    ///
+    /// Propagato in `AgentState::dispatcher_run_id`. Prodotto dal punto unico
+    /// `subagent_native::dispatcher_run_id` (= `ctx.core.run_id`, lo stesso valore
+    /// della colonna `nexus_subagent_runs.dispatcher_run_id`), MAI da
+    /// `parent_run_id` qui sopra: quello e' l'ANCORA della famiglia e per un
+    /// sub-run di primo livello vale la sessione.
+    pub dispatcher_run_id: Option<Uuid>,
     /// Profondita' di annidamento del sub-agente (1 = sub-run chiamato dal main).
     /// `None` per il run principale. Valorizza `AgentState::subagent_depth`: il
     /// grafo nativo lo usa per il guard anti-esplosione del fan-out explore
@@ -4176,6 +4185,10 @@ fn build_initial_state(input: &NativeRunInput) -> AgentState {
         // del fan-out explore se depth>=1). `None` per il run principale -> stato
         // INVARIATO (default None). Solo `dispatch_subagent` popola questi campi.
         parent_run_id: input.parent_run_id.map(|u| u.to_string()),
+        // Chi ha convocato questa figura. Campo DISTINTO da `parent_run_id` e non
+        // derivabile da lui: sono la stessa cosa solo quando il dispatcher e' a
+        // sua volta un sub-run. Lo legge `decisione_chiarimento`.
+        dispatcher_run_id: input.dispatcher_run_id.map(|u| u.to_string()),
         subagent_depth: input.subagent_depth,
         // Il prodotto del run entra nello stato SEMPRE (anche `Lavoro`): un campo
         // popolato solo nel caso restrittivo renderebbe `None` ambiguo fra «run
@@ -4965,6 +4978,8 @@ mod tests {
             step_tx: tx,
             // Run principale di test: nessun annidamento sub-agente.
             parent_run_id: None,
+            // Run principale: nessuna convocazione (vedi `dispatcher_run_id`).
+            dispatcher_run_id: None,
             subagent_depth: None,
             sizing_complexity: None,
             sizing_scope_system_wide: false,
@@ -7275,15 +7290,23 @@ mod tests {
     }
 
     // ── PONTE col produttore: i campi che il DISPATCHER scrive bastano a far
-    //    pagare UNA sola decisione di chiarimento a una convocazione? ─────────
+    //    pagare UNA sola decisione di chiarimento a una convocazione — e a NON
+    //    farla ereditare fra convocazioni diverse? ──────────────────────────
     //
     // Il criterio e il registro vivono in `nexus-agent-graph` e li' sono provati
     // con stati costruiti a mano. Quella prova resterebbe VERDE anche se questo
-    // lato smettesse di propagare `parent_run_id`, o se il mandato venisse
-    // composto in modo diverso per ogni figura: sarebbe il falso verde della
-    // regola O. Qui l'input nasce dai produttori REALI — `compose_subagent_mandate`
-    // per il messaggio, `build_initial_state` per lo stato — e la misura e'
-    // quella che conta: quante chiamate al modello nascono da otto figure.
+    // lato dichiarasse la convocazione SBAGLIATA, ed e' esattamente cio' che e'
+    // successo al primo giro: la chiave era `parent_run_id` — che per un sub-run
+    // di primo livello vale la SESSIONE — e nessun test poteva accorgersene,
+    // perche' l'ancora se la fabbricava il test con un `Uuid::new_v4()`. Un
+    // ponte che inventa l'ancora si accorge solo che il campo e' VUOTO, mai che
+    // contiene un'altra cosa (regola O).
+    //
+    // Qui l'ancora la CHIEDE ai produttori reali (`parent_anchor` e
+    // `dispatcher_run_id`), il mandato lo compone `compose_subagent_mandate` e
+    // lo stato lo costruisce `build_initial_state`. La misura e' quella che
+    // conta: quante chiamate al modello nascono da due convocazioni della stessa
+    // sessione.
     mod decisione_di_convocazione {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -7292,7 +7315,7 @@ mod tests {
         use nexus_agent_graph::nodes::ClarifyOrExpandNode;
         use nexus_agent_graph::runtime::ports::{
             EventSink, LlmGateway, LlmRequest, LlmResponse, MetaStepStore, PortError, SseEvent,
-            ToolCall, ToolOutcome, ToolExecutor,
+            ToolCall, ToolExecutor, ToolOutcome,
         };
         use nexus_agent_graph::runtime::AgentNodeCtx;
         use nexus_agent_graph::state::ToolUse;
@@ -7300,6 +7323,10 @@ mod tests {
         use serde_json::json;
         use tokio_util::sync::CancellationToken;
         use uuid::Uuid;
+
+        use crate::agent_tools::subagent_native::{
+            compose_subagent_mandate, dispatcher_run_id, parent_anchor,
+        };
 
         use super::super::build_initial_state;
         use super::sample_input;
@@ -7366,17 +7393,40 @@ mod tests {
             }
         }
 
+        /// Il ctx del DISPATCHER nella forma che il grafo Real gli da': la
+        /// sessione della conversazione e il run CORRENTE che sta dispatchando.
+        /// `parent_run_id` resta `None`, che e' il caso ORDINARIO di un sub-run
+        /// di primo livello — ed e' proprio quello che rende l'ancora uguale
+        /// alla sessione.
+        fn ctx_dispatcher(
+            sessione: Uuid,
+            run_corrente: Uuid,
+        ) -> crate::agent_tools::AgentToolContext {
+            let mut ctx = crate::test_support::ctx_di_tool_test(std::path::PathBuf::from("."));
+            ctx.core.session_id = Some(sessione);
+            ctx.core.run_id = Some(run_corrente);
+            ctx.core.parent_run_id = None;
+            ctx
+        }
+
         /// LA MISURA (18/08/2026, run `abdbc7c4` su `app-libri-18-08`): otto
-        /// figure convocate dallo stesso padre con `md5(task_description)` unico
-        /// -> otto chiamate clarify in tre secondi, 7715 token, piu' otto
-        /// `list_files`.
+        /// figure convocate dallo stesso dispatcher con `md5(task_description)`
+        /// unico -> otto chiamate clarify, 7715 token, piu' otto `list_files`.
         ///
-        /// MUTAZIONE: azzerare `input.parent_run_id` prima di
-        /// `build_initial_state` — cioe' il dispatcher che smette di dichiarare
-        /// la convocazione — fa risalire il conteggio a 8. E' la ragione per cui
-        /// questa prova sta QUI e non nel crate del criterio.
+        /// E la sua INVERSA, che il primo giro non aveva e che era il difetto:
+        /// la stessa sessione (`7b734e17`, una riga di `chat_sessions`) contiene
+        /// DUE run principali (`abdbc7c4` alle 00:29:44 e `52b3a747` alle
+        /// 00:49:36), quindi due convocazioni diverse con lo stesso mandato
+        /// devono pagare DUE decisioni, non una ereditata dal turno precedente.
+        ///
+        /// MUTAZIONE: in `ChiaveDecisione::della_convocazione` rimettere
+        /// `state.parent_run_id` al posto di `state.dispatcher_run_id` — cioe'
+        /// l'ancora della famiglia — fa scendere il conteggio a 1. Rimettere
+        /// invece l'`anchor` in `input.dispatcher_run_id` qui sotto fa
+        /// rosseggiare allo stesso modo: e' l'altra meta' della stessa
+        /// mutazione, e nessuna delle due passa inosservata.
         #[tokio::test]
-        async fn otto_figure_dello_stesso_padre_pagano_una_decisione_sola() {
+        async fn due_convocazioni_della_stessa_sessione_pagano_due_decisioni() {
             let pool = sqlx::postgres::PgPoolOptions::new()
                 .connect_lazy("postgres://nexus@localhost:1/na")
                 .expect("connect_lazy non fa I/O");
@@ -7407,48 +7457,85 @@ mod tests {
                 Arc::new(Muto),
             ));
 
-            // La convocazione: un solo padre, otto figure, task IDENTICO — la
-            // forma esatta delle sei del Consiglio (context_blob vuoto,
+            // UNA sessione, DUE turni di chat: la forma misurata.
+            let sessione = Uuid::new_v4();
+            let turno_1 = ctx_dispatcher(sessione, Uuid::new_v4());
+            let turno_2 = ctx_dispatcher(sessione, Uuid::new_v4());
+
+            // L'ancora NON si fabbrica: la si chiede a chi la produce.
+            let anchor_1 = parent_anchor(&turno_1);
+            let anchor_2 = parent_anchor(&turno_2);
+            let convocazione_1 =
+                dispatcher_run_id(&turno_1).expect("il grafo Real dichiara il run corrente");
+            let convocazione_2 =
+                dispatcher_run_id(&turno_2).expect("il grafo Real dichiara il run corrente");
+
+            // PREMESSA, misurata sul DB il 18/08/2026 e riprodotta qui: l'ancora
+            // della famiglia e' la SESSIONE, ed e' la stessa per i due turni.
+            // Senza queste asserzioni la prova non saprebbe distinguere «ho usato
+            // il campo giusto» da «i due campi coincidevano».
+            assert_eq!(
+                anchor_1, sessione,
+                "un sub-run di primo livello si ancora alla SESSIONE, non a un run"
+            );
+            assert_eq!(
+                anchor_1, anchor_2,
+                "due turni della stessa chat condividono l'ancora: e' li' il difetto"
+            );
+            assert_ne!(
+                convocazione_1, convocazione_2,
+                "due turni sono due convocazioni: e' questo il campo che le distingue"
+            );
+
+            // Il mandato: uno solo, BYTE-IDENTICO per tutte e dieci le figure —
+            // la forma esatta delle sei del Consiglio (context_blob vuoto,
             // expected_format condiviso).
-            let anchor = Uuid::new_v4();
-            let mandate = crate::agent_tools::subagent_native::compose_subagent_mandate(
+            let mandate = compose_subagent_mandate(
                 "Crea un'app per gestire una libreria personale.",
                 "",
                 "Concludi chiamando advisory_verdict.",
             );
 
             let mut figure = Vec::new();
-            for _ in 0..8 {
-                let mut input = sample_input();
-                // Gli STESSI campi che `prepare_subagent_run` scrive all'origine.
-                input.parent_run_id = Some(anchor);
-                input.subagent_depth = Some(1);
-                input.automation_mode = "automatic".to_string();
-                input.intent_hint = None;
-                input.classifier_resolved = false;
-                input.requires_tools = None;
-                input.agentic_score = None;
-                input.conversation_history = Vec::new();
-                input.initial_msg = mandate.initial_msg.clone();
-                input.bare_task = Some(mandate.bare_task.clone());
-                let state = build_initial_state(&input);
-                let node = node.clone();
-                let ctx = ctx.clone();
-                figure.push(async move {
-                    node.run(&state, &ctx).await.expect("run ok");
-                });
+            for (convocazione, anchor, quante) in [
+                (convocazione_1, anchor_1, 8usize),
+                (convocazione_2, anchor_2, 2usize),
+            ] {
+                for _ in 0..quante {
+                    let mut input = sample_input();
+                    // Gli STESSI campi che `prepare_subagent_run` scrive
+                    // all'origine, coi valori che i produttori hanno appena dato.
+                    input.parent_run_id = Some(anchor);
+                    input.dispatcher_run_id = Some(convocazione);
+                    input.subagent_depth = Some(1);
+                    input.automation_mode = "automatic".to_string();
+                    input.intent_hint = None;
+                    input.classifier_resolved = false;
+                    input.requires_tools = None;
+                    input.agentic_score = None;
+                    input.conversation_history = Vec::new();
+                    input.initial_msg = mandate.initial_msg.clone();
+                    input.bare_task = Some(mandate.bare_task.clone());
+                    let state = build_initial_state(&input);
+                    let node = node.clone();
+                    let ctx = ctx.clone();
+                    figure.push(async move {
+                        node.run(&state, &ctx).await.expect("run ok");
+                    });
+                }
             }
             futures::future::join_all(figure).await;
 
             assert_eq!(
                 llm.n.load(Ordering::SeqCst),
-                1,
-                "otto figure, un mandato: UNA chiamata al modello, non otto"
+                2,
+                "dieci figure, DUE convocazioni: due decisioni — non dieci (nessuna \
+                 condivisione) e non una (decisione ereditata da un altro turno di chat)"
             );
             assert_eq!(
                 tools.n.load(Ordering::SeqCst),
-                1,
-                "e una sola list_files: il contesto di progetto e' un fatto della convocazione"
+                2,
+                "e altrettante list_files: il contesto di progetto e' un fatto della convocazione"
             );
         }
     }

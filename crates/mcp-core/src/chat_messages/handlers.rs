@@ -1354,6 +1354,8 @@ async fn try_resume_interrupted_run(
             supervisor_mode: crate::native_engine::graph_supervisor_mode(supervisor_r),
             step_tx: tx,
             parent_run_id: None,
+            // Run principale: nessuna convocazione (vedi `dispatcher_run_id`).
+            dispatcher_run_id: None,
             subagent_depth: None,
             sizing_complexity: None,
             sizing_scope_system_wide: false,

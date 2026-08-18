@@ -803,6 +803,13 @@ pub struct StateDelta {
         skip_serializing_if = "Option::is_none"
     )]
     pub parent_run_id: Option<Option<String>>,
+    /// Vedi `AgentState::dispatcher_run_id`.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dispatcher_run_id: Option<Option<String>>,
     /// Vedi `AgentState::subagent_depth`.
     #[serde(
         default,

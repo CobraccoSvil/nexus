@@ -1228,14 +1228,21 @@ mod tests {
     /// La CONVOCAZIONE e' nuova a ogni chiamata, e non e' un dettaglio di stile:
     /// da quando la decisione di chiarimento e' memoizzata per (convocazione,
     /// testo) — [`super::decisione_chiarimento`] — due prove che condividessero
-    /// il `parent_run_id` del run misurato condividerebbero anche la decisione,
-    /// e la seconda leggerebbe il verdetto scriptato per la prima (regola F).
+    /// il `dispatcher_run_id` del run misurato condividerebbero anche la
+    /// decisione, e la seconda leggerebbe il verdetto scriptato per la prima
+    /// (regola F).
     fn stato_sub_run() -> AgentState {
         stato_sub_run_di(&Uuid::new_v4().to_string())
     }
 
     /// Come sopra, con la convocazione DICHIARATA: la usano le prove che
-    /// mettono piu' figure sotto lo stesso padre.
+    /// mettono piu' figure sotto lo stesso dispatcher.
+    ///
+    /// `parent_run_id` resta valorizzato perche' e' cio' che il dispatcher
+    /// scrive davvero (l'ANCORA della famiglia), ma porta la SESSIONE — che nel
+    /// caso ordinario e' condivisa fra tutte le convocazioni di una
+    /// conversazione. Tenerlo distinto dal dispatcher e' cio' che rende le prove
+    /// capaci di vedere la differenza fra i due campi.
     fn stato_sub_run_di(convocazione: &str) -> AgentState {
         AgentState {
             messages: vec![human(
@@ -1245,7 +1252,8 @@ mod tests {
             user_intent: Some("code_write".to_string()),
             intent_confidence: Some(0.4),
             automation_mode: Some(AutomationMode::Automatic),
-            parent_run_id: Some(convocazione.to_string()),
+            dispatcher_run_id: Some(convocazione.to_string()),
+            parent_run_id: Some("sessione-della-conversazione".to_string()),
             subagent_depth: Some(1),
             ..Default::default()
         }
