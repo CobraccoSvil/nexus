@@ -150,6 +150,16 @@ pub enum StatoPresupposto {
         /// I bersagli cercati (il giudice vede COSA e' stato chiesto).
         bersagli: Vec<String>,
     },
+    /// Chi convoca il giudizio NON ha accesso alla cronologia del run.
+    ///
+    /// Non e' un'assenza di fatti: e' un'assenza di ACCESSO ai fatti, e i due
+    /// non si equivalgono. La convoca il final gate per le prove del piano di
+    /// verifica (mig 0737): quel criterio gira in un adapter che riceve la
+    /// spec e non lo stato, e nessuna delle altre quattro varianti sarebbe
+    /// vera — [`Self::PrimoPasso`] direbbe al giudice che il run non ha ancora
+    /// fatto nulla, che alla verifica FINALE e' esattamente il contrario del
+    /// vero, e i due mandati (mig 0677) trattano il buio come rifiuto.
+    NonInterrogabile,
     /// I fatti, dal piu' vecchio al piu' recente.
     Fatti {
         /// I fatti pertinenti entro [`MAX_FATTI`].
@@ -193,6 +203,12 @@ impl StatoPresupposto {
                  del batch ({}).\n",
                 bersagli.join(", ")
             ),
+            StatoPresupposto::NonInterrogabile =>
+                "Chi ti convoca non ha accesso alla cronologia di questo run: non sapere cosa \
+                 sia gia' stato prodotto NON e' una prova che non sia stato prodotto, e non e' \
+                 di per se' un motivo di rifiuto. Giudica il RISCHIO di cio' che ti viene \
+                 mostrato.\n"
+                    .to_string(),
             StatoPresupposto::Fatti { fatti, omessi } => elenco_dei_fatti(fatti, *omessi),
         }
     }

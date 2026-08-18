@@ -1558,15 +1558,21 @@ pub(crate) async fn criterio_codice_eseguibile(
 /// per [`criterio_codice_eseguibile`]: il runner non legge il DB, e la misura
 /// resta leggibile in cio' che ha dichiarato di aver usato.
 ///
-/// La POLITICA di ammissione non e' un elenco nuovo: e' il vocabolario del gate
-/// duale, letto dalle STESSE chiavi (regola L). Una prova e' un `run_command` a
-/// tutti gli effetti e viene classificata come tale — il piano di verifica non
-/// e' un canale privilegiato per eseguire comandi.
+/// Il VOCABOLARIO di ammissione non e' un elenco nuovo: sono le STESSE quattro
+/// chiavi del gate duale (regola L). Una prova e' un `run_command` a tutti gli
+/// effetti e viene classificata come tale — il piano di verifica non e' un
+/// canale privilegiato per eseguire comandi.
 ///
-/// Politica ASSENTE (una chiave illeggibile, la soglia fuori vocabolario) non
-/// impedisce al criterio di nascere: nasce, non esegue nulla, e DICHIARA di non
-/// aver potuto misurare. Un criterio che sparisse quando la configurazione manca
-/// sarebbe un gate silenziosamente inerte — cioe' il punto di partenza.
+/// NON c'e' piu' una soglia di criticita' configurabile, e la sua rimozione e'
+/// il fix e non una semplificazione: era l'unica mitigazione di un buco che ora
+/// e' chiuso dal giudizio agentico, ed era documentata con `observation`, un
+/// valore del vocabolario di `step_reach` che `StepCriticality` non ha — chi
+/// l'avesse seguita avrebbe reso il criterio inerte credendo di stringerlo.
+///
+/// Vocabolario ASSENTE (DB muto, chiave svuotata) non impedisce al criterio di
+/// nascere: nasce, non esegue nulla, e DICHIARA di non aver potuto misurare. Un
+/// criterio che sparisse quando la configurazione manca sarebbe un gate
+/// silenziosamente inerte — cioe' il punto di partenza.
 ///
 /// `pub(crate)` per una ragione di MISURA e non di riuso, la stessa degli altri
 /// due costruttori: la configurazione la scrive il DB, e un test che la
@@ -1581,43 +1587,34 @@ pub(crate) async fn criterio_piano_verifica(
     if !abilitato {
         return None;
     }
-    let soglia = nexus_auth::get_setting(db, "agent.final_gate.piano_prova_criticita_max")
-        .await
-        .and_then(|v| serde_json::from_value(serde_json::Value::String(v.trim().to_string())).ok());
-    let politica = soglia.map(|soglia| {
-        let gate = load_step_gate_dispatch(db, 0);
-        (soglia, gate)
-    });
-    let politica = match politica {
-        Some((soglia, gate)) => {
-            let gate = gate.await;
-            Some(PoliticaEsecuzione {
-                soglia,
-                // Lo stesso vocabolario dei mutatori del gate HITL e del gate
-                // duale: un secondo elenco divergerebbe al primo tool aggiunto.
-                mutatori: nexus_auth::get_csv_setting(db, "agent.tools.result_cache_mutators")
-                    .await,
-                regole: gate.rules,
-                rigenerabili: gate.rebuildable_artifacts,
-                osservazione: gate.observation_commands,
-            })
-        }
-        None => {
-            tracing::warn!(
-                target: "mcp_core::native_engine",
-                "piano_di_verifica acceso senza una soglia di criticita' leggibile \
-                 (`agent.final_gate.piano_prova_criticita_max`): il criterio nascera' e \
-                 dichiarera' di non aver potuto eseguire alcuna prova"
-            );
-            None
-        }
+    let gate = load_step_gate_dispatch(db, 0).await;
+    // Lo stesso vocabolario dei mutatori del gate HITL e del gate duale: un
+    // secondo elenco divergerebbe al primo tool aggiunto. E' anche il campo da
+    // cui il criterio sa se il gate HITL avrebbe chiesto conferma all'utente
+    // per questo comando.
+    let mutatori = nexus_auth::get_csv_setting(db, "agent.tools.result_cache_mutators").await;
+    let politica = if mutatori.is_empty() {
+        tracing::warn!(
+            target: "mcp_core::native_engine",
+            "piano_di_verifica acceso senza il vocabolario dei mutatori \
+             (`agent.tools.result_cache_mutators`): il criterio nascera' e dichiarera' di \
+             non aver potuto eseguire alcuna prova"
+        );
+        None
+    } else {
+        Some(PoliticaEsecuzione {
+            mutatori,
+            regole: gate.rules,
+            rigenerabili: gate.rebuildable_artifacts,
+            osservazione: gate.observation_commands,
+        })
     };
     criterio_piano(
         politica.as_ref(),
         &ParametriPiano {
             abilitato,
-            timeout_s: setting_f64(db, "agent.final_gate.prova_timeout_s", 60.0).await,
-            max_prove: setting_usize(db, "agent.final_gate.piano_max_prove", 20).await,
+            timeout_s: setting_f64(db, "agent.final_gate.prova_timeout_s", 45.0).await,
+            max_prove: setting_usize(db, "agent.final_gate.piano_max_prove", 6).await,
         },
     )
 }
@@ -3220,8 +3217,20 @@ pub(crate) fn criteria_runner_del_gate(
     meta_db: &PgPool,
     project_id: Option<Uuid>,
     input: &NativeRunInput,
+    // Il GIUDICE indipendente delle prove del piano (mig 0737): la STESSA porta
+    // che presidia i passi dell'agente nel ToolDispatchNode, e non una seconda
+    // convocazione con una sua configurazione — «due giudici indipendenti
+    // dall'esecutore» deve voler dire la stessa cosa nei due posti in cui un
+    // comando puo' partire.
+    //
+    // Argomento ESPLICITO nella firma e non opzionale per omissione: il
+    // criterio del piano esegue `run_command` fuori dal nodo che porta i
+    // presidi, quindi dimenticare questa porta e' l'apertura del canale
+    // privilegiato — e dev'essere una scelta scritta, non una svista.
+    // `None` = gate duale spento: nessuna prova sopra l'osservazione parte.
+    giudice: Option<Arc<dyn nexus_agent_graph::runtime::ports::StepValidationPort>>,
 ) -> Arc<FinalGateCriteriaRunnerAdapter> {
-    let adapter = FinalGateCriteriaRunnerAdapter::new(tools, run_db, criteria_root)
+    let mut adapter = FinalGateCriteriaRunnerAdapter::new(tools, run_db, criteria_root)
         // L'identita' del run serve al criterio della resa per chiedere al
         // registro QUALE pagina questo lavoro ha prodotto: senza, resterebbe a
         // misurare la prima pagina che trova sull'albero, che e' il difetto
@@ -3229,6 +3238,9 @@ pub(crate) fn criteria_runner_del_gate(
         // pagina, criterio mai nato; progetto vivo -> la pagina di ieri, ciclo
         // di correzione che non puo' convergere).
         .con_run(input.session_id, input.run_id);
+    if let Some(g) = giudice {
+        adapter = adapter.con_giudice(g);
+    }
     Arc::new(match project_id {
         Some(pid) => adapter.con_progetto(meta_db.clone(), pid),
         None => adapter,
@@ -3477,6 +3489,10 @@ async fn build_native_engine(
         &db,
         session_project.as_ref().map(|(pid, _)| *pid),
         input,
+        // La STESSA porta che il ToolDispatchNode usa per i passi dell'agente,
+        // gia' finalizzata con l'identita' contabile del run e col veto
+        // «giudice != worker» sul provider esecutore.
+        step_gate.clone(),
     );
     let criteria: Arc<dyn CriteriaRunner> = criteria_adapter.clone();
 
@@ -7083,6 +7099,11 @@ mod tests {
             &pool,
             Some(project_id),
             &input,
+            // Nessun giudice: questo test misura il criterio della RESA, che
+            // non convoca nessuno. Il piano di verifica ha i propri, e con la
+            // porta assente non eseguirebbe nulla — che e' il comportamento
+            // giusto e non riguarda questa misura.
+            None,
         );
         let collegato = runner
             .run(vec![criterio.clone()])

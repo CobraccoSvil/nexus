@@ -1617,18 +1617,111 @@ assert_single "giudizio-della-prova" 'fn giudica_prova' \
 assert_single "ammissione-della-prova" 'struct PoliticaEsecuzione' \
   'crates/nexus-agent-graph/src/decisions/piano_di_verifica.rs' crates
 
-# Il CONSUMATORE, non la sola definizione (regola O): senza l'ammissione
-# invocata nel runner, la politica resterebbe perfetta e mai interrogata — e il
-# piano diventerebbe la scorciatoia con cui un comando arbitrario aggira i
-# presidi del resto del sistema, con tutti i test del criterio verdi.
-if grep -q 'politica.ammissione(prova)' \
-     crates/mcp-core/src/agent_graph_adapter/criteria_runner.rs; then
-  echo "OK prova-non-privilegiata: il runner classifica ogni prova prima di eseguirla"
+# ── Il piano NON e' un canale privilegiato: la CAPACITA' DI RIFIUTARE ────────
+#
+# La prima stesura di questo guard verificava che `politica.ammissione` fosse
+# CHIAMATA. Non basta, e la review avversaria lo ha misurato: una chiamata a un
+# criterio permissivo e' indistinguibile da una a un criterio severo, quindi il
+# guard sarebbe rimasto VERDE con la soglia messa a un valore che ammette tutto.
+# Un guard che prova l'invocazione e non l'effetto e' la stessa recita che la
+# regola O vieta ai test.
+#
+# Qui si verifica cio' che il criterio deve poter FARE, in tre condizioni che
+# hanno tutte lo stesso significato — un comando che nessun umano vedra' non
+# parte da solo:
+CR=crates/mcp-core/src/agent_graph_adapter/criteria_runner.rs
+PDV=crates/nexus-agent-graph/src/decisions/piano_di_verifica.rs
+
+#  (a) esiste un divieto ASSOLUTO che nessuna configurazione allenta: cio' che
+#      le regole del gate duale marcano irreversibile non e' eseguibile, e la
+#      variante che lo dice non ammette un ramo di esecuzione.
+if grep -q 'Ammissione::Vietata' "$PDV" \
+   && grep -q 'Ammissione::Vietata' "$CR"; then
+  echo "OK prova-vietata: il divieto lessicale esiste ed e' consumato dal runner"
 else
-  echo "!! prova-non-privilegiata: il runner non chiama piu' 'politica.ammissione'." >&2
-  echo "   Una prova e' un run_command proposto da un MODELLO: senza quella" >&2
-  echo "   chiamata il piano di verifica esegue qualunque riga di shell." >&2
+  echo "!! prova-vietata: sparita la variante 'Ammissione::Vietata' o il suo consumo." >&2
+  echo "   Senza, una prova irreversibile tornerebbe eseguibile." >&2
   fail=1
+fi
+
+#  (b) esiste un ramo che pretende un GIUDIZIO INDIPENDENTE, ed e' il gate duale
+#      vero (la stessa porta dei passi dell'agente), non un secondo elenco:
+if grep -q 'Ammissione::RichiedeGiudizio' "$PDV" \
+   && grep -q 'StepValidationPort' "$CR" \
+   && grep -q 'decide_step_gate' "$CR"; then
+  echo "OK prova-giudicata: il runner convoca il gate duale e delega la decisione"
+else
+  echo "!! prova-giudicata: il runner non convoca piu' il gate duale sulle prove." >&2
+  echo "   Il criterio esegue run_command FUORI dal ToolDispatchNode: senza quella" >&2
+  echo "   convocazione il piano e' il canale privilegiato che il design vieta," >&2
+  echo "   e l'elenco lessicale non nomina 'psql -c \"DROP TABLE users\"'." >&2
+  fail=1
+fi
+
+#  (b2) IL RAMO DI DEFAULT dell'ammissione e' il GIUDIZIO, non l'esecuzione.
+#       E' la forma che il guard precedente non poteva vedere e che la review ha
+#       nominata: «resterebbe verde con la soglia a un valore che ammette tutto».
+#       Un elenco lessicale ACCUSA, quindi cio' che non nomina passa: l'unica
+#       posizione sicura per `Diretta` e' dentro il ramo dell'osservazione, e
+#       l'ultima parola dev'essere `RichiedeGiudizio`.
+CORPO_AMMISSIONE=$(awk '/pub fn ammissione\(&self, prova: &Prova\) -> Ammissione/,/^    }$/' "$PDV")
+DIRETTE=$(printf '%s\n' "$CORPO_AMMISSIONE" | grep -c 'Ammissione::Diretta' || true)
+ULTIMA=$(printf '%s\n' "$CORPO_AMMISSIONE" \
+  | grep -oE 'Ammissione::(Diretta|RichiedeGiudizio|Vietata)' | tail -1)
+if [ "$DIRETTE" = "1" ] \
+   && printf '%s\n' "$CORPO_AMMISSIONE" | grep -q '<= StepCriticality::ReadOnly' \
+   && [ "$ULTIMA" = "Ammissione::RichiedeGiudizio" ]; then
+  echo "OK prova-default-giudicata: cio' che le regole non nominano viene giudicato"
+else
+  echo "!! prova-default-giudicata: 'ammissione' non finisce piu' su RichiedeGiudizio," >&2
+  echo "   oppure 'Diretta' e' uscita dal ramo dell'osservazione (trovate: $DIRETTE," >&2
+  echo "   ultima variante: ${ULTIMA:-nessuna})." >&2
+  echo "   L'elenco lessicale ACCUSA: cio' che non nomina PASSA, e non nomina" >&2
+  echo "   'psql -c \"DROP TABLE users\"' ne' 'curl ... | sh'. Se il default e'" >&2
+  echo "   l'esecuzione, il piano torna a essere un canale privilegiato." >&2
+  fail=1
+fi
+
+#  (c) esiste il ramo del CONSENSO UMANO, e delega al punto unico HITL invece di
+#      riconiare un secondo criterio di conferma:
+if grep -q 'fn consenso_umano_richiesto' "$PDV" \
+   && grep -q 'automation_requires_hitl' "$PDV" \
+   && grep -q 'consenso_umano_richiesto' "$CR"; then
+  echo "OK prova-consenso: in Conferma il criterio dichiara invece di eseguire"
+else
+  echo "!! prova-consenso: sparito il gate sul consenso umano o la sua delega a hitl." >&2
+  echo "   run_command e' un mutatore e task_complete no: senza questo ramo le" >&2
+  echo "   prove girano in Conferma senza che nessun umano le veda." >&2
+  fail=1
+fi
+
+#  (d) la soglia lessicale configurabile NON torna. Era l'unica mitigazione del
+#      buco, era documentata con `observation` (valore di StepReach, non di
+#      StepCriticality) e un valore fuori vocabolario SPEGNEVA il criterio invece
+#      di stringerlo: chi seguiva la documentazione otteneva l'opposto.
+if grep -rq 'piano_prova_criticita_max' crates/ db/migrations/*.sql \
+     --include=*.rs --include=*.sql 2>/dev/null \
+   && ! grep -rql 'piano_prova_criticita_max' db/migrations/0737_*.sql; then
+  echo "!! prova-senza-soglia: 'piano_prova_criticita_max' e' tornata." >&2
+  echo "   Il giudizio agentico l'ha sostituita: una soglia lessicale accanto e'" >&2
+  echo "   una seconda verita' su cosa sia ammesso eseguire (regola G)." >&2
+  fail=1
+else
+  echo "OK prova-senza-soglia: nessuna soglia lessicale configurabile sulle prove"
+fi
+
+#  (e) la PROVENIENZA non si legge dal valore che il modello scrive: chi legge la
+#      impone. Se `da_dichiarazione` tornasse a leggere `CAMPO_ORIGINE`, un
+#      `"origine":"council"` nella task_complete comprerebbe la misura
+#      indipendente.
+if awk '/pub fn da_dichiarazione/,/^    }/' "$PDV" | grep -q 'CAMPO_ORIGINE'; then
+  echo "!! prova-provenienza: 'Prova::da_dichiarazione' legge di nuovo l'origine" >&2
+  echo "   dal valore. Quel valore lo scrive un MODELLO: l'esecutore potrebbe" >&2
+  echo "   intestarsi il Consiglio e trasformare una misura autodichiarata in" >&2
+  echo "   una indipendente." >&2
+  fail=1
+else
+  echo "OK prova-provenienza: l'origine la impone chi legge, non il valore letto"
 fi
 
 # «Quale pagina di QUESTO run va misurata?» (2026-08-11, mig 0699)

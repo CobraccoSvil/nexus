@@ -962,16 +962,17 @@ impl FinalGateNode {
     /// l'agente esecutore in coda. La dedup conserva la prima provenienza,
     /// quindi l'esecutore puo' AGGIUNGERE prove ma non intestarsi ne'
     /// sostituire quelle di chi lo giudica.
-    fn criterio_col_piano(
-        criterio: CriterionSpec,
-        state: &AgentState,
-    ) -> CriterionSpec {
+    /// La MODALITA' viaggia insieme al piano perche' decide se quelle prove si
+    /// possano eseguire affatto: in Conferma un umano approva ogni
+    /// `run_command` dell'agente, e il gate non ha nessuno a cui chiedere.
+    /// Il nodo e' l'unico punto che vede entrambe.
+    fn criterio_col_piano(criterio: CriterionSpec, state: &AgentState) -> CriterionSpec {
         use crate::decisions::piano_di_verifica::{con_piano, PianoDiVerifica, PIANO_VERIFICA_KEY};
         let piano = PianoDiVerifica::unione(&[
             PianoDiVerifica::from_value(state.extra.get(PIANO_VERIFICA_KEY)),
             PianoDiVerifica::da_dichiarazione(state.declared_outcome.as_ref()),
         ]);
-        con_piano(criterio, &piano)
+        con_piano(criterio, &piano, state.automation_mode)
     }
 
     /// Il criterio docs (mig 0676): estratto per tenere piatto `build_criteria`
