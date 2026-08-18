@@ -3685,6 +3685,7 @@ mod tests {
             Ok(nexus_agent_graph::runtime::ports::StepValidationReport {
                 verdicts: vec![voto("gatekeeper", "p1"), voto("challenger", "p2")],
                 degraded: None,
+                sostituiti: Vec::new(),
             })
         }
     }
