@@ -10,11 +10,14 @@
 //! FONTE STRUTTURATA (regola M): i `nexus_agent_meta_steps` `kind='clarify'` dei
 //! run della sessione (join `agent_runs.session_id`). L'ESISTENZA del meta_step
 //! `kind='clarify'` E' la dichiarazione strutturata "questo turno ha posto una
-//! domanda-chiarimento all'utente" — il canale d'esito di QUESTO tipo di turno:
-//! un turno di clarify chiude `Completed` + `pending_clarify=true`, NON
-//! `blocked_needs_input` (verificato: `clarify_or_expand` -> END -> `Completed`,
-//! `pending_clarify` non e' un interrupt-resume), quindi il segnale dichiarato
-//! del canale clarify e' il meta_step, non `agent_runs.status`. La DECISIONE di
+//! domanda-chiarimento all'utente" — il canale d'esito di QUESTO tipo di turno.
+//! Dal 18/08/2026 quel turno chiude `blocked_needs_input` e non piu' `Completed`
+//! (`NativeRunOutcome::pending_clarify` -> `classify_status`: un run a zero
+//! iterazioni fermo su una domanda non e' un successo), ma lo STATUS resta
+//! insufficiente come segnale: `blocked_needs_input` ha altri produttori
+//! (credenziale mancante, servizio offline, rifiuto safety) e non porta la
+//! DOMANDA, che e' cio' su cui si costruisce la firma. Quindi il segnale
+//! dichiarato del canale clarify resta il meta_step. La DECISIONE di
 //! contare deriva da quel segnale + dal payload strutturato (`payload->>'question'`);
 //! la firma-testo (sha1 della domanda normalizzata) e' SOLO l'euristica di
 //! loop-detection che decide se e' la STESSA domanda ripetuta (analogo di

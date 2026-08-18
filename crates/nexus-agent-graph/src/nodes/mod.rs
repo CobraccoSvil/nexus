@@ -29,6 +29,7 @@ pub mod verifier;
 
 pub use clarify_or_expand::{
     ClarifyConfig, ClarifyMode, ClarifyOrExpandNode, DecisionCategory, GateOutcome, LlmDecision,
+    META_KIND_CLARIFY, META_KIND_CLARIFY_ASSUNZIONE,
 };
 pub use executor::{ExecutorConfig, ExecutorNode, ScaleConfig};
 pub use review_gate::{ReviewGateConfig, ReviewGateNode, REVIEW_GATE_ESCALATION_KEY};

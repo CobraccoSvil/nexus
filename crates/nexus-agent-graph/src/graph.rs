@@ -701,7 +701,10 @@ mod tests {
 
         AgentGraphNodes {
             router: Arc::new(RouterNode),
-            clarify_or_expand: Arc::new(ClarifyOrExpandNode::new(ClarifyConfig::default())),
+            clarify_or_expand: Arc::new(ClarifyOrExpandNode::new(
+                ClarifyConfig::default(),
+                Arc::new(crate::runtime::test_doubles::StubMetaStepStore::default()),
+            )),
             understanding: Arc::new(UnderstandingNode::new(UnderstandingConfig::default())),
             planner: Arc::new(PlannerNode::new(
                 PlannerConfig::default(),

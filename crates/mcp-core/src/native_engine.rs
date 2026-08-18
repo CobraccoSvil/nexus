@@ -518,6 +518,21 @@ pub struct NativeRunOutcome {
     /// `state.is_awaiting_subagents()`. Letto da `classify_status` per mappare
     /// `AwaitingSubagents` invece di `AwaitingConfirmation` sul ramo interrotto.
     pub awaiting_subagents: bool,
+    /// `true` se il run e' arrivato a `End` perche' il nodo clarify ha posto una
+    /// DOMANDA all'utente (`pending_clarify`), non perche' abbia concluso un
+    /// lavoro.
+    ///
+    /// Il campo non esisteva e l'informazione moriva al confine fra il grafo e
+    /// mcp-core: `pending_clarify` -> edge -> `End` -> `completed=true` ->
+    /// `Completed` con `success=true`, cioe' un run a ZERO iterazioni
+    /// indistinguibile da uno che ha lavorato e non aveva nulla da dire
+    /// (regola Q — l'esito viaggia in un campo, non si deduce dall'assenza di
+    /// altro). Misurato il 18/08/2026 su `ui_ux_designer`: 0 iterazioni, 0
+    /// token, `final_summary` vuoto, `verdict.success=true`.
+    ///
+    /// Un run non puo' aver lavorato E fermarsi qui: il nodo clarify sta in
+    /// testa al grafo, prima di understanding/planner/executor.
+    pub pending_clarify: bool,
     /// Risposta finale (campo `result` dello stato a fine run).
     pub final_answer: Option<String>,
     /// Motivo di stop dell'ultimo turno, se valorizzato.
@@ -842,6 +857,26 @@ impl NativeRunOutcome {
             }
         } else if matches!(self.stop_reason, Some(StopReason::Error)) {
             AgentRunStatus::Failed
+        } else if self.pending_clarify {
+            // Il run e' arrivato a End per porre una DOMANDA, non per aver
+            // concluso: nessuna iterazione, nessun lavoro, un umano deve
+            // rispondere perche' il turno successivo possa esistere.
+            // `BlockedNeedsInput` e' terminale (non occupa la sessione, non e'
+            // resumibile via checkpoint) e `is_success()` e' falso, che e'
+            // l'unica lettura onesta di un turno che non ha prodotto nulla.
+            //
+            // La doc di `BlockedNeedsInput` dice «MAI per ambiguita' di intent»:
+            // quella riga governa cio' che il MODELLO puo' DICHIARARE via
+            // `task_complete` — un modello non deve auto-assolversi dichiarandosi
+            // bloccato davanti a un compito ambiguo che dovrebbe risolvere. Qui
+            // il produttore e' un altro: e' il grafo, con un segnale strutturato,
+            // dopo aver DAVVERO fermato il run in attesa di una risposta umana.
+            //
+            // Difesa in profondita' rispetto al criterio [`Interlocutore`], che
+            // impedisce a un run senza superficie di dialogo di arrivare qui: se
+            // domani quel criterio venisse aggirato, il run non tornerebbe
+            // comunque a dichiararsi «completato con successo».
+            AgentRunStatus::BlockedNeedsInput
         } else if declared_refusal || matches!(declared_kind, Some("blocked") | Some("needs_input"))
         {
             // Bloccato per causa esterna / serve input umano / rifiuto safety:
@@ -3640,7 +3675,10 @@ async fn build_native_engine(
     // ── 11 nodi (porte iniettate nei costruttori reali) ──────────────────────
     let nodes = AgentGraphNodes {
         router: Arc::new(RouterNode),
-        clarify_or_expand: Arc::new(ClarifyOrExpandNode::new(load_clarify_config(&db).await)),
+        clarify_or_expand: Arc::new(ClarifyOrExpandNode::new(
+            load_clarify_config(&db).await,
+            meta_steps.clone(),
+        )),
         understanding: Arc::new(UnderstandingNode::new(load_understanding_config(&db).await)),
         planner: Arc::new(PlannerNode::new(
             planner_cfg.clone(),
@@ -4568,6 +4606,10 @@ pub(crate) fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome 
         // stato porta ancora `awaiting_subagents=true`. Segnale strutturato
         // (regola M) letto dallo stato, non dedotto dal `resume_at`.
         awaiting_subagents: state.is_awaiting_subagents(),
+        // Segnale STRUTTURATO del nodo clarify (regola M/Q): il run si e' fermato
+        // per porre una domanda. Senza questo campo il fatto si perdeva qui, al
+        // confine, e a valle restava un `Completed` a zero iterazioni.
+        pending_clarify: state.is_pending_clarify(),
         final_answer: state.result.clone(),
         stop_reason: state.stop_reason,
         provider_used: state.provider_used.clone(),
@@ -6582,6 +6624,7 @@ mod tests {
         NativeRunOutcome {
             completed: true,
             awaiting_subagents: false,
+            pending_clarify: false,
             suspension_origin: None,
             final_answer: Some("fatto".to_string()),
             stop_reason: None,
@@ -6675,6 +6718,47 @@ mod tests {
         // Mutazione che rende rosso: togliere il ramo `review_panel_rejected`
         // da classify_status -> torna Completed, cioe' il difetto originale.
         assert_eq!(o.classify_status(), AgentRunStatus::FailedDiagnosed);
+    }
+
+    /// Un run che e' arrivato a End per PORRE UNA DOMANDA non e' «completato
+    /// con successo»: e' fermo in attesa di una risposta umana.
+    ///
+    /// MUTAZIONE: togliere il ramo `self.pending_clarify` da `classify_status`
+    /// fa rosseggiare entrambe le asserzioni con `Completed` / `success=true` —
+    /// cioe' i valori esatti letti in DB su `ui_ux_designer` (0 iterazioni, 0
+    /// token, summary vuoto, `verdict.success=true`).
+    #[test]
+    fn classify_status_pending_clarify_non_e_un_successo() {
+        let o = NativeRunOutcome {
+            completed: true,
+            pending_clarify: true,
+            iterations: 0,
+            final_answer: None,
+            ..base_outcome()
+        };
+        assert_eq!(o.classify_status(), AgentRunStatus::BlockedNeedsInput);
+        assert!(
+            !o.classify_status().is_success(),
+            "un turno che non ha prodotto nulla non e' un successo"
+        );
+        // E il verdetto che il PADRE legge oltre il confine dice la stessa cosa
+        // (regola O: si asserisce la conseguenza, non la stringa intermedia).
+        let v = o.structured_verdict();
+        assert_eq!(v["success"], serde_json::json!(false));
+        assert_eq!(v["verdict"], serde_json::json!("blocked_needs_input"));
+    }
+
+    /// Il ramo INTERROTTO precede: un run sospeso su checkpoint resta
+    /// resumibile anche se lo stato porta ancora un clarify pendente.
+    #[test]
+    fn interrupt_precede_il_pending_clarify() {
+        let o = NativeRunOutcome {
+            completed: false,
+            pending_clarify: true,
+            resume_at: Some(NodeId::Executor.as_label().to_string()),
+            ..base_outcome()
+        };
+        assert_eq!(o.classify_status(), AgentRunStatus::AwaitingConfirmation);
     }
 
     #[test]
