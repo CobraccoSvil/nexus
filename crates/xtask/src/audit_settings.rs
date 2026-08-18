@@ -902,6 +902,35 @@ fn classify_db_key(
     }
 }
 
+/// Vero se una migrazione contiene un `DELETE FROM settings` per questa chiave:
+/// la sua assenza dal DB e' una decisione presa, non una svista.
+fn chiave_cancellata_da_una_migrazione(root: &Path, key: &str) -> bool {
+    let dir = root.join("db").join("migrations");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    let ago = format!("'{key}'");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+            continue;
+        }
+        let testo = read_text(&path).to_lowercase();
+        if !testo.contains(&ago.to_lowercase()) {
+            continue;
+        }
+        // La menzione deve stare in una DELETE sui settings, non in un commento
+        // o in una INSERT: si guarda la statement, non il file.
+        for pezzo in testo.split(';') {
+            if pezzo.contains("delete") && pezzo.contains("settings") && pezzo.contains(&ago.to_lowercase())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Individua i FANTASMA: chiavi lette literal nel codice ma assenti dal DB live,
 /// filtrando i falsi positivi per forma-chiave e i lettori solo-test.
 fn detect_ghost_keys(
@@ -935,6 +964,15 @@ fn detect_ghost_keys(
             .iter()
             .all(|s| is_test_path(&root.join(s.split(':').next().unwrap_or(""))));
         if all_test {
+            continue;
+        }
+        // Una chiave che una migrazione CANCELLA esplicitamente e' assente dal DB
+        // di proposito, non per dimenticanza: non e' un fantasma. Senza questa
+        // distinzione, rimuovere un setting rende rosso il gate finche' ogni
+        // menzione (il commento che spiega la rimozione, il test che ne verifica
+        // l'assenza, il guard che ne impedisce il ritorno) non sparisce dal
+        // codice — cioe' esattamente le tracce che documentano la decisione.
+        if chiave_cancellata_da_una_migrazione(root, key) {
             continue;
         }
         let top3: Vec<String> = sites.iter().take(3).cloned().collect();
