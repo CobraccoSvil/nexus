@@ -79,10 +79,18 @@
 //! sbagliato non e' piu' scrivibile perche' la chiave non c'e'.
 //!
 //! LIMITE DICHIARATO: il gate duale spento (`critical_step_gate_mode = off`)
-//! rende il criterio inerte SU TUTTO cio' che non e' osservazione, e lo
-//! dichiara ([`CausaNonEseguita::GiudiceNonDisponibile`]). E' il verso giusto:
-//! senza un giudice indipendente non si esegue un comando che un modello ha
-//! scritto e che nessun umano vedra'.
+//! rende il criterio inerte su OGNI prova, e lo dichiara
+//! ([`CausaNonEseguita::GiudiceNonDisponibile`]). E' il verso giusto: senza un
+//! giudice indipendente non si esegue un comando che un modello ha scritto e
+//! che nessun umano vedra'.
+//!
+//! Fino al 18/08/2026 il limite risparmiava le prove di sola OSSERVAZIONE, che
+//! una quarta variante (`Ammissione::Diretta`) faceva girare senza giudizio:
+//! era la stessa soglia sul costo del gate duale, e cade con lei — la misura e
+//! il perche' stanno in testa a [`super::step_reach`]. La conseguenza qui e' che
+//! `git status` come prova costa ora una convocazione: e' il prezzo dichiarato,
+//! ed e' anche il verso su cui questo modulo sbaglia gia' ovunque (chi non si
+//! puo' far giudicare, non si esegue).
 //!
 //! ## Il pavimento resta, e non e' qui
 //!
@@ -544,20 +552,18 @@ fn prove_da_campo(contenitore: &Value, origine: OriginePiano) -> Vec<Prova> {
 
 /// L'esito dell'ammissione di una prova all'esecuzione.
 ///
-/// TRE varianti e non due: fra «si esegue» e «non si esegue mai» c'e' il caso
-/// che decide tutto — «si esegue SE due giudici indipendenti lo autorizzano».
-/// Con due sole varianti quel caso non era rappresentabile, e finiva
-/// inevitabilmente nella prima.
+/// DUE varianti, e la prima e' quella che decide tutto: fra «non si esegue mai»
+/// e «si esegue» non c'e' un terzo caso libero — c'e' «si esegue SE due giudici
+/// indipendenti lo autorizzano». Prima di questo tipo quel caso non era
+/// rappresentabile e finiva inevitabilmente in «si esegue».
+///
+/// Una TERZA variante e' esistita fino al 18/08/2026 (`Diretta`: eseguibile
+/// senza giudizio perche' la portata collocava la riga fra le osservazioni), e
+/// se n'e' andata col vocabolario che la produceva — vedi [`super::step_reach`]
+/// per la misura. Nessuna prova salta piu' il giudizio per il nome del proprio
+/// comando.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ammissione {
-    /// Eseguibile SENZA giudizio agentico: la portata la colloca fra le
-    /// osservazioni (punto unico [`super::step_reach`], vocabolario DB
-    /// `orchestrator.step_reach.observation_commands`).
-    ///
-    /// E' la sola scorciatoia, ed e' la stessa che il gate duale si concede
-    /// gia' per i passi dell'agente: convocare due modelli per un `git status`
-    /// e' un gate che verra' spento, cioe' lo stesso punto di partenza.
-    Diretta { livello: StepCriticality },
     /// Serve il giudizio del gate duale PRIMA di eseguirla. E' il caso normale:
     /// `run_command` e' `Unconfined` per CONTRATTO del tool, quindi il suo
     /// pavimento e' `Critical`.
@@ -578,7 +584,7 @@ pub enum Ammissione {
 }
 
 /// Il VOCABOLARIO con cui si decide che cosa una prova puo' fare: gli stessi
-/// quattro elenchi DB del gate duale, mai un secondo elenco locale (regola L).
+/// TRE elenchi DB del gate duale, mai un secondo elenco locale (regola L).
 ///
 /// Non porta piu' una SOGLIA, e la rimozione e' il fix del rilievo 3 alla sua
 /// causa e non al suo sintomo. La soglia esisteva per mitigare l'assenza del
@@ -604,8 +610,6 @@ pub struct PoliticaEsecuzione {
     pub regole: Vec<CriticalityRule>,
     /// Artefatti rigenerabili (`orchestrator.rebuildable_artifacts`).
     pub rigenerabili: Vec<String>,
-    /// Comandi di osservazione (`orchestrator.step_reach.observation_commands`).
-    pub osservazione: Vec<String>,
 }
 
 impl PoliticaEsecuzione {
@@ -622,7 +626,6 @@ impl PoliticaEsecuzione {
             &self.mutatori,
             &self.regole,
             &self.rigenerabili,
-            &self.osservazione,
         );
         if classificazione.level >= StepCriticality::Irreversible {
             return Ammissione::Vietata {
@@ -632,15 +635,11 @@ impl PoliticaEsecuzione {
                     .unwrap_or_else(|| classificazione.reach.as_str().to_string()),
             };
         }
-        // La SOLA scorciatoia: una riga fatta di soli comandi del vocabolario
-        // di osservazione. Non e' un'eccezione inventata qui — e' la stessa
-        // soglia con cui il gate duale evita di pagare due chiamate LLM per un
-        // `ls`, e il vocabolario e' lo stesso.
-        if classificazione.level <= StepCriticality::ReadOnly {
-            return Ammissione::Diretta {
-                livello: classificazione.level,
-            };
-        }
+        // Nessuna scorciatoia: ogni prova che non sia vietata passa dal
+        // giudizio. Il livello puo' essere basso solo se `run_command` fosse
+        // uscito dal vocabolario dei mutatori — cioe' nella configurazione che
+        // `from_value` rifiuta — e anche li' la conseguenza e' il giudizio, non
+        // l'esecuzione: e' il verso su cui questo modulo sbaglia ovunque.
         Ammissione::RichiedeGiudizio {
             livello: classificazione.level,
             categoria: classificazione.matched_category,
@@ -672,7 +671,6 @@ impl PoliticaEsecuzione {
             "mutatori": self.mutatori,
             "regole": self.regole,
             "rigenerabili": self.rigenerabili,
-            "osservazione": self.osservazione,
         })
     }
 
@@ -696,7 +694,6 @@ impl PoliticaEsecuzione {
             mutatori,
             regole: regole_da_valore(v.get("regole")),
             rigenerabili: lista_di_stringhe(v.get("rigenerabili")),
-            osservazione: lista_di_stringhe(v.get("osservazione")),
         })
     }
 }
@@ -1573,7 +1570,6 @@ mod tests {
                 category: "destructive_delete".into(),
             }],
             rigenerabili: vec!["dist".into()],
-            osservazione: vec!["git status".into(), "ls".into()],
         }
     }
 
@@ -1936,13 +1932,12 @@ mod tests {
     /// Nessuno di questi e' nominato dalle regole lessicali (il `DROP` di `psql`
     /// sta DENTRO le virgolette e il matcher a token non lo vede — lo dichiara
     /// la 0677 stessa), quindi alla soglia di default della prima versione
-    /// passavano tutti e venivano ESEGUITI. Ora nessuno e' `Diretta`: tutti
-    /// pretendono il giudizio di due giudici indipendenti, e senza quel giudizio
-    /// non partono.
+    /// passavano tutti e venivano ESEGUITI. Ora pretendono tutti il giudizio di
+    /// due giudici indipendenti, e senza quel giudizio non partono.
     ///
-    /// MUTAZIONE ESEGUITA: far ritornare `Ammissione::Diretta` al ramo finale di
-    /// `ammissione` (cioe' rimettere la soglia permissiva) rende rosso questo
-    /// test su tutte e sette le righe.
+    /// MUTAZIONE ESEGUITA: far ritornare dal ramo finale di `ammissione` un
+    /// esito eseguibile senza giudizio (cioe' rimettere la soglia permissiva)
+    /// rende rosso questo test su tutte e sette le righe.
     #[test]
     fn i_comandi_pericolosi_non_nominati_dalle_regole_pretendono_un_giudizio() {
         let pol = politica();
@@ -1987,24 +1982,30 @@ mod tests {
         assert_eq!(categoria, "destructive_delete");
     }
 
-    /// LA SOLA SCORCIATOIA: una riga fatta di soli comandi del vocabolario di
-    /// osservazione. Non e' un'eccezione inventata qui — e' la stessa soglia con
-    /// cui il gate duale evita due chiamate LLM per un `ls`, e un gate
-    /// insostenibile e' un gate che verra' spento.
+    /// NON C'E' PIU' UNA SCORCIATOIA, ed e' il cambiamento del 18/08/2026.
+    /// `git status` era la prova che il vocabolario di osservazione faceva
+    /// girare senza giudizio; ora paga una convocazione come le altre.
+    ///
+    /// Il test resta perche' la proprieta' e' cambiata di SEGNO, non sparita:
+    /// il caso limite del modulo — la prova piu' innocua immaginabile — e' cio'
+    /// che dice se una scorciatoia esiste ancora da qualche parte.
+    ///
+    /// MUTAZIONE: reintrodurre un ramo che ammetta senza giudizio sotto una
+    /// soglia di criticita' fa cadere questa asserzione.
     #[test]
-    fn l_osservazione_passa_senza_giudizio() {
-        assert_eq!(
-            politica().ammissione(&prova(
-                "git status",
-                Attesa::OutputContiene {
-                    testo: "nothing to commit".into()
-                },
-                OriginePiano::Consiglio,
-            )),
-            Ammissione::Diretta {
-                livello: StepCriticality::ReadOnly
-            }
-        );
+    fn nemmeno_la_prova_piu_innocua_salta_il_giudizio() {
+        let a = politica().ammissione(&prova(
+            "git status",
+            Attesa::OutputContiene {
+                testo: "nothing to commit".into(),
+            },
+            OriginePiano::Consiglio,
+        ));
+        let Ammissione::RichiedeGiudizio { livello, reach, .. } = a else {
+            panic!("nessuna prova si esegue senza un giudizio indipendente: {a:?}");
+        };
+        assert_eq!(livello, StepCriticality::Critical);
+        assert_eq!(reach, super::super::step_reach::StepReach::Unconfined);
     }
 
     /// Una prova ORDINARIA e utile — quella del caso reale — richiede il

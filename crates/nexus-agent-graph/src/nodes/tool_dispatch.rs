@@ -366,14 +366,6 @@ pub struct ToolDispatchConfig {
     /// pulizia di cache da una cancellazione definitiva: vedi
     /// `step_gate::declassa_se_rigenerabile`. Vuoto = nessun declassamento.
     pub rebuildable_artifacts: Vec<String>,
-    /// Prefissi di comando che ASSOLVONO una riga di shell
-    /// (`orchestrator.step_reach.observation_commands`, mig 0688). E' la soglia
-    /// sul COSTO del gate duale: senza, ogni `ls` pagherebbe due chiamate LLM.
-    ///
-    /// Unico elenco del gate la cui incompletezza costa denaro e non sicurezza:
-    /// cio' che non nomina viene GIUDICATO. Vuoto = nulla e' provatamente
-    /// innocuo, cioe' tutto viene giudicato — vedi `decisions::step_reach`.
-    pub observation_commands: Vec<String>,
     /// Rimandi massimi del gate duale prima di degradare a NeedsHuman
     /// (`orchestrator.critical_step_max_rejections`): il cap anti ping-pong
     /// fra modello e validatori.
@@ -408,7 +400,6 @@ impl Default for ToolDispatchConfig {
             rebuildable_artifacts: Vec::new(),
             // Vuoto: nessun comando e' provatamente innocuo finche' il DB non
             // lo dichiara. Fallisce verso il giudizio, mai verso il passaggio.
-            observation_commands: Vec::new(),
             step_gate_max_rejections: 2,
         }
     }
@@ -1573,7 +1564,6 @@ impl ToolDispatchNode {
                     &self.cfg.fs_mutator_tools,
                     &self.cfg.step_gate_rules,
                     &self.cfg.rebuildable_artifacts,
-                    &self.cfg.observation_commands,
                 )
             })
             .collect();
@@ -5059,18 +5049,13 @@ mod tests {
 
     // ── (2a) La portata come pavimento del gate (mig 0688) ───────────────────
 
-    /// La config del gate COME LA DEPLOYA la mig 0688: mode `enforce`, le
-    /// regole lessicali che il DB porta gia', e il vocabolario che assolve.
+    /// La config del gate COME LA DEPLOYA la mig 0688: mode `enforce` e le
+    /// regole lessicali che il DB porta gia'. Il vocabolario che ASSOLVEVA le
+    /// righe di osservazione e' stato rimosso il 18/08/2026 (mig 0739).
     fn cfg_gate_0688() -> ToolDispatchConfig {
         ToolDispatchConfig {
             step_gate_mode: crate::decisions::step_gate::StepGateMode::Enforce,
             step_gate_rules: regole_kill(),
-            // Sottoinsieme letterale della mig 0688: qui basta che copra i
-            // comandi del test, non che sia l'elenco intero.
-            observation_commands: ["ls", "cat", "git status", "pwd"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
             fs_mutator_tools: vec!["run_command".to_string(), "edit_file".to_string()],
             ..ToolDispatchConfig::default()
         }
@@ -5135,19 +5120,23 @@ mod tests {
         assert_eq!(slim[0]["category"], Value::Null);
     }
 
-    /// LA SOGLIA SUL COSTO, sullo stesso banco e per la stessa strada: il
-    /// batch fatto di sole osservazioni resta sotto soglia, quindi il passo 2a
-    /// non convoca nessuno. Senza questa meta' il criterio metterebbe due
-    /// chiamate LLM davanti a un `ls`, e un gate insostenibile e' un gate che
-    /// verra' spento.
+    /// CHI VA DAVANTI AI GIUDICI, in un batch misto: le righe di shell si', la
+    /// write ordinaria no. La seconda meta' e' la decisione del 04/08 («le
+    /// write ordinarie non pagano due chiamate LLM»), che il pavimento dalla
+    /// portata NON ha toccato: `edit_file` e' `WorkingTree`, cioe' `Mutating`,
+    /// e nessuna modalita' la convoca.
     ///
-    /// MUTAZIONE: far assolvere `riga_e_osservazione` per default (vocabolario
-    /// che non riconosce -> `true`) NON rompe questo test ma rompe
-    /// `il_gate_convoca_sulla_migrazione_di_schema`; toglierlo del tutto rompe
-    /// questo. I due si tengono per i capelli, ed e' voluto: sono le due meta'
-    /// della stessa soglia.
+    /// Il test asseriva l'opposto fino al 18/08/2026: un batch di sole
+    /// osservazioni (`ls`, `git status`) NON convocava nessuno, perche' un
+    /// vocabolario DB le assolveva. Quel vocabolario e' stato rimosso (mig
+    /// 0739, misura in testa a `decisions::step_reach`), quindi ora anche loro
+    /// arrivano ai giudici — ed e' la conseguenza da vedere QUI, sulla strada
+    /// vera del passo 2a, non solo nel criterio puro.
+    ///
+    /// MUTAZIONE: far salire `edit_file` sopra il pavimento `Mutating` porta i
+    /// convocati da 3 a 4, ed e' la decisione del 04/08 disfatta per sbaglio.
     #[test]
-    fn il_gate_non_convoca_sulle_osservazioni() {
+    fn il_gate_convoca_le_righe_di_shell_e_non_le_write_ordinarie() {
         let (n, _s, _rc) = node(cfg_gate_0688(), Arc::new(MapToolExecutor::new()));
         let pending = pending_dal_gateway(&[
             ("run_command", json!({"command": "ls -la src"})),
@@ -5155,27 +5144,23 @@ mod tests {
             // Una write ordinaria resta `Mutating`: coperta da snapshot e
             // review, fuori dal gate duale per la decisione del 04/08.
             ("edit_file", json!({"path": "src/app.ts"})),
+            ("run_command", json!({"command": "dotnet ef database update"})),
         ]);
-        assert!(
-            n.classifica_batch(&pending).is_none(),
-            "due giudici davanti a `ls` renderebbero il gate insostenibile"
+        let (livello, critici, _slim) = n
+            .classifica_batch(&pending)
+            .expect("una riga di shell nel batch basta a convocare");
+        assert_eq!(
+            livello,
+            crate::decisions::step_gate::StepCriticality::Critical
         );
-
-        // E il batch MISTO non si assolve per maggioranza: basta il passo non
-        // confinato perche' il gate abbia qualcosa da dire, e solo QUELLO
-        // finisce davanti ai validatori.
-        let mut misto = pending;
-        misto.extend(pending_dal_gateway(&[(
-            "run_command",
-            json!({"command": "dotnet ef database update"}),
-        )]));
-        let (_l, critici, _slim) = n
-            .classifica_batch(&misto)
-            .expect("un passo non confinato nel batch basta a convocare");
         assert_eq!(
             critici.len(),
-            1,
-            "solo il passo sopra soglia va ai giudici: gli altri sono contorno"
+            3,
+            "le tre righe di shell vanno ai giudici, la write ordinaria no"
+        );
+        assert!(
+            critici.iter().all(|c| c.tool_name == "run_command"),
+            "la write ordinaria non e' fra i convocati: {critici:?}"
         );
     }
 
@@ -5975,7 +5960,6 @@ mod golden {
             step_gate_mode: d.step_gate_mode,
             step_gate_rules: d.step_gate_rules,
             rebuildable_artifacts: d.rebuildable_artifacts,
-            observation_commands: d.observation_commands,
             step_gate_max_rejections: d.step_gate_max_rejections,
         }
     }

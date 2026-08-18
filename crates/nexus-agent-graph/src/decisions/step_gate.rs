@@ -233,21 +233,19 @@ const TOOL_CON_COMANDO: &[&str] = &[
 /// Il livello base e' il PAVIMENTO della portata ([`super::step_reach`]); le
 /// regole lessicali possono solo ALZARLO, mai abbassarlo. Il perche' del verso
 /// — e la misura che lo impone — stanno in testa a questo modulo e a
-/// [`super::step_reach`], che documenta anche `comandi_di_osservazione`.
+/// [`super::step_reach`].
 pub fn classify_step(
     tool_name: &str,
     tool_input: &Value,
     fs_mutator_tools: &[String],
     rules: &[CriticalityRule],
     artefatti_rigenerabili: &[String],
-    comandi_di_osservazione: &[String],
 ) -> StepClassification {
     let reach = super::step_reach::classifica_portata(
         tool_name,
         tool_input,
         fs_mutator_tools,
         artefatti_rigenerabili,
-        comandi_di_osservazione,
     );
     let pavimento = reach.livello_minimo();
     let mut migliore: Option<(&CriticalityRule, StepCriticality)> = None;
@@ -874,26 +872,22 @@ mod tests {
         )
     }
 
-    /// Il vocabolario che ASSOLVE, nella forma seminata dalla mig 0688. E' la
-    /// configurazione che il gate ha in esercizio: i test lo passano invece di
-    /// un elenco vuoto, o misurerebbero un gate che nessuno ha deployato
-    /// (regola O).
-    fn osservazione() -> Vec<String> {
-        ["ls", "pwd", "cat", "head", "tail", "echo", "git status", "git diff", "git log"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
-    }
-
     /// IL principio del matcher (GAP-1): un comando che NOMINA `rm -rf` non lo
     /// esegue. `echo` e `cat` con la stringa dentro non matchano la regola; il
     /// comando vero si', anche dentro una catena.
     ///
     /// I due livelli qui sono decisi da COSE DIVERSE, e vale la pena dirlo:
-    /// `echo`/`cat` scendono a `ReadOnly` perche' la PORTATA li riconosce come
-    /// osservazione (`step_reach`, soglia sul costo), mentre `rm -rf build/`
-    /// sale a `Irreversible` perche' la REGOLA lessicale lo nomina. Il matcher
-    /// resta l'unico responsabile del salto in alto.
+    /// `echo`/`cat` restano al PAVIMENTO della portata (`Critical`: eseguono una
+    /// riga di shell), mentre `rm -rf build/` sale a `Irreversible` perche' la
+    /// REGOLA lessicale lo nomina. Il matcher resta l'unico responsabile del
+    /// salto in alto, e il salto si vede tutto qui: senza matcher quei comandi
+    /// avrebbero lo stesso livello.
+    ///
+    /// Il pavimento era `ReadOnly` fino al 18/08/2026, quando il vocabolario che
+    /// ASSOLVEVA le righe di osservazione e' stato rimosso (vedi `step_reach`).
+    /// La proprieta' che questo test misura non e' cambiata: la MENZIONE di
+    /// `rm -rf` non e' la sua ESECUZIONE, e il divario fra i due livelli e'
+    /// esattamente cio' che il matcher produce.
     ///
     /// MUTAZIONE: sostituire il match per token con un contains sulla riga fa
     /// matchare `echo "rm -rf"` e la prima asserzione cade a `Irreversible`.
@@ -906,11 +900,14 @@ mod tests {
                 &mutatori(),
                 &regole(),
                 &[],
-                &osservazione(),
             )
         };
-        assert_eq!(classify("echo 'rm -rf tutto'").level, StepCriticality::ReadOnly);
-        assert_eq!(classify("cat cleanup.sh").level, StepCriticality::ReadOnly);
+        assert_eq!(
+            classify("echo 'rm -rf tutto'").level,
+            StepCriticality::Critical,
+            "nessuna regola la nomina: resta al pavimento della portata"
+        );
+        assert_eq!(classify("cat cleanup.sh").level, StepCriticality::Critical);
         assert_eq!(classify("rm -rf build/").level, StepCriticality::Irreversible);
         assert_eq!(
             classify("npm ci && rm -rf dist && npm run build").level,
@@ -944,12 +941,10 @@ mod tests {
             StepCriticality::Critical,
             "rm/-rf sono bersaglio di redirezione e argomento, non un rm eseguito"
         );
-        // `echo` e' nel vocabolario che assolve, ma REDIRETTO scrive un file:
-        // l'assoluzione vale per la riga, non per il programma.
         assert_eq!(
             classify("echo 'ciao' > src/main.rs").level,
             StepCriticality::Critical,
-            "un comando di osservazione che redirige non e' piu' un'osservazione"
+            "una riga che scrive un file resta al pavimento della portata"
         );
     }
 
@@ -972,7 +967,6 @@ mod tests {
             &mutatori(),
             &regole(),
             &[],
-            &osservazione(),
         );
         assert_eq!(c.level, StepCriticality::Critical);
         assert_eq!(c.matched_category, None, "nessuna regola la nomina, ed e' il punto");
@@ -984,21 +978,26 @@ mod tests {
         // un passo innocuo (regola Q).
         assert_eq!(c.reach, super::super::step_reach::StepReach::Unconfined);
 
-        // LA SOGLIA SUL COSTO, sullo stesso banco: il gate che convoca sulla
-        // migrazione NON convoca su un `ls`. Senza questa meta' il criterio
-        // sarebbe corretto e insostenibile — cioe' destinato a essere spento.
-        let innocuo = classify_step(
+        // LA CONSEGUENZA DEL 18/08/2026, sullo stesso banco: anche un `ls`
+        // arriva ora ai giudici. Era la meta' che il vocabolario di
+        // osservazione assolveva, e la misura dice che su 26 righe realmente
+        // eseguite sui due progetti vivi ne assolveva UNA — cioe' il costo
+        // che compra e' +1 convocazione, contro un elenco che invitava a
+        // essere allungato al primo comando rumoroso (regola H).
+        let osservativo = classify_step(
             "run_command",
             &json!({ "command": "ls -la src" }),
             &mutatori(),
             &regole(),
             &[],
-            &osservazione(),
         );
-        assert_eq!(innocuo.reach, super::super::step_reach::StepReach::Observation);
+        assert_eq!(
+            osservativo.reach,
+            super::super::step_reach::StepReach::Unconfined
+        );
         assert!(
-            !StepGateMode::Enforce.convoca(innocuo.level),
-            "due giudici davanti a un `ls` renderebbero il gate insostenibile"
+            StepGateMode::Enforce.convoca(osservativo.level),
+            "nessun comando e' piu' assolto per il proprio nome"
         );
     }
 
@@ -1034,7 +1033,6 @@ mod tests {
                 &mutatori(),
                 &regole,
                 &[],
-                &osservazione(),
             )
             .level
         };
@@ -1060,12 +1058,12 @@ mod tests {
     /// perche' dice PERCHE' il passo e' stato notato.
     #[test]
     fn base_dalla_portata_e_tool_name() {
-        let c = classify_step("read_file", &json!({"path": "a"}), &mutatori(), &regole(), &[], &[]);
+        let c = classify_step("read_file", &json!({"path": "a"}), &mutatori(), &regole(), &[]);
         assert_eq!(c.level, StepCriticality::ReadOnly);
-        let c = classify_step("write_file", &json!({"path": "a"}), &mutatori(), &regole(), &[], &[]);
+        let c = classify_step("write_file", &json!({"path": "a"}), &mutatori(), &regole(), &[]);
         assert_eq!(c.level, StepCriticality::Mutating);
         assert_eq!(c.matched_category, None);
-        let c = classify_step("stop_service", &json!({}), &mutatori(), &regole(), &[], &[]);
+        let c = classify_step("stop_service", &json!({}), &mutatori(), &regole(), &[]);
         assert_eq!(c.level, StepCriticality::Critical);
         assert_eq!(c.matched_category.as_deref(), Some("service_stop"));
     }
@@ -1340,7 +1338,6 @@ mod tests_artefatti_rigenerabili {
             &[],
             &regole_rm(),
             artefatti,
-            &[],
         )
         .level
     }
@@ -1421,7 +1418,6 @@ mod tests_artefatti_rigenerabili {
             &[],
             &regole,
             &artefatti(),
-            &[],
         );
         assert_eq!(c.level, StepCriticality::Irreversible);
     }

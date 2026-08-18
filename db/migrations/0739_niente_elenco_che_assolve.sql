@@ -1,0 +1,97 @@
+-- 0739 — Il gate duale non ha piu' un elenco che ASSOLVE
+--
+-- Rimuove `orchestrator.step_reach.observation_commands` (seminato dalla mig
+-- 0688). Con la chiave sparisce il MECCANISMO: la variante `StepReach::
+-- Observation`, il ramo che la produceva, il campo che trasportava il
+-- vocabolario nella config del dispatch e la quarta variante di `Ammissione`
+-- del piano di verifica (`Diretta`), che senza `Observation` sarebbe rimasta
+-- irraggiungibile. Un vocabolario svuotato avrebbe lasciato in piedi codice
+-- che il prossimo lettore scambia per una funzionalita'.
+--
+-- ============================================================================
+-- LA MISURA CHE DECIDE
+-- ============================================================================
+--
+-- Il vocabolario riportava sotto la soglia di convocazione le righe di shell
+-- fatte di soli comandi di osservazione (`ls`, `cat`, `git status`,
+-- `node --version`: 28 voci). Serviva a non pagare due chiamate LLM per un
+-- `ls`, e l'argomento della POLARITA' era corretto — un elenco che ASSOLVE
+-- manda al giudizio cio' che non nomina, quindi la sua incompletezza costa
+-- denaro e latenza, non un buco silenzioso.
+--
+-- Non reggeva la PREMESSA: che l'agente usi la shell per GUARDARE.
+--
+-- MISURATO il 18/08/2026 su `agent_steps` dei due progetti con attivita', tool
+-- che eseguono una riga (run_command / run_service / nexus_db_query /
+-- git_command):
+--
+--   app-libri-18-08      21 righe: curl 8, npm 5, go 1, netstat 1, python 1,
+--                                  chmod 1, sqlite3 1, git diff 1, piu' due
+--                                  righe che nominavano un altro tool
+--   audit-verifica-17-08  5 righe: node --test 3, npx jest 2
+--
+-- **26 righe, e il vocabolario ne assolveva UNA** (`git diff
+-- backend/db/schema.sql`). Il conteggio non e' a occhio: le 26 righe sono state
+-- fatte passare dal criterio VERO (`decisions::step_gate::classify_step` coi
+-- quattro vocabolari letti dal DB di produzione), non da una sua imitazione
+-- (regola O). Le 33 convocazioni reali del gate registrate su quei due progetti
+-- (`nexus_agent_meta_steps` kind='step_validation') hanno TUTTE `reach =
+-- unconfined`: nessuna e' mai stata risparmiata dal vocabolario.
+--
+-- INCREMENTO: **+1 passo** davanti ai giudici su 26 righe eseguite (da 25 a 26,
+-- +4%). E' il prezzo intero di questa rimozione, sui dati veri.
+--
+-- LA RAGIONE STRUTTURALE per cui il numero e' quello: per guardare, l'agente ha
+-- tool DEDICATI (`read_file`, `list_files`, `search_in_files`). La shell la usa
+-- per COSTRUIRE ed ESEGUIRE — npm, node, curl, go, python. Il vocabolario era
+-- progettato per un uso della shell che non avviene.
+--
+-- LIMITE DELLA MISURA, dichiarato e non nascosto: due soli progetti, entrambi
+-- di generazione di app. Un task di DIAGNOSI userebbe piu' `cat`/`grep`, e li'
+-- qualcosa avrebbe risparmiato. La decisione e' presa sapendolo.
+--
+-- ============================================================================
+-- LA RAGIONE VERA, oltre al fatto che era quasi inerte
+-- ============================================================================
+--
+-- Un elenco che assolve SUGGERISCE la soluzione sbagliata al problema
+-- successivo. Il caso del 18/08 sono cinque `curl` respinti dal gate, e la
+-- strada che veniva spontanea era «aggiungi curl al vocabolario con qualche
+-- flag vietato»: avrebbe chiuso l'istanza `curl` e ripresentato lo stesso
+-- problema con `wget`, con un client HTTP in node, con `psql`. E' esattamente
+-- la toppa che la mig 0688 esisteva per NON commettere (regola H) — inseguire
+-- le varianti a codice — commessa dall'altro lato dello stesso criterio.
+--
+-- La strada giusta e' dare al giudice i FATTI che gli mancano (vedi mig 0706,
+-- `stato_presupposto`), non allungare la lista di chi non deve essere giudicato.
+--
+-- ============================================================================
+-- COSA NON CAMBIA
+-- ============================================================================
+--
+--   * `orchestrator.critical_step_rules` RESTA. E' l'elenco che ACCUSA, ha
+--     polarita' opposta, e puo' solo ALZARE il livello di un passo.
+--   * `run_command` resta `unconfined` per CONTRATTO del tool, pavimento
+--     `Critical`. Nessuna portata e' stata abbassata.
+--   * I freni sul costo restano quelli che c'erano gia':
+--     `orchestrator.critical_step_max_rejections` per il ping-pong, e il
+--     rollback `orchestrator.critical_step_gate_mode` = 'enforce_irreversible'
+--     se il gate risultasse troppo rumoroso. Il rimedio a un comando rumoroso
+--     NON e' piu' aggiungerlo a un elenco: quell'elenco non esiste.
+--
+-- ROLLBACK: non e' una riga di SQL. Ripristinare l'assoluzione significa
+-- ripristinare la variante `StepReach::Observation` e il ramo che la produce,
+-- cioe' un revert di codice — ed e' voluto: il meccanismo se n'e' andato, non
+-- il suo contenuto.
+--
+-- Punto unico del criterio: crates/nexus-agent-graph/src/decisions/step_reach.rs
+
+DELETE FROM settings
+WHERE key = 'orchestrator.step_reach.observation_commands';
+
+-- La descrizione del gate nominava la chiave come «soglia sul costo»: una
+-- descrizione che rimanda a una chiave inesistente e' una seconda verita' su
+-- cosa il gate faccia (regola G). Il valore NON si tocca.
+UPDATE settings
+SET description = 'Gate duale sui passi critici: off | observe (classifica e persiste, zero costo LLM) | enforce_irreversible (convoca solo sugli Irreversible) | enforce (convoca su Critical e Irreversible). Dal 09/08/2026 il livello base viene dalla PORTATA del passo (decisions/step_reach.rs): `unconfined` (esegue una riga di shell/SQL) e `undetermined` (mutatore non collocabile) hanno pavimento Critical, quindi con `enforce` una migrazione di schema arriva ai giudici anche se nessuna regola lessicale la nomina (mig 0688). Dal 18/08/2026 non esiste piu'' alcun elenco che ASSOLVA una riga per il nome del suo comando (mig 0739): ogni riga di shell viene giudicata. Il freno sul costo resta orchestrator.critical_step_max_rejections, e il rollback e'' enforce_irreversible. Vocabolario canonico, parse unico in decisions::step_gate::StepGateMode.'
+WHERE key = 'orchestrator.critical_step_gate_mode';
