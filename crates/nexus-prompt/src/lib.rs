@@ -16,6 +16,7 @@
 
 pub mod ambiente;
 pub mod blocchi;
+pub mod composizione;
 pub mod direttive;
 pub mod learned;
 pub mod processo;

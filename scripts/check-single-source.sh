@@ -4831,6 +4831,48 @@ if [[ "$fail" -eq 0 ]]; then
   echo "OK blocchi-dei-prompt: criterio in un posto solo, presidio armato e provato"
 fi
 
+# -- scomposizione-prompt (2026-08-19) ---------------------------------------
+# La 0744 rende RUMOROSA la perdita di un blocco; questo difende la seconda
+# meta': porre la domanda «questo prompt contiene il blocco X» senza una
+# sottostringa. Il criterio esiste in DUE implementazioni — PL/pgSQL nella 0744
+# e Rust qui — perche' SQL e Rust non si chiamano, e sono DUE implementazioni di
+# UN criterio: se divergono, il trigger e il compositore hanno due idee di
+# «blocco» sulla stessa tabella (misurato: e' successo, su tre template che
+# aprono con attributi).
+sp_mod='crates/nexus-prompt/src/composizione.rs'
+# 1. Lo scompositore ha UNA definizione. Una seconda, anche "solo per un caso",
+#    e' la dispersione che questo modulo esiste per togliere.
+sp_def=$(grep -rln 'fn scomponi_a' crates --include=*.rs 2>/dev/null | sort || true)
+if [[ "$sp_def" != "$sp_mod" ]]; then
+  echo "!! scomposizione-prompt: lo scompositore e' definito fuori da $sp_mod:" >&2
+  printf '     %s\n' ${sp_def:-"(nessuna: il punto unico non esiste piu')"} >&2
+  fail=1
+fi
+# 2. Il PONTE con la funzione SQL deve restare. Senza, le due implementazioni
+#    divergono in silenzio: la prova che serve non e' che ognuna funzioni, e'
+#    che diano la stessa risposta sul corpus VERO (regola O).
+if ! grep -q 'rust_e_sql_riconoscono_gli_stessi_blocchi' "$sp_mod" 2>/dev/null; then
+  echo "!! scomposizione-prompt: sparito il ponte col criterio SQL della 0744" >&2
+  echo "   (test rust_e_sql_riconoscono_gli_stessi_blocchi in $sp_mod)." >&2
+  fail=1
+fi
+if ! grep -q 'nexus_prompt_blocchi' "$sp_mod" 2>/dev/null; then
+  echo "!! scomposizione-prompt: il ponte non interroga piu' nexus_prompt_blocchi" >&2
+  echo "   Confrontare col criterio VERO della 0744, mai con una sua imitazione." >&2
+  fail=1
+fi
+# 3. L'INVARIANTE BYTE sul corpus reale. E' cio' che rende «togli un blocco»
+#    un'operazione sul prompt invece di una riscrittura che gli somiglia: senza
+#    quel test, una modifica allo scompositore muterebbe 174 prompt in silenzio.
+if ! grep -q 'il_giro_dalla_scomposizione_non_cambia_un_byte' "$sp_mod" 2>/dev/null; then
+  echo "!! scomposizione-prompt: sparito l'invariante byte sul corpus migrato" >&2
+  echo "   (test il_giro_dalla_scomposizione_non_cambia_un_byte in $sp_mod)." >&2
+  fail=1
+fi
+if [[ "$fail" -eq 0 ]]; then
+  echo "OK scomposizione-prompt: uno scompositore, il ponte SQL e l'invariante byte"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1
