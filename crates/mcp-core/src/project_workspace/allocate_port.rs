@@ -14,6 +14,7 @@
 //! 4. Scrive `nexus_resource_audit` (allowed/blocked).
 //! 5. Ritorna `{port, label, allocation_mode}` per uso dell'agente.
 
+use super::prenotazione_porta::TenutaAllocazione;
 use super::service_ownership::{self, ServiceOwnership};
 use super::services::deterministic_project_port_for_key;
 use super::*;
@@ -30,6 +31,28 @@ pub struct AllocatePortBody {
 pub struct AllocatedPort {
     pub port: u16,
     pub mode: &'static str, // "existing" | "dynamic" | "adopted" | "reallocated"
+    /// Che cosa tiene in vita la riga appena scritta. `mode` dice COME si e'
+    /// arrivati a questa porta; questo dice se ci si potra' tornare fra cinque
+    /// minuti — ed erano due domande diverse date per una sola.
+    pub tenuta: TenutaAllocazione,
+}
+
+/// CHI chiede la porta, cioe' che cosa la terra' prenotata finche' il servizio
+/// non parte e non le lega la propria unit.
+///
+/// Non e' un `Option<Uuid>` per la stessa ragione per cui `ErroreAllocazione`
+/// non e' una `String`: l'assenza di run e' una CONDIZIONE dichiarata del
+/// chiamante (avvio dal pannello, wizard, provisioning), non un dato che
+/// qualcuno ha dimenticato di passare — e un `None` accidentale sarebbe
+/// indistinguibile da quello deliberato (regola Q).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RichiedenteAllocazione {
+    /// Un run agentico: la riga porta la sua prenotazione e vive quanto lui.
+    Run(Uuid),
+    /// Nessun run. La riga non riceve prenotazione: l'ancora gliela dara' il
+    /// legame con la unit del servizio, che su questi percorsi arriva subito
+    /// dopo (`web_service_port_env`).
+    FuoriDaUnRun,
 }
 
 /// Perche' `find_or_allocate` non ha potuto dare una porta.
@@ -141,20 +164,58 @@ fn active_port_action(ownership: &ServiceOwnership, freed: bool) -> ActivePortAc
     }
 }
 
-/// Funzione internamente riusabile: trova una porta gia' allocata con la stessa
-/// label OPPURE ne alloca una nuova nel bucket del progetto.
+/// PUNTO UNICO (regola L) di «dammi la porta di questo servizio»: trova una
+/// porta gia' allocata con la stessa label OPPURE ne alloca una nuova nel
+/// bucket del progetto, e DICHIARA che cosa terra' in vita la riga.
 ///
 /// Applica quota check (`max_ports`) prima di allocare. In caso di violazione
 /// quota, scrive audit `port_allocate` blocked e ritorna `Err`.
 ///
 /// Idempotente: chiamate ripetute con la stessa `(project_id, label)` ritornano
 /// la stessa porta (modalita' "existing").
+///
+/// # La PROMESSA e la sua DURATA
+///
+/// Restituire un numero non basta: una riga nata qui ha `service_unit` NULL e
+/// nessun listener, quindi il GC la classifica orfana e la rilascia alla prima
+/// passata oltre la grace (misurato il 18/08/2026 su biblioteca-18-08, due
+/// porte promesse e raccolte in 4 minuti e 48 secondi). Il `richiedente` e' cio'
+/// che chiude il buco: un run dichiara la propria PRENOTAZIONE nella riga, e
+/// [`AllocatedPort::tenuta`] dice al chiamante se la porta e' davvero trattenuta
+/// o se ha in mano un numero e basta (regola Q).
 pub async fn find_or_allocate(
     db: &PgPool,
     registry: &PortRegistryCache,
     project_id: Uuid,
     label: &str,
+    richiedente: RichiedenteAllocazione,
 ) -> Result<AllocatedPort, ErroreAllocazione> {
+    let (port, mode) = risolvi_porta(db, registry, project_id, label).await?;
+    let tenuta = dichiara_tenuta(db, project_id, label.trim(), richiedente).await;
+    if !tenuta.e_ancorata() {
+        // Non e' un errore — la porta c'e' ed e' usabile adesso — ma non e'
+        // nemmeno un'assegnazione: il chiamante deve poterlo sapere senza
+        // rileggere il registro, e chi legge i log deve poter distinguere una
+        // porta sparita da una porta mai trattenuta.
+        tracing::warn!(
+            port, label = %label.trim(), mode, project_id = %project_id,
+            "allocazione porte: nessuna ancora sulla riga (ne' prenotazione, ne' unit): \
+             il GC la rilascera' se il servizio non parte entro la grace"
+        );
+    }
+    Ok(AllocatedPort { port, mode, tenuta })
+}
+
+/// La risoluzione della porta, senza la domanda sulla durata: la meta' che
+/// esisteva prima della mig 0741. Privata perche' il suo esito e' una promessa
+/// incompleta — chi la chiama deve passare da [`find_or_allocate`], che la
+/// completa dichiarando chi tiene in vita la riga.
+async fn risolvi_porta(
+    db: &PgPool,
+    registry: &PortRegistryCache,
+    project_id: Uuid,
+    label: &str,
+) -> Result<(u16, &'static str), ErroreAllocazione> {
     let label = label.trim();
     if label.is_empty() {
         return Err(ErroreAllocazione::LabelVuota);
@@ -240,10 +301,7 @@ pub async fn find_or_allocate(
                 .unwrap_or_default();
             match active_port_action(&ownership, freed) {
                 ActivePortAction::ReuseOwn => {
-                    return Ok(AllocatedPort {
-                        port: p,
-                        mode: "existing",
-                    });
+                    return Ok((p, "existing"));
                 }
                 ActivePortAction::ReuseFreed => {
                     tracing::warn!(
@@ -260,10 +318,7 @@ pub async fn find_or_allocate(
                                 "occupant_program": occupant_program,
                             })),
                     );
-                    return Ok(AllocatedPort {
-                        port: p,
-                        mode: "existing",
-                    });
+                    return Ok((p, "existing"));
                 }
                 ActivePortAction::ReallocateNew => {
                     // Porta occupata da un servizio altrui, o da un occupante non
@@ -317,10 +372,7 @@ pub async fn find_or_allocate(
                                 "reason": "occupied_by_other_service",
                             })),
                     );
-                    return Ok(AllocatedPort {
-                        port: new_port,
-                        mode: "reallocated",
-                    });
+                    return Ok((new_port, "reallocated"));
                 }
             }
         }
@@ -376,10 +428,7 @@ pub async fn find_or_allocate(
                             "reason": "listener_owned_by_service",
                         })),
                 );
-                return Ok(AllocatedPort {
-                    port: found_port,
-                    mode: "adopted",
-                });
+                return Ok((found_port, "adopted"));
             }
             service_ownership::StaleAdoption::ReuseStale { .. } => {}
         }
@@ -433,10 +482,7 @@ pub async fn find_or_allocate(
             label = %label, adopted_port = p,
             "find_or_allocate: allocazione stale riusata sulla stessa porta (adopted)"
         );
-        return Ok(AllocatedPort {
-            port: p,
-            mode: "adopted",
-        });
+        return Ok((p, "adopted"));
     }
 
     // 1-bis. Consapevolezza risorse: nessuna riga DB con QUESTA label esatta.
@@ -532,10 +578,7 @@ pub async fn find_or_allocate(
                     "mode": "existing",
                 })),
         );
-        return Ok(AllocatedPort {
-            port: existing_port,
-            mode: "existing",
-        });
+        return Ok((existing_port, "existing"));
     }
 
     // 2. Quota check: non superare max_ports allocate per il progetto.
@@ -598,10 +641,88 @@ pub async fn find_or_allocate(
             .with_details(serde_json::json!({"label": label, "mode": "dynamic"})),
     );
 
-    Ok(AllocatedPort {
-        port,
-        mode: "dynamic",
-    })
+    Ok((port, "dynamic"))
+}
+
+/// L'unica scrittura della prenotazione. `true` se una riga l'ha ricevuta.
+///
+/// Zero righe toccate NON e' un errore del DB: la porta e' stata risolta ma il
+/// registro non conosce (piu') quella label. Si dichiara e non si inventa
+/// un'ancora — un `true` di comodo qui rimetterebbe in piedi esattamente la
+/// promessa non mantenuta che la mig 0741 chiude.
+async fn scrivi_prenotazione(db: &PgPool, project_id: Uuid, label: &str, run_id: Uuid) -> bool {
+    match sqlx::query(
+        "UPDATE nexus_port_allocations SET prenotata_da_run = $1, updated_at = NOW() \
+         WHERE project_id = $2 AND label = $3",
+    )
+    .bind(run_id)
+    .bind(project_id)
+    .bind(label)
+    .execute(db)
+    .await
+    {
+        Ok(r) if r.rows_affected() > 0 => true,
+        Ok(_) => {
+            tracing::warn!(
+                label = %label, run_id = %run_id, project_id = %project_id,
+                "allocazione porte: nessuna riga da prenotare per questa label"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(
+                label = %label, run_id = %run_id, error = %e,
+                "allocazione porte: prenotazione non scritta"
+            );
+            false
+        }
+    }
+}
+
+/// Scrive la PRENOTAZIONE (se c'e' un run che la chiede) e dichiara che cosa,
+/// alla fine, tiene in vita la riga.
+///
+/// La stampigliatura avviene qui e non nei sette rami di [`risolvi_porta`]:
+/// quei rami rispondono a «quale porta», e ricopiarvi la stessa `UPDATE` sette
+/// volte sarebbe la dispersione che la regola L vieta — con l'aggravante che il
+/// ramo dimenticato produrrebbe esattamente il difetto di partenza, una porta
+/// promessa che evapora, senza che nulla fallisca.
+///
+/// L'ordine delle prove non e' arbitrario: la prenotazione viene PRIMA perche'
+/// e' l'unica che si sta scrivendo adesso, e perche' un'`UPDATE` riuscita e' un
+/// fatto piu' forte di una rilettura. Se non c'e' un run, si legge cosa la riga
+/// gia' dichiara. Errore di lettura -> [`TenutaAllocazione::Nessuna`]: «non ho
+/// potuto guardare» qui cade dalla parte della prudenza, perche' il costo e' un
+/// avviso di troppo al chiamante, non una porta distrutta.
+async fn dichiara_tenuta(
+    db: &PgPool,
+    project_id: Uuid,
+    label: &str,
+    richiedente: RichiedenteAllocazione,
+) -> TenutaAllocazione {
+    if let RichiedenteAllocazione::Run(run_id) = richiedente {
+        if scrivi_prenotazione(db, project_id, label, run_id).await {
+            return TenutaAllocazione::PrenotataDaRun(run_id);
+        }
+    }
+
+    let riga: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT allocation_mode, service_unit FROM nexus_port_allocations \
+         WHERE project_id = $1 AND label = $2",
+    )
+    .bind(project_id)
+    .bind(label)
+    .fetch_optional(db)
+    .await
+    .unwrap_or(None);
+
+    match riga {
+        Some((modo, _)) if modo == nexus_tool_kit::ports::ALLOCATION_MODE_MANUAL => {
+            TenutaAllocazione::Manuale
+        }
+        Some((_, Some(unit))) if !unit.trim().is_empty() => TenutaAllocazione::UnitDiServizio,
+        _ => TenutaAllocazione::Nessuna,
+    }
 }
 
 /// Collega l'allocazione porta di `(project_id, label)` al `service_unit` del
@@ -752,8 +873,18 @@ pub async fn web_service_port_env(
     project_id: Uuid,
     label: &str,
 ) -> Result<std::collections::HashMap<String, String>, String> {
-    let alloc = find_or_allocate(db, registry, project_id, label)
-        .await
+    // FuoriDaUnRun: qui l'ancora non e' la prenotazione ma la unit, che si lega
+    // poche righe piu' sotto e nello stesso istante. Prenotare per un run che
+    // sta per consegnare la porta a un servizio managed aggiungerebbe una
+    // seconda verita' sulla durata, piu' debole di quella che sta per arrivare.
+    let alloc = find_or_allocate(
+        db,
+        registry,
+        project_id,
+        label,
+        RichiedenteAllocazione::FuoriDaUnRun,
+    )
+    .await
         .map_err(|e| format!("allocazione porta per '{label}' fallita: {e}"))?;
 
     // L'allocazione va LEGATA all'unit del servizio, altrimenti nasce con
@@ -950,14 +1081,24 @@ pub async fn allocate_port(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
     let _context = load_project_context(&state.db, project_id, user_id).await?;
 
-    let result = find_or_allocate(&state.db, &state.port_registry, project_id, &body.label)
-        .await
-        .map_err(|e| api_error(StatusCode::CONFLICT, e.to_string()))?;
+    // REST: nessun run dietro la richiesta (la fa il pannello o uno script).
+    // La `tenuta` viaggia nella risposta come nel tool: chi chiede una porta da
+    // qui e non avvia subito un servizio deve sapere che il GC la raccogliera'.
+    let result = find_or_allocate(
+        &state.db,
+        &state.port_registry,
+        project_id,
+        &body.label,
+        RichiedenteAllocazione::FuoriDaUnRun,
+    )
+    .await
+    .map_err(|e| api_error(StatusCode::CONFLICT, e.to_string()))?;
 
     Ok(Json(json!({
         "port": result.port,
         "label": body.label.trim(),
         "allocation_mode": result.mode,
+        "tenuta": result.tenuta.as_str(),
         "ok": true,
     })))
 }

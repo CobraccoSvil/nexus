@@ -1466,8 +1466,12 @@ fi
 assert_single "appartenenza-processo" 'fn classify_ownership' \
   'crates/mcp-core/src/project_workspace/service_ownership.rs' crates
 
-# Il consumatore, non solo la definizione: i TRE rami di find_or_allocate che
-# possono legare una porta gia' in uso a un servizio devono passare dal verdetto.
+# Il consumatore, non solo la definizione: i TRE rami che possono legare una
+# porta gia' in uso a un servizio devono passare dal verdetto. Il corpo che li
+# contiene si chiama `risolvi_porta` dalla mig 0741: `find_or_allocate` e' ora
+# il suo involucro, che vi aggiunge la PRENOTAZIONE e la dichiarazione della
+# tenuta. Il guard segue il corpo, non il nome pubblico — con l'ancora sbagliata
+# conterebbe zero rami e fallirebbe per un rename invece che per un difetto.
 # Un grep sul file resterebbe verde se la funzione esistesse ma nessuno la
 # chiamasse (regola O: il codice morto ha test verdi). Il conteggio e' stampato:
 # zero consumatori trovati e' un FALLIMENTO, non un silenzio.
@@ -1475,7 +1479,7 @@ assert_single "appartenenza-processo" 'fn classify_ownership' \
 # commenti, il guard resterebbe verde con la chiamata rimossa e il commento che
 # la descrive ancora al suo posto (misurato: contava 3 rami su 2 reali).
 rami_verdetto="$(awk '
-  /^pub async fn find_or_allocate/ { dentro = 1 }
+  /^async fn risolvi_porta/ { dentro = 1 }
   dentro && !/^[[:space:]]*\/\// && /resolve_stale_adoption\(|owned_listener\(/ { n++ }
   dentro && /^}/ { exit }
   END { print n + 0 }
@@ -1498,7 +1502,7 @@ fi
 # "di frontend", e per un processo non registrato la label la inventa
 # derive_orphan_label dal nome del programma (regola M).
 if awk '
-  /^pub async fn find_or_allocate/ { dentro = 1 }
+  /^async fn risolvi_porta/ { dentro = 1 }
   dentro && /resource_resolver::resolve_for_label\(/ { trovato = 1 }
   dentro && /^}/ { exit }
   END { exit !trovato }
@@ -4584,6 +4588,69 @@ if ! grep -q 'dispatcher_run_id(&turno_1)' crates/mcp-core/src/native_engine.rs 
   fail=1
 else
   echo "OK decisione-di-convocazione: il ponte chiede l'ancora ai produttori"
+fi
+
+# -- prenotazione-porta (2026-08-19, mig 0741) -------------------------------
+# «Chi tiene in vita questa riga di nexus_port_allocations, e finche' quando?»
+# Prima la domanda non era ponibile: il GC accettava due sole prove, entrambe
+# osservate o derivate dall'AVVIO (un listener, la colonna service_unit), e una
+# porta appena chiesta da request_port non puo' avere ne' l'una ne' l'altra —
+# il servizio che la usera' non esiste ancora. MISURATO il 18/08/2026 su
+# biblioteca-18-08: due porte promesse alle 20:49:28 e rilasciate alle 20:54:16.
+assert_single "prenotazione-porta" 'pub enum TenutaAllocazione'   'crates/mcp-core/src/project_workspace/prenotazione_porta.rs' crates
+assert_single "prenotazione-porta" 'pub enum StatoPrenotazione'   'crates/mcp-core/src/project_workspace/prenotazione_porta.rs' crates
+assert_single "prenotazione-porta" 'pub fn classifica_prenotazione'   'crates/mcp-core/src/project_workspace/prenotazione_porta.rs' crates
+assert_single "prenotazione-porta" 'pub trait VitaDelRun'   'crates/mcp-core/src/project_workspace/prenotazione_porta.rs' crates
+
+# Il CONSUMATORE, non solo la definizione: il criterio del GC deve interrogare
+# la terza prova. Senza questa riga il modulo resterebbe perfetto e mai
+# consultato, con tutti i suoi test verdi (regola O) e le porte promesse che
+# continuano a evaporare.
+if ! grep -q 'prenotazione.tiene_in_vita()' crates/mcp-core/src/port_registry.rs; then
+  echo "!! prenotazione-porta: allocazione_da_preservare non interroga piu' la" >&2
+  echo "   prenotazione. Il GC torna a due sole prove, entrambe impossibili per" >&2
+  echo "   una riga appena creata da request_port: la promessa evapora." >&2
+  fail=1
+else
+  echo "OK prenotazione-porta: il GC consulta la terza prova"
+fi
+
+# La PROMESSA e' un campo, non un numero nudo (regola Q): il tool deve dire se
+# la porta e' trattenuta. Un JSON identico nei due casi e' il difetto misurato.
+if ! grep -q 'alloc.tenuta.e_ancorata()' crates/mcp-core/src/agent_tools/ports.rs; then
+  echo "!! prenotazione-porta: request_port non dichiara piu' la tenuta della" >&2
+  echo "   porta. Restituire il numero E' una promessa, e senza quel campo una" >&2
+  echo "   riga trattenuta e una che il GC raccogliera' sono indistinguibili." >&2
+  fail=1
+else
+  echo "OK prenotazione-porta: request_port dichiara la tenuta"
+fi
+
+# La stampigliatura della prenotazione sta in UN punto dopo la risoluzione della
+# porta, non nei sette rami che scelgono il numero: il ramo dimenticato
+# riprodurrebbe il difetto di partenza senza che nulla fallisca (regola L).
+if [[ "$(grep -c 'prenotata_da_run = ' crates/mcp-core/src/project_workspace/allocate_port.rs)" -ne 1 ]]; then
+  echo "!! prenotazione-porta: la prenotazione si scrive in piu' di un punto di" >&2
+  echo "   allocate_port. Un ramo che la dimentica promette una porta che il GC" >&2
+  echo "   raccogliera', ed e' esattamente il difetto che la mig 0741 chiude." >&2
+  fail=1
+else
+  echo "OK prenotazione-porta: un solo punto scrive la prenotazione"
+fi
+
+# -- campo-dichiarato-sopravvive (2026-08-19) --------------------------------
+# I due normalizzatori dei tool dichiarativi RICOSTRUISCONO l'oggetto con un
+# allowlist: un campo dichiarato nello schema e non ricopiato li' sparisce, e
+# niente fallisce. MISURATO il 18/08/2026: 31 prove emesse dalle figure e
+# `piano: PianoDiVerifica { prove: [] }` alla barriera; lo stesso guard ha poi
+# trovato `task_complete.rendered_container` con la stessa sorte.
+if ! grep -q 'fn inserisci_prove' crates/nexus-agent-graph/src/decisions/tool_dispatch.rs   || [[ "$(grep -c 'inserisci_prove(&mut out, obj);' crates/nexus-agent-graph/src/decisions/tool_dispatch.rs)" -ne 2 ]]; then
+  echo "!! campo-dichiarato-sopravvive: le prove non attraversano piu' entrambi i" >&2
+  echo "   normalizzatori (advisory_verdict e task_complete). Il piano di verifica" >&2
+  echo "   nasce vuoto sull'ingresso scoperto e il criterio passa senza misurare." >&2
+  fail=1
+else
+  echo "OK campo-dichiarato-sopravvive: le prove attraversano entrambi gli ingressi"
 fi
 
 if [[ "$fail" -ne 0 ]]; then

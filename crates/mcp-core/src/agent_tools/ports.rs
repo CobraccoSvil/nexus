@@ -20,7 +20,9 @@
 //! due li produce il ramo idempotente, cioe' quello piu' frequente.
 
 use super::AgentToolContext;
-use crate::project_workspace::allocate_port::ErroreAllocazione;
+use crate::project_workspace::allocate_port::{
+    AllocatedPort, ErroreAllocazione, RichiedenteAllocazione,
+};
 use nexus_agent_tools::{
     input_contract::InputTool,
     tool_inputs::{NexusListPortsInput, RequestPortInput},
@@ -55,6 +57,7 @@ pub async fn tool_request_port(ctx: &AgentToolContext, input: &Value) -> Rispost
         &ctx.port_registry,
         ctx.project_id,
         &label,
+        richiedente_del_contesto(ctx),
     )
     .await
     {
@@ -70,15 +73,62 @@ pub async fn tool_request_port(ctx: &AgentToolContext, input: &Value) -> Rispost
                 },
             );
 
-            let esito = json!({
-                "port": alloc.port,
-                "label": label,
-                "allocation_mode": alloc.mode,
-            });
-            RispostaTool::riuscito(esito.to_string())
+            esito_allocazione(&label, &alloc)
         }
         Err(e) => fallimento_allocazione(&label, &e),
     }
+}
+
+/// CHI sta chiedendo la porta, cioe' che cosa la terra' prenotata finche' il
+/// servizio non parte (mig 0741).
+///
+/// `ctx.core.run_id` e' `None` fuori dal grafo nativo (server gRPC, dispatch
+/// legacy): li' non si finge una prenotazione, si dichiara che non c'e' — e
+/// l'esito lo dira' al chiamante invece di lasciargli un numero che sembra
+/// un'assegnazione.
+fn richiedente_del_contesto(ctx: &AgentToolContext) -> RichiedenteAllocazione {
+    match ctx.core.run_id {
+        Some(run_id) => RichiedenteAllocazione::Run(run_id),
+        None => RichiedenteAllocazione::FuoriDaUnRun,
+    }
+}
+
+/// L'ESITO di un'allocazione riuscita come lo riceve il modello.
+///
+/// # Perche' un campo e non solo un numero (regola Q)
+///
+/// Ritornare la porta e basta E' una promessa: «questa porta e' del progetto».
+/// Fino alla mig 0741 quella promessa aveva due significati indistinguibili —
+/// una riga trattenuta e una riga che il port_gc avrebbe raccolto entro cinque
+/// minuti — e il modello riceveva lo stesso identico JSON in entrambi i casi.
+/// Misurato il 18/08/2026 su biblioteca-18-08: quattro chiamate riuscite, zero
+/// righe sopravvissute, e il gate duale che poi rifiuta l'avvio perche' nel
+/// registro non c'e' nessuna allocazione per quel servizio.
+///
+/// `tenuta` e' il campo in cui le due situazioni smettono di coincidere, e il
+/// testo si compone DA quel campo — mai il contrario. Non e' un fallimento:
+/// la porta esiste ed e' usabile adesso; e' una promessa piu' debole, e va
+/// detta, perche' il rimedio del modello e' diverso (avvia il servizio subito,
+/// invece di rimandare).
+fn esito_allocazione(label: &str, alloc: &AllocatedPort) -> RispostaTool {
+    let esito = json!({
+        "port": alloc.port,
+        "label": label,
+        "allocation_mode": alloc.mode,
+        "tenuta": alloc.tenuta.as_str(),
+    });
+    if alloc.tenuta.e_ancorata() {
+        return RispostaTool::riuscito(esito.to_string());
+    }
+    RispostaTool::riuscito(format!(
+        "{esito}\n[Attenzione: la porta {} e' registrata ma NON e' trattenuta da nulla \
+         (tenuta: {}). Nessun run la prenota e nessun servizio la usa ancora: il \
+         garbage collector delle porte la rilascera' se nessuno si mette in ascolto. \
+         Avvia il servizio su questa porta ora, oppure rifai la richiesta quando sei \
+         pronto ad avviarlo.]",
+        alloc.port,
+        alloc.tenuta.as_str()
+    ))
 }
 
 /// Il fallimento di `find_or_allocate` come lo riceve il modello.

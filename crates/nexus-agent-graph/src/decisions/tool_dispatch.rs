@@ -197,6 +197,28 @@ pub fn normalize_declared_outcome(tool_input: &Value) -> Result<Value, Declarati
     if !endpoints.is_empty() {
         out.insert("endpoints".to_string(), Value::Array(endpoints));
     }
+    // `prove` (mig 0737): il SECONDO ingresso del piano di verifica, che
+    // `final_gate::PianoDiVerifica::da_dichiarazione` legge da qui. Perdeva il
+    // campo esattamente come il gemello advisory: vedi [`inserisci_prove`].
+    inserisci_prove(&mut out, obj);
+    // `rendered_container` (mig 0685): il selettore che il criterio della resa
+    // statica pretende NON VUOTO. TERZA occorrenza dello stesso difetto e
+    // trovata dallo stesso guard: `static_render::contenitore_dichiarato` lo
+    // legge da `state.declared_outcome`, che e' QUESTO valore normalizzato —
+    // quindi il contenitore dichiarato dall'agente non arrivava mai al criterio
+    // e il segnale «il contenitore e' rimasto vuoto» non poteva nascere. Il
+    // filtro sul vuoto e' lo stesso del lettore (una stringa di spazi non e'
+    // una dichiarazione), e resta anche li': si valida al confine che si
+    // attraversa.
+    if let Some(sel) = obj.get("rendered_container").and_then(Value::as_str) {
+        let sel = sel.trim();
+        if !sel.is_empty() {
+            out.insert(
+                "rendered_container".to_string(),
+                Value::String(sel.to_string()),
+            );
+        }
+    }
     Ok(Value::Object(out))
 }
 
@@ -624,10 +646,58 @@ pub fn normalize_advisory_verdict(tool_input: &Value) -> Result<Value, Declarati
     if !recommendations.is_empty() {
         out.insert("recommendations".to_string(), Value::Array(recommendations));
     }
+    inserisci_prove(&mut out, obj);
     if let Some(cd) = normalize_contested_decision(obj.get("contested_decision")) {
         out.insert("contested_decision".to_string(), cd);
     }
     Ok(Value::Object(out))
+}
+
+/// Riporta il campo [`super::piano_di_verifica::CAMPO_PROVE`] dall'input del
+/// tool all'oggetto normalizzato.
+///
+/// # Perche' esiste, e perche' e' condiviso fra i due normalizzatori
+///
+/// Questi normalizzatori non FILTRANO: ricostruiscono l'oggetto da zero in una
+/// mappa nuova, con un allowlist implicito di campi. Un campo dichiarato nello
+/// schema del tool ma non ricopiato qui non viene rifiutato — sparisce, e il
+/// valore normalizzato e' l'unico che sopravvive fino all'outcome.
+///
+/// MISURATO il 18/08/2026 su biblioteca-18-08: le figure del consiglio avevano
+/// emesso **31 prove ben formate** in sei chiamate ad `advisory_verdict` (i
+/// `tool_input` sono ancora in `agent_steps`), e il log della barriera advisory
+/// del run 5de631f9 registra `piano: PianoDiVerifica { prove: [] }` con i
+/// requirements della stessa sintesi correttamente popolati. Il piano di
+/// verifica era completo, deployato e strutturalmente incapace di ricevere un
+/// solo dato — su ENTRAMBI i suoi ingressi, perche' `task_complete` perdeva il
+/// campo allo stesso modo. Da qui la funzione unica: due ingressi con lo stesso
+/// difetto non si correggono uno alla volta (regola L).
+///
+/// Le prove passano GREZZE, e la validazione resta a chi le interpreta: il
+/// vocabolario delle attese e' di `piano_di_verifica`, e una seconda idea di
+/// «attesa valida» qui divergerebbe dalla sua al primo tipo aggiunto. Qui si
+/// controlla la sola FORMA — voci che siano oggetti, entro un tetto — perche'
+/// una stringa o un numero in quella lista non e' una prova malformata: e' un
+/// campo di un altro tipo, e non deve occupare il budget di una prova vera.
+fn inserisci_prove(out: &mut serde_json::Map<String, Value>, obj: &serde_json::Map<String, Value>) {
+    let Some(arr) = obj
+        .get(super::piano_di_verifica::CAMPO_PROVE)
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    let prove: Vec<Value> = arr
+        .iter()
+        .filter(|v| v.is_object())
+        .take(ADVISORY_LIST_CAP)
+        .cloned()
+        .collect();
+    if !prove.is_empty() {
+        out.insert(
+            super::piano_di_verifica::CAMPO_PROVE.to_string(),
+            Value::Array(prove),
+        );
+    }
 }
 
 /// Minimo di opzioni perche' una decisione sia CONTESA: una sola alternativa non
@@ -1025,6 +1095,105 @@ pub fn append_reminder_block(blocks: &mut Vec<Value>, reminder_text: &str) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Il payload REALE di una delle sei `advisory_verdict` che hanno emesso
+    /// prove il 18/08/2026 su biblioteca-18-08 (`agent_steps.tool_input`, run
+    /// 5de631f9). Non un corpo di prova inventato: e' cio' che i modelli
+    /// mandano davvero, ed e' cio' che si e' perso.
+    fn parere_reale_con_prove() -> Value {
+        json!({
+            "verdict": "proceed_with_changes",
+            "summary": "Backend e frontend separati, API REST verificabile.",
+            "requirements": [
+                {"text": "Il backend deve esporre GET /books", "direction": "must_be_present"}
+            ],
+            "prove": [
+                {
+                    "descrizione": "l'endpoint dei libri risponde 200",
+                    "comando": "curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8081/books",
+                    "attesa": {"tipo": "output_contains", "testo": "200"}
+                },
+                {
+                    "descrizione": "la suite del backend passa",
+                    "comando": "npm test",
+                    "working_dir": "backend",
+                    "attesa": {"tipo": "exit_code", "codice": 0}
+                }
+            ]
+        })
+    }
+
+    /// LE PROVE NON DEVONO SPARIRE AL CONFINE DEL TOOL (mig 0737).
+    ///
+    /// I normalizzatori non filtrano: RICOSTRUISCONO l'oggetto in una mappa
+    /// nuova, quindi un campo dichiarato nello schema e non ricopiato non viene
+    /// rifiutato — sparisce, e il valore normalizzato e' l'unico che arriva
+    /// all'outcome. MISURATO il 18/08/2026: 31 prove emesse, 59 requisiti
+    /// emessi, e alla barriera `piano: PianoDiVerifica { prove: [] }` con i
+    /// requirements dello stesso giro correttamente popolati.
+    ///
+    /// MUTAZIONE che rende rosso: togliere la chiamata a `inserisci_prove` da
+    /// `normalize_advisory_verdict`. Il campo torna assente, cioe' il valore
+    /// esatto del difetto.
+    #[test]
+    fn il_parere_advisory_conserva_le_prove_dichiarate() {
+        let out = normalize_advisory_verdict(&parere_reale_con_prove()).expect("parere valido");
+        let prove = out
+            .get(super::super::piano_di_verifica::CAMPO_PROVE)
+            .and_then(Value::as_array)
+            .expect("le prove attraversano il normalizzatore");
+        assert_eq!(prove.len(), 2, "nessuna prova va persa per strada");
+        assert_eq!(
+            prove[0].get("comando").and_then(Value::as_str),
+            Some("curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8081/books"),
+            "le prove passano GREZZE: il vocabolario delle attese e' di piano_di_verifica"
+        );
+        assert_eq!(
+            prove[1].get("working_dir").and_then(Value::as_str),
+            Some("backend"),
+            "anche i campi opzionali di una prova sopravvivono"
+        );
+    }
+
+    /// L'ALTRO INGRESSO del piano di verifica perdeva il campo allo stesso
+    /// modo: `final_gate::PianoDiVerifica::da_dichiarazione` legge
+    /// `task_complete.prove`, e il normalizzatore lo scartava.
+    ///
+    /// MUTAZIONE che rende rosso: togliere `inserisci_prove` da
+    /// `normalize_declared_outcome`.
+    #[test]
+    fn la_dichiarazione_di_chiusura_conserva_le_prove() {
+        let mut input = parere_reale_con_prove();
+        let obj = input.as_object_mut().expect("oggetto");
+        obj.remove("verdict");
+        obj.remove("requirements");
+        obj.insert("outcome".to_string(), json!("done"));
+        let out = normalize_declared_outcome(&input).expect("dichiarazione valida");
+        assert_eq!(
+            out.get(super::super::piano_di_verifica::CAMPO_PROVE)
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+    }
+
+    /// Una lista di prove che non contiene oggetti non e' una lista di prove
+    /// malformate: e' un campo di un altro tipo, e non deve occupare il budget
+    /// di una prova vera. Il campo resta ASSENTE, non diventa un array vuoto:
+    /// «nessuna prova dichiarata» e «prove dichiarate e tutte scartate» sono
+    /// due cose diverse per chi legge il piano.
+    #[test]
+    fn le_prove_di_forma_sbagliata_non_entrano_nel_piano() {
+        let input = json!({
+            "verdict": "proceed",
+            "summary": "ok",
+            "prove": ["esegui i test", 42],
+        });
+        let out = normalize_advisory_verdict(&input).expect("parere valido");
+        assert!(out
+            .get(super::super::piano_di_verifica::CAMPO_PROVE)
+            .is_none());
+    }
 
     #[test]
     fn run_notes_set_e_append() {

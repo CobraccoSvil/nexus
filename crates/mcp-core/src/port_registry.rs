@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use sqlx::PgPool;
 use tokio::sync::RwLock;
+
+use crate::project_workspace::prenotazione_porta::{stato_prenotazione, VitaDelRun};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -593,6 +595,8 @@ async fn allocazione_da_preservare(
     project_id: Uuid,
     porta: u16,
     service_unit: Option<&str>,
+    prenotata_da_run: Option<Uuid>,
+    vita: &dyn VitaDelRun,
     scan: &crate::project_workspace::port_recovery::ListenerScan,
 ) -> bool {
     if !nexus_tool_kit::ports::port_authorized_for_project(db, &project_id, porta).await {
@@ -603,6 +607,15 @@ async fn allocazione_da_preservare(
     // gia' fermato tutto), ma resta trattato come "non toccare": e' il difetto
     // che questo ramo evita.
     if scan.ascolta(porta) != Some(false) {
+        return true;
+    }
+    // TERZA PROVA (mig 0741): la riga e' PRENOTATA da un run ancora vivo. Le
+    // altre due sono entrambe OSSERVATE o derivate dall'AVVIO, e una porta
+    // appena chiesta da `request_port` non puo' averle — il servizio che dovra'
+    // usarla non esiste ancora. Il criterio non e' un timer ed e' delegato al
+    // punto unico `prenotazione_porta`, che ne porta la misura e il perche'.
+    let prenotazione = stato_prenotazione(vita, project_id, prenotata_da_run).await;
+    if prenotazione.tiene_in_vita() {
         return true;
     }
     // Riserva di un servizio configurato ma FERMO -> non e' orfana. Criterio
@@ -626,7 +639,27 @@ async fn allocazione_da_preservare(
     }
 }
 
-pub async fn cleanup_orphaned_ports(db: &PgPool, grace_secs: i64) -> u64 {
+/// L'unica cancellazione del GC. Il filtro `<> 'manual'` resta anche qui,
+/// dove la riga e' gia' stata giudicata: una riserva esplicita di una persona
+/// non si tocca nemmeno se il criterio a monte cambiasse idea.
+async fn rilascia_allocazione(db: &PgPool, project_id: Uuid, port: i32) -> u64 {
+    sqlx::query(
+        "DELETE FROM nexus_port_allocations \
+         WHERE project_id = $1 AND port = $2 AND allocation_mode <> 'manual'",
+    )
+    .bind(project_id)
+    .bind(port)
+    .execute(db)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0)
+}
+
+pub async fn cleanup_orphaned_ports(
+    db: &PgPool,
+    grace_secs: i64,
+    vita: &dyn crate::project_workspace::prenotazione_porta::VitaDelRun,
+) -> u64 {
     let grace = grace_secs.max(60);
     // Una sola interrogazione del SO per l'intero giro (invece di una per riga):
     // e' anche una fotografia COERENTE, cosi' due allocazioni non vengono
@@ -644,8 +677,8 @@ pub async fn cleanup_orphaned_ports(db: &PgPool, grace_secs: i64) -> u64 {
         );
         return 0;
     }
-    let rows: Vec<(Uuid, i32, Option<String>)> = sqlx::query_as(
-        "SELECT project_id, port, service_unit FROM nexus_port_allocations \
+    let rows: Vec<(Uuid, i32, Option<String>, Option<Uuid>)> = sqlx::query_as(
+        "SELECT project_id, port, service_unit, prenotata_da_run FROM nexus_port_allocations \
          WHERE allocation_mode <> 'manual' AND created_at < NOW() - make_interval(secs => $1)",
     )
     .bind(grace as f64)
@@ -654,22 +687,22 @@ pub async fn cleanup_orphaned_ports(db: &PgPool, grace_secs: i64) -> u64 {
     .unwrap_or_default();
 
     let mut released = 0u64;
-    for (project_id, port, service_unit) in rows {
+    for (project_id, port, service_unit, prenotata_da_run) in rows {
         let p = port as u16;
-        if allocazione_da_preservare(db, project_id, p, service_unit.as_deref(), &scan).await {
+        if allocazione_da_preservare(
+            db,
+            project_id,
+            p,
+            service_unit.as_deref(),
+            prenotata_da_run,
+            vita,
+            &scan,
+        )
+        .await
+        {
             continue;
         }
-        let n = sqlx::query(
-            "DELETE FROM nexus_port_allocations \
-             WHERE project_id = $1 AND port = $2 AND allocation_mode <> 'manual'",
-        )
-        .bind(project_id)
-        .bind(port)
-        .execute(db)
-        .await
-        .map(|r| r.rows_affected())
-        .unwrap_or(0);
-        released += n;
+        released += rilascia_allocazione(db, project_id, port).await;
     }
     if released > 0 {
         info!("port_gc: rilasciate {released} allocazioni orfane (nessun listener)");
@@ -991,9 +1024,13 @@ pub async fn cleanup_duplicate_dev_servers(_db: &PgPool) -> u64 {
 pub async fn port_gc_loop(db: PgPool, interval_secs: u64, grace_secs: i64) {
     let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(30)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Chi risponde a «il run che ha prenotato questa porta e' ancora vivo?».
+    // Si costruisce una volta: dentro c'e' solo il pool meta, e il pool del
+    // progetto lo risolve (e lo tiene in cache) `project_db_routes`.
+    let vita = crate::project_workspace::prenotazione_porta::RunsDelDbDiProgetto::new(db.clone());
     loop {
         tick.tick().await;
-        cleanup_orphaned_ports(&db, grace_secs).await;
+        cleanup_orphaned_ports(&db, grace_secs, &vita).await;
         cleanup_duplicate_dev_servers(&db).await;
     }
 }
@@ -1055,6 +1092,39 @@ mod tests {
         cleanup_orphaned_ports, dev_server_roots_to_kill, dev_server_signature,
         extract_ports_from_unit_content, windows_unit_backed_by_label, PortRegistryCache,
     };
+    use crate::project_workspace::prenotazione_porta::{EsitoInterrogazioneRun, VitaDelRun};
+    use uuid::Uuid;
+
+    /// Il DB dei run del progetto, sostituito da cio' che il test DICHIARA.
+    ///
+    /// Serve perche' `agent_runs` vive nel DB del PROGETTO e questi test girano
+    /// su un META senza directory di routing: la porta di produzione
+    /// risponderebbe `NonInterrogabile`, che PRESERVA — cioe' il test sarebbe
+    /// verde per fail-closed e non per il criterio, ed e' proprio il falso
+    /// verde che la regola O vieta.
+    struct RunFinto {
+        vivi: Vec<Uuid>,
+    }
+
+    impl RunFinto {
+        fn nessuno_vivo() -> Self {
+            Self { vivi: Vec::new() }
+        }
+        fn con_vivo(run_id: Uuid) -> Self {
+            Self { vivi: vec![run_id] }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VitaDelRun for RunFinto {
+        async fn interroga(&self, _project_id: Uuid, run_id: Uuid) -> EsitoInterrogazioneRun {
+            if self.vivi.contains(&run_id) {
+                EsitoInterrogazioneRun::Stato("running".to_string())
+            } else {
+                EsitoInterrogazioneRun::Stato("completed".to_string())
+            }
+        }
+    }
 
     /// Il GC proteggeva l'artefatto proprio mentre faceva danno.
     ///
@@ -1119,7 +1189,7 @@ mod tests {
             .expect("seed allocazione");
         }
 
-        cleanup_orphaned_ports(&pool, 60).await;
+        cleanup_orphaned_ports(&pool, 60, &RunFinto::nessuno_vivo()).await;
 
         let rimaste: Vec<(i32, String)> = sqlx::query_as(
             "SELECT port::int, allocation_mode FROM nexus_port_allocations \
@@ -1399,6 +1469,98 @@ mod tests {
         let mut k = dev_server_roots_to_kill(&procs);
         k.sort_unstable();
         assert_eq!(k, vec![10, 30]);
+    }
+
+    /// LA PORTA PROMESSA NON DEVE EVAPORARE (mig 0741).
+    ///
+    /// MISURATO il 18/08/2026 su biblioteca-18-08: `request_port` risponde
+    /// 34184 alle 20:49:28, alle 20:54:16 il log dice «port_gc: rilasciate 2
+    /// allocazioni orfane (nessun listener)», e 39 secondi dopo la stessa
+    /// chiamata risponde di nuovo `dynamic` con lo stesso numero — cioe' la
+    /// riga per quella label non esisteva piu'. Il tool non mentiva sulla
+    /// scrittura: mentiva sulla DURATA. Il gate duale ha poi rifiutato sei
+    /// avvii del backend DICENDO IL VERO («non risulta alcuna allocazione di
+    /// porta per il servizio») e l'applicazione non e' partita.
+    ///
+    /// IL TEST ATTRAVERSA IL PRODUTTORE (regola O): la riga la scrive
+    /// `find_or_allocate`, la stessa funzione che il tool `request_port`
+    /// invoca. Seminarla a mano con una `INSERT` fisserebbe come premessa
+    /// proprio cio' che va verificato — che la prenotazione ci finisca dentro.
+    ///
+    /// Il DB dei run e' sostituito da [`RunFinto`] e non dalla porta di
+    /// produzione: qui non c'e' directory di routing, quindi quella
+    /// risponderebbe `NonInterrogabile`, che preserva — un verde per
+    /// fail-closed invece che per il criterio.
+    ///
+    /// MUTAZIONE che rende rosso: togliere da `allocazione_da_preservare` il
+    /// ramo `prenotazione.tiene_in_vita()`. La prima asserzione cade con la
+    /// riga sparita, cioe' col valore esatto del difetto misurato.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_porta_promessa_a_un_run_vivo_sopravvive_al_gc(pool: sqlx::PgPool) {
+        use crate::project_workspace::allocate_port::{find_or_allocate, RichiedenteAllocazione};
+
+        let (_utente, project_id) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let registry = PortRegistryCache::empty_for_tests(pool.clone());
+        let run_id = Uuid::new_v4();
+
+        let alloc = find_or_allocate(
+            &pool,
+            &registry,
+            project_id,
+            "biblioteca-backend",
+            RichiedenteAllocazione::Run(run_id),
+        )
+        .await
+        .expect("il bucket del progetto ha porte libere");
+
+        // La PROMESSA e' dichiarata in un campo, non lasciata al numero
+        // (regola Q): il chiamante sa che la riga e' trattenuta, e da chi.
+        assert_eq!(
+            alloc.tenuta.as_str(),
+            "prenotata_da_run",
+            "una porta chiesta da un run deve nascere prenotata, o il tool \
+             promette cio' che non puo' mantenere"
+        );
+
+        // Il servizio non e' ancora nato: nessun listener, nessuna unit. E'
+        // esattamente la condizione in cui il GC la classificava orfana.
+        sqlx::query(
+            "UPDATE nexus_port_allocations SET created_at = NOW() - INTERVAL '1 hour' \
+             WHERE project_id = $1",
+        )
+        .bind(project_id)
+        .execute(&pool)
+        .await
+        .expect("invecchiamento oltre la grace");
+
+        let sopravvissute = |pool: sqlx::PgPool| async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM nexus_port_allocations WHERE project_id = $1",
+            )
+            .bind(project_id)
+            .fetch_one(&pool)
+            .await
+            .expect("conteggio allocazioni")
+        };
+
+        cleanup_orphaned_ports(&pool, 60, &RunFinto::con_vivo(run_id)).await;
+        assert_eq!(
+            sopravvissute(pool.clone()).await,
+            1,
+            "il run che ha chiesto la porta {} e' ancora vivo: la sua prenotazione \
+             non e' il residuo di un tentativo fallito",
+            alloc.port
+        );
+
+        // E non e' una grace piu' lunga sotto un altro nome: chiuso il run, la
+        // riga torna raccoglibile subito, senza aspettare nessun timer nuovo.
+        cleanup_orphaned_ports(&pool, 60, &RunFinto::nessuno_vivo()).await;
+        assert_eq!(
+            sopravvissute(pool).await,
+            0,
+            "chiuso il run, la prenotazione non tiene piu' niente: una porta \
+             trattenuta per sempre da un run morto e' l'altra meta' del difetto"
+        );
     }
 
     #[test]

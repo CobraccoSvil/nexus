@@ -3715,20 +3715,34 @@ mod tests {
     /// test sa leggere). Una porta un requisito in PROSA, l'altra anche una
     /// PROVA eseguibile: sono i due prodotti che il rilascio deve consegnare
     /// entrambi.
+    ///
+    /// IL BLOCCO `advisory` PASSA DAL NORMALIZZATORE, e non e' un dettaglio:
+    /// finche' questa fixture lo scriveva a mano, il test partiva UN PASSO A
+    /// VALLE del punto in cui il campo `prove` spariva. In produzione quel
+    /// blocco non lo scrive nessun test — lo scrive
+    /// `normalize_advisory_verdict`, che ricostruisce l'oggetto da zero con un
+    /// allowlist di campi e fino al 19/08/2026 `prove` non ne faceva parte.
+    /// MISURATO il 18/08/2026 su biblioteca-18-08: 31 prove emesse dalle figure
+    /// e `piano: PianoDiVerifica { prove: [] }` alla barriera. Il test era
+    /// verde su un piano che nella realta' era sempre vuoto.
     fn pareri_dei_due_apparati() -> Vec<(crate::decisions::AdvisorySource, Value)> {
         use crate::decisions::{
-            compose_advisory_synthesis, AdvisoryPolicy, AdvisoryRoster, AdvisorySource,
+            compose_advisory_synthesis, normalize_advisory_verdict, AdvisoryPolicy,
+            AdvisoryRoster, AdvisorySource,
         };
         let sintesi = |testo: &str, prove: Value| {
+            // Cio' che il MODELLO manda al tool, non cio' che il test vorrebbe
+            // ne uscisse.
+            let tool_input = json!({
+                "verdict": "proceed_with_changes",
+                "summary": "parere della figura",
+                "requirements": [{"text": testo}],
+                "prove": prove,
+            });
             let parere = json!({
                 "success": true,
-                "advisory": {
-                    "verdict": "proceed_with_changes",
-                    "risks": [],
-                    "requirements": [testo],
-                    "recommendations": [],
-                    "prove": prove,
-                }
+                "advisory": normalize_advisory_verdict(&tool_input)
+                    .expect("il parere e' valido: verdict nell'enum e nessun block senza rischi"),
             });
             compose_advisory_synthesis(
                 &[parere],

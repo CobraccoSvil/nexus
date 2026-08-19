@@ -4136,18 +4136,156 @@ mod tests {
     /// otto sarebbero rimaste senza la richiesta. L'ancora e' ora strutturale —
     /// chi emette `advisory_verdict` E' un potenziale produttore di prove — e
     /// qui si conta la COPERTURA, non l'esistenza di una riga.
-    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
-    async fn il_mandato_di_ogni_figura_advisory_chiede_le_prove(pool: PgPool) {
-        let scoperte: Vec<String> = sqlx::query_scalar(
+    /// Il testo della migrazione 0742, letto DAL FILE che il migrator applica.
+    ///
+    /// Un test che ricopiasse quel SQL misurerebbe la propria copia (regola O):
+    /// e' esattamente il modo in cui un guard di migrazione smette di
+    /// corrispondere alla migrazione senza che nulla fallisca.
+    const MIG_0742: &str =
+        include_str!("../../../../db/migrations/0742_copertura_prove_sui_mandati_servibili.sql");
+
+    /// Le righe che il runtime PUO' servire come mandato di una figura
+    /// advisory, derivate dal punto unico `nexus_types::chiavi_servibili`.
+    ///
+    /// Il denominatore NON e' un numero scritto a mano: «otto figure» era vero
+    /// il 18/08/2026 e sara' falso alla prima figura aggiunta, e «la riga
+    /// base» e' gia' falso da quando esistono le varianti `.en` (mig 0726).
+    async fn servibili_delle_figure_advisory(pool: &PgPool) -> Vec<String> {
+        let figure: Vec<String> = sqlx::query_scalar(
             "SELECT key FROM nexus_prompt_templates \
               WHERE key LIKE 'subagent.%' AND is_active \
-                AND content LIKE '%advisory_verdict%' \
-                AND content NOT LIKE '%<prove_eseguibili>%' \
-              ORDER BY key",
+                AND content LIKE '%advisory_verdict%' ORDER BY key",
         )
-        .fetch_all(&pool)
+        .fetch_all(pool)
         .await
-        .expect("censimento dei mandati advisory");
+        .expect("censimento delle figure advisory");
+        assert!(
+            !figure.is_empty(),
+            "nessuna figura advisory: il perimetro sarebbe vuoto e ogni verifica \
+             che segue passerebbe per assenza di controesempi"
+        );
+        let attese: Vec<String> = figure
+            .iter()
+            .flat_map(|k| nexus_types::chiavi_servibili(k))
+            .collect();
+        // Le sole che ESISTONO: `chiavi_servibili` dichiara cosa puo' uscire
+        // dal selettore, non cosa il DB contiene.
+        sqlx::query_scalar(
+            "SELECT key FROM nexus_prompt_templates \
+              WHERE is_active AND key = ANY($1) ORDER BY key",
+        )
+        .bind(&attese)
+        .fetch_all(pool)
+        .await
+        .expect("righe servibili esistenti")
+    }
+
+    async fn senza_blocco_prove(pool: &PgPool, chiavi: &[String]) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT key FROM nexus_prompt_templates \
+              WHERE is_active AND key = ANY($1) \
+                AND content NOT LIKE '%<prove_eseguibili>%' ORDER BY key",
+        )
+        .bind(chiavi)
+        .fetch_all(pool)
+        .await
+        .expect("censimento della copertura")
+    }
+
+    /// LA COPERTURA SI MISURA SUI SERVIBILI, E LA MIGRAZIONE LA DICHIARA
+    /// (mig 0742).
+    ///
+    /// La 0737 aveva chiesto le prove alle figure con un `UPDATE` il cui
+    /// perimetro era `content LIKE '%advisory_verdict%'`, riga per riga: un
+    /// criterio sul TESTO, non sul RUOLO. Una riga di mandato che quel
+    /// letterale non lo contiene — una traduzione `.en`, una riscrittura —
+    /// veniva saltata IN SILENZIO, e il conteggio di copertura, fatto con lo
+    /// stesso criterio, la dichiarava pure «non pertinente». La migrazione
+    /// poteva percio' affermare una copertura piena su un perimetro che si era
+    /// scelto da solo.
+    ///
+    /// Il test SEMINA quel caso: una variante servibile il cui testo NON nomina
+    /// il tool. Poi riesegue la migrazione REALE (letta dal file, non
+    /// ricopiata) e pretende che l'abbia riparata e che il suo guard passi.
+    ///
+    /// MUTAZIONE che rende rosso: nel file 0742, restringere il perimetro
+    /// dell'`UPDATE` sulle varianti a `t.content LIKE '%advisory_verdict%'`
+    /// (cioe' il criterio della 0737). La riga seminata non viene riparata, il
+    /// `DO $$` la elenca e `raw_sql` fallisce: la migrazione DICE di non avere
+    /// la copertura invece di tacere.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_copertura_delle_prove_si_misura_sui_servibili(pool: PgPool) {
+        let figura: String = sqlx::query_scalar(
+            "SELECT key FROM nexus_prompt_templates \
+              WHERE key LIKE 'subagent.%' AND is_active \
+                AND content LIKE '%advisory_verdict%' ORDER BY key LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("almeno una figura advisory");
+        let variante = nexus_types::chiave_variante(&figura);
+
+        // La variante che il criterio della 0737 non poteva vedere: e' un
+        // mandato servibile per quella figura e la sua prosa non nomina il
+        // tool. Non e' un caso di scuola — e' cio' che una traduzione produce.
+        // La variante si CLONA dalla riga base (categoria, titolo, schema li
+        // decide la figura): inventarli qui vorrebbe dire indovinare i vincoli
+        // della tabella invece di ereditarli.
+        sqlx::query(
+            "INSERT INTO nexus_prompt_templates (key, category, title, content, is_active) \
+             SELECT $1, category, title, \
+                    'You analyse the request with your own lens and issue a verdict.', true \
+               FROM nexus_prompt_templates WHERE key = $2",
+        )
+        .bind(&variante)
+        .bind(&figura)
+        .execute(&pool)
+        .await
+        .expect("seed della variante servibile");
+
+        let servibili = servibili_delle_figure_advisory(&pool).await;
+        assert!(
+            servibili.contains(&variante),
+            "la variante e' servibile per costruzione (chiavi_servibili la deriva \
+             dalla chiave della figura): {servibili:?}"
+        );
+        assert_eq!(
+            senza_blocco_prove(&pool, &servibili).await,
+            vec![variante.clone()],
+            "prima della riparazione la sola riga scoperta e' quella seminata"
+        );
+
+        // La migrazione REALE, rieseguita: e' idempotente per costruzione
+        // (`NOT LIKE '%<prove_eseguibili>%'`) e il suo `DO $$` alza eccezione
+        // se la copertura resta incompleta.
+        let mut tx = pool.begin().await.expect("transazione");
+        sqlx::raw_sql(MIG_0742)
+            .execute(&mut *tx)
+            .await
+            .expect("la 0742 ripara la variante servibile e il suo guard passa");
+        tx.commit().await.expect("commit");
+
+        assert!(
+            senza_blocco_prove(&pool, &servibili).await.is_empty(),
+            "dopo la migrazione ogni riga servibile chiede le prove"
+        );
+        let testo: String =
+            sqlx::query_scalar("SELECT content FROM nexus_prompt_templates WHERE key = $1")
+                .bind(&variante)
+                .fetch_one(&pool)
+                .await
+                .expect("rilettura della variante");
+        assert!(
+            testo.contains("output_not_contains") && testo.contains("EXECUTABLE PROOF"),
+            "la lingua la sceglie il suffisso: un blocco italiano in un prompt \
+             inglese soddisferebbe il guard e basta"
+        );
+    }
+
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_mandato_di_ogni_figura_advisory_chiede_le_prove(pool: PgPool) {
+        let servibili = servibili_delle_figure_advisory(&pool).await;
+        let scoperte = senza_blocco_prove(&pool, &servibili).await;
         assert!(
             scoperte.is_empty(),
             "queste figure advisory emettono un verdetto ma nessuno ha chiesto loro delle \
@@ -4295,6 +4433,136 @@ mod tests {
                     && res[0].evidence.get(CHIAVE_DEGENERE).is_none(),
                 "tipo dichiarato '{tipo}' non ha raggiunto il suo handler: {:?}",
                 res[0].evidence
+            );
+        }
+    }
+
+    /// UN CAMPO DICHIARATO NELLO SCHEMA NON PUO' SPARIRE IN SILENZIO.
+    ///
+    /// `normalize_advisory_verdict` e `normalize_declared_outcome` non
+    /// FILTRANO: ricostruiscono l'oggetto da zero in una mappa nuova, con un
+    /// allowlist implicito. Un campo dichiarato nello schema del tool e non
+    /// ricopiato li' dentro non viene rifiutato — sparisce, e il valore
+    /// normalizzato e' l'unico che arriva all'outcome. Nessun tipo lo impedisce
+    /// e nessun test lo vedeva, perche' i test dei consumatori partivano da un
+    /// blocco `advisory` costruito a mano, cioe' UN PASSO A VALLE della perdita
+    /// (regola O).
+    ///
+    /// MISURATO il 18/08/2026 su biblioteca-18-08: 31 prove emesse dalle figure
+    /// e `piano: PianoDiVerifica { prove: [] }` alla barriera. Lo stesso guard,
+    /// scritto per quel campo, ne ha trovato subito un secondo:
+    /// `task_complete.rendered_container`, che `static_render` legge dal
+    /// declared_outcome NORMALIZZATO — dichiarato dall'agente e mai arrivato al
+    /// criterio.
+    ///
+    /// Il campione e' DICHIARATO qui e la sua chiusura e' verificata contro lo
+    /// schema REALE: un campo nuovo nel catalogo lascia questo test ROSSO
+    /// finche' qualcuno non decide che cosa il normalizzatore ne fa. E' la sola
+    /// forma che regge, perche' il difetto non e' un valore sbagliato — e' una
+    /// decisione che nessuno ha preso.
+    ///
+    /// MUTAZIONE che rende rosso: togliere una riga dall'allowlist di uno dei
+    /// due normalizzatori (es. `inserisci_prove`, o il ramo
+    /// `rendered_container`). Il campo sparisce dal valore normalizzato e la
+    /// seconda asserzione lo elenca per nome.
+    #[test]
+    fn ogni_campo_dichiarato_negli_schemi_sopravvive_al_normalizzatore() {
+        use nexus_agent_graph::decisions::{normalize_advisory_verdict, normalize_declared_outcome};
+
+        let tools: Value = serde_json::from_str(nexus_agent_tools::tool_schema::AGENT_TOOLS_JSON)
+            .expect("catalogo parsabile");
+        let proprieta = |nome: &str| -> Vec<String> {
+            tools
+                .as_array()
+                .expect("array")
+                .iter()
+                .find(|t| t["name"] == nome)
+                .unwrap_or_else(|| panic!("{nome} nel catalogo"))["input_schema"]["properties"]
+                .as_object()
+                .expect("properties")
+                .keys()
+                .cloned()
+                .collect()
+        };
+
+        // Un campione MASSIMALE: ogni campo valorizzato con qualcosa che il suo
+        // schema ammette. I valori sono scelti per superare le validazioni che
+        // il normalizzatore applica DAVVERO (due opzioni per una decisione
+        // contesa, una URL assoluta per un endpoint): un campione che non le
+        // supera proverebbe soltanto che quelle validazioni esistono.
+        let campioni: [(&str, Value); 2] = [
+            (
+                "advisory_verdict",
+                json!({
+                    "verdict": "proceed_with_changes",
+                    "summary": "parere",
+                    "requirements": [{"text": "il contrasto deve essere >= 4.5:1"}],
+                    "risks": [{"severity": "alta", "area": "sicurezza", "description": "innerHTML"}],
+                    "recommendations": ["estrai un punto unico"],
+                    "prove": [{
+                        "descrizione": "la suite passa",
+                        "comando": "npm test",
+                        "attesa": {"tipo": "exit_code", "codice": 0}
+                    }],
+                    "contested_decision": {
+                        "topic": "come isolare i sub-run che scrivono",
+                        "options": ["worktree effimero", "lock sul file"]
+                    },
+                }),
+            ),
+            (
+                "task_complete",
+                json!({
+                    "outcome": "done",
+                    "summary": "fatto",
+                    "next_step": "niente",
+                    "blocked_by": "niente",
+                    "blocker": "dependency",
+                    "refusal": true,
+                    "docs_updated": "updated",
+                    "files_touched": ["src/main.rs"],
+                    "endpoints": [{"method": "GET", "url": "http://localhost:34184/api/libri"}],
+                    "prove": [{
+                        "descrizione": "la suite passa",
+                        "comando": "npm test",
+                        "attesa": {"tipo": "exit_code", "codice": 0}
+                    }],
+                    "rendered_container": "#courses-grid",
+                }),
+            ),
+        ];
+
+        for (tool, campione) in &campioni {
+            let dichiarati = proprieta(tool);
+            let coperti: Vec<String> = campione
+                .as_object()
+                .expect("campione oggetto")
+                .keys()
+                .cloned()
+                .collect();
+            let scoperti: Vec<&String> =
+                dichiarati.iter().filter(|k| !coperti.contains(k)).collect();
+            assert!(
+                scoperti.is_empty(),
+                "{tool}: lo schema dichiara campi che il campione non valorizza {scoperti:?}. \
+                 Aggiungili al campione E decidi che cosa il normalizzatore ne fa: finche' \
+                 nessuno decide, quel campo sparisce in silenzio"
+            );
+
+            let normalizzato = match *tool {
+                "advisory_verdict" => normalize_advisory_verdict(campione),
+                _ => normalize_declared_outcome(campione),
+            }
+            .expect("campione valido per il normalizzatore");
+            let persi: Vec<&String> = dichiarati
+                .iter()
+                .filter(|k| normalizzato.get(k.as_str()).is_none())
+                .collect();
+            assert!(
+                persi.is_empty(),
+                "{tool}: questi campi sono dichiarati nello schema del tool e il \
+                 normalizzatore li BUTTA VIA {persi:?}. Il modello li manda, nessun \
+                 consumatore li vedra' mai, e niente fallisce"
             );
         }
     }

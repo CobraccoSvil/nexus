@@ -1622,9 +1622,17 @@ async fn scegli_porta_bucket(
         // lo REGISTRA. Si passa dal punto unico che alloca E registra, come per
         // il caso senza porta esplicita.
     }
-    super::allocate_port::find_or_allocate(&state.db, &state.port_registry, *project_id, short)
-        .await
-        .map(|a| a.port)
+    // Installazione di un servizio managed: la porta la ancorera' la unit che
+    // stiamo per scrivere, non un run (qui un run non c'e' proprio).
+    super::allocate_port::find_or_allocate(
+        &state.db,
+        &state.port_registry,
+        *project_id,
+        short,
+        super::allocate_port::RichiedenteAllocazione::FuoriDaUnRun,
+    )
+    .await
+    .map(|a| a.port)
 }
 
 /// Helper di `install_service_systemd`: se il servizio vuole una porta, la sceglie

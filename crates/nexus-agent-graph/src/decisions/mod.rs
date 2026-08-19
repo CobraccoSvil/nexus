@@ -307,7 +307,8 @@ pub use suspension_watch::{
 pub use text_repetition::{detect_repetition_collapse, RepetitionHit, RepetitionThresholds};
 pub use tool_dispatch::{
     append_reminder_block, apply_run_notes, current_context_token_estimate, estimate_context_chars,
-    estimate_tool_result_size_bytes, extract_returned_bytes, normalize_declared_outcome,
+    estimate_tool_result_size_bytes, extract_returned_bytes, normalize_advisory_verdict,
+    normalize_declared_outcome,
     ContextMessage, MAX_CONTEXT_CHARS, MAX_TOOL_RESULT_CHARS, RUN_NOTES_MAX_CHARS,
     TOKEN_CHARS_DIVISOR, VALID_OUTCOMES,
 };
