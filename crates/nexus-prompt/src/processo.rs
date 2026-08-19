@@ -37,16 +37,36 @@
 use nexus_types::figure_advisory;
 use sqlx::PgPool;
 
+use crate::composizione::{ChiaveBlocco, Composizione};
+
 /// Tag di apertura del blocco: la FORMA vive solo qui (guard
 /// `processo-operativo` in check-single-source.sh). Il testo vero e' nel DB.
 pub const TAG_APERTURA: &str = "<processo_implementazione>";
 
-/// Tag di chiusura: e' QUESTO che decide l'idempotenza. Una MENZIONE del
-/// blocco in un template cita l'apertura, mai la coppia completa — decidere
-/// sull'apertura renderebbe una menzione indistinguibile dal blocco vero e il
-/// blocco non entrerebbe (trappola trovata dalla review avversaria del 04/08:
-/// il rimando inciso in agent.coder.base conteneva il tag letterale).
+/// Tag di chiusura. Resta esposto per i test di posizione dei compositori;
+/// l'IDENTITA' del blocco e' [`NOME_BLOCCO`], e le due forme ne discendono
+/// (`i_due_tag_discendono_dalla_chiave` lo verifica: un rename che ne toccasse
+/// una sola le farebbe divergere in silenzio).
 pub const TAG_CHIUSURA: &str = "</processo_implementazione>";
+
+/// L'identita' del blocco. Su di essa si decide l'idempotenza, e si decide
+/// STRUTTURALMENTE: una MENZIONE del blocco in un template cita l'apertura, mai
+/// la coppia completa (trappola trovata dalla review avversaria del 04/08: il
+/// rimando inciso in agent.coder.base conteneva il tag letterale), e una
+/// scomposizione non conta una menzione per costruzione.
+const NOME_BLOCCO: &str = "processo_implementazione";
+
+/// La chiave, o `None` se `NOME_BLOCCO` non e' un nome di tag ammissibile —
+/// caso che il test di forma esclude, e che qui non degrada a un `expect`
+/// (regola F: fuori dai test non si va in panico su una costante).
+fn chiave() -> Option<ChiaveBlocco> {
+    ChiaveBlocco::nuova(NOME_BLOCCO)
+}
+
+/// Il processo e' gia' in questo system prompt?
+fn gia_presente(system: &str) -> bool {
+    chiave().is_some_and(|k| Composizione::scomponi(system).ha(&k))
+}
 
 /// Chiave del template (regola G: il testo vive nel DB, qui solo il nome).
 const CHIAVE_TEMPLATE: &str = "system.implementation_process";
@@ -85,7 +105,7 @@ pub async fn section(db: &PgPool) -> Option<String> {
 /// system gia' dotato del blocco resta invariato, mai due processi nello
 /// stesso prompt.
 pub async fn con_processo(db: &PgPool, system: String) -> String {
-    if system.contains(TAG_CHIUSURA) {
+    if gia_presente(&system) {
         return system;
     }
     match section(db).await {
@@ -154,6 +174,27 @@ mod tests {
         assert!(finale.contains("task_complete"), "{finale}");
         // Il system di partenza resta intatto: si aggiunge, non si riscrive.
         assert!(finale.contains(SYSTEM_DI_FIGURA), "{finale}");
+    }
+
+    /// Le due FORME discendono dall'identita': un rename che ne toccasse una
+    /// sola le farebbe divergere, e l'idempotenza guarderebbe un tag che il
+    /// blocco non porta.
+    #[test]
+    fn i_due_tag_discendono_dalla_chiave() {
+        let k = chiave().expect("NOME_BLOCCO deve essere un nome di tag");
+        assert_eq!(k.apertura(), TAG_APERTURA);
+        assert_eq!(k.chiusura(), TAG_CHIUSURA);
+    }
+
+    /// L'idempotenza e' STRUTTURALE: una chiusura orfana in prosa non fa
+    /// credere presente un processo che non c'e'.
+    ///
+    /// MUTAZIONE: tornare a `system.contains(TAG_CHIUSURA)` fa credere il
+    /// blocco gia' presente e il processo non entra piu' in quel prompt.
+    #[test]
+    fn una_chiusura_orfana_non_vale_come_processo() {
+        assert!(!gia_presente("prosa che nomina </processo_implementazione> e basta"));
+        assert!(gia_presente("<processo_implementazione>x</processo_implementazione>"));
     }
 
     /// Due passaggi dal compositore = un blocco solo (il caso resend).

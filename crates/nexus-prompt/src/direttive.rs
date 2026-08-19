@@ -54,6 +54,8 @@
 
 use sqlx::PgPool;
 
+use crate::composizione::{ChiaveBlocco, Composizione, Segmento};
+
 /// Valori canonici della colonna `scope` (regola N: l'identificatore vive in un
 /// posto solo, e il DB e' la fonte).
 const SCOPE_AGENT: &str = "agent";
@@ -125,47 +127,67 @@ pub struct DirettivaCondivisa {
 
 impl DirettivaCondivisa {
     /// Il marcatore su cui decidere l'idempotenza: il tag di CHIUSURA se il
-    /// contenuto e' un blocco XML, altrimenti il testo intero.
-    ///
-    /// Sull'APERTURA non si decide: un template che MENZIONA `<safety_progetto>`
-    /// in prosa renderebbe la direttiva vera indistinguibile da una citazione, e
-    /// il blocco non entrerebbe (trappola trovata dalla review avversaria del
-    /// 04/08 sul blocco del processo operativo).
-    pub fn marcatore(&self) -> &str {
-        marcatore_di(&self.content)
+    /// contenuto e' un blocco, altrimenti il testo intero. Per la diagnostica e
+    /// per i test; la DOMANDA la pone [`Self::gia_presente`].
+    pub fn marcatore(&self) -> String {
+        match riconoscimento_di(&self.content) {
+            Riconoscimento::Blocco(k) => k.chiusura(),
+            Riconoscimento::Testo => self.content.clone(),
+        }
     }
 
     /// La direttiva e' gia' in questo prompt?
+    ///
+    /// Dove il contenuto E' un blocco la domanda si pone alla STRUTTURA
+    /// ([`Composizione::ha`]): uguaglianza su un nome di tag, mai una
+    /// sottostringa. Il criterio precedente era `system.contains("</tag>")`, e
+    /// contava come presente anche un tag di chiusura ORFANO — che nel corpus
+    /// reale non esiste (misurato: il ponte Rust/SQL non trova divergenze su 174
+    /// righe attive), quindi il comportamento non cambia e la classe di errore
+    /// sparisce.
     pub fn gia_presente(&self, system: &str) -> bool {
-        system.contains(self.marcatore())
+        match riconoscimento_di(&self.content) {
+            Riconoscimento::Blocco(k) => Composizione::scomponi(system).ha(&k),
+            Riconoscimento::Testo => system.contains(&self.content),
+        }
     }
 }
 
-/// Il tag di chiusura di un contenuto che apre con `<tag>`, altrimenti il
-/// contenuto stesso. Funzione libera perche' la usa anche il test di forma.
-fn marcatore_di(content: &str) -> &str {
-    let t = content.trim_start();
-    if !t.starts_with('<') {
-        return content;
+/// Come si riconosce che questa direttiva e' gia' in un prompt.
+///
+/// Le due varianti non sono un'ottimizzazione: `nexus_shared_directives` e' una
+/// tabella che l'admin riempie, e nulla obbliga il contenuto di una riga a
+/// essere un blocco. L'ignoto non degrada a «blocco senza nome» (regola Q): dove
+/// non c'e' una chiave si torna al testo esatto, che e' l'unica identita' che
+/// quel contenuto possiede.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Riconoscimento {
+    /// Il contenuto E' un blocco: si decide sulla sua CHIAVE.
+    Blocco(ChiaveBlocco),
+    /// Prosa, o piu' blocchi: si decide sul testo esatto.
+    Testo,
+}
+
+/// UN blocco solo, eventualmente circondato da spazi: e' cio' che rende il
+/// contenuto identificabile da una chiave.
+///
+/// Sull'APERTURA non si decide mai: un template che MENZIONA `<safety_progetto>`
+/// in prosa renderebbe la direttiva vera indistinguibile da una citazione, e il
+/// blocco non entrerebbe (trappola trovata dalla review avversaria del 04/08 sul
+/// blocco del processo operativo). La scomposizione la fa il punto unico, che
+/// una menzione non la conta gia' per costruzione.
+fn riconoscimento_di(content: &str) -> Riconoscimento {
+    let mut trovata: Option<ChiaveBlocco> = None;
+    for segmento in Composizione::scomponi(content).segmenti() {
+        match segmento {
+            Segmento::Interstizio(t) if t.trim().is_empty() => {}
+            Segmento::Blocco { chiave, .. } if trovata.is_none() => {
+                trovata = Some(chiave.clone());
+            }
+            _ => return Riconoscimento::Testo,
+        }
     }
-    let Some(fine_apertura) = t.find('>') else {
-        return content;
-    };
-    let nome = &t[1..fine_apertura];
-    if nome.is_empty() || !nome.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return content;
-    }
-    // Il tag di chiusura c'e' davvero? Se no, non e' un blocco: resta il testo.
-    let chiusura_inizio = match t.rfind("</") {
-        Some(i) => i,
-        None => return content,
-    };
-    let chiusura = &t[chiusura_inizio..];
-    if chiusura.trim_end() == format!("</{nome}>") {
-        &chiusura[..chiusura.trim_end().len()]
-    } else {
-        content
-    }
+    trovata.map_or(Riconoscimento::Testo, Riconoscimento::Blocco)
 }
 
 /// Perche' nessuna direttiva entra. Tre cause con tre rimedi diversi: il
@@ -387,7 +409,7 @@ mod tests {
         let solo_prima = format!("{SYSTEM}\n\n{}", righe[0].content);
         let blocco = d.blocco_mancante(&solo_prima).expect("le altre due mancano");
         assert!(!blocco.contains(&righe[0].content), "la prima e' stata riappesa");
-        assert!(blocco.contains(righe[1].marcatore()), "{blocco}");
+        assert!(blocco.contains(&righe[1].marcatore()), "{blocco}");
     }
 
     /// Tutte disattivate dall'admin = registro vuoto DICHIARATO, system
@@ -449,6 +471,10 @@ mod tests {
         assert!(finale.contains("</safety_progetto>"), "{finale}");
     }
 
+    fn marcatore_di(content: &str) -> String {
+        DirettivaCondivisa { key: "k".into(), content: content.into(), priority: 0 }.marcatore()
+    }
+
     #[test]
     fn il_marcatore_e_il_tag_di_chiusura_o_il_testo() {
         assert_eq!(marcatore_di("<a>corpo</a>"), "</a>");
@@ -458,8 +484,29 @@ mod tests {
         // Apertura senza chiusura corrispondente: non e' un blocco.
         assert_eq!(marcatore_di("<a>corpo</b>"), "<a>corpo</b>");
         assert_eq!(marcatore_di("<a>corpo"), "<a>corpo");
-        // Un tag con attributi non e' il nostro caso: resta il testo.
-        assert_eq!(marcatore_di("<a b=\"c\">x</a>"), "<a b=\"c\">x</a>");
+        // DUE blocchi non hanno UNA chiave: si torna al testo.
+        assert_eq!(marcatore_di("<a>x</a><b>y</b>"), "<a>x</a><b>y</b>");
+        // Un'apertura con ATTRIBUTI E' un blocco (il parser scritto a mano che
+        // viveva qui la rifiutava, in disaccordo col criterio della 0744: tre
+        // template attivi aprono cosi').
+        assert_eq!(marcatore_di("<a b=\"c\">x</a>"), "</a>");
+    }
+
+    /// Il criterio e' STRUTTURALE, non una sottostringa: un tag di chiusura
+    /// orfano non fa credere presente una direttiva che non c'e'.
+    ///
+    /// MUTAZIONE: tornare a `system.contains(marcatore)` fa passare la prima
+    /// asserzione e il blocco non entrerebbe piu' in un prompt che, in prosa,
+    /// nomini la chiusura.
+    #[test]
+    fn una_chiusura_orfana_non_vale_come_direttiva() {
+        let d = DirettivaCondivisa {
+            key: "iso".into(),
+            content: "<safety_progetto>x</safety_progetto>".into(),
+            priority: 0,
+        };
+        assert!(!d.gia_presente("prosa che cita </safety_progetto> e basta"));
+        assert!(d.gia_presente("testa\n<safety_progetto>x</safety_progetto>\ncoda"));
     }
 
     #[test]

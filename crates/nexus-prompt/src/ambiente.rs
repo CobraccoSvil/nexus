@@ -55,11 +55,40 @@
 use nexus_agent_tools::ambiente::{self, Disponibilita};
 use sqlx::PgPool;
 
-/// Tag del blocco che AFFERMA la capacita' di installare pacchetti con
-/// privilegi (`system.nexus_base`). E' il testo che su un host senza quel
-/// gestore manda l'agente contro un muro.
-const TAG_PRIVILEGI_APERTURA: &str = "<privilegi_sistema>";
-const TAG_PRIVILEGI_CHIUSURA: &str = "</privilegi_sistema>";
+use crate::composizione::{ChiaveBlocco, Composizione, EsitoRimozione};
+
+/// Il blocco che AFFERMA la capacita' di installare pacchetti con privilegi
+/// (`system.nexus_base`): e' il testo che, su un host senza quel gestore, manda
+/// l'agente contro un muro.
+///
+/// Qui vive la sola IDENTITA' — e' l'unica cosa che questo modulo dichiara di
+/// lui. Le due FORME (`<privilegi_sistema>`, `</privilegi_sistema>`)
+/// non sono piu' costanti qui: le compone [`ChiaveBlocco`], che e' anche il
+/// punto in cui la scomposizione le cerca. Due letterali accanto a una chiave
+/// sono due autorita' sullo stesso tag, e la prima volta che divergessero il
+/// taglio cercherebbe un blocco che il prompt non porta.
+const NOME_PRIVILEGI: &str = "privilegi_sistema";
+
+/// Il system senza la direttiva sui privilegi, e l'esito del taglio.
+///
+/// La rimozione passa dal punto unico [`crate::composizione`] e non da una
+/// ricerca di delimitatori: la stessa nozione di «blocco» che decide se un
+/// blocco C'E' decide anche come si TOGLIE, o le due divergerebbero al primo
+/// tag con un attributo (misurato: tre template attivi ne hanno).
+///
+/// L'esito e' un valore e non un silenzio (regola Q). Il chiamante di oggi non
+/// puo' farne una diagnosi — `<privilegi_sistema>` sta in 3 template su 174,
+/// quindi «non c'era» e' il caso NORMALE per la maggior parte dei prompt e un
+/// WARN qui sarebbe rumore — ma la distinzione esiste nel tipo invece che
+/// scomparire nella stringa di ritorno.
+fn senza_direttiva_privilegi(system: &str) -> (String, EsitoRimozione) {
+    let Some(chiave) = ChiaveBlocco::nuova(NOME_PRIVILEGI) else {
+        return (system.to_string(), EsitoRimozione::NonPresente);
+    };
+    let mut composizione = Composizione::scomponi(system);
+    let esito = composizione.senza(&chiave);
+    (composizione.rendi(), esito)
+}
 
 /// Rende un system prompt COERENTE con l'host su cui girera'.
 ///
@@ -74,11 +103,7 @@ pub async fn con_ambiente(db: &PgPool, system: String) -> String {
     // sarebbe decidere su un'ignoranza.
     let mut testo = match ambiente::gestore_privilegiato(db).await {
         Some(nome) if ambiente.stato_di(&nome) == Disponibilita::Assente => {
-            crate::blocchi::strip_block_between(
-                &system,
-                TAG_PRIVILEGI_APERTURA,
-                TAG_PRIVILEGI_CHIUSURA,
-            )
+            senza_direttiva_privilegi(&system).0
         }
         _ => system,
     };
@@ -125,11 +150,61 @@ Puoi installare dipendenze di SISTEMA con run_command:
     /// test lo esercita per la strada della produzione (regola O): quello che
     /// verifica e' il comportamento REALE su un testo nella forma del template.
     fn strip(system: &str) -> String {
-        crate::blocchi::strip_block_between(
-            system,
-            TAG_PRIVILEGI_APERTURA,
-            TAG_PRIVILEGI_CHIUSURA,
+        senza_direttiva_privilegi(system).0
+    }
+
+    /// La chiave corrisponde al blocco che i template REALI portano davvero.
+    ///
+    /// Non un letterale accanto a un altro letterale (che proverebbe solo che so
+    /// ricopiare): il confronto e' col corpus del DB migrato, dove
+    /// `<privilegi_sistema>` esiste perche' ce l'ha messo una migrazione. Se il
+    /// tag cambiasse li' e non qui, il taglio smetterebbe di trovare la
+    /// direttiva su apt e nessun'altra prova lo direbbe (regola O).
+    ///
+    /// MUTAZIONE: cambiare `NOME_PRIVILEGI` in `privilegi_di_sistema` fa cadere
+    /// l'asserzione col nome del template che porta il blocco vero.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_chiave_e_quella_dei_template_reali(pool: PgPool) {
+        let chiave = ChiaveBlocco::nuova(NOME_PRIVILEGI).expect("nome di tag valido");
+        let portanti: Vec<String> = sqlx::query_scalar::<_, String>(
+            "SELECT key FROM nexus_prompt_templates WHERE is_active ORDER BY key",
         )
+        .fetch_all(&pool)
+        .await
+        .expect("lettura template");
+        let mut con_blocco = Vec::new();
+        for key in portanti {
+            let c: String = sqlx::query_scalar(
+                "SELECT content FROM nexus_prompt_templates WHERE key = $1",
+            )
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .expect("contenuto");
+            if Composizione::scomponi(&c).ha(&chiave) {
+                con_blocco.push(key);
+            }
+        }
+        assert!(
+            !con_blocco.is_empty(),
+            "nessun template attivo porta <{NOME_PRIVILEGI}>: la chiave non corrisponde al corpus"
+        );
+    }
+
+    /// «Non c'era» e' un ESITO, non un silenzio: era la meta' che mancava a
+    /// `strip_block_between`, dove un delimitatore rinominato lasciava in
+    /// piedi la direttiva su apt senza che nessuno lo dicesse.
+    #[test]
+    fn il_taglio_dichiara_di_non_aver_tolto_nulla() {
+        let (testo, esito) = senza_direttiva_privilegi("<role>r</role>");
+        assert_eq!(esito, EsitoRimozione::NonPresente);
+        assert_eq!(testo, "<role>r</role>");
+
+        let (testo, esito) = senza_direttiva_privilegi(SYSTEM_CON_PRIVILEGI);
+        assert_eq!(esito, EsitoRimozione::Rimosso { occorrenze: 1 });
+        assert!(!testo.contains("sudo apt-get install"), "{testo}");
+        assert!(testo.contains("<role>Sei Nexus.</role>"), "{testo}");
+        assert!(testo.contains("<final_summary>"), "{testo}");
     }
 
     /// IL difetto: su un host senza apt, il system prompt non deve piu' dire di
