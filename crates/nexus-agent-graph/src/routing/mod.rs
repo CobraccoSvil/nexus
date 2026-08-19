@@ -194,7 +194,16 @@ pub fn route_after_executor(state: &AgentState, cfg: &RoutingConfig) -> NodeTarg
         //
         // Un run gia' verificato (verdetto presente, qualunque esso sia) non
         // ripete la verifica: la sua ha gia' avuto luogo ed e' registrata.
-        if state.final_gate_verdict.is_none() && signals::final_gate_eligible(state, cfg) {
+        //
+        // SECONDA porta ammessa: il gate ha PROMESSO una rimisura (turno di
+        // grazia) e questa non e' ancora avvenuta. Li' il verdetto in stato c'e'
+        // ma non e' un esito, e la condizione "mai entrato" — corretta per non
+        // ciclare — negava proprio la verifica che il gate si era impegnato a
+        // rifare. Non ripete la verifica piu' di una volta: al rientro il gate
+        // scrive un verdetto terminale e il segnale si spegne.
+        if (state.final_gate_verdict.is_none() || signals::final_gate_attende_rimisura(state))
+            && signals::final_gate_eligible(state, cfg)
+        {
             return NodeTarget::FinalGate;
         }
         return NodeTarget::Learner;
@@ -583,6 +592,10 @@ mod tests {
             crate::state::FinalGateVerdict::FailedPendingCorrection,
             crate::state::FinalGateVerdict::Passed,
             crate::state::FinalGateVerdict::EscalationHandoff,
+            // La rimisura si apre sulla PROMESSA, non sul verdetto da solo:
+            // senza `final_gate_grace_granted` questo verdetto non e' una
+            // promessa di nessuno e la porta resta chiusa come per gli altri.
+            crate::state::FinalGateVerdict::PassedPendingSignature,
         ] {
             s.final_gate_verdict = Some(verdetto);
             assert_eq!(
@@ -591,6 +604,18 @@ mod tests {
                 "verdetto {verdetto:?}: la verifica al cap non si ripete"
             );
         }
+
+        // E la promessa apre la porta UNA volta: concessa la grazia, la rimisura
+        // avviene; qualunque verdetto terminale la richiuda, non si ripete.
+        s.final_gate_grace_granted = Some(true);
+        s.final_gate_verdict = Some(crate::state::FinalGateVerdict::PassedPendingSignature);
+        assert_eq!(route_after_executor(&s, &cfg), NodeTarget::FinalGate);
+        s.final_gate_verdict = Some(crate::state::FinalGateVerdict::FailedFinal);
+        assert_eq!(
+            route_after_executor(&s, &cfg),
+            NodeTarget::Learner,
+            "rimisura avvenuta: la porta si richiude"
+        );
     }
 
     /// Il cap viene dalla CONFIG, non da una costante: con `iteration_cap = 100`

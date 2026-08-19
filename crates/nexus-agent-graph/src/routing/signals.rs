@@ -1629,6 +1629,31 @@ pub fn final_gate_eligible(state: &AgentState, cfg: &RoutingConfig) -> bool {
     cycle < cfg.final_gate_max_cycles
 }
 
+/// True finche' il final gate ha PROMESSO una rimisura e questa non e' ancora
+/// avvenuta: il turno di grazia e' stato concesso
+/// ([`AgentState::final_gate_grace_granted`]) e il verdetto in stato e' ancora
+/// quello NON terminale che quel ramo emette.
+///
+/// Serve perche' la grazia RESTITUISCE il turno dopo aver misurato: da quel
+/// momento l'agente puo' cambiare il codice, quindi l'ultima parola spetta al
+/// rientro nel gate. Senza questo segnale il rientro non avveniva per DUE
+/// strade indipendenti, e nel run misurato il 19/08/2026 fu la seconda a
+/// chiudere il caso: al cap delle iterazioni `route_after_executor` pretende
+/// «il gate non e' mai entrato» (`final_gate_verdict == None`), marcatore giusto
+/// per non ciclare ma che qui vieta proprio la verifica promessa.
+///
+/// Non puo' ciclare: ogni ramo del gate scrive un verdetto, e ogni verdetto
+/// diverso da [`FinalGateVerdict::PassedPendingSignature`] spegne questo
+/// segnale; i due soli rami che non lo scrivono (gate disabilitato, chiusura
+/// dichiarativa della figura) non rimandano all'executor.
+pub fn final_gate_attende_rimisura(state: &AgentState) -> bool {
+    state.final_gate_grace_granted.unwrap_or(false)
+        && matches!(
+            state.final_gate_verdict,
+            Some(crate::state::FinalGateVerdict::PassedPendingSignature)
+        )
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 //  Isolamento todo (todo_isolation_active, orchestrator_config.py)
 // ──────────────────────────────────────────────────────────────────────────

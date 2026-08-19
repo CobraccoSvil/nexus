@@ -45,15 +45,45 @@ pub enum FinalGateVerdict {
     /// verifica mancava, `final_gate_unverified` lo dice a parte: qui il gate
     /// ha comunque emesso un verdetto positivo su cio' che ha potuto misurare.)
     Passed,
-    /// Criteri OGGETTIVI tutti superati; manca SOLO la dichiarazione
-    /// strutturata di chiusura (`task_complete`). Il gate ha concesso il turno
-    /// di grazia per la firma. **Non e' un fallimento**: il lavoro e'
-    /// verificato. Lascia `final_gate_cycle = max_cycles` per non ri-entrare,
-    /// e quel residuo era la causa del falso `FailedDiagnosed`.
+    /// Criteri OGGETTIVI tutti superati e manca SOLO la dichiarazione
+    /// strutturata di chiusura (`task_complete`), constatato mentre il gate
+    /// CHIUDE: il turno non e' restituito a nessuno, quindi l'albero misurato
+    /// e' quello finale e l'affermazione resta vera. **Non e' un fallimento**:
+    /// il lavoro e' verificato, l'esito lo portano `final_gate_passed=true` e
+    /// `final_gate_unverified`.
+    ///
+    /// Fino al 19/08/2026 questa variante veniva emessa anche dal TURNO DI
+    /// GRAZIA, che il turno lo restituisce: era un'affermazione al presente su
+    /// un albero che l'agente poteva ancora cambiare — e che ha cambiato. Vedi
+    /// [`FinalGateVerdict::PassedPendingSignature`].
     ObjectivePassedSignatureMissing,
+    /// Criteri OGGETTIVI superati SULL'ALBERO MISURATO; manca la sola firma, e
+    /// il gate ha RESTITUITO il turno perche' l'agente la apponga (turno di
+    /// grazia). **Non e' un esito**: da questo istante il codice puo' ancora
+    /// cambiare, quindi la parola definitiva spetta alla RIMISURA.
+    ///
+    /// Perche' e' una variante distinta e non la precedente (regola Q): la
+    /// precedente AFFERMA che i criteri oggettivi sono superati, e chi la legge
+    /// ne trae un esito. Misurato il 19/08/2026 sul progetto
+    /// `t3-codice-eseguibile`: il gate concede la grazia alle 21:27:29 su un
+    /// `somma.test.js` che in quell'istante si caricava davvero (l'agente vi
+    /// aveva messo un polyfill di `describe`/`it` alle 21:27:21), l'agente
+    /// toglie il polyfill nelle SETTE scritture successive, e il run chiude
+    /// `completed` alle 21:30:07 con il test che esce 1 e `describe is not
+    /// defined`. Il predicato non aveva sbagliato e nessun criterio era
+    /// mancato: il verdetto era vero quando fu emesso e falso 39 secondi dopo.
+    ///
+    /// Se il run muore PRIMA della rimisura, l'unica lettura onesta e' «svolto
+    /// ma non verificato» (`final_gate_unverified=true` ->
+    /// `CompletedUnverified`): affermare un fallimento che nessuno ha misurato
+    /// sarebbe l'errore speculare.
+    PassedPendingSignature,
     /// Criteri oggettivi falliti al cap: il turno e' ceduto all'executor
     /// perche' promuova un modello piu' capace. Il run PROSEGUE: non e' ancora
-    /// un esito.
+    /// un esito — ma l'ultimo fatto MISURATO e' un fallimento, quindi se il run
+    /// muore prima della ri-verifica vale quello (stessa lettura di
+    /// [`FinalGateVerdict::FailedPendingCorrection`], che infatti condivide il
+    /// ramo del finalizzatore).
     EscalationHandoff,
     /// Chiusura al cap / forced_close con criteri NON superati: bocciatura
     /// esplicita e DEFINITIVA (nessuna ri-verifica era prevista).
@@ -694,6 +724,20 @@ pub struct AgentState {
     /// "completato" muto quando la verifica non e' stata proprio eseguita. `None`
     /// = gate non entrato o verifica eseguita.
     pub final_gate_unverified: Option<bool>,
+    /// `true` quando il TURNO DI GRAZIA del final gate e' gia' stato concesso in
+    /// questo run. MONOTONO: nessun ramo lo riporta a `false`.
+    ///
+    /// Campo DEDICATO e non un secondo significato di `final_gate_cycle` (regola
+    /// Q): quel contatore porta gia' «tentativi consumati» e, tramite
+    /// `final_gate_eligible`, «porta d'ingresso al gate» — la grazia ha bisogno
+    /// di lasciare la porta APERTA per la rimisura e insieme di vietarsi una
+    /// seconda volta, che sullo stesso numero sono richieste opposte.
+    ///
+    /// Lo leggono due punti: il gate (una grazia sola) e
+    /// [`crate::routing::signals::final_gate_attende_rimisura`] (la rimisura
+    /// promessa deve poter avvenire anche al cap delle iterazioni).
+    #[serde(default)]
+    pub final_gate_grace_granted: Option<bool>,
     /// Ultimo risultato del verifier.
     pub verifier_last_result: Option<Value>,
     /// Contatore revisioni strutturali del plan.
