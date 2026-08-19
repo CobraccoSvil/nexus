@@ -1,6 +1,26 @@
--- Migrazione 0743: le direttive condivise tornano ai modelli, e i blocchi
--- cancellati da una riscrittura integrale del blob tornano ai tre prompt che
--- li hanno persi.
+-- Migrazione 0743: le direttive condivise tornano ai modelli.
+--
+-- MISURATO sul META vivo il 19/08/2026: nexus_shared_directives ha 3 righe
+-- attive (project_isolation 2883 char, anti_narration, config_restart) e i
+-- suoi UNICI lettori sono il CRUD admin e una pagina UI. Nessun compositore
+-- di prompt la legge: l'iniettore viveva in brain/prompt_registry.py e il
+-- porting zero-Python (75a6d621, 27/06) lo ha cancellato con tutto il brain.
+-- La tabella e' sopravvissuta all'unico codice che la usava, e da 53 giorni
+-- nessun modello riceve le regole di isolamento progetto.
+--
+-- La 0135 aveva fatto la meta' giusta del lavoro (una sola casa per la
+-- direttiva, regola L) e lasciato scoperta l'altra: nessuno ha verificato che
+-- il canale nuovo arrivasse (regola O).
+--
+-- COSA NON FA QUESTA MIGRAZIONE, e perche'.
+-- La prima stesura ripristinava anche 12 blocchi che la mig 0437 aveva
+-- cancellato da agent.coder.base / tester.base / general.debugger riscrivendo
+-- il blob per intero. La review lo ha respinto con una misura che regge:
+-- ZERO delle 21 figure in nexus_subagent_definitions usa un prompt `agent.*`
+-- (usano tutte `subagent.*`), quindi quei blocchi sarebbero tornati su righe
+-- che quasi nessuno compone, duplicando 3891 caratteri sull'unico `agent.*`
+-- ancora raggiungibile. Il difetto della riscrittura integrale resta reale ed
+-- e' chiuso dalla 0744, che lo rende impossibile da ripetere in silenzio.
 --
 -- ============================================================================
 -- PARTE A — perimetro di `nexus_shared_directives`
@@ -112,190 +132,5 @@ UPDATE nexus_shared_directives
  WHERE key = 'project_isolation'
    AND scope = 'agent';
 
--- ─── B. Blocchi ripristinati dal donatore system.nexus_base ─────────────────
-
-DO $ripristino$
-DECLARE
-    -- (bersaglio, tag) — la mappa e' quella delle migrazioni originali:
-    --   0137 operatore_nexus      -> coder, tester, debugger (+ reviewer, che ce l'ha)
-    --   0191/0396/0434 port_allocation, 0192 attachment_access,
-    --   0193 attachment_investigation, 0225 knowledge_graph_tools,
-    --   0278 database_provisioning, 0329 next_actions, 0363 final_summary
-    --                              -> coder
-    --   0313 file_picking_policy  -> coder, debugger
-    mappa    TEXT[][] := ARRAY[
-        ['agent.coder.base',       'operatore_nexus'],
-        ['agent.coder.base',       'port_allocation'],
-        ['agent.coder.base',       'attachment_access'],
-        ['agent.coder.base',       'attachment_investigation'],
-        ['agent.coder.base',       'knowledge_graph_tools'],
-        ['agent.coder.base',       'database_provisioning'],
-        ['agent.coder.base',       'file_picking_policy'],
-        ['agent.coder.base',       'next_actions'],
-        ['agent.coder.base',       'final_summary'],
-        ['agent.general.debugger', 'operatore_nexus'],
-        ['agent.general.debugger', 'file_picking_policy'],
-        ['agent.tester.base',      'operatore_nexus']
-    ];
-    donatore  TEXT;
-    bersaglio TEXT;
-    tag       TEXT;
-    apertura  TEXT;
-    chiusura  TEXT;
-    fine      INT;
-    inizio    INT;
-    blocco    TEXT;
-    i         INT;
-    aggiunti  INT := 0;
-BEGIN
-    SELECT content INTO donatore
-      FROM nexus_prompt_templates
-     WHERE key = 'system.nexus_base' AND is_active = TRUE;
-    IF donatore IS NULL THEN
-        RAISE EXCEPTION 'mig 0743: system.nexus_base assente o disattivo: nessun donatore da cui estrarre i blocchi';
-    END IF;
-
-    FOR i IN 1 .. array_length(mappa, 1) LOOP
-        bersaglio := mappa[i][1];
-        tag       := mappa[i][2];
-        apertura  := '<'  || tag || '>';
-        chiusura  := '</' || tag || '>';
-
-        -- Il bersaglio ce l'ha gia': niente da fare (idempotenza sul tag di
-        -- CHIUSURA, mai sull'apertura: una menzione in prosa cita l'apertura).
-        CONTINUE WHEN EXISTS (
-            SELECT 1 FROM nexus_prompt_templates
-             WHERE key = bersaglio AND is_active = TRUE AND content LIKE '%' || chiusura || '%'
-        );
-
-        fine := strpos(donatore, chiusura);
-        IF fine = 0 THEN
-            RAISE EXCEPTION 'mig 0743: il donatore system.nexus_base non porta %; la mappa e i dati non concordano', chiusura;
-        END IF;
-        fine := fine + length(chiusura) - 1;
-        -- ULTIMA apertura prima della chiusura (vedi il commento in testa).
-        inizio := length(left(donatore, fine))
-                  - strpos(reverse(left(donatore, fine)), reverse(apertura))
-                  - length(apertura) + 2;
-        blocco := substring(donatore from inizio for fine - inizio + 1);
-        IF left(blocco, length(apertura)) <> apertura THEN
-            RAISE EXCEPTION 'mig 0743: estrazione di % dal donatore non allineata al tag di apertura', tag;
-        END IF;
-
-        UPDATE nexus_prompt_templates
-           SET content    = content || E'\n\n' || blocco,
-               version    = version + 1,
-               updated_at = NOW(),
-               updated_by = 'migration_0743'
-         WHERE key = bersaglio AND is_active = TRUE;
-        aggiunti := aggiunti + 1;
-        RAISE NOTICE 'mig 0743: % <- % (% caratteri)', bersaglio, tag, length(blocco);
-    END LOOP;
-
-    RAISE NOTICE 'mig 0743: % blocchi ripristinati dal donatore', aggiunti;
-END
-$ripristino$;
-
--- ─── C. <database_management> (0167): nessun donatore ───────────────────────
--- La 0167 aveva per unico bersaglio agent.coder.base, quindi nessun altro
--- template ne conserva una copia. E' il solo blocco il cui testo va riportato
--- qui: e' copiato byte per byte dalla 0167, che ne resta la fonte. Non e'
--- superato dalla 0278 (<database_provisioning>, ripristinato sopra): quella
--- governa il provisioning INTERNO gestito da Nexus, questa la registrazione nel
--- pannello di un DB che l'agente ha creato per conto proprio (docker-compose,
--- container singolo). Il tool project_db_set_connection che prescrive esiste
--- tuttora (crates/mcp-core/src/nexus_tool_catalog/database.rs).
-
-UPDATE nexus_prompt_templates
-   SET content = content || '
-
-<database_management>
-GESTIONE DATABASE PROGETTO -- AGGIORNAMENTO PANNELLO DB.
-
-Quando crei un database per il progetto (docker-compose con postgres/mysql,
-container singolo, o database locale), DEVI SEMPRE registrare la connessione
-nel pannello DB di Nexus usando il tool project_db_set_connection.
-
-PROCEDURA OBBLIGATORIA:
-1. Dopo aver avviato il container/servizio DB con run_service, aspetta che sia pronto.
-2. Chiama project_db_set_connection con i parametri:
-   - connection_string: la stringa DSN completa (es. postgres://user:pass@localhost:5435/dbname)
-   - engine: tipo DB (postgres, mysql, sqlite, mssql)
-   - hosting_mode: "internal" per DB locale/docker, "external" per DB remoti
-   - name: nome logico (default "primary")
-3. Questo aggiorna automaticamente il pannello DB dell IDE Nexus in tempo reale.
-
-ESEMPIO:
-Dopo aver creato un docker-compose con PostgreSQL su porta 5435:
-  project_db_set_connection({
-    "connection_string": "postgres://taskboard:taskboard_secret@localhost:5435/taskboard",
-    "engine": "postgres",
-    "hosting_mode": "internal",
-    "name": "primary"
-  })
-
-NON saltare questo passaggio: senza di esso il pannello DB rimane vuoto.
-</database_management>',
-       version    = version + 1,
-       updated_at = NOW(),
-       updated_by = 'migration_0743'
- WHERE key = 'agent.coder.base'
-   AND is_active = TRUE
-   AND content NOT LIKE '%</database_management>%';
-
--- ─── D. Guard: COPERTURA finale, non l'esistenza di una riga ────────────────
--- Un UPDATE che non morde non fallisce: lascia in piedi il testo vecchio in
--- silenzio. Il guard conta quanti dei tag attesi ogni bersaglio porta DAVVERO
--- e nomina quelli che mancano.
-
-DO $guard$
-DECLARE
-    attesi TEXT[][] := ARRAY[
-        ['agent.coder.base',       'operatore_nexus'],
-        ['agent.coder.base',       'port_allocation'],
-        ['agent.coder.base',       'attachment_access'],
-        ['agent.coder.base',       'attachment_investigation'],
-        ['agent.coder.base',       'knowledge_graph_tools'],
-        ['agent.coder.base',       'database_provisioning'],
-        ['agent.coder.base',       'file_picking_policy'],
-        ['agent.coder.base',       'next_actions'],
-        ['agent.coder.base',       'final_summary'],
-        ['agent.coder.base',       'database_management'],
-        ['agent.general.debugger', 'operatore_nexus'],
-        ['agent.general.debugger', 'file_picking_policy'],
-        ['agent.tester.base',      'operatore_nexus']
-    ];
-    i         INT;
-    presenti  INT := 0;
-    mancanti  TEXT := '';
-    scope_iso TEXT;
-BEGIN
-    FOR i IN 1 .. array_length(attesi, 1) LOOP
-        IF EXISTS (
-            SELECT 1 FROM nexus_prompt_templates
-             WHERE key = attesi[i][1] AND is_active = TRUE
-               AND content LIKE '%</' || attesi[i][2] || '>%'
-        ) THEN
-            presenti := presenti + 1;
-        ELSE
-            mancanti := mancanti || E'\n  ' || attesi[i][1] || ' <- <' || attesi[i][2] || '>';
-        END IF;
-    END LOOP;
-
-    SELECT scope INTO scope_iso FROM nexus_shared_directives WHERE key = 'project_isolation';
-    IF scope_iso IS DISTINCT FROM 'all' THEN
-        RAISE EXCEPTION 'mig 0743: project_isolation ha scope %, atteso ''all'': il prompt di sistema non riceverebbe l''isolamento progetto',
-            COALESCE(scope_iso, '(riga assente)');
-    END IF;
-
-    IF mancanti <> '' THEN
-        RAISE EXCEPTION 'mig 0743: copertura % su %; mancano:%',
-            presenti, array_length(attesi, 1), mancanti;
-    END IF;
-
-    RAISE NOTICE 'mig 0743: copertura % su % blocchi attesi, project_isolation scope=all',
-        presenti, array_length(attesi, 1);
-END
-$guard$;
 
 COMMIT;
