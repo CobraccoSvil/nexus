@@ -10,6 +10,7 @@ pub(crate) mod origine_frontend;
 pub mod playwright_install;
 pub mod port_recovery;
 pub mod prenotazione_porta;
+pub mod raccolta_allocazione;
 pub(crate) mod problem_aggregation;
 pub mod processes;
 pub mod resource_resolver;

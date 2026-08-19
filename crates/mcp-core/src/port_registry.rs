@@ -15,7 +15,7 @@ use std::time::Duration;
 use sqlx::PgPool;
 use tokio::sync::RwLock;
 
-use crate::project_workspace::prenotazione_porta::{stato_prenotazione, VitaDelRun};
+use crate::project_workspace::prenotazione_porta::VitaDelRun;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -444,38 +444,6 @@ impl PortRegistryCache {
     }
 }
 
-/// Vero se il file unit `~/.config/systemd/user/<unit>` esiste E dichiara ANCORA
-/// `port` tra le sue porte (Environment=PORT / ExecStart `--port`). Identifica le
-/// RISERVE dei servizi configurati ma temporaneamente fermi, da NON rilasciare
-/// come orfane. Punto unico (regola L) del parsing porte: riusa
-/// `extract_ports_from_unit_content`. False se il file non esiste piu' (servizio
-/// rimosso) o non dichiara piu' quella porta (mapping stale dopo riconfig).
-#[cfg_attr(windows, allow(dead_code))]
-async fn service_unit_reserves_port(unit: &str, port: u16) -> bool {
-    let unit = unit.trim();
-    if unit.is_empty() {
-        return false;
-    }
-    // Windows nativo: NIENTE systemd (i servizi di progetto sono processi gestiti).
-    // Il path `~/.config/systemd/user/<unit>` non esiste -> la lettura fallirebbe
-    // sempre -> il GC rilasciava la porta di un servizio managed fermo (drift 31792
-    // ->31798 / pannello Porte svuotato, bug Beaty-Book). Qui la PRESENZA di una
-    // `service_unit` non vuota e' gia' il segnale che un servizio managed RISERVA la
-    // porta: la preserviamo (piu' conservativo = porta stabile ai riavvii). `cfg!`
-    // runtime (non attributo) cosi' entrambi i rami compilano su ogni piattaforma
-    // (nessun dead_code / unused_async).
-    if cfg!(windows) {
-        let _ = port;
-        return true;
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/administrator".to_string());
-    let path = format!("{home}/.config/systemd/user/{unit}");
-    match tokio::fs::read_to_string(&path).await {
-        Ok(content) => extract_ports_from_unit_content(&content).contains(&port),
-        Err(_) => false,
-    }
-}
-
 /// Segnale strutturato (regola M) che il servizio dietro un'allocazione ESISTE
 /// ancora su Windows: una delle `labels` di servizio del progetto (agent_processes
 /// kind='service') ricostruisce, via il PUNTO UNICO `service_unit_name(slug,label)`
@@ -485,80 +453,6 @@ pub(crate) fn windows_unit_backed_by_label(slug: &str, unit: &str, labels: &[Str
     labels
         .iter()
         .any(|l| crate::project_workspace::services::service_unit_name(slug, l) == unit)
-}
-
-/// Windows: l'allocazione con `service_unit = unit` riserva ancora la porta? Vero
-/// SOLO se il servizio e' ancora installato, cioe' esiste una riga agent_processes
-/// (kind='service') del progetto che ricostruisce quell'unit. Uninstall e
-/// clear-finished cancellano quelle righe -> ritorna false -> l'allocazione orfana
-/// viene rilasciata dal GC. Sostituisce il `return true` cieco che tratteneva per
-/// sempre le porte fantasma dei servizi rimossi (bug pannello Porte segnalato).
-#[cfg(windows)]
-async fn windows_service_unit_still_exists(db: &PgPool, project_id: Uuid, unit: &str) -> bool {
-    // Postura DB-down (regole G + M): un errore TRANSITORIO del DB (acquire timeout
-    // su pool saturo, riconnessione, provisioning) NON deve diventare "servizio
-    // disinstallato" -> porterebbe al DELETE distruttivo della riserva e al drift
-    // porta 31792->31798, la regressione che questo fix deve EVITARE. Rilasciamo
-    // SOLO su esito Ok deterministico (progetto o label realmente assenti =
-    // uninstall/clear-finished); qualunque Err = fail-closed = preserva la riserva.
-    let name = match sqlx::query_scalar::<_, String>("SELECT name FROM projects WHERE id = $1")
-        .bind(project_id)
-        .fetch_optional(db)
-        .await
-    {
-        Ok(Some(n)) => n,
-        Ok(None) => return false, // progetto realmente rimosso: riserva orfana
-        Err(_) => return true,    // META transitorio: preserva la riserva
-    };
-    let slug = crate::project_workspace::services::project_service_slug(&name);
-    // agent_processes e' tabella migrata: instrada sul pool del progetto. Pool
-    // PROGETTO non disponibile = transitorio: fail-closed, preserva la riserva
-    // (stessa postura del ramo Err della query sotto).
-    let proj_pool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(
-                project_id = %project_id,
-                error = %e,
-                "windows_service_unit_still_exists: DB progetto non disponibile, preservo la riserva"
-            );
-            return true;
-        }
-    };
-    // La domanda e' «esiste un servizio INSTALLATO con questa identita'?», non
-    // «e' MAI esistita una riga con questa label».
-    //
-    // `SELECT DISTINCT label` guardava l'intera storia di `agent_processes`, che
-    // e' append-only: la riga porta e' stata scritta da
-    // `link_allocation_to_service_unit` con la STESSA label che ha creato la riga
-    // processo, quindi la condizione era vera per costruzione e restava vera per
-    // sempre. Il GC esaminava tutte le allocazioni e le conservava tutte —
-    // misurato il 03/08/2026: 26 righe su 26 preservate, fra cui una porta la cui
-    // unica traccia erano tre righe 'Frontend (Vite)' morte dal giorno prima.
-    //
-    // `visible_windows_services` risponde alla domanda giusta: per ogni label
-    // guarda la riga PIU' RECENTE, tiene le running/starting e nasconde le morte
-    // (generiche o superseded da una label simile piu' recente). E' lo stesso
-    // criterio con cui il pannello decide cosa mostrare, quindi il GC e il
-    // pannello smettono di avere due idee di quali servizi esistano.
-    let righe: Vec<(String, String, chrono::DateTime<chrono::Utc>)> = match sqlx::query_as(
-        "SELECT label, status, created_at FROM agent_processes \
-          WHERE project_id = $1 AND kind = 'service' \
-          ORDER BY label, created_at DESC",
-    )
-    .bind(project_id)
-    .fetch_all(&proj_pool)
-    .await
-    {
-        Ok(r) => r,
-        Err(_) => return true, // pool PROGETTO transitorio: preserva la riserva
-    };
-    let vive: Vec<String> =
-        crate::project_workspace::services::visible_windows_services(&righe, project_id)
-            .into_iter()
-            .map(|(label, _running)| label)
-            .collect();
-    windows_unit_backed_by_label(&slug, unit, &vive)
 }
 
 /// Rilascia le allocazioni porta auto-gestite ORFANE: oltre la grace period e
@@ -583,13 +477,19 @@ async fn windows_service_unit_still_exists(db: &PgPool, project_id: Uuid, unit: 
 /// rilasciate.
 /// Vero se questa allocazione NON va rilasciata dal GC.
 ///
-/// Le protezioni (listener vivo, riserva di un servizio fermo) dicono "questa
-/// allocazione e' viva, non toccarla": hanno senso solo per una riga che il
-/// progetto ha DIRITTO di avere, perche' applicarle a un artefatto significa
-/// proteggerlo proprio mentre fa danno. Il criterio era il range GLOBALE
-/// (20000-39999) e prendeva dentro il bucket di un ALTRO progetto: ora e'
-/// l'AUTORIZZAZIONE (punto unico, regola L) — nel proprio bucket, oppure allocata
-/// a mano. Le `manual` non arrivano nemmeno qui, escluse dalla query.
+/// NON e' piu' un criterio: e' l'ADATTATORE fra i fatti che questo raccoglitore
+/// possiede e il punto unico [`crate::project_workspace::raccolta_allocazione`],
+/// che risponde alla domanda «va raccolta?» anche per il raccoglitore
+/// dell'avvio di un servizio (regola L). Prima i due avevano criteri diversi, e
+/// cio' che qui era protetto la' veniva cancellato.
+///
+/// Le tre osservazioni che questo raccoglitore porta:
+///  - ETA': il predicato SQL della query ha gia' escluso le righe dentro la
+///    grace, quindi cio' che arriva qui e' oltre per costruzione.
+///  - ASCOLTO: dalla fotografia dei listener presa a inizio giro, cosi' due
+///    allocazioni non vengono giudicate su stati del sistema diversi.
+///  - IMPIEGO: `NonInterrogato`. Il GC non legge `agent_processes` e non lo ha
+///    mai fatto; dichiararlo e' diverso dal dire che nessun processo la usa.
 async fn allocazione_da_preservare(
     db: &PgPool,
     project_id: Uuid,
@@ -599,44 +499,24 @@ async fn allocazione_da_preservare(
     vita: &dyn VitaDelRun,
     scan: &crate::project_workspace::port_recovery::ListenerScan,
 ) -> bool {
-    if !nexus_tool_kit::ports::port_authorized_for_project(db, &project_id, porta).await {
-        return false;
-    }
-    // Se qualcuno ascolta, e' in uso. La risposta viene dalla fotografia presa a
-    // inizio giro; `None` qui e' irraggiungibile (la guardia del chiamante ha
-    // gia' fermato tutto), ma resta trattato come "non toccare": e' il difetto
-    // che questo ramo evita.
-    if scan.ascolta(porta) != Some(false) {
-        return true;
-    }
-    // TERZA PROVA (mig 0741): la riga e' PRENOTATA da un run ancora vivo. Le
-    // altre due sono entrambe OSSERVATE o derivate dall'AVVIO, e una porta
-    // appena chiesta da `request_port` non puo' averle — il servizio che dovra'
-    // usarla non esiste ancora. Il criterio non e' un timer ed e' delegato al
-    // punto unico `prenotazione_porta`, che ne porta la misura e il perche'.
-    let prenotazione = stato_prenotazione(vita, project_id, prenotata_da_run).await;
-    if prenotazione.tiene_in_vita() {
-        return true;
-    }
-    // Riserva di un servizio configurato ma FERMO -> non e' orfana. Criterio
-    // platform-specifico:
-    //  - POSIX: il file unit esiste ancora e dichiara ANCORA questa porta.
-    //  - Windows: NON esiste alcun file unit. Segnale strutturato onesto (regola
-    //    M): esiste ancora una riga agent_processes (servizio installato) che
-    //    ricostruisce quell'unit? uninstall / clear-finished cancellano quelle
-    //    righe -> assenza = servizio rimosso = allocazione ORFANA da rilasciare.
-    //    Su errore DB TRANSITORIO si PRESERVA (fail-closed).
-    let Some(unit) = service_unit else {
-        return false;
-    };
-    #[cfg(windows)]
-    {
-        windows_service_unit_still_exists(db, project_id, unit).await
-    }
-    #[cfg(not(windows))]
-    {
-        service_unit_reserves_port(unit, porta).await
-    }
+    use crate::project_workspace::raccolta_allocazione as raccolta;
+    let verdetto = raccolta::giudica_riga(
+        db,
+        raccolta::RigaAllocazione {
+            project_id,
+            porta,
+            service_unit: service_unit.map(str::to_string),
+            prenotata_da_run,
+        },
+        raccolta::OsservazioniDelChiamante {
+            eta: raccolta::EtaAllocazione::OltreLaGrace,
+            ascolto: raccolta::Ascolto::da_scan(scan, porta),
+            impiego: raccolta::ImpiegoDellaLabel::NonInterrogato,
+        },
+        vita,
+    )
+    .await;
+    !verdetto.raccoglie()
 }
 
 /// L'unica cancellazione del GC. Il filtro `<> 'manual'` resta anche qui,
@@ -1037,7 +917,10 @@ pub async fn port_gc_loop(db: PgPool, interval_secs: u64, grace_secs: i64) {
 
 /// Estrae le porte da un contenuto di file .service (replica semplificata
 /// di `extract_ports_from_unit` in services.rs per evitare dipendenze circolari).
-fn extract_ports_from_unit_content(content: &str) -> Vec<u16> {
+///
+/// `pub(crate)` perche' la legge anche il fatto «riserva di unit» del punto
+/// unico della raccolta: il parsing resta qui, dove vivono i suoi test.
+pub(crate) fn extract_ports_from_unit_content(content: &str) -> Vec<u16> {
     let mut ports = Vec::new();
     for line in content.lines() {
         let line = line.trim();
@@ -1092,39 +975,8 @@ mod tests {
         cleanup_orphaned_ports, dev_server_roots_to_kill, dev_server_signature,
         extract_ports_from_unit_content, windows_unit_backed_by_label, PortRegistryCache,
     };
-    use crate::project_workspace::prenotazione_porta::{EsitoInterrogazioneRun, VitaDelRun};
+    use crate::test_support::RunFinto;
     use uuid::Uuid;
-
-    /// Il DB dei run del progetto, sostituito da cio' che il test DICHIARA.
-    ///
-    /// Serve perche' `agent_runs` vive nel DB del PROGETTO e questi test girano
-    /// su un META senza directory di routing: la porta di produzione
-    /// risponderebbe `NonInterrogabile`, che PRESERVA — cioe' il test sarebbe
-    /// verde per fail-closed e non per il criterio, ed e' proprio il falso
-    /// verde che la regola O vieta.
-    struct RunFinto {
-        vivi: Vec<Uuid>,
-    }
-
-    impl RunFinto {
-        fn nessuno_vivo() -> Self {
-            Self { vivi: Vec::new() }
-        }
-        fn con_vivo(run_id: Uuid) -> Self {
-            Self { vivi: vec![run_id] }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl VitaDelRun for RunFinto {
-        async fn interroga(&self, _project_id: Uuid, run_id: Uuid) -> EsitoInterrogazioneRun {
-            if self.vivi.contains(&run_id) {
-                EsitoInterrogazioneRun::Stato("running".to_string())
-            } else {
-                EsitoInterrogazioneRun::Stato("completed".to_string())
-            }
-        }
-    }
 
     /// Il GC proteggeva l'artefatto proprio mentre faceva danno.
     ///

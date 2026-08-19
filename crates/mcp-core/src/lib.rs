@@ -771,12 +771,10 @@ async fn spawn_port_gc(db: &sqlx::PgPool) {
         .flatten()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(120);
-    let gc_grace = settings::get_setting(db, "agent.port_gc.grace_seconds")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(180);
+    // La grace ha UN solo lettore (regola L): la legge anche il raccoglitore che
+    // gira all'avvio di un servizio, e due default diversi darebbero due idee di
+    // quando una riga diventa giudicabile.
+    let gc_grace = project_workspace::raccolta_allocazione::grace_secs(db).await;
     tokio::spawn(async move {
         port_registry::port_gc_loop(db_gc, gc_interval, gc_grace).await;
     });

@@ -89,6 +89,72 @@ pub(crate) fn ctx_di_tool_test(root: std::path::PathBuf) -> crate::agent_tools::
     }
 }
 
+/// Lo stesso contesto, ma su un pool VERO (quello di un `#[sqlx::test]`) e con
+/// l'identita' del progetto e del run che la produzione gli darebbe.
+///
+/// Delega a [`ctx_di_tool_test`] invece di ricopiarne i quindici campi: una copia
+/// che diverge sul campo sbagliato non fallisce, prova un'altra cosa restando
+/// verde (regola O). Qui si sovrascrivono solo i quattro campi che un test con
+/// DB deve poter scegliere.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn ctx_di_tool_test_su_db(
+    root: std::path::PathBuf,
+    pool: PgPool,
+    project_id: Uuid,
+    run_id: Option<Uuid>,
+) -> crate::agent_tools::AgentToolContext {
+    use std::sync::Arc;
+    let mut ctx = ctx_di_tool_test(root);
+    ctx.core.db = Arc::new(pool.clone());
+    ctx.core.run_db = Arc::new(pool.clone());
+    ctx.core.project_id = project_id;
+    ctx.core.run_id = run_id;
+    ctx.port_registry = crate::port_registry::PortRegistryCache::empty_for_tests(pool);
+    ctx
+}
+
+/// Il DB dei run del progetto, sostituito da cio' che il test DICHIARA.
+///
+/// PUNTO UNICO del finto (regola L): la stessa risposta serve ai test di
+/// ENTRAMBI i raccoglitori di allocazioni — il GC periodico e quello che gira
+/// all'avvio di un servizio — e due finti divergenti darebbero due idee di
+/// «run vivo» proprio dove il criterio e' condiviso.
+///
+/// Serve perche' `agent_runs` vive nel DB del PROGETTO e i `#[sqlx::test]`
+/// girano su un META senza directory di routing: la porta di produzione
+/// risponderebbe `NonInterrogabile`, che PRESERVA — cioe' il test sarebbe verde
+/// per fail-closed e non per il criterio, il falso verde che la regola O vieta.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RunFinto {
+    vivi: Vec<Uuid>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RunFinto {
+    pub(crate) fn nessuno_vivo() -> Self {
+        Self { vivi: Vec::new() }
+    }
+    pub(crate) fn con_vivo(run_id: Uuid) -> Self {
+        Self { vivi: vec![run_id] }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::project_workspace::prenotazione_porta::VitaDelRun for RunFinto {
+    async fn interroga(
+        &self,
+        _project_id: Uuid,
+        run_id: Uuid,
+    ) -> crate::project_workspace::prenotazione_porta::EsitoInterrogazioneRun {
+        use crate::project_workspace::prenotazione_porta::EsitoInterrogazioneRun;
+        if self.vivi.contains(&run_id) {
+            EsitoInterrogazioneRun::Stato("running".to_string())
+        } else {
+            EsitoInterrogazioneRun::Stato("completed".to_string())
+        }
+    }
+}
+
 /// Semina un progetto sul DB META, con la catena di FK che lo schema reale
 /// pretende: `teams` -> `users` -> `projects`.
 ///

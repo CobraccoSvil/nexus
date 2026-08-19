@@ -4606,13 +4606,13 @@ assert_single "prenotazione-porta" 'pub trait VitaDelRun'   'crates/mcp-core/src
 # la terza prova. Senza questa riga il modulo resterebbe perfetto e mai
 # consultato, con tutti i suoi test verdi (regola O) e le porte promesse che
 # continuano a evaporare.
-if ! grep -q 'prenotazione.tiene_in_vita()' crates/mcp-core/src/port_registry.rs; then
-  echo "!! prenotazione-porta: allocazione_da_preservare non interroga piu' la" >&2
-  echo "   prenotazione. Il GC torna a due sole prove, entrambe impossibili per" >&2
+if ! grep -q 'fatti.prenotazione().await.tiene_in_vita()' crates/mcp-core/src/project_workspace/raccolta_allocazione.rs; then
+  echo "!! prenotazione-porta: il criterio di raccolta non interroga piu' la" >&2
+  echo "   prenotazione. Si torna a due sole prove, entrambe impossibili per" >&2
   echo "   una riga appena creata da request_port: la promessa evapora." >&2
   fail=1
 else
-  echo "OK prenotazione-porta: il GC consulta la terza prova"
+  echo "OK prenotazione-porta: il criterio consulta la terza prova"
 fi
 
 # La PROMESSA e' un campo, non un numero nudo (regola Q): il tool deve dire se
@@ -4636,6 +4636,68 @@ if [[ "$(grep -c 'prenotata_da_run = ' crates/mcp-core/src/project_workspace/all
   fail=1
 else
   echo "OK prenotazione-porta: un solo punto scrive la prenotazione"
+fi
+
+# -- raccolta-allocazione (2026-08-19) ---------------------------------------
+# «Questa allocazione va raccolta?» aveva DUE risposte in due punti che
+# cancellano righe della STESSA tabella: il GC periodico
+# (port_registry::cleanup_orphaned_ports) e il raccoglitore che gira a OGNI
+# run_service (agent_tools::service::cleanup_dead_process_ports). Il secondo
+# aveva il criterio piu' debole — «la porta e' bindabile?» — quindi cancellava
+# proprio cio' che il primo aveva appena imparato a preservare, e lo faceva
+# all'avvio di un servizio, senza grace.
+assert_single "raccolta-allocazione" 'pub async fn giudica_riga\(' 'crates/mcp-core/src/project_workspace/raccolta_allocazione.rs' crates
+assert_single "raccolta-allocazione" 'pub async fn giudica\(' 'crates/mcp-core/src/project_workspace/raccolta_allocazione.rs' crates
+assert_single "raccolta-allocazione" 'pub enum VerdettoRaccolta' 'crates/mcp-core/src/project_workspace/raccolta_allocazione.rs' crates
+assert_single "raccolta-allocazione" 'pub trait FattiAllocazione' 'crates/mcp-core/src/project_workspace/raccolta_allocazione.rs' crates
+assert_single "raccolta-allocazione" 'pub enum ImpiegoDellaLabel' 'crates/mcp-core/src/project_workspace/raccolta_allocazione.rs' crates
+assert_single "raccolta-allocazione" 'pub enum RiservaServizio'   'crates/mcp-core/src/project_workspace/raccolta_allocazione.rs' crates
+
+# ENTRAMBI i raccoglitori devono DELEGARE. Un guard sulla sola definizione
+# lascerebbe il punto unico perfetto e uno dei due call site col criterio suo,
+# che e' esattamente lo stato in cui il primo giro del fix aveva lasciato le cose.
+for raccoglitore in \
+  crates/mcp-core/src/port_registry.rs \
+  crates/mcp-core/src/agent_tools/service.rs; do
+  # Il pattern e' il PERCORSO della chiamata, non l'alias di import: un
+  # `use ... as raccolta` tolto in un refactor renderebbe il guard verde per
+  # assenza (regola O), che e' esattamente cio' che e' successo la prima volta.
+  if ! grep -q '::giudica_riga(' "$raccoglitore"; then
+    echo "!! raccolta-allocazione: $raccoglitore non delega piu' il verdetto al" >&2
+    echo "   punto unico. Due criteri sulla stessa tabella: cio' che uno preserva," >&2
+    echo "   l'altro lo cancella (regola L)." >&2
+    fail=1
+  else
+    echo "OK raccolta-allocazione: $raccoglitore delega il verdetto"
+  fi
+done
+
+# Le CANCELLAZIONI di nexus_port_allocations nel codice Rust sono un insieme
+# CHIUSO e dichiarato: due sono i raccoglitori (che ora delegano), le altre due
+# sono azioni umane deliberate (il pulsante kill del pannello Porte, e la
+# release esplicita del registry usata da reset/uninstall). Una quinta riga
+# significa un terzo raccoglitore nato senza criterio.
+attesi_delete=4
+trovati_delete="$(grep -rn 'DELETE FROM nexus_port_allocations' --include='*.rs' crates | wc -l | tr -d ' ')"
+if [[ "$trovati_delete" -ne "$attesi_delete" ]]; then
+  echo "!! raccolta-allocazione: $trovati_delete DELETE su nexus_port_allocations," >&2
+  echo "   attesi $attesi_delete. Se e' un raccoglitore nuovo deve DELEGARE a" >&2
+  echo "   raccolta_allocazione::giudica_riga; se e' un'azione umana deliberata," >&2
+  echo "   aggiornare questo conteggio dichiarando quale e' e perche'." >&2
+  fail=1
+else
+  echo "OK raccolta-allocazione: $trovati_delete cancellazioni, tutte dichiarate"
+fi
+
+# La GRACE ha un solo lettore: due default diversi darebbero due idee di quando
+# una riga diventa giudicabile, e il raccoglitore dell'avvio la legge dallo
+# stesso punto del GC.
+if [[ "$(grep -rn "agent.port_gc.grace_seconds" --include='*.rs' crates | wc -l | tr -d ' ')" -ne 1 ]]; then
+  echo "!! raccolta-allocazione: la grace del port_gc ha piu' di un lettore." >&2
+  echo "   Delegare a raccolta_allocazione::grace_secs (regola L)." >&2
+  fail=1
+else
+  echo "OK raccolta-allocazione: un solo lettore della grace"
 fi
 
 # -- campo-dichiarato-sopravvive (2026-08-19) --------------------------------

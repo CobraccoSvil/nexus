@@ -249,7 +249,10 @@ async fn gate_pre_avvio(
     // l'ETICHETTA di servizio; questo gate toglie loro il POTERE, che e' la
     // difesa che regge anche quando il riconoscimento sbaglia.
     if kind == "service" {
-        dedup_and_cleanup_ports(ctx, label, command, work_dir).await;
+        let processi = EsitoProcessi::letti(&ctx.db, ctx.project_id).await;
+        let vita =
+            crate::project_workspace::prenotazione_porta::RunsDelDbDiProgetto::new((*ctx.db).clone());
+        dedup_and_cleanup_ports(ctx, label, command, work_dir, processi, &vita).await;
     }
 
     if let Some(kind_hint) = kind_hint_for(ctx, label, command, work_dir) {
@@ -748,21 +751,33 @@ fn normalizza_label(raw: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-/// Deduplicazione servizi prima del refuse: ferma processi simili, cleanup
-/// porte orfane, libera LISTEN residuo sullo stesso scopo (zombie/orfani non
-/// tracciati in agent_processes). Delega stop a stop_similar_running_services
-/// (punto unico, regola L).
+/// Deduplicazione servizi prima del refuse: ferma processi simili, raccoglie le
+/// allocazioni che nulla tiene in vita, libera LISTEN residuo sullo stesso scopo
+/// (zombie/orfani non tracciati in agent_processes). Delega stop a
+/// `stop_similar_running_services` e il giudizio sulle porte a
+/// [`cleanup_dead_process_ports`] (punti unici, regola L).
+///
+/// I processi e la vita dei run arrivano come PARAMETRI, non li legge questa
+/// funzione. I processi sono la sola osservazione che questo raccoglitore
+/// possiede e il GC no, e vanno consegnati come fatto: prima la lettura viveva
+/// dentro un `if let Ok(...)` e il suo fallimento saltava in silenzio l'intero
+/// cleanup — un ignoto travestito da «niente da fare» (regola Q). `vita` segue
+/// la stessa disciplina di `port_gc_loop`, che la costruisce una volta e la
+/// passa: e' anche l'unica strada per provare questo percorso su un DB che non
+/// ha la directory di routing, dove la porta di produzione risponderebbe
+/// `NonInterrogabile` — cioe' un verde per fail-closed invece che per il
+/// criterio (regola O).
 async fn dedup_and_cleanup_ports(
     ctx: &AgentToolContext,
     label: &str,
     command: &str,
     work_dir: &std::path::Path,
+    processi: EsitoProcessi,
+    vita: &dyn crate::project_workspace::prenotazione_porta::VitaDelRun,
 ) {
     let _ =
         crate::agent_processes::stop_similar_running_services(&ctx.db, ctx.project_id, label).await;
-    if let Ok(existing) = crate::agent_processes::list_processes(&ctx.db, ctx.project_id).await {
-        cleanup_dead_process_ports(&ctx.db, ctx.project_id, &existing, label).await;
-    }
+    cleanup_dead_process_ports(&ctx.db, ctx.project_id, processi, label, vita).await;
     if let Some(kind_hint) = kind_hint_for(ctx, label, command, work_dir) {
         free_listening_scope_port(ctx, kind_hint).await;
     }
@@ -1613,79 +1628,206 @@ async fn allocate_web_port_env(
     Ok(Some(env))
 }
 
-/// Rilascia porte allocate (dynamic) il cui processo e' morto.
-/// Controlla `agent_processes` per processi non-running di questo progetto
-/// e rimuove le porte allocate che non hanno piu' un processo attivo.
+/// Rilascia le allocazioni di questo progetto che nessuna prova tiene in vita.
+///
+/// # Perche' NON ha un criterio proprio (regola L)
+///
+/// Il GC periodico (`port_registry::cleanup_orphaned_ports`) e questo
+/// raccoglitore cancellano righe della STESSA tabella rispondendo alla STESSA
+/// domanda — «questa allocazione va raccolta?» — e avevano DUE criteri. Qui ce
+/// n'era uno solo, il piu' debole: «la porta e' bindabile?». Bastava che una
+/// prenotazione appena scritta da `request_port` (mig 0741) portasse una label
+/// diversa da quella in avvio perche' venisse cancellata all'istante, nel
+/// momento peggiore e senza nemmeno la grace — e la terza prova di vita, che il
+/// GC aveva appena imparato, qui non esisteva.
+///
+/// Ora il verdetto viene dal punto unico
+/// [`crate::project_workspace::raccolta_allocazione`] e questa funzione porta
+/// soltanto i FATTI che possiede e il GC no:
+///  - ETA': la colonna `created_at` confrontata con la stessa grace del GC.
+///  - ASCOLTO: un tentativo di bind per riga (il GC usa una fotografia dei
+///    listener presa a inizio giro: strumenti diversi, stessa domanda).
+///  - IMPIEGO: la label del servizio in avvio ADESSO, piu' quelle dei processi
+///    running/starting. E' l'unica prova che il GC non ha, ed e' la ragione per
+///    cui non basta chiamare il GC da qui.
 async fn cleanup_dead_process_ports(
     db: &sqlx::PgPool,
     project_id: uuid::Uuid,
-    processes: &[crate::agent_processes::ProcessSummary],
+    processi: EsitoProcessi,
     preserve_label: &str,
+    vita: &dyn crate::project_workspace::prenotazione_porta::VitaDelRun,
 ) {
-    // Raccogli le label dei processi ancora attivi
-    let active_labels: std::collections::HashSet<String> = processes
-        .iter()
-        .filter(|p| p.status == "running" || p.status == "starting")
-        .map(|p| p.label.clone())
-        .collect();
+    let attive = label_attive(&processi);
+    let grace = crate::project_workspace::raccolta_allocazione::grace_secs(db).await;
+    let adesso = chrono::Utc::now();
 
-    // Prendi le porte allocate dinamicamente per questo progetto
-    let rows = sqlx::query_as::<_, (i32, String)>(
-        "SELECT port, label FROM nexus_port_allocations \
+    for riga in allocazioni_dinamiche(db, project_id).await {
+        let impiego = impiego_della_label(&riga.label, preserve_label, attive.as_ref(), &processi);
+        let verdetto = crate::project_workspace::raccolta_allocazione::giudica_riga(
+            db,
+            crate::project_workspace::raccolta_allocazione::RigaAllocazione {
+                project_id,
+                porta: riga.port as u16,
+                service_unit: riga.service_unit.clone(),
+                prenotata_da_run: riga.prenotata_da_run,
+            },
+            osservazioni_della_riga(&riga, impiego, grace, adesso).await,
+            vita,
+        )
+        .await;
+
+        if verdetto.raccoglie() {
+            rilascia_allocazione_raccolta(db, project_id, riga.port, &riga.label, verdetto).await;
+        }
+    }
+}
+
+/// Una riga `dynamic` del registro, coi soli campi su cui il criterio decide.
+///
+/// Struct e non tupla: cinque colonne dello stesso identico tipo di ritorno
+/// scambiabili per posizione, dove `service_unit` e `label` sono entrambe
+/// `Option<String>`/`String` — un ordine sbagliato non lo vedrebbe ne' il
+/// compilatore ne' un test.
+#[derive(sqlx::FromRow)]
+struct RigaDinamica {
+    port: i32,
+    label: String,
+    service_unit: Option<String>,
+    prenotata_da_run: Option<uuid::Uuid>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Il corpus di questo raccoglitore: le sole allocazioni `dynamic` del progetto.
+///
+/// Errore di lettura -> nessuna riga, quindi nessuna cancellazione: non si
+/// distrugge cio' che non si e' potuto leggere.
+async fn allocazioni_dinamiche(db: &sqlx::PgPool, project_id: uuid::Uuid) -> Vec<RigaDinamica> {
+    sqlx::query_as::<_, RigaDinamica>(
+        "SELECT port, label, service_unit, prenotata_da_run, created_at \
+         FROM nexus_port_allocations \
          WHERE project_id = $1 AND allocation_mode = 'dynamic'",
     )
     .bind(project_id)
     .fetch_all(db)
-    .await;
+    .await
+    .unwrap_or_default()
+}
 
-    let Ok(allocations) = rows else {
-        return;
-    };
-    for (port, alloc_label) in allocations {
-        // Non rilasciare l'allocazione del servizio che stiamo (ri)avviando
-        // ora: la sua porta spenta serve all'adozione (deadlock allocazione
-        // stantia), non va liberata. Salta anche le allocazioni con un processo
-        // attivo corrispondente.
-        if alloc_label == preserve_label || active_labels.contains(&alloc_label) {
-            continue;
-        }
-        release_stale_port(db, project_id, port, &alloc_label).await;
+/// Le label dei processi ancora attivi. `None` non e' un insieme vuoto: e'
+/// l'ignoto dichiarato dalla lettura fallita, e i due portano a decisioni
+/// opposte (regola Q).
+fn label_attive(processi: &EsitoProcessi) -> Option<std::collections::HashSet<String>> {
+    match processi {
+        EsitoProcessi::Elenco(v) => Some(
+            v.iter()
+                .filter(|p| p.status == "running" || p.status == "starting")
+                .map(|p| p.label.clone())
+                .collect(),
+        ),
+        EsitoProcessi::NonInterrogabili(_) => None,
     }
 }
 
-/// Rilascia una singola allocazione dinamica se la sua porta non e' realmente
-/// in ascolto (bind test). Estratto da `cleanup_dead_process_ports` per tenerla
-/// sotto soglia; comportamento invariato.
-async fn release_stale_port(
+/// Le tre osservazioni che questo raccoglitore consegna al criterio.
+///
+/// Il bind e' l'unica che costa una syscall, e si paga solo dove puo' cambiare
+/// il verdetto: sotto grace o con la label in uso la riga e' gia' salva, e
+/// interrogare il sistema non aggiungerebbe nulla.
+async fn osservazioni_della_riga(
+    riga: &RigaDinamica,
+    impiego: crate::project_workspace::raccolta_allocazione::ImpiegoDellaLabel,
+    grace: i64,
+    adesso: chrono::DateTime<chrono::Utc>,
+) -> crate::project_workspace::raccolta_allocazione::OsservazioniDelChiamante {
+    use crate::project_workspace::raccolta_allocazione as raccolta;
+    let eta = raccolta::EtaAllocazione::da_creazione(riga.created_at, grace, adesso);
+    let gia_salva = matches!(eta, raccolta::EtaAllocazione::DentroLaGrace)
+        || matches!(impiego, raccolta::ImpiegoDellaLabel::InUso);
+    let ascolto = if gia_salva {
+        raccolta::Ascolto::Nessuno
+    } else {
+        raccolta::Ascolto::da_bind(
+            &crate::project_workspace::port_recovery::probe_bind(riga.port as u16).await,
+        )
+    };
+    raccolta::OsservazioniDelChiamante {
+        eta,
+        ascolto,
+        impiego,
+    }
+}
+
+/// Cio' che si e' potuto sapere dei processi del progetto.
+///
+/// Non e' un `Vec` eventualmente vuoto (regola Q): «nessun processo attivo» e
+/// «non ho potuto leggerli» portano a decisioni opposte, e il secondo caso —
+/// DB del progetto irraggiungibile — non deve autorizzare a cancellare la porta
+/// di un servizio che sta partendo.
+pub(crate) enum EsitoProcessi {
+    Elenco(Vec<crate::agent_processes::ProcessSummary>),
+    NonInterrogabili(String),
+}
+
+impl EsitoProcessi {
+    /// La lettura come la fa la produzione.
+    pub(crate) async fn letti(db: &sqlx::PgPool, project_id: uuid::Uuid) -> Self {
+        match crate::agent_processes::list_processes(db, project_id).await {
+            Ok(v) => Self::Elenco(v),
+            Err(e) => Self::NonInterrogabili(e),
+        }
+    }
+}
+
+/// «Un servizio con questa label la sta usando adesso?», come lo sa questo
+/// raccoglitore.
+///
+/// La label in avvio vince su tutto e non richiede alcuna lettura: e' il
+/// servizio che stiamo facendo partire in questo istante, e la sua porta spenta
+/// serve all'adozione (deadlock dell'allocazione stantia).
+fn impiego_della_label(
+    alloc_label: &str,
+    preserve_label: &str,
+    attive: Option<&std::collections::HashSet<String>>,
+    processi: &EsitoProcessi,
+) -> crate::project_workspace::raccolta_allocazione::ImpiegoDellaLabel {
+    use crate::project_workspace::raccolta_allocazione::ImpiegoDellaLabel;
+    if alloc_label == preserve_label {
+        return ImpiegoDellaLabel::InUso;
+    }
+    match (attive, processi) {
+        (Some(a), _) if a.contains(alloc_label) => ImpiegoDellaLabel::InUso,
+        (Some(_), _) => ImpiegoDellaLabel::NessunProcesso,
+        (None, EsitoProcessi::NonInterrogabili(causa)) => {
+            ImpiegoDellaLabel::NonInterrogabile(causa.clone())
+        }
+        (None, EsitoProcessi::Elenco(_)) => ImpiegoDellaLabel::NessunProcesso,
+    }
+}
+
+/// L'unica cancellazione di questo raccoglitore. Il motivo del verdetto entra
+/// nel log: «rilasciata» senza il perche' non distingue un residuo da un errore
+/// di giudizio, ed e' proprio la riga che il difetto del 18/08/2026 avrebbe
+/// prodotto su una prenotazione valida.
+async fn rilascia_allocazione_raccolta(
     db: &sqlx::PgPool,
     project_id: uuid::Uuid,
     port: i32,
     alloc_label: &str,
+    verdetto: crate::project_workspace::raccolta_allocazione::VerdettoRaccolta,
 ) {
-    // Questa funzione CANCELLA una riga di allocazione: si procede solo su una
-    // porta osservata LIBERA, mai su un esito che non sappiamo interpretare.
-    //
-    // Il punto unico classifica i tre casi (`PortBind`): con `.is_err()`
-    // l'occupazione e l'impossibilita' di interrogare il sistema collassavano
-    // nello stesso `true` — qui per fortuna nel verso prudente (non cancella),
-    // ma per caso, non per scelta. Scritto col `match` la prudenza e'
-    // dichiarata, e chi un domani invertisse la condizione vedrebbe i tre rami
-    // invece di un booleano.
-    match super::super::project_workspace::port_recovery::probe_bind(port as u16).await {
-        crate::project_workspace::port_recovery::PortBind::Libera => {}
-        // Occupata: la porta serve a qualcuno, l'allocazione resta.
-        // Non interrogabile: non si distrugge niente su cio' che non si e' visto.
-        _ => return,
-    }
-    let _ = sqlx::query("DELETE FROM nexus_port_allocations WHERE project_id = $1 AND port = $2")
-        .bind(project_id)
-        .bind(port)
-        .execute(db)
-        .await;
+    let _ = sqlx::query(
+        "DELETE FROM nexus_port_allocations \
+         WHERE project_id = $1 AND port = $2 AND allocation_mode <> 'manual'",
+    )
+    .bind(project_id)
+    .bind(port)
+    .execute(db)
+    .await;
     tracing::info!(
         port = port,
         label = %alloc_label,
-        "cleanup: porta dinamica rilasciata (processo morto)"
+        motivo = verdetto.motivo(),
+        "cleanup avvio servizio: allocazione rilasciata"
     );
 }
 
@@ -3239,6 +3381,151 @@ mod tests {
         .await
         .expect("conteggio");
         assert_eq!(righe, 1, "nessuna riga in piu' e nessuna in meno");
+    }
+
+    /// L'AVVIO DI UN SERVIZIO NON RACCOGLIE LA PRENOTAZIONE DI UN ALTRO.
+    ///
+    /// E' il test che conta (regola O): attraversa `dedup_and_cleanup_ports`,
+    /// cioe' ESATTAMENTE la funzione che `gate_pre_avvio` chiama a ogni
+    /// `run_service` con `kind = "service"`, contro lo schema reale (compresa la
+    /// colonna `prenotata_da_run` della mig 0741) e la `SELECT`/`DELETE` di
+    /// produzione. Un test sul solo criterio puro non basta: era esattamente
+    /// cio' che il primo giro del fix aveva, e questo raccoglitore restava col
+    /// proprio criterio piu' debole.
+    ///
+    /// Le due righe sono nel BUCKET del progetto, `dynamic`, oltre la grace, con
+    /// una label DIVERSA da quella in avvio e nessun processo attivo: prima del
+    /// fix entrambe finivano nel `DELETE`, perche' l'unica domanda era «la porta
+    /// e' bindabile?».
+    ///
+    /// Il test DISCRIMINA — una riga sopravvive e una viene raccolta — quindi
+    /// non puo' essere verde per un preserva-tutto: se il criterio si spegnesse
+    /// del tutto, o se i fatti non arrivassero, cadrebbe la seconda asserzione.
+    ///
+    /// MUTAZIONE che rende rosso: togliere la terza prova di vita da questo
+    /// raccoglitore — in `raccolta_allocazione::giudica`, il ramo
+    /// `fatti.prenotazione().await.tiene_in_vita()` — oppure smettere di passare
+    /// `prenotata_da_run` nella `RigaAllocazione`. In entrambi i casi la porta
+    /// prenotata sparisce all'avvio del servizio, che e' il difetto misurato il
+    /// 18/08/2026 su biblioteca-18-08.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn l_avvio_di_un_servizio_non_raccoglie_una_prenotazione_viva(pool: sqlx::PgPool) {
+        let (_utente, progetto) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let (bucket_start, _bucket_end) =
+            crate::project_workspace::services::project_bucket_range(&progetto);
+        let prenotata = bucket_start as i32;
+        let residuo = (bucket_start + 1) as i32;
+        let run_vivo = Uuid::new_v4();
+
+        for (porta, label, run) in [
+            (prenotata, "frontend", Some(run_vivo)),
+            (residuo, "tentativo-fallito", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO nexus_port_allocations \
+                   (project_id, port, label, allocation_mode, prenotata_da_run, created_at) \
+                 VALUES ($1, $2, $3, 'dynamic', $4, NOW() - INTERVAL '1 hour')",
+            )
+            .bind(progetto)
+            .bind(porta)
+            .bind(label)
+            .bind(run)
+            .execute(&pool)
+            .await
+            .expect("seed allocazione");
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = crate::test_support::ctx_di_tool_test_su_db(
+            dir.path().to_path_buf(),
+            pool.clone(),
+            progetto,
+            Some(run_vivo),
+        );
+
+        // Il servizio che sta partendo si chiama `backend`: nessuna delle due
+        // righe e' protetta dalla label in avvio, ed e' la condizione in cui il
+        // difetto si manifestava.
+        super::dedup_and_cleanup_ports(
+            &ctx,
+            "backend",
+            "npm run dev",
+            dir.path(),
+            super::EsitoProcessi::Elenco(Vec::new()),
+            &crate::test_support::RunFinto::con_vivo(run_vivo),
+        )
+        .await;
+
+        let rimaste: Vec<i32> = sqlx::query_scalar(
+            "SELECT port::int FROM nexus_port_allocations WHERE project_id = $1 ORDER BY port",
+        )
+        .bind(progetto)
+        .fetch_all(&pool)
+        .await
+        .expect("rilettura allocazioni");
+
+        assert!(
+            rimaste.contains(&prenotata),
+            "la porta prenotata da un run VIVO deve sopravvivere all'avvio di un altro \
+             servizio: il servizio che la usera' non esiste ancora, quindi non puo' avere \
+             ne' listener ne' service_unit. Rimaste: {rimaste:?}"
+        );
+        assert!(
+            !rimaste.contains(&residuo),
+            "la riga senza alcuna prova di vita e' il residuo che questo raccoglitore \
+             esiste per raccogliere: se sopravvive, il criterio non sta decidendo. \
+             Rimaste: {rimaste:?}"
+        );
+    }
+
+    /// Il raccoglitore dell'avvio ha ereditato anche le prove che NON erano sue.
+    ///
+    /// Con `list_processes` non interrogabile (DB del progetto irraggiungibile)
+    /// non si cancella nulla: prima quel caso era un `if let Ok(...)` che
+    /// saltava il cleanup in silenzio, ora e' un fatto dichiarato che PRESERVA —
+    /// stesso esito, ma visibile e per il criterio.
+    ///
+    /// MUTAZIONE che rende rosso: far degradare
+    /// `ImpiegoDellaLabel::NonInterrogabile` a `NessunProcesso` in
+    /// `impiego_della_label`.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn senza_i_processi_del_progetto_non_si_cancella_niente(pool: sqlx::PgPool) {
+        let (_utente, progetto) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let (bucket_start, _fine) =
+            crate::project_workspace::services::project_bucket_range(&progetto);
+        let porta = bucket_start as i32;
+
+        sqlx::query(
+            "INSERT INTO nexus_port_allocations \
+               (project_id, port, label, allocation_mode, created_at) \
+             VALUES ($1, $2, 'tentativo-fallito', 'dynamic', NOW() - INTERVAL '1 hour')",
+        )
+        .bind(progetto)
+        .bind(porta)
+        .execute(&pool)
+        .await
+        .expect("seed allocazione");
+
+        super::cleanup_dead_process_ports(
+            &pool,
+            progetto,
+            super::EsitoProcessi::NonInterrogabili("pool del progetto assente".into()),
+            "backend",
+            &crate::test_support::RunFinto::nessuno_vivo(),
+        )
+        .await;
+
+        let rimaste: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM nexus_port_allocations WHERE project_id = $1")
+                .bind(progetto)
+                .fetch_one(&pool)
+                .await
+                .expect("conteggio");
+        assert_eq!(
+            rimaste, 1,
+            "«non ho potuto leggere i processi» non e' «nessun processo la usa»: \
+             sull'ignoto non si distrugge"
+        );
     }
 
     /// I due casi in cui si scrive davvero, sempre contro lo schema vero: la
