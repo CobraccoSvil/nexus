@@ -553,6 +553,51 @@ pub(crate) async fn create_ai_price_catalog_table(pool: &PgPool) {
 // dal punto unico piu' sopra (`create_settings_table` + `seed_setting`), che
 // porta gia' l'invalidazione della cache per-chiave: due fixture per la stessa
 // tabella erano il difetto che questo lavoro chiude.
+/// Sostituisce PER INTERO il contenuto di un template, dichiarando al presidio
+/// della mig 0744 che la perdita dei blocchi e' voluta. Ritorna le righe toccate.
+///
+/// Serve perche' dal 19/08/2026 un trigger rifiuta ogni scrittura su
+/// `nexus_prompt_templates` che faccia sparire un blocco `<nome>...</nome>` senza
+/// che qualcuno lo abbia dichiarato: e' il presidio contro le riscritture
+/// integrali del blob, che nelle mig 0437/0438 hanno cancellato 23 blocchi da
+/// tre prompt senza far fallire niente.
+///
+/// Un test che riscrive un template **e'** una perdita voluta — sta provando che
+/// la configurazione viene dal DB e non dal binario (regola G), e per farlo deve
+/// per forza sostituire il testo che il compositore legge. Quindi non si esenta
+/// dal presidio: si dichiara, con la stessa forma che una migrazione dovrebbe
+/// usare. La dichiarazione e' DERIVATA dal punto unico `nexus_prompt_blocchi`
+/// interrogando la riga che si sta per sovrascrivere, mai da un elenco scritto a
+/// mano qui: un elenco letterale invecchierebbe alla prima migrazione che
+/// aggiunge un blocco a quel prompt, e il test rosseggerebbe per un motivo che
+/// non c'entra nulla con cio' che misura.
+///
+/// PUNTO UNICO (regola L) della riscrittura integrale nei test: con la
+/// dichiarazione ricopiata in ogni modulo, il primo che la dimentica trova un
+/// errore del DB e la strada spontanea diventa spegnere il trigger.
+pub async fn sostituisci_contenuto_template(pool: &PgPool, key: &str, nuovo: &str) -> u64 {
+    let mut tx = pool.begin().await.expect("transazione per la dichiarazione");
+    // `set_config(..., is_local = true)` vale per la sola transazione: la
+    // dichiarazione non sopravvive a questa riscrittura.
+    sqlx::query(
+        "SELECT set_config('nexus.blocchi_rimossi', COALESCE((             SELECT array_to_string(nexus_prompt_blocchi(content), ',')                FROM nexus_prompt_templates WHERE key = $1), ''), true)",
+    )
+    .bind(key)
+    .execute(&mut *tx)
+    .await
+    .expect("dichiarazione dei blocchi rimossi");
+
+    let toccate = sqlx::query("UPDATE nexus_prompt_templates SET content = $2 WHERE key = $1")
+        .bind(key)
+        .bind(nuovo)
+        .execute(&mut *tx)
+        .await
+        .expect("riscrittura del template")
+        .rows_affected();
+    tx.commit().await.expect("commit della riscrittura");
+    toccate
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4780,6 +4780,57 @@ else
   echo "OK campo-dichiarato-sopravvive: le prove attraversano entrambi gli ingressi"
 fi
 
+# -- blocchi-dei-prompt (2026-08-19) -----------------------------------------
+# Un prompt e' un BLOB: chi lo riscrive cancella cio' che altri vi hanno appeso
+# e nessun test rosseggia — un blocco che non arriva al modello non fa fallire
+# niente. Le 0437/0438 hanno perso cosi' 23 blocchi da tre prompt, invisibili
+# per 48 giorni. Il presidio e' il trigger della mig 0744, e questi tre
+# controlli difendono LUI: il criterio in un posto solo, e nessuno che lo
+# disarmi in silenzio.
+bdp_mig='db/migrations/0744_i_blocchi_di_un_prompt_non_spariscono_in_silenzio.sql'
+# 1. Il criterio "quali blocchi dichiara questo contenuto" ha UNA definizione.
+#    Una `CREATE OR REPLACE` in una migrazione successiva cambierebbe cio' che
+#    il trigger considera un blocco senza toccare il trigger.
+for bdp_fn in nexus_prompt_blocchi nexus_prompt_blocchi_persi nexus_prompt_templates_guard_blocchi; do
+  bdp_def=$(grep -rl "CREATE OR REPLACE FUNCTION $bdp_fn" db/migrations --include=*.sql 2>/dev/null | sort || true)
+  if [[ "$bdp_def" != "$bdp_mig" ]]; then
+    echo "!! blocchi-dei-prompt: $bdp_fn e' definita fuori dalla 0744." >&2
+    echo "   Atteso solo: $bdp_mig" >&2
+    echo "   Trovate:" >&2
+    printf '     %s
+' ${bdp_def:-"(nessuna: la funzione non esiste piu')"} >&2
+    fail=1
+  fi
+done
+# 2. I due trigger nascono in un posto solo.
+bdp_crea=$(grep -rl 'CREATE TRIGGER trg_prompt_blocchi_' db/migrations --include=*.sql 2>/dev/null | sort || true)
+if [[ "$bdp_crea" != "$bdp_mig" ]]; then
+  echo "!! blocchi-dei-prompt: i trigger sono creati fuori dalla 0744: ${bdp_crea:-(nessuno)}" >&2
+  fail=1
+fi
+# 3. NESSUNO li spegne. Il `DROP TRIGGER IF EXISTS` idempotente vive nella 0744
+#    stessa; una DROP in una migrazione successiva e' il presidio disattivato,
+#    e sarebbe l'unico modo di riaprire il difetto senza che niente fallisca.
+bdp_drop=$(grep -rl 'DROP TRIGGER.*trg_prompt_blocchi_' db/migrations --include=*.sql 2>/dev/null | grep -v "^$bdp_mig$" | sort || true)
+if [[ -n "$bdp_drop" ]]; then
+  echo "!! blocchi-dei-prompt: una migrazione DISATTIVA il presidio sui blocchi:" >&2
+  printf '     %s
+' $bdp_drop >&2
+  echo "   Per rimuovere un blocco di proposito si DICHIARA la rimozione:" >&2
+  echo "     SET LOCAL nexus.blocchi_rimossi = 'tag1,tag2';" >&2
+  fail=1
+fi
+# 4. La prova che il presidio FALLISCE davvero deve restare: e' l'unica cosa che
+#    distingue un trigger armato da uno che non e' mai stato esercitato.
+if ! grep -q 'senza_il_trigger_la_stessa_riscrittura_passa' crates/nexus-prompt/tests/blocchi_dei_prompt.rs 2>/dev/null; then
+  echo "!! blocchi-dei-prompt: sparita la mutazione che prova il presidio" >&2
+  echo "   (crates/nexus-prompt/tests/blocchi_dei_prompt.rs)." >&2
+  fail=1
+fi
+if [[ "$fail" -eq 0 ]]; then
+  echo "OK blocchi-dei-prompt: criterio in un posto solo, presidio armato e provato"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

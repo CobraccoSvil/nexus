@@ -6325,14 +6325,22 @@ mod tests {
         upsert_setting(&pool, "reflection_sample_rate", "0.77").await;
         // La riga esiste per SEED (mig 0448): la si aggiorna, e il numero di
         // righe toccate e' esso stesso il controllo che quel seed ci sia.
-        let toccate = sqlx::query(
-            "UPDATE nexus_prompt_templates SET content = 'RUBRICA-DAL-DB', is_active = TRUE \
+        sqlx::query(
+            "UPDATE nexus_prompt_templates SET is_active = TRUE \
              WHERE key = 'system.reflection_rubric'",
         )
         .execute(&pool)
         .await
-        .expect("update template rubrica")
-        .rows_affected();
+        .expect("attivazione template rubrica");
+        // La riscrittura passa dal punto unico: dal 19/08/2026 sostituire per
+        // intero il contenuto di un template e' una perdita di blocchi, e va
+        // DICHIARATA al trigger della mig 0744.
+        let toccate = crate::test_support::sostituisci_contenuto_template(
+            &pool,
+            "system.reflection_rubric",
+            "RUBRICA-DAL-DB",
+        )
+        .await;
         assert_eq!(toccate, 1, "il seed 0448 deve esserci");
 
         let cfg =

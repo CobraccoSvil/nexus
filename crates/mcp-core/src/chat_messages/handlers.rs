@@ -3247,13 +3247,8 @@ mod tests_system_prompt_della_chat {
         // La domanda vera: la configurazione sta nel DB (regola G) o nel
         // binario? Un template riscritto e' l'unico modo per distinguerle.
         const TEMPLATE: &str = "Sei l'agente. Regola unica: chiedi prima di scrivere.";
-        sqlx::query(
-            "UPDATE nexus_prompt_templates SET content = $1 WHERE key = 'system.nexus_base'",
-        )
-        .bind(TEMPLATE)
-        .execute(&pool)
-        .await
-        .expect("riscrittura di system.nexus_base");
+        crate::test_support::sostituisci_contenuto_template(&pool, "system.nexus_base", TEMPLATE)
+            .await;
 
         let cache = TemplateCache::new();
         let system =
@@ -3313,12 +3308,7 @@ mod tests_system_prompt_della_chat {
             ("system.nexus_base", BASE),
             ("system.nexus_act_first_suffix", SUFFISSO),
         ] {
-            sqlx::query("UPDATE nexus_prompt_templates SET content = $1 WHERE key = $2")
-                .bind(content)
-                .bind(key)
-                .execute(&pool)
-                .await
-                .expect("riscrittura template");
+            crate::test_support::sostituisci_contenuto_template(&pool, key, content).await;
         }
 
         let cache = TemplateCache::new();
@@ -3360,12 +3350,7 @@ mod tests_system_prompt_della_chat {
             ("system.nexus_base", BASE),
             ("system.nexus_act_first_suffix", SUFFISSO),
         ] {
-            sqlx::query("UPDATE nexus_prompt_templates SET content = $1 WHERE key = $2")
-                .bind(content)
-                .bind(key)
-                .execute(&pool)
-                .await
-                .expect("riscrittura template");
+            crate::test_support::sostituisci_contenuto_template(&pool, key, content).await;
         }
 
         let cache = TemplateCache::new();
