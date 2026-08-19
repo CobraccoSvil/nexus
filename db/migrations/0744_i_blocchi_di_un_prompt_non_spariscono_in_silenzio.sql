@@ -49,8 +49,8 @@
 -- la 0674 documenta al suo punto 4, e su cui la 0743 ha dovuto correggere
 -- l'estrazione dal donatore).
 --
--- MISURATO sul corpus vivo: 71 tag di chiusura distinti sui template attivi, e
--- NESSUNO e' markup accidentale — non c'e' un solo `</div>`, `</p>`, `</li>`.
+-- MISURATO sul corpus vivo (META, 19/08/2026): 69 tag di chiusura distinti su
+-- 174 righe attive, e NESSUNO e' markup accidentale — non c'e' un solo `</div>`, `</p>`, `</li>`.
 -- In questa tabella un tag di chiusura significa una cosa sola.
 --
 -- POLARITA' del riconoscimento: e' deliberatamente PERMISSIVO
