@@ -494,7 +494,17 @@ async fn resolve_system_text(
         registro.push_str("\n\n");
         registro.push_str(&direttiva);
     }
-    nexus_prompt::ambiente::con_ambiente(&ctx.core.db, registro).await
+    let registro = nexus_prompt::ambiente::con_ambiente(&ctx.core.db, registro).await;
+    // Le direttive condivise (`nexus_shared_directives`, mig 0135). Ambito
+    // `Figura`: e' il prompt di una figura convocata, e lo DICHIARA il call site
+    // — la chiave e' `subagent.<kind>.base`, quindi il criterio lessicale della
+    // 0135 («scope agent = chiavi agent.*») non l'avrebbe mai selezionata.
+    nexus_prompt::direttive::con_direttive(
+        &ctx.core.db,
+        registro,
+        nexus_prompt::direttive::AmbitoPrompt::Figura,
+    )
+    .await
 }
 
 /// Costruisce l'array tools del sub-run filtrando lo schema REALE

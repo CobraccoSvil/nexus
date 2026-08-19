@@ -2487,6 +2487,71 @@ else
   echo "OK processo-operativo: le advisory sono discriminate dal punto unico"
 fi
 
+# ── direttive-condivise (2026-08-19) ────────────────────────────────────────
+# `nexus_shared_directives` (mig 0135) nasce per togliere dai template le copie
+# inline di <safety_progetto> e <anti_narration> e tenerne UNA riga ciascuno. La
+# 0135 quelle copie le RIMUOVE, perche' l'iniezione a runtime le avrebbe
+# rimesse; l'iniettore era brain/agents/prompt_registry.py, che il porting
+# zero-Python (75a6d621, 27/06/2026) ha cancellato. Dal 27/06 al 19/08/2026 la
+# tabella aveva DUE soli lettori in tutto il repo — la pagina admin e il CRUD —
+# e nessun compositore di prompt: le regole di isolamento progetto non
+# raggiungevano alcun modello, e il difetto non poteva far fallire niente.
+#
+# 1. La lettura della tabella vive in UN posto sul lato prompt. Un secondo
+#    caricatore sceglierebbe per conto suo ordine e perimetro, cioe' due idee
+#    diverse di "quali direttive valgono qui".
+dir_lettori=$(grep -rl 'FROM nexus_shared_directives' crates --include=*.rs 2>/dev/null \
+  | grep -v '^crates/admin-service/' | sort)
+dir_atteso='crates/nexus-prompt/src/direttive.rs'
+if [[ "$dir_lettori" != "$dir_atteso" ]]; then
+  echo "!! direttive-condivise: la tabella e' letta fuori dal punto unico." >&2
+  echo "   Atteso solo: $dir_atteso (piu' il CRUD di admin-service)." >&2
+  echo "   Trovati:" >&2
+  printf '     %s\n' $dir_lettori >&2
+  fail=1
+else
+  echo "OK direttive-condivise: un solo lettore della tabella sul lato prompt"
+fi
+# 2. L'AMBITO lo dichiara il chiamante (regola Q): dedurlo dal prefisso della
+#    chiave e' il confronto lessicale che ha reso il criterio inservibile — le
+#    figure hanno chiavi `subagent.*`, che nessuno `scope = 'agent'` seleziona.
+if grep -qE 'starts_with\("(agent|system)\.' crates/nexus-prompt/src/direttive.rs 2>/dev/null; then
+  echo "!! direttive-condivise: l'ambito e' tornato a dedursi dal prefisso della chiave." >&2
+  echo "   Le figure hanno chiavi subagent.*: un prefisso 'agent.' non le vede." >&2
+  fail=1
+else
+  echo "OK direttive-condivise: l'ambito e' dichiarato dal chiamante, non dedotto"
+fi
+# 3. L'innesto sta DENTRO i tre compositori (stessa terna di
+#    `ambiente-dichiarato` e `processo-operativo`): nel chiamante, comporre un
+#    prompt senza direttive tornerebbe possibile e la regressione sarebbe
+#    invisibile — e' esattamente com'e' andata per 53 giorni.
+dir_mancanti=""
+dir_innesto() {
+  local file="$1" fn="$2"
+  awk -v fn="$fn" '
+    index($0, fn) { dentro = 1 }
+    dentro && /nexus_prompt::direttive::/ { print "trovato"; exit }
+    dentro && /^}/ { exit }
+  ' "$file" 2>/dev/null
+}
+if [[ -z "$(dir_innesto crates/mcp-core/src/chat_messages/handlers.rs 'async fn compose_chat_system_context')" ]]; then
+  dir_mancanti+="  compose_chat_system_context (chat)"$'\n'
+fi
+if [[ -z "$(dir_innesto crates/mcp-core/src/agent_tools/subagent_native.rs 'async fn resolve_system_text')" ]]; then
+  dir_mancanti+="  resolve_system_text (sub-run / figure del consiglio)"$'\n'
+fi
+if [[ -z "$(dir_innesto crates/mcp-core/src/chat_messages/agent_run.rs 'async fn compose_agent_system_text')" ]]; then
+  dir_mancanti+="  compose_agent_system_text (run agentico, resume e remediation)"$'\n'
+fi
+if [[ -n "$dir_mancanti" ]]; then
+  echo "!! direttive-condivise: un contesto non riceve piu' le direttive condivise:" >&2
+  printf '%s' "$dir_mancanti" >&2
+  fail=1
+else
+  echo "OK direttive-condivise: i tre compositori innestano le direttive"
+fi
+
 # ── causa-del-timeout (2026-08-02) ──────────────────────────────────────────
 # «Tempo scaduto» e' vero e non serve a nulla: non distingue un run fermo su una
 # strada chiusa da uno che stava lavorando, e solo per il secondo ha senso

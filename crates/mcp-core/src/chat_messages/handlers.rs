@@ -606,6 +606,18 @@ async fn compose_chat_system_context(
     // esecuzione non deve essere componibile senza (vedi `crate::prompt_ambiente`).
     // PRIMA del blocco KB: e' un fatto stabile e deve restare nel prefisso.
     let stabile = nexus_prompt::ambiente::con_ambiente(db, ctx).await;
+    // Le direttive condivise (`nexus_shared_directives`, mig 0135): dal porting
+    // zero-Python al 19/08/2026 la tabella non aveva alcun consumatore, e le
+    // regole di isolamento progetto non raggiungevano nessun modello. Ambito
+    // dichiarato dal chiamante (mai dedotto dal nome della chiave: le figure
+    // hanno chiavi `subagent.*` e un prefisso `agent.` non le selezionerebbe).
+    // PRIMA del blocco KB: sono testo stabile e devono restare nel prefisso.
+    let stabile = nexus_prompt::direttive::con_direttive(
+        db,
+        stabile,
+        nexus_prompt::direttive::AmbitoPrompt::Sistema,
+    )
+    .await;
     // Iniezione Knowledge Base (top-K note semanticamente rilevanti), gia'
     // risolta dal chiamante. Failsafe: se brain down o KB vuota il flusso
     // prosegue senza contesto KB — e senza confine, perche' un blocco vuoto e'
@@ -3161,6 +3173,73 @@ mod tests_system_prompt_della_chat {
         // La premessa del confine: il blocco KB sta DOPO, quindi fuori dalla
         // parte stabile — altrimenti questo test non distingue le posizioni.
         assert!(!stabile.contains("Note pertinenti"), "{stabile}");
+    }
+
+    /// Le direttive condivise (mig 0135) arrivano al MODELLO: la misura passa
+    /// dal compositore reale della chat, non dalla funzione che le carica.
+    ///
+    /// E' la forma esatta del difetto vissuto dal 27/06 al 19/08/2026: la
+    /// tabella era popolata, la pagina admin la mostrava, e il testo non entrava
+    /// in nessun prompt — un test sul solo caricatore sarebbe rimasto verde per
+    /// tutti quei 53 giorni.
+    ///
+    /// La POSIZIONE e' parte del contratto: blocco stabile, quindi dentro
+    /// `parte_stabile`, o esce dal prefisso che il fornitore riusa.
+    ///
+    /// MUTAZIONE: togliere `con_direttive` da `compose_chat_system_context`
+    /// riporta il system senza `</safety_progetto>` e la prima asserzione cade
+    /// col valore del difetto reale.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_chat_riceve_le_direttive_condivise_nella_parte_stabile(pool: PgPool) {
+        let cache = TemplateCache::new();
+        // Blocco KB presente: solo cosi' il confine di turno esiste e la
+        // posizione delle direttive rispetto a esso e' misurabile.
+        let kb = Some("### Note pertinenti\n- nota di prova".to_string());
+        let system =
+            compose_chat_system_context(&pool, &cache, TASK, AutomationMode::Study, None, kb)
+                .await;
+
+        // Il testo atteso lo chiedo al PRODUTTORE, la stessa strada della
+        // produzione: ne' una copia scritta qui (seconda verita', regola G) ne'
+        // una query mia alla tabella (un secondo lettore che potrebbe leggere
+        // altro, regola O).
+        let atteso = nexus_prompt::direttive::section(
+            &pool,
+            nexus_prompt::direttive::AmbitoPrompt::Sistema,
+        )
+        .await
+        .blocco_mancante("")
+        .expect("la mig 0135 semina le direttive condivise");
+        assert!(
+            system.contains(atteso.trim()),
+            "le direttive condivise non sono nel system della chat.\n{system}"
+        );
+        assert_eq!(system.matches("</safety_progetto>").count(), 1, "{system}");
+
+        let stabile = nexus_types::system_prompt::parte_stabile(&system);
+        assert!(
+            stabile.contains("</safety_progetto>"),
+            "le direttive sono nel system ma FUORI dalla parte stabile: da li' \
+             non entrano nel prefisso che il fornitore riusa.\n{system}"
+        );
+        assert!(!stabile.contains("Note pertinenti"), "{stabile}");
+    }
+
+    /// Il verso opposto, che tiene onesto il test qui sopra: disattivate le
+    /// righe, il testo sparisce dal prompt. Senza questo, un'asserzione di
+    /// `contains` resterebbe verde anche se quel testo arrivasse dal template
+    /// invece che dalla tabella.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn direttive_disattivate_non_entrano_nel_system(pool: PgPool) {
+        sqlx::query("UPDATE nexus_shared_directives SET is_active = false")
+            .execute(&pool)
+            .await
+            .expect("disattiva le direttive");
+        let cache = TemplateCache::new();
+        let system =
+            compose_chat_system_context(&pool, &cache, TASK, AutomationMode::Study, None, None)
+                .await;
+        assert!(!system.contains("</safety_progetto>"), "{system}");
     }
 
     #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]

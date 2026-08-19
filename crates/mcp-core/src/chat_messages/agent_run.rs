@@ -4746,6 +4746,18 @@ pub(crate) async fn compose_agent_system_text(
             .map(|block| format!("\n{block}\n"))
             .unwrap_or_default()
     };
+    // Le direttive condivise (`nexus_shared_directives`, mig 0135, punto unico
+    // `nexus_prompt::direttive`). STABILI come il processo: cambiano solo su
+    // edit admin, quindi entrano nel primo gruppo. Appenderle in coda — come fa
+    // `con_ambiente` qui sotto — le spingerebbe dietro il confine di turno
+    // appena esiste una parte variabile, fuori dal prefisso riusabile.
+    //
+    // L'idempotenza si chiede a `parts.system_context`: e' l'unica parte che
+    // viene da un template gia' composto (per la chat porta gia' le direttive,
+    // e questa chiamata e' un no-op), le altre non possono portarle.
+    let ambito = nexus_prompt::direttive::AmbitoPrompt::Sistema;
+    let direttive =
+        nexus_prompt::direttive::blocco_stabile(db, &parts.system_context, ambito).await;
     // L'ordine non e' estetico: e' il tratto di prompt che due run dello stesso
     // progetto possono condividere. Prima cio' che resta identico fra run, poi
     // cio' che cambia da un run all'altro — e il criterio sta nel punto unico
@@ -4769,6 +4781,7 @@ pub(crate) async fn compose_agent_system_text(
             &parts.profile_prompt_block,
             &processo,
             &parts.system_context,
+            &direttive,
         ],
         &[
             &parts.risorse_block,
@@ -7920,6 +7933,60 @@ mod tests_prefisso_fra_run {
             "il processo e' nel system agentico ma FUORI dalla parte stabile.\n{sys}"
         );
         assert!(!stabile.contains(MEMORIA_DEPLOY), "{stabile}");
+    }
+
+    /// Le direttive condivise (mig 0135) entrano nel system del RUN AGENTICO e
+    /// stanno nella parte STABILE.
+    ///
+    /// Il compositore della chat non copre questo percorso: in Conferma e
+    /// Automatico l'handler dispatcha qui, e i percorsi FUORI chat
+    /// (`process_resume`, i due worker di remediation) arrivano con
+    /// `system_context` vuoto — sono anche i piu' esposti, perche' eseguono
+    /// comandi di sistema. E' la stessa lezione di `prompt_memories`: un
+    /// consumo su un ramo solo lascia l'altro scoperto senza che nulla fallisca.
+    ///
+    /// MUTAZIONE: appendere `direttive` in coda a `compose_agent_system_text`
+    /// (come fa `con_ambiente`) invece che nel gruppo `stabili` lo spinge dietro
+    /// il confine appena esiste una parte variabile, e l'ultima asserzione cade.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn le_direttive_condivise_stanno_nella_parte_stabile_del_run(pool: PgPool) {
+        let project_id = Uuid::new_v4();
+        let recall = RecallInMemoria::nuovo().con_punto(0.91, punto(project_id, MEMORIA_DEPLOY));
+        let sys =
+            compose_agent_system_text(&pool, &recall, project_id, TASK_A, parti_del_progetto())
+                .await;
+
+        assert_eq!(sys.matches("</safety_progetto>").count(), 1, "{sys}");
+        let stabile = parte_stabile(&sys);
+        assert!(stabile.len() < sys.len(), "nessun confine emesso: {sys}");
+        assert!(
+            stabile.contains("</safety_progetto>"),
+            "le direttive condivise sono nel system agentico ma FUORI dalla \
+             parte stabile.\n{sys}"
+        );
+    }
+
+    /// Il caso chat -> run agentico: il `system_context` arriva gia' dotato
+    /// delle direttive e il compositore non le raddoppia. Senza idempotenza il
+    /// modello leggerebbe due volte le stesse regole di isolamento.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn le_direttive_gia_nel_contesto_non_si_raddoppiano(pool: PgPool) {
+        let project_id = Uuid::new_v4();
+        let recall = RecallInMemoria::nuovo();
+        // Il contesto passa dal produttore reale delle direttive, non da una
+        // copia scritta a mano qui (regola O).
+        let contesto = nexus_prompt::direttive::con_direttive(
+            &pool,
+            "<role>Sei Nexus.</role>".to_string(),
+            nexus_prompt::direttive::AmbitoPrompt::Sistema,
+        )
+        .await;
+        assert!(contesto.contains("</safety_progetto>"), "premessa: {contesto}");
+
+        let mut parti = parti_del_progetto();
+        parti.system_context = contesto;
+        let sys = compose_agent_system_text(&pool, &recall, project_id, TASK_A, parti).await;
+        assert_eq!(sys.matches("</safety_progetto>").count(), 1, "{sys}");
     }
 }
 

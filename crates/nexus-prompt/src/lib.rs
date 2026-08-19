@@ -16,5 +16,6 @@
 
 pub mod ambiente;
 pub mod blocchi;
+pub mod direttive;
 pub mod learned;
 pub mod processo;
