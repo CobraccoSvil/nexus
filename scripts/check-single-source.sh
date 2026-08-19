@@ -4827,6 +4827,32 @@ if ! grep -q 'senza_il_trigger_la_stessa_riscrittura_passa' crates/nexus-prompt/
   echo "   (crates/nexus-prompt/tests/blocchi_dei_prompt.rs)." >&2
   fail=1
 fi
+# 5. La COPERTURA (mig 0745) e' l'altra meta': il criterio serve a INTERROGARE,
+#    e il perimetro su cui lo si interroga non si scrive a mano. Stessa
+#    disciplina: una definizione sola, e il prefisso NON chiesto a `LIKE` — le
+#    chiavi contengono underscore, che in `LIKE` e' un jolly, ed e' lo stesso
+#    equivoco che ha prodotto lo «0 su 8» del 18/08.
+bdp_mig745='db/migrations/0745_copertura_di_un_blocco_sul_perimetro_servibile.sql'
+for bdp_fn in prompt_chiavi_servibili prompt_copertura_blocco; do
+  bdp_def=$(grep -rl "CREATE OR REPLACE FUNCTION $bdp_fn" db/migrations --include=*.sql 2>/dev/null | sort || true)
+  if [[ "$bdp_def" != "$bdp_mig745" ]]; then
+    echo "!! blocchi-dei-prompt: $bdp_fn e' definita fuori dalla 0745." >&2
+    echo "   Atteso solo: $bdp_mig745" >&2
+    echo "   Trovate:" >&2
+    printf '     %s\n' ${bdp_def:-"(nessuna: la funzione non esiste piu')"} >&2
+    fail=1
+  fi
+done
+# Le righe di COMMENTO restano fuori: quel file SPIEGA perche' la forma con
+# `LIKE` e' sbagliata, e un guard che matchasse la propria spiegazione sarebbe
+# rosso per costruzione (misurato: e' successo alla prima stesura).
+if grep -vE '^\s*--' "$bdp_mig745" 2>/dev/null | grep -q "key LIKE p_chiave"; then
+  echo "!! blocchi-dei-prompt: il perimetro e' tornato a chiedere il prefisso a LIKE." >&2
+  echo "   Le chiavi contengono underscore, e in LIKE l'underscore e' un JOLLY:" >&2
+  echo "   il perimetro accetterebbe chiavi che differiscono proprio li'." >&2
+  echo "   Forma corretta: left(key, length(p_chiave) + 1) = p_chiave || '.'" >&2
+  fail=1
+fi
 if [[ "$fail" -eq 0 ]]; then
   echo "OK blocchi-dei-prompt: criterio in un posto solo, presidio armato e provato"
 fi

@@ -308,3 +308,109 @@ async fn il_criterio_e_interrogabile_in_un_posto_solo(pool: PgPool) {
         .expect("il punto unico risponde");
     assert_eq!(persi, vec!["a"], "aggiungere <c> non e' perdere");
 }
+
+// ── mig 0745: la copertura di un blocco sul perimetro servibile ─────────────
+
+/// Il PERIMETRO ha DUE implementazioni e la loro relazione va MISURATA.
+///
+/// `nexus_types::chiavi_servibili` (Rust, ESATTO) e `prompt_chiavi_servibili`
+/// (SQL, per PREFISSO, quindi SOVRAINSIEME) esistono entrambe perche' il SQL
+/// non puo' leggere il Rust: un guard scritto in una migrazione si appoggia al
+/// secondo, i test al primo. Se il sovrainsieme smettesse di contenere l'esatto,
+/// un guard SQL potrebbe passare su una riga che il runtime serve davvero — che
+/// e' il difetto della 0739, dove i mandati italiani erano aggiornati e le
+/// varianti `.en` no.
+///
+/// MUTAZIONE: togliere il ramo `key LIKE p_chiave || '.%'` da
+/// `prompt_chiavi_servibili` fa cadere questa asserzione nominando le chiavi
+/// `.en` che il runtime serve e il perimetro SQL non vedrebbe piu'.
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+async fn il_perimetro_sql_contiene_quello_rust(pool: PgPool) {
+    let basi: Vec<String> = sqlx::query_scalar(
+        "SELECT key FROM nexus_prompt_templates WHERE is_active AND key NOT LIKE '%.en' ORDER BY key",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("elenco delle chiavi base");
+    assert!(basi.len() > 100, "corpus troppo piccolo: {} chiavi", basi.len());
+
+    let mut mancanti = Vec::new();
+    for base in &basi {
+        let dal_sql: Vec<String> = sqlx::query_scalar("SELECT prompt_key FROM prompt_chiavi_servibili($1)")
+            .bind(base)
+            .fetch_all(&pool)
+            .await
+            .expect("perimetro SQL");
+        for attesa in nexus_types::chiavi_servibili(base) {
+            // Solo le righe che ESISTONO e sono attive: una variante mai
+            // scritta non e' nel perimetro di nessuno dei due.
+            let esiste: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM nexus_prompt_templates WHERE key = $1 AND is_active)",
+            )
+            .bind(&attesa)
+            .fetch_one(&pool)
+            .await
+            .expect("esistenza");
+            if esiste && !dal_sql.contains(&attesa) {
+                mancanti.push(attesa);
+            }
+        }
+    }
+    assert!(
+        mancanti.is_empty(),
+        "il perimetro SQL non contiene righe che il runtime puo' servire: {mancanti:?}"
+    );
+}
+
+/// La copertura risponde alla domanda del 18/08 sul corpus vero, e la risposta
+/// e' quella che il guard LESSICALE della 0742 dava per un'altra strada.
+///
+/// Il valore non e' il numero: e' che il perimetro non si scrive a mano. Il
+/// `8 su 8` di ieri e' falso alla prima figura aggiunta, e una figura nuova
+/// entra qui da sola.
+///
+/// MUTAZIONE: togliere il blocco a una riga servibile nella 0742 fa cadere
+/// questa asserzione nominando la chiave scoperta.
+#[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+async fn la_copertura_risponde_dove_l_ilike_rispondeva_zero(pool: PgPool) {
+    // Il perimetro della 0742: le figure che emettono `advisory_verdict`.
+    let figure: Vec<String> = sqlx::query_scalar(
+        "SELECT key FROM nexus_prompt_templates \
+         WHERE is_active AND key LIKE 'subagent.%' AND content LIKE '%advisory_verdict%' \
+         ORDER BY key",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("figure advisory");
+    assert!(!figure.is_empty(), "perimetro vuoto: la verifica sarebbe vacua");
+
+    let mut fuori = Vec::new();
+    let mut righe = 0usize;
+    for figura in &figure {
+        let esiti: Vec<(String, String)> =
+            sqlx::query_as("SELECT prompt_key, esito FROM prompt_copertura_blocco($1, $2)")
+                .bind("prove_eseguibili")
+                .bind(figura)
+                .fetch_all(&pool)
+                .await
+                .expect("copertura");
+        for (chiave, esito) in esiti {
+            righe += 1;
+            if esito != "presente" {
+                fuori.push(format!("{chiave}: {esito}"));
+            }
+        }
+    }
+    assert!(righe >= figure.len(), "meno righe servibili delle figure");
+    assert!(fuori.is_empty(), "righe servibili senza il piano di verifica: {fuori:?}");
+
+    // E la forma esatta del falso negativo del 18/08: con lo SPAZIO al posto
+    // dell'underscore, il LESSICALE risponde zero sulle stesse righe.
+    let con_spazio: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM nexus_prompt_templates WHERE is_active AND content ILIKE '%prove eseguibili%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("conteggio lessicale");
+    assert_eq!(con_spazio, 0, "la ricerca con lo spazio deve rispondere zero");
+}
