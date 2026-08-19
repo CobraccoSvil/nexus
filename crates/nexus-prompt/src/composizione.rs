@@ -57,15 +57,28 @@
 //!
 //! Senza di esso «togli un blocco» non e' un'operazione sul prompt: e' una
 //! riscrittura del prompt che per caso somiglia all'originale. MISURATO il
-//! 19/08/2026 sul META vivo, 174 righe attive: **0 su 174 cambiano un byte**
-//! attraversando la scomposizione. La proprieta' resta sorvegliata da
+//! 19/08/2026 sul META vivo con lo scompositore definitivo, 174 righe attive:
+//! **0 su 174 cambiano un byte** attraversando la scomposizione — comprese le
+//! 27 righe `subagent.*` che nascono a runtime dal FigureWizard e che nessuna
+//! migrazione produce, quindi invisibili al corpus del DB migrato. La
+//! proprieta' resta sorvegliata da
 //! `il_giro_dalla_scomposizione_non_cambia_un_byte`, che gira sul corpus del DB
 //! migrato a ogni gate.
 //!
-//! ## Tre fatti del corpus reale che hanno deciso il criterio
+//! ## Quattro fatti del corpus reale che hanno deciso il criterio
 //!
-//! (misura del 19/08/2026 sul META vivo: 180 righe, 174 attive, 58 con almeno un
-//! blocco, 65 tag distinti)
+//! Misura del 19/08/2026 sul META vivo, RIPETUTA con lo scompositore definitivo
+//! (il primo giro diceva 58 e 65: quei numeri erano di uno scompositore che
+//! ignorava le aperture con attributi — punto 4 — ed erano quindi la misura di
+//! un difetto, non del corpus):
+//!
+//! **180 righe, 174 attive, 61 con almeno un blocco, 69 tag distinti.**
+//!
+//! I 69 coincidono con i «69 tag di chiusura distinti» che la mig 0744 aveva
+//! contato per conto proprio, con una regexp e senza mai comporre un'apertura:
+//! due strade indipendenti sullo stesso corpus, stesso numero. E' la stessa
+//! cosa che il ponte `rust_e_sql_riconoscono_gli_stessi_blocchi` sorveglia
+//! riga per riga.
 //!
 //! 1. **L'annidamento esiste, ed e' uno.** `<suggested_actions>` sta dentro
 //!    `<next_actions>` in `system.nexus_base`. Uno scompositore a scansione
