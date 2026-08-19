@@ -1390,6 +1390,12 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
             _ => 0,
         };
         let passed = !matches!(esito, EsitoCriteri::Fallito);
+        // UN solo criterio di "chiusura non verificata" per i DUE rami che
+        // chiudono positivamente (PASSED, e la rimisura dopo il turno di
+        // grazia): due espressioni darebbero due idee di "verificato" che
+        // divergono al primo ritocco (regola L).
+        let chiusura_non_verificata =
+            self.cfg.verify_profile_missing || functional_probe_missing || inconclusive_n > 0;
 
         // ── Ramo PASSED (final_gate.py:513-522) ───────────────────────────────
         // Chiude con esito canonico CompletedVerified lato mcp-core.
@@ -1432,11 +1438,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 // boccia (non prova un difetto) e non assolve (non prova la
                 // correttezza), quindi ha esattamente la conseguenza degli altri
                 // due -- il finalizzatore mappa `CompletedUnverified`.
-                final_gate_unverified: Some(Some(
-                    self.cfg.verify_profile_missing
-                        || functional_probe_missing
-                        || inconclusive_n > 0,
-                )),
+                final_gate_unverified: Some(Some(chiusura_non_verificata)),
                 ..Default::default()
             }
             .into_opaque());
@@ -1460,13 +1462,28 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
             // bocciare come FailedDiagnosed un lavoro di fatto riuscito e
             // verificato: concedi UN turno mirato per la firma. SOLO al primo
             // ingresso al cap (`cycle == max_cycles`) e NON su forced_close (abort
-            // anti-loop): il turno porta `final_gate_cycle` a max_cycles, quindi il
-            // giro successivo rientra qui con `cycle > max_cycles` e chiude — grazia
-            // una volta sola, nessun loop, nessun nuovo campo di stato.
-            if !forced_close
-                && cycle == max_cycles
-                && Self::only_completion_confirmed_failed(&results)
-            {
+            // anti-loop).
+            //
+            // LA GRAZIA NON E' UN VERDETTO, E' UNA PROMESSA. Restituendo il
+            // turno si consegna il codice a chi lo puo' ancora cambiare, quindi
+            // cio' che si e' appena misurato descrive l'albero di ADESSO e non
+            // l'esito del run: il verdetto emesso e' `PassedPendingSignature`
+            // (non terminale) e l'ultima parola spetta alla RIMISURA. Perche' la
+            // rimisura possa avvenire il ciclo scende a `max_cycles - 1` — la
+            // porta ordinaria (`final_gate_eligible`) resta aperta per UN solo
+            // rientro — e la seconda grazia la vieta il flag DEDICATO
+            // `final_gate_grace_granted`, monotono (regola Q: il contatore
+            // porterebbe due significati opposti sullo stesso numero).
+            //
+            // Prima il turno portava `final_gate_cycle` a `max_cycles` con la
+            // didascalia «il giro successivo rientra qui e chiude»: quella
+            // premessa il routing la rende IMPOSSIBILE (`final_gate_eligible`
+            // pretende `cycle < max_cycles`), quindi il turno di grazia era
+            // l'ULTIMO ingresso del gate e il suo verdetto positivo sopravviveva
+            // a qualunque scrittura successiva.
+            let grazia_gia_concessa = state.final_gate_grace_granted.unwrap_or(false);
+            let solo_firma_manca = Self::only_completion_confirmed_failed(&results);
+            if !forced_close && cycle == max_cycles && !grazia_gia_concessa && solo_firma_manca {
                 crate::nodes::emit_phase_meta(
                     ctx.emit.as_ref(),
                     self.meta_steps.as_ref(),
@@ -1487,20 +1504,45 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 };
                 return Ok(StateDelta {
                     messages: Some(vec![hm]),
-                    final_gate_cycle: Some(Some(cycle)),
+                    // UN solo rientro: la porta ordinaria resta aperta e la
+                    // seconda grazia la vieta il flag qui sotto.
+                    final_gate_cycle: Some(Some(max_cycles.saturating_sub(1))),
+                    final_gate_grace_granted: Some(Some(true)),
                     stop_reason: Some(Some(StopReason::ToolUse)),
                     pending_tool_uses: Some(Some(vec![])),
-                    // Il lavoro E' verificato: manca solo la firma. Senza questo
-                    // verdetto esplicito il `cycle = max_cycles` qui sopra veniva
-                    // letto a valle come "verifica fallita" e un run RIUSCITO
-                    // chiudeva FailedDiagnosed.
+                    // Il lavoro e' verificato SULL'ALBERO MISURATO: manca solo la
+                    // firma. Senza questo verdetto esplicito il ciclo veniva letto
+                    // a valle come "verifica fallita" e un run RIUSCITO chiudeva
+                    // FailedDiagnosed.
                     gate_routing: Some(Some(GateRouting::RimandaInCorrezione)),
-                    final_gate_verdict: Some(Some(
-                        FinalGateVerdict::ObjectivePassedSignatureMissing,
-                    )),
+                    final_gate_verdict: Some(Some(FinalGateVerdict::PassedPendingSignature)),
+                    // Se il run muore PRIMA della rimisura promessa, l'unica
+                    // lettura onesta e' "svolto ma non verificato": la misura che
+                    // abbiamo descrive un albero che da qui in poi puo' cambiare.
+                    // Il rientro nel gate ricalcola questo campo dai fatti.
+                    final_gate_unverified: Some(Some(true)),
                     ..Default::default()
                 }
                 .into_opaque());
+            }
+
+            // ── CHIUSURA dopo la grazia: firma ancora assente, criteri
+            // oggettivi superati ────────────────────────────────────────────
+            // Stessa constatazione del turno di grazia, ma qui il gate CHIUDE:
+            // il turno non torna a nessuno, quindi l'albero appena misurato e'
+            // quello finale e l'affermazione "criteri oggettivi superati" resta
+            // vera. E' il caso per cui la grazia esiste — l'agente ha lavorato,
+            // tutto passa, la sola dichiarazione strutturata non arriva — e
+            // continua a chiudere bene: `final_gate_passed=true` piu' l'onesta'
+            // sul non-misurato, esattamente come il ramo PASSED.
+            //
+            // Senza questo ramo la grazia sarebbe una trappola: chi la riceve e
+            // firma chiude bene, chi la riceve e tace verrebbe bocciato
+            // `FailedFinal` con i criteri oggettivi tutti verdi.
+            if !forced_close && grazia_gia_concessa && solo_firma_manca {
+                return Ok(self
+                    .chiusura_con_firma_assente(cycle, inconclusive_n, chiusura_non_verificata, ctx)
+                    .await);
             }
             // ── NON-CONVERGENZA -> ESCALATION di modello (regola H, "niente di
             // fisso") ─────────────────────────────────────────────────────────
@@ -1529,7 +1571,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 .unwrap_or(0);
             if self.cfg.escalate_on_nonconvergence
                 && !forced_close
-                && !Self::only_completion_confirmed_failed(&results)
+                && !solo_firma_manca
                 && auto_escalations < self.cfg.max_escalations
             {
                 tracing::warn!(
@@ -1699,6 +1741,56 @@ impl FinalGateNode {
             serde_json::json!({"phase": "profile_missing"}),
         )
         .await;
+    }
+
+    /// CHIUSURA con i criteri oggettivi superati e la sola firma assente, DOPO
+    /// che il turno di grazia e' gia' stato speso.
+    ///
+    /// E' l'altra meta' della grazia e ne rende vera l'affermazione: qui il gate
+    /// CHIUDE, quindi l'albero appena misurato e' quello finale e
+    /// [`FinalGateVerdict::ObjectivePassedSignatureMissing`] non puo' piu' essere
+    /// smentito da una scrittura successiva. Senza questo ramo la grazia sarebbe
+    /// una trappola — chi la riceve e firma chiude bene, chi la riceve e tace
+    /// verrebbe bocciato `FailedFinal` con tutti gli oggettivi verdi.
+    ///
+    /// `non_verificata` arriva dal chiamante ed e' lo STESSO valore che riceve il
+    /// ramo PASSED: i due rami che chiudono positivamente non possono avere due
+    /// idee di "verificato" (regola L).
+    async fn chiusura_con_firma_assente(
+        &self,
+        cycle: i64,
+        inconclusive_n: usize,
+        non_verificata: bool,
+        ctx: &AgentNodeCtx,
+    ) -> OpaqueDelta {
+        tracing::info!(
+            target: "nexus_agent_graph::final_gate",
+            cycle,
+            inconclusive = inconclusive_n,
+            "final_gate: criteri oggettivi superati alla rimisura, firma assente -> chiusura"
+        );
+        crate::nodes::emit_phase_meta(
+            ctx.emit.as_ref(),
+            self.meta_steps.as_ref(),
+            "final_gate",
+            "Criteri oggettivi superati, dichiarazione di chiusura assente: chiudo".to_string(),
+            serde_json::json!({
+                "cycle": cycle,
+                "phase": "objective_passed_signature_missing",
+                "inconclusive": inconclusive_n,
+            }),
+        )
+        .await;
+        StateDelta {
+            final_gate_cycle: Some(Some(0)),
+            stop_reason: Some(Some(StopReason::EndTurn)),
+            final_gate_passed: Some(Some(true)),
+            final_gate_verdict: Some(Some(FinalGateVerdict::ObjectivePassedSignatureMissing)),
+            gate_routing: Some(Some(GateRouting::Chiude)),
+            final_gate_unverified: Some(Some(non_verificata)),
+            ..Default::default()
+        }
+        .into_opaque()
     }
 
     /// Delta pass-through (`final_gate.py:506`): il gate non si applica, il
@@ -2001,7 +2093,6 @@ mod tests {
             out.final_gate_passed, None,
             "il turno di grazia NON registra final_gate_passed=false"
         );
-        assert_eq!(out.final_gate_cycle, Some(2));
         let msg = serde_json::to_string(&out.messages).unwrap();
         assert!(
             msg.contains("task_complete"),
@@ -2009,27 +2100,185 @@ mod tests {
         );
     }
 
+    /// La grazia RESTITUISCE il turno: cio' che ha misurato descrive l'albero di
+    /// adesso, non l'esito del run. Il delta deve percio' dichiarare una PROMESSA
+    /// (verdetto non terminale + porta lasciata aperta a UNA rimisura), non un
+    /// verdetto positivo definitivo.
+    ///
+    /// Mutazione che lo rende rosso: riportare il delta a
+    /// `final_gate_verdict = ObjectivePassedSignatureMissing` e
+    /// `final_gate_cycle = cycle`.
     #[tokio::test]
-    async fn completion_grace_una_volta_sola_poi_chiude() {
-        // Al giro DOPO la grazia (cycle > max_cycles) il gate chiude failed anche
-        // se completion_confirmed e' ancora l'unico fallito: nessun loop.
+    async fn completion_grace_promette_una_rimisura_e_non_un_esito() {
         let runner = Arc::new(StubCriteriaRunner::with_results(vec![
-            ok_result("run_command"),
+            ok_result("codice_eseguibile"),
             fail_result("completion_confirmed", json!({})),
         ]));
         let node = node_with(FinalGateConfig::default(), runner);
         let ctx = ctx_with();
         let st = AgentState {
-            final_gate_cycle: Some(2), // -> cycle diventa 3 > max_cycles
+            final_gate_cycle: Some(1), // -> cycle diventa 2 == max_cycles
             ..software_state()
         };
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(
-            out.final_gate_passed,
-            Some(false),
-            "grazia gia' spesa: chiude failed"
+            out.final_gate_verdict,
+            Some(FinalGateVerdict::PassedPendingSignature),
+            "il turno di grazia non ha ancora l'ultima parola: il verdetto non e' un esito"
         );
+        assert_eq!(
+            out.final_gate_grace_granted,
+            Some(true),
+            "la grazia si dichiara con un campo suo, non col contatore"
+        );
+        assert_eq!(
+            out.final_gate_cycle,
+            Some(1),
+            "il ciclo lascia aperta la porta ordinaria del gate per UNA rimisura"
+        );
+        assert_eq!(
+            out.final_gate_unverified,
+            Some(true),
+            "se il run muore prima della rimisura, l'esito onesto e' 'svolto ma non verificato'"
+        );
+    }
+
+    /// REGOLA O — il rientro promesso deve avvenire per la strada VERA. Il test
+    /// precedente di questa famiglia fabbricava `final_gate_cycle = 2`, uno stato
+    /// che il routing non consegna MAI al nodo (`final_gate_eligible` pretende
+    /// `cycle < max_cycles`): era verde e misurava un ingresso che non avviene.
+    ///
+    /// Qui lo stato lo produce il gate stesso e la domanda la si pone alle DUE
+    /// porte reali: il turno ordinario e il cap delle iterazioni — che nel run
+    /// misurato il 19/08/2026 era quella percorsa.
+    #[tokio::test]
+    async fn dopo_la_grazia_il_routing_riporta_al_gate_anche_al_cap() {
+        let runner = Arc::new(StubCriteriaRunner::with_results(vec![
+            ok_result("codice_eseguibile"),
+            fail_result("completion_confirmed", json!({})),
+        ]));
+        let node = node_with(FinalGateConfig::default(), runner);
+        let ctx = ctx_with();
+        let st = AgentState {
+            final_gate_cycle: Some(1),
+            ..software_state()
+        };
+        let dopo_grazia = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
+
+        let cfg = RoutingConfig::default();
+        assert!(
+            crate::routing::signals::final_gate_eligible(&dopo_grazia, &cfg),
+            "porta ordinaria: il gate deve poter rimisurare"
+        );
+
+        // Porta del CAP: `route_after_executor` ramo (4). Il marcatore "il gate
+        // non e' mai entrato" e' falso — un verdetto c'e' — quindi senza il
+        // segnale di rimisura promessa si chiuderebbe senza verificare.
+        let al_cap = AgentState {
+            iterations: Some(cfg.iteration_cap),
+            stop_reason: Some(StopReason::EndTurn),
+            pending_tool_uses: Some(vec![]),
+            ..dopo_grazia.clone()
+        };
+        assert_eq!(
+            crate::routing::route_after_executor(&al_cap, &cfg),
+            crate::routing::NodeTarget::FinalGate,
+            "al cap delle iterazioni la rimisura promessa deve avvenire"
+        );
+    }
+
+    /// LA CATENA del difetto misurato il 19/08/2026 su `t3-codice-eseguibile`:
+    /// grazia concessa su un albero che in quell'istante passava davvero, agente
+    /// che poi cambia il codice e lo rompe, gate che RIMISURA. Il verdetto finale
+    /// deve venire dalla seconda misura, non dalla prima.
+    ///
+    /// Mutazione che lo rende rosso: far tornare la grazia a un verdetto
+    /// definitivo (il gate non rientra e il run chiude sulla misura vecchia).
+    #[tokio::test]
+    async fn la_rimisura_dopo_la_grazia_boccia_il_codice_rotto() {
+        let ctx = ctx_with();
+        // Giro 1: il file si carica, manca solo la firma -> grazia.
+        let primo = node_with(
+            FinalGateConfig::default(),
+            Arc::new(StubCriteriaRunner::with_results(vec![
+                ok_result("codice_eseguibile"),
+                fail_result("completion_confirmed", json!({})),
+            ])),
+        );
+        let st = AgentState {
+            final_gate_cycle: Some(1),
+            // Escalation gia' esaurite: qui si misura la CHIUSURA, non la
+            // promozione di modello (che ha i suoi test).
+            extra: [("auto_escalations".to_string(), json!(3))]
+                .into_iter()
+                .collect(),
+            ..software_state()
+        };
+        let dopo_grazia = apply(st.clone(), primo.run(&st, &ctx).await.expect("run ok"));
+
+        // Giro 2: l'agente ha tolto cio' che faceva caricare il file.
+        let secondo = node_with(
+            FinalGateConfig::default(),
+            Arc::new(StubCriteriaRunner::with_results(vec![
+                fail_result("codice_eseguibile", json!({"verdict": "code_broken"})),
+                fail_result("completion_confirmed", json!({})),
+            ])),
+        );
+        let fine = apply(
+            dopo_grazia.clone(),
+            secondo
+                .run(&dopo_grazia, &ctx)
+                .await
+                .expect("run ok"),
+        );
+        assert_eq!(
+            fine.final_gate_passed,
+            Some(false),
+            "un criterio oggettivo fallito alla rimisura e' il verdetto del run"
+        );
+        assert_eq!(
+            fine.final_gate_verdict,
+            Some(FinalGateVerdict::FailedFinal),
+            "nessuna seconda grazia: il verdetto e' terminale"
+        );
+    }
+
+    /// Il caso PER CUI la grazia esiste non si rompe: chi ha superato tutti gli
+    /// oggettivi e non firma nemmeno dopo il turno mirato chiude comunque BENE —
+    /// ma ora sulla misura fresca, col gate che CHIUDE invece di restituire il
+    /// turno, che e' cio' che rende vera l'affermazione del verdetto.
+    #[tokio::test]
+    async fn grazia_gia_concessa_e_firma_ancora_assente_chiude_bene() {
+        let runner = Arc::new(StubCriteriaRunner::with_results(vec![
+            ok_result("codice_eseguibile"),
+            fail_result("completion_confirmed", json!({})),
+        ]));
+        let node = node_with(FinalGateConfig::default(), runner);
+        let ctx = ctx_with();
+        let st = AgentState {
+            final_gate_cycle: Some(1),
+            final_gate_grace_granted: Some(true),
+            final_gate_verdict: Some(FinalGateVerdict::PassedPendingSignature),
+            ..software_state()
+        };
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(out.gate_routing, Some(GateRouting::Chiude));
+        assert_eq!(
+            out.final_gate_passed,
+            Some(true),
+            "i criteri oggettivi sono superati sull'albero FINALE: non e' una bocciatura"
+        );
+        assert_eq!(
+            out.final_gate_verdict,
+            Some(FinalGateVerdict::ObjectivePassedSignatureMissing),
+            "qui il gate chiude: l'affermazione del verdetto resta vera"
+        );
+        assert_eq!(
+            out.final_gate_unverified,
+            Some(false),
+            "profilo di verifica presente e nessun criterio non misurabile: chiusura verificata"
+        );
     }
 
     // ── Ramo FORCED / CAP ───────────────────────────────────────────────────────

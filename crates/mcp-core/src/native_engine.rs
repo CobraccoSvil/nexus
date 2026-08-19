@@ -4691,21 +4691,32 @@ pub(crate) fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome 
         // Il `match` e' esaustivo di proposito: un ramo nuovo del gate non
         // compila finche' non dichiara cosa significa qui.
         final_gate_failed_pending: match state.final_gate_verdict {
-            // L'unico caso vero: bocciato con ri-verifica ATTESA e mai avvenuta.
+            // Bocciato con ri-verifica ATTESA e mai avvenuta. Il gemello e'
+            // l'escalation: anche li' l'ultimo fatto MISURATO e' un fallimento e
+            // il turno e' stato ceduto contando su un rientro nel gate; se il run
+            // muore prima (cap iterazioni, errore, cancellazione) quel fallimento
+            // e' l'unico esito oggettivo noto, e leggerlo come "completato"
+            // significherebbe chiudere bene un run la cui verifica e' fallita.
             // In plan-phase il gate e' one-shot (`final_gate_eligible` la esclude):
             // nessuna ri-verifica era prevista, quindi non e' "pendente".
-            Some(FinalGateVerdict::FailedPendingCorrection) => {
-                !state.plan_phase_active.unwrap_or(false)
-            }
-            // Grazia: criteri oggettivi TUTTI passati, manca solo la firma. Era
-            // questo il falso positivo: lascia `cycle = max_cycles` e veniva
-            // letto come "verifica fallita e non ripetuta".
-            Some(FinalGateVerdict::ObjectivePassedSignatureMissing) => false,
+            Some(
+                FinalGateVerdict::FailedPendingCorrection | FinalGateVerdict::EscalationHandoff,
+            ) => !state.plan_phase_active.unwrap_or(false),
+            // Grazia: criteri oggettivi passati sull'albero misurato, manca solo
+            // la firma, e il turno e' stato restituito. NON e' un fallimento —
+            // nessun criterio ha bocciato — quindi non e' questo il flag che ne
+            // porta l'esito: se la rimisura promessa non avviene, l'onesta' la
+            // porta `final_gate_unverified=true` -> `CompletedUnverified`.
+            // Dichiarare qui un fallimento mai misurato sarebbe l'errore
+            // speculare a quello che questo campo esiste per evitare.
+            Some(FinalGateVerdict::PassedPendingSignature) => false,
             // Verdetti espliciti: l'esito lo portano `final_gate_passed` /
             // `final_gate_unverified`, non questo flag.
-            Some(FinalGateVerdict::Passed | FinalGateVerdict::FailedFinal) => false,
-            // Il run e' proseguito su un modello promosso: non e' un esito.
-            Some(FinalGateVerdict::EscalationHandoff) => false,
+            Some(
+                FinalGateVerdict::Passed
+                | FinalGateVerdict::FailedFinal
+                | FinalGateVerdict::ObjectivePassedSignatureMissing,
+            ) => false,
             // Il gate non e' mai entrato: niente da dichiarare fallito.
             None => false,
         },
@@ -5613,8 +5624,10 @@ mod tests {
         let state = AgentState {
             result: Some("Fatto".to_string()),
             stop_reason: Some(StopReason::EndTurn),
-            // Cio' che scrive davvero il ramo di grazia: cycle == max_cycles.
-            final_gate_cycle: Some(2),
+            // Cio' che scrive il gate quando CHIUDE con gli oggettivi superati e
+            // la sola firma assente (la rimisura dopo il turno di grazia).
+            final_gate_cycle: Some(0),
+            final_gate_passed: Some(true),
             final_gate_verdict: Some(FinalGateVerdict::ObjectivePassedSignatureMissing),
             ..Default::default()
         };
@@ -5622,6 +5635,62 @@ mod tests {
         assert!(
             !out.final_gate_failed_pending,
             "la grazia ha i criteri OGGETTIVI tutti passati: non e' una bocciatura"
+        );
+        assert_eq!(out.classify_status(), AgentRunStatus::Completed);
+    }
+
+    /// IL DIFETTO del 19/08/2026 (`t3-codice-eseguibile`) letto dal lato del
+    /// finalizzatore: nessun verdetto che RESTITUISCE il turno puo' chiudere
+    /// `Completed`. Sono i tre casi in cui il gate ha misurato e poi ha ceduto la
+    /// parola a chi il codice lo puo' ancora cambiare, e per due di essi cio' che
+    /// era stato misurato e' un FALLIMENTO.
+    ///
+    /// Mutazione che lo rende rosso, un ramo per volta:
+    ///   - `EscalationHandoff => false` -> `Completed` su una verifica FALLITA
+    ///     (il caso reale: escalation al cap, run morto senza ri-verifica);
+    ///   - `PassedPendingSignature` che non porta `final_gate_unverified` ->
+    ///     `Completed` su una misura vecchia di sette scritture.
+    #[test]
+    fn nessun_verdetto_che_restituisce_il_turno_chiude_completed() {
+        // (a) Fallimento misurato, turno ceduto per promuovere il modello: se il
+        //     run muore prima della ri-verifica, l'ultimo fatto noto e' quello.
+        let mut o = base_outcome();
+        o.final_gate_failed_pending = map_outcome(StepOutcome::Completed(AgentState {
+            stop_reason: Some(StopReason::EndTurn),
+            final_gate_verdict: Some(FinalGateVerdict::EscalationHandoff),
+            ..Default::default()
+        }))
+        .final_gate_failed_pending;
+        assert_eq!(
+            o.classify_status(),
+            AgentRunStatus::FailedDiagnosed,
+            "un run il cui ultimo criterio oggettivo MISURATO e' fallito non chiude 'completed'"
+        );
+        assert!(
+            o.final_gate_failed_pending,
+            "l'escalation cede il turno su un fallimento MISURATO"
+        );
+
+        // (b) Turno di grazia: nessun criterio ha bocciato, quindi non si
+        //     dichiara un fallimento mai misurato — ma la misura descrive un
+        //     albero che da li' in poi puo' cambiare, e infatti cambio'.
+        let grazia = map_outcome(StepOutcome::Completed(AgentState {
+            result: Some("Fatto".to_string()),
+            stop_reason: Some(StopReason::EndTurn),
+            final_gate_cycle: Some(1),
+            final_gate_grace_granted: Some(true),
+            final_gate_verdict: Some(FinalGateVerdict::PassedPendingSignature),
+            final_gate_unverified: Some(true),
+            ..Default::default()
+        }));
+        assert!(
+            !grazia.final_gate_failed_pending,
+            "nessun criterio ha bocciato: non si inventa una bocciatura"
+        );
+        assert_eq!(
+            grazia.classify_status(),
+            AgentRunStatus::CompletedUnverified,
+            "misura promessa e non avvenuta: 'svolto ma non verificato', mai 'completed'"
         );
     }
 
