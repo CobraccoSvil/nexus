@@ -160,6 +160,7 @@ pub mod debate_panel;
 pub mod end_turn;
 pub mod endpoint_probes;
 pub mod escalation;
+pub mod fine_turno;
 pub mod g1_accounting;
 pub mod governance;
 pub mod helpers;

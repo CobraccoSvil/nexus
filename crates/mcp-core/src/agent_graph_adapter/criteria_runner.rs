@@ -41,7 +41,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -1521,10 +1521,10 @@ task_complete (outcome + summary)"
         let piano = piano_di_verifica::PianoDiVerifica::from_value(
             spec.get(piano_di_verifica::CHIAVE_PROVE),
         );
-        let max_prove = spec
-            .get(piano_di_verifica::CHIAVE_MAX_PROVE)
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
+        let budget_s = spec
+            .get(piano_di_verifica::CHIAVE_BUDGET_TEMPO)
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
         // (1) Vocabolario assente: NON si esegue niente e lo si dichiara.
         // Eseguire senza sapere cosa sia vietato e' esattamente il canale
         // privilegiato che questo criterio esiste per negare, e assolvere in
@@ -1577,7 +1577,7 @@ task_complete (outcome + summary)"
         // (5) Budget ed esecuzione, nell'ordine in cui il piano le ha raccolte.
         esito_piano(
             &self
-                .esegui_le_ammesse(ammissioni, giudizio, max_prove, timeout_s)
+                .esegui_le_ammesse(ammissioni, giudizio, budget_s, timeout_s)
                 .await,
         )
     }
@@ -1593,15 +1593,15 @@ task_complete (outcome + summary)"
         &self,
         ammissioni: Vec<(piano_di_verifica::Prova, piano_di_verifica::Ammissione)>,
         giudizio: Option<piano_di_verifica::CausaNonEseguita>,
-        max_prove: usize,
+        budget_s: f64,
         timeout_s: f64,
     ) -> Vec<piano_di_verifica::EsitoProva> {
         use piano_di_verifica::{Ammissione, CausaNonEseguita, EsitoProva, EsitoSingolo};
         let mut esiti: Vec<EsitoProva> = Vec::with_capacity(ammissioni.len());
-        let mut budget = Budget {
-            max: max_prove,
-            residuo: max_prove,
-        };
+        // Il cronometro parte QUI, non alla prima prova: il budget e' di questa
+        // invocazione del criterio, e le prove rifiutate a monte non ne
+        // consumano perche' non aspettano nulla.
+        let mut budget = BudgetTempo::nuovo(budget_s);
         for (prova, ammissione) in ammissioni {
             let esito = match &ammissione {
                 Ammissione::Vietata { livello, categoria } => {
@@ -1746,24 +1746,29 @@ task_complete (outcome + summary)"
         })
     }
 
-    /// Esegue la prova se il tetto lo consente, e ne giudica l'osservazione.
+    /// Esegue la prova se c'e' ancora budget di TEMPO, e ne giudica
+    /// l'osservazione.
     ///
-    /// Il tetto si consuma SOLO qui: una prova rifiutata a monte non deve
-    /// portare via il budget di quella che conta.
+    /// Il budget si consuma SOLO qui: una prova rifiutata a monte non aspetta
+    /// nulla, quindi non porta via il tempo di quella che conta.
+    ///
+    /// L'attesa della singola prova e' TAGLIATA sul residuo: senza, l'ultima
+    /// prova ammessa a budget quasi esaurito potrebbe sforare di un intero
+    /// `prova_timeout_s`, e il budget non sarebbe piu' un bound.
     async fn esegui_se_c_e_budget(
         &self,
         prova: &piano_di_verifica::Prova,
-        budget: &mut Budget,
+        budget: &mut BudgetTempo,
         timeout_s: f64,
     ) -> piano_di_verifica::EsitoSingolo {
-        use piano_di_verifica::{CausaNonEseguita, EsitoSingolo};
-        if budget.residuo == 0 {
-            return EsitoSingolo::non_eseguibile(CausaNonEseguita::OltreIlTetto {
-                max: budget.max,
-            });
+        use piano_di_verifica::EsitoSingolo;
+        let residuo = budget.residuo();
+        if residuo.is_zero() {
+            return EsitoSingolo::non_eseguibile(budget.esaurito());
         }
-        budget.residuo -= 1;
-        match self.osserva_la_prova(prova, timeout_s).await {
+        budget.eseguite += 1;
+        let attesa = timeout_s.min(residuo.as_secs_f64());
+        match self.osserva_la_prova(prova, attesa).await {
             Ok(oss) => piano_di_verifica::giudica_prova(&prova.attesa, &oss),
             Err(causa) => EsitoSingolo::non_eseguibile(causa),
         }
@@ -2228,15 +2233,49 @@ fn mandato_dei_giudici(
     )
 }
 
-/// Il tetto di prove eseguibili in un giro di gate, col suo residuo.
+/// Il budget di TEMPO di UNA invocazione del criterio, col suo consumo.
 ///
-/// Il MASSIMO viaggia accanto al residuo perche' la causa
-/// [`piano_di_verifica::CausaNonEseguita::OltreIlTetto`] lo porta come CAMPO:
-/// chi legge il referto deve sapere quale numero alzare, e un residuo a zero da
-/// solo non lo dice.
-struct Budget {
-    max: usize,
-    residuo: usize,
+/// Ha sostituito il tetto sul NUMERO di prove il 20/08/2026: il perche' sta in
+/// [`piano_di_verifica::ParametriPiano`]. Qui conta solo la meccanica, e i due
+/// campi accanto al tempo non sono decorazione — la causa
+/// [`piano_di_verifica::CausaNonEseguita::BudgetTempoEsaurito`] li porta
+/// entrambi come CAMPI, perche' «budget finito dopo 2 prove» e «budget finito
+/// dopo 20» hanno rimedi diversi (una prova bloccata contro un budget stretto).
+struct BudgetTempo {
+    /// Quanto tempo aveva in tutto questa invocazione.
+    totale: Duration,
+    /// Quando e' cominciata. Il consumo si MISURA, non si stima sommando i
+    /// timeout dichiarati: una prova che risponde in 40 ms non consuma i 20
+    /// secondi che il gate era disposto ad aspettarla.
+    inizio: Instant,
+    /// Quante prove hanno effettivamente girato: e' il numero che dice a chi
+    /// legge se il budget sia stato mangiato da una prova sola o consumato
+    /// onestamente da tante.
+    eseguite: usize,
+}
+
+impl BudgetTempo {
+    fn nuovo(totale_s: f64) -> Self {
+        Self {
+            totale: Duration::from_secs_f64(totale_s.max(0.0)),
+            inizio: Instant::now(),
+            eseguite: 0,
+        }
+    }
+
+    /// Quanto tempo resta. `Duration::ZERO` = esaurito.
+    fn residuo(&self) -> Duration {
+        self.totale.saturating_sub(self.inizio.elapsed())
+    }
+
+    /// La causa da dichiarare per una prova che non e' potuta partire, coi
+    /// campi che dicono su quale numero intervenire.
+    fn esaurito(&self) -> piano_di_verifica::CausaNonEseguita {
+        piano_di_verifica::CausaNonEseguita::BudgetTempoEsaurito {
+            budget_s: self.totale.as_secs(),
+            eseguite: self.eseguite,
+        }
+    }
 }
 
 /// Tutte le prove del piano non eseguite per la STESSA causa: e' il caso in cui
@@ -4000,6 +4039,93 @@ mod tests {
         assert!(
             !giudice.comandi_giudicati().iter().any(|c| c.contains("rm -rf")),
             "un irreversibile non si chiede a nessuno: non si esegue e basta"
+        );
+    }
+
+    /// MUTAZIONE OBBLIGATORIA del difetto B, con la CONSEGUENZA: **prove non
+    /// eseguite, e il referto lo DICHIARA.**
+    ///
+    /// Fino al 20/08/2026 il criterio limitava il NUMERO di prove eseguibili
+    /// (`agent.final_gate.piano_max_prove`), e quel tetto esisteva solo per
+    /// limitare il TEMPO — la 0737 lo dichiara: «6 x 45 = 270s». Un numero al
+    /// posto di un criterio: con 21 prove sane, tutte sotto il secondo, il tetto
+    /// a 6 ne escludeva quindici senza che nessuna avesse consumato attesa.
+    ///
+    /// Il test attraversa la catena REALE (spec dal DB migrato, dispatch per
+    /// tipo, `check_piano_verifica`) e verifica DUE cose:
+    ///
+    ///  1. il budget arriva davvero dalla configurazione — la chiave esiste
+    ///     nella spec col valore che la mig 0747 scrive, quindi il criterio non
+    ///     e' inerte per assenza di parametro;
+    ///  2. a budget esaurito NESSUNA prova raggiunge il tool e ognuna resta nel
+    ///     referto con la propria causa. La prova e' il conteggio delle chiamate
+    ///     al `ToolExecutor`, non una stringa nell'evidenza (regola O).
+    ///
+    /// MUTAZIONE che lo fa rosseggiare, col difetto reale: far ignorare a
+    /// `esegui_se_c_e_budget` il residuo (eseguire sempre) porta le chiamate al
+    /// tool da 0 a 2 e la causa sparisce dal referto.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn a_budget_esaurito_nessuna_prova_parte_e_il_referto_lo_dichiara(pool: PgPool) {
+        let piano = piano_con_prove_dell_agente(&[json!({
+            "descrizione": "la sorgente si carica",
+            "comando": "node --check calcolatrice.js",
+            "attesa": {"tipo": "exit_code", "codice": 0},
+        })]);
+        assert_eq!(piano.len(), 2, "una del Consiglio piu' una dell'agente");
+
+        let mut criterio = criterio_reale(
+            &pool,
+            &piano,
+            Some(nexus_agent_graph::AutomationMode::Automatic),
+        )
+        .await;
+        // (1) Il budget viene dalla CONFIGURAZIONE, non da un letterale.
+        let dal_db = criterio
+            .spec
+            .get(piano_di_verifica::CHIAVE_BUDGET_TEMPO)
+            .and_then(Value::as_f64)
+            .expect("la mig 0747 scrive il budget di tempo e la spec lo porta");
+        assert!(
+            dal_db > 0.0,
+            "un budget non positivo renderebbe il criterio inerte: {dal_db}"
+        );
+
+        // (2) Il ramo del budget ESAURITO. Il valore e' un parametro del test,
+        // e resta l'unica cosa che il test fissa: tutto il resto attraversa la
+        // produzione.
+        if let Value::Object(map) = &mut criterio.spec {
+            map.insert(
+                piano_di_verifica::CHIAVE_BUDGET_TEMPO.to_string(),
+                json!(0.0),
+            );
+        }
+
+        let exec = FakeToolExecutor::with(&[("run_command", &["EXIT CODE: 0", "EXIT CODE: 0"])]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec.clone(), pool, None)
+            .con_giudice(GiudiceFinto::che_approva());
+        let res = runner.run(vec![criterio]).await.expect("nessun PortError");
+
+        assert!(
+            exec.calls.lock().unwrap().is_empty(),
+            "a budget esaurito nessun comando deve girare: {:?}",
+            exec.calls.lock().unwrap()
+        );
+        let ev = &res[0].evidence;
+        assert_eq!(ev["prove"]["dichiarate"], 2);
+        assert_eq!(ev["prove"]["superate"], 0);
+        assert_eq!(ev["prove"]["non_eseguibili"], 2);
+        assert_eq!(
+            ev["skipped_cause"], "time_budget_exhausted",
+            "il referto dichiara PERCHE' nessuna prova e' partita: {ev}"
+        );
+        assert_eq!(ev["cause"]["time_budget_exhausted"], 2);
+        // E il fatto arriva a chi legge la CHAT: la nota non e' quella del
+        // piano vuoto.
+        let referto = piano_di_verifica::RefertoProve::da_evidenza(ev).expect("referto");
+        let nota = referto.nota();
+        assert!(
+            nota.contains("2") && nota.contains("budget di tempo"),
+            "la nota deve dire quante prove c'erano e perche' non sono partite: {nota}"
         );
     }
 

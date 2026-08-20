@@ -132,7 +132,7 @@ const CAMPO_VERDICT: &str = "verdict";
 use nexus_agent_graph::decisions::step_gate::{
     CAUSA_ASTENSIONE_CALL as CAUSA_CALL, CAUSA_ASTENSIONE_EXECUTOR as CAUSA_EXECUTOR,
     CAUSA_ASTENSIONE_JOIN as CAUSA_JOIN, CAUSA_ASTENSIONE_SCHEMA as CAUSA_SCHEMA,
-    CAUSA_ASTENSIONE_TIMEOUT as CAUSA_TIMEOUT,
+    CAUSA_ASTENSIONE_TIMEOUT as CAUSA_TIMEOUT, CAUSA_ASTENSIONE_TRONCATO as CAUSA_TRONCATO,
 };
 
 /// Configurazione ARMATA del gate: esiste solo se il mode non e' `off` e i due
@@ -1015,9 +1015,38 @@ fn richiesta_verdetto(
     }
 }
 
+/// PERCHE' non c'e' un verdetto utilizzabile in questa risposta.
+///
+/// Il verdetto si legge dai CAMPI della tool-call (regola M/Q) e la causa del
+/// suo fallimento si legge da un altro CAMPO della stessa risposta: il
+/// `stop_reason`, delegato al punto unico
+/// [`nexus_agent_graph::decisions::fine_turno`]. Mai una sottostringa del
+/// contenuto.
+///
+/// Le due cause sono OPPOSTE e collassarle e' il difetto misurato il 19/08/2026
+/// (dettaglio e ledger in testa a quel modulo): `schema_mismatch` dice «questo
+/// modello non regge lo schema», ed e' `Strutturale` — la coppia finisce nel
+/// registro dei giudici inadatti per un'ora; `output_truncated` dice «il modello
+/// stava rispondendo e l'abbiamo tagliato noi», ed e' `Transitoria` — nessuna
+/// annotazione, perche' il difetto e' nel nostro tetto.
+///
+/// `stop_reason` ASSENTE resta `schema_mismatch`: «non so come si e' chiuso il
+/// turno» non e' una prova che l'abbiamo troncato, e attribuire a noi una causa
+/// mai osservata spegnerebbe il registro dei giudici inadatti nel silenzio.
+fn causa_del_verdetto_assente(
+    resp: &nexus_agent_graph::runtime::ports::LlmResponse,
+) -> &'static str {
+    use nexus_agent_graph::decisions::fine_turno::fine_turno;
+    if fine_turno(resp.stop_reason.as_deref()).tagliata_dal_nostro_tetto() {
+        return CAUSA_TRONCATO;
+    }
+    CAUSA_SCHEMA
+}
+
 /// L'esito dai CAMPI della tool-call (regola M/Q): tool assente, verdetto
-/// fuori enum o input malformato = astensione con causa `schema_mismatch`,
-/// mai un parse della prosa.
+/// fuori enum o input malformato = astensione, mai un parse della prosa. QUALE
+/// astensione lo decide [`causa_del_verdetto_assente`] da un altro campo della
+/// stessa risposta.
 fn estrai_verdetto(
     resp: &nexus_agent_graph::runtime::ports::LlmResponse,
     role: &'static str,
@@ -1025,20 +1054,26 @@ fn estrai_verdetto(
     model_eff: String,
     cost_usd: Option<f64>,
 ) -> ValidatorVerdict {
+    // Una sola volta, e la STESSA per i due rami: la risposta e' quella, e due
+    // letture separate potrebbero divergere al primo ritocco.
+    let causa = causa_del_verdetto_assente(resp);
     let Some(tc) = resp.tool_calls.iter().find(|t| t.name == TOOL_VERDETTO) else {
         return ValidatorVerdict {
             cost_usd,
-            ..astensione_su(role, provider_eff, model_eff, CAUSA_SCHEMA)
+            ..astensione_su(role, provider_eff, model_eff, causa)
         };
     };
     let verdict = match tc.input.get(CAMPO_VERDICT).and_then(Value::as_str) {
         Some("approve") => StepVerdict::Approve,
         Some("reject") => StepVerdict::Reject,
         Some("needs_human") => StepVerdict::NeedsHuman,
+        // La tool-call c'e' ma l'`arguments` non porta il verdetto: e' la forma
+        // ESATTA del troncamento misurato — il JSON tagliato a meta' non si
+        // parsa e l'adapter del gateway consegna `input: {}`.
         _ => {
             return ValidatorVerdict {
                 cost_usd,
-                ..astensione_su(role, provider_eff, model_eff, CAUSA_SCHEMA)
+                ..astensione_su(role, provider_eff, model_eff, causa)
             }
         }
     };
@@ -2311,6 +2346,188 @@ mod tests_giudice_inadatto {
 
         crate::giudici_inadatti::dimentica(&forn("sost", "kimi"), MODELLO_INADATTO);
         server.abort();
+    }
+
+    /// La risposta TRONCATA dal nostro tetto, nella forma esatta del 19/08/2026:
+    /// la tool-call c'e' — il modello aveva cominciato a rispondere bene — e il
+    /// suo `arguments` e' un JSON tagliato a meta', che non si parsa. Il
+    /// gateway lo consegna come `input: {}`, e `finish_reason` e' `length`.
+    ///
+    /// NON e' una risposta in prosa (quella e' `risposta_gateway(.., false)`, il
+    /// caso `schema_mismatch`): sono due forme diverse dello stesso silenzio, ed
+    /// e' il `finish_reason` a distinguerle — non il contenuto (regola M).
+    fn risposta_troncata(provider: &str, model: &str) -> String {
+        let corpo = json!({
+            "content": "",
+            "usage": {"input_tokens": 6489, "output_tokens": 512},
+            "model_used": model,
+            "provider_used": provider,
+            "latency_ms": 900,
+            "finish_reason": "length",
+            "tool_calls": [{
+                "id": "tc-1",
+                "type": "function",
+                "function": {
+                    "name": TOOL_VERDETTO,
+                    // Tagliato a meta' di una stringa: e' cio' che il ledger ha
+                    // registrato con `completion_tokens` 512 esatti.
+                    "arguments": "{\"verdict\": \"appro",
+                },
+            }],
+        })
+        .to_string();
+        const CRLF: &str = "\r\n";
+        [
+            "HTTP/1.1 200 OK",
+            "Content-Type: application/json",
+            &format!("Content-Length: {}", corpo.len()),
+            "Connection: close",
+            "",
+            &corpo,
+        ]
+        .join(CRLF)
+    }
+
+    /// Gateway finto che TRONCA la risposta di un modello: gemello di
+    /// [`gateway_finto`], stessa meccanica, altra forma di silenzio.
+    async fn gateway_che_tronca(
+        troncato: &'static str,
+    ) -> (u16, StdArc<StdMutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("porta effimera");
+        let porta = listener.local_addr().expect("indirizzo").port();
+        let interrogati: StdArc<StdMutex<Vec<String>>> = StdArc::new(StdMutex::new(Vec::new()));
+        let registro = interrogati.clone();
+        let handle = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let corpo = corpo_richiesta(&mut socket).await;
+                let richiesta: Value = serde_json::from_str(&corpo).unwrap_or(Value::Null);
+                let provider = richiesta
+                    .get("pin_provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let model = modello_del_wire(&richiesta, &provider);
+                if let Ok(mut r) = registro.lock() {
+                    r.push(model.clone());
+                }
+                let risposta = if model == troncato {
+                    risposta_troncata(&provider, &model)
+                } else {
+                    risposta_gateway(&provider, &model, true)
+                };
+                let _ = socket.write_all(risposta.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        (porta, interrogati, handle)
+    }
+
+    /// MUTAZIONE OBBLIGATORIA del difetto A, con la CONSEGUENZA misurata: **un
+    /// modello troncato non finisce fra i giudici inadatti.**
+    ///
+    /// Il 19/08/2026 su `t4-prove-consiglio` `deepseek/deepseek-v4-flash` ha
+    /// risposto al batch da 25 prove con `completion_tokens` 512 esatti — il
+    /// tetto calcolato per quella coppia — e la tool-call tagliata a meta' e'
+    /// stata letta come `schema_mismatch`, cioe' come causa STRUTTURALE. Da li'
+    /// `segna_inadatto` ha tolto la coppia dai candidati per un'ora: dal ledger,
+    /// dalle 23:05 in poi quel modello non riceve piu' una chiamata di
+    /// taglia-giudice e le convocazioni successive hanno UN SOLO giudice.
+    ///
+    /// Il test attraversa la convocazione REALE (gateway finto su porta
+    /// effimera, `validate`, catena `map_gw_response` -> `estrai_verdetto` ->
+    /// `natura_astensione` -> `registra_inadatto`): un test che chiamasse
+    /// `estrai_verdetto` a mano non toccherebbe il registro, cioe' proprio la
+    /// conseguenza che il difetto produce (regola O).
+    ///
+    /// MUTAZIONE che lo fa rosseggiare, col difetto reale: far ritornare
+    /// `CAUSA_SCHEMA` a [`causa_del_verdetto_assente`] anche sul troncamento —
+    /// la coppia torna esclusa e la prima asserzione cade.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn un_giudice_troncato_non_finisce_fra_gli_inadatti(pool: PgPool) {
+        const MODELLO_TRONCATO: &str = "kimi-k2.6";
+        semina(&pool, "tronc", PARCO).await;
+        crate::giudici_inadatti::dimentica(&forn("tronc", "kimi"), MODELLO_TRONCATO);
+        let (porta, _interrogati, server) = gateway_che_tronca(MODELLO_TRONCATO).await;
+
+        let porta_gate = adapter(
+            arma_il_gate(&pool, porta).await,
+            String::new(),
+            String::new(),
+            forn("tronc", "google"),
+        );
+        let report = porta_gate
+            .validate(richiesta_del_17_08())
+            .await
+            .expect("la convocazione non e' un errore");
+
+        // LA CONSEGUENZA PER PRIMA. Prima di questo lavoro la coppia veniva
+        // esclusa dalle convocazioni per
+        // `orchestrator.step_validator_inadatto_ttl_s` (3600s in produzione).
+        let escluso = crate::giudici_inadatti::giudizio_sulla_coppia(
+            &forn("tronc", "kimi"),
+            MODELLO_TRONCATO,
+        )
+        .esclude();
+        // E il posto NON si riassegna: il sostituto riceverebbe lo stesso
+        // tetto, quindi la seconda chiamata sarebbe pagata per nulla.
+        let sostituiti = report.sostituiti.len();
+        crate::giudici_inadatti::dimentica(&forn("tronc", "kimi"), MODELLO_TRONCATO);
+        server.abort();
+        assert!(
+            !escluso,
+            "un modello sano tagliato dal NOSTRO tetto e' finito fra i giudici inadatti"
+        );
+        assert_eq!(
+            sostituiti, 0,
+            "sostituire il giudice non rimedia a un tetto nostro"
+        );
+
+        let astenuto = report
+            .verdicts
+            .iter()
+            .find(|v| v.verdict == StepVerdict::Abstained)
+            .expect("il giudice troncato non ha potuto emettere un verdetto");
+        assert_eq!(astenuto.model, MODELLO_TRONCATO);
+        assert_eq!(
+            astenuto.abstain_cause.as_deref(),
+            Some(CAUSA_TRONCATO),
+            "la causa e' NOSTRA: il tetto ha tagliato la risposta"
+        );
+    }
+
+    /// PONTE col produttore del valore (regola O): il `stop_reason` che
+    /// `estrai_verdetto` legge non e' un letterale scritto nel test, e' quello
+    /// che `normalize_gw_finish_reason` produce dal `finish_reason` del gateway.
+    ///
+    /// Le due implementazioni esistono perche' `nexus-agent-graph` non puo'
+    /// chiamare i normalizzatori privati del gateway; questo test e' il punto in
+    /// cui la loro dichiarazione incontra il produttore vero. MUTAZIONE:
+    /// cambiare la mappa `"length" => "max_tokens"` senza toccare il vocabolario
+    /// di `fine_turno` -> questo test rosseggia, mentre i test del criterio puro
+    /// resterebbero tutti verdi.
+    #[test]
+    fn il_valore_del_gateway_e_riconosciuto_come_troncamento() {
+        use nexus_agent_graph::decisions::fine_turno::{fine_turno, FineTurno};
+        let di_porta = crate::agent_graph_adapter::llm_gateway::normalize_gw_finish_reason(
+            nexus_agent_graph::decisions::fine_turno::FINE_TURNO_WIRE_TRONCATO,
+        );
+        assert_eq!(
+            fine_turno(Some(&di_porta)),
+            FineTurno::Troncato,
+            "il valore che la porta consegna davvero deve essere riconosciuto: {di_porta}"
+        );
+        // E le chiusure normali del gateway non devono mai passare per
+        // troncamento: qui il produttore e' lo stesso.
+        for wire in ["stop", "tool_calls", "content_filter"] {
+            let porta = crate::agent_graph_adapter::llm_gateway::normalize_gw_finish_reason(wire);
+            assert_eq!(fine_turno(Some(&porta)), FineTurno::Concluso, "{wire}");
+        }
     }
 
     /// Senza sostituti il gate NON approva per stanchezza: dichiara di non aver

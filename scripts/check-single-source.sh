@@ -4971,6 +4971,93 @@ else
   echo "OK giudizio-del-gate-sul-piano: i criteri non misurati arrivano al referto"
 fi
 
+# ── troncamento-non-e-schema (2026-08-20) ───────────────────────────────────
+# «Questo turno l'abbiamo TAGLIATO noi?» ha UN punto unico (`fine_turno`), e la
+# sua conseguenza e' una causa d'astensione DISTINTA da `schema_mismatch`.
+#
+# Il difetto chiuso, misurato il 19/08/2026: una risposta troncata dal nostro
+# tetto di output veniva letta come forma sbagliata del modello, quindi come
+# causa STRUTTURALE, quindi la coppia finiva fra i giudici inadatti per un'ora —
+# un modello sano squalificato per colpa di un nostro parametro.
+ft='crates/nexus-agent-graph/src/decisions/fine_turno.rs'
+assert_single "troncamento-non-e-schema" 'pub fn fine_turno\(' \
+  "$ft" crates/nexus-agent-graph/src crates/mcp-core/src
+# Il produttore della causa deve DELEGARE il criterio: la forma del difetto e'
+# un ritorno secco a `CAUSA_SCHEMA` senza guardare `stop_reason`.
+if ! grep -q 'fine_turno::fine_turno' "$sv"; then
+  echo "!! troncamento-non-e-schema: 'step_validation' non interroga piu' il" >&2
+  echo "   criterio sul fine turno: il troncamento torna indistinguibile dalla" >&2
+  echo "   forma sbagliata, e squalifica un giudice sano." >&2
+  fail=1
+elif grep -qE 'stop_reason.*contains|contains.*max_tokens' "$sv"; then
+  echo "!! troncamento-non-e-schema: il troncamento e' riconosciuto da una" >&2
+  echo "   sottostringa invece che dal campo (regola M)." >&2
+  fail=1
+else
+  echo "OK troncamento-non-e-schema: la causa nasce dal campo stop_reason, via punto unico"
+fi
+# La natura della causa nuova e' TRANSITORIA: strutturale significherebbe
+# sostituire il giudice e marcarlo inadatto, che e' il difetto.
+sg='crates/nexus-agent-graph/src/decisions/step_gate.rs'
+if ! grep -qE 'CAUSA_ASTENSIONE_EXECUTOR\s*$|\| CAUSA_ASTENSIONE_TRONCATO => return NaturaAstensione::Transitoria' "$sg"; then
+  echo "!! troncamento-non-e-schema: 'CAUSA_ASTENSIONE_TRONCATO' non risulta piu'" >&2
+  echo "   fra le astensioni TRANSITORIE." >&2
+  fail=1
+else
+  echo "OK troncamento-non-e-schema: il troncamento resta un'astensione transitoria"
+fi
+
+# ── referto-delle-prove (2026-08-20) ────────────────────────────────────────
+# «Che cosa e' successo alle PROVE?» ha UN produttore di nota, distinto da
+# quello dei requisiti in prosa, e UNA uscita che lo deposita nello stato.
+#
+# Il difetto chiuso, misurato in chat il 20/08/2026: 21 prove eseguibili emesse
+# dalle figure e un messaggio di chiusura identico a quello di due giorni prima,
+# quando le prove non esistevano.
+assert_single "referto-delle-prove" 'pub fn da_evidenza\(' \
+  "$pdv" crates/nexus-agent-graph/src crates/mcp-core/src
+# Il trasporto deve esistere in ENTRAMBI i lati del confine.
+if ! grep -q 'fn con_referto_prove' "$fg"; then
+  echo "!! referto-delle-prove: il gate non deposita piu' l'evidenza del piano" >&2
+  echo "   nello stato: la chat torna muta sulle prove." >&2
+  fail=1
+elif ! grep -q 'RefertoProve::nota' crates/mcp-core/src/chat_messages/agent_run.rs; then
+  echo "!! referto-delle-prove: il finalizzatore non compone piu' la nota delle" >&2
+  echo "   prove: l'evidenza arriva allo stato e nessuno la legge." >&2
+  fail=1
+else
+  echo "OK referto-delle-prove: l'evidenza esce dal gate e la nota arriva in chat"
+fi
+# L'uscita dei rami che hanno eseguito i criteri e' UNA: un `into_opaque` diretto
+# li' dentro e' il ramo dimenticato che riapre il difetto.
+if [[ "$(grep -c 'con_referto(state' "$fg")" -lt 6 ]]; then
+  echo "!! referto-delle-prove: uno dei rami del gate e' tornato a uscire senza" >&2
+  echo "   passare da 'con_referto'." >&2
+  fail=1
+else
+  echo "OK referto-delle-prove: tutti i rami con criteri eseguiti passano da con_referto"
+fi
+
+# ── budget-delle-prove (2026-08-20) ─────────────────────────────────────────
+# «Quanto puo' durare la verifica delle prove?» si misura in TEMPO, non si stima
+# contando le prove. Il tetto sul NUMERO (`piano_max_prove`) e' rimosso dalla
+# mig 0747: reintrodurlo rimetterebbe un numero al posto del criterio.
+#
+# Il criterio e' la CHIAVE come letterale Rust (`"..."`), non la menzione: la
+# storia del difetto vive nei commenti che lo spiegano, e un guard che matcha
+# anche quelli costringe a cancellare il perche' per far passare il gate.
+if grep -rq '"agent\.final_gate\.piano_max_prove"' crates/ 2>/dev/null; then
+  echo "!! budget-delle-prove: 'piano_max_prove' e' ricomparso nel codice. Il" >&2
+  echo "   tetto sul NUMERO di prove esisteva solo per limitare il TEMPO, e il" >&2
+  echo "   tempo si misura direttamente (mig 0747)." >&2
+  fail=1
+elif ! grep -q 'piano_budget_tempo_s' crates/mcp-core/src/native_engine.rs; then
+  echo "!! budget-delle-prove: il budget non arriva piu' dal DB (regola G)." >&2
+  fail=1
+else
+  echo "OK budget-delle-prove: il criterio ha un budget di tempo dal DB, non un tetto sul numero"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

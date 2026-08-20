@@ -6626,6 +6626,7 @@ mod tests {
             pending_actions: Vec::new(),
             council_requirements: Vec::new(),
             council_conformance: None,
+            referto_prove: None,
         }
     }
 
@@ -8335,6 +8336,7 @@ mod tests {
             pending_actions: Vec::new(),
             council_requirements: Vec::new(),
             council_conformance: None,
+            referto_prove: None,
         };
         let keys = |v: &Value| -> BTreeSet<String> {
             v.as_object()

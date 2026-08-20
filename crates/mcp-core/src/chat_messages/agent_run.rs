@@ -1737,6 +1737,29 @@ pub(crate) async fn native_outcome_to_run_result(
         (other, _) => other,
     };
 
+    // Che cosa e' successo alle PROVE ESEGUIBILI del piano di verifica.
+    //
+    // E' una nota DISTINTA da quella qui sopra e resta tale (regola L): quella
+    // risponde a «i vincoli in prosa risultano applicati?», questa a «le prove
+    // eseguibili sono passate?», e i due rimedi sono diversi — un vincolo non
+    // applicato si corregge nel codice, una prova non eseguita puo' voler dire
+    // che il gate duale non l'ha autorizzata o che il budget e' finito.
+    //
+    // MISURATO in chat il 20/08/2026 su t4-prove-consiglio: le figure avevano
+    // emesso 21 prove eseguibili e il messaggio di chiusura era identico a
+    // quello di due giorni prima, quando le prove non esistevano. L'evidenza
+    // c'era, il produttore della nota no.
+    let final_answer = match (
+        final_answer,
+        outcome
+            .referto_prove
+            .as_ref()
+            .map(nexus_agent_graph::decisions::piano_di_verifica::RefertoProve::nota),
+    ) {
+        (Some(ans), Some(nota)) => Some(format!("{ans}\n\n---\n\n{nota}")),
+        (other, _) => other,
+    };
+
     // Segnale STRUTTURATO del lavoro svolto per DELEGA (regola M). Sotto
     // todo-isolation (`supervisor_mode=continuous`) i todo del piano sono
     // eseguiti come SUB-RUN isolati: il run PRINCIPALE e' solo un dispatcher e
@@ -9464,6 +9487,7 @@ mod tests_native_mapping {
             pending_actions: Vec::new(),
             council_requirements: Vec::new(),
             council_conformance: None,
+            referto_prove: None,
         }
     }
 
@@ -9766,6 +9790,93 @@ mod tests_native_mapping {
             emessi.to_value(),
         );
         state
+    }
+
+    /// MUTAZIONE OBBLIGATORIA del difetto C, SECONDA META': **le prove del
+    /// piano compaiono NEL RESOCONTO CHE L'UTENTE LEGGE.**
+    ///
+    /// MISURATO leggendo la chat di Nexus il 20/08/2026 (`t4-prove-consiglio`):
+    /// le figure avevano emesso 21 prove eseguibili e il messaggio diceva solo
+    /// «Requisiti del Consiglio: nessuno verificabile automaticamente (26 in
+    /// totale)» — lo stesso testo di due giorni prima, quando le prove non
+    /// esistevano. Sotto, quelle 21 prove verificavano proprio i requisiti
+    /// dichiarati NON VERIFICABILI: tre `curl` per la validazione del titolo, un
+    /// `grep` per il limite del body parser.
+    ///
+    /// IL PONTE E' DIVISO IN DUE META', e la divisione e' obbligata: la prima —
+    /// «il gate deposita l'evidenza nello stato» — vive in
+    /// `nexus_agent_graph::nodes::final_gate`
+    /// (`l_evidenza_del_piano_esce_dal_gate_in_entrambi_i_rami`), perche' quel
+    /// nodo mcp-core non lo puo' istanziare. Qui c'e' la seconda: dalla chiave
+    /// nello stato alla riga in chat. L'evidenza NON e' scritta a mano: la
+    /// produce `evidenza_piano`, il produttore vero (regola O).
+    ///
+    /// MUTAZIONE che lo fa rosseggiare, col difetto reale: togliere il ramo che
+    /// appende `RefertoProve::nota` in `native_outcome_to_run_result` — il
+    /// resoconto torna a essere quello del 20/08, muto sulle prove.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn le_prove_del_piano_compaiono_nel_resoconto(pool: sqlx::PgPool) {
+        use nexus_agent_graph::decisions::piano_di_verifica::{
+            classifica_piano, evidenza_piano, Attesa, CausaNonEseguita, EsitoProva, EsitoSingolo,
+            OriginePiano, Prova, PIANO_REFERTO_KEY,
+        };
+        use nexus_agent_graph::decisions::step_gate::StepGateDecision;
+        use nexus_graph::outcome::StepOutcome;
+
+        let run = setup_mapping_run(&pool).await;
+        // Le prove del caso misurato: emesse dal Consiglio, nessuna eseguita
+        // perche' il gate duale non ha raggiunto un quorum.
+        let esiti: Vec<EsitoProva> = (0..21)
+            .map(|i| EsitoProva {
+                prova: Prova {
+                    descrizione: format!("la POST /api/todo valida il titolo ({i})"),
+                    comando: format!("curl -s -o /dev/null -w '%{{http_code}}' localhost/api/{i}"),
+                    working_dir: None,
+                    attesa: Attesa::Uscita { codice: 0 },
+                    origine: OriginePiano::Consiglio,
+                },
+                esito: EsitoSingolo::non_eseguibile(CausaNonEseguita::GiudizioNonEspresso {
+                    decisione: StepGateDecision::NeedsHuman,
+                }),
+            })
+            .collect();
+        let verdetto = classifica_piano(&esiti);
+
+        let mut state = nexus_agent_graph::state::AgentState {
+            result: Some("Task completato: API todo.".to_string()),
+            ..Default::default()
+        };
+        state.extra.insert(
+            PIANO_REFERTO_KEY.to_string(),
+            evidenza_piano(&verdetto, &esiti),
+        );
+
+        let outcome = crate::native_engine::map_outcome(StepOutcome::Completed(state));
+        let referto = outcome
+            .referto_prove
+            .as_ref()
+            .expect("map_outcome legge l'evidenza depositata dal gate");
+        assert_eq!(referto.dichiarate, 21);
+
+        let r = native_outcome_to_run_result(&pool, run, outcome).await;
+        let resoconto = r.final_answer.expect("un resoconto c'e'");
+        assert!(
+            resoconto.contains("21"),
+            "il resoconto deve dire quante prove esistevano: {resoconto}"
+        );
+        assert!(
+            resoconto.contains("Prove eseguibili"),
+            "le prove hanno una riga propria, distinta da quella dei requisiti: {resoconto}"
+        );
+        assert!(
+            resoconto.starts_with("Task completato"),
+            "la nota si aggiunge al resoconto, non lo sostituisce"
+        );
+        // E il testo e' per un umano: mai il nome interno della variante.
+        assert!(
+            !resoconto.contains("judgment_not_reached"),
+            "{resoconto}"
+        );
     }
 
     /// LA CONSEGUENZA (regola O): un requisito del Consiglio NON applicato deve

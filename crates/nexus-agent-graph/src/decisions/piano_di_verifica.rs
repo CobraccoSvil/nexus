@@ -151,7 +151,12 @@ pub const CAMPO_PROVE: &str = "prove";
 /// referenziano da qui, mai come letterali sparsi).
 pub const CHIAVE_PROVE: &str = "prove";
 pub const CHIAVE_POLITICA: &str = "politica";
-pub const CHIAVE_MAX_PROVE: &str = "max_prove";
+/// Il budget di TEMPO complessivo di UNA invocazione del criterio.
+///
+/// Ha sostituito `max_prove` il 20/08/2026 (mig 0747): il tetto sul NUMERO
+/// esisteva solo per limitare il tempo, e il tempo si misura direttamente. Il
+/// perche' sta in [`ParametriPiano::budget_s`].
+pub const CHIAVE_BUDGET_TEMPO: &str = "budget_tempo_s";
 pub const CHIAVE_ATTESA_MASSIMA: &str = "attesa_massima_s";
 /// La modalita' di automazione del RUN: e' cio' da cui dipende se esista un
 /// umano a cui chiedere il consenso ([`consenso_umano_richiesto`]). La inietta
@@ -857,9 +862,25 @@ pub enum CausaNonEseguita {
     /// autorizzare questo comando, quindi non parte.
     /// RIMEDIO: `orchestrator.critical_step_gate_mode` diverso da `off`.
     GiudiceNonDisponibile { motivo: MotivoGiudiceAssente },
-    /// Oltre il tetto di prove eseguibili in un giro di gate.
-    /// RIMEDIO: `agent.final_gate.piano_max_prove`.
-    OltreIlTetto { max: usize },
+    /// Il BUDGET DI TEMPO dell'invocazione era gia' finito quando questa prova
+    /// avrebbe dovuto partire: le prove che l'hanno preceduta se lo sono
+    /// consumato.
+    ///
+    /// NON e' «tutte eseguite» e non e' «nessuna eseguita» (regola Q): il
+    /// referto porta entrambi i numeri — quanto budget c'era e quante prove
+    /// erano gia' girate — perche' i due casi hanno rimedi diversi. Poche prove
+    /// eseguite dicono che qualcuna si e' bloccata e ha mangiato il tempo di
+    /// tutte; molte dicono che il budget e' tarato stretto per quel piano.
+    ///
+    /// RIMEDIO: guardare QUALE prova ha consumato il tempo, e solo dopo
+    /// `agent.final_gate.piano_budget_tempo_s`.
+    ///
+    /// I secondi sono INTERI: la causa la legge un umano, e il budget e' un
+    /// numero di secondi per costruzione (la mig 0747 pretende che valga almeno
+    /// tre attese per prova, quindi la parte frazionaria non porta
+    /// informazione). Tenerli `f64` costerebbe l'`Eq` dell'intero vocabolario
+    /// delle cause, che i confronti di questo modulo usano.
+    BudgetTempoEsaurito { budget_s: u64, eseguite: usize },
     /// L'ambiente non ha eseguito il comando (non trovato, non eseguibile, il
     /// tool non e' partito).
     /// RIMEDIO: riparare l'ambiente o correggere il comando della prova.
@@ -953,7 +974,7 @@ impl CausaNonEseguita {
             Self::GiudizioNonEspresso { .. } => "judgment_not_reached",
             Self::GiudizioRimandatoANessuno { .. } => "no_human_to_decide",
             Self::GiudiceNonDisponibile { .. } => "judge_unavailable",
-            Self::OltreIlTetto { .. } => "over_cap",
+            Self::BudgetTempoEsaurito { .. } => "time_budget_exhausted",
             Self::AmbienteNonPronto { .. } => "environment",
             Self::AttesaScaduta { .. } => "timeout",
             Self::EsitoNonOsservato => "outcome_not_observed",
@@ -993,9 +1014,9 @@ impl CausaNonEseguita {
                  scritto da un modello e che nessun umano vedra' non parte senza giudizio",
                 motivo.as_str()
             ),
-            Self::OltreIlTetto { max } => format!(
-                "oltre il tetto di {max} prove eseguibili in un giro di gate \
-                 (`agent.final_gate.piano_max_prove`)"
+            Self::BudgetTempoEsaurito { budget_s, eseguite } => format!(
+                "il budget di tempo della verifica ({budget_s}s) era gia' esaurito: {eseguite} \
+                 prove erano gia' girate e si sono prese il tempo di questa"
             ),
             Self::AmbienteNonPronto { dettaglio } => {
                 format!("l'ambiente non ha eseguito il comando: {dettaglio}")
@@ -1076,11 +1097,17 @@ pub enum EsitoSingolo {
 }
 
 impl EsitoSingolo {
+    /// L'etichetta della prova OSSERVATA e non conforme, scritta una volta
+    /// sola: la emette [`Self::as_str`] e la rilegge [`fallimenti_leggibili`]
+    /// dall'evidenza, e due letterali darebbero due idee di «fallita» che
+    /// divergono al primo rinominamento.
+    pub const ETICHETTA_FALLITA: &'static str = "failed";
+
     /// Identificatore canonico (regola N).
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Superata => "passed",
-            Self::Fallita { .. } => "failed",
+            Self::Fallita { .. } => Self::ETICHETTA_FALLITA,
             Self::NonEseguibile { .. } => "not_runnable",
         }
     }
@@ -1418,7 +1445,7 @@ pub fn classifica_piano(esiti: &[EsitoProva]) -> VerdettoPiano {
 /// ricostruisce il verdetto da questo testo.
 pub fn evidenza_piano(verdetto: &VerdettoPiano, esiti: &[EsitoProva]) -> Value {
     let mut out = json!({
-        "verdict": verdetto.as_str(),
+        CAMPO_VERDICT_EVIDENZA: verdetto.as_str(),
         "bloccante": verdetto.e_bloccante(),
         "misurato": verdetto.ha_misurato(),
         CAMPO_PROVE: {
@@ -1494,6 +1521,194 @@ fn cause_non_eseguite(esiti: &[EsitoProva]) -> BTreeMap<&'static str, usize> {
     per
 }
 
+// ─── Il referto che l'utente legge in chat ────────────────────────────────────
+
+/// Chiave con cui il final gate deposita nello stato l'EVIDENZA del criterio,
+/// perche' il finalizzatore del run possa comporne il referto per la chat.
+///
+/// Il gate emette gia' quell'evidenza nel payload del meta_step (persistita,
+/// interrogabile in SQL), ma il canale della CHAT e' un altro e passa da
+/// `AgentState`: senza questa chiave l'unica strada per sapere che cosa e'
+/// successo alle prove e' una query.
+pub const PIANO_REFERTO_KEY: &str = "piano_di_verifica_referto";
+
+/// Che cosa e' successo alle PROVE di questo run, nella forma in cui lo si dice
+/// a un umano.
+///
+/// ## Il difetto (MISURATO in chat il 20/08/2026, `t4-prove-consiglio`)
+///
+/// Le figure avevano emesso 21 prove eseguibili, e il messaggio di chiusura in
+/// chat diceva soltanto:
+///
+/// > Requisiti del Consiglio: nessuno verificabile automaticamente (26 in
+/// > totale). Il rispetto dei vincoli non e' stato riscontrato: vanno
+/// > controllati a mano.
+/// > NON VERIFICABILE: La POST /api/todo deve validare che il titolo sia
+/// > obbligatorio...
+///
+/// Cioe' lo STESSO messaggio di due giorni prima, quando le prove non
+/// esistevano — mentre sotto c'erano tre `curl` che provavano esattamente
+/// quella validazione e un `grep` che cercava il limite del body parser.
+///
+/// La causa non e' in [`super::requirement_conformance`], che quella nota la
+/// compone bene e per la propria domanda («i vincoli in PROSA risultano
+/// applicati?»). La causa e' che alla domanda gemella — «le prove ESEGUIBILI
+/// sono passate?» — nessuno rispondesse in chat: il piano aveva un'evidenza
+/// strutturata completa ([`evidenza_piano`]) e nessun produttore di nota.
+///
+/// Restano DUE note e non una (regola L): due domande, due rimedi. Un vincolo
+/// in prosa non applicato si corregge nel codice; una prova non eseguita puo'
+/// voler dire che il gate duale non ha autorizzato nulla, che il budget e'
+/// finito, che l'ambiente non ha eseguito il comando.
+///
+/// ## Perche' si legge dall'evidenza e non dagli esiti
+///
+/// Gli [`EsitoProva`] vivono nel runner (`mcp-core`), il referto si compone al
+/// finalizzatore del run: fra i due c'e' lo stato del grafo, che trasporta
+/// `Value`. Questa struttura rilegge percio' cio' che [`evidenza_piano`] ha
+/// scritto — CAMPI, mai prosa da interpretare — e il ponte fra i due lati e'
+/// verificato dal test `il_referto_nasce_dall_evidenza_reale`, che parte dagli
+/// esiti veri e attraversa il produttore (regola O).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefertoProve {
+    /// Identificatore canonico del verdetto ([`VerdettoPiano::as_str`]).
+    pub verdetto: String,
+    pub dichiarate: usize,
+    pub superate: usize,
+    pub fallite: usize,
+    pub non_eseguibili: usize,
+    /// Le prove che NON sono partite, raggruppate per causa: identificatore
+    /// canonico, prosa gia' composta dal criterio, quante.
+    ///
+    /// La prosa arriva da [`CausaNonEseguita::descrizione`] e non si ricompone
+    /// qui: il testo per un umano nasce dai campi in UN posto solo, e nominare
+    /// in chat `judgment_denied` sarebbe dire il nome interno della variante
+    /// invece del fatto.
+    pub cause: Vec<(String, String, usize)>,
+    /// Le prove OSSERVATE e non conformi, gia' in forma leggibile.
+    pub fallimenti: Vec<String>,
+}
+
+impl RefertoProve {
+    /// Rilegge cio' che [`evidenza_piano`] ha scritto. `None` quando il criterio
+    /// non ha girato affatto (evidenza assente o senza il blocco dei conteggi):
+    /// «non ho misurato» e «non sono stato interrogato» sono due cose diverse, e
+    /// solo la prima ha un referto da scrivere.
+    pub fn da_evidenza(ev: &Value) -> Option<Self> {
+        let prove = ev.get(CAMPO_PROVE)?;
+        let conta = |k: &str| prove.get(k).and_then(Value::as_u64).unwrap_or(0) as usize;
+        let dettaglio = ev.get("dettaglio").and_then(Value::as_array);
+        Some(Self {
+            verdetto: ev
+                .get(CAMPO_VERDICT_EVIDENZA)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            dichiarate: conta("dichiarate"),
+            superate: conta("superate"),
+            fallite: conta("fallite"),
+            non_eseguibili: conta("non_eseguibili"),
+            cause: cause_in_prosa(dettaglio),
+            fallimenti: fallimenti_leggibili(dettaglio),
+        })
+    }
+
+    /// La nota per la chat, composta DAI campi (regola Q, punto 3).
+    ///
+    /// Si scrive SEMPRE che il criterio abbia girato, anche a piano vuoto: il
+    /// silenzio non distingue «nessuno ha dichiarato prove» da «ne sono state
+    /// dichiarate venticinque e nessuna e' partita», ed e' precisamente la
+    /// distinzione per cui questo referto esiste.
+    pub fn nota(&self) -> String {
+        if self.dichiarate == 0 {
+            return "**Prove eseguibili: nessuna dichiarata.** Ne' gli apparati advisory \
+                    ne' l'agente ne hanno emesse, quindi la verifica finale non ha \
+                    eseguito alcun accertamento sul comportamento dell'applicazione."
+                .to_string();
+        }
+        let mut s = format!("**{}**", self.titolo());
+        for f in self.fallimenti.iter().take(MAX_RIGHE_REFERTO) {
+            s.push_str(&format!("\n- NON SUPERATA: {f}"));
+        }
+        for (_, prosa, quante) in self.cause.iter().take(MAX_RIGHE_REFERTO) {
+            s.push_str(&format!("\n- {quante} non eseguite: {prosa}"));
+        }
+        s
+    }
+
+    /// La prima riga: dice in che situazione si e'. Forma NOMINALE, la legge un
+    /// utente.
+    fn titolo(&self) -> String {
+        let tot = self.dichiarate;
+        if self.fallite > 0 {
+            return format!(
+                "Prove eseguibili NON superate: {} su {tot} ({} superate, {} non eseguite).",
+                self.fallite, self.superate, self.non_eseguibili
+            );
+        }
+        if self.superate == 0 {
+            return format!(
+                "Prove eseguibili dichiarate: {tot}, nessuna eseguita. Il comportamento \
+                 dell'applicazione non e' stato accertato."
+            );
+        }
+        if self.non_eseguibili > 0 {
+            return format!(
+                "Prove eseguibili superate: {} su {tot} ({} non eseguite).",
+                self.superate, self.non_eseguibili
+            );
+        }
+        format!("Prove eseguibili superate: tutte e {tot}.")
+    }
+}
+
+/// Quante righe di dettaglio si stampano per gruppo. I CONTEGGI del titolo
+/// restano completi: il taglio riguarda solo l'elenco per esteso, come in
+/// [`super::requirement_conformance`].
+const MAX_RIGHE_REFERTO: usize = 6;
+
+/// Chiave del verdetto dentro l'evidenza (la scrive [`evidenza_piano`]).
+const CAMPO_VERDICT_EVIDENZA: &str = "verdict";
+
+/// Le cause di mancata esecuzione raggruppate, con la prosa che il criterio ha
+/// gia' composto per ognuna. Ordine di PRIMA APPARIZIONE: e' l'ordine in cui il
+/// piano ha raccolto le prove, e riordinarlo per conteggio direbbe a chi legge
+/// una storia diversa da quella del referto strutturato.
+fn cause_in_prosa(dettaglio: Option<&Vec<Value>>) -> Vec<(String, String, usize)> {
+    let mut ordine: Vec<(String, String, usize)> = Vec::new();
+    for v in dettaglio.into_iter().flatten() {
+        let (Some(causa), Some(motivo)) = (
+            v.get("causa").and_then(Value::as_str),
+            v.get("motivo").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        match ordine.iter_mut().find(|(c, _, _)| c == causa) {
+            Some((_, _, n)) => *n += 1,
+            None => ordine.push((causa.to_string(), motivo.to_string(), 1)),
+        }
+    }
+    ordine
+}
+
+/// Le prove osservate e non conformi, in una riga ciascuna.
+fn fallimenti_leggibili(dettaglio: Option<&Vec<Value>>) -> Vec<String> {
+    dettaglio
+        .into_iter()
+        .flatten()
+        .filter(|v| v.get("esito").and_then(Value::as_str) == Some(EsitoSingolo::ETICHETTA_FALLITA))
+        .map(|v| {
+            let campo = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default();
+            format!(
+                "{} -> `{}`: {}",
+                campo(CAMPO_DESCRIZIONE),
+                campo(CAMPO_COMANDO),
+                campo("osservato")
+            )
+        })
+        .collect()
+}
+
 /// Una riga per prova, coi campi con cui si corregge.
 fn dettaglio_esiti(esiti: &[EsitoProva]) -> Vec<Value> {
     esiti
@@ -1538,31 +1753,60 @@ fn per_origine(esiti: &[EsitoProva]) -> BTreeMap<&'static str, usize> {
 /// I parametri della misura, risolti dal DB da chi costruisce il criterio
 /// (regola G) e non dal runner.
 ///
-/// I DUE numeri hanno un PRODOTTO, ed e' il numero operativamente rilevante:
-/// [`Self::attesa_massima_s`] e' quanto una invocazione del criterio puo'
-/// tenere fermo il gate nel caso peggiore, e va moltiplicato per i cicli del
-/// gate. I default (6 x 45s = 270s) sono scelti perche' quel prodotto stia
-/// sotto i cinque minuti, non perche' i due numeri singoli siano stati
-/// misurati: non lo sono, e la misura da fare e' la durata reale delle prove
-/// in esercizio.
+/// ## Il difetto: un numero al posto di un criterio (20/08/2026)
+///
+/// Fino alla mig 0747 il secondo parametro era `max_prove`, un tetto sul NUMERO
+/// di prove eseguibili in un giro di gate. Nasceva a 6 (mig 0737, quando nessuna
+/// figura emetteva prove e il volume reale era zero) ed e' stato portato a 24 la
+/// notte del 19/08 (mig 0746) perche' un Consiglio ne emette 21 — misurate.
+///
+/// **6 e 24 sono entrambi arbitrari, e il difetto non e' il valore.** Quel tetto
+/// esisteva per UNA ragione sola — limitare il TEMPO che il criterio puo' tenere
+/// fermo il gate — e la dichiarava esso stesso: [`Self::attesa_massima_s`] era
+/// il PRODOTTO `max_prove x timeout_s`. Un tempo stimato moltiplicando due
+/// numeri, quando il tempo si puo' misurare direttamente.
+///
+/// Le conseguenze del surrogato non sono teoriche: con 21 prove sane, che sul
+/// run misurato stavano tutte sotto il secondo, il tetto a 6 ne lasciava fuori
+/// quindici senza che nessuna avesse consumato tempo; e col tetto a 24 una sola
+/// prova bloccata poteva far durare il gate 8 minuti (24 x 20s) senza che quel
+/// numero dicesse nulla su quanto si stesse aspettando.
+///
+/// Col budget di TEMPO il criterio diventa «esegui finche' hai budget»: venti
+/// prove veloci girano tutte, e una prova che si blocca consuma il budget e
+/// ferma le altre — che e' il comportamento voluto, ottenuto senza inventare un
+/// numero di prove.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParametriPiano {
     /// La chiave lo accende (`agent.final_gate.piano_verifica_enabled`).
     pub abilitato: bool,
     /// Pazienza del GATE per UNA prova.
+    ///
+    /// Resta, e non e' ridondante col budget: senza, UNA prova bloccata si
+    /// prenderebbe l'intero budget prima che il gate possa passare alla
+    /// successiva. E' un bound sulla singola attesa, il budget e' un bound sul
+    /// totale.
     pub timeout_s: f64,
-    /// Tetto di prove effettivamente eseguite in un giro di gate: oltre, la
-    /// prova resta dichiarata ([`CausaNonEseguita::OltreIlTetto`]) e non e' una
-    /// prova in piu'. Senza, un piano da duecento prove farebbe durare il gate
-    /// quanto una build.
-    pub max_prove: usize,
+    /// Budget di TEMPO complessivo di UNA invocazione del criterio: si eseguono
+    /// prove finche' ce n'e', e la prima che trova il budget esaurito resta
+    /// dichiarata con [`CausaNonEseguita::BudgetTempoEsaurito`].
+    ///
+    /// Il valore vive nel DB (`agent.final_gate.piano_budget_tempo_s`, regola G)
+    /// ed e' MOTIVATO da una misura: sul run del 19/08 le prove reali sono curl
+    /// verso un servizio locale e grep sull'albero, tutte sotto il secondo, e un
+    /// Consiglio ne emette 21.
+    pub budget_s: f64,
 }
 
 impl ParametriPiano {
-    /// Il PRODOTTO dei due tetti: quanto, nel caso peggiore, questo criterio
-    /// puo' tenere fermo il gate in UNA invocazione.
+    /// Quanto, nel caso peggiore, questo criterio puo' tenere fermo il gate in
+    /// UNA invocazione.
+    ///
+    /// Non e' piu' un prodotto da rifare a mano: e' il budget stesso. Il
+    /// `timeout_s` non lo allunga — una prova non puo' cominciare dopo che il
+    /// budget e' finito, e la sua attesa e' comunque tagliata sul residuo.
     pub fn attesa_massima_s(&self) -> f64 {
-        self.timeout_s.max(0.0) * self.max_prove as f64
+        self.budget_s.max(0.0)
     }
 }
 
@@ -1588,10 +1832,11 @@ pub fn criterio_piano(
         return None;
     }
     let mut spec = Map::new();
-    spec.insert(CHIAVE_MAX_PROVE.to_string(), json!(p.max_prove));
-    // Il PRODOTTO nella spec, non solo i due fattori: e' il numero che dice
-    // quanto il gate puo' restare fermo, e va letto senza rifare la
-    // moltiplicazione a mano (regola Q, punto 3).
+    spec.insert(CHIAVE_BUDGET_TEMPO.to_string(), json!(p.budget_s));
+    // Quanto il gate puo' restare fermo, letto senza rifare conti a mano
+    // (regola Q, punto 3). Con il budget di tempo i due valori coincidono, e la
+    // chiave resta perche' e' quella che il consumatore interroga: e' il numero
+    // che risponde alla domanda, non il modo in cui e' stato ottenuto.
     spec.insert(
         CHIAVE_ATTESA_MASSIMA.to_string(),
         json!(p.attesa_massima_s()),
@@ -1745,6 +1990,150 @@ mod tests {
         EsitoSingolo::non_eseguibile(causa)
     }
 
+    // ── il referto per la chat (difetto C, 20/08/2026) ───────────────────────
+
+    /// Il referto nasce dall'EVIDENZA REALE, non da una sua imitazione: gli
+    /// esiti passano da [`evidenza_piano`], che e' il produttore che gira in
+    /// produzione, e solo dopo da [`RefertoProve::da_evidenza`] (regola O).
+    fn referto_da(esiti: &[EsitoProva]) -> RefertoProve {
+        let v = classifica_piano(esiti);
+        RefertoProve::da_evidenza(&evidenza_piano(&v, esiti)).expect("il criterio ha girato")
+    }
+
+    /// MUTAZIONE OBBLIGATORIA del difetto C: **«nessuna prova dichiarata» e
+    /// «prove dichiarate e nessuna eseguita» si leggono DIVERSI in chat.**
+    ///
+    /// MISURATO in chat il 20/08/2026 su `t4-prove-consiglio`: le figure avevano
+    /// emesso 21 prove eseguibili e il messaggio di chiusura era identico a
+    /// quello di due giorni prima, quando le prove non esistevano. Il difetto
+    /// non era nell'evidenza — completa — ma nel fatto che nessuno ne componesse
+    /// una nota.
+    ///
+    /// MUTAZIONE che lo fa rosseggiare: far ritornare a `nota()` lo stesso testo
+    /// nei due casi (per esempio ignorando `dichiarate`) — le due note tornano
+    /// identiche e l'asserzione cade.
+    #[test]
+    fn il_referto_distingue_il_piano_vuoto_dalle_prove_mai_partite() {
+        let vuoto = referto_da(&[]);
+        let bloccate: Vec<EsitoProva> = (0..25)
+            .map(|i| {
+                esito(
+                    prova(
+                        &format!("curl -s localhost/api/{i}"),
+                        Attesa::Uscita { codice: 0 },
+                        OriginePiano::Consiglio,
+                    ),
+                    non_eseguibile(CausaNonEseguita::GiudizioNonEspresso {
+                        decisione: StepGateDecision::NeedsHuman,
+                    }),
+                )
+            })
+            .collect();
+        let non_partite = referto_da(&bloccate);
+
+        assert_eq!(vuoto.dichiarate, 0);
+        assert_eq!(non_partite.dichiarate, 25);
+        assert_eq!(non_partite.superate, 0);
+        assert_ne!(
+            vuoto.nota(),
+            non_partite.nota(),
+            "in chat i due casi devono leggersi diversi, non solo in SQL"
+        );
+        assert!(
+            non_partite.nota().contains("25"),
+            "il referto dice quante prove esistevano: {}",
+            non_partite.nota()
+        );
+        // E dice il FATTO, non il nome interno della variante.
+        assert!(
+            !non_partite.nota().contains("judgment_not_reached"),
+            "la nota la legge un umano: {}",
+            non_partite.nota()
+        );
+        assert!(
+            non_partite.nota().contains("astensioni"),
+            "la causa arriva in prosa dal criterio: {}",
+            non_partite.nota()
+        );
+    }
+
+    /// Il terzo caso, che il difetto B rende osservabile: alcune prove sono
+    /// girate e le altre no perche' il BUDGET DI TEMPO e' finito. Non e' «tutte
+    /// eseguite» e non e' «nessuna eseguita» (regola Q), e il referto porta
+    /// entrambi i numeri — perche' «budget finito dopo 2 prove» e «dopo 20»
+    /// hanno rimedi diversi.
+    #[test]
+    fn il_referto_dichiara_il_budget_finito_a_meta_del_piano() {
+        let mut esiti: Vec<EsitoProva> = (0..2)
+            .map(|i| {
+                esito(
+                    prova(
+                        &format!("curl -s localhost/api/{i}"),
+                        Attesa::Uscita { codice: 0 },
+                        OriginePiano::Consiglio,
+                    ),
+                    EsitoSingolo::Superata,
+                )
+            })
+            .collect();
+        esiti.extend((0..3).map(|i| {
+            esito(
+                prova(
+                    &format!("grep -q limite src/app{i}.js"),
+                    Attesa::Uscita { codice: 0 },
+                    OriginePiano::Consiglio,
+                ),
+                non_eseguibile(CausaNonEseguita::BudgetTempoEsaurito {
+                    budget_s: 120,
+                    eseguite: 2,
+                }),
+            )
+        }));
+        let r = referto_da(&esiti);
+        assert_eq!((r.dichiarate, r.superate, r.non_eseguibili), (5, 2, 3));
+        let nota = r.nota();
+        assert!(nota.contains('5') && nota.contains('2') && nota.contains('3'), "{nota}");
+        assert!(
+            nota.contains("120s") && nota.contains("budget di tempo"),
+            "il referto dice su quale numero intervenire: {nota}"
+        );
+        // Distinto da «tutte eseguite»: quel caso non nomina alcun budget.
+        let tutte: Vec<EsitoProva> = esiti
+            .iter()
+            .take(2)
+            .cloned()
+            .collect();
+        assert!(!referto_da(&tutte).nota().contains("budget"));
+    }
+
+    /// Una prova OSSERVATA e non conforme arriva in chat col comando e con cio'
+    /// che si e' visto: e' il fatto su cui si torna a lavorare.
+    #[test]
+    fn il_referto_nomina_le_prove_non_superate() {
+        let r = referto_da(&[esito(
+            prova(
+                "node --test calcolatrice.test.js",
+                Attesa::Uscita { codice: 0 },
+                OriginePiano::Consiglio,
+            ),
+            EsitoSingolo::Fallita {
+                osservato: "exit code 1 (atteso 0)".into(),
+            },
+        )]);
+        assert_eq!(r.fallite, 1);
+        let nota = r.nota();
+        assert!(nota.contains("node --test calcolatrice.test.js"), "{nota}");
+        assert!(nota.contains("exit code 1"), "{nota}");
+    }
+
+    /// Il criterio NON interrogato non ha un referto: `None` e' «non sono stato
+    /// chiamato», che in chat non deve produrre nessuna riga (regola Q).
+    #[test]
+    fn senza_evidenza_non_c_e_referto() {
+        assert!(RefertoProve::da_evidenza(&json!({})).is_none());
+        assert!(RefertoProve::da_evidenza(&json!({"verdict": "plan_passed"})).is_none());
+    }
+
     // ── il vocabolario ───────────────────────────────────────────────────────
 
     /// Identificatori canonici e distinti (regola N).
@@ -1814,7 +2203,7 @@ mod tests {
             CausaNonEseguita::GiudiceNonDisponibile {
                 motivo: MotivoGiudiceAssente::GateSpento,
             },
-            CausaNonEseguita::OltreIlTetto { max: 6 },
+            CausaNonEseguita::BudgetTempoEsaurito { budget_s: 120, eseguite: 6 },
             CausaNonEseguita::AmbienteNonPronto {
                 dettaglio: "x".into(),
             },
@@ -2679,7 +3068,7 @@ mod tests {
             ),
             esito(
                 prova("pytest", Attesa::Uscita { codice: 0 }, OriginePiano::Agente),
-                non_eseguibile(CausaNonEseguita::OltreIlTetto { max: 6 }),
+                non_eseguibile(CausaNonEseguita::BudgetTempoEsaurito { budget_s: 120, eseguite: 6 }),
             ),
         ];
         assert_eq!(
@@ -2777,7 +3166,7 @@ mod tests {
                 Attesa::Uscita { codice: 0 },
                 OriginePiano::Consiglio,
             ),
-            non_eseguibile(CausaNonEseguita::OltreIlTetto { max: 6 }),
+            non_eseguibile(CausaNonEseguita::BudgetTempoEsaurito { budget_s: 120, eseguite: 6 }),
         )]);
         assert!(!non_partita.dichiara_un_esito());
     }
@@ -2822,8 +3211,8 @@ mod tests {
     fn parametri(abilitato: bool) -> ParametriPiano {
         ParametriPiano {
             abilitato,
-            timeout_s: 45.0,
-            max_prove: 6,
+            timeout_s: 20.0,
+            budget_s: 120.0,
         }
     }
 
@@ -2833,17 +3222,30 @@ mod tests {
         assert!(criterio_piano(Some(&politica()), &parametri(false)).is_none());
     }
 
-    /// RILIEVO 8 — IL PRODOTTO E' DICHIARATO.
+    /// RILIEVO 8 — L'ATTESA MASSIMA E' DICHIARATA, e dal 20/08/2026 non e' piu'
+    /// un PRODOTTO da rifare a mano: e' il budget stesso.
     ///
-    /// I due tetti da soli non dicono nulla: il numero operativamente rilevante
-    /// e' quanto il criterio puo' tenere fermo il gate in UNA invocazione, e va
-    /// letto nella spec invece di essere rifatto a mano da chi legge.
+    /// MUTAZIONE del difetto B: tornare a `timeout_s * max_prove` fa risalire
+    /// questo numero a 480 (24 x 20) col tetto della 0746, cioe' quattro volte
+    /// il bound che il criterio dichiara — e quel numero non lo misurava
+    /// nessuno, si otteneva moltiplicando due parametri.
     #[test]
-    fn l_attesa_massima_e_il_prodotto_dei_due_tetti() {
+    fn l_attesa_massima_e_il_budget_di_tempo() {
         let p = parametri(true);
-        assert_eq!(p.attesa_massima_s(), 270.0, "6 prove x 45s");
+        assert_eq!(
+            p.attesa_massima_s(),
+            120.0,
+            "il bound e' il budget, non il prodotto con l'attesa per prova"
+        );
         let spec = criterio_piano(Some(&politica()), &p).expect("criterio acceso");
-        assert_eq!(spec.spec[CHIAVE_ATTESA_MASSIMA], json!(270.0));
+        assert_eq!(spec.spec[CHIAVE_ATTESA_MASSIMA], json!(120.0));
+        // L'attesa per prova NON allunga il bound: una prova non puo'
+        // cominciare a budget esaurito.
+        let stretto = ParametriPiano {
+            timeout_s: 600.0,
+            ..parametri(true)
+        };
+        assert_eq!(stretto.attesa_massima_s(), 120.0);
     }
 
     /// Acceso, nasce col vocabolario dentro la spec e riceve piano e MODALITA'
@@ -2853,8 +3255,8 @@ mod tests {
         let pol = politica();
         let base = criterio_piano(Some(&pol), &parametri(true)).expect("criterio acceso");
         assert_eq!(base.criterion_type, CRITERION_TYPE);
-        assert_eq!(base.timeout_s, Some(45.0));
-        assert_eq!(base.spec[CHIAVE_MAX_PROVE], json!(6));
+        assert_eq!(base.timeout_s, Some(20.0));
+        assert_eq!(base.spec[CHIAVE_BUDGET_TEMPO], json!(120.0));
         assert!(
             base.spec.get(CHIAVE_PROVE).is_none(),
             "a t=0 nessuno ha ancora dichiarato prove"

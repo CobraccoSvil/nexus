@@ -749,6 +749,17 @@ pub struct NativeRunOutcome {
     /// lettura dei conteggi sarebbe una seconda idea di cosa significa
     /// "applicato" (regola L).
     pub council_conformance: Option<nexus_agent_graph::decisions::ConformanceReport>,
+    /// Che cosa e' successo alle PROVE ESEGUIBILI del piano di verifica.
+    ///
+    /// `None` = il criterio non e' stato interrogato (piano di verifica spento,
+    /// oppure il gate non e' mai entrato). NON e' «non ha misurato»: quel caso
+    /// e' un referto con `superate = 0` e la causa dichiarata, ed e' proprio la
+    /// distinzione che il 20/08/2026 mancava in chat (regola Q).
+    ///
+    /// TIPIZZATO come [`nexus_agent_graph::decisions::ConformanceReport`] e per
+    /// la stessa ragione: la nota la compone il punto unico
+    /// (`RefertoProve::nota`), non il finalizzatore rileggendo un JSON.
+    pub referto_prove: Option<nexus_agent_graph::decisions::piano_di_verifica::RefertoProve>,
 }
 
 /// Chiavi del blocco esito STRUTTURATO ([`NativeRunOutcome::structured_verdict`]).
@@ -1656,8 +1667,8 @@ pub(crate) async fn criterio_piano_verifica(
         politica.as_ref(),
         &ParametriPiano {
             abilitato,
-            timeout_s: setting_f64(db, "agent.final_gate.prova_timeout_s", 45.0).await,
-            max_prove: setting_usize(db, "agent.final_gate.piano_max_prove", 6).await,
+            timeout_s: setting_f64(db, "agent.final_gate.prova_timeout_s", 20.0).await,
+            budget_s: setting_f64(db, "agent.final_gate.piano_budget_tempo_s", 120.0).await,
         },
     )
 }
@@ -4763,6 +4774,14 @@ pub(crate) fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome 
             .unwrap_or_default(),
         // Lo riempie il chiamante async: qui non si legge nessun file.
         council_conformance: None,
+        // L'evidenza del criterio del piano, depositata dal final gate nello
+        // stato. La chiave ASSENTE significa «il piano non e' stato
+        // interrogato», e resta `None`: non si inventa un referto vuoto, che in
+        // chat sarebbe indistinguibile da «nessuna prova dichiarata».
+        referto_prove: state
+            .extra
+            .get(nexus_agent_graph::decisions::piano_di_verifica::PIANO_REFERTO_KEY)
+            .and_then(nexus_agent_graph::decisions::piano_di_verifica::RefertoProve::da_evidenza),
     }
 }
 
@@ -6737,6 +6756,7 @@ mod tests {
             pending_actions: Vec::new(),
             council_requirements: Vec::new(),
             council_conformance: None,
+            referto_prove: None,
         }
     }
 

@@ -81,6 +81,31 @@ use crate::state::{
     AgentState, FinalGateVerdict, GateRouting, Message, MessageContent, StateDelta, StopReason,
 };
 
+/// L'uscita dei rami del gate che hanno gia' ESEGUITO i criteri.
+///
+/// Esiste per rendere UNO il punto in cui l'evidenza del piano di verifica
+/// entra nello stato: i rami sono cinque, e cinque `put_extra` scritti a mano
+/// sarebbero cinque occasioni di dimenticarsene — il ramo dimenticato
+/// riaprirebbe in silenzio il difetto del 20/08/2026 (le prove che girano e la
+/// chat che non lo dice).
+trait UscitaConReferto {
+    fn con_referto(
+        self,
+        state: &AgentState,
+        results: &[CriterionResult],
+    ) -> nexus_graph::StateDelta;
+}
+
+impl UscitaConReferto for StateDelta {
+    fn con_referto(
+        self,
+        state: &AgentState,
+        results: &[CriterionResult],
+    ) -> nexus_graph::StateDelta {
+        FinalGateNode::con_referto_prove(self, state, results).into_opaque()
+    }
+}
+
 /// Pattern di errore di compilazione comuni (TypeScript, Rust, generici).
 /// Replica 1:1 `_BUILD_ERROR_PATTERNS` (`final_gate.py:276-282`). Il conteggio
 /// e' indicativo (best-effort): comunica all'agente la SCALA del problema, non
@@ -1199,6 +1224,51 @@ impl FinalGateNode {
         )
     }
 
+    /// Deposita nello stato l'EVIDENZA del criterio del piano di verifica, cosi'
+    /// che il finalizzatore del run possa comporne il referto per la CHAT.
+    ///
+    /// ## Il difetto (MISURATO in chat il 20/08/2026, `t4-prove-consiglio`)
+    ///
+    /// Le figure avevano emesso 21 prove eseguibili e il messaggio di chiusura
+    /// diceva soltanto «Requisiti del Consiglio: nessuno verificabile
+    /// automaticamente» — lo stesso testo di quando le prove non esistevano.
+    /// L'evidenza del piano c'era, completa, e viaggiava nel payload del
+    /// meta_step: nel canale della CHAT non entrava, perche' quel canale passa
+    /// da `AgentState` e nessuno ci scriveva nulla.
+    ///
+    /// ## Perche' in TUTTI i rami e non solo in quelli che chiudono
+    ///
+    /// Il referto descrive l'ULTIMA misura del gate. Scriverlo anche nei rami
+    /// che rimandano in correzione costa una chiave e mantiene il dato fresco
+    /// per un run che muoia prima di rientrare; scriverlo nei soli rami di
+    /// chiusura sarebbe una condizione in piu' da ricordarsi, cioe' il ramo
+    /// dimenticato che riaprirebbe il difetto in silenzio.
+    ///
+    /// Il criterio ASSENTE non scrive nulla: la chiave mancante significa «il
+    /// piano non e' stato interrogato», che non e' «non ha misurato» (regola Q).
+    fn con_referto_prove(
+        mut delta: StateDelta,
+        state: &AgentState,
+        results: &[CriterionResult],
+    ) -> StateDelta {
+        let Some(r) = results
+            .iter()
+            .find(|r| r.criterion_type == crate::decisions::piano_di_verifica::CRITERION_TYPE)
+        else {
+            return delta;
+        };
+        // `extra` ha semantica di OVERWRITE totale: si parte da cio' che il
+        // ramo ha gia' deciso di scrivere, e in sua assenza dallo stato — mai
+        // da una mappa nuova, che cancellerebbe le altre chiavi.
+        let mut extra = delta.extra.take().unwrap_or_else(|| state.extra.clone());
+        extra.insert(
+            crate::decisions::piano_di_verifica::PIANO_REFERTO_KEY.to_string(),
+            r.evidence.clone(),
+        );
+        delta.extra = Some(extra);
+        delta
+    }
+
     fn con_criteri_non_misurati(mut payload: Value, results: &[CriterionResult]) -> Value {
         if let Value::Object(map) = &mut payload {
             map.insert(
@@ -1542,7 +1612,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 final_gate_unverified: Some(Some(chiusura_non_verificata)),
                 ..Default::default()
             }
-            .into_opaque());
+            .con_referto(state, &results));
         }
 
         // ── Ramo FORCED / CAP (final_gate.py:524-537) ─────────────────────────
@@ -1624,7 +1694,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                     final_gate_unverified: Some(Some(true)),
                     ..Default::default()
                 }
-                .into_opaque());
+                .con_referto(state, &results));
             }
 
             // ── CHIUSURA dopo la grazia: firma ancora assente, criteri
@@ -1643,7 +1713,8 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
             if !forced_close && grazia_gia_concessa && solo_firma_manca {
                 return Ok(self
                     .chiusura_con_firma_assente(cycle, inconclusive_n, &results, chiusura_non_verificata, ctx)
-                    .await);
+                    .await
+                    .con_referto(state, &results));
             }
             // ── NON-CONVERGENZA -> ESCALATION di modello (regola H, "niente di
             // fisso") ─────────────────────────────────────────────────────────
@@ -1707,7 +1778,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                     extra: Some(extra_out),
                     ..Default::default()
                 }
-                .into_opaque());
+                .con_referto(state, &results));
             }
             tracing::warn!(
                 target: "nexus_agent_graph::final_gate",
@@ -1732,7 +1803,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 gate_routing: Some(Some(GateRouting::Chiude)),
                 ..Default::default()
             }
-            .into_opaque());
+            .con_referto(state, &results));
         }
 
         // ── Ramo FAIL (final_gate.py:539-546) ─────────────────────────────────
@@ -1778,7 +1849,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
             final_gate_verdict: Some(Some(FinalGateVerdict::FailedPendingCorrection)),
             ..Default::default()
         }
-        .into_opaque())
+        .con_referto(state, &results))
     }
 }
 
@@ -1857,6 +1928,11 @@ impl FinalGateNode {
     /// `non_verificata` arriva dal chiamante ed e' lo STESSO valore che riceve il
     /// ramo PASSED: i due rami che chiudono positivamente non possono avere due
     /// idee di "verificato" (regola L).
+    ///
+    /// Ritorna il delta TIPIZZATO e non quello opaco: l'uscita — e con lei il
+    /// deposito del referto delle prove ([`UscitaConReferto`]) — resta al
+    /// chiamante, dove stanno gli altri rami. Cosi' questo ramo non ha bisogno
+    /// dello stato per una cosa che non lo riguarda.
     async fn chiusura_con_firma_assente(
         &self,
         cycle: i64,
@@ -1864,7 +1940,7 @@ impl FinalGateNode {
         results: &[CriterionResult],
         non_verificata: bool,
         ctx: &AgentNodeCtx,
-    ) -> OpaqueDelta {
+    ) -> StateDelta {
         tracing::info!(
             target: "nexus_agent_graph::final_gate",
             cycle,
@@ -1893,7 +1969,6 @@ impl FinalGateNode {
             final_gate_unverified: Some(Some(non_verificata)),
             ..Default::default()
         }
-        .into_opaque()
     }
 
     /// Delta pass-through (`final_gate.py:506`): il gate non si applica, il
@@ -2557,6 +2632,100 @@ mod tests {
         }
     }
 
+    // ── il referto delle prove raggiunge lo stato (difetto C, 20/08/2026) ────
+
+    /// MUTAZIONE OBBLIGATORIA del difetto C, PRIMA META': **l'evidenza del piano
+    /// esce dal gate e finisce nello stato**, da cui il finalizzatore compone la
+    /// nota per la chat.
+    ///
+    /// MISURATO in chat il 20/08/2026 su `t4-prove-consiglio`: 21 prove
+    /// eseguibili emesse dalle figure e un messaggio di chiusura identico a
+    /// quello di due giorni prima. L'evidenza esisteva ed era completa — la
+    /// portava gia' il payload del meta_step — ma il canale della CHAT passa da
+    /// `AgentState` e li' non ci scriveva nessuno.
+    ///
+    /// Il test copre i DUE rami che contano davvero, e sono opposti: quello che
+    /// CHIUDE (il run finisce, il referto e' l'ultima parola) e quello che
+    /// RIMANDA in correzione (il run muore prima di rientrare e il referto e'
+    /// l'ultima misura disponibile).
+    ///
+    /// MUTAZIONE che lo fa rosseggiare, col difetto reale: togliere
+    /// `con_referto` da uno dei due rami — la chiave sparisce dallo stato, il
+    /// finalizzatore non ha nulla da dire e la chat torna muta sulle prove.
+    #[tokio::test]
+    async fn l_evidenza_del_piano_esce_dal_gate_in_entrambi_i_rami() {
+        use crate::decisions::piano_di_verifica::{CRITERION_TYPE, PIANO_REFERTO_KEY};
+        let evidenza = json!({
+            "verdict": "plan_not_run",
+            "prove": {"dichiarate": 21, "superate": 0, "fallite": 0, "non_eseguibili": 21},
+            "skipped_cause": "judgment_not_reached",
+        });
+        let ctx = ctx_with();
+        let st = software_state();
+
+        // Ramo che CHIUDE: il piano non ha misurato, gli altri criteri passano.
+        let passa = Arc::new(StubCriteriaRunner::with_results(vec![CriterionResult {
+            criterion_type: CRITERION_TYPE.to_string(),
+            outcome: CriterionOutcome::Inconclusive,
+            evidence: evidenza.clone(),
+        }]));
+        let out = apply(
+            st.clone(),
+            node_with(FinalGateConfig::default(), passa)
+                .run(&st, &ctx)
+                .await
+                .expect("run ok"),
+        );
+        assert_eq!(out.final_gate_passed, Some(true), "ramo di chiusura");
+        assert_eq!(
+            out.extra.get(PIANO_REFERTO_KEY),
+            Some(&evidenza),
+            "il referto deve arrivare allo stato anche quando il gate chiude"
+        );
+
+        // Ramo che RIMANDA: un altro criterio boccia.
+        let boccia = Arc::new(StubCriteriaRunner::with_results(vec![
+            CriterionResult {
+                criterion_type: CRITERION_TYPE.to_string(),
+                outcome: CriterionOutcome::Inconclusive,
+                evidence: evidenza.clone(),
+            },
+            fail_result("no_orphan_imported", json!({"verdict": "rotto"})),
+        ]));
+        let out = apply(
+            st.clone(),
+            node_with(FinalGateConfig::default(), boccia)
+                .run(&st, &ctx)
+                .await
+                .expect("run ok"),
+        );
+        assert_eq!(out.stop_reason, Some(StopReason::ToolUse), "ramo di rimando");
+        assert_eq!(out.extra.get(PIANO_REFERTO_KEY), Some(&evidenza));
+    }
+
+    /// Il criterio del piano ASSENTE non deposita nulla: la chiave mancante
+    /// significa «il piano non e' stato interrogato», che non e' «non ha
+    /// misurato» (regola Q). Senza questa asimmetria il finalizzatore
+    /// scriverebbe in chat «nessuna prova dichiarata» anche su un run in cui il
+    /// criterio era spento.
+    #[tokio::test]
+    async fn senza_criterio_del_piano_lo_stato_resta_intatto() {
+        use crate::decisions::piano_di_verifica::PIANO_REFERTO_KEY;
+        let runner = Arc::new(StubCriteriaRunner::with_results(vec![ok_result(
+            "no_orphan_imported",
+        )]));
+        let ctx = ctx_with();
+        let st = software_state();
+        let out = apply(
+            st.clone(),
+            node_with(FinalGateConfig::default(), runner)
+                .run(&st, &ctx)
+                .await
+                .expect("run ok"),
+        );
+        assert!(out.extra.get(PIANO_REFERTO_KEY).is_none());
+    }
+
     // ── build_criteria deterministico ────────────────────────────────────────────
 
     /// IL NODO E' L'UNICO PUNTO CHE VEDE LO STATO, ed e' li' che il piano entra
@@ -2592,7 +2761,7 @@ mod tests {
                 &ParametriPiano {
                     abilitato: true,
                     timeout_s: 60.0,
-                    max_prove: 20,
+                    budget_s: 120.0,
                 },
             ),
             ..Default::default()
@@ -2642,7 +2811,7 @@ mod tests {
         let parametri = ParametriPiano {
             abilitato: true,
             timeout_s: 60.0,
-            max_prove: 20,
+            budget_s: 120.0,
         };
         let st = software_state();
         let spento = node_with(

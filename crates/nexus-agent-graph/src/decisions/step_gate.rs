@@ -457,6 +457,16 @@ pub const CAUSA_ASTENSIONE_SCHEMA: &str = "schema_mismatch";
 /// Il gateway ha ripiegato sull'ESECUTORE del turno: il verdetto ci sarebbe
 /// anche, ma non e' indipendente.
 pub const CAUSA_ASTENSIONE_EXECUTOR: &str = "executor_fallback";
+/// La risposta e' stata TAGLIATA dal tetto di output che abbiamo dichiarato noi
+/// ([`super::fine_turno::FineTurno::Troncato`]): il modello stava rispondendo e
+/// non ha potuto finire.
+///
+/// E' una causa DISTINTA da [`CAUSA_ASTENSIONE_SCHEMA`] e non una sua sfumatura:
+/// li' il modello ha risposto nella forma sbagliata, qui non ha potuto rispondere
+/// per intero, e i due rimedi sono opposti — cambiare giudice contro tarare il
+/// tetto. Il difetto che nasce dal collasso delle due e' MISURATO in testa a
+/// [`super::fine_turno`].
+pub const CAUSA_ASTENSIONE_TRONCATO: &str = "output_truncated";
 
 /// Perche' un giudice non ha espresso un verdetto — e soprattutto: **cambierebbe
 /// qualcosa riconvocare LO STESSO?**
@@ -534,7 +544,15 @@ impl NaturaAstensione {
 ///   dal catalogo, e trattarlo come strutturale marchierebbe come inadatto un
 ///   modello sano;
 /// - `executor_fallback` dipende da dove il gateway ha potuto instradare in
-///   quell'istante, cioe' dallo stato dei cooldown: ambiente.
+///   quell'istante, cioe' dallo stato dei cooldown: ambiente;
+/// - `output_truncated` e' una causa NOSTRA. Il modello stava rispondendo bene e
+///   la risposta e' finita contro il tetto di output che abbiamo dichiarato noi
+///   ([`super::fine_turno`]): riproporre LA STESSA coppia con un tetto adeguato
+///   funziona, e sostituire il giudice non rimedia nulla — il tetto lo
+///   riceverebbe identico anche il sostituto. E' quindi `Transitoria` in
+///   entrambe le conseguenze che quel tipo governa: nessuna sostituzione, e
+///   soprattutto nessuna annotazione nel registro dei giudici inadatti, che e'
+///   il danno misurato (un modello sano fuori dalle convocazioni per un'ora).
 pub fn natura_astensione(causa: Option<&str>) -> NaturaAstensione {
     let Some(causa) = causa.map(str::trim).filter(|c| !c.is_empty()) else {
         return NaturaAstensione::NonDichiarata;
@@ -544,7 +562,8 @@ pub fn natura_astensione(causa: Option<&str>) -> NaturaAstensione {
         CAUSA_ASTENSIONE_TIMEOUT
         | CAUSA_ASTENSIONE_JOIN
         | CAUSA_ASTENSIONE_CALL
-        | CAUSA_ASTENSIONE_EXECUTOR => return NaturaAstensione::Transitoria,
+        | CAUSA_ASTENSIONE_EXECUTOR
+        | CAUSA_ASTENSIONE_TRONCATO => return NaturaAstensione::Transitoria,
         _ => {}
     }
     natura_dal_fornitore(causa).unwrap_or(NaturaAstensione::NonDichiarata)
@@ -1239,6 +1258,7 @@ mod tests {
             CAUSA_ASTENSIONE_JOIN,
             CAUSA_ASTENSIONE_CALL,
             CAUSA_ASTENSIONE_EXECUTOR,
+            CAUSA_ASTENSIONE_TRONCATO,
         ] {
             assert_eq!(
                 natura_astensione(Some(causa)),
@@ -1247,6 +1267,33 @@ mod tests {
             );
             assert!(!natura_astensione(Some(causa)).richiede_un_altro_giudice());
         }
+    }
+
+    /// MUTAZIONE OBBLIGATORIA del difetto A, con la sua CONSEGUENZA: se
+    /// `output_truncated` fosse classificato come `schema_mismatch` — cioe' se
+    /// il collasso delle due cause tornasse — questo test rosseggia dicendo che
+    /// una coppia sana finirebbe nel registro dei giudici inadatti.
+    ///
+    /// La conseguenza vera la esercita il test gemello in
+    /// `mcp-core::agent_graph_adapter::step_validation`
+    /// (`un_giudice_troncato_non_finisce_fra_gli_inadatti`), che attraversa la
+    /// convocazione reale: qui si fissa il criterio, li' si misura l'effetto.
+    #[test]
+    fn un_troncamento_non_squalifica_il_giudice() {
+        let natura = natura_astensione(Some(CAUSA_ASTENSIONE_TRONCATO));
+        assert_eq!(
+            natura,
+            NaturaAstensione::Transitoria,
+            "il troncamento e' causato dal NOSTRO tetto: il modello e' sano"
+        );
+        assert!(
+            !natura.richiede_un_altro_giudice(),
+            "sostituire il giudice non rimedia: il sostituto riceverebbe lo stesso tetto"
+        );
+        assert_ne!(
+            CAUSA_ASTENSIONE_TRONCATO, CAUSA_ASTENSIONE_SCHEMA,
+            "due fatti opposti non possono condividere l'identificatore"
+        );
     }
 
     /// Le cause del FORNITORE arrivano dal suo vocabolario, non da un elenco di
