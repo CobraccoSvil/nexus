@@ -236,12 +236,23 @@ pub fn scrivi_prontezza(p: &mut serde_json::Value, readiness: &ProviderReadiness
 mod tests {
     use super::*;
 
+    /// I fatti di QUALIFICAZIONE sono qui allo stato d'ingresso e nessuno di
+    /// questi test li guarda: la prontezza chiede «sappiamo che risponde?», la
+    /// selezionabilita' «il gate lo ammette?» — due domande sugli stessi fatti
+    /// di catalogo (`nexus_capability_audit::selezionabilita`), e i casi della
+    /// seconda si provano li'. Restano scritti per esteso invece di venire da un
+    /// `Default`, che su una struct di FATTI sarebbe un fatto inventato a
+    /// disposizione anche della produzione.
     fn abilitato() -> ModelFact {
         ModelFact {
             is_enabled: true,
             capability_source: "auto".to_string(),
             auto_disabled_reason: None,
             ha_capability: true,
+            qualification_valid: false,
+            qualification_attempts: 0,
+            qualification_reason: None,
+            qualification_state: "unqualified".to_string(),
         }
     }
 
@@ -250,11 +261,11 @@ mod tests {
     fn in_attesa_di_verifica() -> ModelFact {
         ModelFact {
             is_enabled: false,
-            capability_source: "auto".to_string(),
             auto_disabled_reason: Some(
                 crate::model_health_probe::REASON_UNVERIFIED_NO_PROBE.to_string(),
             ),
             ha_capability: false,
+            ..abilitato()
         }
     }
 
@@ -263,9 +274,9 @@ mod tests {
     fn nel_limbo() -> ModelFact {
         ModelFact {
             is_enabled: false,
-            capability_source: "auto".to_string(),
             auto_disabled_reason: None,
             ha_capability: false,
+            ..abilitato()
         }
     }
 
@@ -360,9 +371,9 @@ mod tests {
         // predicato: cambiando SOLO il reason lo stato deve ribaltarsi.
         let escluso = ModelFact {
             is_enabled: false,
-            capability_source: "auto".to_string(),
             auto_disabled_reason: Some("manual:disabilitato dall'admin".to_string()),
             ha_capability: false,
+            ..abilitato()
         };
         assert_eq!(
             classifica(true, &[escluso], None),

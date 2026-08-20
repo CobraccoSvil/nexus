@@ -75,6 +75,14 @@ mod tests {
             capability_source: "auto".to_string(),
             auto_disabled_reason: None,
             ha_capability,
+            // La qualificazione e' la TERZA domanda sugli stessi fatti
+            // (`nexus_capability_audit::selezionabilita`) e qui non decide
+            // nulla: lo stato d'ingresso e' cio' che rende questi casi
+            // confrontabili con quelli della copertura.
+            qualification_valid: false,
+            qualification_attempts: 0,
+            qualification_reason: None,
+            qualification_state: "unqualified".to_string(),
         }
     }
 

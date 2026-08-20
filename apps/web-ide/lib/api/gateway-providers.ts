@@ -46,6 +46,28 @@ export type ProviderDeclaration =
   | "partial"
   | "absent";
 
+/**
+ * Le varianti di selezionabilita' dichiarate da
+ * `mcp-core::provider_selectability`.
+ *
+ * TERZA domanda sugli stessi fatti, e ortogonale alle altre due: la prontezza
+ * dice se il fornitore RISPONDE, la dichiarazione se cio' che sappiamo BASTA a
+ * usarlo, questa se il gate di qualificazione lo AMMETTE nel routing.
+ *
+ * Che le tre non si possano fondere lo prova un caso reale, misurato il
+ * 20/08/2026: groq e' `healthy`, `absent` di capability e `stuck_unmeasured`
+ * insieme — sano, scoperto e fuori dal routing per intent, con tre rimedi
+ * diversi. Tutte e 14 le sue righe di `nexus_routing_matrix` erano spente da
+ * 36 giorni e nessun campo del wire lo diceva.
+ */
+export type ProviderSelectability =
+  | "nothing_to_select"
+  | "gate_off"
+  | "selectable"
+  | "stuck_unmeasured"
+  | "awaiting_measurement"
+  | "measured_not_qualified";
+
 /** Una entry di `GET /api/gateway/providers`. */
 export interface GatewayProvider {
   name: string;
@@ -66,6 +88,15 @@ export interface GatewayProvider {
   declaration?: ProviderDeclaration;
   /** Quanti modelli ABILITATI sono privi di capability. Assente dove non ne manca nessuno. */
   declaration_undeclared?: number;
+  selectability?: ProviderSelectability;
+  /** Il gate ammette almeno un modello di questo fornitore. */
+  selectable_for_routing?: boolean;
+  /**
+   * Quanti modelli ABILITATI sono fermi su giri che non li misurano. Assente
+   * dove non ce n'e' nessuno: uno zero inviterebbe a cercare un blocco che non
+   * c'e'.
+   */
+  selectability_stuck_models?: number;
 }
 
 /**
@@ -169,6 +200,51 @@ export function renderDeclaration(p: GatewayProvider): RenderedReadiness | null 
       };
     default:
       // `complete`, `nothing_to_declare`, o campo assente: niente da mostrare.
+      return null;
+  }
+}
+
+/**
+ * L'etichetta della SELEZIONABILITA', o `null` quando non c'e' nulla da dire.
+ *
+ * Stessa disciplina di [`renderDeclaration`]: `null` non e' un esito
+ * conflazionato — l'esito sta nel campo `selectability` — ed e' solo il verdetto
+ * su cosa MOSTRARE. Scrivere «selezionabile» accanto a ogni fornitore in ordine
+ * sarebbe rumore, e il rumore e' il modo in cui una riga che conta smette di
+ * essere letta.
+ *
+ * I DUE silenzi restano DUE frasi perche' hanno rimedi opposti, ed e' l'intera
+ * ragione per cui questo campo esiste: `stuck_unmeasured` e' la batteria che si
+ * spende contro un fornitore saturo e non lo misura MAI — non si scioglie
+ * aspettando — mentre `awaiting_measurement` e' la batteria che non ci e'
+ * ancora arrivata, e si scioglie da sola. Al 20/08/2026 erano rispettivamente
+ * groq e perplexity, e sul pannello erano indistinguibili.
+ *
+ * `measured_not_qualified` non si mostra: e' un'esclusione a ragion veduta, non
+ * un difetto, e un allarme li' non avrebbe nessun intervento che lo spenga.
+ *
+ * L'IGNOTO non diventa un allarme: una entry senza `selectability` viene da un
+ * backend che non parla questa versione del contratto.
+ */
+export function renderSelectability(p: GatewayProvider): RenderedReadiness | null {
+  const fermi = p.selectability_stuck_models;
+  switch (p.selectability) {
+    case "stuck_unmeasured":
+      return {
+        label:
+          fermi === undefined
+            ? "fuori dal routing: la qualificazione non riesce a misurarlo"
+            : `fuori dal routing: ${fermi} modelli che la qualificazione non riesce a misurare`,
+        requiresAction: true,
+      };
+    case "awaiting_measurement":
+      return {
+        label: "fuori dal routing: in attesa della prima qualificazione",
+        requiresAction: false,
+      };
+    default:
+      // `selectable`, `gate_off`, `nothing_to_select`,
+      // `measured_not_qualified`, o campo assente: niente da mostrare.
       return null;
   }
 }

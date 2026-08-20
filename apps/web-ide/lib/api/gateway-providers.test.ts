@@ -7,6 +7,7 @@ import { dirname, join } from "node:path";
 import {
   renderDeclaration,
   renderReadiness,
+  renderSelectability,
   type GatewayProvider,
 } from "./gateway-providers.ts";
 
@@ -192,6 +193,90 @@ test("il difetto reale: derivare l'etichetta dal solo healthy la sbaglia", () =>
     assert.ok(
       etichette.size >= 1 && !etichette.has("mai misurato"),
       `nessuna entry senza misura deve uscire come 'mai misurato': ${[...etichette].join(" | ")}`,
+    );
+  }
+});
+
+/**
+ * LA TERZA DOMANDA — selezionabilita' (20/08/2026).
+ *
+ * La fixture e' del 10/08/2026 e NON contiene `selectability`: e' wire reale
+ * catturato prima che il campo esistesse, e aggiungerlo a mano sarebbe
+ * fabbricare un input, cioe' fissare l'assunto da verificare (regola O). Cio'
+ * che sulla fixture VERA si puo' provare — e conta — e' che un backend che non
+ * parla questa versione del contratto non produca allarmi.
+ */
+test("un wire senza selectability non inventa un allarme", () => {
+  const providers = wire();
+  const senzaCampo = providers.filter((p) => !p.selectability);
+  assert.equal(
+    senzaCampo.length,
+    providers.length,
+    "premessa: la fixture precede il campo, e questo test vale su di essa",
+  );
+  const resi = senzaCampo.map((p) => renderSelectability(p));
+  assert.deepEqual(
+    resi.filter((r) => r !== null),
+    [],
+    "l'ignoto non degrada in un allarme: senza il campo non sappiamo se il gate lo ammetta",
+  );
+});
+
+test("i due silenzi della selezionabilita' restano due frasi", () => {
+  // E' l'intera ragione per cui il campo esiste. Lo stato reale del
+  // 20/08/2026: groq e' fermo su giri che non lo misurano da 36 giorni,
+  // perplexity aspetta soltanto la prima qualificazione. Sul pannello erano
+  // indistinguibili — entrambi semplicemente assenti dal routing.
+  const groq = renderSelectability({
+    name: "groq",
+    healthy: true,
+    selectability: "stuck_unmeasured",
+    selectability_stuck_models: 2,
+  });
+  const perplexity = renderSelectability({
+    name: "perplexity",
+    healthy: true,
+    selectability: "awaiting_measurement",
+  });
+  assert.ok(groq && perplexity);
+  assert.notEqual(
+    groq.label,
+    perplexity.label,
+    "due stati con rimedi opposti non possono dare la stessa frase",
+  );
+  assert.equal(groq.requiresAction, true, "un blocco non si scioglie aspettando");
+  assert.equal(perplexity.requiresAction, false, "un'attesa si scioglie da sola");
+  assert.match(groq.label, /2 modelli/, "quanti sono fermi dimensiona l'intervento");
+});
+
+test("le tre domande restano tre campi", () => {
+  // MUTAZIONE dichiarata: se la selezionabilita' fosse stata infilata in
+  // `readiness` o in `declaration`, questa entry non sarebbe rappresentabile.
+  // E' lo stato reale di groq il 20/08/2026: sano, scoperto e fuori dal
+  // routing insieme, con tre rimedi diversi.
+  const p: GatewayProvider = {
+    name: "groq",
+    healthy: true,
+    readiness: "healthy",
+    declaration: "absent",
+    declaration_undeclared: 3,
+    selectability: "stuck_unmeasured",
+    selectable_for_routing: false,
+    selectability_stuck_models: 2,
+  };
+  assert.equal(renderReadiness(p).requiresAction, false, "la salute e' misurata e va bene");
+  assert.equal(renderDeclaration(p)?.requiresAction, true, "la dichiarazione manca");
+  assert.equal(renderSelectability(p)?.requiresAction, true, "e il gate non lo ammette");
+});
+
+test("un'esclusione misurata non e' un allarme", () => {
+  // `measured_not_qualified` e' il fornitore che la batteria HA guardato e non
+  // ha promosso: nessun intervento lo cambierebbe, quindi non si mostra.
+  for (const selectability of ["selectable", "gate_off", "nothing_to_select", "measured_not_qualified"] as const) {
+    assert.equal(
+      renderSelectability({ name: "x", healthy: true, selectability }),
+      null,
+      `${selectability} non deve produrre una riga`,
     );
   }
 });

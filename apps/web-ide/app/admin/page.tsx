@@ -8,7 +8,7 @@ import { AdminPageHeader } from "../../components/admin/AdminPageHeader";
 import { getGatewayProviders, reloadGatewayConfig } from "../../lib/api-client";
 import { useProviderBudgets } from "../../components/settings/provider-budget";
 import { renderSpendCap } from "../../lib/api/provider-spend-cap";
-import { renderDeclaration, renderReadiness, type GatewayProvider } from "../../lib/api/gateway-providers";
+import { renderDeclaration, renderReadiness, renderSelectability, type GatewayProvider } from "../../lib/api/gateway-providers";
 
 const SHORTCUTS: Array<{ label: string; href: Route; desc: string }> = [
   { label: "Provider & Modelli", href: "/admin/settings/providers" as Route, desc: "API key, modelli attivi, stato, budget" },
@@ -108,11 +108,14 @@ export default function AdminDashboardPage() {
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               {providers.map((p) => {
-                // Due domande, due righe: la salute e la copertura della
-                // dichiarazione non si possono fondere in un'etichetta sola —
-                // groq e openrouter sono `attivo` E senza una riga di
-                // capability, e una riga sola dovrebbe sceglierne una.
+                // TRE domande, tre righe: salute, copertura della
+                // dichiarazione e selezionabilita' non si possono fondere in
+                // un'etichetta sola. Misurato il 20/08/2026: groq e' `attivo`,
+                // senza una riga di capability E fuori dal routing per intent
+                // (14 righe di matrice spente da 36 giorni), e una riga sola
+                // dovrebbe sceglierne una delle tre.
                 const dichiarazione = renderDeclaration(p);
+                const selezionabilita = renderSelectability(p);
                 return (
                   <div key={p.name} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
@@ -136,6 +139,14 @@ export default function AdminDashboardPage() {
                         color: dichiarazione.requiresAction ? "#fbbf24" : tc.textMuted,
                       }}>
                         {dichiarazione.label}
+                      </div>
+                    )}
+                    {selezionabilita && (
+                      <div style={{
+                        fontSize: 11, paddingLeft: 16,
+                        color: selezionabilita.requiresAction ? "#fbbf24" : tc.textMuted,
+                      }}>
+                        {selezionabilita.label}
                       </div>
                     )}
                   </div>

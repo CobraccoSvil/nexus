@@ -1556,6 +1556,103 @@ mod tests {
         );
     }
 
+    /// IL PONTE fra il gate che ESCLUDE e il criterio che lo DICHIARA
+    /// (regola O).
+    ///
+    /// `nexus_capability_audit::selezionabilita` risponde a «il gate ammette
+    /// almeno un modello di questo fornitore?», e per farlo ricostruisce in SQL
+    /// la condizione di qualificazione valida. Se le due divergessero, il
+    /// pannello direbbe instradabile un fornitore che il promote scarta — cioe'
+    /// misurerebbe un sistema diverso da quello in esercizio, e nessun test dei
+    /// due lati se ne accorgerebbe da solo.
+    ///
+    /// Il caso scelto e' la SCADENZA perche' e' l'unico in cui i due potrebbero
+    /// divergere in silenzio: lo stato resta `qualified`, e solo il confronto
+    /// col tempo distingue. Al 20/08/2026 sul META vivo openai aveva 8 modelli
+    /// abilitati esattamente in quello stato.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_gate_e_la_selezionabilita_escludono_lo_stesso_modello(pool: sqlx::PgPool) {
+        sqlx::query("DELETE FROM ai_price_catalog")
+            .execute(&pool)
+            .await
+            .expect("pulizia catalog");
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+                (provider, model, is_enabled, supports_tool_use, performance_tier, \
+                 capabilities, qualification_state, qualification_expires_at, \
+                 input_cost_per_million_tokens, output_cost_per_million_tokens, \
+                 auto_disabled_reason, currency, last_probe_healthy_at) VALUES \
+             ('zeta', 'zeta-valido',  true, true, 'medium', '[\"code\"]'::jsonb, 'qualified', \
+              now() + interval '30 days', 1.0, 1.0, NULL, 'USD', now()), \
+             ('zeta', 'zeta-scaduto', true, true, 'medium', '[\"code\"]'::jsonb, 'qualified', \
+              now() - interval '1 day',  0.1, 0.1, NULL, 'USD', now())",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        let gate = crate::orchestrator::QualificationGate {
+            require_qualified: true,
+            exclude_preview: true,
+        };
+        let ammessi: Vec<String> = load_catalog_with_gate(&pool, gate)
+            .await
+            .expect("load_catalog")
+            .into_iter()
+            .map(|m| m.model)
+            .collect();
+        assert_eq!(
+            ammessi,
+            vec!["zeta-valido".to_string()],
+            "premessa: il gate del promote scarta la qualificazione scaduta"
+        );
+
+        // Lo stesso fornitore, visto dal criterio: selezionabile, e con UN solo
+        // modello qualificato — lo stesso che il gate ha ammesso.
+        let fatti = crate::provider_readiness::carica_fatti_catalogo(&pool).await;
+        let modelli = fatti.get("zeta").cloned().unwrap_or_default();
+        assert_eq!(
+            crate::provider_selectability::classifica_selezionabilita(
+                &modelli,
+                gate.require_qualified
+            ),
+            nexus_capability_audit::ProviderSelectability::Selectable {
+                qualified: 1,
+                enabled: 2
+            },
+            "il criterio deve contare come qualificati ESATTAMENTE i modelli che \
+             il gate ammette: una seconda idea di 'qualificato' direbbe \
+             instradabile un fornitore che il promote scarta"
+        );
+
+        // MUTAZIONE: scade anche il valido. Il gate resta senza candidati e il
+        // criterio DEVE dichiararlo non instradabile — se restasse
+        // `Selectable`, la condizione di scadenza non sarebbe la stessa.
+        sqlx::query(
+            "UPDATE ai_price_catalog SET qualification_expires_at = now() - interval '1 hour'",
+        )
+        .execute(&pool)
+        .await
+        .expect("scadenza");
+        assert!(
+            load_catalog_with_gate(&pool, gate)
+                .await
+                .expect("load_catalog")
+                .is_empty(),
+            "col gate acceso e nessuna qualificazione valida non ci sono candidati"
+        );
+        let fatti = crate::provider_readiness::carica_fatti_catalogo(&pool).await;
+        let modelli = fatti.get("zeta").cloned().unwrap_or_default();
+        assert!(
+            !crate::provider_selectability::classifica_selezionabilita(
+                &modelli,
+                gate.require_qualified
+            )
+            .instradabile(),
+            "nessun candidato per il promote deve leggersi come non instradabile"
+        );
+    }
+
     /// REGRESSIONE (2026-07-26, seguito del fix `agentic_default`): con tutte le
     /// capability trattate alla pari, su `debug` ({code, fix, reasoning}) un
     /// modello con code+fix ma SENZA reasoning pareggiava 2/3 contro uno con

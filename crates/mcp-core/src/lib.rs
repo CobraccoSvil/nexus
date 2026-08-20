@@ -122,6 +122,7 @@ mod provider_inflight;
 mod provider_health_probe;
 mod provider_declaration;
 mod provider_readiness;
+mod provider_selectability;
 mod provider_spend_cap;
 mod rag;
 mod reconcile_default_models;

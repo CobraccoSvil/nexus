@@ -3069,6 +3069,67 @@ mod tests {
         assert_eq!(classifica_inconcluso(&[misto]), EsitoInconcluso::RoundMeasured);
     }
 
+    /// IL PONTE con chi legge quella reason (regola O).
+    ///
+    /// `nexus_capability_audit::selezionabilita` riconosce il giro non misurante
+    /// dal PREFISSO canonico della reason, e quella costante e' una
+    /// DICHIARAZIONE: i due lati non si possono chiamare, perche' mcp-core e'
+    /// bin-only. Senza questo test, rinominare la reason qui lascerebbe quel
+    /// criterio muto — un fornitore bloccato tornerebbe indistinguibile da uno
+    /// mai tentato — con tutte le sue prove verdi.
+    ///
+    /// Il valore NON si scrive a mano: lo produce `blocking_verdict`, cioe' lo
+    /// stesso codice che scrive la colonna in `ai_price_catalog`.
+    #[test]
+    fn la_batteria_dichiara_il_prefisso_che_il_criterio_riconosce() {
+        // La fixture (a) del test qui sopra: il giro si e' speso contro il
+        // fornitore senza guardare il modello.
+        let mut agentic = profile_run("agentic_real", &[], true, 0, 0, 3, 3, None);
+        agentic.inconclusive_fornitore = 3;
+        let derived = blocking_verdict(&[
+            profile_run("tool_smoke", &[], true, 1, 0, 0, 1, None),
+            agentic,
+        ])
+        .expect("un profilo bloccante sotto soglia produce un verdetto");
+
+        assert_eq!(
+            derived.state,
+            DerivedState::Inconclusive(EsitoInconcluso::RoundNotMeasuring),
+            "premessa: e' il giro che NON ha misurato"
+        );
+        assert!(
+            derived
+                .reason
+                .starts_with(nexus_capability_audit::PREFISSO_ROUND_NON_MISURANTE),
+            "la reason prodotta ({}) deve cominciare col prefisso che il criterio \
+             di selezionabilita' riconosce ({})",
+            derived.reason,
+            nexus_capability_audit::PREFISSO_ROUND_NON_MISURANTE
+        );
+
+        // E l'altra meta': un giro che HA misurato non deve portare quel
+        // prefisso, o il criterio segnalerebbe come bloccato ogni fornitore che
+        // la batteria ha guardato davvero.
+        let misurato = blocking_verdict(&[profile_run(
+            "agentic_real",
+            &[],
+            true,
+            0,
+            0,
+            3,
+            3,
+            None,
+        )])
+        .expect("verdetto");
+        assert!(
+            !misurato
+                .reason
+                .starts_with(nexus_capability_audit::PREFISSO_ROUND_NON_MISURANTE),
+            "un giro misurato ({}) non e' un blocco",
+            misurato.reason
+        );
+    }
+
     /// IL TEST DI CONTRATTO (incidente 2026-07-15). Non costruisce il turno a
     /// mano: lo fa produrre a `agent_turn_value_from_gw`, l'UNICO produttore
     /// reale, partendo da una `GwResponse` come quella che il gateway restituisce

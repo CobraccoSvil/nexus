@@ -3554,6 +3554,15 @@ else
   echo "OK prontezza-fornitore: l'ignoto e' una variante, e i cicli si interrogano"
 fi
 
+# Il TESTO della costante `SQL_FATTI_CATALOGO`, dalla dichiarazione al `";` che
+# la chiude. I due guard che la interrogano (dichiarazione-fornitore,
+# selezionabilita-fornitore) guardano cosi' la QUERY e non il file: la prosa che
+# spiega la query nomina le stesse tabelle, e un guard soddisfatto da un
+# commento e' verde per assenza.
+sql_fatti_catalogo() {
+  sed -n '/pub const SQL_FATTI_CATALOGO/,/";$/p' "$1"
+}
+
 # --- dichiarazione-fornitore ------------------------------------------------
 # Copertura di `nexus_provider_capabilities` (2026-08-10). MISURATO: 37 modelli
 # ABILITATI su 128 senza una riga di capability, e nessun ciclo a runtime li
@@ -3576,10 +3585,15 @@ dichiarazione="crates/nexus-capability-audit/src/copertura.rs"
 if [[ ! -f "$dichiarazione" ]]; then
   echo "!! dichiarazione-fornitore: $dichiarazione non esiste piu'" >&2
   fail=1
-elif ! grep -A 8 'pub const SQL_FATTI_CATALOGO' "$dichiarazione" | grep -q 'v_model_capabilities'; then
+elif ! sql_fatti_catalogo "$dichiarazione" | grep -q 'v_model_capabilities'; then
   # Si guarda la QUERY, non il file: il nome della vista compare anche nella
   # prosa che spiega perche' si usi, e un guard soddisfatto da un commento e'
   # verde per assenza come lo erano i tre pattern con la parentesi non escapata.
+  # La finestra e' la costante INTERA (fino al `";` che la chiude), non un
+  # numero di righe: `-A 8` bastava finche' la query aveva quattro colonne, e si
+  # e' rotta il 2026-08-20 quando la selezionabilita' ne ha aggiunte quattro —
+  # un guard che rosseggia perche' una riga si e' spostata non misura piu' cio'
+  # che dice di misurare.
   echo "!! dichiarazione-fornitore: i fatti di catalogo non arrivano piu' dalla" >&2
   echo "   vista v_model_capabilities. La copertura va misurata sulla stessa" >&2
   echo "   fonte che i consumatori interrogano a runtime: chiedere alla tabella" >&2
@@ -3607,6 +3621,89 @@ if ! grep -q 'renderDeclaration' apps/web-ide/app/admin/page.tsx \
   fail=1
 else
   echo "OK dichiarazione-fornitore: il campo arriva alla pagina e sta nella fixture"
+fi
+
+# --- selezionabilita-fornitore ----------------------------------------------
+# TERZA domanda sugli stessi fatti di catalogo (2026-08-20): il gate di
+# qualificazione ammette almeno un modello di questo fornitore?
+#
+# MISURATO sul META vivo: groq NON e' «il fornitore meno usato», e' ASSENTE dal
+# routing per intent — tutte e 14 le sue righe di `nexus_routing_matrix` sono
+# `is_active=false`, e le 66 chiamate dei tre giorni precedenti arrivavano da
+# altre strade. La catena non ha un anello rotto: il gate ammette i soli
+# `qualified`, groq non ne ha nessuno perche' due dei suoi tre modelli abilitati
+# sono fermi su `round_not_measuring:provider_saturated` da 36 giorni, e senza
+# candidati il promote non riattiva nulla. Il difetto era che «non si riesce a
+# misurarlo» e «l'abbiamo misurato ed e' inadatto» finissero nello stesso
+# silenzio, con rimedi OPPOSTI.
+#
+# Come la copertura, NON puo' essere una variante di `provider_readiness`:
+# `classifica` ritorna `Observed` appena c'e' una misura di salute, e groq di
+# osservazioni ne ha migliaia — la variante nuova sarebbe irraggiungibile
+# proprio per il fornitore che il difetto riguarda.
+assert_single "selezionabilita-fornitore" 'pub fn classifica_selezionabilita\(' \
+  'crates/nexus-capability-audit/src/selezionabilita.rs' crates
+
+selez="crates/nexus-capability-audit/src/selezionabilita.rs"
+if [[ ! -f "$selez" ]]; then
+  echo "!! selezionabilita-fornitore: $selez non esiste piu'" >&2
+  fail=1
+elif ! grep -q 'PREFISSO_ROUND_NON_MISURANTE' "$selez"; then
+  echo "!! selezionabilita-fornitore: il criterio non riconosce piu' il giro non" >&2
+  echo "   misurante dal prefisso canonico della reason. Senza, un fornitore che" >&2
+  echo "   la batteria non riesce a misurare torna indistinguibile da uno mai" >&2
+  echo "   tentato — e i due rimedi sono opposti (regola Q)." >&2
+  fail=1
+elif ! grep -q 'PREFISSO_ROUND_NON_MISURANTE' crates/mcp-core/src/model_qualification.rs; then
+  # IL PONTE (regola O): la costante e' una DICHIARAZIONE, e i due lati non si
+  # possono chiamare perche' mcp-core e' bin-only. Senza il test che la
+  # confronta con cio' che `blocking_verdict` emette davvero, rinominare la
+  # reason lascerebbe il criterio muto con tutte le sue prove verdi.
+  echo "!! selezionabilita-fornitore: sparito il ponte col produttore della reason" >&2
+  echo "   in model_qualification.rs. La costante e' una dichiarazione: senza un" >&2
+  echo "   test che la confronti con blocking_verdict, un rename la rende muta." >&2
+  fail=1
+elif grep -n 'pub fn classifica(' -A 40 crates/mcp-core/src/provider_readiness.rs \
+     | grep -q 'qualification_'; then
+  echo "!! selezionabilita-fornitore: la prontezza ha cominciato a guardare la" >&2
+  echo "   qualificazione. Sono due domande con due rimedi: fonderle perde la" >&2
+  echo "   meta' che dice se il fornitore RISPONDE." >&2
+  fail=1
+else
+  echo "OK selezionabilita-fornitore: criterio unico, ponte col produttore, e non e' la prontezza"
+fi
+
+# Il gate che ESCLUDE e il criterio che lo DICHIARA devono restare la stessa
+# condizione: due idee di «qualificato» direbbero instradabile un fornitore che
+# il promote scarta. Il ponte e' un #[sqlx::test] sullo schema reale.
+if ! grep -q 'il_gate_e_la_selezionabilita_escludono_lo_stesso_modello' \
+     crates/mcp-core/src/routing_matrix_auto_promoter.rs; then
+  echo "!! selezionabilita-fornitore: sparito il ponte fra load_catalog_with_gate" >&2
+  echo "   e il criterio. La condizione di qualificazione valida e' ricostruita in" >&2
+  echo "   SQL da SQL_FATTI_CATALOGO: senza quel test le due divergono in silenzio." >&2
+  fail=1
+elif ! sql_fatti_catalogo crates/nexus-capability-audit/src/copertura.rs \
+        | grep -q 'qualification_expires_at'; then
+  echo "!! selezionabilita-fornitore: i fatti non portano piu' la SCADENZA della" >&2
+  echo "   qualificazione. E' l'unico caso in cui il criterio e il gate possono" >&2
+  echo "   divergere in silenzio: lo stato resta 'qualified' e solo il confronto" >&2
+  echo "   col tempo distingue." >&2
+  fail=1
+else
+  echo "OK selezionabilita-fornitore: la condizione del gate e quella del criterio sono la stessa"
+fi
+
+# I due lati del confine devono nominare la resa: un campo che nessuno rende e'
+# un campo che non esiste — che e' esattamente lo stato da cui questo criterio
+# nasce.
+if ! grep -q 'renderSelectability' apps/web-ide/app/admin/page.tsx \
+   || ! grep -q 'renderSelectability' apps/web-ide/lib/api/gateway-providers.ts; then
+  echo "!! selezionabilita-fornitore: la selezionabilita' non arriva piu' alla" >&2
+  echo "   pagina (admin/page.tsx) o non ha piu' un compositore. Un fornitore" >&2
+  echo "   fuori dal routing tornerebbe invisibile, che e' il difetto d'origine." >&2
+  fail=1
+else
+  echo "OK selezionabilita-fornitore: il campo arriva alla pagina"
 fi
 
 # --- tetto-di-spesa ---------------------------------------------------------

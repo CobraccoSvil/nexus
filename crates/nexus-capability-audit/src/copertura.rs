@@ -52,6 +52,28 @@ pub struct ModelFact {
     /// dichiarazione esiste. NON e' un fatto sulla salute: `provider_readiness`
     /// non lo guarda, e un test in mcp-core lo prova nel verso opposto.
     pub ha_capability: bool,
+    /// La qualificazione di questo modello e' VALIDA adesso: stato `qualified`
+    /// e non scaduta. E' la stessa condizione con cui il gate di routing
+    /// filtra i candidati (`load_catalog_with_gate`), e si calcola in SQL
+    /// perche' il criterio che la legge resti puro — un `now()` dentro il
+    /// criterio lo renderebbe dipendente dall'orologio.
+    pub qualification_valid: bool,
+    /// Quanti giri la batteria ha speso su questo modello. `0` = nessuno lo ha
+    /// ancora guardato; un giro NON misurante non lo incrementa (per contratto
+    /// di `EsitoInconcluso::RoundNotMeasuring`), quindi qui lo zero puo'
+    /// convivere con dei tentativi spesi contro il fornitore.
+    pub qualification_attempts: i32,
+    /// Perche' la qualificazione sta dove sta, come la batteria l'ha scritta.
+    /// `None` = mai scritta. Si legge col solo criterio del PREFISSO canonico
+    /// (vedi [`crate::selezionabilita`]), mai a sottostringa.
+    pub qualification_reason: Option<String>,
+    /// Lo stato dichiarato dalla batteria: `unqualified` (il default d'ingresso)
+    /// | `qualified` | `disqualified`. Serve accanto a
+    /// [`Self::qualification_valid`] perche' i due dicono cose diverse: una
+    /// qualificazione SCADUTA e' `qualified` e non piu' valida, e resta un
+    /// modello che qualcuno ha MISURATO — trattarla come «mai guardato»
+    /// direbbe di aspettare una prima misura che c'e' gia' stata.
+    pub qualification_state: String,
 }
 
 /// La query dei fatti. Costante ESPOSTA perche' e' la premessa di ogni numero
@@ -63,10 +85,24 @@ pub struct ModelFact {
 /// significare qui esattamente cio' che significa li'. Interrogare la tabella
 /// sarebbe una seconda idea dello stesso concetto, e divergerebbe il giorno in
 /// cui la vista cambia definizione.
+/// La condizione di qualificazione VALIDA e' scritta qui una volta sola perche'
+/// e' la stessa che il gate di routing applica ai candidati
+/// (`mcp-core::routing_matrix_auto_promoter::load_catalog_with_gate`): una
+/// seconda idea di «qualificato» direbbe selezionabile un modello che il gate
+/// scarta, cioe' misurerebbe un sistema diverso da quello in esercizio
+/// (regola O). Il ponte fra le due lo tiene onesto un `#[sqlx::test]` in
+/// mcp-core, che semina un modello qualificato-ma-SCADUTO e pretende che
+/// entrambe lo escludano.
 pub const SQL_FATTI_CATALOGO: &str = "SELECT c.provider, c.is_enabled, \
         COALESCE(c.capability_source, 'auto') AS capability_source, \
         c.auto_disabled_reason, \
-        (v.model IS NOT NULL) AS ha_capability \
+        (v.model IS NOT NULL) AS ha_capability, \
+        (c.qualification_state = 'qualified' \
+           AND (c.qualification_expires_at IS NULL \
+                OR c.qualification_expires_at > now())) AS qualification_valid, \
+        COALESCE(c.qualification_attempts, 0) AS qualification_attempts, \
+        c.qualification_reason, \
+        COALESCE(c.qualification_state, 'unqualified') AS qualification_state \
    FROM ai_price_catalog c \
    LEFT JOIN v_model_capabilities v \
           ON v.provider = c.provider AND v.model = c.model";
@@ -95,6 +131,15 @@ pub async fn carica_fatti_catalogo(db: &sqlx::PgPool) -> HashMap<String, Vec<Mod
                 .ok()
                 .flatten(),
             ha_capability: r.try_get("ha_capability").unwrap_or(false),
+            qualification_valid: r.try_get("qualification_valid").unwrap_or(false),
+            qualification_attempts: r.try_get("qualification_attempts").unwrap_or(0),
+            qualification_reason: r
+                .try_get::<Option<String>, _>("qualification_reason")
+                .ok()
+                .flatten(),
+            qualification_state: r
+                .try_get("qualification_state")
+                .unwrap_or_else(|_| "unqualified".to_string()),
         });
     }
     out
@@ -190,6 +235,10 @@ mod tests {
             capability_source: "auto".to_string(),
             auto_disabled_reason: None,
             ha_capability,
+            qualification_valid: false,
+            qualification_attempts: 0,
+            qualification_reason: None,
+            qualification_state: "unqualified".to_string(),
         }
     }
 

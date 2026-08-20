@@ -526,6 +526,10 @@ mod tests {
             capability_source: "auto".into(),
             auto_disabled_reason: None,
             ha_capability: false,
+            qualification_valid: false,
+            qualification_attempts: 0,
+            qualification_reason: None,
+            qualification_state: "unqualified".into(),
         }];
         assert_eq!(
             audit::classifica_dichiarazione(&modelli),

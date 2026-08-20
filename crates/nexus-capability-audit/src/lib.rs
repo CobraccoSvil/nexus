@@ -5,6 +5,10 @@
 //!   - [`copertura`] — «i modelli instradabili di questo fornitore hanno una
 //!     riga di capability?». Verdetto condiviso fra il pannello (mcp-core) e il
 //!     censimento a riga di comando (xtask).
+//!   - [`selezionabilita`] — «i modelli di questo fornitore possono essere
+//!     SCELTI, e se nessuno puo', qualcuno lo sta ancora misurando?». Stessi
+//!     fatti di catalogo, terza domanda: un fornitore sano e dichiarato puo'
+//!     essere fuori dal routing perche' la sua qualificazione non converge.
 //!   - [`vocabolario`] — «di questa colonna, chi la legge, di chi e' la
 //!     proprieta', con quale prova si accerta?».
 //!
@@ -123,11 +127,15 @@
 //! nessun esperimento puo' dire se il suo valore sia «vero».
 
 pub mod copertura;
+pub mod selezionabilita;
 pub mod vocabolario;
 
 pub use copertura::{
     carica_fatti_catalogo, classifica_dichiarazione, DeclarationCoverage, ModelFact,
     SQL_FATTI_CATALOGO,
+};
+pub use selezionabilita::{
+    classifica_selezionabilita, ProviderSelectability, PREFISSO_ROUND_NON_MISURANTE,
 };
 pub use vocabolario::{
     colonna, senza_lettore, Accertamento, ColonnaCapability, Lettura, Proprieta, COLONNE,

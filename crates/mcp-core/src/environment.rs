@@ -985,6 +985,26 @@ mod provider_names_tests {
 
     /// Nessun saldo osservato: la mappa vuota e' lo stato di partenza di ogni
     /// provider (regola Q: l'assenza e' assenza, non uno 0).
+    /// I fatti condivisi delle tre risposte, nella forma che la produzione usa.
+    /// Costruirli qui invece che a ogni chiamata e' anche cio' che tiene i test
+    /// allineati alla firma: se domani arriva una quarta domanda, cambia un
+    /// posto solo — come in produzione.
+    fn fatti_di_test<'a>(
+        health_map: &'a std::collections::HashMap<String, ProviderHealthRow>,
+        api_key_configured: &'a std::collections::HashMap<String, bool>,
+        catalog_facts: &'a std::collections::HashMap<
+            String,
+            Vec<crate::provider_readiness::ModelFact>,
+        >,
+    ) -> FattiProntezza<'a> {
+        FattiProntezza {
+            health_map,
+            api_key_configured,
+            catalog_facts,
+            require_qualified: true,
+        }
+    }
+
     fn saldi_vuoti() -> std::collections::HashMap<String, SaldoOsservato> {
         std::collections::HashMap::new()
     }
@@ -1016,7 +1036,12 @@ mod provider_names_tests {
         let cooldown_map = std::collections::HashMap::new(); // cooldown scaduto/mai applicato
         let api_keys = std::collections::HashMap::new();
 
-        let entry = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys, &catalog_facts(), &saldi_vuoti());
+        let entry = build_provider_status_entry(
+            "deepseek",
+            &cooldown_map,
+            &saldi_vuoti(),
+            &fatti_di_test(&health_map, &api_keys, &catalog_facts()),
+        );
 
         assert_eq!(entry["healthy"], json!(false));
         assert_eq!(entry["error_kind"], json!("timeout"));
@@ -1040,7 +1065,12 @@ mod provider_names_tests {
         );
         let api_keys = std::collections::HashMap::new();
 
-        let entry = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys, &catalog_facts(), &saldi_vuoti());
+        let entry = build_provider_status_entry(
+            "deepseek",
+            &cooldown_map,
+            &saldi_vuoti(),
+            &fatti_di_test(&health_map, &api_keys, &catalog_facts()),
+        );
 
         assert_eq!(entry["error"], json!("rate limit raggiunto ora"));
         assert_eq!(entry["cooldown_seconds_remaining"], json!(42));
@@ -1054,7 +1084,12 @@ mod provider_names_tests {
         let cooldown_map = std::collections::HashMap::new();
         let api_keys = std::collections::HashMap::new();
 
-        let entry = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys, &catalog_facts(), &saldi_vuoti());
+        let entry = build_provider_status_entry(
+            "deepseek",
+            &cooldown_map,
+            &saldi_vuoti(),
+            &fatti_di_test(&health_map, &api_keys, &catalog_facts()),
+        );
 
         assert_eq!(entry["healthy"], json!(true));
         assert!(entry.get("error").is_none());
@@ -1083,12 +1118,22 @@ mod provider_names_tests {
             },
         );
 
-        let con_saldo = build_provider_status_entry("openrouter", &health_map, &cooldown_map, &api_keys, &catalog_facts(), &saldi);
+        let con_saldo = build_provider_status_entry(
+            "openrouter",
+            &cooldown_map,
+            &saldi,
+            &fatti_di_test(&health_map, &api_keys, &catalog_facts()),
+        );
         assert_eq!(con_saldo["balance_usd"], json!(10.4));
         assert_eq!(con_saldo["balance_source"], json!("auth_key_fallback"));
         assert_eq!(con_saldo["balance_observed_at"], json!(quando.to_rfc3339()));
 
-        let senza = build_provider_status_entry("deepseek", &health_map, &cooldown_map, &api_keys, &catalog_facts(), &saldi);
+        let senza = build_provider_status_entry(
+            "deepseek",
+            &cooldown_map,
+            &saldi,
+            &fatti_di_test(&health_map, &api_keys, &catalog_facts()),
+        );
         assert!(senza.get("balance_usd").is_none(), "mai osservato = campo assente, non 0");
         assert!(senza.get("balance_source").is_none());
     }
@@ -1132,18 +1177,17 @@ fn fetch_cooldown_map() -> std::collections::HashMap<String, (u64, Option<String
 /// mostrano l'ultimo stato noto invece di essere tutti grigi.
 fn build_providers_fallback(
     names: &[String],
-    health_map: &std::collections::HashMap<String, ProviderHealthRow>,
-    api_key_configured: &std::collections::HashMap<String, bool>,
     cooldown_map: &std::collections::HashMap<String, (u64, Option<String>)>,
-    catalog_facts: &std::collections::HashMap<String, Vec<crate::provider_readiness::ModelFact>>,
+    fatti: &FattiProntezza<'_>,
 ) -> Vec<serde_json::Value> {
+    let health_map = fatti.health_map;
     names
         .iter()
         .map(|name| {
             let name = name.as_str();
             // Stessa prontezza dell'altro ramo, dallo stesso punto: il gateway
             // spento non cambia cio' che sappiamo della salute di un fornitore.
-            let mut p = entry_con_prontezza(name, health_map, api_key_configured, catalog_facts);
+            let mut p = entry_con_prontezza(name, fatti);
             if let Some(h) = health_map.get(name) {
                 p["healthy"] = json!(h.healthy);
                 p["last_health_check_at"] = json!(h.checked_at.to_rfc3339());
@@ -1314,6 +1358,11 @@ struct FontiStatoProvider {
     provider_names: Vec<String>,
     catalog_facts: std::collections::HashMap<String, Vec<crate::provider_readiness::ModelFact>>,
     saldo_map: std::collections::HashMap<String, SaldoOsservato>,
+    /// Il gate di qualificazione e' ACCESO: il routing ammette i soli modelli
+    /// qualificati. E' un fatto del sistema, non dei fornitori, e si legge una
+    /// volta per risposta invece che una volta per entry — con nove fornitori
+    /// sarebbero nove letture della stessa riga di `settings`.
+    require_qualified: bool,
 }
 
 impl FontiStatoProvider {
@@ -1325,6 +1374,13 @@ impl FontiStatoProvider {
         let provider_names = provider_names_for_status(db, &api_key_configured).await;
         let catalog_facts = crate::provider_readiness::carica_fatti_catalogo(db).await;
         let saldo_map = fetch_saldi_osservati(db).await;
+        // Lo STESSO gate che filtra i candidati del promote
+        // (`routing_matrix_auto_promoter::load_catalog_with_gate`), chiesto al
+        // suo punto unico e non riletto da `settings` qui: due letture della
+        // stessa chiave sono due idee di quando il gate sia acceso (regola L).
+        let require_qualified = crate::orchestrator::qualification_gate(db)
+            .await
+            .require_qualified;
         Self {
             health_map,
             api_key_configured,
@@ -1332,6 +1388,7 @@ impl FontiStatoProvider {
             provider_names,
             catalog_facts,
             saldo_map,
+            require_qualified,
         }
     }
 }
@@ -1399,13 +1456,8 @@ pub async fn gateway_providers_handler(
         .unwrap_or_default();
 
     let f = FontiStatoProvider::carica(&state.db).await;
-    let providers_fallback = build_providers_fallback(
-        &f.provider_names,
-        &f.health_map,
-        &f.api_key_configured,
-        &f.cooldown_map,
-        &f.catalog_facts,
-    );
+    let providers_fallback =
+        build_providers_fallback(&f.provider_names, &f.cooldown_map, &f.fatti_prontezza());
     let (health_map, cooldown_map) = (f.health_map, f.cooldown_map);
 
     // Nessun header di autorizzazione: `/providers` e' una rotta ESENTE nel
@@ -1706,19 +1758,13 @@ pub async fn providers_status_internal(
     // overloaded). Lo stesso dato e' esposto da
     // `/api/neural/providers/billing-cooldown`.
     let f = FontiStatoProvider::carica(&state.db).await;
+    let fatti = f.fatti_prontezza();
 
     let providers: Vec<Value> = f
         .provider_names
         .iter()
         .map(|name| {
-            build_provider_status_entry(
-                name,
-                &f.health_map,
-                &f.cooldown_map,
-                &f.api_key_configured,
-                &f.catalog_facts,
-                &f.saldo_map,
-            )
+            build_provider_status_entry(name, &f.cooldown_map, &f.saldo_map, &fatti)
         })
         .collect();
 
@@ -1731,13 +1777,12 @@ pub async fn providers_status_internal(
 /// imitazione nel test).
 fn build_provider_status_entry(
     name: &str,
-    health_map: &std::collections::HashMap<String, ProviderHealthRow>,
     cooldown_map: &std::collections::HashMap<String, (u64, Option<String>)>,
-    api_key_configured: &std::collections::HashMap<String, bool>,
-    catalog_facts: &std::collections::HashMap<String, Vec<crate::provider_readiness::ModelFact>>,
     saldo_map: &std::collections::HashMap<String, SaldoOsservato>,
+    fatti: &FattiProntezza<'_>,
 ) -> Value {
-    let mut p = entry_con_prontezza(name, health_map, api_key_configured, catalog_facts);
+    let health_map = fatti.health_map;
+    let mut p = entry_con_prontezza(name, fatti);
     // Il saldo osservato entra SOLO quando c'e' un'osservazione (mig 0719):
     // l'assenza del campo e' "mai osservato" (regola Q, niente 0 di comodo).
     if let Some(s) = saldo_map.get(name) {
@@ -1784,14 +1829,61 @@ fn build_provider_status_entry(
 /// due non si possono fondere in un campo solo — un fornitore sano e interamente
 /// privo di capability e' il caso REALE di groq e openrouter (misurato il
 /// 10/08/2026), e collassarle perderebbe l'una o l'altra meta'.
-fn entry_con_prontezza(
-    name: &str,
-    health_map: &std::collections::HashMap<String, ProviderHealthRow>,
-    api_key_configured: &std::collections::HashMap<String, bool>,
-    catalog_facts: &std::collections::HashMap<String, Vec<crate::provider_readiness::ModelFact>>,
-) -> Value {
-    let configured = api_key_configured.get(name).copied().unwrap_or(false);
-    let modelli = catalog_facts.get(name).map(Vec::as_slice).unwrap_or(&[]);
+///
+/// Accanto a entrambe viaggia la SELEZIONABILITA', terza domanda sugli stessi
+/// fatti: il gate di qualificazione ammette almeno un modello di questo
+/// fornitore? Nemmeno questa si puo' fondere con le altre — al 20/08/2026 groq
+/// e' sano, scoperto di capability E inselezionabile, e i tre rimedi sono
+/// diversi (nessuno; una migrazione di capability; sbloccare una batteria che
+/// da 36 giorni non riesce a misurarlo).
+/// I fatti da cui nascono le TRE risposte di una entry di fornitore, presi
+/// insieme perche' insieme si usano.
+///
+/// Non e' cosmesi: `entry_con_prontezza` e i suoi due chiamanti li passavano
+/// per posizione, e ogni risposta nuova allungava tre firme — la terza
+/// (selezionabilita', 20/08/2026) ha portato `build_provider_status_entry` a
+/// sette parametri, cioe' al limite oltre cui clippy stesso protesta, e ha
+/// reso i due call site due blocchi IDENTICI di sei righe che il quality-scan
+/// conta come duplicazione. La quarta domanda, quando arrivera', qui e' un
+/// campo e nessuna firma cambia.
+///
+/// Presta i riferimenti invece di possederli: la proprieta' e' di
+/// [`FontiStatoProvider`], che li carica una volta per risposta.
+struct FattiProntezza<'a> {
+    health_map: &'a std::collections::HashMap<String, ProviderHealthRow>,
+    api_key_configured: &'a std::collections::HashMap<String, bool>,
+    catalog_facts:
+        &'a std::collections::HashMap<String, Vec<crate::provider_readiness::ModelFact>>,
+    /// Il gate di qualificazione e' acceso. Fatto del SISTEMA, non dei
+    /// fornitori: sta qui perche' e' cio' che la selezionabilita' pretende, e
+    /// leggerlo dentro il criterio lo renderebbe non provabile senza DB.
+    require_qualified: bool,
+}
+
+impl FontiStatoProvider {
+    /// I fatti condivisi dalle tre risposte, prestati alle funzioni pure che
+    /// compongono le entry.
+    fn fatti_prontezza(&self) -> FattiProntezza<'_> {
+        FattiProntezza {
+            health_map: &self.health_map,
+            api_key_configured: &self.api_key_configured,
+            catalog_facts: &self.catalog_facts,
+            require_qualified: self.require_qualified,
+        }
+    }
+}
+
+fn entry_con_prontezza(name: &str, fatti: &FattiProntezza<'_>) -> Value {
+    let configured = fatti
+        .api_key_configured
+        .get(name)
+        .copied()
+        .unwrap_or(false);
+    let modelli = fatti
+        .catalog_facts
+        .get(name)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     let mut p = json!({
         "name": name,
         "configured": configured,
@@ -1802,12 +1894,19 @@ fn entry_con_prontezza(
         &crate::provider_readiness::classifica(
             configured,
             modelli,
-            health_map.get(name).map(|h| h.healthy),
+            fatti.health_map.get(name).map(|h| h.healthy),
         ),
     );
     crate::provider_declaration::scrivi_dichiarazione(
         &mut p,
         &crate::provider_declaration::classifica_dichiarazione(modelli),
+    );
+    crate::provider_selectability::scrivi_selezionabilita(
+        &mut p,
+        &crate::provider_selectability::classifica_selezionabilita(
+            modelli,
+            fatti.require_qualified,
+        ),
     );
     p
 }
