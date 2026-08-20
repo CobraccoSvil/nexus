@@ -146,6 +146,32 @@ impl Interlocutore {
         matches!(self, Self::Umano)
     }
 
+    /// Identificatore canonico (regola N): e' cio' che attraversa un wire
+    /// quando il criterio non puo' essere calcolato dov'e' consumato.
+    ///
+    /// Serve alla spec del criterio del piano di verifica, che gira DENTRO il
+    /// final gate: li' lo stato del grafo non c'e', quindi il fatto lo inietta
+    /// il nodo (`piano_di_verifica::con_piano`) e lo rilegge il runner. Nessun
+    /// secondo criterio: attraversa il valore, non la sua derivazione.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Umano => "human",
+            Self::Nessuno => "none",
+        }
+    }
+
+    /// L'inversa di [`Self::as_str`]. Un valore ASSENTE o fuori vocabolario
+    /// vale [`Self::Umano`], che e' il [`Default`] gia' dichiarato: chi non
+    /// popola il campo — un produttore anteriore a questo contratto — non deve
+    /// vedersi STRINGERE il comportamento, e la conseguenza qui e' solo QUALE
+    /// causa il referto dichiara, mai se un comando parta.
+    pub fn parse(v: Option<&str>) -> Self {
+        match v.map(str::trim) {
+            Some(s) if s == Self::Nessuno.as_str() => Self::Nessuno,
+            _ => Self::Umano,
+        }
+    }
+
     /// Motivo da persistire accanto all'assunzione applicata, quando la domanda
     /// non e' ponibile.
     ///
@@ -226,6 +252,20 @@ mod tests {
     fn il_default_e_l_umano() {
         assert_eq!(Interlocutore::default(), Interlocutore::Umano);
         assert!(Interlocutore::default().puo_porre_una_domanda());
+    }
+
+    /// Il valore attraversa un wire e torna indietro identico, e cio' che non
+    /// riconosce cade sul default — mai su `Nessuno`, che e' la variante che
+    /// toglie a un run la possibilita' di fermarsi a chiedere.
+    #[test]
+    fn il_giro_sul_wire_conserva_il_criterio() {
+        for i in [Interlocutore::Umano, Interlocutore::Nessuno] {
+            assert_eq!(Interlocutore::parse(Some(i.as_str())), i);
+        }
+        assert_eq!(Interlocutore::parse(None), Interlocutore::Umano);
+        assert_eq!(Interlocutore::parse(Some("")), Interlocutore::Umano);
+        assert_eq!(Interlocutore::parse(Some("chissa")), Interlocutore::Umano);
+        assert_eq!(Interlocutore::parse(Some(" none ")), Interlocutore::Nessuno);
     }
 
     /// Il criterio letto dallo STATO e' lo stesso letto dai campi: se divergesse,

@@ -768,14 +768,31 @@ pub fn classify_block(
     if prior_rejections.saturating_add(1) >= max_rejections.max(1) {
         return GateBlock::RetriesExhausted;
     }
-    let qualcuno_ha_giudicato = verdicts
-        .iter()
-        .any(|v| matches!(v, StepVerdict::Reject | StepVerdict::NeedsHuman));
-    if qualcuno_ha_giudicato {
+    if verdetto_contrario_espresso(verdicts) {
         GateBlock::StepRejected
     } else {
         GateBlock::NotJudgeable
     }
+}
+
+/// «Qualcuno ha ESPRESSO un verdetto contrario?» — cioe' il blocco e' un
+/// giudizio su QUESTO batch, oppure un quorum che non si e' formato?
+///
+/// Estratta da [`classify_block`], che vi delega, perche' ha un SECONDO
+/// consumatore con un altro vocabolario di conseguenze: il criterio del piano
+/// di verifica (`super::piano_di_verifica::CausaNonEseguita::dal_gate`), che
+/// non ha un contatore di rimandi da opporre e quindi non puo' chiamare
+/// `classify_block` senza inventarne uno. Due copie del predicato darebbero due
+/// idee di «il gate ha giudicato» sugli STESSI verdetti (regola L).
+///
+/// Un `Approve` accanto a un'astensione NON e' un giudizio: e' un quorum
+/// mancante. Trattarlo come rifiuto manda a correggere cio' che nessuno ha
+/// contestato — misurato il 09/08/2026 (nove script di correzione) e di nuovo
+/// il 19/08/2026 sulle prove del piano.
+pub fn verdetto_contrario_espresso(verdicts: &[StepVerdict]) -> bool {
+    verdicts
+        .iter()
+        .any(|v| matches!(v, StepVerdict::Reject | StepVerdict::NeedsHuman))
 }
 
 /// Chiave `extra` del contatore dei rimandi del gate duale nel run (cap anti

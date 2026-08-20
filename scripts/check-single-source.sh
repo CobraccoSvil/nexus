@@ -4899,6 +4899,78 @@ if [[ "$fail" -eq 0 ]]; then
   echo "OK scomposizione-prompt: uno scompositore, il ponte SQL e l'invariante byte"
 fi
 
+# ── giudizio-del-gate-sul-piano (2026-08-19) ────────────────────────────────
+# «Che cosa significa, per le PROVE del piano, una decisione del gate duale?»
+# ha UN punto unico (`CausaNonEseguita::dal_gate`), e il predicato su cui
+# poggia — «qualcuno ha espresso un verdetto CONTRARIO?» — ne ha un altro, in
+# `step_gate`, dove `classify_block` gia' lo incarnava.
+#
+# Il difetto chiuso, misurato il 19/08/2026 su `t4-prove-consiglio`: il runner
+# collassava le tre decisioni non-Approved in un solo `judgment_denied`, quindi
+# «un giudice ha bocciato le prove», «nessun giudice ha risposto» e «il gate ha
+# rimandato a un umano che in automatico non esiste» erano lo stesso referto —
+# con 25 prove dichiarate e zero eseguite.
+pdv='crates/nexus-agent-graph/src/decisions/piano_di_verifica.rs'
+cr='crates/mcp-core/src/agent_graph_adapter/criteria_runner.rs'
+assert_single "giudizio-del-gate-sul-piano" 'pub fn dal_gate' \
+  "$pdv" crates/nexus-agent-graph/src/decisions crates/mcp-core/src
+assert_single "giudizio-del-gate-sul-piano" 'pub fn verdetto_contrario_espresso' \
+  'crates/nexus-agent-graph/src/decisions/step_gate.rs' \
+  crates/nexus-agent-graph/src/decisions crates/mcp-core/src
+# Il runner deve DELEGARE: la forma del difetto e' un `match` sulla decisione
+# scritto li' dentro, che non fallisce nulla e riporta il referto a una parola
+# sola.
+if ! grep -q 'CausaNonEseguita::dal_gate' "$cr"; then
+  echo "!! giudizio-del-gate-sul-piano: il runner non delega piu' la traduzione" >&2
+  echo "   della decisione del gate: le tre cause tornano a collassare in una." >&2
+  fail=1
+elif grep -qE 'StepGateDecision::Approved *=>' "$cr"; then
+  echo "!! giudizio-del-gate-sul-piano: nel runner e' ricomparso un match sulla" >&2
+  echo "   decisione del gate. La traduzione in causa e' di 'dal_gate'." >&2
+  fail=1
+else
+  echo "OK giudizio-del-gate-sul-piano: il runner delega la traduzione della decisione"
+fi
+# «Un NeedsHuman lo vedra' qualcuno?» e' la COMPOSIZIONE dei due punti unici
+# esistenti: se il criterio smette di interrogare l'interlocutore, resta la sola
+# modalita' e un final gate dentro un sub-run torna a promettere un destinatario
+# che non esiste (regola D).
+if ! grep -q 'interlocutore::Interlocutore' "$pdv"; then
+  echo "!! giudizio-del-gate-sul-piano: il criterio non compone piu' la superficie" >&2
+  echo "   di dialogo col punto unico 'interlocutore'." >&2
+  fail=1
+elif ! grep -q 'giudizio_umano_raggiungibile' "$cr"; then
+  echo "!! giudizio-del-gate-sul-piano: il runner non interroga piu' la" >&2
+  echo "   raggiungibilita' dell'umano: il vicolo cieco torna indistinguibile" >&2
+  echo "   da un rifiuto sul contenuto delle prove." >&2
+  fail=1
+else
+  echo "OK giudizio-del-gate-sul-piano: la raggiungibilita' dell'umano e' composta e letta"
+fi
+# Il budget di risposta VISIBILE del verdetto dipende dalla TAGLIA del batch:
+# una costante e' cio' che ha troncato a 512 token il verdetto sul batch da 25
+# prove (`completion_tokens` 512 esatti nel ledger) trasformando un giudice sano
+# in un'astensione `schema_mismatch`.
+sv='crates/mcp-core/src/agent_graph_adapter/step_validation.rs'
+if ! grep -q 'visibile_del_batch(req.steps.len())' "$sv"; then
+  echo "!! giudizio-del-gate-sul-piano: il tetto di output del verdetto non e'" >&2
+  echo "   piu' derivato dalla taglia del batch: il piano ricco torna a essere" >&2
+  echo "   quello che il gate tronca." >&2
+  fail=1
+else
+  echo "OK giudizio-del-gate-sul-piano: il budget visibile del verdetto e' derivato dal batch"
+fi
+# Il referto deve PORTARE i criteri non misurati: senza, «non c'erano prove» e
+# «c'erano e nessuno le ha eseguite» restano lo stesso intero.
+fg='crates/nexus-agent-graph/src/nodes/final_gate.rs'
+if [[ "$(grep -c 'inconclusive_criteria' "$fg")" -lt 5 ]]; then
+  echo "!! giudizio-del-gate-sul-piano: i criteri NON MISURATI non arrivano piu' a" >&2
+  echo "   tutti i payload del gate: il referto torna al solo contatore." >&2
+  fail=1
+else
+  echo "OK giudizio-del-gate-sul-piano: i criteri non misurati arrivano al referto"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

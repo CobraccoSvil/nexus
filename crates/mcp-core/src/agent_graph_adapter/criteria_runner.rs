@@ -1562,7 +1562,17 @@ task_complete (outcome + summary)"
         // richiedono, come il nodo fa per il batch di tool. Convocare una volta
         // per prova moltiplicherebbe per N il costo del gate e darebbe ai
         // giudici una vista parziale di cio' che sta per girare.
-        let giudizio = self.giudizio_sulle_prove(&ammissioni).await;
+        //
+        // Chi vedrebbe un `NeedsHuman` prodotto qui e' un fatto del RUN, e il
+        // criterio e' la composizione dei due punti unici che gia' rispondono
+        // alle due meta' della domanda: il runner non lo ricalcola.
+        let umano_raggiungibile = piano_di_verifica::giudizio_umano_raggiungibile(
+            modalita,
+            piano_di_verifica::interlocutore_da_spec(spec),
+        );
+        let giudizio = self
+            .giudizio_sulle_prove(&ammissioni, umano_raggiungibile)
+            .await;
 
         // (5) Budget ed esecuzione, nell'ordine in cui il piano le ha raccolte.
         esito_piano(
@@ -1619,13 +1629,18 @@ task_complete (outcome + summary)"
     /// `Approved`). `Some(causa)` = quelle prove NON si eseguono, e la causa
     /// dice se il rimedio sia riformulare la prova o accendere il gate.
     ///
-    /// La DECISIONE resta del punto unico `decide_step_gate`: qui si convoca e
-    /// si riporta, esattamente come fa il nodo (regola L).
+    /// La DECISIONE resta del punto unico `decide_step_gate` e la sua
+    /// TRADUZIONE in causa resta di `CausaNonEseguita::dal_gate`: qui si convoca
+    /// e si riporta, esattamente come fa il nodo (regola L). Il `match` che
+    /// stava qui collassava le tre decisioni non-`Approved` in un solo
+    /// `judgment_denied`, e il referto diceva «un giudice ha bocciato le prove»
+    /// anche quando nessun giudice aveva aperto bocca (19/08/2026).
     async fn giudizio_sulle_prove(
         &self,
         ammissioni: &[(piano_di_verifica::Prova, piano_di_verifica::Ammissione)],
+        umano_raggiungibile: bool,
     ) -> Option<piano_di_verifica::CausaNonEseguita> {
-        use nexus_agent_graph::decisions::step_gate::{decide_step_gate, StepGateDecision};
+        use nexus_agent_graph::decisions::step_gate::decide_step_gate;
         use piano_di_verifica::{Ammissione, CausaNonEseguita, MotivoGiudiceAssente};
 
         let richiesta = self.convocazione_delle_prove(ammissioni)?;
@@ -1651,20 +1666,13 @@ task_complete (outcome + summary)"
         };
         let verdetti: Vec<_> = report.verdicts.iter().map(|v| v.verdict).collect();
         let decisione = decide_step_gate(&verdetti, livello);
-        tracing::info!(
-            target: "mcp_core::criteria_runner",
-            giudici = verdetti.len(),
-            decisione = ?decisione,
-            da_giudicare = ammissioni
-                .iter()
-                .filter(|(_, a)| matches!(a, Ammissione::RichiedeGiudizio { .. }))
-                .count(),
-            "piano_di_verifica: il gate duale ha giudicato le prove del piano"
-        );
-        match decisione {
-            StepGateDecision::Approved => None,
-            altra => Some(CausaNonEseguita::GiudizioNegato { decisione: altra }),
-        }
+        let causa = CausaNonEseguita::dal_gate(decisione, &verdetti, umano_raggiungibile);
+        let da_giudicare = ammissioni
+            .iter()
+            .filter(|(_, a)| matches!(a, Ammissione::RichiedeGiudizio { .. }))
+            .count();
+        traccia_giudizio(&report, decisione, &causa, umano_raggiungibile, da_giudicare);
+        causa
     }
 
     /// La richiesta di validazione per le sole prove che richiedono giudizio.
@@ -2268,6 +2276,37 @@ fn tutte_non_eseguite(
 /// ha misurato resta scritto nell'evidenza (`misurato: false`,
 /// `skipped_reason`, `per_origine` a zero): il razionale per esteso sta sulla
 /// variante `VerdettoPiano::PianoVuoto`.
+/// L'unica traccia che resta della convocazione del gate duale sulle PROVE.
+///
+/// Il meta_step `step_validation` lo emette il solo NODO: questo secondo
+/// chiamante della porta non persiste nulla, quindi il log e' cio' su cui si
+/// diagnostica. Senza le astensioni e la causa, la diagnosi del 19/08/2026 e'
+/// dovuta passare dal ledger economico per ricostruire chi avesse risposto e
+/// chi no (regola O).
+fn traccia_giudizio(
+    report: &nexus_agent_graph::runtime::ports::StepValidationReport,
+    decisione: nexus_agent_graph::decisions::step_gate::StepGateDecision,
+    causa: &Option<piano_di_verifica::CausaNonEseguita>,
+    umano_raggiungibile: bool,
+    da_giudicare: usize,
+) {
+    tracing::info!(
+        target: "mcp_core::criteria_runner",
+        giudici = report.verdicts.len(),
+        decisione = ?decisione,
+        causa = causa.as_ref().map(piano_di_verifica::CausaNonEseguita::as_str),
+        umano_raggiungibile,
+        astensioni = report
+            .verdicts
+            .iter()
+            .filter_map(|v| v.abstain_cause.as_deref())
+            .collect::<Vec<_>>()
+            .join(","),
+        da_giudicare,
+        "piano_di_verifica: il gate duale ha giudicato le prove del piano"
+    );
+}
+
 fn esito_piano(esiti: &[piano_di_verifica::EsitoProva]) -> (CriterionOutcome, Value) {
     use piano_di_verifica::VerdettoPiano;
     let verdetto = piano_di_verifica::classifica_piano(esiti);
@@ -3614,6 +3653,10 @@ mod tests {
     /// asserzioni la recita passerebbe verde.
     struct GiudiceFinto {
         verdetto: nexus_agent_graph::decisions::step_gate::StepVerdict,
+        /// Il verdetto del SECONDO posto. Distinto perche' il caso misurato il
+        /// 19/08/2026 e' proprio l'asimmetria: un giudice approva, l'altro non
+        /// riesce a rispondere.
+        verdetto_challenger: nexus_agent_graph::decisions::step_gate::StepVerdict,
         /// `true` = la porta fallisce (guasto), invece di rispondere.
         guasto: bool,
         richieste: StdMutex<Vec<StepValidationRequest>>,
@@ -3629,12 +3672,26 @@ mod tests {
         fn guasto() -> Arc<Self> {
             Self::con(nexus_agent_graph::decisions::step_gate::StepVerdict::Approve, true)
         }
+        /// IL CASO MISURATO: il gatekeeper approva, il challenger si astiene
+        /// (verdetto troncato dal tetto di output -> `schema_mismatch`).
+        /// `decide_step_gate` ne fa un `NeedsHuman`, e nessuno ha espresso un
+        /// verdetto CONTRARIO.
+        fn senza_quorum() -> Arc<Self> {
+            use nexus_agent_graph::decisions::step_gate::StepVerdict;
+            Arc::new(Self {
+                verdetto: StepVerdict::Approve,
+                verdetto_challenger: StepVerdict::Abstained,
+                guasto: false,
+                richieste: StdMutex::new(Vec::new()),
+            })
+        }
         fn con(
             verdetto: nexus_agent_graph::decisions::step_gate::StepVerdict,
             guasto: bool,
         ) -> Arc<Self> {
             Arc::new(Self {
                 verdetto,
+                verdetto_challenger: verdetto,
                 guasto,
                 richieste: StdMutex::new(Vec::new()),
             })
@@ -3669,20 +3726,31 @@ mod tests {
             // DUE giudici distinti: e' il quorum che `decide_step_gate`
             // pretende, e riprodurne uno solo cambierebbe la decisione senza
             // che il test se ne accorga.
-            let voto = |ruolo: &str, provider: &str| {
+            let voto = |ruolo: &str,
+                        provider: &str,
+                        verdict: nexus_agent_graph::decisions::step_gate::StepVerdict| {
                 nexus_agent_graph::runtime::ports::ValidatorVerdict {
                     role: ruolo.to_string(),
                     provider: provider.to_string(),
                     model: "m".to_string(),
-                    verdict: self.verdetto,
+                    verdict,
                     reasons: vec![],
                     safer_alternative: None,
-                    abstain_cause: None,
+                    // La causa dell'astensione e' quella misurata: il verdetto
+                    // troncato al tetto di output non regge lo schema.
+                    abstain_cause: matches!(
+                        verdict,
+                        nexus_agent_graph::decisions::step_gate::StepVerdict::Abstained
+                    )
+                    .then(|| "schema_mismatch".to_string()),
                     cost_usd: None,
                 }
             };
             Ok(nexus_agent_graph::runtime::ports::StepValidationReport {
-                verdicts: vec![voto("gatekeeper", "p1"), voto("challenger", "p2")],
+                verdicts: vec![
+                    voto("gatekeeper", "p1", self.verdetto),
+                    voto("challenger", "p2", self.verdetto_challenger),
+                ],
                 degraded: None,
                 // Percorso ORDINARIO: nessuna astensione strutturale, quindi
                 // nessun posto riassegnato (vedi la doc del campo).
@@ -3781,7 +3849,72 @@ mod tests {
             "il vocabolario di ammissione viaggia nella spec: {}",
             criterio.spec
         );
-        piano_di_verifica::con_piano(criterio, piano, modalita)
+        // Lo STATO passa dal produttore reale: `con_piano` deriva da li' sia la
+        // modalita' sia la superficie di dialogo, e un test che scrivesse la
+        // spec a mano fisserebbe proprio l'assunto da verificare (regola O).
+        let stato = nexus_agent_graph::state::AgentState {
+            automation_mode: modalita,
+            ..Default::default()
+        };
+        piano_di_verifica::con_piano(criterio, piano, &stato)
+    }
+
+    /// Lo stesso criterio con la POLITICA del DB privata di `run_command` dal
+    /// vocabolario dei mutatori, e per un run che ha o non ha una superficie di
+    /// dialogo.
+    ///
+    /// ## Perche' serve una politica diversa per raggiungere il cancello 4
+    ///
+    /// Il cancello 2 e' `automation_requires_hitl(modalita) &&
+    /// is_mutator_tool_name("run_command", mutatori)`, e col vocabolario di
+    /// produzione `run_command` E' un mutatore: quindi il cancello 2 intercetta
+    /// ESATTAMENTE le modalita' in cui un umano verrebbe interpellato, e al
+    /// cancello 4 `automation_requires_hitl` e' sempre falso. Oggi, percio', la
+    /// meta' che decide se un `NeedsHuman` abbia un destinatario e' la
+    /// MODALITA'; la SUPERFICIE di dialogo diventa il discriminante solo se
+    /// `run_command` esce da `agent.tools.result_cache_mutators` — una riga di
+    /// `settings`, cambiabile senza redeploy, ed e' la stessa coppia di
+    /// condizioni che `consenso_umano_richiesto` dichiara gia' accoppiate.
+    ///
+    /// La politica si ricompone col TIPO reale (`PoliticaEsecuzione::to_value`)
+    /// a partire da quella che il DB ha davvero: scrivere la chiave a mano
+    /// fisserebbe la forma della spec invece di attraversarla (regola O).
+    async fn criterio_col_cancello_2_aperto(
+        pool: &PgPool,
+        piano: &nexus_agent_graph::decisions::PianoDiVerifica,
+        modalita: Option<nexus_agent_graph::AutomationMode>,
+        sub_run: bool,
+    ) -> CriterionSpec {
+        let mut criterio = crate::native_engine::criterio_piano_verifica(pool)
+            .await
+            .expect("il criterio nasce: la migrazione 0737 lo accende");
+        let mut politica =
+            piano_di_verifica::PoliticaEsecuzione::from_value(
+                criterio.spec.get(piano_di_verifica::CHIAVE_POLITICA),
+            )
+            .expect("il vocabolario di ammissione viene dal DB");
+        assert!(
+            politica.mutatori.iter().any(|m| m == "run_command"),
+            "in produzione `run_command` E' un mutatore: e' il presupposto di \
+             questo test, non un dettaglio"
+        );
+        politica.mutatori.retain(|m| m != "run_command");
+        if let Value::Object(map) = &mut criterio.spec {
+            map.insert(
+                piano_di_verifica::CHIAVE_POLITICA.to_string(),
+                politica.to_value(),
+            );
+        }
+        // I DUE campi che il dispatcher valorizza insieme
+        // (`subagent_native::prepare_subagent_run`).
+        let stato = nexus_agent_graph::state::AgentState {
+            automation_mode: modalita,
+            subagent_depth: sub_run.then_some(1),
+            parent_run_id: sub_run
+                .then(|| "812fcb44-fa66-4901-a184-478f2cbee810".to_string()),
+            ..Default::default()
+        };
+        piano_di_verifica::con_piano(criterio, piano, &stato)
     }
 
     /// IL SALTO DEL 0737, dall'inizio alla fine e con la configurazione REALE.
@@ -3937,6 +4070,111 @@ mod tests {
         assert_eq!(visti.len(), 8);
         assert!(visti.iter().any(|c| c.contains("DROP TABLE users")), "{visti:?}");
         assert!(visti.iter().any(|c| c == "git push --force"), "{visti:?}");
+    }
+
+    /// IL CASO MISURATO IL 19/08/2026 (`t4-prove-consiglio`), dalla catena reale.
+    ///
+    /// Le figure emettono prove eseguibili, il gate duale viene convocato, UN
+    /// giudice approva e l'altro NON riesce a rispondere (verdetto troncato al
+    /// tetto di output -> `schema_mismatch`). `decide_step_gate` ne fa un
+    /// `NeedsHuman`, e il run gira in `automatic`: nessuno vedra' mai quella
+    /// domanda. Nel log: «nessuna prova eseguita causa="judgment_denied"
+    /// dichiarate=25».
+    ///
+    /// Due cose devono valere insieme, e prima non valeva nessuna delle due:
+    ///
+    ///  1. il FAIL-CLOSED resta — nessuno dei comandi raggiunge il tool;
+    ///  2. il referto DICE cosa e' successo, e non lo confonde con un rifiuto
+    ///     sul contenuto delle prove: il rimedio qui e' il quorum del gate, non
+    ///     riscrivere le prove.
+    ///
+    /// MUTAZIONE ESEGUITA: rimettere in `giudizio_sulle_prove` il `match`
+    /// `Approved => None, altra => GiudizioNegato` (il codice di prima) -> le
+    /// due asserzioni sulla causa cadono col valore del difetto reale,
+    /// `judgment_denied`.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn un_needs_human_in_autonomia_e_un_vicolo_cieco_e_il_referto_lo_dice(pool: PgPool) {
+        let piano = piano_del_caso_reale();
+        let criterio = criterio_reale(
+            &pool,
+            &piano,
+            Some(nexus_agent_graph::AutomationMode::Automatic),
+        )
+        .await;
+        let exec = FakeToolExecutor::with(&[("run_command", &["EXIT CODE: 0"])]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec.clone(), pool, None)
+            .con_giudice(GiudiceFinto::senza_quorum());
+        let res = runner.run(vec![criterio]).await.expect("nessun PortError");
+
+        assert!(
+            exec.calls.lock().unwrap().is_empty(),
+            "il fail-closed non si allenta: {:?}",
+            exec.calls.lock().unwrap()
+        );
+        let ev = &res[0].evidence;
+        assert_eq!(res[0].outcome, CriterionOutcome::Inconclusive);
+        assert_eq!(
+            ev["skipped_cause"], "no_human_to_decide",
+            "il gate ha rimandato a un umano che in automatico non c'e': non e' \
+             un giudizio sulle prove"
+        );
+        // REGOLA H: la prova DISTRUTTIVA del piano tiene la propria causa e non
+        // si porta dietro le altre, e le altre non pagano la sua. Sono due
+        // rimedi diversi, e il referto li conta separati.
+        assert_eq!(ev["cause"]["no_human_to_decide"], 2);
+        assert_eq!(ev["cause"]["forbidden"], 1);
+        // E il referto porta il NUMERO che distingue questo caso da un piano
+        // vuoto: era l'unica cosa che il contatore `inconclusive` non diceva.
+        assert_eq!(ev["prove"]["dichiarate"], piano.len());
+        assert_eq!(ev["prove"]["non_eseguibili"], piano.len());
+    }
+
+    /// GLI STESSI VERDETTI, E DUE ESITI DIVERSI A SECONDA DI CHI PUO' RISPONDERE.
+    ///
+    /// Il discriminante e' la SUPERFICIE DI DIALOGO e attraversa la spec dal
+    /// nodo al runner: qui la porta il produttore reale (`con_piano` sui due
+    /// campi che il dispatcher valorizza su ogni sub-run), non una chiave
+    /// scritta a mano.
+    ///
+    /// Serve una politica in cui `run_command` non sia un mutatore, e il perche'
+    /// sta su [`criterio_col_cancello_2_aperto`]: col vocabolario di produzione
+    /// il cancello 2 intercetta prima ogni modalita' che interpellerebbe un
+    /// umano, quindi oggi al cancello 4 decide la MODALITA' e questa meta' e'
+    /// la difesa che regge il giorno in cui quella riga di `settings` cambia.
+    ///
+    /// MUTAZIONE ESEGUITA: togliere l'insert di `CHIAVE_INTERLOCUTORE` da
+    /// `con_piano` -> il sub-run rilegge `Umano`, i due esiti collassano e la
+    /// prima asserzione cade con `judgment_not_reached`.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn senza_superficie_di_dialogo_il_rimando_a_un_umano_e_dichiarato_tale(pool: PgPool) {
+        let piano = piano_del_caso_reale();
+        let conferma = Some(nexus_agent_graph::AutomationMode::Confirm);
+        let esito = |spec: CriterionSpec, pool: PgPool| async move {
+            let exec = FakeToolExecutor::with(&[("run_command", &["EXIT CODE: 0"])]);
+            let runner = FinalGateCriteriaRunnerAdapter::new(exec.clone(), pool, None)
+                .con_giudice(GiudiceFinto::senza_quorum());
+            let res = runner.run(vec![spec]).await.expect("nessun PortError");
+            assert!(
+                exec.calls.lock().unwrap().is_empty(),
+                "il fail-closed non si allenta in nessuno dei due casi"
+            );
+            res[0].evidence["skipped_cause"].clone()
+        };
+
+        // Un SUB-RUN: la modalita' interpellerebbe un umano, ma il prodotto di
+        // questo run e' un tool_result e nessun umano lo leggera'.
+        let figura =
+            criterio_col_cancello_2_aperto(&pool, &piano, conferma, true).await;
+        assert_eq!(
+            esito(figura, pool.clone()).await,
+            "no_human_to_decide",
+            "un sub-run non ha nessuno a cui chiedere, in nessuna modalita'"
+        );
+
+        // Lo STESSO panel su un run di CHAT: li' la domanda un destinatario ce
+        // l'ha, e cio' che manca e' il quorum — un rimedio diverso.
+        let chat = criterio_col_cancello_2_aperto(&pool, &piano, conferma, false).await;
+        assert_eq!(esito(chat, pool).await, "judgment_not_reached");
     }
 
     /// BLOCCANTE 1 — IL CONSENSO UMANO, in Conferma.

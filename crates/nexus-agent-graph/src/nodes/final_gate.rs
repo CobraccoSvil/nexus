@@ -399,6 +399,10 @@ impl Default for FinalGateConfig {
 /// che il caso `Inconclusive` esiste per non far dire piu': il numero, nel
 /// titolo, e' cio' che distingue una verifica CONCLUSA da una verifica in cui
 /// una parte non e' stata guardata.
+/// Il campo con cui un criterio dichiara il proprio verdetto nell'evidenza.
+/// Scritto una volta: e' la chiave che i due sunti del payload rileggono.
+const CAMPO_VERDICT: &str = "verdict";
+
 fn titolo_verifica_superata(inconclusive: usize) -> String {
     if inconclusive == 0 {
         return "Verifica superata".to_string();
@@ -962,17 +966,20 @@ impl FinalGateNode {
     /// l'agente esecutore in coda. La dedup conserva la prima provenienza,
     /// quindi l'esecutore puo' AGGIUNGERE prove ma non intestarsi ne'
     /// sostituire quelle di chi lo giudica.
-    /// La MODALITA' viaggia insieme al piano perche' decide se quelle prove si
-    /// possano eseguire affatto: in Conferma un umano approva ogni
-    /// `run_command` dell'agente, e il gate non ha nessuno a cui chiedere.
-    /// Il nodo e' l'unico punto che vede entrambe.
+    /// I FATTI DEL RUN viaggiano insieme al piano perche' decidono se quelle
+    /// prove si possano eseguire affatto: la MODALITA' (in Conferma un umano
+    /// approva ogni `run_command` dell'agente, e il gate non ha nessuno a cui
+    /// chiedere) e la SUPERFICIE DI DIALOGO (se il gate duale rimanda a un
+    /// umano, ne esiste uno che vedra' la domanda?). Il nodo e' l'unico punto
+    /// che vede lo stato, e li passa INTERO: cosi' il fatto aggiunto dopo non
+    /// puo' fermarsi a meta' strada.
     fn criterio_col_piano(criterio: CriterionSpec, state: &AgentState) -> CriterionSpec {
         use crate::decisions::piano_di_verifica::{con_piano, PianoDiVerifica, PIANO_VERIFICA_KEY};
         let piano = PianoDiVerifica::unione(&[
             PianoDiVerifica::from_value(state.extra.get(PIANO_VERIFICA_KEY)),
             PianoDiVerifica::da_dichiarazione(state.declared_outcome.as_ref()),
         ]);
-        con_piano(criterio, &piano, state.automation_mode)
+        con_piano(criterio, &piano, state)
     }
 
     /// Il criterio docs (mig 0676): estratto per tenere piatto `build_criteria`
@@ -1071,7 +1078,7 @@ impl FinalGateNode {
             .map(|r| {
                 let ev = &r.evidence;
                 let excerpt = str_truthy(ev.get("output_excerpt"))
-                    .or_else(|| str_truthy(ev.get("verdict")))
+                    .or_else(|| str_truthy(ev.get(CAMPO_VERDICT)))
                     .or_else(|| str_truthy(ev.get("error")))
                     .unwrap_or("");
                 let excerpt: String = excerpt.chars().take(500).collect();
@@ -1104,6 +1111,104 @@ impl FinalGateNode {
         Value::Array(items)
     }
 
+    /// Sunto STRUTTURATO dei criteri NON MISURATI, gemello di
+    /// [`Self::failed_criteria_meta`] per l'altra meta' del referto.
+    ///
+    /// ## Il difetto (MISURATO il 19/08/2026, progetto `t4-prove-consiglio`)
+    ///
+    /// Un `Inconclusive` non e' `failed()`, quindi non entrava in
+    /// `failed_criteria` ne' nel testo del rimando: l'unica traccia persistita
+    /// era il CONTATORE (`{"phase":"passed","inconclusive":3}`, il meta_step 198
+    /// di quel run). Le figure avevano emesso venticinque prove eseguibili, il
+    /// gate duale non le aveva autorizzate, nessuna era girata — e per chi legge
+    /// il referto quel run era indistinguibile da uno in cui nessuno aveva
+    /// dichiarato prove: un intero che passa da 2 a 3.
+    ///
+    /// I criteri l'evidenza ce l'avevano gia' e completa (`skipped_cause`,
+    /// `skipped_reason`, i conteggi per prova): mancava il TRASPORTO. Il testo
+    /// si compone DAI campi, e qui i campi si fermavano prima del confine
+    /// (regola Q, punto 3).
+    ///
+    /// GENERICO e non specifico del piano: i tre campi che legge sono quelli con
+    /// cui QUALUNQUE criterio dichiara di non aver potuto misurare, e un
+    /// estrattore dedicato a un tipo lascerebbe muti gli altri due che oggi
+    /// contribuiscono allo stesso contatore.
+    fn inconclusive_criteria_meta(results: &[CriterionResult]) -> Value {
+        let items: Vec<Value> = results
+            .iter()
+            .filter(|r| r.inconclusive())
+            .map(Self::criterio_non_misurato_meta)
+            .collect();
+        Value::Array(items)
+    }
+
+    /// UNA voce dell'elenco dei non misurati.
+    fn criterio_non_misurato_meta(r: &CriterionResult) -> Value {
+        let ev = &r.evidence;
+        let verdetto = ev.get(CAMPO_VERDICT).and_then(Value::as_str);
+        // La CAUSA e' il campo su cui si conta e si filtra; il motivo in prosa
+        // le sta accanto per chi legge, e nessuno lo rilegge.
+        let motivo = str_truthy(ev.get("skipped_reason"))
+            .or_else(|| str_truthy(ev.get("error")))
+            .or_else(|| verdetto.filter(|v| !v.is_empty()))
+            .unwrap_or("");
+        let mut item = serde_json::Map::new();
+        item.insert("type".to_string(), serde_json::json!(r.criterion_type));
+        item.insert(CAMPO_VERDICT.to_string(), serde_json::json!(verdetto));
+        item.insert(
+            "skipped_cause".to_string(),
+            serde_json::json!(ev.get("skipped_cause").and_then(Value::as_str)),
+        );
+        item.insert(
+            "reason".to_string(),
+            serde_json::json!(motivo.chars().take(500).collect::<String>()),
+        );
+        // I conteggi che rendono «non ho misurato» una misura: sono esattamente
+        // cio' che distingue un piano vuoto da venticinque prove che nessuno ha
+        // eseguito.
+        for campo in ["prove", "cause"] {
+            let Some(v) = ev.get(campo) else { continue };
+            item.insert(campo.to_string(), v.clone());
+        }
+        Value::Object(item)
+    }
+
+    /// L'elenco dei criteri NON MISURATI dentro il payload di un ciclo del gate.
+    ///
+    /// Un punto solo per i QUATTRO payload che lo portano: la chiave scritta a
+    /// mano in ognuno era il modo in cui un ramo poteva restare indietro, e i
+    /// rami che chiudono POSITIVAMENTE sono proprio quelli in cui il referto
+    /// aveva il solo contatore.
+    /// Il payload dei DUE rami che chiudono POSITIVAMENTE.
+    ///
+    /// Un costruttore solo, per la stessa ragione per cui quei due rami non
+    /// possono avere due idee di «verificato» (regola L): erano due oggetti
+    /// identici scritti a mano, ed e' proprio li' che il contatore
+    /// `inconclusive` viaggiava senza il proprio elenco — 19/08/2026,
+    /// venticinque prove dichiarate e zero eseguite indistinguibili da un piano
+    /// vuoto.
+    fn payload_chiusura(
+        cycle: i64,
+        fase: &str,
+        inconclusive_n: usize,
+        results: &[CriterionResult],
+    ) -> Value {
+        Self::con_criteri_non_misurati(
+            serde_json::json!({ "cycle": cycle, "phase": fase, "inconclusive": inconclusive_n }),
+            results,
+        )
+    }
+
+    fn con_criteri_non_misurati(mut payload: Value, results: &[CriterionResult]) -> Value {
+        if let Value::Object(map) = &mut payload {
+            map.insert(
+                "inconclusive_criteria".to_string(),
+                Self::inconclusive_criteria_meta(results),
+            );
+        }
+        payload
+    }
+
     pub fn render_failed_block(
         state: &AgentState,
         cycle: i64,
@@ -1126,7 +1231,7 @@ impl FinalGateNode {
             // `str_truthy` (Some solo se la stringa NON e' vuota) per replicarla
             // 1:1: con output_excerpt:"" + verdict valorizzato si rende il verdict.
             let excerpt = str_truthy(ev.get("output_excerpt"))
-                .or_else(|| str_truthy(ev.get("verdict")))
+                .or_else(|| str_truthy(ev.get(CAMPO_VERDICT)))
                 .or_else(|| str_truthy(ev.get("error")))
                 .unwrap_or("");
             if excerpt.is_empty() {
@@ -1411,11 +1516,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 self.meta_steps.as_ref(),
                 "final_gate",
                 titolo_verifica_superata(inconclusive_n),
-                serde_json::json!({
-                    "cycle": cycle,
-                    "phase": "passed",
-                    "inconclusive": inconclusive_n,
-                }),
+                Self::payload_chiusura(cycle, "passed", inconclusive_n, &results),
             )
             .await;
             return Ok(StateDelta {
@@ -1541,7 +1642,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
             // `FailedFinal` con i criteri oggettivi tutti verdi.
             if !forced_close && grazia_gia_concessa && solo_firma_manca {
                 return Ok(self
-                    .chiusura_con_firma_assente(cycle, inconclusive_n, chiusura_non_verificata, ctx)
+                    .chiusura_con_firma_assente(cycle, inconclusive_n, &results, chiusura_non_verificata, ctx)
                     .await);
             }
             // ── NON-CONVERGENZA -> ESCALATION di modello (regola H, "niente di
@@ -1586,7 +1687,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                     self.meta_steps.as_ref(),
                     "final_gate",
                     "Verifica non superata al limite tentativi: promuovo a un modello piu' capace".to_string(),
-                    serde_json::json!({"cycle": cycle, "phase": "nonconvergence_escalation", "failed_criteria": Self::failed_criteria_meta(&results)}),
+                    Self::con_criteri_non_misurati(serde_json::json!({"cycle": cycle, "phase": "nonconvergence_escalation", "failed_criteria": Self::failed_criteria_meta(&results)}), &results),
                 )
                 .await;
                 let block = Self::render_failed_block(state, cycle, max_cycles, &results);
@@ -1620,7 +1721,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 self.meta_steps.as_ref(),
                 "final_gate",
                 "Verifica non superata: chiudo (limite tentativi)".to_string(),
-                serde_json::json!({"cycle": cycle, "phase": "forced_close", "forced": forced_close, "failed_criteria": Self::failed_criteria_meta(&results)}),
+                Self::con_criteri_non_misurati(serde_json::json!({"cycle": cycle, "phase": "forced_close", "forced": forced_close, "failed_criteria": Self::failed_criteria_meta(&results)}), &results),
             )
             .await;
             return Ok(StateDelta {
@@ -1647,7 +1748,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
             self.meta_steps.as_ref(),
             "final_gate",
             format!("Verifica fallita: rimando in correzione ({cycle}/{max_cycles})"),
-            serde_json::json!({"cycle": cycle, "max_cycles": max_cycles, "phase": "failed", "failed_criteria": Self::failed_criteria_meta(&results)}),
+            Self::con_criteri_non_misurati(serde_json::json!({"cycle": cycle, "max_cycles": max_cycles, "phase": "failed", "failed_criteria": Self::failed_criteria_meta(&results)}), &results),
         )
         .await;
         let block = Self::render_failed_block(state, cycle, max_cycles, &results);
@@ -1760,6 +1861,7 @@ impl FinalGateNode {
         &self,
         cycle: i64,
         inconclusive_n: usize,
+        results: &[CriterionResult],
         non_verificata: bool,
         ctx: &AgentNodeCtx,
     ) -> OpaqueDelta {
@@ -1774,11 +1876,12 @@ impl FinalGateNode {
             self.meta_steps.as_ref(),
             "final_gate",
             "Criteri oggettivi superati, dichiarazione di chiusura assente: chiudo".to_string(),
-            serde_json::json!({
-                "cycle": cycle,
-                "phase": "objective_passed_signature_missing",
-                "inconclusive": inconclusive_n,
-            }),
+            Self::payload_chiusura(
+                cycle,
+                "objective_passed_signature_missing",
+                inconclusive_n,
+                results,
+            ),
         )
         .await;
         StateDelta {
@@ -3206,6 +3309,107 @@ mod tests {
             count_build_errors(vite_ok_con_warning),
             0,
             "un build vite riuscito con soli warning (reporter/chunk-size) non deve contare errori"
+        );
+    }
+
+    /// UN PIANO DI 25 PROVE NEGATE NON E' UN PIANO VUOTO (19/08/2026).
+    ///
+    /// Il referto portava il solo CONTATORE (`{"phase":"passed",
+    /// "inconclusive":3}`): venticinque prove dichiarate dalle figure e nessuna
+    /// eseguita valevano un intero che passa da 2 a 3, e chi legge non aveva
+    /// modo di distinguere «non c'erano prove» da «c'erano e nessuno le ha
+    /// eseguite» — che sono due fatti con due rimedi (regola Q).
+    ///
+    /// L'evidenza la produce il PRODUTTORE reale (`classifica_piano` +
+    /// `evidenza_piano`): fabbricarla a mano proverebbe che il trasporto sa
+    /// leggere il JSON che il test sa scrivere (regola O).
+    ///
+    /// MUTAZIONE: togliere `inconclusive_criteria` dal payload del ramo
+    /// `passed` -> l'ultima asserzione cade, e il referto torna a essere il solo
+    /// intero del difetto.
+    #[test]
+    fn il_referto_distingue_25_prove_negate_da_un_piano_vuoto() {
+        use crate::decisions::piano_di_verifica::{
+            classifica_piano, evidenza_piano, CausaNonEseguita, EsitoProva, EsitoSingolo,
+            PianoDiVerifica,
+        };
+        use crate::decisions::step_gate::StepGateDecision;
+
+        // Le prove nascono dalla FORMA in cui le figure le emettono, attraverso
+        // il lettore di produzione: una `Prova` costruita a mano proverebbe che
+        // il referto sa rendere cio' che il test sa costruire (regola O).
+        let piano = PianoDiVerifica::from_value(Some(&json!((0..25)
+            .map(|i| json!({
+                "descrizione": format!("la POST senza titolo risponde 400 ({i})"),
+                "comando": format!("curl -s -o /dev/null -w '%{{http_code}}' -X POST /todo/{i}"),
+                "attesa": { "tipo": "output_contains", "testo": "400" },
+                "origine": "council",
+            }))
+            .collect::<Vec<_>>())));
+        assert_eq!(piano.len(), 25, "le venticinque prove del caso misurato");
+        // Il caso misurato: la decisione e' `NeedsHuman` in un run che non ha
+        // nessuno a cui chiedere, e la causa la deriva il punto unico.
+        let causa = CausaNonEseguita::dal_gate(
+            StepGateDecision::NeedsHuman,
+            &[
+                crate::decisions::step_gate::StepVerdict::Approve,
+                crate::decisions::step_gate::StepVerdict::Abstained,
+            ],
+            false,
+        )
+        .expect("un NeedsHuman non e' un via libera");
+        let esiti: Vec<EsitoProva> = piano
+            .prove
+            .into_iter()
+            .map(|prova| EsitoProva {
+                prova,
+                esito: EsitoSingolo::non_eseguibile(causa.clone()),
+            })
+            .collect();
+        let negato = CriterionResult {
+            criterion_type: "piano_di_verifica".to_string(),
+            outcome: CriterionOutcome::Inconclusive,
+            evidence: evidenza_piano(&classifica_piano(&esiti), &esiti),
+        };
+        // L'altro criterio inconcludente del run, che non c'entra col piano.
+        let altro = CriterionResult {
+            criterion_type: "ui_styling".to_string(),
+            outcome: CriterionOutcome::Inconclusive,
+            evidence: json!({ "verdict": "vocabolario assente" }),
+        };
+
+        let meta = FinalGateNode::inconclusive_criteria_meta(&[negato, altro]);
+        let arr = meta.as_array().expect("array");
+        assert_eq!(arr.len(), 2, "entrambi i non misurati arrivano al referto");
+        assert_eq!(arr[0]["type"], json!("piano_di_verifica"));
+        assert_eq!(
+            arr[0]["skipped_cause"],
+            json!("no_human_to_decide"),
+            "il rimedio e' sul quorum del gate, non sulla prova"
+        );
+        assert_eq!(
+            arr[0]["prove"]["dichiarate"],
+            json!(25),
+            "e' IL numero che il contatore da solo non poteva portare"
+        );
+        assert_eq!(arr[0]["prove"]["non_eseguibili"], json!(25));
+        assert_eq!(arr[0]["cause"]["no_human_to_decide"], json!(25));
+        assert!(
+            arr[0]["reason"].as_str().is_some_and(|r| !r.is_empty()),
+            "la prosa sta accanto ai campi, e nessuno la rilegge"
+        );
+
+        // E il PIANO VUOTO non e' nemmeno inconcludente: `dichiara_un_esito`
+        // resta vero, quindi non compare qui. La differenza fra i due casi non
+        // e' piu' un intero.
+        let vuoto = CriterionResult {
+            criterion_type: "piano_di_verifica".to_string(),
+            outcome: CriterionOutcome::Passed,
+            evidence: evidenza_piano(&classifica_piano(&[]), &[]),
+        };
+        assert_eq!(
+            FinalGateNode::inconclusive_criteria_meta(&[vuoto]),
+            json!([])
         );
     }
 

@@ -414,6 +414,10 @@ impl StepGateAdapter {
         req: &StepValidationRequest,
     ) -> Vec<ValidatorVerdict> {
         let mut attese = Vec::new();
+        // Il budget di risposta VISIBILE dipende da quanti passi il giudice deve
+        // poter contestare: si deriva QUI, dove la taglia del batch e' nota, e
+        // non dentro la chiamata, che vede solo il blob gia' composto.
+        let visibile = visibile_del_batch(req.steps.len());
         for (role, cand) in posti {
             let system = self.system_del_ruolo(role);
             let blob = blob_del_batch(req);
@@ -426,6 +430,7 @@ impl StepGateAdapter {
             let cand_task = cand.clone();
             let futuro = chiamata_one_shot(
                 setup, cand_task, role, system, blob, project_id, user_id, executor, run_id,
+                visibile,
             );
             let handle = tokio::spawn(tokio::time::timeout(timeout, futuro));
             attese.push((role, cand, handle));
@@ -834,6 +839,7 @@ async fn chiamata_one_shot(
     user_id: String,
     executor_provider: String,
     run_id: String,
+    visibile_tokens: u32,
 ) -> ValidatorVerdict {
     let llm = GatewayLlmAdapter::new(
         setup.gateway.clone(),
@@ -848,7 +854,7 @@ async fn chiamata_one_shot(
         &setup.db,
         &cand.provider,
         &cand.model,
-        VERDETTO_VISIBILE_TOKENS,
+        visibile_tokens,
     )
     .await;
     let resp = match llm
@@ -908,14 +914,66 @@ async fn forzatura_ammessa(db: &PgPool, provider: &str, model: &str) -> bool {
     provider_style_supports_forcing(stile.as_deref())
 }
 
-/// Quanto deve essere lunga la RISPOSTA VISIBILE di un verdetto: una tool-call
-/// con enum, motivi e severita' sta ampiamente in questo spazio.
+/// Quanto deve essere lunga la RISPOSTA VISIBILE di un verdetto a PARITA' di
+/// passi: l'enum, la severita' e i motivi che non nominano un passo preciso.
 ///
 /// E' il solo numero che questo modulo puo' dichiarare, perche' riguarda cio'
 /// che LUI deve leggere. Quanto serva al modello per arrivarci — il
 /// ragionamento, che su alcuni fornitori non si spegne — non e' cosa sua: lo
 /// calcola `capability::resolve_tetto_output` dai fatti del catalogo.
-const VERDETTO_VISIBILE_TOKENS: u32 = 256;
+const VERDETTO_VISIBILE_BASE_TOKENS: u32 = 256;
+
+/// Quanto costa, in risposta VISIBILE, UN motivo che nomina UN passo: un
+/// oggetto `{severity, description}` con dentro una frase breve.
+///
+/// Il verdetto e' UNO per batch, ma `reasons` e' un ARRAY che deve poter
+/// coprire i passi contestati: senza questo termine il budget visibile e' lo
+/// stesso per un batch da 1 e per uno da 25.
+const VERDETTO_VISIBILE_PER_PASSO_TOKENS: u32 = 64;
+
+/// Tetto della parte visibile: oltre questo punto il giudice deve scegliere i
+/// motivi che contano, non scrivere un tema.
+const VERDETTO_VISIBILE_MAX_TOKENS: u32 = 2048;
+
+/// La parte VISIBILE che questo modulo dichiara di dover leggere, DERIVATA
+/// dalla taglia del batch.
+///
+/// ## Il difetto (MISURATO il 19/08/2026, progetto `t4-prove-consiglio`)
+///
+/// Il numero era una costante (256) dimensionata sul batch che il NODO
+/// convoca, che porta 1-2 passi. Il SECONDO chiamante della porta —
+/// `criteria_runner::convocazione_delle_prove` — ne consegna quanti ne ha
+/// dichiarati il piano di verifica: in esercizio 25, tutti `run_command`.
+///
+/// Il ledger dello stesso run dice come e' finita. Sui batch da 1-2 passi del
+/// nodo `deepseek/deepseek-v4-flash` ha risposto con 57 e 74 token di
+/// completion e verdetti validi; sul batch da 25 del piano ha risposto con
+/// `completion_tokens` **512 ESATTI**, cioe' il tetto calcolato per quella
+/// coppia (`thinking = false` -> `visibile * 2`). `completion_tokens` uguale al
+/// tetto e' la firma documentata del troncamento: tool-call incompleta ->
+/// [`estrai_verdetto`] -> astensione `schema_mismatch`, e con l'altro giudice
+/// che aveva approvato la matrice ha prodotto `NeedsHuman`. Venticinque prove
+/// dichiarate, zero eseguite — e la coppia e' pure finita nel registro dei
+/// giudici inadatti, cioe' un modello sano declassato per colpa di un nostro
+/// parametro.
+///
+/// ## Perche' DERIVATO e non semplicemente piu' alto
+///
+/// Il tetto dichiarato non e' una spesa — si paga cio' che il modello genera —
+/// ma su groq viene PRENOTATO contro il limite per minuto, e il gate convoca
+/// due giudici per ogni batch: alzare la costante farebbe pagare il batch da 25
+/// a ogni batch da 1. Il termine per passo lo lega a cio' che il giudice deve
+/// davvero poter scrivere.
+///
+/// Il TOTALE resta al catalogo: qui si dichiara solo il VISIBILE
+/// ([`nexus_agent_graph::decisions::tetto_output::RichiestaOutput::Visibile`]).
+fn visibile_del_batch(passi: usize) -> u32 {
+    let per_passo = VERDETTO_VISIBILE_PER_PASSO_TOKENS
+        .saturating_mul(u32::try_from(passi).unwrap_or(u32::MAX));
+    VERDETTO_VISIBILE_BASE_TOKENS
+        .saturating_add(per_passo)
+        .min(VERDETTO_VISIBILE_MAX_TOKENS)
+}
 
 /// La richiesta one-shot: system del ruolo (prefisso STABILE riusabile in
 /// cache), batch nel messaggio utente, tool inline. Il `tool_choice` si forza
@@ -1302,7 +1360,7 @@ mod tests {
             default_output: Some(8192),
             massimo_fornitore: None,
         };
-        let tetto = tetto_per(VERDETTO_VISIBILE_TOKENS, &kimi);
+        let tetto = tetto_per(visibile_del_batch(1), &kimi);
         assert_eq!(
             tetto.max_tokens(),
             Some(8192),
@@ -1315,7 +1373,56 @@ mod tests {
         // E il numero che questo modulo dichiara e' solo la parte VISIBILE:
         // verificato a COMPILE-TIME, cosi' non c'e' un istante in cui il
         // letterale possa tornare a essere il totale.
-        const { assert!(VERDETTO_VISIBILE_TOKENS < 1024) };
+        const { assert!(VERDETTO_VISIBILE_BASE_TOKENS < 1024) };
+    }
+
+    /// IL BUDGET VISIBILE DIPENDE DALLA TAGLIA DEL BATCH (19/08/2026).
+    ///
+    /// MISURATO su `t4-prove-consiglio`: il piano di verifica consegna 25 prove
+    /// in UNA convocazione, `deepseek/deepseek-v4-flash` e' a catalogo
+    /// `thinking = false` (`visibile * 2`), quindi col visibile fisso a 256 il
+    /// tetto valeva 512 — e la risposta e' uscita con `completion_tokens` 512
+    /// ESATTI, cioe' troncata: tool-call incompleta, astensione
+    /// `schema_mismatch`, `Approve + Abstained` -> `NeedsHuman`, venticinque
+    /// prove dichiarate e zero eseguite. Sui batch da 1-2 passi dello stesso
+    /// run e con la stessa coppia le risposte erano 57 e 74 token: il difetto
+    /// non e' del modello, e' del parametro.
+    ///
+    /// MUTAZIONE: far ritornare a `visibile_del_batch` il solo
+    /// `VERDETTO_VISIBILE_BASE_TOKENS` (cioe' la costante di prima) -> la prima
+    /// asserzione cade sul valore del difetto reale, 512.
+    #[test]
+    fn il_budget_visibile_del_verdetto_cresce_col_batch() {
+        use nexus_agent_graph::decisions::tetto_output::{tetto_per, FattiTetto};
+        // I fatti di deepseek-v4-flash come sono a catalogo il 19/08/2026.
+        let deepseek = FattiTetto {
+            ragiona: Some(false),
+            default_output: Some(16384),
+            massimo_fornitore: Some(16384),
+        };
+        let venticinque = tetto_per(visibile_del_batch(25), &deepseek)
+            .max_tokens()
+            .expect("il catalogo dichiara un tetto per questa coppia");
+        assert!(
+            venticinque > 512,
+            "512 e' il tetto che ha troncato il verdetto sul batch da 25 prove \
+             (completion_tokens 512 esatti nel ledger): ora vale {venticinque}"
+        );
+        // E il batch da 1 del nodo NON paga il batch da 25: il numero e'
+        // derivato, non alzato (su groq il tetto dichiarato viene prenotato
+        // contro il limite per minuto).
+        assert!(
+            visibile_del_batch(1) < visibile_del_batch(25),
+            "il budget visibile deve dipendere dalla taglia del batch"
+        );
+        assert_eq!(
+            visibile_del_batch(0),
+            VERDETTO_VISIBILE_BASE_TOKENS,
+            "nessun passo: resta il costo fisso del verdetto"
+        );
+        // Il tetto della parte visibile regge un batch qualunque senza
+        // trasformarsi in un tema, e non trabocca.
+        assert_eq!(visibile_del_batch(usize::MAX), VERDETTO_VISIBILE_MAX_TOKENS);
     }
 
     /// Fuori da un rimando il blocco NON compare: un contesto che c'e' sempre
@@ -1735,6 +1842,9 @@ mod tests {
                     String::new(),
                     String::new(),
                     "gap4-prova".to_string(),
+                    // Il budget lo deriva il produttore dalla taglia del batch
+                    // reale, non un numero scritto qui (regola O).
+                    visibile_del_batch(req.steps.len()),
                 )
                 .await;
                 println!(

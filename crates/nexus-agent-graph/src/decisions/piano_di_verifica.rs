@@ -157,6 +157,10 @@ pub const CHIAVE_ATTESA_MASSIMA: &str = "attesa_massima_s";
 /// umano a cui chiedere il consenso ([`consenso_umano_richiesto`]). La inietta
 /// il nodo insieme al piano, perche' e' l'unico punto che vede lo stato.
 pub const CHIAVE_MODALITA: &str = "automation_mode";
+/// Esiste una superficie di dialogo per questo run? E' l'ALTRA meta' di
+/// [`giudizio_umano_raggiungibile`], e la inietta lo stesso punto: il criterio
+/// vive dentro il final gate, che non ha lo stato del grafo sotto mano.
+pub const CHIAVE_INTERLOCUTORE: &str = "interlocutore";
 
 /// I campi di UNA prova sul wire. Un punto di scrittura solo: li scrive
 /// [`Prova::to_value`], li rilegge [`Prova::from_value`], li dichiara lo schema
@@ -722,6 +726,40 @@ pub fn consenso_umano_richiesto(
         && super::hitl::is_mutator_tool_name(TOOL_DELLA_PROVA, mutatori)
 }
 
+/// Un `NeedsHuman` del gate duale su queste prove lo vedra' QUALCUNO che possa
+/// rispondere?
+///
+/// Le due meta' della risposta hanno gia' un punto unico ciascuna e questa e'
+/// solo la loro COMPOSIZIONE (regola L, nessun terzo criterio):
+///
+/// - [`super::interlocutore::Interlocutore`] — «esiste una superficie di
+///   dialogo per questo run?». Per un sub-run e' `Nessuno` per costruzione;
+/// - [`super::hitl::automation_requires_hitl`] — «visto che qualcuno c'e',
+///   questa modalita' lo interpella?». In Automatic no (regola D).
+///
+/// ## Perche' serve DUE volte nello stesso criterio, e non e' ridondanza
+///
+/// Al cancello 2 la domanda e' «questo run pretende che un umano veda ogni
+/// comando?» ([`consenso_umano_richiesto`]) e riguarda la MODALITA'. Qui la
+/// domanda e' un'altra: il gate duale ha gia' deciso, la sua decisione e'
+/// `NeedsHuman`, e bisogna sapere se quella decisione abbia un destinatario.
+/// MISURATO il 19/08/2026 su `t4-prove-consiglio`: run PRINCIPALE in
+/// `automatic`, quindi il cancello 2 lo lascia passare correttamente (nessuno
+/// pretende di vedere ogni comando) e poi il gate risponde `NeedsHuman` —
+/// venticinque prove dichiarate, zero eseguite, e il referto non distingueva
+/// quel vicolo cieco da «un giudice ha bocciato le prove».
+///
+/// Il criterio dell'INTERLOCUTORE da solo non morderebbe (li' la risposta e'
+/// `Umano`: il run e' di chat, la superficie esiste); quello della MODALITA' da
+/// solo non coprirebbe un final gate dentro un sub-run. Servono entrambi, e
+/// nessuno dei due va riscritto qui.
+pub fn giudizio_umano_raggiungibile(
+    modalita: Option<crate::state::AutomationMode>,
+    interlocutore: super::interlocutore::Interlocutore,
+) -> bool {
+    interlocutore.puo_porre_una_domanda() && super::hitl::automation_requires_hitl(modalita)
+}
+
 /// Le regole di criticita' rilette dalla spec. Una voce che non si deserializza
 /// si SCARTA, come fa `step_gate::parse_rules` col vocabolario del DB: una
 /// regola rotta non deve portarsi via le altre, che sono quelle che vietano.
@@ -793,9 +831,26 @@ pub enum CausaNonEseguita {
     /// gate non ha un umano a cui chiederlo.
     /// RIMEDIO: eseguire la prova a mano, o il run in Automatico.
     ConsensoUmanoNonRichiedibile,
-    /// Il gate duale ha DECISO, e la decisione non e' un via libera.
-    /// RIMEDIO: la prova va riformulata — il giudizio e' sul suo contenuto.
+    /// Almeno un giudice ha ESPRESSO un verdetto contrario: il blocco e' un
+    /// giudizio sul CONTENUTO di cio' che sta per girare.
+    /// RIMEDIO: la prova va riformulata.
     GiudizioNegato {
+        decisione: super::step_gate::StepGateDecision,
+    },
+    /// Il gate ha deciso di non lasciar passare, e NESSUN giudice ha espresso un
+    /// verdetto contrario: solo astensioni. Non e' una proprieta' delle prove,
+    /// e' una condizione dell'ambiente (credito, cooldown, timeout del
+    /// fornitore, risposta troncata dal tetto di output).
+    /// RIMEDIO: guardare perche' i giudici non rispondono — riformulare le
+    /// prove non cambia nulla, ed e' la diagnosi sbagliata da consegnare.
+    GiudizioNonEspresso {
+        decisione: super::step_gate::StepGateDecision,
+    },
+    /// Il gate ha rimandato la decisione a un UMANO, e questo run non ne ha uno
+    /// che possa vederla ([`giudizio_umano_raggiungibile`]).
+    /// RIMEDIO: nessuno, sulla prova. La decisione non ha un destinatario:
+    /// vanno guardati il quorum del gate e i suoi giudici.
+    GiudizioRimandatoANessuno {
         decisione: super::step_gate::StepGateDecision,
     },
     /// Il gate duale non e' interrogabile: nessun giudice indipendente puo'
@@ -840,6 +895,53 @@ impl MotivoGiudiceAssente {
 }
 
 impl CausaNonEseguita {
+    /// La causa a partire da cio' che il gate duale ha DECISO e da cio' che i
+    /// suoi giudici hanno DETTO. `None` = si puo' procedere.
+    ///
+    /// UNICO punto in cui una [`super::step_gate::StepGateDecision`] diventa una
+    /// causa del piano: prima il criterio collassava le tre decisioni non-
+    /// `Approved` in un solo `judgment_denied`, e chi leggeva il referto vedeva
+    /// «un giudice ha bocciato le prove» anche quando nessun giudice aveva
+    /// aperto bocca.
+    ///
+    /// ## Il fail-closed NON si allenta
+    ///
+    /// Ogni decisione diversa da `Approved` continua a NON far girare nulla, e
+    /// questo include `UnavailableDeclared`: il nodo, davanti a un batch che
+    /// nessuno ha potuto giudicare, procede DICHIARANDOLO — perche' quel passo
+    /// lo ha proposto l'agente sotto tutti gli altri presidi — mentre qui le
+    /// prove le hanno proposte le FIGURE e girano dentro il final gate, dove
+    /// nessun altro presidio le guarda. Ereditare quella scelta per simmetria
+    /// allargherebbe il perimetro di cio' che si esegue senza giudizio, che e'
+    /// esattamente il canale privilegiato che questo criterio esiste per
+    /// negare. Cambia solo COSA il referto dichiara.
+    ///
+    /// ## Precedenza
+    ///
+    /// Il vicolo cieco viene PRIMA (regola D): un `NeedsHuman` che nessuno
+    /// vedra' non e' una decisione sul contenuto, e presentarlo come tale manda
+    /// a riscrivere una prova che nessuno ha contestato. Sotto, il
+    /// discriminante e' se qualcuno abbia espresso un verdetto CONTRARIO, e lo
+    /// decide il punto unico [`super::step_gate::verdetto_contrario_espresso`].
+    pub fn dal_gate(
+        decisione: super::step_gate::StepGateDecision,
+        verdetti: &[super::step_gate::StepVerdict],
+        umano_raggiungibile: bool,
+    ) -> Option<Self> {
+        use super::step_gate::StepGateDecision;
+        match decisione {
+            StepGateDecision::Approved => None,
+            StepGateDecision::NeedsHuman if !umano_raggiungibile => {
+                Some(Self::GiudizioRimandatoANessuno { decisione })
+            }
+            altra => Some(if super::step_gate::verdetto_contrario_espresso(verdetti) {
+                Self::GiudizioNegato { decisione: altra }
+            } else {
+                Self::GiudizioNonEspresso { decisione: altra }
+            }),
+        }
+    }
+
     /// Identificatore canonico (regola N): e' il campo su cui si conta e si
     /// filtra, mai la prosa di [`Self::descrizione`].
     pub fn as_str(&self) -> &'static str {
@@ -848,6 +950,8 @@ impl CausaNonEseguita {
             Self::Vietata { .. } => "forbidden",
             Self::ConsensoUmanoNonRichiedibile => "human_consent_required",
             Self::GiudizioNegato { .. } => "judgment_denied",
+            Self::GiudizioNonEspresso { .. } => "judgment_not_reached",
+            Self::GiudizioRimandatoANessuno { .. } => "no_human_to_decide",
             Self::GiudiceNonDisponibile { .. } => "judge_unavailable",
             Self::OltreIlTetto { .. } => "over_cap",
             Self::AmbienteNonPronto { .. } => "environment",
@@ -877,10 +981,13 @@ impl CausaNonEseguita {
                  umano approvi ogni comando, e la verifica finale non ha nessuno a cui \
                  chiederlo: la prova resta dichiarata e non eseguita"
                 .to_string(),
-            Self::GiudizioNegato { decisione } => format!(
-                "il gate duale non ha autorizzato la prova (decisione '{}')",
-                decisione_canonica(*decisione)
-            ),
+            // Le tre nature del blocco del gate compongono altrove, per tenere
+            // questo match leggibile: il punto di composizione resta UNO.
+            Self::GiudizioNegato { decisione }
+            | Self::GiudizioNonEspresso { decisione }
+            | Self::GiudizioRimandatoANessuno { decisione } => {
+                descrizione_del_gate(self, *decisione)
+            }
             Self::GiudiceNonDisponibile { motivo } => format!(
                 "nessun giudice indipendente puo' autorizzare questa prova ({}): un comando \
                  scritto da un modello e che nessun umano vedra' non parte senza giudizio",
@@ -910,6 +1017,37 @@ impl CausaNonEseguita {
 /// `as_str`, e aggiungerne uno cambierebbe un tipo che tre nodi consumano: la
 /// mappatura e' totale, quindi una variante nuova non compila finche' non e'
 /// nominata anche qui.
+/// La prosa delle TRE nature del blocco del gate, composta dai campi (regola Q,
+/// punto 3). Sta accanto a [`decisione_canonica`] e non dentro il match di
+/// [`CausaNonEseguita::descrizione`] per tenere quel match leggibile: il punto
+/// di composizione resta uno, ed e' questo.
+///
+/// I tre testi dicono TRE RIMEDI diversi, ed e' l'intera ragione per cui le
+/// varianti sono tre: riformulare la prova, guardare perche' i giudici non
+/// rispondono, guardare il quorum del gate.
+fn descrizione_del_gate(
+    causa: &CausaNonEseguita,
+    decisione: super::step_gate::StepGateDecision,
+) -> String {
+    let d = decisione_canonica(decisione);
+    match causa {
+        CausaNonEseguita::GiudizioNegato { .. } => format!(
+            "almeno un giudice del gate duale ha espresso un verdetto contrario a questa \
+             prova (decisione '{d}'): il rilievo e' sul suo contenuto"
+        ),
+        CausaNonEseguita::GiudizioNonEspresso { .. } => format!(
+            "nessun giudice del gate duale ha espresso un verdetto su questa prova, solo \
+             astensioni (decisione '{d}'): non e' un giudizio sulla prova, e' una condizione \
+             dell'ambiente — riproporla riformulata non la cambia"
+        ),
+        _ => format!(
+            "il gate duale ha rimandato la decisione a un umano (decisione '{d}') e questo run \
+             non ne ha uno che possa vederla: la prova resta dichiarata e non eseguita, e il \
+             rimedio non e' sulla prova ma sul quorum del gate"
+        ),
+    }
+}
+
 fn decisione_canonica(d: super::step_gate::StepGateDecision) -> &'static str {
     use super::step_gate::StepGateDecision as D;
     match d {
@@ -1481,11 +1619,13 @@ pub fn criterio_piano(
 /// lo stato, non la forma della spec — e con due punti di iniezione due gate
 /// potrebbero eseguire due piani diversi sullo stesso run.
 ///
-/// I DUE dati viaggiano INSIEME e non in due funzioni: senza la modalita' il
-/// runner non puo' sapere se un umano dovrebbe vedere quei comandi, e un
-/// chiamante che iniettasse il piano dimenticando la modalita' eseguirebbe le
-/// prove in Conferma — cioe' il difetto misurato. Con un solo punto d'ingresso
-/// la dimenticanza non e' rappresentabile.
+/// I dati viaggiano INSIEME e non in tre funzioni: senza la modalita' il runner
+/// non puo' sapere se un umano dovrebbe vedere quei comandi, e un chiamante che
+/// iniettasse il piano dimenticandola eseguirebbe le prove in Conferma — cioe'
+/// il difetto misurato. Per la stessa ragione il parametro e' lo STATO e non i
+/// singoli fatti: cosi' la dimenticanza non e' rappresentabile, e il fatto
+/// aggiunto il 19/08/2026 ([`super::interlocutore::Interlocutore`]) non ha
+/// potuto arrivare a meta' strada.
 ///
 /// Il piano si scrive SEMPRE, anche vuoto: «nessuno ha dichiarato prove» e «non
 /// ho letto il piano» sono due cose diverse, e distinguerle e' tutto il punto
@@ -1494,13 +1634,17 @@ pub fn criterio_piano(
 pub fn con_piano(
     mut spec: crate::runtime::ports::CriterionSpec,
     piano: &PianoDiVerifica,
-    modalita: Option<crate::state::AutomationMode>,
+    state: &crate::state::AgentState,
 ) -> crate::runtime::ports::CriterionSpec {
     if let Value::Object(map) = &mut spec.spec {
         map.insert(CHIAVE_PROVE.to_string(), piano.to_value());
         map.insert(
             CHIAVE_MODALITA.to_string(),
-            serde_json::to_value(modalita).unwrap_or(Value::Null),
+            serde_json::to_value(state.automation_mode).unwrap_or(Value::Null),
+        );
+        map.insert(
+            CHIAVE_INTERLOCUTORE.to_string(),
+            json!(super::interlocutore::Interlocutore::dello_stato(state).as_str()),
         );
     }
     spec
@@ -1511,6 +1655,16 @@ pub fn con_piano(
 /// non sappiamo leggere non deve autorizzare l'esecuzione.
 pub fn modalita_da_spec(spec: &Value) -> Option<crate::state::AutomationMode> {
     serde_json::from_value(spec.get(CHIAVE_MODALITA)?.clone()).ok()
+}
+
+/// La superficie di dialogo riletta dalla spec. Il criterio resta quello del
+/// punto unico [`super::interlocutore::Interlocutore`]: qui si legge il valore
+/// che il nodo ha gia' derivato, non lo si ricalcola (il runner non ha lo stato
+/// del grafo, e derivarlo da altro sarebbe una seconda idea di «sub-run»).
+pub fn interlocutore_da_spec(spec: &Value) -> super::interlocutore::Interlocutore {
+    super::interlocutore::Interlocutore::parse(
+        spec.get(CHIAVE_INTERLOCUTORE).and_then(Value::as_str),
+    )
 }
 
 #[cfg(test)]
@@ -2710,13 +2864,144 @@ mod tests {
             AdvisorySource::Council,
             sintesi(&[prova_del_caso_reale()]),
         )]);
-        let con = con_piano(base, &piano, Some(AutomationMode::Automatic));
+        let con = con_piano(base, &piano, &stato(AutomationMode::Automatic));
         assert_eq!(PianoDiVerifica::from_value(con.spec.get(CHIAVE_PROVE)), piano);
         assert_eq!(
             PoliticaEsecuzione::from_value(con.spec.get(CHIAVE_POLITICA)),
             Some(pol)
         );
         assert_eq!(modalita_da_spec(&con.spec), Some(AutomationMode::Automatic));
+    }
+
+    /// Lo stato minimo di un run di CHAT: la superficie di dialogo esiste.
+    fn stato(modalita: AutomationMode) -> crate::state::AgentState {
+        crate::state::AgentState {
+            automation_mode: Some(modalita),
+            ..Default::default()
+        }
+    }
+
+    /// LA SUPERFICIE DI DIALOGO VIAGGIA COL PIANO, e per la stessa ragione
+    /// della modalita': il criterio gira dentro il final gate, dove lo stato del
+    /// grafo non c'e'. Passando lo STATO invece dei singoli fatti, il fatto
+    /// aggiunto il 19/08/2026 non ha potuto fermarsi a meta' strada.
+    ///
+    /// MUTAZIONE: togliere l'insert di `CHIAVE_INTERLOCUTORE` da `con_piano` ->
+    /// il sub-run rilegge `Umano` e `giudizio_umano_raggiungibile` dice che il
+    /// `NeedsHuman` ha un destinatario che non esiste.
+    #[test]
+    fn la_superficie_di_dialogo_viaggia_col_piano() {
+        use crate::decisions::interlocutore::Interlocutore;
+        let base = || criterio_piano(Some(&politica()), &parametri(true)).expect("acceso");
+        let piano = PianoDiVerifica::default();
+
+        let chat = con_piano(base(), &piano, &stato(AutomationMode::Automatic));
+        assert_eq!(interlocutore_da_spec(&chat.spec), Interlocutore::Umano);
+
+        // I DUE campi che il dispatcher valorizza insieme su ogni sub-run.
+        let mut s = stato(AutomationMode::Automatic);
+        s.subagent_depth = Some(1);
+        s.parent_run_id = Some("abdbc7c4".to_string());
+        let figura = con_piano(base(), &piano, &s);
+        assert_eq!(interlocutore_da_spec(&figura.spec), Interlocutore::Nessuno);
+
+        // Spec senza la chiave (produttore anteriore al contratto): il default
+        // non stringe nessuno, e la conseguenza e' solo QUALE causa si dichiara.
+        assert_eq!(interlocutore_da_spec(&json!({})), Interlocutore::Umano);
+    }
+
+    /// «Un `NeedsHuman` lo vedra' qualcuno?» e' la COMPOSIZIONE dei due punti
+    /// unici, e nessuno dei due basta da solo — che e' esattamente il caso
+    /// misurato: run PRINCIPALE (superficie presente) in `automatic` (nessuno
+    /// verra' interpellato).
+    #[test]
+    fn nessuno_dei_due_criteri_basta_da_solo() {
+        use crate::decisions::interlocutore::Interlocutore::{Nessuno, Umano};
+        assert!(
+            !giudizio_umano_raggiungibile(Some(AutomationMode::Automatic), Umano),
+            "il caso di t4-prove-consiglio: la chat c'e', ma in automatico \
+             nessuno viene interpellato (regola D)"
+        );
+        assert!(
+            !giudizio_umano_raggiungibile(Some(AutomationMode::Confirm), Nessuno),
+            "un final gate dentro un sub-run: la modalita' interpella, e non \
+             c'e' nessuna superficie su cui la domanda comparirebbe"
+        );
+        assert!(!giudizio_umano_raggiungibile(
+            Some(AutomationMode::Automatic),
+            Nessuno
+        ));
+        assert!(
+            giudizio_umano_raggiungibile(Some(AutomationMode::Confirm), Umano),
+            "l'unico caso in cui il rimando a un umano ha un destinatario"
+        );
+        assert!(
+            giudizio_umano_raggiungibile(None, Umano),
+            "modalita' illeggibile: `automation_requires_hitl` la tratta gia' \
+             come «serve un umano», e qui non si allenta"
+        );
+    }
+
+    /// LE TRE DECISIONI NON-`Approved` NON SONO LA STESSA CAUSA (19/08/2026).
+    ///
+    /// Il criterio collassava tutto in `judgment_denied`, e i rimedi sono tre:
+    /// riformulare la prova, guardare perche' i giudici non rispondono, o
+    /// guardare il quorum del gate. Il fail-closed non cambia in nessuno dei
+    /// tre — `dal_gate` ritorna `Some` per ogni decisione diversa da
+    /// `Approved`, `UnavailableDeclared` compreso.
+    ///
+    /// MUTAZIONE: far ritornare a `dal_gate` sempre `GiudizioNegato` (cioe' il
+    /// `match` di prima) -> cadono le tre asserzioni sugli identificatori, coi
+    /// valori del difetto reale.
+    #[test]
+    fn le_tre_nature_del_blocco_hanno_tre_cause_distinte() {
+        use crate::decisions::step_gate::{StepGateDecision as D, StepVerdict as V};
+        let caso_misurato = [V::Approve, V::Abstained];
+
+        assert_eq!(
+            CausaNonEseguita::dal_gate(D::Approved, &[V::Approve, V::Approve], false),
+            None,
+            "l'unanimita' esegue: il fix serve a far girare le prove quando e' lecito"
+        );
+        // Il caso del 19/08: approve + astensione (verdetto troncato a 512
+        // token) -> NeedsHuman, in un run automatico dove nessuno rispondera'.
+        assert_eq!(
+            CausaNonEseguita::dal_gate(D::NeedsHuman, &caso_misurato, false)
+                .as_ref()
+                .map(CausaNonEseguita::as_str),
+            Some("no_human_to_decide")
+        );
+        // Lo stesso identico esito dove un umano c'e' davvero: li' non e' un
+        // vicolo cieco, ed e' comunque un quorum mancante e non un rilievo
+        // sulla prova.
+        assert_eq!(
+            CausaNonEseguita::dal_gate(D::NeedsHuman, &caso_misurato, true)
+                .as_ref()
+                .map(CausaNonEseguita::as_str),
+            Some("judgment_not_reached")
+        );
+        // Un verdetto CONTRARIO espresso: qui il rilievo e' sulla prova.
+        for verdetti in [
+            vec![V::Reject, V::Approve],
+            vec![V::NeedsHuman, V::Approve],
+        ] {
+            assert_eq!(
+                CausaNonEseguita::dal_gate(D::Rejected, &verdetti, true)
+                    .as_ref()
+                    .map(CausaNonEseguita::as_str),
+                Some("judgment_denied"),
+                "{verdetti:?}"
+            );
+        }
+        // Astensione TOTALE su un Critical: il nodo procede dichiarandolo, il
+        // piano NO — le prove le hanno proposte le figure e girano dentro il
+        // final gate, dove nessun altro presidio le guarda.
+        assert_eq!(
+            CausaNonEseguita::dal_gate(D::UnavailableDeclared, &[V::Abstained, V::Abstained], true)
+                .as_ref()
+                .map(CausaNonEseguita::as_str),
+            Some("judgment_not_reached")
+        );
     }
 
     /// La MODALITA' viaggia con il piano e non in una funzione a parte: un
@@ -2750,7 +3035,7 @@ mod tests {
         let c = con_piano(
             criterio_piano(Some(&politica()), &parametri(true)).expect("criterio acceso"),
             &PianoDiVerifica::default(),
-            Some(AutomationMode::Automatic),
+            &stato(AutomationMode::Automatic),
         );
         assert_eq!(c.spec[CHIAVE_PROVE], json!([]));
     }
